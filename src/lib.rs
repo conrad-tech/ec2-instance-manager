@@ -1,7 +1,9 @@
+pub mod accounts;
 pub mod aws_cli;
 pub mod aws_context;
 pub mod config;
 pub mod connection_tabs;
+pub mod credentials;
 pub mod diagnostics;
 pub mod error;
 pub mod filter;

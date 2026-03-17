@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
+use crate::accounts;
 use crate::error::Result;
-use crate::models::{Mode, PortForwardPreset, RecentConnection, SavedFilter, TagMapping};
+use crate::models::{Mode, PortForwardPreset, ProfileConfig, RecentConnection, SavedFilter, TagMapping};
 use crate::util::{home_dir, split_csv};
 
 const APP_DIR: &str = "ec2-manager";
@@ -21,6 +22,8 @@ pub struct AppConfig {
     pub recents: Vec<RecentConnection>,
     pub saved_filters: BTreeMap<String, Vec<SavedFilter>>,
     pub port_forward_presets: Vec<PortForwardPreset>,
+    pub profiles: Vec<ProfileConfig>,
+    pub last_selected_profile: Option<String>,
     pub theme: Option<String>,
     pub scroll_sensitivity: Option<f32>,
 }
@@ -48,6 +51,8 @@ impl Default for AppConfig {
                     remote_port: 5432,
                 },
             ],
+            profiles: Vec::new(),
+            last_selected_profile: None,
             theme: None,
             scroll_sensitivity: None,
         }
@@ -83,7 +88,15 @@ impl AppConfig {
         }
 
         let raw = fs::read_to_string(path)?;
-        Ok(Self::parse(&raw))
+        let mut cfg = Self::parse(&raw);
+
+        // accounts.json takes precedence over profile_name.* entries in config.ini
+        let json_accounts = accounts::load_accounts();
+        if !json_accounts.is_empty() {
+            cfg.profiles = json_accounts;
+        }
+
+        Ok(cfg)
     }
 
     pub fn save(&self) -> Result<()> {
@@ -220,9 +233,17 @@ impl AppConfig {
         before != self.port_forward_presets.len()
     }
 
+    pub fn has_configured_profiles(&self) -> bool {
+        !self.profiles.is_empty()
+    }
+
     fn parse(raw: &str) -> Self {
         let mut cfg = Self::default();
         cfg.recents.clear();
+
+        let mut profile_names: BTreeMap<String, String> = BTreeMap::new();
+        let mut profile_regions: BTreeMap<String, String> = BTreeMap::new();
+        let mut profile_account_ids: BTreeMap<String, String> = BTreeMap::new();
 
         for line in raw.lines() {
             let line = line.trim();
@@ -236,6 +257,27 @@ impl AppConfig {
 
             let key = k.trim();
             let value = v.trim();
+
+            if let Some(rest) = key.strip_prefix("profile_name.") {
+                if !rest.is_empty() && !value.is_empty() {
+                    profile_names.insert(rest.to_string(), value.to_string());
+                }
+                continue;
+            }
+
+            if let Some(rest) = key.strip_prefix("profile_region.") {
+                if !rest.is_empty() && !value.is_empty() {
+                    profile_regions.insert(rest.to_string(), value.to_string());
+                }
+                continue;
+            }
+
+            if let Some(rest) = key.strip_prefix("profile_account_id.") {
+                if !rest.is_empty() && !value.is_empty() {
+                    profile_account_ids.insert(rest.to_string(), value.to_string());
+                }
+                continue;
+            }
 
             if let Some(rest) = key.strip_prefix("account_region.") {
                 if !rest.is_empty() && !value.is_empty() {
@@ -331,8 +373,25 @@ impl AppConfig {
                         cfg.scroll_sensitivity = Some(val);
                     }
                 }
+                "last_selected_profile" => {
+                    cfg.last_selected_profile = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
                 _ => {}
             }
+        }
+
+        // Merge profile_name and profile_region maps into Vec<ProfileConfig>.
+        for (id, display_name) in &profile_names {
+            cfg.profiles.push(ProfileConfig {
+                profile_id: id.clone(),
+                display_name: display_name.clone(),
+                account_id: profile_account_ids.get(id).cloned().unwrap_or_default(),
+                region: profile_regions.get(id).cloned(),
+            });
         }
 
         cfg
@@ -361,6 +420,29 @@ impl AppConfig {
 
         if let Some(val) = self.scroll_sensitivity {
             lines.push(format!("scroll_sensitivity={val}"));
+        }
+
+        for profile in &self.profiles {
+            lines.push(format!(
+                "profile_name.{}={}",
+                profile.profile_id, profile.display_name
+            ));
+            if !profile.account_id.is_empty() {
+                lines.push(format!(
+                    "profile_account_id.{}={}",
+                    profile.profile_id, profile.account_id
+                ));
+            }
+            if let Some(region) = &profile.region {
+                lines.push(format!(
+                    "profile_region.{}={}",
+                    profile.profile_id, region
+                ));
+            }
+        }
+
+        if let Some(last) = &self.last_selected_profile {
+            lines.push(format!("last_selected_profile={last}"));
         }
 
         for (account, region) in &self.account_regions {

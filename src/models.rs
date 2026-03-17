@@ -180,3 +180,18 @@ pub struct PortForwardPreset {
     pub local_port: u16,
     pub remote_port: u16,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileConfig {
+    pub profile_id: String,
+    pub display_name: String,
+    pub account_id: String,
+    pub region: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileAuthInfo {
+    pub profile_id: String,
+    pub auth_status: AuthStatus,
+    pub expires_at: Option<u64>,
+}

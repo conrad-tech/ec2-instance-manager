@@ -23,8 +23,9 @@ mod gui {
     use eframe::egui;
     use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
-    use ec2_manager::aws_context::build_context;
+    use ec2_manager::aws_context::build_context_with_profile;
     use ec2_manager::config::AppConfig;
+    use ec2_manager::credentials;
     use ec2_manager::connection_tabs::ConnectionTabs;
     use ec2_manager::diagnostics::run_diagnostics;
     use ec2_manager::error::{AppError, Result};
@@ -32,8 +33,8 @@ mod gui {
     use ec2_manager::gui_cli::{gui_help_text, parse_gui_args, GuiOptions};
     use ec2_manager::inventory::load_inventory;
     use ec2_manager::models::{
-        AuthStatus, AwsContext, DependencyStatus, Instance, Inventory, Mode, SavedFilter,
-        TerminalKind, TerminalOption,
+        AuthStatus, AwsContext, DependencyStatus, Instance, Inventory, Mode, ProfileAuthInfo,
+        SavedFilter, TerminalKind, TerminalOption,
     };
     use ec2_manager::profile_choice::profile_choice_path;
     use ec2_manager::terminal::{
@@ -627,6 +628,10 @@ mod gui {
         refreshing: bool,
         dark_mode: bool,
         scroll_sensitivity: f32,
+        selected_profile: Option<String>,
+        profile_auth_infos: Vec<ProfileAuthInfo>,
+        last_credentials_mtime: Option<SystemTime>,
+        last_credentials_poll_at: Instant,
         file_browsers: HashMap<u64, FileBrowserState>,
         file_op_tx: Sender<FileOpEvent>,
         file_op_rx: Receiver<FileOpEvent>,
@@ -654,6 +659,9 @@ mod gui {
             let gui_smoke = gui_smoke_config_from_env();
             let dark_mode = config.theme.as_deref() != Some("light");
             let scroll_sensitivity = config.scroll_sensitivity.unwrap_or(10.0);
+            let profile_auth_infos = credentials::check_all_profiles_auth(&config.profiles);
+            let last_credentials_mtime = credentials::credentials_mtime();
+            let selected_profile = config.last_selected_profile.clone();
 
             let mut app = Self {
                 options,
@@ -700,6 +708,10 @@ mod gui {
                 refreshing: false,
                 dark_mode,
                 scroll_sensitivity,
+                selected_profile,
+                profile_auth_infos,
+                last_credentials_mtime,
+                last_credentials_poll_at: Instant::now(),
                 file_browsers: HashMap::new(),
                 file_op_tx,
                 file_op_rx,
@@ -758,6 +770,20 @@ mod gui {
             self.last_profile_choice_mtime = current_mtime;
             self.log_info("detected profileChoice change, refreshing context and inventory");
             self.refresh_context_and_inventory(true);
+        }
+
+        fn poll_credentials_changes(&mut self) {
+            if self.last_credentials_poll_at.elapsed() < PROFILE_POLL_INTERVAL {
+                return;
+            }
+            self.last_credentials_poll_at = Instant::now();
+            let current_mtime = credentials::credentials_mtime();
+            if current_mtime != self.last_credentials_mtime {
+                self.last_credentials_mtime = current_mtime;
+                self.profile_auth_infos =
+                    credentials::check_all_profiles_auth(&self.config.profiles);
+                self.log_debug("credentials file changed; refreshed profile auth status");
+            }
         }
 
         fn log(&mut self, level: LogLevel, message: impl Into<String>) {
@@ -834,10 +860,16 @@ mod gui {
             let mode = self.options.mode.clone();
             let config = self.config.clone();
             let region_override = self.options.region.clone();
+            let profile_override = self.selected_profile.clone();
             let tx = self.refresh_tx.clone();
 
             std::thread::spawn(move || {
-                let context = match build_context(mode, &config, region_override.as_deref()) {
+                let context = match build_context_with_profile(
+                    mode,
+                    &config,
+                    region_override.as_deref(),
+                    profile_override.as_deref(),
+                ) {
                     Ok(ctx) => ctx,
                     Err(err) => {
                         let _ = tx.send(RefreshEvent::Failed {
@@ -2992,6 +3024,7 @@ mod gui {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             let update_result = panic::catch_unwind(AssertUnwindSafe(|| {
                 self.poll_profile_choice_changes();
+                self.poll_credentials_changes();
                 self.poll_connection_events();
                 self.poll_refresh_events();
                 self.poll_file_op_events();
@@ -3160,6 +3193,93 @@ mod gui {
                     } else if ui.button("Refresh Inventory").clicked() {
                         self.refresh_context_and_inventory(true);
                     }
+
+                    if !self.config.profiles.is_empty() {
+                        ui.separator();
+                        ui.label("Account Profile");
+                        let before_profile = self.selected_profile.clone();
+
+                        // Build (profile_id, display_label, is_authenticated) tuples in JSON order.
+                        let profile_options: Vec<(String, String, bool)> = self
+                            .config
+                            .profiles
+                            .iter()
+                            .map(|p| {
+                                let auth_ok = self
+                                    .profile_auth_infos
+                                    .iter()
+                                    .find(|a| a.profile_id == p.profile_id)
+                                    .map(|a| a.auth_status == AuthStatus::Ok)
+                                    .unwrap_or(false);
+                                (p.profile_id.clone(), p.display_name.clone(), auth_ok)
+                            })
+                            .collect();
+
+                        let selected_text = before_profile
+                            .as_ref()
+                            .and_then(|id| profile_options.iter().find(|(pid, _, _)| pid == id))
+                            .map(|(_, label, _)| label.clone())
+                            .unwrap_or_else(|| "(none)".to_string());
+
+                        egui::ComboBox::from_id_salt("profile_selector_combo")
+                            .selected_text(selected_text)
+                            .show_ui(ui, |ui| {
+                                let auth: Vec<_> = profile_options
+                                    .iter()
+                                    .filter(|(_, _, ok)| *ok)
+                                    .collect();
+                                let unauth: Vec<_> = profile_options
+                                    .iter()
+                                    .filter(|(_, _, ok)| !*ok)
+                                    .collect();
+
+                                if !auth.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("Authenticated").weak().small(),
+                                    );
+                                    for (profile_id, label, _) in &auth {
+                                        ui.selectable_value(
+                                            &mut self.selected_profile,
+                                            Some(profile_id.clone()),
+                                            label,
+                                        );
+                                    }
+                                }
+
+                                if !auth.is_empty() && !unauth.is_empty() {
+                                    ui.separator();
+                                }
+
+                                if !unauth.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("Not Authenticated").weak().small(),
+                                    );
+                                    for (profile_id, label, _) in &unauth {
+                                        ui.selectable_value(
+                                            &mut self.selected_profile,
+                                            Some(profile_id.clone()),
+                                            label,
+                                        );
+                                    }
+                                }
+                            });
+
+                        if self.selected_profile != before_profile {
+                            self.config.last_selected_profile = self.selected_profile.clone();
+                            if let Err(err) = self.config.save() {
+                                self.message = format!("error: {err}");
+                                self.log_error(self.message.clone());
+                            } else {
+                                self.log_info(format!(
+                                    "profile selection changed to {}",
+                                    self.selected_profile.as_deref().unwrap_or("(none)")
+                                ));
+                            }
+                            self.refresh_context_and_inventory(true);
+                        }
+                        ui.separator();
+                    }
+
                     let before_region = self.options.region.clone();
                     let context_region = self.context.as_ref().map(|c| c.region.as_str());
                     let selected_region_text =

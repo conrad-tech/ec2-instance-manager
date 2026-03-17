@@ -2,6 +2,7 @@ use std::fs;
 
 use crate::aws_cli::run_aws_cli;
 use crate::config::AppConfig;
+use crate::credentials;
 use crate::error::Result;
 use crate::models::{AuthStatus, AwsContext, Mode};
 use crate::profile_choice::read_profile_choice;
@@ -12,12 +13,25 @@ pub fn build_context(
     config: &AppConfig,
     region_override: Option<&str>,
 ) -> Result<AwsContext> {
-    let profile_res = read_profile_choice();
+    build_context_with_profile(mode, config, region_override, None)
+}
 
-    let profile = match profile_res {
-        Ok(value) => value,
-        Err(_) if mode == Mode::Sim => "sim-profile".to_string(),
-        Err(_) => String::new(),
+pub fn build_context_with_profile(
+    mode: Mode,
+    config: &AppConfig,
+    region_override: Option<&str>,
+    profile_override: Option<&str>,
+) -> Result<AwsContext> {
+    let profile = if let Some(p) = profile_override {
+        // Treat the override as an account_id and discover the credentials section.
+        // Falls back to the literal value for CLI callers that pass a real profile name.
+        credentials::find_profile_by_account_id(p).unwrap_or_else(|| p.to_string())
+    } else {
+        match read_profile_choice() {
+            Ok(value) => value,
+            Err(_) if mode == Mode::Sim => "sim-profile".to_string(),
+            Err(_) => String::new(),
+        }
     };
 
     if mode == Mode::Sim {
