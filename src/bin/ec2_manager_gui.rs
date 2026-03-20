@@ -826,13 +826,18 @@ mod gui {
                     .and_then(|p| p.region.clone())
                     .or_else(|| app.config.default_region.clone())
                     .unwrap_or_else(|| "us-east-1".to_string());
+                app.log_info(format!("disk cache lookup: profile={profile_id} region={region}"));
                 if let Some(cached) = ec2_manager::inventory::load_disk_cache(profile_id, &region) {
                     let count = cached.instances.len();
                     app.inventory = cached;
                     app.apply_filters();
                     app.message = format!("Loaded {count} instances from cache (refreshing...)");
                     app.log_info(app.message.clone());
+                } else {
+                    app.log_info("no disk cache found for this profile/region");
                 }
+            } else {
+                app.log_info("no selected profile, skipping disk cache");
             }
 
             app.refresh_context_and_inventory(true);
@@ -1658,11 +1663,13 @@ mod gui {
                         config_update,
                     } => {
                         // Save inventory to disk cache for fast startup next time
-                        ec2_manager::inventory::save_disk_cache(
-                            &context.profile,
-                            &context.region,
-                            &inventory,
-                        );
+                        if let Some(ref profile_id) = self.selected_profile {
+                            ec2_manager::inventory::save_disk_cache(
+                                profile_id,
+                                &context.region,
+                                &inventory,
+                            );
+                        }
                         self.context = Some(context);
                         self.inventory = inventory;
                         self.apply_filters();
