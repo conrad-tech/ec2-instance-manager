@@ -3266,6 +3266,14 @@ mod gui {
 
                         if self.selected_profile != before_profile {
                             self.config.last_selected_profile = self.selected_profile.clone();
+                            // Update region to match the selected account's region
+                            if let Some(ref profile_id) = self.selected_profile {
+                                if let Some(profile) = self.config.profiles.iter().find(|p| &p.profile_id == profile_id) {
+                                    if let Some(ref region) = profile.region {
+                                        self.options.region = Some(region.clone());
+                                    }
+                                }
+                            }
                             if let Err(err) = self.config.save() {
                                 self.message = format!("error: {err}");
                                 self.log_error(self.message.clone());

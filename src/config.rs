@@ -80,11 +80,21 @@ impl AppConfig {
 
     pub fn load() -> Result<Self> {
         let Some(path) = Self::config_path() else {
-            return Ok(Self::default());
+            let mut cfg = Self::default();
+            let json_accounts = accounts::load_accounts();
+            if !json_accounts.is_empty() {
+                cfg.profiles = json_accounts;
+            }
+            return Ok(cfg);
         };
 
         if !path.exists() {
-            return Ok(Self::default());
+            let mut cfg = Self::default();
+            let json_accounts = accounts::load_accounts();
+            if !json_accounts.is_empty() {
+                cfg.profiles = json_accounts;
+            }
+            return Ok(cfg);
         }
 
         let raw = fs::read_to_string(path)?;

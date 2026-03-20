@@ -18,6 +18,25 @@ Rust-only EC2 + SSM instance explorer with:
 - Diagnostics for auth/dependencies/permissions.
 - Interactive Rust shell mode (`--interactive`) for local operation without JS/HTML.
 
+## Prerequisites
+
+- **Rust / Cargo** — Install via [rustup](https://rustup.rs):
+  ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  ```
+  Or download and run `rustup-init.exe` from https://rustup.rs. Restart your shell after install.
+- **Windows (building from source):**
+  - Visual Studio Build Tools — download and install from:
+    https://visualstudio.microsoft.com/visual-cpp-build-tools/
+    After installing, open Visual Studio Installer, click **Installed**, then click **Modify** on Build Tools.
+    Check the **"Desktop development with C++"** workload and click **Modify** (bottom right) to install it.
+  - MSVC target and toolchain:
+    ```bash
+    rustup target add x86_64-pc-windows-msvc
+    rustup toolchain install stable-x86_64-pc-windows-msvc
+    ```
+  - `zip` for packaging (optional): `choco install zip`
+
 ## Build
 
 ```bash
@@ -32,6 +51,12 @@ cargo build --features gui --bin ec2_manager_gui
 
 Build scripts:
 
+# Windows gitbash
+
+./scripts/build_binaries.sh windows
+
+# Linux OS
+
 ```bash
 # host-native build
 ./scripts/build_binaries.sh
@@ -44,14 +69,20 @@ Artifacts are written to:
 - `dist/linux/`
 - `dist/windows/`
 
-Expected files:
-- `dist/linux/ec2_manager`
-- `dist/linux/ec2_manager_gui`
+Expected files (Windows — built on Windows with MSVC):
+- `dist/windows/ec2_manager.exe`
+- `dist/windows/ec2_manager_gui.exe`
+
+Expected files (Windows — cross-compiled from Linux with MinGW):
 - `dist/windows/ec2_manager.exe`
 - `dist/windows/ec2_manager_gui.exe`
 - `dist/windows/libgcc_s_seh-1.dll`
 - `dist/windows/libstdc++-6.dll`
 - `dist/windows/libwinpthread-1.dll`
+
+Expected files (Linux):
+- `dist/linux/ec2_manager`
+- `dist/linux/ec2_manager_gui`
 
 ## Launch Desktop GUI (Pop!_OS 24.04)
 
@@ -109,21 +140,36 @@ The GUI embeds a terminal via ConPTY. Supported embedded shells on Windows:
 
 ### Windows setup (binary distribution)
 
-1. Copy the entire `dist/windows/` folder to your Windows laptop.
-2. Keep the `.exe` files and the three DLLs in the same folder:
+#### Built on Windows (MSVC)
+
+1. Copy the `.exe` files to your Windows machine:
+   - `ec2_manager.exe`
+   - `ec2_manager_gui.exe`
+2. No DLLs needed — everything is statically linked.
+
+#### Cross-compiled from Linux (MinGW)
+
+1. Copy the entire `dist/windows/` folder to your Windows machine.
+2. Keep the `.exe` files and the three DLLs in the **same folder**:
    - `ec2_manager.exe`
    - `ec2_manager_gui.exe`
    - `libgcc_s_seh-1.dll`
    - `libstdc++-6.dll`
    - `libwinpthread-1.dll`
-3. Install AWS tools on Windows:
+3. If Windows reports a missing DLL, it means the DLL is not next to the `.exe`.
+   Do not put DLLs in `C:\Windows\System32`; keep them beside the `.exe`.
+
+#### Common setup (both builds)
+
+1. Install AWS tools on Windows:
    - AWS CLI v2
    - Session Manager Plugin
-4. Ensure AWS auth/profile setup exists:
+2. Ensure AWS auth/profile setup exists:
    - `%USERPROFILE%\\.aws\\profileChoice`
    - plus normal AWS config/credentials as needed by your profile.
-5. Launch GUI:
+3. Launch GUI:
    - `ec2_manager_gui.exe` (defaults to `--mode live`)
+
 
 If Windows reports a missing DLL, it means the DLL is not next to the `.exe`.
 
@@ -244,3 +290,4 @@ Related smoke harness checks:
 
 - Linux: `~/.config/ec2-manager/config.ini`
 - Windows: `%APPDATA%\ec2-manager\config.ini`
+
