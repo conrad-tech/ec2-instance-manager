@@ -55,17 +55,17 @@ mod gui {
     const GUI_SMOKE_EXIT_ON_MARKER_ENV: &str = "EC2_MANAGER_GUI_SMOKE_EXIT_ON_MARKER";
     const GUI_SMOKE_AUTO_CONNECT_ENV: &str = "EC2_MANAGER_GUI_SMOKE_AUTO_CONNECT";
 
-    const COL_FAV_W: f32 = 60.0;
-    const COL_INSTANCE_W: f32 = 150.0;
-    const COL_NAME_W: f32 = 220.0;
-    const COL_STATE_W: f32 = 90.0;
-    const COL_SSM_W: f32 = 70.0;
-    const COL_IP_W: f32 = 130.0;
-    const COL_ENV_W: f32 = 70.0;
-    const COL_INSTANCE_TYPE_W: f32 = 120.0;
-    const COL_AMI_W: f32 = 150.0;
-    const COL_MMODAL_ENV_W: f32 = 120.0;
-    const COL_TAG_W: f32 = 260.0;
+    const COL_FAV_W: f32 = 55.0;
+    const COL_INSTANCE_W: f32 = 80.0;
+    const COL_NAME_W: f32 = 50.0;
+    const COL_STATE_W: f32 = 50.0;
+    const COL_SSM_W: f32 = 40.0;
+    const COL_IP_W: f32 = 75.0;
+    const COL_ENV_W: f32 = 40.0;
+    const COL_INSTANCE_TYPE_W: f32 = 95.0;
+    const COL_AMI_W: f32 = 55.0;
+    const COL_MMODAL_ENV_W: f32 = 90.0;
+    const COL_TAG_W: f32 = 120.0;
     const COL_COPY_W: f32 = 20.0;
     const STATE_FILTER_NONE: &str = "";
     const STATE_FILTER_RUNNING: &str = "running";
@@ -734,7 +734,8 @@ mod gui {
             let ui_scale = config.ui_scale.unwrap_or(1.0);
             let profile_auth_infos = credentials::check_all_profiles_auth(&config.profiles);
             let last_credentials_mtime = credentials::credentials_mtime();
-            let selected_profile = config.last_selected_profile.clone();
+            let selected_profile = config.last_selected_profile.clone()
+                .or_else(|| config.profiles.first().map(|p| p.profile_id.clone()));
 
             let mut app = Self {
                 options,
@@ -1015,8 +1016,8 @@ mod gui {
 
         fn auto_size_columns(&mut self) {
             let char_w: f32 = 7.5; // approximate character width in default font
-            let padding: f32 = 20.0;
-            let min_w: f32 = 40.0;
+            let padding: f32 = 12.0;
+            let min_w: f32 = 30.0;
 
             let headers: &[(&str, SortColumn)] = &[
                 ("Favorite", SortColumn::Favorite),
@@ -1034,7 +1035,7 @@ mod gui {
             for (label, col) in headers {
                 let header_w = label.len() as f32 * char_w + padding;
                 let has_copy = matches!(col, SortColumn::InstanceId | SortColumn::PrivateIp | SortColumn::AmiId);
-                let copy_extra = if has_copy { COL_COPY_W + 4.0 } else { 0.0 };
+                let copy_extra = if has_copy { COL_COPY_W } else { 0.0 };
 
                 let max_content_w = self.filtered.iter().map(|inst| {
                     let text = match col {
@@ -2291,6 +2292,8 @@ mod gui {
                 .show(ui, |ui| {
                 egui::Grid::new("instance_grid")
                     .striped(true)
+                    .min_col_width(0.0)
+                    .max_col_width(f32::INFINITY)
                     .show(ui, |ui| {
                         let header_columns: &[(&str, SortColumn)] = &[
                             ("Favorite", SortColumn::Favorite),
@@ -2501,36 +2504,34 @@ mod gui {
                             row_double_clicked |= resp_id.double_clicked();
                             row_hovered |= resp_id.hovered();
 
-                            let resp_name = ui.add_sized(
-                                [cw(SortColumn::Name), 18.0],
-                                egui::Label::new(instance.name.clone().unwrap_or_default())
-                                    .sense(egui::Sense::click()),
-                            );
+                            let resp_name = ui.allocate_ui_with_layout(
+                                egui::vec2(cw(SortColumn::Name), 18.0),
+                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                |ui| ui.add(egui::Label::new(instance.name.clone().unwrap_or_default()).sense(egui::Sense::click())),
+                            ).inner;
                             row_clicked |= resp_name.clicked();
                             row_double_clicked |= resp_name.double_clicked();
                             row_hovered |= resp_name.hovered();
 
-                            let resp_state = ui.add_sized(
-                                [cw(SortColumn::State), 18.0],
-                                egui::Label::new(instance.state.clone())
-                                    .sense(egui::Sense::click()),
-                            );
+                            let resp_state = ui.allocate_ui_with_layout(
+                                egui::vec2(cw(SortColumn::State), 18.0),
+                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                |ui| ui.add(egui::Label::new(instance.state.clone()).sense(egui::Sense::click())),
+                            ).inner;
                             row_clicked |= resp_state.clicked();
                             row_double_clicked |= resp_state.double_clicked();
                             row_hovered |= resp_state.hovered();
 
-                            let resp_ssm = ui.add_sized(
-                                [cw(SortColumn::Ssm), 18.0],
-                                egui::Label::new(if instance.ssm_managed {
-                                    instance
-                                        .ssm_ping
-                                        .clone()
-                                        .unwrap_or_else(|| "Managed".to_string())
-                                } else {
-                                    "No".to_string()
-                                })
-                                .sense(egui::Sense::click()),
-                            );
+                            let ssm_text = if instance.ssm_managed {
+                                instance.ssm_ping.clone().unwrap_or_else(|| "Managed".to_string())
+                            } else {
+                                "No".to_string()
+                            };
+                            let resp_ssm = ui.allocate_ui_with_layout(
+                                egui::vec2(cw(SortColumn::Ssm), 18.0),
+                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                |ui| ui.add(egui::Label::new(ssm_text).sense(egui::Sense::click())),
+                            ).inner;
                             row_clicked |= resp_ssm.clicked();
                             row_double_clicked |= resp_ssm.double_clicked();
                             row_hovered |= resp_ssm.hovered();
@@ -2613,29 +2614,30 @@ mod gui {
                             row_double_clicked |= resp_ami.double_clicked();
                             row_hovered |= resp_ami.hovered();
 
-                            let resp_itype = ui.add_sized(
-                                [cw(SortColumn::InstanceType), 18.0],
-                                egui::Label::new(instance.instance_type.clone().unwrap_or_default())
-                                    .sense(egui::Sense::click()),
-                            );
+                            let resp_itype = ui.allocate_ui_with_layout(
+                                egui::vec2(cw(SortColumn::InstanceType), 18.0),
+                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                |ui| ui.add(egui::Label::new(instance.instance_type.clone().unwrap_or_default()).sense(egui::Sense::click())),
+                            ).inner;
                             row_clicked |= resp_itype.clicked();
                             row_double_clicked |= resp_itype.double_clicked();
                             row_hovered |= resp_itype.hovered();
 
-                            let resp_env = ui.add_sized(
-                                [cw(SortColumn::Env), 18.0],
-                                egui::Label::new(instance.env.clone().unwrap_or_default())
-                                    .sense(egui::Sense::click()),
-                            );
+                            let resp_env = ui.allocate_ui_with_layout(
+                                egui::vec2(cw(SortColumn::Env), 18.0),
+                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                |ui| ui.add(egui::Label::new(instance.env.clone().unwrap_or_default()).sense(egui::Sense::click())),
+                            ).inner;
                             row_clicked |= resp_env.clicked();
                             row_double_clicked |= resp_env.double_clicked();
                             row_hovered |= resp_env.hovered();
 
                             let mmodal_env_val = instance.tags.get("mmodal_env").cloned().unwrap_or_default();
-                            let resp_mmodal = ui.add_sized(
-                                [cw(SortColumn::MmodalEnv), 18.0],
-                                egui::Label::new(mmodal_env_val).sense(egui::Sense::click()),
-                            );
+                            let resp_mmodal = ui.allocate_ui_with_layout(
+                                egui::vec2(cw(SortColumn::MmodalEnv), 18.0),
+                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                |ui| ui.add(egui::Label::new(mmodal_env_val).sense(egui::Sense::click())),
+                            ).inner;
                             row_clicked |= resp_mmodal.clicked();
                             row_double_clicked |= resp_mmodal.double_clicked();
                             row_hovered |= resp_mmodal.hovered();
@@ -2651,10 +2653,11 @@ mod gui {
                                     .join(", ");
                                 truncate(&text, 42)
                             };
-                            let resp_tag = ui.add_sized(
-                                [cw(SortColumn::MatchTag), 18.0],
-                                egui::Label::new(matched_tag_text).sense(egui::Sense::click()),
-                            );
+                            let resp_tag = ui.allocate_ui_with_layout(
+                                egui::vec2(cw(SortColumn::MatchTag), 18.0),
+                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                |ui| ui.add(egui::Label::new(matched_tag_text).sense(egui::Sense::click())),
+                            ).inner;
                             row_clicked |= resp_tag.clicked();
                             row_double_clicked |= resp_tag.double_clicked();
                             row_hovered |= resp_tag.hovered();
