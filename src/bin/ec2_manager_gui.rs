@@ -66,7 +66,7 @@ mod gui {
     const COL_AMI_W: f32 = 55.0;
     const COL_MMODAL_ENV_W: f32 = 90.0;
     const COL_TAG_W: f32 = 120.0;
-    const COL_COPY_W: f32 = 20.0;
+    const COL_COPY_W: f32 = 14.0;
     const STATE_FILTER_NONE: &str = "";
     const STATE_FILTER_RUNNING: &str = "running";
     const STATE_FILTER_STOPPED: &str = "stopped";
@@ -735,6 +735,7 @@ mod gui {
             let profile_auth_infos = credentials::check_all_profiles_auth(&config.profiles);
             let last_credentials_mtime = credentials::credentials_mtime();
             let selected_profile = config.last_selected_profile.clone()
+                .filter(|s| !s.is_empty())
                 .or_else(|| config.profiles.first().map(|p| p.profile_id.clone()));
 
             let mut app = Self {
@@ -1015,9 +1016,8 @@ mod gui {
         }
 
         fn auto_size_columns(&mut self) {
-            let char_w: f32 = 7.5; // approximate character width in default font
-            let padding: f32 = 12.0;
-            let min_w: f32 = 30.0;
+            let char_w: f32 = 6.5; // approximate character width in default font
+            let pad: f32 = 8.0; // small padding on each side
 
             let headers: &[(&str, SortColumn)] = &[
                 ("Favorite", SortColumn::Favorite),
@@ -1033,13 +1033,14 @@ mod gui {
             ];
 
             for (label, col) in headers {
-                let header_w = label.len() as f32 * char_w + padding;
+                // Header needs room for label + sort arrow + drag zone
+                let header_w = label.len() as f32 * char_w + pad + 14.0;
                 let has_copy = matches!(col, SortColumn::InstanceId | SortColumn::PrivateIp | SortColumn::AmiId);
                 let copy_extra = if has_copy { COL_COPY_W } else { 0.0 };
 
                 let max_content_w = self.filtered.iter().map(|inst| {
                     let text = match col {
-                        SortColumn::Favorite => String::new(),
+                        SortColumn::Favorite => return 0.0_f32,
                         SortColumn::InstanceId => inst.instance_id.clone(),
                         SortColumn::Name => inst.name.clone().unwrap_or_default(),
                         SortColumn::State => inst.state.clone(),
@@ -1051,12 +1052,12 @@ mod gui {
                         SortColumn::InstanceType => inst.instance_type.clone().unwrap_or_default(),
                         SortColumn::Env => inst.env.clone().unwrap_or_default(),
                         SortColumn::MmodalEnv => inst.tags.get("mmodal_env").cloned().unwrap_or_default(),
-                        SortColumn::MatchTag => String::new(),
+                        SortColumn::MatchTag => return 0.0_f32,
                     };
-                    text.len() as f32 * char_w + copy_extra + padding
+                    text.len() as f32 * char_w + copy_extra + pad
                 }).fold(0.0_f32, f32::max);
 
-                let w = header_w.max(max_content_w).max(min_w);
+                let w = header_w.max(max_content_w).max(30.0);
                 self.column_widths.insert(*col as u8, w);
             }
         }
@@ -2293,7 +2294,7 @@ mod gui {
                 egui::Grid::new("instance_grid")
                     .striped(true)
                     .min_col_width(0.0)
-                    .max_col_width(f32::INFINITY)
+                    .spacing(egui::vec2(2.0, 4.0))
                     .show(ui, |ui| {
                         let header_columns: &[(&str, SortColumn)] = &[
                             ("Favorite", SortColumn::Favorite),
@@ -2318,53 +2319,55 @@ mod gui {
                             };
                             let header_text = format!("{label}{arrow}");
 
-                            // Allocate the full header cell, then split into
-                            // clickable label area (left) and drag handle (right 6px).
-                            let header_resp = ui.allocate_ui_with_layout(
-                                egui::vec2(width, 18.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    let drag_zone_w = 6.0_f32;
-                                    let label_w = (width - drag_zone_w).max(20.0);
-
-                                    // Label / sort button
-                                    let resp = ui.add_sized(
-                                        [label_w, 18.0],
-                                        egui::Button::new(egui::RichText::new(header_text).strong()).frame(false),
-                                    );
-                                    if resp.hovered() {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                    }
-                                    if resp.clicked() {
-                                        if self.sort_column == Some(*col) {
-                                            self.sort_direction = self.sort_direction.toggle();
-                                        } else {
-                                            self.sort_column = Some(*col);
-                                            self.sort_direction = SortDirection::Ascending;
-                                        }
-                                    }
-
-                                    // Drag handle on the right edge
-                                    let (drag_rect, drag_resp) = ui.allocate_exact_size(
-                                        egui::vec2(drag_zone_w, 18.0),
-                                        egui::Sense::drag(),
-                                    );
-                                    if drag_resp.hovered() || drag_resp.dragged() {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
-                                        // Draw visible resize line
-                                        let x = drag_rect.center().x;
-                                        ui.painter().line_segment(
-                                            [egui::pos2(x, drag_rect.top()), egui::pos2(x, drag_rect.bottom())],
-                                            egui::Stroke::new(2.0, ui.visuals().text_color()),
-                                        );
-                                    }
-                                    if drag_resp.dragged() {
-                                        let new_width = (width + drag_resp.drag_delta().x).max(30.0);
-                                        self.column_widths.insert(col_key, new_width);
-                                    }
-                                },
+                            // Full header cell: sort button + drag handle on right edge
+                            let resp = ui.add_sized(
+                                [width, 18.0],
+                                egui::Button::new(egui::RichText::new(header_text).strong()).frame(false),
                             );
-                            let _ = header_resp;
+
+                            // Check if cursor is near the right edge (within 8px)
+                            let drag_id = ui.id().with(("col_resize", col_key));
+                            let near_right = ui.input(|i| {
+                                i.pointer.hover_pos().map_or(false, |pos| {
+                                    resp.rect.contains(pos) && pos.x > resp.rect.right() - 8.0
+                                })
+                            });
+                            let is_dragging = ui.ctx().is_being_dragged(drag_id);
+
+                            if near_right || is_dragging {
+                                // Show resize cursor and line
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+                                let x = resp.rect.right();
+                                ui.painter().line_segment(
+                                    [egui::pos2(x, resp.rect.top()), egui::pos2(x, resp.rect.bottom())],
+                                    egui::Stroke::new(2.0, ui.visuals().text_color()),
+                                );
+
+                                // Handle drag
+                                let drag_resp = ui.interact(
+                                    egui::Rect::from_min_size(
+                                        resp.rect.right_top() - egui::vec2(8.0, 0.0),
+                                        egui::vec2(16.0, resp.rect.height()),
+                                    ),
+                                    drag_id,
+                                    egui::Sense::drag(),
+                                );
+                                if drag_resp.dragged() {
+                                    let new_width = (width + drag_resp.drag_delta().x).max(30.0);
+                                    self.column_widths.insert(col_key, new_width);
+                                }
+                            } else if resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+
+                            if resp.clicked() && !near_right {
+                                if self.sort_column == Some(*col) {
+                                    self.sort_direction = self.sort_direction.toggle();
+                                } else {
+                                    self.sort_column = Some(*col);
+                                    self.sort_direction = SortDirection::Ascending;
+                                }
+                            }
                         }
                         ui.end_row();
 
@@ -2457,30 +2460,31 @@ mod gui {
                             } else {
                                 egui::RichText::new("\u{2606}")
                             };
-                            let resp_fav = ui.add_sized(
-                                [cw(SortColumn::Favorite), 18.0],
-                                egui::Button::new(star_label).frame(false),
-                            );
+                            let resp_fav = ui.allocate_ui_with_layout(
+                                egui::vec2(cw(SortColumn::Favorite), 18.0),
+                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                |ui| ui.add(egui::Button::new(star_label).frame(false)),
+                            ).inner;
                             if resp_fav.clicked() {
                                 pending_fav_toggle = Some(instance.instance_id.clone());
                             }
                             row_double_clicked |= resp_fav.double_clicked();
                             row_hovered |= resp_fav.hovered();
 
-                            // Copy button + InstanceId grouped in one grid cell
+                            // Copy button + InstanceId grouped in one grid cell (centered)
                             let id_w = cw(SortColumn::InstanceId);
                             let id_resp = ui.allocate_ui_with_layout(
                                 egui::vec2(id_w, 18.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
+                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
                                 |ui| {
                                     let (copy_rect, copy_id) = ui.allocate_exact_size(egui::vec2(COL_COPY_W, 14.0), egui::Sense::click());
                                     if ui.is_rect_visible(copy_rect) {
                                         let color = ui.visuals().text_color();
                                         let stroke = egui::Stroke::new(1.0, color);
                                         let p = ui.painter();
-                                        p.rect_stroke(egui::Rect::from_min_size(copy_rect.min + egui::vec2(2.0, 0.0), egui::vec2(9.0, 9.0)), 1.0, stroke, egui::StrokeKind::Outside);
-                                        p.rect_filled(egui::Rect::from_min_size(copy_rect.min + egui::vec2(6.0, 4.0), egui::vec2(9.0, 9.0)), 1.0, ui.visuals().window_fill);
-                                        p.rect_stroke(egui::Rect::from_min_size(copy_rect.min + egui::vec2(6.0, 4.0), egui::vec2(9.0, 9.0)), 1.0, stroke, egui::StrokeKind::Outside);
+                                        p.rect_stroke(egui::Rect::from_min_size(copy_rect.min + egui::vec2(0.0, 1.0), egui::vec2(8.0, 8.0)), 1.0, stroke, egui::StrokeKind::Outside);
+                                        p.rect_filled(egui::Rect::from_min_size(copy_rect.min + egui::vec2(4.0, 5.0), egui::vec2(8.0, 8.0)), 1.0, ui.visuals().window_fill);
+                                        p.rect_stroke(egui::Rect::from_min_size(copy_rect.min + egui::vec2(4.0, 5.0), egui::vec2(8.0, 8.0)), 1.0, stroke, egui::StrokeKind::Outside);
                                     }
                                     if copy_id.clicked() {
                                         if let Ok(mut clipboard) = arboard::Clipboard::new() {
@@ -2536,11 +2540,11 @@ mod gui {
                             row_double_clicked |= resp_ssm.double_clicked();
                             row_hovered |= resp_ssm.hovered();
 
-                            // Copy button + Private IP grouped in one grid cell
+                            // Copy button + Private IP grouped in one grid cell (centered)
                             let ip_w = cw(SortColumn::PrivateIp);
                             let ip_resp = ui.allocate_ui_with_layout(
                                 egui::vec2(ip_w, 18.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
+                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
                                 |ui| {
                                     let (copy_ip_rect, copy_ip) = ui.allocate_exact_size(egui::vec2(COL_COPY_W, 14.0), egui::Sense::click());
                                     if ui.is_rect_visible(copy_ip_rect) {
@@ -2575,11 +2579,11 @@ mod gui {
                             row_double_clicked |= resp_ip.double_clicked();
                             row_hovered |= resp_ip.hovered();
 
-                            // Copy button + AMI ID grouped in one grid cell
+                            // Copy button + AMI ID grouped in one grid cell (centered)
                             let ami_w = cw(SortColumn::AmiId);
                             let ami_resp = ui.allocate_ui_with_layout(
                                 egui::vec2(ami_w, 18.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
+                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
                                 |ui| {
                                     let (copy_ami_rect, copy_ami) = ui.allocate_exact_size(egui::vec2(COL_COPY_W, 14.0), egui::Sense::click());
                                     if ui.is_rect_visible(copy_ami_rect) {
@@ -2655,7 +2659,7 @@ mod gui {
                             };
                             let resp_tag = ui.allocate_ui_with_layout(
                                 egui::vec2(cw(SortColumn::MatchTag), 18.0),
-                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| ui.add(egui::Label::new(matched_tag_text).sense(egui::Sense::click())),
                             ).inner;
                             row_clicked |= resp_tag.clicked();
@@ -3748,6 +3752,7 @@ mod gui {
                         ui.separator();
                     }
 
+                    ui.label("Region");
                     let before_region = self.options.region.clone();
                     let context_region = self.context.as_ref().map(|c| c.region.as_str());
                     let selected_region_text =
