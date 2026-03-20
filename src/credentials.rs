@@ -117,8 +117,10 @@ pub fn find_profile_by_account_id(account_id: &str) -> Option<String> {
     parse_profile_by_account_id(&content, account_id)
 }
 
-fn parse_profile_by_account_id(content: &str, account_id: &str) -> Option<String> {
+/// Returns all credential section names whose `fed_role` ARN matches the given account ID.
+fn parse_all_profiles_by_account_id(content: &str, account_id: &str) -> Vec<String> {
     let mut current_section: Option<String> = None;
+    let mut matches = Vec::new();
 
     for line in content.lines() {
         let line = line.trim();
@@ -136,7 +138,7 @@ fn parse_profile_by_account_id(content: &str, account_id: &str) -> Option<String
                 if let Some(ref section) = current_section {
                     if let Some(arn_account) = account_id_from_role_arn(v.trim()) {
                         if arn_account == account_id {
-                            return Some(section.clone());
+                            matches.push(section.clone());
                         }
                     }
                 }
@@ -144,22 +146,91 @@ fn parse_profile_by_account_id(content: &str, account_id: &str) -> Option<String
         }
     }
 
-    None
+    matches
+}
+
+fn parse_profile_by_account_id(content: &str, account_id: &str) -> Option<String> {
+    let matches = parse_all_profiles_by_account_id(content, account_id);
+    if matches.is_empty() {
+        return None;
+    }
+    if matches.len() == 1 {
+        return Some(matches.into_iter().next().unwrap());
+    }
+
+    // Multiple sections match — pick the one with valid auth (latest expiry).
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut best: Option<(String, u64)> = None;
+    for section in &matches {
+        let expire = parse_fed_expire(content, section).unwrap_or(0);
+        if expire > now {
+            // Valid auth — prefer the one with the latest expiry.
+            match &best {
+                Some((_, best_exp)) if *best_exp >= expire => {}
+                _ => best = Some((section.clone(), expire)),
+            }
+        } else if best.is_none() {
+            // No valid auth found yet — track the latest expired as fallback.
+            best = Some((section.clone(), expire));
+        } else if let Some((_, best_exp)) = &best {
+            if *best_exp < now && expire > *best_exp {
+                // Both expired — prefer the one that expired most recently.
+                best = Some((section.clone(), expire));
+            }
+        }
+    }
+
+    best.map(|(section, _)| section)
 }
 
 pub fn check_all_profiles_auth(profiles: &[ProfileConfig]) -> Vec<ProfileAuthInfo> {
+    let content = credentials_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .unwrap_or_default();
+
     profiles
         .iter()
         .map(|p| {
-            let section = find_profile_by_account_id(&p.account_id);
-            let (auth_status, expires_at) = match section {
-                Some(ref s) => (check_profile_auth(s), read_fed_expire(s)),
-                None => (AuthStatus::Missing, None),
-            };
+            let sections = parse_all_profiles_by_account_id(&content, &p.account_id);
+            if sections.is_empty() {
+                return ProfileAuthInfo {
+                    profile_id: p.profile_id.clone(),
+                    auth_status: AuthStatus::Missing,
+                    expires_at: None,
+                };
+            }
+
+            // Check all matching sections — use the best auth status.
+            let mut best_status = AuthStatus::Missing;
+            let mut best_expire: Option<u64> = None;
+            for section in &sections {
+                let status = check_profile_auth(section);
+                let expire = parse_fed_expire(&content, section);
+                if status == AuthStatus::Ok {
+                    // Valid auth found — use it (pick latest expiry).
+                    if best_status != AuthStatus::Ok
+                        || expire.unwrap_or(0) > best_expire.unwrap_or(0)
+                    {
+                        best_status = AuthStatus::Ok;
+                        best_expire = expire;
+                    }
+                } else if best_status != AuthStatus::Ok {
+                    // No valid auth yet — track the latest expired.
+                    if expire.unwrap_or(0) > best_expire.unwrap_or(0) {
+                        best_status = status;
+                        best_expire = expire;
+                    }
+                }
+            }
+
             ProfileAuthInfo {
                 profile_id: p.profile_id.clone(),
-                auth_status,
-                expires_at,
+                auth_status: best_status,
+                expires_at: best_expire,
             }
         })
         .collect()

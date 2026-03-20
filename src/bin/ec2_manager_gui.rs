@@ -2621,17 +2621,47 @@ mod gui {
                                 ));
                             }
                             if terminal_focus_response.secondary_clicked() {
-                                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                    if let Ok(text) = clipboard.get_text() {
-                                        if !text.is_empty() {
-                                            self.send_raw_bytes_to_connection_tab(
-                                                tab_id,
-                                                text.as_bytes(),
-                                            );
-                                            self.log_debug(format!(
-                                                "right-click paste tab={tab_id} bytes={}",
-                                                text.len()
-                                            ));
+                                // If text is selected, copy it; otherwise paste.
+                                let has_selection = self
+                                    .terminal_selections
+                                    .get(&tab_id)
+                                    .and_then(|sel| sel.normalized())
+                                    .is_some();
+                                if has_selection {
+                                    if let Some(sel) = self.terminal_selections.get(&tab_id).cloned() {
+                                        if let Some((start, end)) = sel.normalized() {
+                                            if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
+                                                let text = extract_selection_text(
+                                                    &mut session.parser, start, end,
+                                                );
+                                                if !text.is_empty() {
+                                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                                        let _ = clipboard.set_text(&text);
+                                                    }
+                                                    self.log_debug(format!(
+                                                        "right-click copy tab={tab_id} len={}",
+                                                        text.len()
+                                                    ));
+                                                }
+                                            }
+                                            if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
+                                                sel.clear();
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                        if let Ok(text) = clipboard.get_text() {
+                                            if !text.is_empty() {
+                                                self.send_raw_bytes_to_connection_tab(
+                                                    tab_id,
+                                                    text.as_bytes(),
+                                                );
+                                                self.log_debug(format!(
+                                                    "right-click paste tab={tab_id} bytes={}",
+                                                    text.len()
+                                                ));
+                                            }
                                         }
                                     }
                                 }
