@@ -1048,6 +1048,11 @@ mod gui {
                 let has_copy = matches!(col, SortColumn::InstanceId | SortColumn::PrivateIp | SortColumn::AmiId);
                 let copy_extra = if has_copy { COL_COPY_W } else { 0.0 };
 
+                let copy_gap = match col {
+                    SortColumn::PrivateIp => 15.0,
+                    SortColumn::AmiId => 20.0,
+                    _ => 0.0,
+                };
                 let max_content_w = self.filtered.iter().map(|inst| {
                     let text = match col {
                         SortColumn::Favorite => return 0.0_f32,
@@ -1064,7 +1069,7 @@ mod gui {
                         SortColumn::MmodalEnv => inst.tags.get("mmodal_env").cloned().unwrap_or_default(),
                         SortColumn::MatchTag => return 0.0_f32,
                     };
-                    text.len() as f32 * char_w + copy_extra + pad
+                    text.len() as f32 * char_w + copy_extra + copy_gap + pad
                 }).fold(0.0_f32, f32::max);
 
                 let w = header_w.max(max_content_w).max(30.0);
@@ -2579,7 +2584,7 @@ mod gui {
                             // Copy button + AMI ID grouped and centered in grid cell
                             let ami_w = cw(SortColumn::AmiId);
                             let ami_text = instance.image_id.clone().unwrap_or_default();
-                            let ami_copy_gap = 20.0;
+                            let ami_copy_gap = 18.0;
                             let ami_content_w = ami_text.len() as f32 * 6.5 + COL_COPY_W + 4.0 + ami_copy_gap;
                             let ami_pad = ((ami_w - ami_content_w) / 2.0).max(0.0);
                             let ami_resp = ui.allocate_ui_with_layout(
@@ -3964,7 +3969,7 @@ mod gui {
                                         self.selected_saved_filter = saved.name.clone();
                                     }
                                     if ui
-                                        .small_button("\u{2715}")
+                                        .small_button("x")
                                         .on_hover_text("Delete filter")
                                         .clicked()
                                     {
