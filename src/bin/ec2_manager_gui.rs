@@ -62,7 +62,11 @@ mod gui {
     const COL_SSM_W: f32 = 70.0;
     const COL_IP_W: f32 = 130.0;
     const COL_ENV_W: f32 = 70.0;
+    const COL_INSTANCE_TYPE_W: f32 = 120.0;
+    const COL_AMI_W: f32 = 150.0;
+    const COL_MMODAL_ENV_W: f32 = 120.0;
     const COL_TAG_W: f32 = 260.0;
+    const COL_COPY_W: f32 = 20.0;
     const STATE_FILTER_NONE: &str = "";
     const STATE_FILTER_RUNNING: &str = "running";
     const STATE_FILTER_STOPPED: &str = "stopped";
@@ -98,22 +102,84 @@ mod gui {
         "ap-northeast-3",
     ];
 
-    const INVENTORY_HEADERS: &[(&str, f32)] = &[
-        ("Favorite", COL_FAV_W),
-        ("InstanceId", COL_INSTANCE_W),
-        ("Name", COL_NAME_W),
-        ("State", COL_STATE_W),
-        ("SSM", COL_SSM_W),
-        ("Private IP", COL_IP_W),
-        ("Env", COL_ENV_W),
-        ("Match Tag", COL_TAG_W),
-    ];
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MainTab {
         Inventory,
         Connections,
         Log,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SortColumn {
+        Favorite,
+        InstanceId,
+        Name,
+        State,
+        Ssm,
+        PrivateIp,
+        Env,
+        InstanceType,
+        AmiId,
+        MmodalEnv,
+        MatchTag,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SortDirection {
+        Ascending,
+        Descending,
+    }
+
+    impl SortDirection {
+        fn toggle(self) -> Self {
+            match self {
+                Self::Ascending => Self::Descending,
+                Self::Descending => Self::Ascending,
+            }
+        }
+
+        fn arrow(self) -> &'static str {
+            match self {
+                Self::Ascending => " \u{25B2}",
+                Self::Descending => " \u{25BC}",
+            }
+        }
+    }
+
+    impl SortColumn {
+        fn default_width(self) -> f32 {
+            match self {
+                Self::Favorite => COL_FAV_W,
+                Self::InstanceId => COL_INSTANCE_W + COL_COPY_W,
+                Self::Name => COL_NAME_W,
+                Self::State => COL_STATE_W,
+                Self::Ssm => COL_SSM_W,
+                Self::PrivateIp => COL_IP_W + COL_COPY_W,
+                Self::AmiId => COL_AMI_W,
+                Self::InstanceType => COL_INSTANCE_TYPE_W,
+                Self::Env => COL_ENV_W,
+                Self::MmodalEnv => COL_MMODAL_ENV_W,
+                Self::MatchTag => COL_TAG_W,
+            }
+        }
+    }
+
+    fn default_column_widths() -> HashMap<u8, f32> {
+        let cols = [
+            SortColumn::Favorite,
+            SortColumn::InstanceId,
+            SortColumn::Name,
+            SortColumn::State,
+            SortColumn::Ssm,
+            SortColumn::PrivateIp,
+            SortColumn::AmiId,
+            SortColumn::InstanceType,
+            SortColumn::Env,
+            SortColumn::MmodalEnv,
+            SortColumn::MatchTag,
+        ];
+        cols.iter().map(|c| (*c as u8, c.default_width())).collect()
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -630,6 +696,9 @@ mod gui {
         dark_mode: bool,
         scroll_sensitivity: f32,
         ui_scale: f32,
+        sort_column: Option<SortColumn>,
+        sort_direction: SortDirection,
+        column_widths: HashMap<u8, f32>,
         selected_profile: Option<String>,
         profile_auth_infos: Vec<ProfileAuthInfo>,
         last_credentials_mtime: Option<SystemTime>,
@@ -712,6 +781,9 @@ mod gui {
                 dark_mode,
                 scroll_sensitivity,
                 ui_scale,
+                sort_column: None,
+                sort_direction: SortDirection::Ascending,
+                column_widths: default_column_widths(),
                 selected_profile,
                 profile_auth_infos,
                 last_credentials_mtime,
@@ -1082,6 +1154,7 @@ mod gui {
             Ok(())
         }
 
+        #[allow(dead_code)]
         fn port_forward_selected(&mut self) -> Result<()> {
             let context = self
                 .context
@@ -2039,6 +2112,7 @@ mod gui {
             }
         }
 
+        #[allow(dead_code)]
         fn toggle_favorite_selected(&mut self) -> Result<()> {
             let Some(instance_id) = self.selected_instance().map(|i| i.instance_id.clone()) else {
                 return Err(AppError::NotFound("Select an instance first".to_string()));
@@ -2071,8 +2145,8 @@ mod gui {
             let (include_terms, exclude_terms) = search_terms_from_rules(&self.search_rules);
 
             self.config.upsert_saved_filter(
-                &self.account_scope(),
-                &self.region_scope(),
+                "global",
+                "global",
                 SavedFilter {
                     name: name.to_string(),
                     include_terms,
@@ -2095,10 +2169,10 @@ mod gui {
                 ));
             }
 
-            let scope_filters = self
+            let all_filters = self
                 .config
-                .saved_filters_for_scope(&self.account_scope(), &self.region_scope());
-            let Some(saved) = scope_filters
+                .saved_filters_for_scope("global", "global");
+            let Some(saved) = all_filters
                 .into_iter()
                 .find(|f| f.name.eq_ignore_ascii_case(&name))
             else {
@@ -2160,11 +2234,57 @@ mod gui {
                 egui::Grid::new("instance_grid")
                     .striped(true)
                     .show(ui, |ui| {
-                        for (label, width) in INVENTORY_HEADERS {
-                            ui.add_sized(
-                                [*width, 18.0],
-                                egui::Label::new(egui::RichText::new(*label).strong()),
+                        let header_columns: &[(&str, SortColumn)] = &[
+                            ("Favorite", SortColumn::Favorite),
+                            ("InstanceId", SortColumn::InstanceId),
+                            ("Name", SortColumn::Name),
+                            ("State", SortColumn::State),
+                            ("SSM", SortColumn::Ssm),
+                            ("Private IP", SortColumn::PrivateIp),
+                            ("AMI ID", SortColumn::AmiId),
+                            ("Instance Type", SortColumn::InstanceType),
+                            ("Env", SortColumn::Env),
+                            ("MMODAL_ENV", SortColumn::MmodalEnv),
+                            ("Match Tag", SortColumn::MatchTag),
+                        ];
+                        for (label, col) in header_columns {
+                            let col_key = *col as u8;
+                            let width = self.column_widths.get(&col_key).copied().unwrap_or_else(|| col.default_width());
+                            let arrow = if self.sort_column == Some(*col) {
+                                self.sort_direction.arrow()
+                            } else {
+                                ""
+                            };
+                            let header_text = format!("{label}{arrow}");
+                            let resp = ui.add_sized(
+                                [width, 18.0],
+                                egui::Button::new(egui::RichText::new(header_text).strong()).frame(false),
                             );
+                            if resp.clicked() {
+                                if self.sort_column == Some(*col) {
+                                    self.sort_direction = self.sort_direction.toggle();
+                                } else {
+                                    self.sort_column = Some(*col);
+                                    self.sort_direction = SortDirection::Ascending;
+                                }
+                            }
+                            // Drag handle for column resize
+                            let drag_id = ui.id().with(("col_resize", col_key));
+                            let drag_resp = ui.interact(
+                                egui::Rect::from_min_size(
+                                    resp.rect.right_top() - egui::vec2(3.0, 0.0),
+                                    egui::vec2(6.0, resp.rect.height()),
+                                ),
+                                drag_id,
+                                egui::Sense::drag(),
+                            );
+                            if drag_resp.hovered() || drag_resp.dragged() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+                            }
+                            if drag_resp.dragged() {
+                                let new_width = (width + drag_resp.drag_delta().x).max(30.0);
+                                self.column_widths.insert(col_key, new_width);
+                            }
                         }
                         ui.end_row();
 
@@ -2173,6 +2293,68 @@ mod gui {
                         let mut pending_connect: Option<String> = None;
                         let mut pending_fav_toggle: Option<String> = None;
                         let (include_terms, _) = search_terms_from_rules(&self.search_rules);
+
+                        // Sort filtered instances if a sort column is selected.
+                        if let Some(sort_col) = self.sort_column {
+                            let acct = account_scope.clone();
+                            let rgn = region_scope.clone();
+                            let cfg = &self.config;
+                            self.filtered.sort_by(|a, b| {
+                                let cmp = match sort_col {
+                                    SortColumn::Favorite => {
+                                        let fa = cfg.is_favorite(&acct, &rgn, &a.instance_id);
+                                        let fb = cfg.is_favorite(&acct, &rgn, &b.instance_id);
+                                        fb.cmp(&fa) // true (fav) before false
+                                    }
+                                    SortColumn::InstanceId => a.instance_id.cmp(&b.instance_id),
+                                    SortColumn::Name => {
+                                        let na = a.name.as_deref().unwrap_or("");
+                                        let nb = b.name.as_deref().unwrap_or("");
+                                        na.to_ascii_lowercase().cmp(&nb.to_ascii_lowercase())
+                                    }
+                                    SortColumn::State => a.state.cmp(&b.state),
+                                    SortColumn::Ssm => a.ssm_managed.cmp(&b.ssm_managed),
+                                    SortColumn::PrivateIp => {
+                                        let ia = a.private_ip.as_deref().unwrap_or("");
+                                        let ib = b.private_ip.as_deref().unwrap_or("");
+                                        ia.cmp(ib)
+                                    }
+                                    SortColumn::Env => {
+                                        let ea = a.env.as_deref().unwrap_or("");
+                                        let eb = b.env.as_deref().unwrap_or("");
+                                        ea.to_ascii_lowercase().cmp(&eb.to_ascii_lowercase())
+                                    }
+                                    SortColumn::InstanceType => {
+                                        let ta = a.instance_type.as_deref().unwrap_or("");
+                                        let tb = b.instance_type.as_deref().unwrap_or("");
+                                        ta.cmp(tb)
+                                    }
+                                    SortColumn::AmiId => {
+                                        let aa = a.image_id.as_deref().unwrap_or("");
+                                        let ab = b.image_id.as_deref().unwrap_or("");
+                                        aa.cmp(ab)
+                                    }
+                                    SortColumn::MmodalEnv => {
+                                        let ma = a.tags.get("mmodal_env").map(|s| s.as_str()).unwrap_or("");
+                                        let mb = b.tags.get("mmodal_env").map(|s| s.as_str()).unwrap_or("");
+                                        ma.to_ascii_lowercase().cmp(&mb.to_ascii_lowercase())
+                                    }
+                                    SortColumn::MatchTag => {
+                                        // Sort by first matching tag value
+                                        let ta = matching_tags(a, &include_terms);
+                                        let tb = matching_tags(b, &include_terms);
+                                        let va = ta.first().map(|(_, v)| v.as_str()).unwrap_or("");
+                                        let vb = tb.first().map(|(_, v)| v.as_str()).unwrap_or("");
+                                        va.to_ascii_lowercase().cmp(&vb.to_ascii_lowercase())
+                                    }
+                                };
+                                if self.sort_direction == SortDirection::Descending {
+                                    cmp.reverse()
+                                } else {
+                                    cmp
+                                }
+                            });
+                        }
 
                         for instance in &self.filtered {
                             let is_fav = self.config.is_favorite(
@@ -2186,13 +2368,17 @@ mod gui {
                             let mut row_hovered = false;
                             let mut quick_connect_clicked = false;
 
+                            let cw = |col: SortColumn| -> f32 {
+                                self.column_widths.get(&(col as u8)).copied().unwrap_or_else(|| col.default_width())
+                            };
+
                             let star_label = if is_fav {
                                 egui::RichText::new("\u{2605}").color(egui::Color32::YELLOW)
                             } else {
                                 egui::RichText::new("\u{2606}")
                             };
                             let resp_fav = ui.add_sized(
-                                [COL_FAV_W, 18.0],
+                                [cw(SortColumn::Favorite), 18.0],
                                 egui::Button::new(star_label).frame(false),
                             );
                             if resp_fav.clicked() {
@@ -2201,16 +2387,29 @@ mod gui {
                             row_double_clicked |= resp_fav.double_clicked();
                             row_hovered |= resp_fav.hovered();
 
+                            // InstanceId + copy button share the InstanceId column width
+                            let id_w = cw(SortColumn::InstanceId);
                             let resp_id = ui.add_sized(
-                                [COL_INSTANCE_W, 18.0],
-                                egui::Button::selectable(selected, instance.instance_id.clone()),
+                                [id_w - COL_COPY_W, 18.0],
+                                egui::Label::new(instance.instance_id.clone())
+                                    .sense(egui::Sense::click()),
                             );
                             row_clicked |= resp_id.clicked();
                             row_double_clicked |= resp_id.double_clicked();
                             row_hovered |= resp_id.hovered();
+                            let copy_id = ui.add_sized(
+                                [COL_COPY_W, 18.0],
+                                egui::Button::new("\u{1F4CB}").frame(false),
+                            );
+                            if copy_id.clicked() {
+                                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                    let _ = clipboard.set_text(&instance.instance_id);
+                                }
+                            }
+                            copy_id.on_hover_text("Copy Instance ID");
 
                             let resp_name = ui.add_sized(
-                                [COL_NAME_W, 18.0],
+                                [cw(SortColumn::Name), 18.0],
                                 egui::Label::new(instance.name.clone().unwrap_or_default())
                                     .sense(egui::Sense::click()),
                             );
@@ -2219,7 +2418,7 @@ mod gui {
                             row_hovered |= resp_name.hovered();
 
                             let resp_state = ui.add_sized(
-                                [COL_STATE_W, 18.0],
+                                [cw(SortColumn::State), 18.0],
                                 egui::Label::new(instance.state.clone())
                                     .sense(egui::Sense::click()),
                             );
@@ -2228,7 +2427,7 @@ mod gui {
                             row_hovered |= resp_state.hovered();
 
                             let resp_ssm = ui.add_sized(
-                                [COL_SSM_W, 18.0],
+                                [cw(SortColumn::Ssm), 18.0],
                                 egui::Label::new(if instance.ssm_managed {
                                     instance
                                         .ssm_ping
@@ -2243,23 +2442,64 @@ mod gui {
                             row_double_clicked |= resp_ssm.double_clicked();
                             row_hovered |= resp_ssm.hovered();
 
+                            // Private IP + copy button share the PrivateIp column width
+                            let ip_w = cw(SortColumn::PrivateIp);
                             let resp_ip = ui.add_sized(
-                                [COL_IP_W, 18.0],
+                                [ip_w - COL_COPY_W, 18.0],
                                 egui::Label::new(instance.private_ip.clone().unwrap_or_default())
                                     .sense(egui::Sense::click()),
                             );
                             row_clicked |= resp_ip.clicked();
                             row_double_clicked |= resp_ip.double_clicked();
                             row_hovered |= resp_ip.hovered();
+                            let copy_ip = ui.add_sized(
+                                [COL_COPY_W, 18.0],
+                                egui::Button::new("\u{1F4CB}").frame(false),
+                            );
+                            if copy_ip.clicked() {
+                                if let Some(ip) = &instance.private_ip {
+                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                        let _ = clipboard.set_text(ip);
+                                    }
+                                }
+                            }
+                            copy_ip.on_hover_text("Copy IP Address");
+
+                            let resp_ami = ui.add_sized(
+                                [cw(SortColumn::AmiId), 18.0],
+                                egui::Label::new(instance.image_id.clone().unwrap_or_default())
+                                    .sense(egui::Sense::click()),
+                            );
+                            row_clicked |= resp_ami.clicked();
+                            row_double_clicked |= resp_ami.double_clicked();
+                            row_hovered |= resp_ami.hovered();
+
+                            let resp_itype = ui.add_sized(
+                                [cw(SortColumn::InstanceType), 18.0],
+                                egui::Label::new(instance.instance_type.clone().unwrap_or_default())
+                                    .sense(egui::Sense::click()),
+                            );
+                            row_clicked |= resp_itype.clicked();
+                            row_double_clicked |= resp_itype.double_clicked();
+                            row_hovered |= resp_itype.hovered();
 
                             let resp_env = ui.add_sized(
-                                [COL_ENV_W, 18.0],
+                                [cw(SortColumn::Env), 18.0],
                                 egui::Label::new(instance.env.clone().unwrap_or_default())
                                     .sense(egui::Sense::click()),
                             );
                             row_clicked |= resp_env.clicked();
                             row_double_clicked |= resp_env.double_clicked();
                             row_hovered |= resp_env.hovered();
+
+                            let mmodal_env_val = instance.tags.get("mmodal_env").cloned().unwrap_or_default();
+                            let resp_mmodal = ui.add_sized(
+                                [cw(SortColumn::MmodalEnv), 18.0],
+                                egui::Label::new(mmodal_env_val).sense(egui::Sense::click()),
+                            );
+                            row_clicked |= resp_mmodal.clicked();
+                            row_double_clicked |= resp_mmodal.double_clicked();
+                            row_hovered |= resp_mmodal.hovered();
 
                             let matched_tag_text = if include_terms.is_empty() {
                                 String::new()
@@ -2273,7 +2513,7 @@ mod gui {
                                 truncate(&text, 42)
                             };
                             let resp_tag = ui.add_sized(
-                                [COL_TAG_W, 18.0],
+                                [cw(SortColumn::MatchTag), 18.0],
                                 egui::Label::new(matched_tag_text).sense(egui::Sense::click()),
                             );
                             row_clicked |= resp_tag.clicked();
@@ -2288,6 +2528,9 @@ mod gui {
                                 .union(resp_ssm.clone())
                                 .union(resp_ip.clone())
                                 .union(resp_env.clone())
+                                .union(resp_itype.clone())
+                                .union(resp_ami.clone())
+                                .union(resp_mmodal.clone())
                                 .union(resp_tag.clone());
 
                             row_response.context_menu(|ui| {
@@ -3555,25 +3798,6 @@ mod gui {
                         }
                     }
 
-                    if ui.button("Toggle Favorite").clicked() {
-                        if let Err(err) = self.toggle_favorite_selected() {
-                            self.message = format!("error: {err}");
-                            self.log_error(self.message.clone());
-                        }
-                    }
-
-                    ui.horizontal(|ui| {
-                        ui.label("Local Port");
-                        ui.add(egui::DragValue::new(&mut self.local_port).range(1..=65535));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Remote Port");
-                        ui.add(egui::DragValue::new(&mut self.remote_port).range(1..=65535));
-                    });
-                    if ui.button("Port Forward").clicked() {
-                        self.guarded_action("port forward", |app| app.port_forward_selected());
-                    }
-
                     ui.separator();
                     ui.label("Saved Filters");
                     ui.horizontal(|ui| {
@@ -3582,14 +3806,17 @@ mod gui {
                             if let Err(err) = self.save_current_filter() {
                                 self.message = format!("error: {err}");
                                 self.log_error(self.message.clone());
+                            } else {
+                                self.save_filter_name.clear();
                             }
                         }
                     });
 
                     let scope_filters = self
                         .config
-                        .saved_filters_for_scope(&self.account_scope(), &self.region_scope());
+                        .saved_filters_for_scope("global", "global");
 
+                    let mut pending_delete_filter: Option<String> = None;
                     egui::ComboBox::from_id_salt("saved_filter_combo")
                         .selected_text(if self.selected_saved_filter.is_empty() {
                             "(choose)".to_string()
@@ -3597,21 +3824,59 @@ mod gui {
                             self.selected_saved_filter.clone()
                         })
                         .show_ui(ui, |ui| {
-                            for saved in scope_filters {
-                                ui.selectable_value(
-                                    &mut self.selected_saved_filter,
-                                    saved.name.clone(),
-                                    saved.name,
-                                );
+                            for saved in &scope_filters {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .selectable_label(
+                                            self.selected_saved_filter == saved.name,
+                                            &saved.name,
+                                        )
+                                        .clicked()
+                                    {
+                                        self.selected_saved_filter = saved.name.clone();
+                                    }
+                                    if ui
+                                        .small_button("\u{2715}")
+                                        .on_hover_text("Delete filter")
+                                        .clicked()
+                                    {
+                                        pending_delete_filter = Some(saved.name.clone());
+                                    }
+                                });
                             }
                         });
 
-                    if ui.button("Apply Saved").clicked() {
-                        if let Err(err) = self.apply_saved_filter() {
-                            self.message = format!("error: {err}");
-                            self.log_error(self.message.clone());
+                    if let Some(name) = pending_delete_filter {
+                        self.config.delete_saved_filter(
+                            "global",
+                            "global",
+                            &name,
+                        );
+                        if self.selected_saved_filter == name {
+                            self.selected_saved_filter.clear();
                         }
+                        let _ = self.config.save();
+                        self.message = format!("Deleted filter: {name}");
+                        self.log_info(self.message.clone());
                     }
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply Saved").clicked() {
+                            if let Err(err) = self.apply_saved_filter() {
+                                self.message = format!("error: {err}");
+                                self.log_error(self.message.clone());
+                            }
+                        }
+                        if ui.button("Clear Filters").clicked() {
+                            self.search_rules = vec![SearchRuleInput::default()];
+                            self.selected_state_filter = STATE_FILTER_NONE.to_string();
+                            self.only_ssm = false;
+                            self.selected_saved_filter.clear();
+                            self.apply_filters();
+                            self.message = "Filters cleared".to_string();
+                            self.log_info(self.message.clone());
+                        }
+                    });
 
                     if ui.button("Run Diagnostics").clicked() {
                         self.run_diagnostics();
