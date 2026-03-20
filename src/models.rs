@@ -78,7 +78,7 @@ impl Default for TagMapping {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Instance {
     pub instance_id: String,
     pub state: String,
@@ -123,7 +123,7 @@ impl Instance {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Inventory {
     pub instances: Vec<Instance>,
     pub fetched_at: SystemTime,

@@ -818,6 +818,23 @@ mod gui {
                     smoke.expected_text
                 ));
             }
+
+            // Load cached inventory from disk for instant display
+            if let Some(ref profile_id) = app.selected_profile {
+                let region = app.config.profiles.iter()
+                    .find(|p| &p.profile_id == profile_id)
+                    .and_then(|p| p.region.clone())
+                    .or_else(|| app.config.default_region.clone())
+                    .unwrap_or_else(|| "us-east-1".to_string());
+                if let Some(cached) = ec2_manager::inventory::load_disk_cache(profile_id, &region) {
+                    let count = cached.instances.len();
+                    app.inventory = cached;
+                    app.apply_filters();
+                    app.message = format!("Loaded {count} instances from cache (refreshing...)");
+                    app.log_info(app.message.clone());
+                }
+            }
+
             app.refresh_context_and_inventory(true);
             app
         }
@@ -1640,6 +1657,12 @@ mod gui {
                         inventory,
                         config_update,
                     } => {
+                        // Save inventory to disk cache for fast startup next time
+                        ec2_manager::inventory::save_disk_cache(
+                            &context.profile,
+                            &context.region,
+                            &inventory,
+                        );
                         self.context = Some(context);
                         self.inventory = inventory;
                         self.apply_filters();

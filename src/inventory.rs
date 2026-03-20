@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::aws_cli::run_aws_cli;
+use crate::config::AppConfig;
 use crate::error::Result;
 use crate::models::{AuthStatus, AwsContext, Instance, Inventory, Mode, TagMapping};
 use crate::sim;
@@ -63,6 +65,34 @@ pub fn load_inventory(
     }
 
     Ok(inventory)
+}
+
+/// Returns the path to the disk cache file for a given profile/region.
+fn disk_cache_path(profile: &str, region: &str) -> Option<PathBuf> {
+    AppConfig::config_path().map(|p| {
+        let safe_profile = profile.replace(['/', '\\', ':'], "_");
+        let safe_region = region.replace(['/', '\\', ':'], "_");
+        p.with_file_name(format!("inventory_cache_{safe_profile}_{safe_region}.json"))
+    })
+}
+
+/// Load inventory from disk cache. Returns None if no cache exists or it can't be read.
+pub fn load_disk_cache(profile: &str, region: &str) -> Option<Inventory> {
+    let path = disk_cache_path(profile, region)?;
+    let data = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+/// Save inventory to disk cache.
+pub fn save_disk_cache(profile: &str, region: &str, inventory: &Inventory) {
+    if let Some(path) = disk_cache_path(profile, region) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(data) = serde_json::to_string(inventory) {
+            let _ = std::fs::write(&path, data);
+        }
+    }
 }
 
 fn load_live_inventory(context: &AwsContext, mapping: &TagMapping) -> Result<Inventory> {
