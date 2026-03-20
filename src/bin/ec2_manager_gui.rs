@@ -645,7 +645,8 @@ mod gui {
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([GUI_DEFAULT_WIDTH, GUI_DEFAULT_HEIGHT])
-                .with_min_inner_size([GUI_MIN_WIDTH, GUI_MIN_HEIGHT]),
+                .with_min_inner_size([GUI_MIN_WIDTH, GUI_MIN_HEIGHT])
+                .with_maximized(true),
             ..Default::default()
         }
     }
@@ -969,20 +970,27 @@ mod gui {
                     return;
                 }
 
-                match load_inventory(&context, &config.tag_mapping, force) {
-                    Ok(inventory) => {
-                        let _ = tx.send(RefreshEvent::Completed {
-                            context,
-                            inventory,
-                            config_update,
-                        });
+                // Retry up to 2 times on transient failures.
+                let mut last_err = String::new();
+                for attempt in 0..3 {
+                    if attempt > 0 {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
                     }
-                    Err(err) => {
-                        let _ = tx.send(RefreshEvent::Failed {
-                            error: err.to_string(),
-                        });
+                    match load_inventory(&context, &config.tag_mapping, force) {
+                        Ok(inventory) => {
+                            let _ = tx.send(RefreshEvent::Completed {
+                                context,
+                                inventory,
+                                config_update,
+                            });
+                            return;
+                        }
+                        Err(err) => {
+                            last_err = err.to_string();
+                        }
                     }
                 }
+                let _ = tx.send(RefreshEvent::Failed { error: last_err });
             });
         }
 
@@ -2230,7 +2238,9 @@ mod gui {
                 });
             });
 
-            egui::ScrollArea::both().show(ui, |ui| {
+            egui::ScrollArea::both()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .show(ui, |ui| {
                 egui::Grid::new("instance_grid")
                     .striped(true)
                     .show(ui, |ui| {
@@ -2387,26 +2397,37 @@ mod gui {
                             row_double_clicked |= resp_fav.double_clicked();
                             row_hovered |= resp_fav.hovered();
 
-                            // InstanceId + copy button share the InstanceId column width
+                            // InstanceId + copy button grouped in one grid cell
                             let id_w = cw(SortColumn::InstanceId);
-                            let resp_id = ui.add_sized(
-                                [id_w - COL_COPY_W, 18.0],
-                                egui::Label::new(instance.instance_id.clone())
-                                    .sense(egui::Sense::click()),
+                            let id_resp = ui.allocate_ui_with_layout(
+                                egui::vec2(id_w, 18.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    let resp_id = ui.add_sized(
+                                        [id_w - COL_COPY_W, 18.0],
+                                        egui::Label::new(instance.instance_id.clone())
+                                            .sense(egui::Sense::click()),
+                                    );
+                                    let copy_id = ui.add_sized(
+                                        [COL_COPY_W, 18.0],
+                                        egui::Button::new(egui::RichText::new("\u{29C9}").color(ui.visuals().text_color())).frame(false),
+                                    );
+                                    if copy_id.clicked() {
+                                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                            let _ = clipboard.set_text(&instance.instance_id);
+                                        }
+                                    }
+                                    if copy_id.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    copy_id.on_hover_text("Copy Instance ID");
+                                    resp_id
+                                },
                             );
+                            let resp_id = id_resp.inner;
                             row_clicked |= resp_id.clicked();
                             row_double_clicked |= resp_id.double_clicked();
                             row_hovered |= resp_id.hovered();
-                            let copy_id = ui.add_sized(
-                                [COL_COPY_W, 18.0],
-                                egui::Button::new("\u{1F4CB}").frame(false),
-                            );
-                            if copy_id.clicked() {
-                                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                    let _ = clipboard.set_text(&instance.instance_id);
-                                }
-                            }
-                            copy_id.on_hover_text("Copy Instance ID");
 
                             let resp_name = ui.add_sized(
                                 [cw(SortColumn::Name), 18.0],
@@ -2442,28 +2463,39 @@ mod gui {
                             row_double_clicked |= resp_ssm.double_clicked();
                             row_hovered |= resp_ssm.hovered();
 
-                            // Private IP + copy button share the PrivateIp column width
+                            // Private IP + copy button grouped in one grid cell
                             let ip_w = cw(SortColumn::PrivateIp);
-                            let resp_ip = ui.add_sized(
-                                [ip_w - COL_COPY_W, 18.0],
-                                egui::Label::new(instance.private_ip.clone().unwrap_or_default())
-                                    .sense(egui::Sense::click()),
+                            let ip_resp = ui.allocate_ui_with_layout(
+                                egui::vec2(ip_w, 18.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    let resp_ip = ui.add_sized(
+                                        [ip_w - COL_COPY_W, 18.0],
+                                        egui::Label::new(instance.private_ip.clone().unwrap_or_default())
+                                            .sense(egui::Sense::click()),
+                                    );
+                                    let copy_ip = ui.add_sized(
+                                        [COL_COPY_W, 18.0],
+                                        egui::Button::new(egui::RichText::new("\u{29C9}").color(ui.visuals().text_color())).frame(false),
+                                    );
+                                    if copy_ip.clicked() {
+                                        if let Some(ip) = &instance.private_ip {
+                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                                let _ = clipboard.set_text(ip);
+                                            }
+                                        }
+                                    }
+                                    if copy_ip.hovered() {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    copy_ip.on_hover_text("Copy IP Address");
+                                    resp_ip
+                                },
                             );
+                            let resp_ip = ip_resp.inner;
                             row_clicked |= resp_ip.clicked();
                             row_double_clicked |= resp_ip.double_clicked();
                             row_hovered |= resp_ip.hovered();
-                            let copy_ip = ui.add_sized(
-                                [COL_COPY_W, 18.0],
-                                egui::Button::new("\u{1F4CB}").frame(false),
-                            );
-                            if copy_ip.clicked() {
-                                if let Some(ip) = &instance.private_ip {
-                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                        let _ = clipboard.set_text(ip);
-                                    }
-                                }
-                            }
-                            copy_ip.on_hover_text("Copy IP Address");
 
                             let resp_ami = ui.add_sized(
                                 [cw(SortColumn::AmiId), 18.0],
@@ -2605,6 +2637,7 @@ mod gui {
                             }
                         }
                     });
+                ui.add_space(20.0);
             });
         }
 
