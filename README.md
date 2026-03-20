@@ -104,7 +104,36 @@ Flags:
 - `--dry-run` prevents launching terminal sessions
 - `--no-dry-run` allows real terminal/session launches (default)
 
-## Sim mode (Pop!_OS)
+## Sim mode (testing without AWS credentials)
+
+Sim mode loads fake EC2 instances locally so you can test the GUI and CLI without any AWS credentials or connectivity. Instances include realistic data for all columns: Name, State, SSM status, Private IP, AMI ID, Instance Type, Env, and MMODAL_ENV.
+
+### GUI sim mode
+
+From source (run from the project root, e.g. `D:\Work Projects\ec2-instance-manager`):
+
+```bash
+cargo run --features gui --bin ec2_manager_gui -- --mode sim
+```
+
+From built binary (from the project root or any directory):
+
+```bash
+# Windows (Git Bash)
+./dist/windows/ec2_manager_gui.exe --mode sim
+
+# Windows (PowerShell/CMD)
+.\dist\windows\ec2_manager_gui.exe --mode sim
+
+# Linux
+./dist/linux/ec2_manager_gui --mode sim
+```
+
+The `--mode sim` flag starts the GUI with simulated inventory data. You can test sorting, filtering, favorites, copy buttons, column resizing, and saved filters without connecting to AWS.
+
+### CLI sim mode
+
+From the project root:
 
 ```bash
 cargo run -- --mode sim
@@ -200,7 +229,8 @@ Do not put these DLLs in `C:\Windows\System32`; keep them beside the `.exe`.
 ### Windows sim-mode quick check
 
 ```powershell
-.\ec2_manager_gui.exe --mode sim --dry-run
+# From project root
+.\dist\windows\ec2_manager_gui.exe --mode sim
 ```
 
 Commands:

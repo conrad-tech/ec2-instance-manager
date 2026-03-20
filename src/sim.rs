@@ -16,6 +16,9 @@ pub fn generate_inventory(_region: &str, mapping: &TagMapping) -> Inventory {
             "team-payments",
             true,
             "Online",
+            "t3.large",
+            "ami-0abcdef1234567890",
+            "cpa",
         ),
         make_instance(
             "i-sim0002",
@@ -29,6 +32,9 @@ pub fn generate_inventory(_region: &str, mapping: &TagMapping) -> Inventory {
             "team-payments",
             true,
             "Online",
+            "t3.large",
+            "ami-0abcdef1234567890",
+            "cpa",
         ),
         make_instance(
             "i-sim0003",
@@ -42,6 +48,9 @@ pub fn generate_inventory(_region: &str, mapping: &TagMapping) -> Inventory {
             "team-platform",
             false,
             "Offline",
+            "m5.xlarge",
+            "ami-0fedcba9876543210",
+            "staging",
         ),
         make_instance(
             "i-sim0004",
@@ -55,6 +64,9 @@ pub fn generate_inventory(_region: &str, mapping: &TagMapping) -> Inventory {
             "team-platform",
             true,
             "Offline",
+            "m5.xlarge",
+            "ami-0fedcba9876543210",
+            "staging",
         ),
         make_instance(
             "i-sim0005",
@@ -68,6 +80,9 @@ pub fn generate_inventory(_region: &str, mapping: &TagMapping) -> Inventory {
             "team-data",
             true,
             "Online",
+            "r5.2xlarge",
+            "ami-0aabbccdd1122334",
+            "production",
         ),
         make_instance(
             "i-sim0006",
@@ -81,6 +96,9 @@ pub fn generate_inventory(_region: &str, mapping: &TagMapping) -> Inventory {
             "team-legacy",
             false,
             "Offline",
+            "t3.micro",
+            "ami-0112233445566778",
+            "dev",
         ),
     ];
 
@@ -106,6 +124,9 @@ fn make_instance(
     team: &str,
     ssm_managed: bool,
     ping: &str,
+    instance_type: &str,
+    image_id: &str,
+    mmodal_env: &str,
 ) -> Instance {
     let mut instance = Instance::new(instance_id.to_string(), state.to_string());
     instance.private_ip = if private_ip.is_empty() {
@@ -114,6 +135,16 @@ fn make_instance(
         Some(private_ip.to_string())
     };
     instance.az = Some(az.to_string());
+    instance.instance_type = if instance_type.is_empty() {
+        None
+    } else {
+        Some(instance_type.to_string())
+    };
+    instance.image_id = if image_id.is_empty() {
+        None
+    } else {
+        Some(image_id.to_string())
+    };
     instance.ssm_managed = ssm_managed;
     instance.ssm_ping = Some(ping.to_string());
     instance.ssm_last_ping = Some("2026-02-08T13:00:00Z".to_string());
@@ -122,6 +153,9 @@ fn make_instance(
     instance.tags.insert("App".to_string(), app.to_string());
     instance.tags.insert("Role".to_string(), role.to_string());
     instance.tags.insert("Team".to_string(), team.to_string());
+    if !mmodal_env.is_empty() {
+        instance.tags.insert("mmodal_env".to_string(), mmodal_env.to_string());
+    }
 
     if role == "web" {
         instance.tags.insert(

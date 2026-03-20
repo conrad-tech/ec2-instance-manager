@@ -60,10 +60,10 @@ mod gui {
     const COL_NAME_W: f32 = 50.0;
     const COL_STATE_W: f32 = 50.0;
     const COL_SSM_W: f32 = 40.0;
-    const COL_IP_W: f32 = 75.0;
+    const COL_IP_W: f32 = 83.0;
     const COL_ENV_W: f32 = 40.0;
     const COL_INSTANCE_TYPE_W: f32 = 95.0;
-    const COL_AMI_W: f32 = 55.0;
+    const COL_AMI_W: f32 = 71.0;
     const COL_MMODAL_ENV_W: f32 = 90.0;
     const COL_TAG_W: f32 = 120.0;
     const COL_COPY_W: f32 = 14.0;
@@ -736,7 +736,17 @@ mod gui {
             let last_credentials_mtime = credentials::credentials_mtime();
             let selected_profile = config.last_selected_profile.clone()
                 .filter(|s| !s.is_empty())
-                .or_else(|| config.profiles.first().map(|p| p.profile_id.clone()));
+                .filter(|s| config.profiles.iter().any(|p| &p.profile_id == s))
+                .or_else(|| {
+                    // Prefer the first authenticated profile, fall back to the first profile
+                    config.profiles.iter()
+                        .find(|p| {
+                            profile_auth_infos.iter()
+                                .any(|a| a.profile_id == p.profile_id && a.auth_status == AuthStatus::Ok)
+                        })
+                        .or_else(|| config.profiles.first())
+                        .map(|p| p.profile_id.clone())
+                });
 
             let mut app = Self {
                 options,
@@ -1060,6 +1070,27 @@ mod gui {
                 let w = header_w.max(max_content_w).max(30.0);
                 self.column_widths.insert(*col as u8, w);
             }
+        }
+
+        fn paint_copy_button(ui: &mut egui::Ui, text_to_copy: &str, tooltip: &str) {
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(COL_COPY_W, 14.0), egui::Sense::click());
+            if ui.is_rect_visible(rect) {
+                let color = ui.visuals().text_color();
+                let stroke = egui::Stroke::new(1.0, color);
+                let p = ui.painter();
+                p.rect_stroke(egui::Rect::from_min_size(rect.min + egui::vec2(0.0, 1.0), egui::vec2(8.0, 8.0)), 1.0, stroke, egui::StrokeKind::Outside);
+                p.rect_filled(egui::Rect::from_min_size(rect.min + egui::vec2(4.0, 5.0), egui::vec2(8.0, 8.0)), 1.0, ui.visuals().window_fill);
+                p.rect_stroke(egui::Rect::from_min_size(rect.min + egui::vec2(4.0, 5.0), egui::vec2(8.0, 8.0)), 1.0, stroke, egui::StrokeKind::Outside);
+            }
+            if resp.clicked() {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    let _ = clipboard.set_text(text_to_copy);
+                }
+            }
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            resp.on_hover_text(tooltip);
         }
 
         fn maybe_auto_connect_gui_smoke(&mut self) {
@@ -2471,35 +2502,18 @@ mod gui {
                             row_double_clicked |= resp_fav.double_clicked();
                             row_hovered |= resp_fav.hovered();
 
-                            // Copy button + InstanceId grouped in one grid cell (centered)
+                            // Copy button + InstanceId grouped and centered in grid cell
                             let id_w = cw(SortColumn::InstanceId);
+                            let id_text = &instance.instance_id;
+                            let id_content_w = id_text.len() as f32 * 6.5 + COL_COPY_W + 4.0;
+                            let id_pad = ((id_w - id_content_w) / 2.0).max(0.0);
                             let id_resp = ui.allocate_ui_with_layout(
                                 egui::vec2(id_w, 18.0),
-                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    let (copy_rect, copy_id) = ui.allocate_exact_size(egui::vec2(COL_COPY_W, 14.0), egui::Sense::click());
-                                    if ui.is_rect_visible(copy_rect) {
-                                        let color = ui.visuals().text_color();
-                                        let stroke = egui::Stroke::new(1.0, color);
-                                        let p = ui.painter();
-                                        p.rect_stroke(egui::Rect::from_min_size(copy_rect.min + egui::vec2(0.0, 1.0), egui::vec2(8.0, 8.0)), 1.0, stroke, egui::StrokeKind::Outside);
-                                        p.rect_filled(egui::Rect::from_min_size(copy_rect.min + egui::vec2(4.0, 5.0), egui::vec2(8.0, 8.0)), 1.0, ui.visuals().window_fill);
-                                        p.rect_stroke(egui::Rect::from_min_size(copy_rect.min + egui::vec2(4.0, 5.0), egui::vec2(8.0, 8.0)), 1.0, stroke, egui::StrokeKind::Outside);
-                                    }
-                                    if copy_id.clicked() {
-                                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                            let _ = clipboard.set_text(&instance.instance_id);
-                                        }
-                                    }
-                                    if copy_id.hovered() {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                    }
-                                    copy_id.on_hover_text("Copy Instance ID");
-                                    let resp_id = ui.add_sized(
-                                        [id_w - COL_COPY_W, 18.0],
-                                        egui::Label::new(instance.instance_id.clone())
-                                            .sense(egui::Sense::click()),
-                                    );
+                                    ui.add_space(id_pad);
+                                    Self::paint_copy_button(ui, id_text, "Copy Instance ID");
+                                    let resp_id = ui.add(egui::Label::new(id_text.clone()).sense(egui::Sense::click()));
                                     resp_id
                                 },
                             );
@@ -2540,37 +2554,20 @@ mod gui {
                             row_double_clicked |= resp_ssm.double_clicked();
                             row_hovered |= resp_ssm.hovered();
 
-                            // Copy button + Private IP grouped in one grid cell (centered)
+                            // Copy button + Private IP grouped and centered in grid cell
                             let ip_w = cw(SortColumn::PrivateIp);
+                            let ip_text = instance.private_ip.clone().unwrap_or_default();
+                            let ip_copy_gap = 15.0;
+                            let ip_content_w = ip_text.len() as f32 * 6.5 + COL_COPY_W + 4.0 + ip_copy_gap;
+                            let ip_pad = ((ip_w - ip_content_w) / 2.0).max(0.0);
                             let ip_resp = ui.allocate_ui_with_layout(
                                 egui::vec2(ip_w, 18.0),
-                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    let (copy_ip_rect, copy_ip) = ui.allocate_exact_size(egui::vec2(COL_COPY_W, 14.0), egui::Sense::click());
-                                    if ui.is_rect_visible(copy_ip_rect) {
-                                        let color = ui.visuals().text_color();
-                                        let stroke = egui::Stroke::new(1.0, color);
-                                        let p = ui.painter();
-                                        p.rect_stroke(egui::Rect::from_min_size(copy_ip_rect.min + egui::vec2(2.0, 0.0), egui::vec2(9.0, 9.0)), 1.0, stroke, egui::StrokeKind::Outside);
-                                        p.rect_filled(egui::Rect::from_min_size(copy_ip_rect.min + egui::vec2(6.0, 4.0), egui::vec2(9.0, 9.0)), 1.0, ui.visuals().window_fill);
-                                        p.rect_stroke(egui::Rect::from_min_size(copy_ip_rect.min + egui::vec2(6.0, 4.0), egui::vec2(9.0, 9.0)), 1.0, stroke, egui::StrokeKind::Outside);
-                                    }
-                                    if copy_ip.clicked() {
-                                        if let Some(ip) = &instance.private_ip {
-                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                                let _ = clipboard.set_text(ip);
-                                            }
-                                        }
-                                    }
-                                    if copy_ip.hovered() {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                    }
-                                    copy_ip.on_hover_text("Copy IP Address");
-                                    let resp_ip = ui.add_sized(
-                                        [ip_w - COL_COPY_W, 18.0],
-                                        egui::Label::new(instance.private_ip.clone().unwrap_or_default())
-                                            .sense(egui::Sense::click()),
-                                    );
+                                    ui.add_space(ip_pad);
+                                    ui.add_space(ip_copy_gap);
+                                    Self::paint_copy_button(ui, &ip_text, "Copy IP Address");
+                                    let resp_ip = ui.add(egui::Label::new(ip_text.clone()).sense(egui::Sense::click()));
                                     resp_ip
                                 },
                             );
@@ -2579,37 +2576,20 @@ mod gui {
                             row_double_clicked |= resp_ip.double_clicked();
                             row_hovered |= resp_ip.hovered();
 
-                            // Copy button + AMI ID grouped in one grid cell (centered)
+                            // Copy button + AMI ID grouped and centered in grid cell
                             let ami_w = cw(SortColumn::AmiId);
+                            let ami_text = instance.image_id.clone().unwrap_or_default();
+                            let ami_copy_gap = 20.0;
+                            let ami_content_w = ami_text.len() as f32 * 6.5 + COL_COPY_W + 4.0 + ami_copy_gap;
+                            let ami_pad = ((ami_w - ami_content_w) / 2.0).max(0.0);
                             let ami_resp = ui.allocate_ui_with_layout(
                                 egui::vec2(ami_w, 18.0),
-                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    let (copy_ami_rect, copy_ami) = ui.allocate_exact_size(egui::vec2(COL_COPY_W, 14.0), egui::Sense::click());
-                                    if ui.is_rect_visible(copy_ami_rect) {
-                                        let color = ui.visuals().text_color();
-                                        let stroke = egui::Stroke::new(1.0, color);
-                                        let p = ui.painter();
-                                        p.rect_stroke(egui::Rect::from_min_size(copy_ami_rect.min + egui::vec2(2.0, 0.0), egui::vec2(9.0, 9.0)), 1.0, stroke, egui::StrokeKind::Outside);
-                                        p.rect_filled(egui::Rect::from_min_size(copy_ami_rect.min + egui::vec2(6.0, 4.0), egui::vec2(9.0, 9.0)), 1.0, ui.visuals().window_fill);
-                                        p.rect_stroke(egui::Rect::from_min_size(copy_ami_rect.min + egui::vec2(6.0, 4.0), egui::vec2(9.0, 9.0)), 1.0, stroke, egui::StrokeKind::Outside);
-                                    }
-                                    if copy_ami.clicked() {
-                                        if let Some(ami) = &instance.image_id {
-                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                                let _ = clipboard.set_text(ami);
-                                            }
-                                        }
-                                    }
-                                    if copy_ami.hovered() {
-                                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                    }
-                                    copy_ami.on_hover_text("Copy AMI ID");
-                                    let resp_ami = ui.add_sized(
-                                        [ami_w - COL_COPY_W, 18.0],
-                                        egui::Label::new(instance.image_id.clone().unwrap_or_default())
-                                            .sense(egui::Sense::click()),
-                                    );
+                                    ui.add_space(ami_pad);
+                                    ui.add_space(ami_copy_gap);
+                                    Self::paint_copy_button(ui, &ami_text, "Copy AMI ID");
+                                    let resp_ami = ui.add(egui::Label::new(ami_text.clone()).sense(egui::Sense::click()));
                                     resp_ami
                                 },
                             );
