@@ -26,6 +26,7 @@ pub struct AppConfig {
     pub last_selected_profile: Option<String>,
     pub theme: Option<String>,
     pub scroll_sensitivity: Option<f32>,
+    pub ui_scale: Option<f32>,
 }
 
 impl Default for AppConfig {
@@ -55,6 +56,7 @@ impl Default for AppConfig {
             last_selected_profile: None,
             theme: None,
             scroll_sensitivity: None,
+            ui_scale: None,
         }
     }
 }
@@ -383,6 +385,11 @@ impl AppConfig {
                         cfg.scroll_sensitivity = Some(val);
                     }
                 }
+                "ui_scale" => {
+                    if let Ok(val) = value.parse::<f32>() {
+                        cfg.ui_scale = Some(val);
+                    }
+                }
                 "last_selected_profile" => {
                     cfg.last_selected_profile = if value.is_empty() {
                         None
@@ -430,6 +437,10 @@ impl AppConfig {
 
         if let Some(val) = self.scroll_sensitivity {
             lines.push(format!("scroll_sensitivity={val}"));
+        }
+
+        if let Some(val) = self.ui_scale {
+            lines.push(format!("ui_scale={val}"));
         }
 
         for profile in &self.profiles {

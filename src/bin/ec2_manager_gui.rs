@@ -55,7 +55,7 @@ mod gui {
     const GUI_SMOKE_EXIT_ON_MARKER_ENV: &str = "EC2_MANAGER_GUI_SMOKE_EXIT_ON_MARKER";
     const GUI_SMOKE_AUTO_CONNECT_ENV: &str = "EC2_MANAGER_GUI_SMOKE_AUTO_CONNECT";
 
-    const COL_FAV_W: f32 = 44.0;
+    const COL_FAV_W: f32 = 60.0;
     const COL_INSTANCE_W: f32 = 150.0;
     const COL_NAME_W: f32 = 220.0;
     const COL_STATE_W: f32 = 90.0;
@@ -99,7 +99,7 @@ mod gui {
     ];
 
     const INVENTORY_HEADERS: &[(&str, f32)] = &[
-        ("Fav", COL_FAV_W),
+        ("Favorite", COL_FAV_W),
         ("InstanceId", COL_INSTANCE_W),
         ("Name", COL_NAME_W),
         ("State", COL_STATE_W),
@@ -549,6 +549,7 @@ mod gui {
                     } else {
                         cc.egui_ctx.set_theme(egui::ThemePreference::Light);
                     }
+                    cc.egui_ctx.set_pixels_per_point(app.ui_scale * cc.egui_ctx.native_pixels_per_point().unwrap_or(1.0));
                     Ok(Box::new(app))
                 }),
             )
@@ -628,6 +629,7 @@ mod gui {
         refreshing: bool,
         dark_mode: bool,
         scroll_sensitivity: f32,
+        ui_scale: f32,
         selected_profile: Option<String>,
         profile_auth_infos: Vec<ProfileAuthInfo>,
         last_credentials_mtime: Option<SystemTime>,
@@ -659,6 +661,7 @@ mod gui {
             let gui_smoke = gui_smoke_config_from_env();
             let dark_mode = config.theme.as_deref() != Some("light");
             let scroll_sensitivity = config.scroll_sensitivity.unwrap_or(10.0);
+            let ui_scale = config.ui_scale.unwrap_or(1.0);
             let profile_auth_infos = credentials::check_all_profiles_auth(&config.profiles);
             let last_credentials_mtime = credentials::credentials_mtime();
             let selected_profile = config.last_selected_profile.clone();
@@ -708,6 +711,7 @@ mod gui {
                 refreshing: false,
                 dark_mode,
                 scroll_sensitivity,
+                ui_scale,
                 selected_profile,
                 profile_auth_infos,
                 last_credentials_mtime,
@@ -2136,6 +2140,20 @@ mod gui {
                     self.filtered.len(),
                     self.inventory.instances.len()
                 ));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("+").on_hover_text("Zoom In").clicked() {
+                        self.ui_scale = (self.ui_scale + 0.1).min(3.0);
+                        self.config.ui_scale = Some(self.ui_scale);
+                        let _ = self.config.save();
+                        ui.ctx().set_pixels_per_point(self.ui_scale * ui.ctx().native_pixels_per_point().unwrap_or(1.0));
+                    }
+                    if ui.button("\u{2212}").on_hover_text("Zoom Out").clicked() {
+                        self.ui_scale = (self.ui_scale - 0.1).max(0.5);
+                        self.config.ui_scale = Some(self.ui_scale);
+                        let _ = self.config.save();
+                        ui.ctx().set_pixels_per_point(self.ui_scale * ui.ctx().native_pixels_per_point().unwrap_or(1.0));
+                    }
+                });
             });
 
             egui::ScrollArea::both().show(ui, |ui| {
@@ -2153,6 +2171,7 @@ mod gui {
                         let account_scope = self.account_scope();
                         let region_scope = self.region_scope();
                         let mut pending_connect: Option<String> = None;
+                        let mut pending_fav_toggle: Option<String> = None;
                         let (include_terms, _) = search_terms_from_rules(&self.search_rules);
 
                         for instance in &self.filtered {
@@ -2167,12 +2186,18 @@ mod gui {
                             let mut row_hovered = false;
                             let mut quick_connect_clicked = false;
 
+                            let star_label = if is_fav {
+                                egui::RichText::new("\u{2605}").color(egui::Color32::YELLOW)
+                            } else {
+                                egui::RichText::new("\u{2606}")
+                            };
                             let resp_fav = ui.add_sized(
                                 [COL_FAV_W, 18.0],
-                                egui::Label::new(if is_fav { "*" } else { "" })
-                                    .sense(egui::Sense::click()),
+                                egui::Button::new(star_label).frame(false),
                             );
-                            row_clicked |= resp_fav.clicked();
+                            if resp_fav.clicked() {
+                                pending_fav_toggle = Some(instance.instance_id.clone());
+                            }
                             row_double_clicked |= resp_fav.double_clicked();
                             row_hovered |= resp_fav.hovered();
 
@@ -2315,6 +2340,25 @@ mod gui {
                             self.selected_instance_id = instance_id;
                             if self.guarded_action("quick connect", |app| app.connect_selected()) {
                                 self.main_tab = MainTab::Connections;
+                            }
+                        }
+
+                        if let Some(instance_id) = pending_fav_toggle {
+                            let enabled = self.config.toggle_favorite(
+                                &account_scope,
+                                &region_scope,
+                                &instance_id,
+                            );
+                            if let Err(err) = self.config.save() {
+                                self.message = format!("error: {err}");
+                                self.log_error(self.message.clone());
+                            } else {
+                                self.message = format!(
+                                    "Favorite {}: {}",
+                                    if enabled { "enabled" } else { "disabled" },
+                                    instance_id
+                                );
+                                self.log_info(self.message.clone());
                             }
                         }
                     });
