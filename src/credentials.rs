@@ -36,7 +36,12 @@ fn parse_fed_expire(content: &str, profile: &str) -> Option<u64> {
 
         if let Some((k, v)) = line.split_once('=') {
             if k.trim().eq_ignore_ascii_case("fed_expire") {
-                return v.trim().parse::<u64>().ok();
+                let val = v.trim();
+                // Try Unix epoch first, then ISO 8601 (e.g. "2026-03-21T04:14:59Z")
+                if let Ok(epoch) = val.parse::<u64>() {
+                    return Some(epoch);
+                }
+                return parse_iso8601_to_epoch(val);
             }
         }
     }
@@ -95,6 +100,39 @@ fn parse_fed_role(content: &str, profile: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Parses an ISO 8601 datetime string (e.g. "2026-03-21T04:14:59Z") to a Unix epoch.
+fn parse_iso8601_to_epoch(s: &str) -> Option<u64> {
+    // Expected format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS
+    let s = s.trim_end_matches('Z');
+    let (date, time) = s.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year: u64 = date_parts.next()?.parse().ok()?;
+    let month: u64 = date_parts.next()?.parse().ok()?;
+    let day: u64 = date_parts.next()?.parse().ok()?;
+
+    let mut time_parts = time.split(':');
+    let hour: u64 = time_parts.next()?.parse().ok()?;
+    let min: u64 = time_parts.next()?.parse().ok()?;
+    let sec: u64 = time_parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    // Days from year 1970 to the given year/month/day (UTC).
+    let mut days: u64 = 0;
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    let month_days = [31, 28 + if is_leap(year) { 1 } else { 0 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 0..(month.saturating_sub(1) as usize) {
+        days += month_days.get(m).copied().unwrap_or(30) as u64;
+    }
+    days += day.saturating_sub(1);
+
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+fn is_leap(y: u64) -> bool {
+    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
 }
 
 /// Extracts the account ID from a role ARN.
