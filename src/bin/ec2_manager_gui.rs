@@ -820,14 +820,14 @@ mod gui {
             }
 
             // Load cached inventory from disk for instant display
-            if let Some(ref profile_id) = app.selected_profile {
+            if let Some(profile_id) = app.selected_profile.clone() {
                 let region = app.config.profiles.iter()
-                    .find(|p| &p.profile_id == profile_id)
+                    .find(|p| p.profile_id == profile_id)
                     .and_then(|p| p.region.clone())
                     .or_else(|| app.config.default_region.clone())
                     .unwrap_or_else(|| "us-east-1".to_string());
                 app.log_info(format!("disk cache lookup: profile={profile_id} region={region}"));
-                if let Some(cached) = ec2_manager::inventory::load_disk_cache(profile_id, &region) {
+                if let Some(cached) = ec2_manager::inventory::load_disk_cache(&profile_id, &region) {
                     let count = cached.instances.len();
                     app.inventory = cached;
                     app.apply_filters();
