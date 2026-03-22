@@ -5175,15 +5175,25 @@ mod gui {
         let kind = terminal.map(|t| t.kind.clone()).unwrap_or(TerminalKind::Wsl);
 
         match kind {
-            TerminalKind::Wsl => PtyCommand {
-                program: "wsl.exe".to_string(),
-                args: vec![
-                    "-e".to_string(),
-                    "bash".to_string(),
-                    "-lc".to_string(),
-                    command_line.to_string(),
-                ],
-            },
+            TerminalKind::Wsl => {
+                // Use `wsl -- bash -lc` instead of `wsl -e bash -lc`.
+                // The `--` form gives WSL proper user/passwd context,
+                // which session-manager-plugin needs for getpwuid().
+                // Also export HOME explicitly as a fallback.
+                let wrapped = format!(
+                    "export HOME=\"${{HOME:-$(getent passwd $(id -u) | cut -d: -f6)}}\" 2>/dev/null; {}",
+                    command_line
+                );
+                PtyCommand {
+                    program: "wsl.exe".to_string(),
+                    args: vec![
+                        "--".to_string(),
+                        "bash".to_string(),
+                        "-lc".to_string(),
+                        wrapped,
+                    ],
+                }
+            }
             TerminalKind::PowerShell7 | TerminalKind::WindowsPowerShell => {
                 let program = terminal
                     .map(|t| t.program.clone())
