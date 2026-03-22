@@ -694,6 +694,8 @@ mod gui {
         refresh_tx: Sender<RefreshEvent>,
         refresh_rx: Receiver<RefreshEvent>,
         refreshing: bool,
+        /// Per-profile in-memory inventory cache: profile_id -> (Inventory, AwsContext)
+        profile_inventory_cache: HashMap<String, (Inventory, AwsContext)>,
         dark_mode: bool,
         scroll_sensitivity: f32,
         ui_scale: f32,
@@ -704,6 +706,12 @@ mod gui {
         profile_auth_infos: Vec<ProfileAuthInfo>,
         last_credentials_mtime: Option<SystemTime>,
         last_credentials_poll_at: Instant,
+        account_color_map: HashMap<String, egui::Color32>,
+        show_account_color_legend: bool,
+        tab_rename_id: Option<u64>,
+        tab_rename_buf: String,
+        tab_color_picker_id: Option<u64>,
+        tab_color_picker_rgb: [f32; 3],
         file_browsers: HashMap<u64, FileBrowserState>,
         file_op_tx: Sender<FileOpEvent>,
         file_op_rx: Receiver<FileOpEvent>,
@@ -791,6 +799,7 @@ mod gui {
                 refresh_tx,
                 refresh_rx,
                 refreshing: false,
+                profile_inventory_cache: HashMap::new(),
                 dark_mode,
                 scroll_sensitivity,
                 ui_scale,
@@ -801,6 +810,12 @@ mod gui {
                 profile_auth_infos,
                 last_credentials_mtime,
                 last_credentials_poll_at: Instant::now(),
+                account_color_map: HashMap::new(),
+                show_account_color_legend: false,
+                tab_rename_id: None,
+                tab_rename_buf: String::new(),
+                tab_color_picker_id: None,
+                tab_color_picker_rgb: [0.0, 0.0, 0.0],
                 file_browsers: HashMap::new(),
                 file_op_tx,
                 file_op_rx,
@@ -810,6 +825,7 @@ mod gui {
                 ui_rx,
             };
 
+            app.rebuild_account_colors();
             app.log_info("application started");
             if let Some(smoke) = &app.gui_smoke {
                 app.log_info(format!(
@@ -819,22 +835,20 @@ mod gui {
                 ));
             }
 
-            // Load cached inventory from disk for instant display
+            // Load cached inventory from disk — but only if the profile is authenticated.
+            // If auth is expired/missing, don't show stale data; wait for auth to become OK.
             if let Some(profile_id) = app.selected_profile.clone() {
-                let region = app.config.profiles.iter()
-                    .find(|p| p.profile_id == profile_id)
-                    .and_then(|p| p.region.clone())
-                    .or_else(|| app.config.default_region.clone())
-                    .unwrap_or_else(|| "us-east-1".to_string());
-                app.log_info(format!("disk cache lookup: profile={profile_id} region={region}"));
-                if let Some(cached) = ec2_manager::inventory::load_disk_cache(&profile_id, &region) {
-                    let count = cached.instances.len();
-                    app.inventory = cached;
-                    app.apply_filters();
-                    app.message = format!("Loaded {count} instances from cache (refreshing...)");
-                    app.log_info(app.message.clone());
+                let is_auth_ok = app.profile_auth_infos.iter().any(|a| {
+                    a.profile_id == profile_id && a.auth_status == AuthStatus::Ok
+                }) || app.options.mode == Mode::Sim;
+
+                if is_auth_ok {
+                    app.load_cache_for_profile(&profile_id);
                 } else {
-                    app.log_info("no disk cache found for this profile/region");
+                    app.log_info(format!(
+                        "skipping disk cache for profile={profile_id}: auth not OK"
+                    ));
+                    app.message = "Waiting for authentication...".to_string();
                 }
             } else {
                 app.log_info("no selected profile, skipping disk cache");
@@ -891,9 +905,33 @@ mod gui {
             let current_mtime = credentials::credentials_mtime();
             if current_mtime != self.last_credentials_mtime {
                 self.last_credentials_mtime = current_mtime;
+
+                // Check if the current profile was NOT authenticated before
+                let was_auth_ok = self.selected_profile.as_ref().map(|pid| {
+                    self.profile_auth_infos.iter().any(|a| {
+                        a.profile_id == *pid && a.auth_status == AuthStatus::Ok
+                    })
+                }).unwrap_or(false);
+
                 self.profile_auth_infos =
                     credentials::check_all_profiles_auth(&self.config.profiles);
                 self.log_debug("credentials file changed; refreshed profile auth status");
+
+                // If auth just became OK, load cache and start refresh
+                if !was_auth_ok {
+                    if let Some(ref profile_id) = self.selected_profile.clone() {
+                        let is_now_ok = self.profile_auth_infos.iter().any(|a| {
+                            a.profile_id == *profile_id && a.auth_status == AuthStatus::Ok
+                        });
+                        if is_now_ok {
+                            self.log_info(format!(
+                                "auth became OK for profile={profile_id}, loading cache"
+                            ));
+                            self.load_cache_for_profile(profile_id);
+                            self.refresh_context_and_inventory(true);
+                        }
+                    }
+                }
             }
         }
 
@@ -957,6 +995,75 @@ mod gui {
             self.terminals
                 .iter()
                 .find(|t| t.id == self.selected_terminal_id)
+        }
+
+        fn rebuild_account_colors(&mut self) {
+            // Collect all known profile_ids: from config + from open tabs
+            let mut profile_ids: Vec<String> = self
+                .config
+                .profiles
+                .iter()
+                .map(|p| p.profile_id.clone())
+                .collect();
+            for tab in self.connections.tabs() {
+                if !tab.profile_id.is_empty() && !profile_ids.contains(&tab.profile_id) {
+                    profile_ids.push(tab.profile_id.clone());
+                }
+            }
+            self.account_color_map =
+                build_account_color_map(&profile_ids, &self.config.account_colors);
+        }
+
+        /// Load cached inventory for a profile (in-memory first, then disk).
+        /// Sets self.inventory, self.filtered, self.context, and self.message.
+        fn load_cache_for_profile(&mut self, profile_id: &str) {
+            // Try in-memory cache first
+            if let Some((inv, ctx)) = self.profile_inventory_cache.get(profile_id) {
+                let count = inv.instances.len();
+                self.inventory = inv.clone();
+                self.context = Some(ctx.clone());
+                self.apply_filters();
+                self.message = format!("Loaded {count} instances from cache (refreshing...)");
+                self.log_info(format!(
+                    "loaded {count} instances from memory cache for profile={profile_id}"
+                ));
+                return;
+            }
+
+            // Fall back to disk cache
+            let profile_cfg = self.config.profiles.iter()
+                .find(|p| p.profile_id == profile_id);
+            let region = profile_cfg
+                .and_then(|p| p.region.clone())
+                .or_else(|| self.config.default_region.clone())
+                .unwrap_or_else(|| "us-east-1".to_string());
+            let account_id = profile_cfg
+                .map(|p| p.account_id.clone())
+                .filter(|s| !s.is_empty());
+
+            self.log_info(format!("disk cache lookup: profile={profile_id} region={region}"));
+            if let Some(cached) = ec2_manager::inventory::load_disk_cache(profile_id, &region) {
+                let count = cached.instances.len();
+                let ctx = AwsContext {
+                    mode: self.options.mode.clone(),
+                    profile: profile_id.to_string(),
+                    account_id,
+                    arn: None,
+                    user_id: None,
+                    region: region.clone(),
+                    auth_status: AuthStatus::Ok,
+                };
+                // Store in memory cache for fast switching later
+                self.profile_inventory_cache
+                    .insert(profile_id.to_string(), (cached.clone(), ctx.clone()));
+                self.inventory = cached;
+                self.context = Some(ctx);
+                self.apply_filters();
+                self.message = format!("Loaded {count} instances from cache (refreshing...)");
+                self.log_info(self.message.clone());
+            } else {
+                self.log_info("no disk cache found for this profile/region");
+            }
         }
 
         fn refresh_context_and_inventory(&mut self, force: bool) {
@@ -1351,7 +1458,8 @@ mod gui {
                 "terminal selection: {}",
                 terminal_debug_label(selected_terminal.as_ref())
             ));
-            let tab_id = self.connections.open(title.clone(), instance_id.clone());
+            let tab_id = self.connections.open(title.clone(), instance_id.clone(), context.profile.clone());
+            self.rebuild_account_colors();
             let default_path = if context.mode == Mode::Sim {
                 std::env::current_dir()
                     .map(|p| p.to_string_lossy().to_string())
@@ -1662,12 +1770,16 @@ mod gui {
                         inventory,
                         config_update,
                     } => {
-                        // Save inventory to disk cache for fast startup next time
+                        // Save inventory to disk and in-memory cache
                         if let Some(ref profile_id) = self.selected_profile {
                             ec2_manager::inventory::save_disk_cache(
                                 profile_id,
                                 &context.region,
                                 &inventory,
+                            );
+                            self.profile_inventory_cache.insert(
+                                profile_id.clone(),
+                                (inventory.clone(), context.clone()),
                             );
                         }
                         self.context = Some(context);
@@ -2771,11 +2883,11 @@ mod gui {
         }
 
         fn render_connections_panel(&mut self, ui: &mut egui::Ui) {
-            let tabs_snapshot: Vec<(u64, String, bool)> = self
+            let tabs_snapshot: Vec<(u64, String, String, bool)> = self
                 .connections
                 .tabs()
                 .iter()
-                .map(|t| (t.id, t.title.clone(), t.running))
+                .map(|t| (t.id, t.title.clone(), t.profile_id.clone(), t.running))
                 .collect();
 
             if tabs_snapshot.is_empty() {
@@ -2783,14 +2895,44 @@ mod gui {
                 return;
             }
 
+            let colors_enabled = self.config.account_colors_enabled;
+
             let mut to_select: Option<u64> = None;
             let mut to_close: Option<u64> = None;
             let mut close_all = false;
+            let mut to_rename: Option<u64> = None;
+            let mut to_reopen: Option<(String, String)> = None;
+            let mut to_pick_color: Option<(u64, String)> = None;
 
             ui.horizontal_wrapped(|ui| {
-                for (id, title, running) in &tabs_snapshot {
-                    ui.group(|ui| {
+                for (id, title, profile_id, running) in &tabs_snapshot {
+                    let tab_color = if colors_enabled {
+                        self.account_color_map.get(profile_id).copied()
+                    } else {
+                        None
+                    };
+
+                    let frame = if let Some(color) = tab_color {
+                        egui::Frame::group(ui.style())
+                            .stroke(egui::Stroke::new(2.0, color))
+                            .fill(egui::Color32::from_rgba_unmultiplied(
+                                color.r(), color.g(), color.b(), 25,
+                            ))
+                    } else {
+                        egui::Frame::group(ui.style())
+                    };
+
+                    let frame_resp = frame.show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            // Color dot indicator
+                            if let Some(color) = tab_color {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(8.0, 8.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(rect.center(), 4.0, color);
+                            }
+
                             let prefix = if *running { "" } else { "[done] " };
                             let selected = self.connections.selected() == Some(*id);
                             if ui
@@ -2807,6 +2949,41 @@ mod gui {
                             }
                         });
                     });
+
+                    // Right-click context menu on the tab frame
+                    let tab_id = *id;
+                    let tab_instance_id = self
+                        .connections
+                        .tabs()
+                        .iter()
+                        .find(|t| t.id == tab_id)
+                        .map(|t| t.instance_id.clone())
+                        .unwrap_or_default();
+                    let tab_profile = profile_id.clone();
+                    let tab_running = *running;
+                    frame_resp.response.context_menu(|ui| {
+                        if ui.button("Rename").clicked() {
+                            to_rename = Some(tab_id);
+                            ui.close();
+                        }
+                        if !tab_running {
+                            if ui.button("Re-open").clicked() {
+                                to_reopen = Some((tab_instance_id.clone(), tab_profile.clone()));
+                                to_close = Some(tab_id);
+                                ui.close();
+                            }
+                        }
+                        if colors_enabled {
+                            if ui.button("Change Color").clicked() {
+                                to_pick_color = Some((tab_id, tab_profile.clone()));
+                                ui.close();
+                            }
+                        }
+                        if ui.button("Close").clicked() {
+                            to_close = Some(tab_id);
+                            ui.close();
+                        }
+                    });
                 }
                 if tabs_snapshot.len() > 1 && ui.button("Close All").clicked() {
                     close_all = true;
@@ -2816,13 +2993,124 @@ mod gui {
             if let Some(id) = to_select {
                 self.connections.select(id);
             }
+            // Handle rename request
+            if let Some(id) = to_rename {
+                let current_title = self
+                    .connections
+                    .tabs()
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.title.clone())
+                    .unwrap_or_default();
+                self.tab_rename_id = Some(id);
+                self.tab_rename_buf = current_title;
+            }
+            // Handle re-open request
+            if let Some((instance_id, _profile_id)) = to_reopen {
+                self.selected_instance_id = instance_id;
+                // User can click Connect after re-selecting; switch to inventory
+                self.main_tab = MainTab::Inventory;
+                self.message = "Instance selected for re-connect. Click Connect.".to_string();
+            }
+            // Handle color picker request
+            if let Some((_tab_id, profile_id)) = to_pick_color {
+                let current_color = self
+                    .account_color_map
+                    .get(&profile_id)
+                    .copied()
+                    .unwrap_or(egui::Color32::from_rgb(128, 128, 128));
+                self.tab_color_picker_id = self
+                    .connections
+                    .tabs()
+                    .iter()
+                    .find(|t| t.profile_id == profile_id)
+                    .map(|t| t.id);
+                self.tab_color_picker_rgb = [
+                    current_color.r() as f32 / 255.0,
+                    current_color.g() as f32 / 255.0,
+                    current_color.b() as f32 / 255.0,
+                ];
+            }
             if close_all {
-                let tab_ids: Vec<u64> = tabs_snapshot.iter().map(|(id, _, _)| *id).collect();
+                let tab_ids: Vec<u64> = tabs_snapshot.iter().map(|(id, _, _, _)| *id).collect();
                 for id in tab_ids {
                     self.close_connection_tab(id);
                 }
             } else if let Some(id) = to_close {
                 self.close_connection_tab(id);
+            }
+
+            // Account color legend
+            if colors_enabled && !self.account_color_map.is_empty() {
+                ui.horizontal(|ui| {
+                    let legend_label = if self.show_account_color_legend {
+                        "Legend \u{25B2}"
+                    } else {
+                        "Legend \u{25BC}"
+                    };
+                    if ui.small_button(legend_label).clicked() {
+                        self.show_account_color_legend = !self.show_account_color_legend;
+                    }
+                });
+
+                if self.show_account_color_legend {
+                    ui.horizontal_wrapped(|ui| {
+                        // Show all profiles with their colors, sorted by env rank
+                        let mut profiles: Vec<(String, egui::Color32)> = self
+                            .account_color_map
+                            .iter()
+                            .map(|(k, v)| (k.clone(), *v))
+                            .collect();
+                        profiles.sort_by(|a, b| env_rank(&a.0).cmp(&env_rank(&b.0)));
+
+                        for (profile_id, color) in &profiles {
+                            let display_name = self
+                                .config
+                                .profiles
+                                .iter()
+                                .find(|p| &p.profile_id == profile_id)
+                                .map(|p| p.display_name.as_str())
+                                .unwrap_or(profile_id.as_str());
+
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(10.0, 10.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().circle_filled(rect.center(), 5.0, *color);
+                            ui.label(display_name);
+                            ui.add_space(8.0);
+                        }
+                    });
+                }
+            }
+
+            // Inline rename editor
+            if self.tab_rename_id.is_some() {
+                ui.horizontal(|ui| {
+                    ui.label("Rename tab:");
+                    let response = ui.text_edit_singleline(&mut self.tab_rename_buf);
+                    if response.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
+                        if let Some(id) = self.tab_rename_id.take() {
+                            let new_title = self.tab_rename_buf.trim().to_string();
+                            if !new_title.is_empty() {
+                                self.connections.rename(id, new_title);
+                            }
+                        }
+                    }
+                    if ui.button("OK").clicked() {
+                        if let Some(id) = self.tab_rename_id.take() {
+                            let new_title = self.tab_rename_buf.trim().to_string();
+                            if !new_title.is_empty() {
+                                self.connections.rename(id, new_title);
+                            }
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.tab_rename_id = None;
+                    }
+                });
             }
 
             ui.separator();
@@ -3579,6 +3867,72 @@ mod gui {
                     }
                 }
 
+                // Color picker window for tab account color
+                if self.tab_color_picker_id.is_some() {
+                    let profile_id = self
+                        .tab_color_picker_id
+                        .and_then(|id| {
+                            self.connections
+                                .tabs()
+                                .iter()
+                                .find(|t| t.id == id)
+                                .map(|t| t.profile_id.clone())
+                        })
+                        .unwrap_or_default();
+
+                    let display_name = self
+                        .config
+                        .profiles
+                        .iter()
+                        .find(|p| p.profile_id == profile_id)
+                        .map(|p| p.display_name.clone())
+                        .unwrap_or_else(|| profile_id.clone());
+
+                    let mut open = true;
+                    egui::Window::new(format!("Color: {display_name}"))
+                        .collapsible(false)
+                        .resizable(false)
+                        .open(&mut open)
+                        .show(ctx, |ui| {
+                            ui.color_edit_button_rgb(&mut self.tab_color_picker_rgb);
+                            ui.add_space(4.0);
+                            let [r, g, b] = self.tab_color_picker_rgb;
+                            let preview_color = egui::Color32::from_rgb(
+                                (r * 255.0) as u8,
+                                (g * 255.0) as u8,
+                                (b * 255.0) as u8,
+                            );
+                            let hex = color32_to_hex(preview_color);
+                            ui.label(format!("Hex: {hex}"));
+                            ui.add_space(4.0);
+
+                            ui.horizontal(|ui| {
+                                if ui.button("Apply").clicked() {
+                                    let hex = color32_to_hex(preview_color);
+                                    if !profile_id.is_empty() {
+                                        self.config
+                                            .account_colors
+                                            .insert(profile_id.clone(), hex);
+                                        self.rebuild_account_colors();
+                                        let _ = self.config.save();
+                                    }
+                                    self.tab_color_picker_id = None;
+                                }
+                                if ui.button("Reset to Default").clicked() {
+                                    if !profile_id.is_empty() {
+                                        self.config.account_colors.remove(&profile_id);
+                                        self.rebuild_account_colors();
+                                        let _ = self.config.save();
+                                    }
+                                    self.tab_color_picker_id = None;
+                                }
+                            });
+                        });
+                    if !open {
+                        self.tab_color_picker_id = None;
+                    }
+                }
+
                 egui::TopBottomPanel::top("top").show(ctx, |ui| {
                     egui::MenuBar::new().ui(ui, |ui| {
                         ui.menu_button("Edit", |ui| {
@@ -3613,6 +3967,26 @@ mod gui {
                                         ui.close();
                                     }
                                 }
+                            });
+                            ui.menu_button("Account Tab Colors", |ui| {
+                                let was_enabled = self.config.account_colors_enabled;
+                                if ui
+                                    .selectable_label(self.config.account_colors_enabled, "Enabled")
+                                    .clicked()
+                                {
+                                    self.config.account_colors_enabled = !self.config.account_colors_enabled;
+                                    let _ = self.config.save();
+                                }
+                                ui.separator();
+                                if self.config.account_colors_enabled {
+                                    if ui.button("Reset All to Defaults").clicked() {
+                                        self.config.account_colors.clear();
+                                        self.rebuild_account_colors();
+                                        let _ = self.config.save();
+                                        ui.close();
+                                    }
+                                }
+                                let _ = was_enabled; // suppress unused warning
                             });
                         });
                     });
@@ -3744,6 +4118,16 @@ mod gui {
                             });
 
                         if self.selected_profile != before_profile {
+                            // Save current inventory to memory cache before switching
+                            if let Some(ref old_profile) = before_profile {
+                                if let Some(ref ctx) = self.context {
+                                    self.profile_inventory_cache.insert(
+                                        old_profile.clone(),
+                                        (self.inventory.clone(), ctx.clone()),
+                                    );
+                                }
+                            }
+
                             self.config.last_selected_profile = self.selected_profile.clone();
                             // Update region to match the selected account's region
                             if let Some(ref profile_id) = self.selected_profile {
@@ -3762,6 +4146,26 @@ mod gui {
                                     self.selected_profile.as_deref().unwrap_or("(none)")
                                 ));
                             }
+
+                            // Load cached inventory for the new profile immediately
+                            if let Some(ref profile_id) = self.selected_profile {
+                                let is_auth_ok = self.profile_auth_infos.iter().any(|a| {
+                                    a.profile_id == *profile_id && a.auth_status == AuthStatus::Ok
+                                }) || self.options.mode == Mode::Sim;
+
+                                if is_auth_ok {
+                                    self.load_cache_for_profile(&profile_id.clone());
+                                } else {
+                                    // Clear the display when switching to unauthed profile
+                                    self.inventory = Inventory {
+                                        instances: Vec::new(),
+                                        fetched_at: std::time::SystemTime::now(),
+                                    };
+                                    self.filtered.clear();
+                                    self.context = None;
+                                }
+                            }
+
                             self.refresh_context_and_inventory(true);
                         }
                         ui.separator();
@@ -4506,6 +4910,110 @@ mod gui {
         format!(
             "Instance: {title} ({instance_id})\tPrivate IP: {private_ip}\tStatus: {status}\tRx: {bytes_label}"
         )
+    }
+
+    /// Default ordered color palette for account tab coloring.
+    /// Ordered from green (dev-like) through yellow/orange to red (prod-like),
+    /// then extends into additional distinct hues for extra accounts.
+    const ACCOUNT_COLOR_PALETTE: &[(u8, u8, u8)] = &[
+        (46, 160, 67),    // green (dev)
+        (0, 180, 160),    // teal
+        (54, 154, 220),   // blue
+        (200, 180, 30),   // yellow
+        (230, 150, 0),    // orange
+        (210, 80, 60),    // red-orange
+        (200, 40, 40),    // red (prod)
+        (170, 30, 70),    // crimson (prod-b)
+        (140, 60, 160),   // purple
+        (100, 100, 190),  // indigo
+        (0, 140, 120),    // dark teal
+        (180, 120, 60),   // brown
+    ];
+
+    /// Environment ranking keywords — lower index means "lower" environment.
+    /// Profiles matching earlier entries get greener colors; later entries get redder colors.
+    const ENV_RANK_KEYWORDS: &[&str] = &[
+        "dev", "develop", "development",
+        "test", "testing",
+        "qa", "quality",
+        "int", "integration",
+        "staging", "stage", "stg",
+        "uat", "preprod", "pre-prod",
+        "prod", "production", "prd", "live",
+    ];
+
+    /// Determine a sort rank for a profile name based on environment keywords.
+    /// Returns (rank, original_name) for sorting.
+    fn env_rank(profile_name: &str) -> (usize, String) {
+        let lower = profile_name.to_ascii_lowercase();
+        for (idx, &kw) in ENV_RANK_KEYWORDS.iter().enumerate() {
+            if lower.contains(kw) {
+                return (idx, lower);
+            }
+        }
+        // Unknown profiles sort after all known environments but before nothing
+        (ENV_RANK_KEYWORDS.len(), lower)
+    }
+
+    /// Given a set of profile_ids, return a mapping from profile_id to Color32.
+    /// Uses user-customized colors from config where available, and auto-assigns
+    /// the rest from the palette ordered by environment rank.
+    fn build_account_color_map(
+        profile_ids: &[String],
+        custom_colors: &std::collections::BTreeMap<String, String>,
+    ) -> HashMap<String, egui::Color32> {
+        let mut map = HashMap::new();
+
+        // Sort profiles by environment rank so dev gets green, prod gets red
+        let mut sorted: Vec<&String> = profile_ids.iter().collect();
+        sorted.sort_by(|a, b| env_rank(a).cmp(&env_rank(b)));
+        sorted.dedup();
+
+        let palette_len = ACCOUNT_COLOR_PALETTE.len();
+
+        for (idx, profile_id) in sorted.iter().enumerate() {
+            // Check for user-customized color first
+            if let Some(hex) = custom_colors.get(*profile_id) {
+                if let Some(c) = parse_hex_color(hex) {
+                    map.insert((*profile_id).clone(), c);
+                    continue;
+                }
+            }
+
+            // Auto-assign from palette, wrapping with a brightness shift for overflow
+            let base_idx = idx % palette_len;
+            let cycle = idx / palette_len;
+            let (r, g, b) = ACCOUNT_COLOR_PALETTE[base_idx];
+            let color = if cycle == 0 {
+                egui::Color32::from_rgb(r, g, b)
+            } else {
+                // Shift brightness for subsequent cycles so colors stay distinct
+                let shift = ((cycle as i16) * 40).min(120);
+                egui::Color32::from_rgb(
+                    (r as i16 + shift).clamp(0, 255) as u8,
+                    (g as i16 + shift).clamp(0, 255) as u8,
+                    (b as i16 + shift).clamp(0, 255) as u8,
+                )
+            };
+            map.insert((*profile_id).clone(), color);
+        }
+
+        map
+    }
+
+    fn parse_hex_color(hex: &str) -> Option<egui::Color32> {
+        let hex = hex.strip_prefix('#').unwrap_or(hex);
+        if hex.len() != 6 {
+            return None;
+        }
+        let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+        Some(egui::Color32::from_rgb(r, g, b))
+    }
+
+    fn color32_to_hex(c: egui::Color32) -> String {
+        format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
     }
 
     fn terminal_panel_fill() -> egui::Color32 {

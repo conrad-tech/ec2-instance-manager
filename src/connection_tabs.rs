@@ -3,6 +3,7 @@ pub struct ConnectionTab {
     pub id: u64,
     pub title: String,
     pub instance_id: String,
+    pub profile_id: String,
     pub running: bool,
     pub lines: Vec<String>,
 }
@@ -41,13 +42,14 @@ impl ConnectionTabs {
         self.tabs.iter().find(|t| t.id == id)
     }
 
-    pub fn open(&mut self, title: String, instance_id: String) -> u64 {
+    pub fn open(&mut self, title: String, instance_id: String, profile_id: String) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         self.tabs.push(ConnectionTab {
             id,
             title,
             instance_id,
+            profile_id,
             running: true,
             lines: Vec::new(),
         });
@@ -58,6 +60,12 @@ impl ConnectionTabs {
     pub fn select(&mut self, id: u64) {
         if self.tabs.iter().any(|t| t.id == id) {
             self.selected = Some(id);
+        }
+    }
+
+    pub fn rename(&mut self, id: u64, new_title: String) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+            tab.title = new_title;
         }
     }
 
@@ -96,8 +104,8 @@ mod tests {
     #[test]
     fn open_select_close_tabs() {
         let mut tabs = ConnectionTabs::new();
-        let a = tabs.open("api-a".to_string(), "i-a".to_string());
-        let b = tabs.open("api-b".to_string(), "i-b".to_string());
+        let a = tabs.open("api-a".to_string(), "i-a".to_string(), "dev".to_string());
+        let b = tabs.open("api-b".to_string(), "i-b".to_string(), "qa".to_string());
 
         assert_eq!(tabs.tabs().len(), 2);
         assert_eq!(tabs.selected(), Some(b));
@@ -113,7 +121,7 @@ mod tests {
     #[test]
     fn append_lines_and_cap_buffer() {
         let mut tabs = ConnectionTabs::new();
-        let id = tabs.open("api-a".to_string(), "i-a".to_string());
+        let id = tabs.open("api-a".to_string(), "i-a".to_string(), "dev".to_string());
 
         for i in 0..10_200 {
             tabs.append_line(id, format!("line {i}"));

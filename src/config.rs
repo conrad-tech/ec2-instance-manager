@@ -27,6 +27,8 @@ pub struct AppConfig {
     pub theme: Option<String>,
     pub scroll_sensitivity: Option<f32>,
     pub ui_scale: Option<f32>,
+    pub account_colors_enabled: bool,
+    pub account_colors: BTreeMap<String, String>,
 }
 
 impl Default for AppConfig {
@@ -57,6 +59,8 @@ impl Default for AppConfig {
             theme: None,
             scroll_sensitivity: None,
             ui_scale: None,
+            account_colors_enabled: true,
+            account_colors: BTreeMap::new(),
         }
     }
 }
@@ -291,6 +295,14 @@ impl AppConfig {
                 continue;
             }
 
+            if let Some(rest) = key.strip_prefix("account_color.") {
+                if !rest.is_empty() && !value.is_empty() {
+                    cfg.account_colors
+                        .insert(rest.to_string(), value.to_string());
+                }
+                continue;
+            }
+
             if let Some(rest) = key.strip_prefix("account_region.") {
                 if !rest.is_empty() && !value.is_empty() {
                     cfg.account_regions
@@ -390,6 +402,9 @@ impl AppConfig {
                         cfg.ui_scale = Some(val);
                     }
                 }
+                "account_colors_enabled" => {
+                    cfg.account_colors_enabled = !matches!(value, "0" | "false" | "FALSE");
+                }
                 "last_selected_profile" => {
                     cfg.last_selected_profile = if value.is_empty() {
                         None
@@ -464,6 +479,14 @@ impl AppConfig {
 
         if let Some(last) = &self.last_selected_profile {
             lines.push(format!("last_selected_profile={last}"));
+        }
+
+        if !self.account_colors_enabled {
+            lines.push("account_colors_enabled=0".to_string());
+        }
+
+        for (profile, color) in &self.account_colors {
+            lines.push(format!("account_color.{profile}={color}"));
         }
 
         for (account, region) in &self.account_regions {
