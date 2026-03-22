@@ -920,9 +920,17 @@ mod gui {
                 }) || app.options.mode == Mode::Sim;
 
                 // Always set a preliminary context so Connect doesn't fail with "context not loaded"
+                // Resolve the profile_id to an actual AWS CLI profile name.
+                // If profile_id is already a profile name (from accounts.json "profile" field),
+                // find_profile_by_account_id will return None and we use profile_id as-is.
+                let resolved_profile = credentials::find_profile_by_account_id(&profile_id)
+                    .unwrap_or_else(|| profile_id.clone());
+                app.log_info(format!(
+                    "profile resolution: profile_id={profile_id} -> resolved={resolved_profile}"
+                ));
                 app.context = Some(AwsContext {
                     mode: app.options.mode.clone(),
-                    profile: profile_id.clone(),
+                    profile: resolved_profile,
                     account_id,
                     arn: None,
                     user_id: None,
