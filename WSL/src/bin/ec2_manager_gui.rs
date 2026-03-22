@@ -1823,6 +1823,25 @@ mod gui {
             while let Ok(event) = self.proc_rx.try_recv() {
                 match event {
                     ProcEvent::Output { tab_id, bytes } => {
+                        // Filter the harmless WSL ConPTY getpwuid warning from
+                        // the terminal display, but log it for diagnostics.
+                        let bytes = {
+                            let text = String::from_utf8_lossy(&bytes);
+                            if text.contains("CreateProcessParseCommon:1005: getpwuid") {
+                                for line in text.lines() {
+                                    if line.contains("CreateProcessParseCommon:1005: getpwuid") {
+                                        self.log_debug(format!("tab={tab_id} filtered WSL noise: {line}"));
+                                    }
+                                }
+                                let cleaned: String = text.lines()
+                                    .filter(|l| !l.contains("CreateProcessParseCommon:1005: getpwuid"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                cleaned.into_bytes()
+                            } else {
+                                bytes
+                            }
+                        };
                         let log_msg = if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
                             session.bytes_received += bytes.len() as u64;
                             session.output_event_count += 1;
