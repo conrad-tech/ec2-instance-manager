@@ -3184,13 +3184,9 @@ mod gui {
                                 ui.painter().circle_filled(rect.center(), 4.0, color);
                             }
 
-                            let prefix = if *running { "" } else { "[done] " };
                             let selected = self.connections.selected() == Some(*id);
                             if ui
-                                .selectable_label(
-                                    selected,
-                                    format!("{}{}", prefix, truncate(title, 28)),
-                                )
+                                .selectable_label(selected, truncate(title, 28))
                                 .clicked()
                             {
                                 to_select = Some(*id);
