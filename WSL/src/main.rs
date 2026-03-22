@@ -256,7 +256,7 @@ fn run() -> Result<()> {
             ));
         }
 
-        let base_cmd = build_ssm_session_command(&instance.instance_id, &context.region);
+        let base_cmd = build_ssm_session_command(&instance.instance_id, &context.region, &context.profile);
         let session_cmd = if mode == Mode::Sim {
             format!("echo '[SIM MODE] {base_cmd}'")
         } else {
@@ -314,6 +314,7 @@ fn run() -> Result<()> {
         let base_cmd = build_ssm_port_forward_command(
             &instance.instance_id,
             &context.region,
+            &context.profile,
             local_port,
             remote_port,
         );
@@ -906,7 +907,7 @@ fn run_interactive_shell(
                 continue;
             };
 
-            let base_cmd = build_ssm_session_command(&instance.instance_id, &context.region);
+            let base_cmd = build_ssm_session_command(&instance.instance_id, &context.region, &context.profile);
             let command = if context.mode == Mode::Sim {
                 format!("echo '[SIM MODE] {base_cmd}'")
             } else {
@@ -976,6 +977,7 @@ fn run_interactive_shell(
             let base_cmd = build_ssm_port_forward_command(
                 &instance.instance_id,
                 &context.region,
+                &context.profile,
                 local_port,
                 remote_port,
             );

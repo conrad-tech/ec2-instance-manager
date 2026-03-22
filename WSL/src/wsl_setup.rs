@@ -7,6 +7,32 @@ use std::os::windows::process::CommandExt;
 
 use crate::config::AppConfig;
 
+/// Simple base64 encoder to avoid quoting issues when passing commands through shell layers.
+fn base64_encode(input: &str) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 /// Result of checking WSL prerequisites.
 #[derive(Clone, Debug)]
 pub struct WslSetupStatus {
@@ -330,7 +356,15 @@ pub fn run_wsl_setup() -> WslSetupStatus {
 /// Run a command inside WSL with sudo, piping the password via stdin.
 /// Returns (success, output).
 fn wsl_sudo_run(password: &str, cmd_str: &str) -> (bool, String) {
-    let full_cmd = format!("echo '{}' | sudo -S bash -c '{}'", password, cmd_str);
+    // Use a heredoc-style approach to avoid single-quote nesting issues.
+    // The password is piped via stdin to sudo -S, and the command is passed
+    // as a base64-encoded string to avoid any quoting problems.
+    let encoded = base64_encode(cmd_str);
+    let full_cmd = format!(
+        "echo '{}' | sudo -S bash -c \"$(echo '{}' | base64 -d)\"",
+        password.replace('\'', "'\\''"),
+        encoded
+    );
     let mut cmd = Command::new("wsl.exe");
     cmd.args(["-e", "bash", "-c", &full_cmd])
         .stdout(Stdio::piped())

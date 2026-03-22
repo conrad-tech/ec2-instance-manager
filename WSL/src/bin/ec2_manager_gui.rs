@@ -1541,7 +1541,7 @@ mod gui {
             }
 
             let command_args =
-                build_ssm_session_args(&instance.instance_id, &context.region);
+                build_ssm_session_args(&instance.instance_id, &context.region, &context.profile);
             let command_line = format!("aws {}", command_args.join(" "));
             let command = if context.mode == Mode::Sim {
                 let kind = self
@@ -1596,6 +1596,7 @@ mod gui {
             let command_args = build_ssm_port_forward_args(
                 &instance.instance_id,
                 &context.region,
+                &context.profile,
                 self.local_port,
                 self.remote_port,
             );
@@ -5292,6 +5293,8 @@ mod gui {
         );
         cmd.env("AWS_PROFILE", &context.profile);
         cmd.env("AWS_REGION", &context.region);
+        // Ensure AWS env vars pass through to WSL sessions
+        cmd.env("WSLENV", "AWS_PROFILE/u:AWS_REGION/u");
         cmd.env("TERM", "xterm-256color");
         #[cfg(target_os = "windows")]
         {

@@ -155,7 +155,7 @@ pub fn pick_default_terminal(
     terminals.first().cloned()
 }
 
-pub fn build_ssm_session_args(instance_id: &str, region: &str) -> Vec<String> {
+pub fn build_ssm_session_args(instance_id: &str, region: &str, profile: &str) -> Vec<String> {
     vec![
         "ssm".to_string(),
         "start-session".to_string(),
@@ -163,12 +163,15 @@ pub fn build_ssm_session_args(instance_id: &str, region: &str) -> Vec<String> {
         instance_id.to_string(),
         "--region".to_string(),
         region.to_string(),
+        "--profile".to_string(),
+        profile.to_string(),
     ]
 }
 
 pub fn build_ssm_port_forward_args(
     instance_id: &str,
     region: &str,
+    profile: &str,
     local_port: u16,
     remote_port: u16,
 ) -> Vec<String> {
@@ -179,6 +182,8 @@ pub fn build_ssm_port_forward_args(
         instance_id.to_string(),
         "--region".to_string(),
         region.to_string(),
+        "--profile".to_string(),
+        profile.to_string(),
         "--document-name".to_string(),
         "AWS-StartPortForwardingSession".to_string(),
         "--parameters".to_string(),
@@ -188,22 +193,23 @@ pub fn build_ssm_port_forward_args(
     ]
 }
 
-pub fn build_ssm_session_command(instance_id: &str, region: &str) -> String {
+pub fn build_ssm_session_command(instance_id: &str, region: &str, profile: &str) -> String {
     format!(
         "aws {}",
-        build_ssm_session_args(instance_id, region).join(" ")
+        build_ssm_session_args(instance_id, region, profile).join(" ")
     )
 }
 
 pub fn build_ssm_port_forward_command(
     instance_id: &str,
     region: &str,
+    profile: &str,
     local_port: u16,
     remote_port: u16,
 ) -> String {
     format!(
         "aws {}",
-        build_ssm_port_forward_args(instance_id, region, local_port, remote_port).join(" ")
+        build_ssm_port_forward_args(instance_id, region, profile, local_port, remote_port).join(" ")
     )
 }
 
@@ -434,15 +440,16 @@ mod tests {
 
     #[test]
     fn build_port_forward_command() {
-        let cmd = build_ssm_port_forward_command("i-abc", "us-east-1", 15432, 5432);
+        let cmd = build_ssm_port_forward_command("i-abc", "us-east-1", "default", 15432, 5432);
         assert!(cmd.contains("AWS-StartPortForwardingSession"));
         assert!(cmd.contains("localPortNumber=15432"));
         assert!(cmd.contains("portNumber=5432"));
+        assert!(cmd.contains("--profile default"));
     }
 
     #[test]
     fn build_port_forward_command_is_shell_neutral() {
-        let cmd = build_ssm_port_forward_command("i-abc", "us-east-1", 15432, 5432);
+        let cmd = build_ssm_port_forward_command("i-abc", "us-east-1", "default", 15432, 5432);
         assert!(!cmd.contains('\''));
         assert!(!cmd.contains('"'));
     }
