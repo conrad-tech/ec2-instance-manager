@@ -64,7 +64,6 @@ mod gui {
     const COL_ENV_W: f32 = 40.0;
     const COL_INSTANCE_TYPE_W: f32 = 95.0;
     const COL_AMI_W: f32 = 71.0;
-    const COL_MMODAL_ENV_W: f32 = 90.0;
     const COL_TAG_W: f32 = 120.0;
     const COL_COPY_W: f32 = 14.0;
     const STATE_FILTER_NONE: &str = "";
@@ -121,7 +120,6 @@ mod gui {
         Env,
         InstanceType,
         AmiId,
-        MmodalEnv,
         MatchTag,
     }
 
@@ -159,7 +157,6 @@ mod gui {
                 Self::AmiId => COL_AMI_W + COL_COPY_W,
                 Self::InstanceType => COL_INSTANCE_TYPE_W,
                 Self::Env => COL_ENV_W,
-                Self::MmodalEnv => COL_MMODAL_ENV_W,
                 Self::MatchTag => COL_TAG_W,
             }
         }
@@ -176,7 +173,6 @@ mod gui {
             SortColumn::AmiId,
             SortColumn::InstanceType,
             SortColumn::Env,
-            SortColumn::MmodalEnv,
             SortColumn::MatchTag,
         ];
         cols.iter().map(|c| (*c as u8, c.default_width())).collect()
@@ -474,6 +470,9 @@ mod gui {
         }
     }
 
+    /// Parse rules into include/exclude terms for general search.
+    /// Terms with `TagKey: value` syntax are skipped here — they're handled
+    /// as tag matches in apply_filters.
     fn search_terms_from_rules(rules: &[SearchRuleInput]) -> (Vec<String>, Vec<String>) {
         let mut includes = Vec::new();
         let mut excludes = Vec::new();
@@ -481,6 +480,10 @@ mod gui {
         for rule in rules {
             let term = rule.term.trim();
             if term.is_empty() {
+                continue;
+            }
+            // Skip "Key: Value" syntax — handled as tag match in apply_filters
+            if term.contains(':') {
                 continue;
             }
             match rule.kind {
@@ -1239,6 +1242,53 @@ mod gui {
                     only_ssm_managed: self.only_ssm,
                 },
             );
+
+            // Apply tag-specific rules using "TagKey: value" syntax.
+            // Include rules with colon require the tag to match.
+            // Exclude rules with colon reject instances where the tag matches.
+            let mut tag_includes: Vec<(String, String)> = Vec::new();
+            let mut tag_excludes: Vec<(String, String)> = Vec::new();
+            for rule in &self.search_rules {
+                let term = rule.term.trim();
+                if term.is_empty() {
+                    continue;
+                }
+                if let Some((key, value)) = term.split_once(':') {
+                    let key = key.trim();
+                    let value = value.trim().to_ascii_lowercase();
+                    if !key.is_empty() && !value.is_empty() {
+                        match rule.kind {
+                            SearchRuleKind::Include => {
+                                tag_includes.push((key.to_string(), value));
+                            }
+                            SearchRuleKind::Exclude => {
+                                tag_excludes.push((key.to_string(), value));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !tag_includes.is_empty() || !tag_excludes.is_empty() {
+                self.filtered.retain(|instance| {
+                    // All tag includes must match
+                    let includes_ok = tag_includes.iter().all(|(tag_key, pattern)| {
+                        instance.tags.iter().any(|(k, v)| {
+                            k.eq_ignore_ascii_case(tag_key)
+                                && v.to_ascii_lowercase().contains(pattern.as_str())
+                        })
+                    });
+                    // No tag excludes may match
+                    let excludes_ok = !tag_excludes.iter().any(|(tag_key, pattern)| {
+                        instance.tags.iter().any(|(k, v)| {
+                            k.eq_ignore_ascii_case(tag_key)
+                                && v.to_ascii_lowercase().contains(pattern.as_str())
+                        })
+                    });
+                    includes_ok && excludes_ok
+                });
+            }
+
             self.auto_size_columns();
             self.log_debug(format!(
                 "filters applied -> {} visible / {} total",
@@ -1260,8 +1310,7 @@ mod gui {
                 ("Private IP", SortColumn::PrivateIp),
                 ("AMI ID", SortColumn::AmiId),
                 ("Instance Type", SortColumn::InstanceType),
-                ("Env", SortColumn::Env),
-                ("MMODAL_ENV", SortColumn::MmodalEnv),
+                ("Environment", SortColumn::Env),
             ];
 
             for (label, col) in headers {
@@ -1287,8 +1336,7 @@ mod gui {
                         SortColumn::PrivateIp => inst.private_ip.clone().unwrap_or_default(),
                         SortColumn::AmiId => inst.image_id.clone().unwrap_or_default(),
                         SortColumn::InstanceType => inst.instance_type.clone().unwrap_or_default(),
-                        SortColumn::Env => inst.env.clone().unwrap_or_default(),
-                        SortColumn::MmodalEnv => inst.tags.get("mmodal_env").cloned().unwrap_or_default(),
+                        SortColumn::Env => inst.tags.get("MMODAL_ENV").or_else(|| inst.tags.get("mmodal_env")).cloned().unwrap_or_default(),
                         SortColumn::MatchTag => return 0.0_f32,
                     };
                     text.len() as f32 * char_w + copy_extra + copy_gap + pad
@@ -2643,8 +2691,7 @@ mod gui {
                             ("Private IP", SortColumn::PrivateIp),
                             ("AMI ID", SortColumn::AmiId),
                             ("Instance Type", SortColumn::InstanceType),
-                            ("Env", SortColumn::Env),
-                            ("MMODAL_ENV", SortColumn::MmodalEnv),
+                            ("Environment", SortColumn::Env),
                             ("Match Tag", SortColumn::MatchTag),
                         ];
                         for (label, col) in header_columns {
@@ -2741,8 +2788,8 @@ mod gui {
                                         ia.cmp(ib)
                                     }
                                     SortColumn::Env => {
-                                        let ea = a.env.as_deref().unwrap_or("");
-                                        let eb = b.env.as_deref().unwrap_or("");
+                                        let ea = a.tags.get("MMODAL_ENV").or_else(|| a.tags.get("mmodal_env")).map(|s| s.as_str()).unwrap_or("");
+                                        let eb = b.tags.get("MMODAL_ENV").or_else(|| b.tags.get("mmodal_env")).map(|s| s.as_str()).unwrap_or("");
                                         ea.to_ascii_lowercase().cmp(&eb.to_ascii_lowercase())
                                     }
                                     SortColumn::InstanceType => {
@@ -2754,11 +2801,6 @@ mod gui {
                                         let aa = a.image_id.as_deref().unwrap_or("");
                                         let ab = b.image_id.as_deref().unwrap_or("");
                                         aa.cmp(ab)
-                                    }
-                                    SortColumn::MmodalEnv => {
-                                        let ma = a.tags.get("mmodal_env").map(|s| s.as_str()).unwrap_or("");
-                                        let mb = b.tags.get("mmodal_env").map(|s| s.as_str()).unwrap_or("");
-                                        ma.to_ascii_lowercase().cmp(&mb.to_ascii_lowercase())
                                     }
                                     SortColumn::MatchTag => {
                                         // Sort by first matching tag value
@@ -2914,24 +2956,18 @@ mod gui {
                             row_double_clicked |= resp_itype.double_clicked();
                             row_hovered |= resp_itype.hovered();
 
+                            let env_val = instance.tags.get("MMODAL_ENV")
+                                .or_else(|| instance.tags.get("mmodal_env"))
+                                .cloned()
+                                .unwrap_or_default();
                             let resp_env = ui.allocate_ui_with_layout(
                                 egui::vec2(cw(SortColumn::Env), 18.0),
                                 egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-                                |ui| ui.add(egui::Label::new(instance.env.clone().unwrap_or_default()).sense(egui::Sense::click())),
+                                |ui| ui.add(egui::Label::new(env_val).sense(egui::Sense::click())),
                             ).inner;
                             row_clicked |= resp_env.clicked();
                             row_double_clicked |= resp_env.double_clicked();
                             row_hovered |= resp_env.hovered();
-
-                            let mmodal_env_val = instance.tags.get("mmodal_env").cloned().unwrap_or_default();
-                            let resp_mmodal = ui.allocate_ui_with_layout(
-                                egui::vec2(cw(SortColumn::MmodalEnv), 18.0),
-                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-                                |ui| ui.add(egui::Label::new(mmodal_env_val).sense(egui::Sense::click())),
-                            ).inner;
-                            row_clicked |= resp_mmodal.clicked();
-                            row_double_clicked |= resp_mmodal.double_clicked();
-                            row_hovered |= resp_mmodal.hovered();
 
                             let matched_tag_text = if include_terms.is_empty() {
                                 String::new()
@@ -2963,7 +2999,6 @@ mod gui {
                                 .union(resp_env.clone())
                                 .union(resp_itype.clone())
                                 .union(resp_ami.clone())
-                                .union(resp_mmodal.clone())
                                 .union(resp_tag.clone());
 
                             row_response.context_menu(|ui| {
