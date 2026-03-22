@@ -788,6 +788,8 @@ mod gui {
         /// Profile ID for the color picker (from Edit menu or right-click)
         color_picker_profile: Option<String>,
         file_browsers: HashMap<u64, FileBrowserState>,
+        /// Per-tab editor/terminal vertical split ratio (0.0-1.0, 0.5 = 50/50)
+        editor_split: HashMap<u64, f32>,
         file_op_tx: Sender<FileOpEvent>,
         file_op_rx: Receiver<FileOpEvent>,
         #[cfg(target_os = "windows")]
@@ -925,6 +927,7 @@ mod gui {
                 tab_color_picker_rgb: [0.0, 0.0, 0.0],
                 color_picker_profile: None,
                 file_browsers: HashMap::new(),
+                editor_split: HashMap::new(),
                 file_op_tx,
                 file_op_rx,
                 #[cfg(target_os = "windows")]
@@ -2668,6 +2671,7 @@ mod gui {
                             content.len()
                         ));
                         if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                            let was_empty = fb.editor_tabs.is_empty();
                             // Check if file is already open — switch to it
                             if let Some(idx) = fb.editor_tabs.iter().position(|t| t.remote_path == remote_path) {
                                 fb.active_editor = Some(idx);
@@ -2682,6 +2686,10 @@ mod gui {
                                 fb.active_editor = Some(fb.editor_tabs.len() - 1);
                             }
                             fb.status = FileOpStatus::Idle;
+                            // Default to 50/50 split when first file opens
+                            if was_empty {
+                                self.editor_split.insert(tab_id, 0.5);
+                            }
                         }
                     }
                     FileOpEvent::FileReadFailed { tab_id, error } => {
@@ -3594,11 +3602,20 @@ mod gui {
                 let font_id = egui::TextStyle::Monospace.resolve(ui.style());
                 let tab_id = tab.id;
                 let tab_lines = tab.lines.clone();
+
+                // --- Editor file tabs (above the main split) ---
+                self.render_editor_tab_bar(ui, tab_id);
+
                 let available = ui.available_size();
                 let file_browser_width = 220.0_f32;
 
+                let has_editors = self.file_browsers.get(&tab_id)
+                    .map(|fb| !fb.editor_tabs.is_empty())
+                    .unwrap_or(false);
+                let split_ratio = self.editor_split.get(&tab_id).copied().unwrap_or(0.5);
+
                 ui.horizontal(|ui| {
-                    // Left: File browser panel
+                    // Left: File browser sidebar
                     ui.allocate_ui_with_layout(
                         egui::vec2(file_browser_width, available.y),
                         egui::Layout::top_down(egui::Align::Min),
@@ -3609,7 +3626,6 @@ mod gui {
 
                     ui.separator();
 
-                    // Right: Terminal with outer banner
                     let banner_fill = if self.dark_mode {
                         egui::Color32::from_rgb(44, 44, 44)
                     } else {
@@ -3617,10 +3633,49 @@ mod gui {
                     };
 
                     let remaining_width = (available.x - file_browser_width - 12.0).max(100.0);
+                    let splitter_height = 6.0_f32;
+
+                    // Right: vertical split (editor top + terminal bottom)
                     ui.allocate_ui_with_layout(
                         egui::vec2(remaining_width, available.y),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
+                            // --- Editor panel (top half) ---
+                            if has_editors {
+                                let editor_height = (available.y * split_ratio - splitter_height / 2.0).max(50.0);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(remaining_width, editor_height),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        self.render_editor_content(ui, tab_id);
+                                    },
+                                );
+
+                                // --- Draggable splitter ---
+                                let splitter_rect = ui.allocate_space(egui::vec2(remaining_width, splitter_height)).1;
+                                let splitter_id = ui.make_persistent_id(("editor_splitter", tab_id));
+                                let splitter_response = ui.interact(splitter_rect, splitter_id, egui::Sense::drag());
+                                // Draw splitter line
+                                ui.painter().rect_filled(
+                                    splitter_rect,
+                                    0.0,
+                                    if splitter_response.hovered() || splitter_response.dragged() {
+                                        egui::Color32::from_rgb(100, 100, 200)
+                                    } else {
+                                        egui::Color32::from_rgb(80, 80, 80)
+                                    },
+                                );
+                                if splitter_response.hovered() || splitter_response.dragged() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                                }
+                                if splitter_response.dragged() {
+                                    let delta = splitter_response.drag_delta().y;
+                                    let new_ratio = (split_ratio + delta / available.y).clamp(0.1, 0.9);
+                                    self.editor_split.insert(tab_id, new_ratio);
+                                }
+                            }
+
+                            // --- Terminal panel (bottom / full when no editor) ---
                             let terminal_response = egui::Frame::NONE
                                 .fill(banner_fill)
                                 .inner_margin(egui::Margin::same(4))
@@ -4124,188 +4179,6 @@ mod gui {
                 self.request_file_read(tab_id, file_path);
             }
 
-            // Inline editor tabs
-            let has_editors = self.file_browsers.get(&tab_id)
-                .map(|fb| !fb.editor_tabs.is_empty())
-                .unwrap_or(false);
-            if has_editors {
-                ui.separator();
-
-                // Editor tab bar — horizontal scrolling
-                let tab_snapshot: Vec<(usize, String, bool, String)> = self.file_browsers
-                    .get(&tab_id)
-                    .map(|fb| {
-                        fb.editor_tabs.iter().enumerate().map(|(i, et)| {
-                            (i, et.filename().to_string(), et.dirty, et.status.clone())
-                        }).collect()
-                    })
-                    .unwrap_or_default();
-                let active_editor = self.file_browsers.get(&tab_id)
-                    .and_then(|fb| fb.active_editor);
-                let mut new_active: Option<usize> = active_editor;
-                let mut close_editor: Option<usize> = None;
-
-                egui::ScrollArea::horizontal()
-                    .id_salt(("editor_tabs", tab_id))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            for (idx, filename, dirty, _status) in &tab_snapshot {
-                                let is_active = active_editor == Some(*idx);
-                                let label = if *dirty {
-                                    format!("{filename} *")
-                                } else {
-                                    filename.clone()
-                                };
-                                let frame = if is_active {
-                                    egui::Frame::group(ui.style())
-                                        .fill(ui.style().visuals.selection.bg_fill)
-                                } else {
-                                    egui::Frame::group(ui.style())
-                                };
-                                frame.show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        if ui.selectable_label(is_active, &label).clicked() {
-                                            new_active = Some(*idx);
-                                        }
-                                        if ui.small_button("x").clicked() {
-                                            close_editor = Some(*idx);
-                                        }
-                                    });
-                                });
-                            }
-                        });
-                    });
-
-                // Handle tab close
-                if let Some(close_idx) = close_editor {
-                    if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
-                        fb.editor_tabs.remove(close_idx);
-                        if fb.editor_tabs.is_empty() {
-                            fb.active_editor = None;
-                        } else if let Some(active) = fb.active_editor {
-                            if active >= fb.editor_tabs.len() {
-                                fb.active_editor = Some(fb.editor_tabs.len() - 1);
-                            } else if active > close_idx {
-                                fb.active_editor = Some(active - 1);
-                            }
-                        }
-                    }
-                } else if new_active != active_editor {
-                    if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
-                        fb.active_editor = new_active;
-                    }
-                }
-
-                // Render active editor content
-                let editor_data = self.file_browsers.get(&tab_id).and_then(|fb| {
-                    fb.active_editor.and_then(|idx| {
-                        fb.editor_tabs.get(idx).map(|et| (
-                            et.remote_path.clone(),
-                            et.content.clone(),
-                            et.dirty,
-                            et.status.clone(),
-                            fb.status.clone(),
-                        ))
-                    })
-                });
-                if let Some((remote_path, mut editor_content, editor_dirty, editor_status, ed_status)) = editor_data {
-                    // Status line
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{remote_path}"));
-                        if !editor_status.is_empty() {
-                            if editor_status.starts_with("Error") || editor_status.starts_with("Save failed") {
-                                ui.colored_label(egui::Color32::RED, &editor_status);
-                            } else if editor_status == "Saved" {
-                                ui.colored_label(egui::Color32::GREEN, &editor_status);
-                            } else {
-                                ui.label(&editor_status);
-                            }
-                        }
-                    });
-
-                    let saving = matches!(ed_status, FileOpStatus::Uploading);
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(editor_dirty && !saving, egui::Button::new("Save (Ctrl+S)")).clicked() {
-                            if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
-                                if let Some(idx) = fb.active_editor {
-                                    if let Some(et) = fb.editor_tabs.get_mut(idx) {
-                                        et.content = editor_content.clone();
-                                    }
-                                }
-                            }
-                            self.request_file_save(tab_id);
-                        }
-                    });
-
-                    // Ctrl+S shortcut
-                    let ctrl_s = ui.input(|i| {
-                        i.events.iter().any(|e| matches!(e,
-                            egui::Event::Key {
-                                key: egui::Key::S,
-                                pressed: true,
-                                modifiers,
-                                ..
-                            } if modifiers.ctrl || modifiers.command
-                        ))
-                    });
-                    if ctrl_s && editor_dirty && !saving {
-                        if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
-                            if let Some(idx) = fb.active_editor {
-                                if let Some(et) = fb.editor_tabs.get_mut(idx) {
-                                    et.content = editor_content.clone();
-                                }
-                            }
-                        }
-                        self.request_file_save(tab_id);
-                    }
-
-                    // Text editor with line numbers
-                    egui::ScrollArea::both()
-                        .max_height(ui.available_height() - 40.0)
-                        .show(ui, |ui| {
-                            ui.horizontal_top(|ui| {
-                                let line_count = editor_content.lines().count().max(1);
-                                let line_numbers: String = (1..=line_count)
-                                    .map(|n| format!("{n:>4}"))
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut line_numbers.as_str())
-                                        .font(egui::TextStyle::Monospace)
-                                        .desired_width(40.0)
-                                        .interactive(false)
-                                        .frame(false),
-                                );
-                                let response = ui.add(
-                                    egui::TextEdit::multiline(&mut editor_content)
-                                        .font(egui::TextStyle::Monospace)
-                                        .desired_width(f32::INFINITY)
-                                        .code_editor(),
-                                );
-                                if response.changed() {
-                                    if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
-                                        if let Some(idx) = fb.active_editor {
-                                            if let Some(et) = fb.editor_tabs.get_mut(idx) {
-                                                et.dirty = editor_content != et.original;
-                                                et.content = editor_content;
-                                                if et.status == "Saved" {
-                                                    et.status.clear();
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            });
-                        });
-                }
-
-                // Handle navigation even when editor is open
-                if let Some(nav) = navigate_to {
-                    self.request_file_listing(tab_id, nav);
-                }
-                return;
-            }
-
             ui.separator();
 
             // Upload / Download buttons
@@ -4383,6 +4256,181 @@ mod gui {
             if let Some(path) = navigate_to {
                 self.request_file_listing(tab_id, path);
             }
+        }
+
+        /// Render the editor file tab bar (horizontal scrolling, shown above the editor/terminal split).
+        fn render_editor_tab_bar(&mut self, ui: &mut egui::Ui, tab_id: u64) {
+            let tab_snapshot: Vec<(usize, String, bool)> = self.file_browsers
+                .get(&tab_id)
+                .map(|fb| {
+                    fb.editor_tabs.iter().enumerate().map(|(i, et)| {
+                        (i, et.filename().to_string(), et.dirty)
+                    }).collect()
+                })
+                .unwrap_or_default();
+            if tab_snapshot.is_empty() {
+                return;
+            }
+            let active_editor = self.file_browsers.get(&tab_id)
+                .and_then(|fb| fb.active_editor);
+            let mut new_active: Option<usize> = active_editor;
+            let mut close_editor: Option<usize> = None;
+
+            egui::ScrollArea::horizontal()
+                .id_salt(("editor_tabs", tab_id))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (idx, filename, dirty) in &tab_snapshot {
+                            let is_active = active_editor == Some(*idx);
+                            let label = if *dirty {
+                                format!("{filename} *")
+                            } else {
+                                filename.clone()
+                            };
+                            let frame = if is_active {
+                                egui::Frame::group(ui.style())
+                                    .fill(ui.style().visuals.selection.bg_fill)
+                            } else {
+                                egui::Frame::group(ui.style())
+                            };
+                            frame.show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.selectable_label(is_active, &label).clicked() {
+                                        new_active = Some(*idx);
+                                    }
+                                    if ui.small_button("x").clicked() {
+                                        close_editor = Some(*idx);
+                                    }
+                                });
+                            });
+                        }
+                    });
+                });
+
+            // Handle tab close
+            if let Some(close_idx) = close_editor {
+                if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                    fb.editor_tabs.remove(close_idx);
+                    if fb.editor_tabs.is_empty() {
+                        fb.active_editor = None;
+                        self.editor_split.remove(&tab_id);
+                    } else if let Some(active) = fb.active_editor {
+                        if active >= fb.editor_tabs.len() {
+                            fb.active_editor = Some(fb.editor_tabs.len() - 1);
+                        } else if active > close_idx {
+                            fb.active_editor = Some(active - 1);
+                        }
+                    }
+                }
+            } else if new_active != active_editor {
+                if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                    fb.active_editor = new_active;
+                }
+            }
+        }
+
+        /// Render the active editor content (code editor with line numbers + save).
+        fn render_editor_content(&mut self, ui: &mut egui::Ui, tab_id: u64) {
+            let editor_data = self.file_browsers.get(&tab_id).and_then(|fb| {
+                fb.active_editor.and_then(|idx| {
+                    fb.editor_tabs.get(idx).map(|et| (
+                        et.remote_path.clone(),
+                        et.content.clone(),
+                        et.dirty,
+                        et.status.clone(),
+                        fb.status.clone(),
+                    ))
+                })
+            });
+            let Some((remote_path, mut editor_content, editor_dirty, editor_status, ed_status)) = editor_data else {
+                return;
+            };
+
+            // Status + save bar
+            ui.horizontal(|ui| {
+                ui.label(&remote_path);
+                if !editor_status.is_empty() {
+                    if editor_status.starts_with("Error") || editor_status.starts_with("Save failed") {
+                        ui.colored_label(egui::Color32::RED, &editor_status);
+                    } else if editor_status == "Saved" {
+                        ui.colored_label(egui::Color32::GREEN, &editor_status);
+                    } else {
+                        ui.label(&editor_status);
+                    }
+                }
+                let saving = matches!(ed_status, FileOpStatus::Uploading);
+                if ui.add_enabled(editor_dirty && !saving, egui::Button::new("Save")).clicked() {
+                    if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                        if let Some(idx) = fb.active_editor {
+                            if let Some(et) = fb.editor_tabs.get_mut(idx) {
+                                et.content = editor_content.clone();
+                            }
+                        }
+                    }
+                    self.request_file_save(tab_id);
+                }
+
+                // Ctrl+S shortcut
+                let ctrl_s = ui.input(|i| {
+                    i.events.iter().any(|e| matches!(e,
+                        egui::Event::Key {
+                            key: egui::Key::S,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if modifiers.ctrl || modifiers.command
+                    ))
+                });
+                if ctrl_s && editor_dirty && !saving {
+                    if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                        if let Some(idx) = fb.active_editor {
+                            if let Some(et) = fb.editor_tabs.get_mut(idx) {
+                                et.content = editor_content.clone();
+                            }
+                        }
+                    }
+                    self.request_file_save(tab_id);
+                }
+            });
+
+            // Code editor with line numbers
+            egui::ScrollArea::both()
+                .id_salt(("editor_scroll", tab_id))
+                .show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        let line_count = editor_content.lines().count().max(1);
+                        let line_numbers: String = (1..=line_count)
+                            .map(|n| format!("{n:>4}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut line_numbers.as_str())
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(40.0)
+                                .interactive(false)
+                                .frame(false),
+                        );
+                        let response = ui.add(
+                            egui::TextEdit::multiline(&mut editor_content)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .code_editor(),
+                        );
+                        if response.changed() {
+                            if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                                if let Some(idx) = fb.active_editor {
+                                    if let Some(et) = fb.editor_tabs.get_mut(idx) {
+                                        et.dirty = editor_content != et.original;
+                                        et.content = editor_content;
+                                        if et.status == "Saved" {
+                                            et.status.clear();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                });
         }
 
         fn render_log_panel(&mut self, ui: &mut egui::Ui) {
