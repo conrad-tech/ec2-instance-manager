@@ -34,7 +34,7 @@ mod gui {
     use ec2_manager::inventory::load_inventory;
     use ec2_manager::models::{
         AuthStatus, AwsContext, DependencyStatus, Instance, Inventory, Mode, ProfileAuthInfo,
-        SavedFilter, TerminalKind, TerminalOption,
+        ProfileConfig, SavedFilter, TerminalKind, TerminalOption,
     };
     use ec2_manager::profile_choice::profile_choice_path;
     use ec2_manager::terminal::{
@@ -282,14 +282,20 @@ mod gui {
 
     enum RefreshEvent {
         Completed {
+            generation: u64,
+            profile_id: String,
             context: AwsContext,
             inventory: Inventory,
             config_update: Option<(String, String)>,
         },
         AuthNotOk {
+            generation: u64,
+            profile_id: String,
             context: AwsContext,
         },
         Failed {
+            generation: u64,
+            profile_id: String,
             error: String,
         },
     }
@@ -694,6 +700,9 @@ mod gui {
         refresh_tx: Sender<RefreshEvent>,
         refresh_rx: Receiver<RefreshEvent>,
         refreshing: bool,
+        refresh_generation: u64,
+        /// Profiles currently being refreshed in background threads
+        refreshing_profiles: HashMap<String, u64>,
         /// Per-profile in-memory inventory cache: profile_id -> (Inventory, AwsContext)
         profile_inventory_cache: HashMap<String, (Inventory, AwsContext)>,
         dark_mode: bool,
@@ -800,6 +809,8 @@ mod gui {
                 refresh_tx,
                 refresh_rx,
                 refreshing: false,
+                refresh_generation: 0,
+                refreshing_profiles: HashMap::new(),
                 profile_inventory_cache: HashMap::new(),
                 dark_mode,
                 scroll_sensitivity,
@@ -876,7 +887,7 @@ mod gui {
                 app.log_info("no selected profile, skipping disk cache");
             }
 
-            app.refresh_context_and_inventory(true);
+            app.refresh_all_authenticated(true);
             app
         }
 
@@ -928,30 +939,34 @@ mod gui {
             if current_mtime != self.last_credentials_mtime {
                 self.last_credentials_mtime = current_mtime;
 
-                // Check if the current profile was NOT authenticated before
-                let was_auth_ok = self.selected_profile.as_ref().map(|pid| {
-                    self.profile_auth_infos.iter().any(|a| {
-                        a.profile_id == *pid && a.auth_status == AuthStatus::Ok
+                // Remember which profiles were NOT authenticated before
+                let previously_unauthed: Vec<String> = self
+                    .config
+                    .profiles
+                    .iter()
+                    .filter(|p| {
+                        !self.profile_auth_infos.iter().any(|a| {
+                            a.profile_id == p.profile_id && a.auth_status == AuthStatus::Ok
+                        })
                     })
-                }).unwrap_or(false);
+                    .map(|p| p.profile_id.clone())
+                    .collect();
 
                 self.profile_auth_infos =
                     credentials::check_all_profiles_auth(&self.config.profiles);
                 self.log_debug("credentials file changed; refreshed profile auth status");
 
-                // If auth just became OK, load cache and start refresh
-                if !was_auth_ok {
-                    if let Some(ref profile_id) = self.selected_profile.clone() {
-                        let is_now_ok = self.profile_auth_infos.iter().any(|a| {
-                            a.profile_id == *profile_id && a.auth_status == AuthStatus::Ok
-                        });
-                        if is_now_ok {
-                            self.log_info(format!(
-                                "auth became OK for profile={profile_id}, loading cache"
-                            ));
-                            self.load_cache_for_profile(profile_id);
-                            self.refresh_context_and_inventory(true);
-                        }
+                // Refresh any profiles that just became authenticated
+                for pid in &previously_unauthed {
+                    let is_now_ok = self.profile_auth_infos.iter().any(|a| {
+                        a.profile_id == *pid && a.auth_status == AuthStatus::Ok
+                    });
+                    if is_now_ok {
+                        self.log_info(format!(
+                            "auth became OK for profile={pid}, loading cache and refreshing"
+                        ));
+                        self.load_cache_for_profile(pid);
+                        self.refresh_profile(pid, true);
                     }
                 }
             }
@@ -1020,20 +1035,21 @@ mod gui {
         }
 
         fn rebuild_account_colors(&mut self) {
-            // Collect all known profile_ids: from config + from open tabs
-            let mut profile_ids: Vec<String> = self
-                .config
-                .profiles
-                .iter()
-                .map(|p| p.profile_id.clone())
-                .collect();
+            // Collect extra profile_ids from open tabs not in config
+            let mut extra_ids: Vec<String> = Vec::new();
             for tab in self.connections.tabs() {
-                if !tab.profile_id.is_empty() && !profile_ids.contains(&tab.profile_id) {
-                    profile_ids.push(tab.profile_id.clone());
+                if !tab.profile_id.is_empty()
+                    && !self.config.profiles.iter().any(|p| p.profile_id == tab.profile_id)
+                    && !extra_ids.contains(&tab.profile_id)
+                {
+                    extra_ids.push(tab.profile_id.clone());
                 }
             }
-            self.account_color_map =
-                build_account_color_map(&profile_ids, &self.config.account_colors);
+            self.account_color_map = build_account_color_map(
+                &self.config.profiles,
+                &extra_ids,
+                &self.config.account_colors,
+            );
         }
 
         /// Load cached inventory for a profile (in-memory first, then disk).
@@ -1088,19 +1104,25 @@ mod gui {
             }
         }
 
-        fn refresh_context_and_inventory(&mut self, force: bool) {
-            if self.refreshing {
-                self.log_debug("refresh already in progress, skipping");
-                return;
+        /// Refresh a single profile in the background.
+        fn refresh_profile(&mut self, profile_id: &str, force: bool) {
+            self.refresh_generation += 1;
+            let gen = self.refresh_generation;
+            let pid = profile_id.to_string();
+            self.refreshing_profiles.insert(pid.clone(), gen);
+
+            // If this is the selected profile, show loading indicator
+            if self.selected_profile.as_deref() == Some(profile_id) {
+                self.refreshing = true;
+                self.message = "Refreshing...".to_string();
             }
-            self.refreshing = true;
-            self.log_info(format!("refresh inventory requested (force={force})"));
-            self.message = "Refreshing...".to_string();
+            self.log_info(format!(
+                "refresh profile={pid} requested (force={force}) gen={gen}"
+            ));
 
             let mode = self.options.mode.clone();
             let config = self.config.clone();
             let region_override = self.options.region.clone();
-            let profile_override = self.selected_profile.clone();
             let tx = self.refresh_tx.clone();
 
             std::thread::spawn(move || {
@@ -1108,11 +1130,13 @@ mod gui {
                     mode,
                     &config,
                     region_override.as_deref(),
-                    profile_override.as_deref(),
+                    Some(&pid),
                 ) {
                     Ok(ctx) => ctx,
                     Err(err) => {
                         let _ = tx.send(RefreshEvent::Failed {
+                            generation: gen,
+                            profile_id: pid,
                             error: err.to_string(),
                         });
                         return;
@@ -1129,7 +1153,11 @@ mod gui {
                     });
 
                 if context.mode == Mode::Live && context.auth_status != AuthStatus::Ok {
-                    let _ = tx.send(RefreshEvent::AuthNotOk { context });
+                    let _ = tx.send(RefreshEvent::AuthNotOk {
+                        generation: gen,
+                        profile_id: pid,
+                        context,
+                    });
                     return;
                 }
 
@@ -1142,6 +1170,8 @@ mod gui {
                     match load_inventory(&context, &config.tag_mapping, force) {
                         Ok(inventory) => {
                             let _ = tx.send(RefreshEvent::Completed {
+                                generation: gen,
+                                profile_id: pid,
                                 context,
                                 inventory,
                                 config_update,
@@ -1153,8 +1183,49 @@ mod gui {
                         }
                     }
                 }
-                let _ = tx.send(RefreshEvent::Failed { error: last_err });
+                let _ = tx.send(RefreshEvent::Failed {
+                    generation: gen,
+                    profile_id: pid,
+                    error: last_err,
+                });
             });
+        }
+
+        /// Convenience: refresh the currently selected profile.
+        fn refresh_context_and_inventory(&mut self, force: bool) {
+            if let Some(ref pid) = self.selected_profile.clone() {
+                self.refresh_profile(pid, force);
+            }
+        }
+
+        /// Refresh all authenticated profiles in parallel.
+        fn refresh_all_authenticated(&mut self, force: bool) {
+            let authed_profiles: Vec<String> = self
+                .config
+                .profiles
+                .iter()
+                .filter(|p| {
+                    self.profile_auth_infos.iter().any(|a| {
+                        a.profile_id == p.profile_id && a.auth_status == AuthStatus::Ok
+                    })
+                })
+                .map(|p| p.profile_id.clone())
+                .collect();
+
+            if authed_profiles.is_empty() {
+                // Fall back to refreshing selected profile (may discover auth via STS)
+                self.refresh_context_and_inventory(force);
+                return;
+            }
+
+            self.log_info(format!(
+                "refreshing {} authenticated profiles in parallel",
+                authed_profiles.len()
+            ));
+
+            for pid in &authed_profiles {
+                self.refresh_profile(pid, force);
+            }
         }
 
         fn apply_filters(&mut self) {
@@ -1480,7 +1551,15 @@ mod gui {
                 "terminal selection: {}",
                 terminal_debug_label(selected_terminal.as_ref())
             ));
-            let tab_id = self.connections.open(title.clone(), instance_id.clone(), context.profile.clone());
+            // Use the config profile_id (account_id) so it matches the color map.
+            // Fall back to finding a config profile by context.profile, then the raw value.
+            let tab_profile = self.selected_profile.clone().unwrap_or_else(|| {
+                self.config.profiles.iter()
+                    .find(|p| p.profile_id == context.profile || p.display_name == context.profile)
+                    .map(|p| p.profile_id.clone())
+                    .unwrap_or_else(|| context.profile.clone())
+            });
+            let tab_id = self.connections.open(title.clone(), instance_id.clone(), tab_profile);
             self.rebuild_account_colors();
             let default_path = if context.mode == Mode::Sim {
                 std::env::current_dir()
@@ -1785,34 +1864,73 @@ mod gui {
 
         fn poll_refresh_events(&mut self) {
             while let Ok(event) = self.refresh_rx.try_recv() {
-                self.refreshing = false;
+                let event_profile = match &event {
+                    RefreshEvent::Completed { profile_id, .. } => profile_id.clone(),
+                    RefreshEvent::AuthNotOk { profile_id, .. } => profile_id.clone(),
+                    RefreshEvent::Failed { profile_id, .. } => profile_id.clone(),
+                };
+                let event_gen = match &event {
+                    RefreshEvent::Completed { generation, .. } => *generation,
+                    RefreshEvent::AuthNotOk { generation, .. } => *generation,
+                    RefreshEvent::Failed { generation, .. } => *generation,
+                };
+
+                // Discard if this profile was re-requested with a newer generation
+                if let Some(&expected_gen) = self.refreshing_profiles.get(&event_profile) {
+                    if event_gen < expected_gen {
+                        self.log_debug(format!(
+                            "discarding stale refresh for profile={event_profile} gen={event_gen} (expected={expected_gen})"
+                        ));
+                        continue;
+                    }
+                }
+
+                // This profile's refresh is done
+                self.refreshing_profiles.remove(&event_profile);
+
+                let is_selected = self.selected_profile.as_deref() == Some(&event_profile);
+
+                // Clear the loading indicator if no more profiles are refreshing,
+                // or if the selected profile just finished
+                if is_selected || self.refreshing_profiles.is_empty() {
+                    self.refreshing = !self.refreshing_profiles.is_empty();
+                }
+
                 match event {
                     RefreshEvent::Completed {
+                        profile_id,
                         context,
                         inventory,
                         config_update,
+                        ..
                     } => {
-                        // Save inventory to disk and in-memory cache
-                        if let Some(ref profile_id) = self.selected_profile {
-                            ec2_manager::inventory::save_disk_cache(
-                                profile_id,
-                                &context.region,
-                                &inventory,
-                            );
-                            self.profile_inventory_cache.insert(
-                                profile_id.clone(),
-                                (inventory.clone(), context.clone()),
+                        // Always save to disk and in-memory cache
+                        ec2_manager::inventory::save_disk_cache(
+                            &profile_id,
+                            &context.region,
+                            &inventory,
+                        );
+                        self.profile_inventory_cache.insert(
+                            profile_id.clone(),
+                            (inventory.clone(), context.clone()),
+                        );
+                        self.log_info(format!(
+                            "refreshed profile={profile_id}: {} instances",
+                            inventory.instances.len()
+                        ));
+
+                        // Only update the active display if this is the selected profile
+                        if is_selected {
+                            self.context = Some(context);
+                            self.inventory = inventory;
+                            self.apply_filters();
+                            self.message = format!(
+                                "Loaded {} instances ({} filtered)",
+                                self.inventory.instances.len(),
+                                self.filtered.len()
                             );
                         }
-                        self.context = Some(context);
-                        self.inventory = inventory;
-                        self.apply_filters();
-                        self.message = format!(
-                            "Loaded {} instances ({} filtered)",
-                            self.inventory.instances.len(),
-                            self.filtered.len()
-                        );
-                        self.log_info(self.message.clone());
+
                         if let Some((account_id, region)) = config_update {
                             self.config.upsert_account_region(&account_id, &region);
                             if let Err(err) = self.config.save() {
@@ -1821,23 +1939,43 @@ mod gui {
                                 ));
                             }
                         }
-                        self.maybe_auto_connect_gui_smoke();
+                        if is_selected {
+                            self.maybe_auto_connect_gui_smoke();
+                        }
                     }
-                    RefreshEvent::AuthNotOk { context } => {
-                        self.context = Some(context);
-                        self.inventory = Inventory {
-                            instances: Vec::new(),
-                            fetched_at: std::time::SystemTime::now(),
-                        };
-                        self.filtered.clear();
-                        self.message =
-                            "Auth is not OK (live mode). Refresh credentials and retry."
-                                .to_string();
-                        self.log_warn("inventory refresh blocked: auth not OK in live mode");
+                    RefreshEvent::AuthNotOk { profile_id, context, .. } => {
+                        let display = self.config.profiles.iter()
+                            .find(|p| p.profile_id == profile_id)
+                            .map(|p| p.display_name.as_str())
+                            .unwrap_or(profile_id.as_str())
+                            .to_string();
+                        self.log_warn(format!(
+                            "auth not OK for {display} ({profile_id})"
+                        ));
+                        if is_selected {
+                            self.context = Some(context);
+                            self.inventory = Inventory {
+                                instances: Vec::new(),
+                                fetched_at: std::time::SystemTime::now(),
+                            };
+                            self.filtered.clear();
+                            self.message = format!(
+                                "Auth is not OK for {display}. Refresh credentials and retry."
+                            );
+                        }
                     }
-                    RefreshEvent::Failed { error } => {
-                        self.message = format!("error: {error}");
-                        self.log_error(self.message.clone());
+                    RefreshEvent::Failed { profile_id, error, .. } => {
+                        let display = self.config.profiles.iter()
+                            .find(|p| p.profile_id == profile_id)
+                            .map(|p| p.display_name.as_str())
+                            .unwrap_or(profile_id.as_str())
+                            .to_string();
+                        self.log_error(format!(
+                            "refresh failed for {display} ({profile_id}): {error}"
+                        ));
+                        if is_selected {
+                            self.message = format!("error ({display}): {error}");
+                        }
                     }
                 }
             }
@@ -3878,7 +4016,7 @@ mod gui {
                             ui.add_space(4.0);
 
                             ui.horizontal(|ui| {
-                                if ui.button("Apply").clicked() {
+                                if ui.button("OK").clicked() {
                                     let hex = color32_to_hex(preview_color);
                                     if !profile_id.is_empty() {
                                         self.config
@@ -3887,6 +4025,9 @@ mod gui {
                                         self.rebuild_account_colors();
                                         let _ = self.config.save();
                                     }
+                                    self.color_picker_profile = None;
+                                }
+                                if ui.button("Cancel").clicked() {
                                     self.color_picker_profile = None;
                                 }
                                 if ui.button("Reset to Default").clicked() {
@@ -3957,7 +4098,11 @@ mod gui {
                                         .iter()
                                         .map(|p| (p.profile_id.clone(), p.display_name.clone()))
                                         .collect();
-                                    profiles_sorted.sort_by(|a, b| env_rank(&a.0).cmp(&env_rank(&b.0)));
+                                    profiles_sorted.sort_by(|a, b| {
+                                        let pa = self.config.profiles.iter().find(|p| p.profile_id == a.0);
+                                        let pb = self.config.profiles.iter().find(|p| p.profile_id == b.0);
+                                        profile_sort_key(pa, &a.0).cmp(&profile_sort_key(pb, &b.0))
+                                    });
 
                                     let mut pick_profile: Option<String> = None;
                                     for (pid, display_name) in &profiles_sorted {
@@ -4052,8 +4197,13 @@ mod gui {
                                 .iter()
                                 .map(|(k, v)| (k.clone(), *v))
                                 .collect();
-                            profiles.sort_by(|a, b| env_rank(&a.0).cmp(&env_rank(&b.0)));
+                            profiles.sort_by(|a, b| {
+                                let pa = self.config.profiles.iter().find(|p| p.profile_id == a.0);
+                                let pb = self.config.profiles.iter().find(|p| p.profile_id == b.0);
+                                profile_sort_key(pa, &a.0).cmp(&profile_sort_key(pb, &b.0))
+                            });
 
+                            let mut legend_pick_color: Option<String> = None;
                             for (pid, color) in &profiles {
                                 let display_name = self
                                     .config
@@ -4068,7 +4218,27 @@ mod gui {
                                     egui::Sense::hover(),
                                 );
                                 ui.painter().circle_filled(rect.center(), 5.0, *color);
-                                ui.label(display_name);
+                                let label_resp = ui.label(display_name);
+                                let pid_clone = pid.clone();
+                                label_resp.context_menu(|ui| {
+                                    if ui.button("Change Color").clicked() {
+                                        legend_pick_color = Some(pid_clone.clone());
+                                        ui.close();
+                                    }
+                                });
+                            }
+                            if let Some(pid) = legend_pick_color {
+                                let current_color = self
+                                    .account_color_map
+                                    .get(&pid)
+                                    .copied()
+                                    .unwrap_or(egui::Color32::from_rgb(128, 128, 128));
+                                self.tab_color_picker_rgb = [
+                                    current_color.r() as f32 / 255.0,
+                                    current_color.g() as f32 / 255.0,
+                                    current_color.b() as f32 / 255.0,
+                                ];
+                                self.color_picker_profile = Some(pid);
                             }
                         }
                     });
@@ -4123,7 +4293,6 @@ mod gui {
                             base_text
                         };
 
-                        ui.add_enabled_ui(!self.refreshing, |ui| {
                         egui::ComboBox::from_id_salt("profile_selector_combo")
                             .selected_text(selected_text)
                             .show_ui(ui, |ui| {
@@ -4218,7 +4387,6 @@ mod gui {
 
                             self.refresh_context_and_inventory(true);
                         }
-                        }); // add_enabled_ui
                         ui.separator();
 
                     }
@@ -4982,8 +5150,8 @@ mod gui {
         (180, 120, 60),   // brown
     ];
 
-    /// Environment ranking keywords — lower index means "lower" environment.
-    /// Profiles matching earlier entries get greener colors; later entries get redder colors.
+    // ENV_RANK_KEYWORDS and env_rank removed — replaced by sort_order in accounts.json
+    #[allow(dead_code)]
     const ENV_RANK_KEYWORDS: &[&str] = &[
         "dev", "develop", "development",
         "test", "testing",
@@ -4994,8 +5162,7 @@ mod gui {
         "prod", "production", "prd", "live",
     ];
 
-    /// Determine a sort rank for a profile name based on environment keywords.
-    /// Returns (rank, original_name) for sorting.
+    #[allow(dead_code)]
     fn env_rank(profile_name: &str) -> (usize, String) {
         let lower = profile_name.to_ascii_lowercase();
         for (idx, &kw) in ENV_RANK_KEYWORDS.iter().enumerate() {
@@ -5010,36 +5177,69 @@ mod gui {
     /// Given a set of profile_ids, return a mapping from profile_id to Color32.
     /// Uses user-customized colors from config where available, and auto-assigns
     /// the rest from the palette ordered by environment rank.
+    /// Sort key for profiles: sort_order first, then alphabetical by display name.
+    fn profile_sort_key(profile: Option<&ProfileConfig>, profile_id: &str) -> (u32, String) {
+        if let Some(p) = profile {
+            (
+                p.sort_order.unwrap_or(u32::MAX),
+                p.display_name.to_ascii_lowercase(),
+            )
+        } else {
+            (u32::MAX, profile_id.to_ascii_lowercase())
+        }
+    }
+
     fn build_account_color_map(
-        profile_ids: &[String],
+        profiles: &[ProfileConfig],
+        extra_profile_ids: &[String],
         custom_colors: &std::collections::BTreeMap<String, String>,
     ) -> HashMap<String, egui::Color32> {
         let mut map = HashMap::new();
 
-        // Sort profiles by environment rank so dev gets green, prod gets red
-        let mut sorted: Vec<&String> = profile_ids.iter().collect();
-        sorted.sort_by(|a, b| env_rank(a).cmp(&env_rank(b)));
-        sorted.dedup();
+        // Collect all profile IDs, dedup
+        let mut all_ids: Vec<String> = profiles.iter().map(|p| p.profile_id.clone()).collect();
+        for id in extra_profile_ids {
+            if !all_ids.contains(id) {
+                all_ids.push(id.clone());
+            }
+        }
+
+        // Sort by sort_order (from accounts.json), then alphabetical
+        all_ids.sort_by(|a, b| {
+            let pa = profiles.iter().find(|p| p.profile_id == *a);
+            let pb = profiles.iter().find(|p| p.profile_id == *b);
+            profile_sort_key(pa, a).cmp(&profile_sort_key(pb, b))
+        });
+        all_ids.dedup();
 
         let palette_len = ACCOUNT_COLOR_PALETTE.len();
 
-        for (idx, profile_id) in sorted.iter().enumerate() {
-            // Check for user-customized color first
-            if let Some(hex) = custom_colors.get(*profile_id) {
+        for (idx, profile_id) in all_ids.iter().enumerate() {
+            // 1. User-customized color (from Edit > Account Tab Colors > Change Color)
+            if let Some(hex) = custom_colors.get(profile_id) {
                 if let Some(c) = parse_hex_color(hex) {
-                    map.insert((*profile_id).clone(), c);
+                    map.insert(profile_id.clone(), c);
                     continue;
                 }
             }
 
-            // Auto-assign from palette, wrapping with a brightness shift for overflow
+            // 2. Color from accounts.json
+            if let Some(profile) = profiles.iter().find(|p| &p.profile_id == profile_id) {
+                if let Some(hex) = &profile.color {
+                    if let Some(c) = parse_hex_color(hex) {
+                        map.insert(profile_id.clone(), c);
+                        continue;
+                    }
+                }
+            }
+
+            // 3. Auto-assign from palette, wrapping with a brightness shift for overflow
             let base_idx = idx % palette_len;
             let cycle = idx / palette_len;
             let (r, g, b) = ACCOUNT_COLOR_PALETTE[base_idx];
             let color = if cycle == 0 {
                 egui::Color32::from_rgb(r, g, b)
             } else {
-                // Shift brightness for subsequent cycles so colors stay distinct
                 let shift = ((cycle as i16) * 40).min(120);
                 egui::Color32::from_rgb(
                     (r as i16 + shift).clamp(0, 255) as u8,
@@ -5047,7 +5247,7 @@ mod gui {
                     (b as i16 + shift).clamp(0, 255) as u8,
                 )
             };
-            map.insert((*profile_id).clone(), color);
+            map.insert(profile_id.clone(), color);
         }
 
         map

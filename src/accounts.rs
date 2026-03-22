@@ -15,6 +15,8 @@ struct AccountEntry {
     label: String,
     account_id: String,
     region: Option<String>,
+    sort_order: Option<u32>,
+    color: Option<String>,
 }
 
 pub fn accounts_path() -> Option<PathBuf> {
@@ -32,6 +34,8 @@ fn parse_accounts(json: &str) -> Vec<ProfileConfig> {
             display_name: e.label,
             account_id: e.account_id,
             region: e.region,
+            sort_order: e.sort_order,
+            color: e.color,
         })
         .collect()
 }

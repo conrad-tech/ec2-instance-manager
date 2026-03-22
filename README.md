@@ -321,3 +321,79 @@ Related smoke harness checks:
 - Linux: `~/.config/ec2-manager/config.ini`
 - Windows: `%APPDATA%\ec2-manager\config.ini`
 
+## Account configuration (accounts.json)
+
+Place an `accounts.json` file next to `config.ini` (same directory) to configure your AWS accounts.
+The file is an array of account objects:
+
+```json
+[
+  {
+    "label":      "Dev",
+    "account_id": "123456789012",
+    "region":     "us-east-1",
+    "sort_order": 1,
+    "color":      "#2ea043"
+  },
+  {
+    "label":      "QA",
+    "account_id": "234567890123",
+    "region":     "us-east-1",
+    "sort_order": 2,
+    "color":      "#c8b41e"
+  },
+  {
+    "label":      "Staging",
+    "account_id": "345678901234",
+    "region":     "us-east-1",
+    "sort_order": 3,
+    "color":      "#e69600"
+  },
+  {
+    "label":      "Prod-A",
+    "account_id": "456789012345",
+    "region":     "us-east-1",
+    "sort_order": 4,
+    "color":      "#c82828"
+  },
+  {
+    "label":      "Prod-B",
+    "account_id": "567890123456",
+    "region":     "us-west-2",
+    "sort_order": 5,
+    "color":      "#aa1e46"
+  }
+]
+```
+
+### Fields
+
+| Field        | Required | Description |
+|-------------|----------|-------------|
+| `label`      | Yes      | Display name shown in the UI |
+| `account_id` | Yes      | AWS account ID (used as profile identifier) |
+| `region`     | No       | Default AWS region for this account |
+| `sort_order` | No       | Display order in legend and dropdowns (lower = first). Omit for alphabetical. |
+| `color`      | No       | Hex color code for tab coloring (e.g. `"#2ea043"`). Omit for auto-assignment. |
+
+### Available color codes
+
+Use any hex color code (`#RRGGBB`). Here are some suggested defaults:
+
+| Color | Hex | Suggested use |
+|-------|-----|--------------|
+| Green | `#2ea043` | Dev |
+| Teal | `#00b4a0` | Test |
+| Blue | `#369adc` | QA |
+| Yellow | `#c8b41e` | Integration |
+| Orange | `#e69600` | Staging |
+| Red-Orange | `#d2503c` | UAT / Pre-prod |
+| Red | `#c82828` | Production |
+| Crimson | `#aa1e46` | Production (secondary) |
+| Purple | `#8c3ca0` | Sandbox |
+| Indigo | `#6464be` | Shared services |
+| Dark Teal | `#008c78` | DR / Backup |
+| Brown | `#b4783c` | Legacy |
+
+Colors can also be customized at runtime via **right-click on a legend item** or **Edit > Account Tab Colors > Edit**. Runtime overrides are saved to `config.ini` and take priority over `accounts.json`.
+

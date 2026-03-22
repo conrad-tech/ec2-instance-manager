@@ -189,6 +189,10 @@ pub struct ProfileConfig {
     pub display_name: String,
     pub account_id: String,
     pub region: Option<String>,
+    /// Display order in legend/dropdowns (lower = first). None = alphabetical.
+    pub sort_order: Option<u32>,
+    /// Default color as hex string (e.g. "#2ea043"). None = auto-assigned.
+    pub color: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

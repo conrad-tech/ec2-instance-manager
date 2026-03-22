@@ -423,6 +423,8 @@ impl AppConfig {
                 display_name: display_name.clone(),
                 account_id: profile_account_ids.get(id).cloned().unwrap_or_default(),
                 region: profile_regions.get(id).cloned(),
+                sort_order: None,
+                color: None,
             });
         }
 
