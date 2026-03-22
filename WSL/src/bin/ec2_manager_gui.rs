@@ -377,6 +377,24 @@ mod gui {
         Error(String),
     }
 
+    #[derive(Clone)]
+    struct EditorTab {
+        remote_path: String,
+        content: String,
+        original: String,
+        dirty: bool,
+        status: String,
+    }
+
+    impl EditorTab {
+        fn filename(&self) -> &str {
+            self.remote_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&self.remote_path)
+        }
+    }
+
     struct FileBrowserState {
         current_path: String,
         entries: Vec<FileEntry>,
@@ -386,6 +404,10 @@ mod gui {
         pending_downloads: usize,
         path_input: String,
         initialized: bool,
+        /// Multiple open editor tabs per connection
+        editor_tabs: Vec<EditorTab>,
+        /// Index of the currently active editor tab
+        active_editor: Option<usize>,
     }
 
     impl Default for FileBrowserState {
@@ -399,6 +421,8 @@ mod gui {
                 pending_downloads: 0,
                 path_input: String::new(),
                 initialized: false,
+                editor_tabs: Vec::new(),
+                active_editor: None,
             }
         }
     }
@@ -430,6 +454,23 @@ mod gui {
             bytes: u64,
         },
         UploadFailed {
+            tab_id: u64,
+            error: String,
+        },
+        FileReadCompleted {
+            tab_id: u64,
+            remote_path: String,
+            content: String,
+        },
+        FileReadFailed {
+            tab_id: u64,
+            error: String,
+        },
+        FileSaveCompleted {
+            tab_id: u64,
+            remote_path: String,
+        },
+        FileSaveFailed {
             tab_id: u64,
             error: String,
         },
@@ -2413,6 +2454,123 @@ mod gui {
             });
         }
 
+        /// Read a remote file's content into the inline editor.
+        fn request_file_read(&mut self, tab_id: u64, remote_path: String) {
+            let Some(fb) = self.file_browsers.get_mut(&tab_id) else {
+                return;
+            };
+            fb.status = FileOpStatus::Downloading;
+
+            let tab = self.connections.selected_ref().cloned();
+            let instance_id = tab.map(|t| t.instance_id.clone()).unwrap_or_default();
+            let mode = self.options.mode.clone();
+            let context = self.context.clone();
+            let tx = self.file_op_tx.clone();
+
+            std::thread::spawn(move || {
+                let result = if mode == Mode::Sim {
+                    std::fs::read_to_string(&remote_path)
+                        .map_err(|e| e.to_string())
+                } else if let Some(ctx) = &context {
+                    let cmd = format!("base64 {remote_path}");
+                    ssm_send_command(&ctx.profile, &ctx.region, &instance_id, &cmd)
+                        .and_then(|command_id| {
+                            ssm_wait_for_command(
+                                &ctx.profile,
+                                &ctx.region,
+                                &instance_id,
+                                &command_id,
+                            )
+                        })
+                        .and_then(|b64_output| {
+                            use base64::Engine;
+                            let cleaned: String = b64_output.chars()
+                                .filter(|c| !c.is_whitespace())
+                                .collect();
+                            let data = base64::engine::general_purpose::STANDARD
+                                .decode(&cleaned)
+                                .map_err(|e| format!("base64 decode failed: {e}"))?;
+                            String::from_utf8(data)
+                                .map_err(|e| format!("file is not valid UTF-8 text: {e}"))
+                        })
+                } else {
+                    Err("no AWS context available".to_string())
+                };
+
+                match result {
+                    Ok(content) => {
+                        let _ = tx.send(FileOpEvent::FileReadCompleted {
+                            tab_id,
+                            remote_path,
+                            content,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = tx.send(FileOpEvent::FileReadFailed { tab_id, error });
+                    }
+                }
+            });
+        }
+
+        /// Save editor content back to the remote file.
+        fn request_file_save(&mut self, tab_id: u64) {
+            let Some(fb) = self.file_browsers.get_mut(&tab_id) else {
+                return;
+            };
+            let Some(active) = fb.active_editor else {
+                return;
+            };
+            let Some(et) = fb.editor_tabs.get_mut(active) else {
+                return;
+            };
+            let remote_path = et.remote_path.clone();
+            let content = et.content.clone();
+            et.status = "Saving...".to_string();
+            fb.status = FileOpStatus::Uploading;
+
+            let tab = self.connections.selected_ref().cloned();
+            let instance_id = tab.map(|t| t.instance_id.clone()).unwrap_or_default();
+            let mode = self.options.mode.clone();
+            let context = self.context.clone();
+            let tx = self.file_op_tx.clone();
+
+            std::thread::spawn(move || {
+                let result = if mode == Mode::Sim {
+                    std::fs::write(&remote_path, &content)
+                        .map_err(|e| e.to_string())
+                } else if let Some(ctx) = &context {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD
+                        .encode(content.as_bytes());
+                    let cmd = format!("echo '{}' | base64 -d > {}", b64, remote_path);
+                    ssm_send_command(&ctx.profile, &ctx.region, &instance_id, &cmd)
+                        .and_then(|command_id| {
+                            ssm_wait_for_command(
+                                &ctx.profile,
+                                &ctx.region,
+                                &instance_id,
+                                &command_id,
+                            )
+                        })
+                        .map(|_| ())
+                } else {
+                    Err("no AWS context available".to_string())
+                };
+
+                match result {
+                    Ok(()) => {
+                        let _ = tx.send(FileOpEvent::FileSaveCompleted {
+                            tab_id,
+                            remote_path,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = tx.send(FileOpEvent::FileSaveFailed { tab_id, error });
+                    }
+                }
+            });
+        }
+
         fn poll_file_op_events(&mut self) {
             while let Ok(event) = self.file_op_rx.try_recv() {
                 match event {
@@ -2498,6 +2656,67 @@ mod gui {
                         ));
                         if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
                             fb.status = FileOpStatus::Error(error);
+                        }
+                    }
+                    FileOpEvent::FileReadCompleted {
+                        tab_id,
+                        remote_path,
+                        content,
+                    } => {
+                        self.log_info(format!(
+                            "file read completed tab={tab_id} path={remote_path} ({} bytes)",
+                            content.len()
+                        ));
+                        if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                            // Check if file is already open — switch to it
+                            if let Some(idx) = fb.editor_tabs.iter().position(|t| t.remote_path == remote_path) {
+                                fb.active_editor = Some(idx);
+                            } else {
+                                fb.editor_tabs.push(EditorTab {
+                                    remote_path,
+                                    content: content.clone(),
+                                    original: content,
+                                    dirty: false,
+                                    status: String::new(),
+                                });
+                                fb.active_editor = Some(fb.editor_tabs.len() - 1);
+                            }
+                            fb.status = FileOpStatus::Idle;
+                        }
+                    }
+                    FileOpEvent::FileReadFailed { tab_id, error } => {
+                        self.log_error(format!(
+                            "file read failed tab={tab_id}: {error}"
+                        ));
+                        if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                            fb.status = FileOpStatus::Idle;
+                        }
+                        self.message = format!("Failed to open file: {error}");
+                    }
+                    FileOpEvent::FileSaveCompleted { tab_id, remote_path } => {
+                        self.log_info(format!(
+                            "file saved tab={tab_id} path={remote_path}"
+                        ));
+                        if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                            if let Some(et) = fb.editor_tabs.iter_mut().find(|t| t.remote_path == remote_path) {
+                                et.original = et.content.clone();
+                                et.dirty = false;
+                                et.status = "Saved".to_string();
+                            }
+                            fb.status = FileOpStatus::Idle;
+                        }
+                    }
+                    FileOpEvent::FileSaveFailed { tab_id, error } => {
+                        self.log_error(format!(
+                            "file save failed tab={tab_id}: {error}"
+                        ));
+                        if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                            if let Some(active) = fb.active_editor {
+                                if let Some(et) = fb.editor_tabs.get_mut(active) {
+                                    et.status = format!("Save failed: {error}");
+                                }
+                            }
+                            fb.status = FileOpStatus::Idle;
                         }
                     }
                 }
@@ -3707,6 +3926,28 @@ mod gui {
         }
 
         fn render_file_browser(&mut self, ui: &mut egui::Ui, tab_id: u64) {
+            // Handle drag-and-drop file upload
+            let dropped: Vec<egui::DroppedFile> = ui.ctx().input(|i| i.raw.dropped_files.clone());
+            if !dropped.is_empty() {
+                let current_dir = self.file_browsers.get(&tab_id)
+                    .map(|fb| fb.current_path.clone())
+                    .unwrap_or_default();
+                if !current_dir.is_empty() {
+                    for file in &dropped {
+                        if let Some(path) = &file.path {
+                            let local = path.to_string_lossy().to_string();
+                            self.log_info(format!("drag-drop upload: {local} -> {current_dir}"));
+                            self.request_file_upload(tab_id, local, current_dir.clone());
+                        }
+                    }
+                }
+            }
+            // Show drop hint when files are being hovered
+            let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+            if hovering {
+                ui.colored_label(egui::Color32::YELLOW, "Drop files here to upload");
+            }
+
             ui.label("File Browser");
             ui.separator();
 
@@ -3810,6 +4051,7 @@ mod gui {
             let mut new_selected = selected_entries.clone();
             let mut new_last_clicked = last_clicked;
             let mut double_clicked_dir: Option<String> = None;
+            let mut double_clicked_file: Option<String> = None;
             let modifiers = ui.input(|i| i.modifiers);
             egui::ScrollArea::vertical()
                 .max_height(ui.available_height() - 40.0)
@@ -3849,9 +4091,14 @@ mod gui {
                                 new_last_clicked = Some(idx);
                             }
                         }
-                        if response.double_clicked() && entry.is_dir {
-                            double_clicked_dir =
-                                Some(join_path(&current_path, &entry.name));
+                        if response.double_clicked() {
+                            if entry.is_dir {
+                                double_clicked_dir =
+                                    Some(join_path(&current_path, &entry.name));
+                            } else {
+                                double_clicked_file =
+                                    Some(join_path(&current_path, &entry.name));
+                            }
                         }
                     }
                     if entries.is_empty()
@@ -3870,6 +4117,193 @@ mod gui {
             // Navigate on double-click dir
             if let Some(dir_path) = double_clicked_dir {
                 navigate_to = Some(dir_path);
+            }
+
+            // Open file in editor on double-click
+            if let Some(file_path) = double_clicked_file {
+                self.request_file_read(tab_id, file_path);
+            }
+
+            // Inline editor tabs
+            let has_editors = self.file_browsers.get(&tab_id)
+                .map(|fb| !fb.editor_tabs.is_empty())
+                .unwrap_or(false);
+            if has_editors {
+                ui.separator();
+
+                // Editor tab bar — horizontal scrolling
+                let tab_snapshot: Vec<(usize, String, bool, String)> = self.file_browsers
+                    .get(&tab_id)
+                    .map(|fb| {
+                        fb.editor_tabs.iter().enumerate().map(|(i, et)| {
+                            (i, et.filename().to_string(), et.dirty, et.status.clone())
+                        }).collect()
+                    })
+                    .unwrap_or_default();
+                let active_editor = self.file_browsers.get(&tab_id)
+                    .and_then(|fb| fb.active_editor);
+                let mut new_active: Option<usize> = active_editor;
+                let mut close_editor: Option<usize> = None;
+
+                egui::ScrollArea::horizontal()
+                    .id_salt(("editor_tabs", tab_id))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (idx, filename, dirty, _status) in &tab_snapshot {
+                                let is_active = active_editor == Some(*idx);
+                                let label = if *dirty {
+                                    format!("{filename} *")
+                                } else {
+                                    filename.clone()
+                                };
+                                let frame = if is_active {
+                                    egui::Frame::group(ui.style())
+                                        .fill(ui.style().visuals.selection.bg_fill)
+                                } else {
+                                    egui::Frame::group(ui.style())
+                                };
+                                frame.show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if ui.selectable_label(is_active, &label).clicked() {
+                                            new_active = Some(*idx);
+                                        }
+                                        if ui.small_button("x").clicked() {
+                                            close_editor = Some(*idx);
+                                        }
+                                    });
+                                });
+                            }
+                        });
+                    });
+
+                // Handle tab close
+                if let Some(close_idx) = close_editor {
+                    if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                        fb.editor_tabs.remove(close_idx);
+                        if fb.editor_tabs.is_empty() {
+                            fb.active_editor = None;
+                        } else if let Some(active) = fb.active_editor {
+                            if active >= fb.editor_tabs.len() {
+                                fb.active_editor = Some(fb.editor_tabs.len() - 1);
+                            } else if active > close_idx {
+                                fb.active_editor = Some(active - 1);
+                            }
+                        }
+                    }
+                } else if new_active != active_editor {
+                    if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                        fb.active_editor = new_active;
+                    }
+                }
+
+                // Render active editor content
+                let editor_data = self.file_browsers.get(&tab_id).and_then(|fb| {
+                    fb.active_editor.and_then(|idx| {
+                        fb.editor_tabs.get(idx).map(|et| (
+                            et.remote_path.clone(),
+                            et.content.clone(),
+                            et.dirty,
+                            et.status.clone(),
+                            fb.status.clone(),
+                        ))
+                    })
+                });
+                if let Some((remote_path, mut editor_content, editor_dirty, editor_status, ed_status)) = editor_data {
+                    // Status line
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{remote_path}"));
+                        if !editor_status.is_empty() {
+                            if editor_status.starts_with("Error") || editor_status.starts_with("Save failed") {
+                                ui.colored_label(egui::Color32::RED, &editor_status);
+                            } else if editor_status == "Saved" {
+                                ui.colored_label(egui::Color32::GREEN, &editor_status);
+                            } else {
+                                ui.label(&editor_status);
+                            }
+                        }
+                    });
+
+                    let saving = matches!(ed_status, FileOpStatus::Uploading);
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(editor_dirty && !saving, egui::Button::new("Save (Ctrl+S)")).clicked() {
+                            if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                                if let Some(idx) = fb.active_editor {
+                                    if let Some(et) = fb.editor_tabs.get_mut(idx) {
+                                        et.content = editor_content.clone();
+                                    }
+                                }
+                            }
+                            self.request_file_save(tab_id);
+                        }
+                    });
+
+                    // Ctrl+S shortcut
+                    let ctrl_s = ui.input(|i| {
+                        i.events.iter().any(|e| matches!(e,
+                            egui::Event::Key {
+                                key: egui::Key::S,
+                                pressed: true,
+                                modifiers,
+                                ..
+                            } if modifiers.ctrl || modifiers.command
+                        ))
+                    });
+                    if ctrl_s && editor_dirty && !saving {
+                        if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                            if let Some(idx) = fb.active_editor {
+                                if let Some(et) = fb.editor_tabs.get_mut(idx) {
+                                    et.content = editor_content.clone();
+                                }
+                            }
+                        }
+                        self.request_file_save(tab_id);
+                    }
+
+                    // Text editor with line numbers
+                    egui::ScrollArea::both()
+                        .max_height(ui.available_height() - 40.0)
+                        .show(ui, |ui| {
+                            ui.horizontal_top(|ui| {
+                                let line_count = editor_content.lines().count().max(1);
+                                let line_numbers: String = (1..=line_count)
+                                    .map(|n| format!("{n:>4}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut line_numbers.as_str())
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(40.0)
+                                        .interactive(false)
+                                        .frame(false),
+                                );
+                                let response = ui.add(
+                                    egui::TextEdit::multiline(&mut editor_content)
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY)
+                                        .code_editor(),
+                                );
+                                if response.changed() {
+                                    if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                                        if let Some(idx) = fb.active_editor {
+                                            if let Some(et) = fb.editor_tabs.get_mut(idx) {
+                                                et.dirty = editor_content != et.original;
+                                                et.content = editor_content;
+                                                if et.status == "Saved" {
+                                                    et.status.clear();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                }
+
+                // Handle navigation even when editor is open
+                if let Some(nav) = navigate_to {
+                    self.request_file_listing(tab_id, nav);
+                }
+                return;
             }
 
             ui.separator();
