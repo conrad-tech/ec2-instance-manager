@@ -804,7 +804,7 @@ mod gui {
                 });
 
             let debug_mode = options.debug;
-            let wsl_auto_setup = options.wsl_auto_setup;
+            let wsl_auto_setup = true;
             let mut app = Self {
                 wsl_setup_state,
                 wsl_setup_status: None,
