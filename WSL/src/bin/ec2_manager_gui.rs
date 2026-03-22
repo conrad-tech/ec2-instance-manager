@@ -5184,13 +5184,15 @@ mod gui {
 
         match kind {
             TerminalKind::Wsl => {
-                // Use `wsl -- bash -lc` instead of `wsl -e bash -lc`.
-                // The `--` form gives WSL proper user/passwd context,
-                // which session-manager-plugin needs for getpwuid().
-                // Also export HOME explicitly as a fallback.
+                // Strip --profile from the command for WSL sessions.
+                // Credentials are injected via env vars (AWS_ACCESS_KEY_ID, etc.)
+                // because the credential_process tool ('fed') only exists on
+                // Windows.  Keeping --profile would cause aws to read the
+                // credentials file and try to run 'fed' inside WSL.
+                let wsl_cmd = strip_profile_flag(command_line);
                 let wrapped = format!(
                     "export HOME=\"${{HOME:-$(getent passwd $(id -u) | cut -d: -f6)}}\" 2>/dev/null; {}",
-                    command_line
+                    wsl_cmd
                 );
                 PtyCommand {
                     program: "wsl.exe".to_string(),
@@ -5222,6 +5224,26 @@ mod gui {
                 args: vec!["/K".to_string(), command_line.to_string()],
             },
         }
+    }
+
+    /// Remove `--profile <value>` from a command string.
+    /// Used for WSL sessions where creds are passed via env vars.
+    fn strip_profile_flag(cmd: &str) -> String {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        let mut out = Vec::new();
+        let mut skip_next = false;
+        for part in &parts {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if *part == "--profile" {
+                skip_next = true;
+                continue;
+            }
+            out.push(*part);
+        }
+        out.join(" ")
     }
 
     fn sim_pty_command(terminal: Option<&TerminalOption>, command_line: &str) -> PtyCommand {
