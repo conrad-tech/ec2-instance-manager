@@ -120,13 +120,13 @@ From built binary (from the project root or any directory):
 
 ```bash
 # Windows (Git Bash)
-./dist/windows/ec2_manager_gui.exe --mode sim
+./dist/windows/ec2_manager_windows/ec2_manager_gui.exe --mode sim
 
 # Windows (PowerShell/CMD)
-.\dist\windows\ec2_manager_gui.exe --mode sim
+.\dist\windows\ec2_manager_windows\ec2_manager_gui.exe --mode sim
 
 # Linux
-./dist/linux/ec2_manager_gui --mode sim
+./dist/windows/ec2_manager_windows/ec2_manager_gui.exe --mode sim
 ```
 
 The `--mode sim` flag starts the GUI with simulated inventory data. You can test sorting, filtering, favorites, copy buttons, column resizing, and saved filters without connecting to AWS.

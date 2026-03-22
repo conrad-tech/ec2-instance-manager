@@ -1938,10 +1938,13 @@ mod gui {
 
                 let is_selected = self.selected_profile.as_deref() == Some(&event_profile);
 
-                // Clear the loading indicator if no more profiles are refreshing,
-                // or if the selected profile just finished
+                // Update loading indicator based on whether the *selected* profile
+                // is still refreshing (not all profiles globally), so the user
+                // can freely switch accounts while others load in the background.
                 if is_selected || self.refreshing_profiles.is_empty() {
-                    self.refreshing = !self.refreshing_profiles.is_empty();
+                    self.refreshing = self.selected_profile.as_ref()
+                        .and_then(|pid| self.refreshing_profiles.get(pid.as_str()))
+                        .is_some();
                 }
 
                 match event {
@@ -4420,7 +4423,18 @@ mod gui {
                                 }
                             }
 
-                            self.refresh_context_and_inventory(true);
+                            // Update loading indicator for the newly selected profile
+                            if let Some(ref pid) = self.selected_profile {
+                                self.refreshing = self.refreshing_profiles.contains_key(pid);
+                            }
+
+                            // Only trigger a new refresh if this profile isn't already being
+                            // refreshed (e.g. from the initial parallel load at startup).
+                            if let Some(ref pid) = self.selected_profile {
+                                if !self.refreshing_profiles.contains_key(pid) {
+                                    self.refresh_context_and_inventory(true);
+                                }
+                            }
                         }
                         ui.separator();
 
