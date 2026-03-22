@@ -5307,8 +5307,20 @@ mod gui {
         );
         cmd.env("AWS_PROFILE", &context.profile);
         cmd.env("AWS_REGION", &context.region);
-        // Ensure AWS env vars pass through to WSL sessions
-        cmd.env("WSLENV", "AWS_PROFILE/u:AWS_REGION/u");
+        // Inject actual credentials as env vars so WSL's aws CLI doesn't
+        // need to run credential_process tools (like 'fed') that are
+        // only installed on Windows.
+        if let Some(creds) = credentials::read_profile_credentials(&context.profile) {
+            cmd.env("AWS_ACCESS_KEY_ID", &creds.access_key_id);
+            cmd.env("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
+            if let Some(ref token) = creds.session_token {
+                cmd.env("AWS_SESSION_TOKEN", token);
+            }
+            // Pass credential env vars through to WSL
+            cmd.env("WSLENV", "AWS_ACCESS_KEY_ID/u:AWS_SECRET_ACCESS_KEY/u:AWS_SESSION_TOKEN/u:AWS_REGION/u:AWS_PROFILE/u");
+        } else {
+            cmd.env("WSLENV", "AWS_PROFILE/u:AWS_REGION/u");
+        }
         cmd.env("TERM", "xterm-256color");
         #[cfg(target_os = "windows")]
         {

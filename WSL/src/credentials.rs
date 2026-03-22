@@ -274,6 +274,64 @@ pub fn check_all_profiles_auth(profiles: &[ProfileConfig]) -> Vec<ProfileAuthInf
         .collect()
 }
 
+/// AWS credential keys for a profile, read from the fed_aws_* fields
+/// in ~/.aws/credentials.
+#[derive(Clone, Debug)]
+pub struct AwsCredentialKeys {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+}
+
+/// Read the fed_aws_* credential keys for a given profile section.
+/// Returns None if the profile or keys are not found.
+pub fn read_profile_credentials(profile: &str) -> Option<AwsCredentialKeys> {
+    let path = credentials_path()?;
+    let content = fs::read_to_string(path).ok()?;
+    parse_profile_credentials(&content, profile)
+}
+
+fn parse_profile_credentials(content: &str, profile: &str) -> Option<AwsCredentialKeys> {
+    if profile.trim().is_empty() {
+        return None;
+    }
+    let header = format!("[{profile}]");
+    let mut in_section = false;
+    let mut access_key = None;
+    let mut secret_key = None;
+    let mut session_token = None;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            if in_section {
+                break; // past our section
+            }
+            in_section = line.eq_ignore_ascii_case(&header);
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let k = k.trim();
+            let v = v.trim().to_string();
+            match k {
+                "fed_aws_access_key_id" | "aws_access_key_id" => access_key = Some(v),
+                "fed_aws_secret_access_key" | "aws_secret_access_key" => secret_key = Some(v),
+                "fed_aws_session_token" | "aws_session_token" => session_token = Some(v),
+                _ => {}
+            }
+        }
+    }
+
+    Some(AwsCredentialKeys {
+        access_key_id: access_key?,
+        secret_access_key: secret_key?,
+        session_token,
+    })
+}
+
 pub fn credentials_mtime() -> Option<SystemTime> {
     let path = credentials_path()?;
     fs::metadata(path).ok()?.modified().ok()
