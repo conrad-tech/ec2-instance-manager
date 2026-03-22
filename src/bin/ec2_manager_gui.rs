@@ -699,6 +699,7 @@ mod gui {
         dark_mode: bool,
         scroll_sensitivity: f32,
         ui_scale: f32,
+        last_native_ppp: f32,
         sort_column: Option<SortColumn>,
         sort_direction: SortDirection,
         column_widths: HashMap<u8, f32>,
@@ -707,11 +708,11 @@ mod gui {
         last_credentials_mtime: Option<SystemTime>,
         last_credentials_poll_at: Instant,
         account_color_map: HashMap<String, egui::Color32>,
-        show_account_color_legend: bool,
         tab_rename_id: Option<u64>,
         tab_rename_buf: String,
-        tab_color_picker_id: Option<u64>,
         tab_color_picker_rgb: [f32; 3],
+        /// Profile ID for the color picker (from Edit menu or right-click)
+        color_picker_profile: Option<String>,
         file_browsers: HashMap<u64, FileBrowserState>,
         file_op_tx: Sender<FileOpEvent>,
         file_op_rx: Receiver<FileOpEvent>,
@@ -803,6 +804,7 @@ mod gui {
                 dark_mode,
                 scroll_sensitivity,
                 ui_scale,
+                last_native_ppp: 0.0,
                 sort_column: None,
                 sort_direction: SortDirection::Ascending,
                 column_widths: default_column_widths(),
@@ -811,11 +813,10 @@ mod gui {
                 last_credentials_mtime,
                 last_credentials_poll_at: Instant::now(),
                 account_color_map: HashMap::new(),
-                show_account_color_legend: false,
                 tab_rename_id: None,
                 tab_rename_buf: String::new(),
-                tab_color_picker_id: None,
                 tab_color_picker_rgb: [0.0, 0.0, 0.0],
+                color_picker_profile: None,
                 file_browsers: HashMap::new(),
                 file_op_tx,
                 file_op_rx,
@@ -835,12 +836,33 @@ mod gui {
                 ));
             }
 
-            // Load cached inventory from disk — but only if the profile is authenticated.
-            // If auth is expired/missing, don't show stale data; wait for auth to become OK.
+            // Build a preliminary context so Connect works before the background refresh completes.
+            // Also load cached inventory from disk if the profile is authenticated.
             if let Some(profile_id) = app.selected_profile.clone() {
+                let profile_cfg = app.config.profiles.iter()
+                    .find(|p| p.profile_id == profile_id);
+                let region = profile_cfg
+                    .and_then(|p| p.region.clone())
+                    .or_else(|| app.config.default_region.clone())
+                    .unwrap_or_else(|| "us-east-1".to_string());
+                let account_id = profile_cfg
+                    .map(|p| p.account_id.clone())
+                    .filter(|s| !s.is_empty());
+
                 let is_auth_ok = app.profile_auth_infos.iter().any(|a| {
                     a.profile_id == profile_id && a.auth_status == AuthStatus::Ok
                 }) || app.options.mode == Mode::Sim;
+
+                // Always set a preliminary context so Connect doesn't fail with "context not loaded"
+                app.context = Some(AwsContext {
+                    mode: app.options.mode.clone(),
+                    profile: profile_id.clone(),
+                    account_id,
+                    arn: None,
+                    user_id: None,
+                    region: region.clone(),
+                    auth_status: if is_auth_ok { AuthStatus::Ok } else { AuthStatus::Expired },
+                });
 
                 if is_auth_ok {
                     app.load_cache_for_profile(&profile_id);
@@ -2890,12 +2912,12 @@ mod gui {
                 .map(|t| (t.id, t.title.clone(), t.profile_id.clone(), t.running))
                 .collect();
 
+            let colors_enabled = self.config.account_colors_enabled;
+
             if tabs_snapshot.is_empty() {
                 ui.label("No active connections. Select an instance and click Connect.");
                 return;
             }
-
-            let colors_enabled = self.config.account_colors_enabled;
 
             let mut to_select: Option<u64> = None;
             let mut to_close: Option<u64> = None;
@@ -3019,17 +3041,12 @@ mod gui {
                     .get(&profile_id)
                     .copied()
                     .unwrap_or(egui::Color32::from_rgb(128, 128, 128));
-                self.tab_color_picker_id = self
-                    .connections
-                    .tabs()
-                    .iter()
-                    .find(|t| t.profile_id == profile_id)
-                    .map(|t| t.id);
                 self.tab_color_picker_rgb = [
                     current_color.r() as f32 / 255.0,
                     current_color.g() as f32 / 255.0,
                     current_color.b() as f32 / 255.0,
                 ];
+                self.color_picker_profile = Some(profile_id);
             }
             if close_all {
                 let tab_ids: Vec<u64> = tabs_snapshot.iter().map(|(id, _, _, _)| *id).collect();
@@ -3038,50 +3055,6 @@ mod gui {
                 }
             } else if let Some(id) = to_close {
                 self.close_connection_tab(id);
-            }
-
-            // Account color legend
-            if colors_enabled && !self.account_color_map.is_empty() {
-                ui.horizontal(|ui| {
-                    let legend_label = if self.show_account_color_legend {
-                        "Legend \u{25B2}"
-                    } else {
-                        "Legend \u{25BC}"
-                    };
-                    if ui.small_button(legend_label).clicked() {
-                        self.show_account_color_legend = !self.show_account_color_legend;
-                    }
-                });
-
-                if self.show_account_color_legend {
-                    ui.horizontal_wrapped(|ui| {
-                        // Show all profiles with their colors, sorted by env rank
-                        let mut profiles: Vec<(String, egui::Color32)> = self
-                            .account_color_map
-                            .iter()
-                            .map(|(k, v)| (k.clone(), *v))
-                            .collect();
-                        profiles.sort_by(|a, b| env_rank(&a.0).cmp(&env_rank(&b.0)));
-
-                        for (profile_id, color) in &profiles {
-                            let display_name = self
-                                .config
-                                .profiles
-                                .iter()
-                                .find(|p| &p.profile_id == profile_id)
-                                .map(|p| p.display_name.as_str())
-                                .unwrap_or(profile_id.as_str());
-
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(10.0, 10.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().circle_filled(rect.center(), 5.0, *color);
-                            ui.label(display_name);
-                            ui.add_space(8.0);
-                        }
-                    });
-                }
             }
 
             // Inline rename editor
@@ -3790,6 +3763,13 @@ mod gui {
     impl eframe::App for Ec2GuiApp {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             let update_result = panic::catch_unwind(AssertUnwindSafe(|| {
+                // Re-apply scaling when native DPI changes (monitor switch)
+                let native_ppp = ctx.native_pixels_per_point().unwrap_or(1.0);
+                if (native_ppp - self.last_native_ppp).abs() > 0.01 {
+                    self.last_native_ppp = native_ppp;
+                    ctx.set_pixels_per_point(self.ui_scale * native_ppp);
+                }
+
                 self.poll_profile_choice_changes();
                 self.poll_credentials_changes();
                 self.poll_connection_events();
@@ -3867,18 +3847,9 @@ mod gui {
                     }
                 }
 
-                // Color picker window for tab account color
-                if self.tab_color_picker_id.is_some() {
-                    let profile_id = self
-                        .tab_color_picker_id
-                        .and_then(|id| {
-                            self.connections
-                                .tabs()
-                                .iter()
-                                .find(|t| t.id == id)
-                                .map(|t| t.profile_id.clone())
-                        })
-                        .unwrap_or_default();
+                // Color picker window (opened from Edit menu or right-click tab)
+                if self.color_picker_profile.is_some() {
+                    let profile_id = self.color_picker_profile.clone().unwrap_or_default();
 
                     let display_name = self
                         .config
@@ -3916,7 +3887,7 @@ mod gui {
                                         self.rebuild_account_colors();
                                         let _ = self.config.save();
                                     }
-                                    self.tab_color_picker_id = None;
+                                    self.color_picker_profile = None;
                                 }
                                 if ui.button("Reset to Default").clicked() {
                                     if !profile_id.is_empty() {
@@ -3924,12 +3895,12 @@ mod gui {
                                         self.rebuild_account_colors();
                                         let _ = self.config.save();
                                     }
-                                    self.tab_color_picker_id = None;
+                                    self.color_picker_profile = None;
                                 }
                             });
                         });
                     if !open {
-                        self.tab_color_picker_id = None;
+                        self.color_picker_profile = None;
                     }
                 }
 
@@ -3969,7 +3940,6 @@ mod gui {
                                 }
                             });
                             ui.menu_button("Account Tab Colors", |ui| {
-                                let was_enabled = self.config.account_colors_enabled;
                                 if ui
                                     .selectable_label(self.config.account_colors_enabled, "Enabled")
                                     .clicked()
@@ -3977,8 +3947,52 @@ mod gui {
                                     self.config.account_colors_enabled = !self.config.account_colors_enabled;
                                     let _ = self.config.save();
                                 }
-                                ui.separator();
                                 if self.config.account_colors_enabled {
+                                    ui.separator();
+
+                                    // Show each profile with its color and an edit button
+                                    let mut profiles_sorted: Vec<(String, String)> = self
+                                        .config
+                                        .profiles
+                                        .iter()
+                                        .map(|p| (p.profile_id.clone(), p.display_name.clone()))
+                                        .collect();
+                                    profiles_sorted.sort_by(|a, b| env_rank(&a.0).cmp(&env_rank(&b.0)));
+
+                                    let mut pick_profile: Option<String> = None;
+                                    for (pid, display_name) in &profiles_sorted {
+                                        ui.horizontal(|ui| {
+                                            if let Some(color) = self.account_color_map.get(pid) {
+                                                let (rect, _) = ui.allocate_exact_size(
+                                                    egui::vec2(12.0, 12.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().circle_filled(rect.center(), 6.0, *color);
+                                            }
+                                            ui.label(display_name.as_str());
+                                            if ui.small_button("Edit").clicked() {
+                                                pick_profile = Some(pid.clone());
+                                            }
+                                        });
+                                    }
+
+                                    if let Some(pid) = pick_profile {
+                                        let current_color = self
+                                            .account_color_map
+                                            .get(&pid)
+                                            .copied()
+                                            .unwrap_or(egui::Color32::from_rgb(128, 128, 128));
+                                        self.tab_color_picker_rgb = [
+                                            current_color.r() as f32 / 255.0,
+                                            current_color.g() as f32 / 255.0,
+                                            current_color.b() as f32 / 255.0,
+                                        ];
+                                        // Use a sentinel: store profile_id in a new field
+                                        self.color_picker_profile = Some(pid);
+                                        ui.close();
+                                    }
+
+                                    ui.separator();
                                     if ui.button("Reset All to Defaults").clicked() {
                                         self.config.account_colors.clear();
                                         self.rebuild_account_colors();
@@ -3986,7 +4000,6 @@ mod gui {
                                         ui.close();
                                     }
                                 }
-                                let _ = was_enabled; // suppress unused warning
                             });
                         });
                     });
@@ -4006,7 +4019,7 @@ mod gui {
                         }
                     });
 
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if ui
                             .selectable_label(self.main_tab == MainTab::Inventory, "Inventory")
                             .clicked()
@@ -4027,6 +4040,36 @@ mod gui {
                             .clicked()
                         {
                             self.main_tab = MainTab::Log;
+                        }
+
+                        // Inline account color legend
+                        if self.config.account_colors_enabled
+                            && !self.account_color_map.is_empty()
+                        {
+                            ui.separator();
+                            let mut profiles: Vec<(String, egui::Color32)> = self
+                                .account_color_map
+                                .iter()
+                                .map(|(k, v)| (k.clone(), *v))
+                                .collect();
+                            profiles.sort_by(|a, b| env_rank(&a.0).cmp(&env_rank(&b.0)));
+
+                            for (pid, color) in &profiles {
+                                let display_name = self
+                                    .config
+                                    .profiles
+                                    .iter()
+                                    .find(|p| &p.profile_id == pid)
+                                    .map(|p| p.display_name.as_str())
+                                    .unwrap_or(pid.as_str());
+
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(10.0, 10.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(rect.center(), 5.0, *color);
+                                ui.label(display_name);
+                            }
                         }
                     });
 
@@ -4068,12 +4111,19 @@ mod gui {
                             })
                             .collect();
 
-                        let selected_text = before_profile
+                        let base_text = before_profile
                             .as_ref()
                             .and_then(|id| profile_options.iter().find(|(pid, _, _)| pid == id))
                             .map(|(_, label, _)| label.clone())
                             .unwrap_or_else(|| "(none)".to_string());
 
+                        let selected_text = if self.refreshing {
+                            format!("{base_text} (loading...)")
+                        } else {
+                            base_text
+                        };
+
+                        ui.add_enabled_ui(!self.refreshing, |ui| {
                         egui::ComboBox::from_id_salt("profile_selector_combo")
                             .selected_text(selected_text)
                             .show_ui(ui, |ui| {
@@ -4168,7 +4218,9 @@ mod gui {
 
                             self.refresh_context_and_inventory(true);
                         }
+                        }); // add_enabled_ui
                         ui.separator();
+
                     }
 
                     ui.label("Region");
