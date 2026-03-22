@@ -1145,9 +1145,11 @@ mod gui {
             self.log_info(format!("disk cache lookup: profile={profile_id} region={region}"));
             if let Some(cached) = ec2_manager::inventory::load_disk_cache(profile_id, &region) {
                 let count = cached.instances.len();
+                let resolved_profile = credentials::find_profile_by_account_id(profile_id)
+                    .unwrap_or_else(|| profile_id.to_string());
                 let ctx = AwsContext {
                     mode: self.options.mode.clone(),
-                    profile: profile_id.to_string(),
+                    profile: resolved_profile,
                     account_id,
                     arn: None,
                     user_id: None,
