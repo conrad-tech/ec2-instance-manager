@@ -42,21 +42,22 @@ fn parse_accounts(json: &str) -> Vec<ProfileConfig> {
 
 /// Load the ordered account list.
 ///
-/// Priority:
-/// 1. `accounts.json` in the user config dir (runtime override — add/remove without rebuilding)
-/// 2. `assets/accounts.json` compiled into the binary (edit in repo, then rebuild)
+/// Always uses the bundled `assets/accounts.json` compiled into the binary.
+/// On load, copies it to the user config dir so you can see/reference the file,
+/// but the bundled version is the source of truth — edit `assets/accounts.json`
+/// and rebuild to change accounts.
 pub fn load_accounts() -> Vec<ProfileConfig> {
+    let profiles = parse_accounts(BUNDLED_ACCOUNTS);
+
+    // Write the bundled version to the config dir so the user has a reference copy
     if let Some(path) = accounts_path() {
-        if path.exists() {
-            if let Ok(content) = fs::read_to_string(&path) {
-                let profiles = parse_accounts(&content);
-                if !profiles.is_empty() {
-                    return profiles;
-                }
-            }
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
         }
+        let _ = fs::write(&path, BUNDLED_ACCOUNTS);
     }
-    parse_accounts(BUNDLED_ACCOUNTS)
+
+    profiles
 }
 
 #[cfg(test)]
