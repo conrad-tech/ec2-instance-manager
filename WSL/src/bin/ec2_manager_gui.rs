@@ -43,6 +43,7 @@ mod gui {
     };
     use ec2_manager::util::truncate;
     use ec2_manager::workflow::find_instance;
+    use ec2_manager::wsl_setup;
 
     const GUI_DEFAULT_WIDTH: f32 = 1720.0;
     const GUI_DEFAULT_HEIGHT: f32 = 980.0;
@@ -660,7 +661,23 @@ mod gui {
         }
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum WslSetupState {
+        /// Cache says setup is done — skip check
+        Cached,
+        /// Checking prerequisites (background thread)
+        Checking,
+        /// Setup is needed — show commands to run
+        Needed,
+        /// Setup completed successfully
+        Ready,
+    }
+
     struct Ec2GuiApp {
+        wsl_setup_state: WslSetupState,
+        wsl_setup_status: Option<wsl_setup::WslSetupStatus>,
+        wsl_setup_tx: Sender<wsl_setup::WslSetupStatus>,
+        wsl_setup_rx: Receiver<wsl_setup::WslSetupStatus>,
         options: GuiOptions,
         gui_smoke: Option<GuiSmokeConfig>,
         gui_smoke_marker_written: bool,
@@ -708,6 +725,10 @@ mod gui {
         refreshing_profiles: HashMap<String, u64>,
         /// Per-profile in-memory inventory cache: profile_id -> (Inventory, AwsContext)
         profile_inventory_cache: HashMap<String, (Inventory, AwsContext)>,
+        debug_mode: bool,
+        wsl_auto_setup: bool,
+        wsl_password_buf: String,
+        wsl_show_password_popup: bool,
         dark_mode: bool,
         scroll_sensitivity: f32,
         ui_scale: f32,
@@ -741,6 +762,19 @@ mod gui {
             let config = AppConfig::load().unwrap_or_default();
             let dependencies = dependency_status();
             let (proc_tx, proc_rx) = mpsc::channel();
+            let (wsl_setup_tx, wsl_setup_rx) = mpsc::channel();
+
+            // Check WSL setup: if cached, skip; otherwise check in background
+            let wsl_setup_state = if wsl_setup::is_setup_cached() {
+                WslSetupState::Cached
+            } else {
+                let tx = wsl_setup_tx.clone();
+                std::thread::spawn(move || {
+                    let status = wsl_setup::check_wsl_setup();
+                    let _ = tx.send(status);
+                });
+                WslSetupState::Checking
+            };
             let (refresh_tx, refresh_rx) = mpsc::channel();
             let (file_op_tx, file_op_rx) = mpsc::channel();
             #[cfg(target_os = "windows")]
@@ -769,7 +803,13 @@ mod gui {
                         .map(|p| p.profile_id.clone())
                 });
 
+            let debug_mode = options.debug;
+            let wsl_auto_setup = options.wsl_auto_setup;
             let mut app = Self {
+                wsl_setup_state,
+                wsl_setup_status: None,
+                wsl_setup_tx,
+                wsl_setup_rx,
                 options,
                 gui_smoke,
                 gui_smoke_marker_written: false,
@@ -796,7 +836,15 @@ mod gui {
                 diagnostics: String::new(),
                 main_tab: MainTab::Inventory,
                 logs: VecDeque::new(),
-                log_filters: LogFilters::default(),
+                log_filters: if debug_mode {
+                    LogFilters {
+                        debug: true,
+                        trace: true,
+                        ..LogFilters::default()
+                    }
+                } else {
+                    LogFilters::default()
+                },
                 terminals,
                 selected_terminal_id,
                 profile_choice_path,
@@ -815,6 +863,10 @@ mod gui {
                 refresh_generation: 0,
                 refreshing_profiles: HashMap::new(),
                 profile_inventory_cache: HashMap::new(),
+                debug_mode,
+                wsl_auto_setup,
+                wsl_password_buf: String::new(),
+                wsl_show_password_popup: false,
                 dark_mode,
                 scroll_sensitivity,
                 ui_scale,
@@ -1085,13 +1137,9 @@ mod gui {
             self.log_info(format!("disk cache lookup: profile={profile_id} region={region}"));
             if let Some(cached) = ec2_manager::inventory::load_disk_cache(profile_id, &region) {
                 let count = cached.instances.len();
-                // Resolve the actual AWS credentials profile name from the account-id-based
-                // profile_id, so that AWS_PROFILE is set correctly when spawning sessions.
-                let resolved_profile = ec2_manager::credentials::find_profile_by_account_id(profile_id)
-                    .unwrap_or_else(|| profile_id.to_string());
                 let ctx = AwsContext {
                     mode: self.options.mode.clone(),
-                    profile: resolved_profile,
+                    profile: profile_id.to_string(),
                     account_id,
                     arn: None,
                     user_id: None,
@@ -1499,7 +1547,7 @@ mod gui {
                 let kind = self
                     .selected_terminal()
                     .map(|t| t.kind.clone())
-                    .unwrap_or(TerminalKind::Cmd);
+                    .unwrap_or(TerminalKind::Wsl);
                 format_sim_command(kind, &command_line, &instance.instance_id, None)
             } else {
                 command_line
@@ -1557,7 +1605,7 @@ mod gui {
                 let kind = self
                     .selected_terminal()
                     .map(|t| t.kind.clone())
-                    .unwrap_or(TerminalKind::Cmd);
+                    .unwrap_or(TerminalKind::Wsl);
                 format_sim_command(
                     kind,
                     &command_line,
@@ -3950,6 +3998,43 @@ mod gui {
                     ctx.set_pixels_per_point(self.ui_scale * native_ppp);
                 }
 
+                // --- WSL Setup (non-blocking) ---
+                if matches!(self.wsl_setup_state, WslSetupState::Checking) {
+                    if let Ok(status) = self.wsl_setup_rx.try_recv() {
+                        if status.is_ready() {
+                            self.wsl_setup_state = WslSetupState::Ready;
+                            wsl_setup::mark_setup_done();
+                            self.message = "WSL setup complete.".to_string();
+                            self.log_info("WSL setup verified and cached");
+                        } else if !status.wsl_available {
+                            self.wsl_setup_state = WslSetupState::Needed;
+                            self.message = "WSL is not installed. Install WSL and click 'Initialize WSL'.".to_string();
+                            self.log_warn("WSL not available on this machine");
+                        } else {
+                            self.wsl_setup_state = WslSetupState::Needed;
+                            self.message = "WSL prerequisites missing.".to_string();
+                            self.log_warn("WSL prerequisites not met");
+                            // Auto-prompt for sudo password if --wsl flag is set
+                            if self.wsl_auto_setup {
+                                self.wsl_show_password_popup = true;
+                            }
+                        }
+                        // Log WSL setup details
+                        for line in &status.setup_log {
+                            if self.debug_mode {
+                                self.log_info(format!("[WSL] {line}"));
+                            } else {
+                                self.log_debug(format!("[WSL] {line}"));
+                            }
+                        }
+                        self.wsl_setup_status = Some(status);
+                    }
+                    if self.wsl_setup_state == WslSetupState::Checking {
+                        self.message = "Initializing WSL setup...".to_string();
+                    }
+                    ctx.request_repaint_after(Duration::from_millis(200));
+                }
+
                 self.poll_profile_choice_changes();
                 self.poll_credentials_changes();
                 self.poll_connection_events();
@@ -4024,6 +4109,101 @@ mod gui {
                                     }
                                 });
                             });
+                    }
+                }
+
+                // WSL setup popup
+                if self.wsl_show_password_popup {
+                    let mut open = true;
+                    egui::Window::new("WSL Setup Required")
+                        .collapsible(false)
+                        .resizable(false)
+                        .open(&mut open)
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(ctx, |ui| {
+                            ui.label("The following WSL prerequisites need to be installed:");
+                            ui.add_space(4.0);
+
+                            if let Some(ref status) = self.wsl_setup_status {
+                                if !status.aws_cli_installed {
+                                    ui.label("  - AWS CLI v2");
+                                }
+                                if !status.ssm_plugin_installed {
+                                    ui.label("  - Session Manager Plugin");
+                                }
+                                if !status.aws_credentials_linked {
+                                    ui.label("  - AWS credentials link");
+                                }
+                            }
+
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+
+                            ui.label("Option 1: Enter sudo password to auto-install");
+                            ui.add_space(4.0);
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut self.wsl_password_buf)
+                                    .password(true)
+                                    .hint_text("WSL sudo password")
+                            );
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                let enter_pressed = resp.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                if ui.button("Install").clicked() || enter_pressed {
+                                    let password = self.wsl_password_buf.clone();
+                                    self.wsl_password_buf.clear();
+                                    self.log_info("[WSL] sudo password cleared from memory");
+                                    self.wsl_show_password_popup = false;
+                                    self.wsl_setup_state = WslSetupState::Checking;
+                                    self.message = "Running WSL setup...".to_string();
+                                    self.log_info("WSL auto-setup started");
+                                    let tx = self.wsl_setup_tx.clone();
+                                    std::thread::spawn(move || {
+                                        let status = wsl_setup::run_wsl_setup_with_password(&password);
+                                        let _ = tx.send(status);
+                                    });
+                                }
+                            });
+
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+
+                            ui.label("Option 2: Copy commands and run in your WSL terminal");
+                            ui.add_space(4.0);
+                            if ui.button("Copy Commands").clicked() {
+                                let win_user = std::env::var("USERNAME").unwrap_or_default();
+                                let mut cmds: Vec<String> = Vec::new();
+                                cmds.push("sudo apt-get update && sudo apt-get install -y unzip curl".to_string());
+                                if let Some(ref status) = self.wsl_setup_status {
+                                    if !status.aws_cli_installed {
+                                        cmds.push("cd /tmp && curl -s \"https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip\" -o awscliv2.zip && unzip -qo awscliv2.zip && sudo ./aws/install && rm -rf aws awscliv2.zip".to_string());
+                                    }
+                                    if !status.ssm_plugin_installed {
+                                        cmds.push("cd /tmp && curl -s \"https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb\" -o ssm.deb && sudo dpkg -i ssm.deb && rm ssm.deb".to_string());
+                                    }
+                                    if !status.aws_credentials_linked && !win_user.is_empty() {
+                                        cmds.push(format!("ln -s /mnt/c/Users/{win_user}/.aws ~/.aws"));
+                                    }
+                                }
+                                let full_cmd = cmds.join(" && ");
+                                ui.ctx().copy_text(full_cmd);
+                                self.message = "Commands copied to clipboard!".to_string();
+                                self.wsl_password_buf.clear();
+                                self.wsl_show_password_popup = false;
+                            }
+
+                            ui.add_space(8.0);
+                            if ui.button("Cancel").clicked() {
+                                self.wsl_password_buf.clear();
+                                self.wsl_show_password_popup = false;
+                            }
+                        });
+                    if !open {
+                        self.wsl_password_buf.clear();
+                        self.wsl_show_password_popup = false;
                     }
                 }
 
@@ -4295,6 +4475,133 @@ mod gui {
                     .resizable(true)
                     .show(ctx, |ui| {
                     ui.heading("Controls");
+
+                    // WSL setup status / button — only show when WSL is the selected terminal
+                    let is_wsl_selected = self.selected_terminal_id == "wsl";
+                    if is_wsl_selected {
+                    match self.wsl_setup_state {
+                        WslSetupState::Checking => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Initializing WSL setup...");
+                            });
+                            ui.separator();
+                        }
+                        WslSetupState::Needed => {
+                            ui.group(|ui| {
+                                let is_wsl_missing = self.wsl_setup_status
+                                    .as_ref()
+                                    .map(|s| !s.wsl_available)
+                                    .unwrap_or(false);
+
+                                if is_wsl_missing {
+                                    ui.colored_label(
+                                        egui::Color32::YELLOW,
+                                        "WSL not installed",
+                                    );
+                                    ui.label("Install WSL from PowerShell (admin):");
+                                    ui.monospace("wsl --install");
+                                } else {
+                                    ui.colored_label(
+                                        egui::Color32::YELLOW,
+                                        "WSL setup incomplete",
+                                    );
+                                    if let Some(ref status) = self.wsl_setup_status {
+                                        if !status.aws_cli_installed {
+                                            ui.label("- AWS CLI: missing");
+                                        }
+                                        if !status.ssm_plugin_installed {
+                                            ui.label("- Session Manager Plugin: missing");
+                                        }
+                                        if !status.aws_credentials_linked {
+                                            ui.label("- AWS credentials: not linked");
+                                        }
+                                    }
+
+                                    ui.add_space(4.0);
+
+                                    let win_user = std::env::var("USERNAME").unwrap_or_default();
+
+                                    // Build the commands based on what's missing
+                                    let mut cmds: Vec<String> = Vec::new();
+                                    cmds.push("sudo apt-get update && sudo apt-get install -y unzip curl".to_string());
+
+                                    if let Some(ref status) = self.wsl_setup_status {
+                                        if !status.aws_cli_installed {
+                                            cmds.push(
+                                                "cd /tmp && curl -s \"https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip\" -o awscliv2.zip && unzip -qo awscliv2.zip && sudo ./aws/install && rm -rf aws awscliv2.zip".to_string()
+                                            );
+                                        }
+                                        if !status.ssm_plugin_installed {
+                                            cmds.push(
+                                                "cd /tmp && curl -s \"https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb\" -o ssm.deb && sudo dpkg -i ssm.deb && rm ssm.deb".to_string()
+                                            );
+                                        }
+                                        if !status.aws_credentials_linked && !win_user.is_empty() {
+                                            cmds.push(format!(
+                                                "ln -s /mnt/c/Users/{win_user}/.aws ~/.aws"
+                                            ));
+                                        }
+                                    }
+
+                                    let full_cmd = cmds.join(" && ");
+
+                                    ui.horizontal(|ui| {
+                                        ui.label("Run in a WSL terminal:");
+                                        if ui.small_button("Copy Commands").clicked() {
+                                            ui.ctx().copy_text(full_cmd.clone());
+                                            self.message = "Commands copied to clipboard!".to_string();
+                                        }
+                                    });
+
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&full_cmd).monospace().small()
+                                        )
+                                        .wrap()
+                                    );
+                                }
+
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    if ui.button("Re-check WSL").clicked() {
+                                        self.wsl_setup_state = WslSetupState::Checking;
+                                        let tx = self.wsl_setup_tx.clone();
+                                        std::thread::spawn(move || {
+                                            let status = wsl_setup::check_wsl_setup();
+                                            let _ = tx.send(status);
+                                        });
+                                    }
+                                    if self.wsl_auto_setup {
+                                        if ui.button("Setup WSL").clicked() {
+                                            self.wsl_show_password_popup = true;
+                                        }
+                                    }
+                                });
+
+                                // Uninstall commands
+                                ui.add_space(4.0);
+                                ui.collapsing("Uninstall WSL tools", |ui| {
+                                    let uninstall = wsl_setup::uninstall_commands();
+                                    let uninstall_resp = ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&uninstall).monospace().small()
+                                        )
+                                        .wrap()
+                                        .sense(egui::Sense::click())
+                                    );
+                                    if uninstall_resp.clicked() {
+                                        ui.ctx().copy_text(uninstall.clone());
+                                        self.message = "Uninstall commands copied to clipboard!".to_string();
+                                    }
+                                    uninstall_resp.on_hover_text("Click to copy");
+                                });
+                            });
+                            ui.separator();
+                        }
+                        WslSetupState::Ready | WslSetupState::Cached => {}
+                    }
+                    } // is_wsl_selected
 
                     if self.refreshing {
                         ui.add_enabled(false, egui::Button::new("Refreshing..."));
@@ -4820,6 +5127,7 @@ mod gui {
 
         if cfg!(windows) {
             match kind {
+                TerminalKind::Wsl => format!("echo '[SIM MODE] {cmd}'; echo '{status_line}'"),
                 TerminalKind::Cmd => format!("echo [SIM MODE] {cmd} & echo {status_line}"),
                 TerminalKind::PowerShell7 | TerminalKind::WindowsPowerShell => {
                     format!("Write-Host '[SIM MODE] {cmd}'; Write-Host '{status_line}'")
@@ -4864,19 +5172,40 @@ mod gui {
     }
 
     fn shell_wrapped_pty_command(
-        _terminal: Option<&TerminalOption>,
+        terminal: Option<&TerminalOption>,
         command_line: &str,
     ) -> PtyCommand {
-        // Always use CMD for live-mode shell wrapping.  Windows
-        // PowerShell 5.1 + ConPTY has a known issue where only
-        // cursor-visibility sequences flow through the PTY pipe
-        // and all other output (including keystroke echo) is lost.
-        // CMD's simpler console handling works reliably with ConPTY,
-        // and /K runs the command then keeps the shell alive for
-        // interactive I/O (e.g. session-manager-plugin).
-        PtyCommand {
-            program: windows_cmd_path(),
-            args: vec!["/K".to_string(), command_line.to_string()],
+        let kind = terminal.map(|t| t.kind.clone()).unwrap_or(TerminalKind::Wsl);
+
+        match kind {
+            TerminalKind::Wsl => PtyCommand {
+                program: "wsl.exe".to_string(),
+                args: vec![
+                    "-e".to_string(),
+                    "bash".to_string(),
+                    "-lc".to_string(),
+                    command_line.to_string(),
+                ],
+            },
+            TerminalKind::PowerShell7 | TerminalKind::WindowsPowerShell => {
+                let program = terminal
+                    .map(|t| t.program.clone())
+                    .unwrap_or_else(|| "powershell".to_string());
+                PtyCommand {
+                    program,
+                    args: vec![
+                        "-NoLogo".to_string(),
+                        "-NoExit".to_string(),
+                        "-Command".to_string(),
+                        command_line.to_string(),
+                    ],
+                }
+            }
+            // CMD and everything else
+            _ => PtyCommand {
+                program: windows_cmd_path(),
+                args: vec!["/K".to_string(), command_line.to_string()],
+            },
         }
     }
 
@@ -4884,8 +5213,19 @@ mod gui {
         if cfg!(windows) {
             let kind = terminal
                 .map(|t| t.kind.clone())
-                .unwrap_or(TerminalKind::Cmd);
+                .unwrap_or(TerminalKind::Wsl);
             match kind {
+                TerminalKind::Wsl => {
+                    return PtyCommand {
+                        program: "wsl.exe".to_string(),
+                        args: vec![
+                            "-e".to_string(),
+                            "bash".to_string(),
+                            "-lc".to_string(),
+                            command_line.to_string(),
+                        ],
+                    };
+                }
                 TerminalKind::PowerShell7 | TerminalKind::WindowsPowerShell => {
                     let program = terminal
                         .map(|t| t.program.clone())
@@ -5858,6 +6198,7 @@ mod gui {
                         TerminalKind::PowerShell7
                             | TerminalKind::WindowsPowerShell
                             | TerminalKind::Cmd
+                            | TerminalKind::Wsl
                     )
                 })
                 .collect()

@@ -1,0 +1,16 @@
+[
+  {
+    "label": "Dev",
+    "account_id": "123456789012",
+    "region": "us-east-1",
+    "sort_order": 2,
+    "color": "#2ea043"
+  },
+  {
+    "label": "Staging",
+    "account_id": "234567890123",
+    "region": "us-east-1",
+    "sort_order": 1,
+    "color": "#c8b41e"
+  }
+]
