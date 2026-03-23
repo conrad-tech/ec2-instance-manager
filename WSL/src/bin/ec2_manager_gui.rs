@@ -5994,7 +5994,7 @@ mod gui {
                     ui.label("Saved Filters");
                     ui.horizontal(|ui| {
                         ui.text_edit_singleline(&mut self.save_filter_name);
-                        if ui.button("Save Current").clicked() {
+                        if ui.button("Save").clicked() {
                             // Use selected filter name if the text field is empty
                             if self.save_filter_name.trim().is_empty()
                                 && !self.selected_saved_filter.is_empty()
@@ -6025,6 +6025,8 @@ mod gui {
                     } else {
                         self.selected_saved_filter.clone()
                     };
+                    let mut clear_filters = false;
+                    ui.horizontal(|ui| {
                     egui::ComboBox::from_id_salt("saved_filter_combo")
                         .selected_text(filter_btn_text)
                         .show_ui(ui, |ui| {
@@ -6061,6 +6063,10 @@ mod gui {
                                 });
                             }
                         });
+                    if ui.button("Clear").clicked() {
+                        clear_filters = true;
+                    }
+                    }); // horizontal
 
                     // Handle "Show Favorites" built-in filter
                     if show_favorites_only {
@@ -6102,7 +6108,7 @@ mod gui {
                         self.log_info(self.message.clone());
                     }
 
-                    if ui.button("Clear Filters").clicked() {
+                    if clear_filters {
                         self.search_rules = vec![SearchRuleInput::default()];
                         self.selected_state_filter = STATE_FILTER_NONE.to_string();
                         self.only_ssm = false;
