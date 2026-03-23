@@ -4913,26 +4913,39 @@ mod gui {
             ));
             ui.separator();
 
+            ui.horizontal(|ui| {
+                if ui.button("Copy All").clicked() {
+                    let text: String = self.logs.iter()
+                        .filter(|e| self.log_filters.includes(e.level))
+                        .map(|e| format!("[{}] {}", e.level.as_str(), e.message))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(&text);
+                    }
+                }
+            });
+
+            // Build colored log text as a LayoutJob for selectable display
+            let mut log_text = String::new();
+            for entry in self.logs.iter()
+                .filter(|e| self.log_filters.includes(e.level))
+            {
+                if !log_text.is_empty() {
+                    log_text.push('\n');
+                }
+                log_text.push_str(&format!("[{}] {}", entry.level.as_str(), entry.message));
+            }
+
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
-                    for entry in self
-                        .logs
-                        .iter()
-                        .filter(|entry| self.log_filters.includes(entry.level))
-                    {
-                        let color = match entry.level {
-                            LogLevel::Error => egui::Color32::RED,
-                            LogLevel::Warn => egui::Color32::YELLOW,
-                            LogLevel::Info => egui::Color32::LIGHT_GREEN,
-                            LogLevel::Debug => egui::Color32::LIGHT_BLUE,
-                            LogLevel::Trace => egui::Color32::GRAY,
-                        };
-                        ui.colored_label(
-                            color,
-                            format!("[{}] {}", entry.level.as_str(), entry.message),
-                        );
-                    }
+                    ui.add(
+                        egui::TextEdit::multiline(&mut log_text.as_str())
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .frame(false),
+                    );
                 });
         }
     }
