@@ -3667,8 +3667,24 @@ mod gui {
                                 .find(|p| p.profile_id == *pid)
                                 .map(|p| p.display_name.as_str())
                                 .unwrap_or("?");
+                            let env_lower = env.to_ascii_lowercase();
+                            let instances: Vec<String> = if self.selected_profile.as_deref() == Some(pid.as_str()) {
+                                self.inventory.instances.iter()
+                                    .filter(|i| instance_env(i).map(|e| e.to_ascii_lowercase()) == Some(env_lower.clone()))
+                                    .map(|i| i.instance_id.clone())
+                                    .take(5)
+                                    .collect()
+                            } else if let Some((inv, _)) = self.profile_inventory_cache.get(pid) {
+                                inv.instances.iter()
+                                    .filter(|i| instance_env(i).map(|e| e.to_ascii_lowercase()) == Some(env_lower.clone()))
+                                    .map(|i| i.instance_id.clone())
+                                    .take(5)
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
                             self.log_info(format!(
-                                "legend: env={env} profile={pid} label={label} color=({},{},{})",
+                                "legend: env={env} profile={pid} label={label} color=({},{},{}) instances={instances:?}",
                                 color.r(), color.g(), color.b()
                             ));
                         }
