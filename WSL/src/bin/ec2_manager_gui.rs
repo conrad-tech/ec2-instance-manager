@@ -4148,32 +4148,6 @@ mod gui {
                 ui.colored_label(egui::Color32::YELLOW, "Drop files here to upload");
             }
 
-            // Auto-refresh: detect when user returns from the terminal
-            // (terminal had hover/focus last frame, now the file browser is hovered)
-            let fb_hovered = ui.rect_contains_pointer(ui.max_rect());
-            let auto_refresh = self.file_browsers.get_mut(&tab_id).and_then(|fb| {
-                let already_busy = matches!(fb.status, FileOpStatus::Listing)
-                    || !fb.fetching_dirs.is_empty();
-                if fb.terminal_had_focus && fb_hovered && fb.initialized && !already_busy {
-                    fb.terminal_had_focus = false;
-                    let path = fb.current_path.clone();
-                    let expanded: Vec<String> = fb.expanded_dirs.iter().cloned().collect();
-                    fb.dir_cache.remove(&path);
-                    for dir in &expanded {
-                        fb.dir_cache.remove(dir);
-                        fb.fetching_dirs.remove(dir);
-                    }
-                    Some((path, expanded))
-                } else {
-                    None
-                }
-            });
-            if let Some((path, expanded)) = auto_refresh {
-                self.request_file_listing(tab_id, path);
-                for dir in expanded {
-                    self.request_bg_listing(tab_id, dir);
-                }
-            }
 
             ui.label("File Browser");
             ui.separator();
@@ -4207,6 +4181,7 @@ mod gui {
 
             // Path bar
             let mut navigate_to: Option<String> = None;
+            let mut refresh_all = false;
             let busy = matches!(
                 status,
                 FileOpStatus::Listing | FileOpStatus::Downloading | FileOpStatus::Uploading
@@ -4229,6 +4204,7 @@ mod gui {
                     .add_enabled(!busy, egui::Button::new("Refresh").small())
                     .clicked()
                 {
+                    refresh_all = true;
                     navigate_to = Some(current_path.clone());
                 }
             });
@@ -4517,7 +4493,22 @@ mod gui {
 
             // Handle navigation
             if let Some(path) = navigate_to {
-                self.request_file_listing(tab_id, path);
+                if refresh_all {
+                    // Invalidate entire cache and refresh expanded dirs
+                    let expanded: Vec<String> = self.file_browsers.get(&tab_id)
+                        .map(|fb| fb.expanded_dirs.iter().cloned().collect())
+                        .unwrap_or_default();
+                    if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                        fb.dir_cache.clear();
+                        fb.fetching_dirs.clear();
+                    }
+                    self.request_file_listing(tab_id, path);
+                    for dir in expanded {
+                        self.request_bg_listing(tab_id, dir);
+                    }
+                } else {
+                    self.request_file_listing(tab_id, path);
+                }
             }
         }
 
