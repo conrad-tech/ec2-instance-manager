@@ -3572,6 +3572,14 @@ mod gui {
             if let Some(tab) = self.connections.selected_ref().cloned() {
                 let private_ip = find_instance(&self.inventory.instances, &tab.instance_id)
                     .and_then(|i| i.private_ip.clone())
+                    .or_else(|| {
+                        // Search cached inventories for tabs from other profiles
+                        self.profile_inventory_cache.values()
+                            .find_map(|(inv, _)| {
+                                find_instance(&inv.instances, &tab.instance_id)
+                                    .and_then(|i| i.private_ip.clone())
+                            })
+                    })
                     .unwrap_or_else(|| "-".to_string());
                 let pty_bytes = self.pty_sessions.get(&tab.id)
                     .map(|s| s.bytes_received)
@@ -6353,7 +6361,8 @@ mod gui {
         let cell_w = if cell_w >= 1.0 { cell_w } else { font_id.size * 0.6 };
         let cell_h = if cell_h >= 1.0 { cell_h } else { font_id.size * 1.2 };
         let cols = (available.x / cell_w).floor().max(1.0) as u16;
-        let rows = (available.y / cell_h).floor().max(1.0) as u16;
+        // Reserve one row at the bottom so the cursor/last line is always visible
+        let rows = ((available.y / cell_h).floor() - 1.0).max(1.0) as u16;
         (rows, cols, cell_w, cell_h)
     }
 
