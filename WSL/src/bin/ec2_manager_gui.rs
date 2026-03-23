@@ -5309,6 +5309,9 @@ mod gui {
                 egui::SidePanel::left("controls")
                     .resizable(true)
                     .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("controls_scroll")
+                        .show(ui, |ui| {
                     ui.heading("Controls");
 
                     // WSL setup status / button — only show when WSL is the selected terminal
@@ -5857,49 +5860,80 @@ mod gui {
                     let mut auto_apply = false;
                     let mut show_favorites_only = false;
                     const SHOW_FAVORITES_LABEL: &str = "Show Favorites";
-                    let filter_header = if self.selected_saved_filter.is_empty() {
-                        "Saved Filters".to_string()
+
+                    // Custom dropdown that only closes on filter select or click-outside
+                    let filter_btn_text = if self.selected_saved_filter.is_empty() {
+                        "(choose)".to_string()
                     } else {
-                        format!("Filter: {}", self.selected_saved_filter)
+                        self.selected_saved_filter.clone()
                     };
-                    egui::CollapsingHeader::new(filter_header)
-                        .id_salt("saved_filter_list")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            // Built-in "Show Favorites" option
-                            if ui
-                                .selectable_label(
-                                    self.selected_saved_filter == SHOW_FAVORITES_LABEL,
-                                    SHOW_FAVORITES_LABEL,
-                                )
-                                .clicked()
-                            {
-                                self.selected_saved_filter = SHOW_FAVORITES_LABEL.to_string();
-                                show_favorites_only = true;
-                            }
-                            ui.separator();
-                            for saved in &scope_filters {
-                                ui.horizontal(|ui| {
+                    let popup_id = ui.make_persistent_id("saved_filter_popup");
+                    let is_open = ui.memory(|m| m.is_popup_open(popup_id));
+                    let btn_response = ui.button(format!("{filter_btn_text} \u{25BC}"));
+                    if btn_response.clicked() {
+                        ui.memory_mut(|m| m.toggle_popup(popup_id));
+                    }
+
+                    if is_open {
+                        let mut close_popup = false;
+                        let area_response = egui::Area::new(popup_id)
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(btn_response.rect.left_bottom())
+                            .show(ui.ctx(), |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    ui.set_min_width(150.0);
+                                    // Built-in "Show Favorites" option
                                     if ui
                                         .selectable_label(
-                                            self.selected_saved_filter == saved.name,
-                                            &saved.name,
+                                            self.selected_saved_filter == SHOW_FAVORITES_LABEL,
+                                            SHOW_FAVORITES_LABEL,
                                         )
                                         .clicked()
                                     {
-                                        self.selected_saved_filter = saved.name.clone();
-                                        auto_apply = true;
+                                        self.selected_saved_filter = SHOW_FAVORITES_LABEL.to_string();
+                                        show_favorites_only = true;
+                                        close_popup = true;
                                     }
-                                    if ui
-                                        .small_button("x")
-                                        .on_hover_text("Delete filter")
-                                        .clicked()
-                                    {
-                                        pending_delete_filter = Some(saved.name.clone());
+                                    ui.separator();
+                                    for saved in &scope_filters {
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .selectable_label(
+                                                    self.selected_saved_filter == saved.name,
+                                                    &saved.name,
+                                                )
+                                                .clicked()
+                                            {
+                                                self.selected_saved_filter = saved.name.clone();
+                                                auto_apply = true;
+                                                close_popup = true;
+                                            }
+                                            if ui
+                                                .small_button("x")
+                                                .on_hover_text("Delete filter")
+                                                .clicked()
+                                            {
+                                                pending_delete_filter = Some(saved.name.clone());
+                                                // Do NOT close popup on delete
+                                            }
+                                        });
                                     }
                                 });
+                            });
+
+                        // Close if filter was selected or user clicked outside the popup
+                        if close_popup {
+                            ui.memory_mut(|m| m.toggle_popup(popup_id));
+                        } else {
+                            let popup_rect = area_response.response.rect;
+                            let clicked_outside = ui.input(|i| i.pointer.any_pressed())
+                                && !popup_rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()))
+                                && !btn_response.rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()));
+                            if clicked_outside {
+                                ui.memory_mut(|m| m.toggle_popup(popup_id));
                             }
-                        });
+                        }
+                    }
 
                     // Handle "Show Favorites" built-in filter
                     if show_favorites_only {
@@ -5967,7 +6001,8 @@ mod gui {
                         self.dependencies.ssm_plugin_found,
                         self.terminals.len()
                     ));
-                    });
+                    }); // ScrollArea
+                    }); // SidePanel
                 }
 
                 egui::CentralPanel::default().show(ctx, |ui| match self.main_tab {
