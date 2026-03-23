@@ -765,7 +765,6 @@ mod gui {
         /// Additional account profile IDs to include in the instance list
         multi_account_ids: std::collections::HashSet<String>,
         save_filter_name: String,
-        filter_dropdown_open: bool,
         /// Environments hidden from the color legend (toggled on the connections page)
         hidden_envs: std::collections::HashSet<String>,
         selected_saved_filter: String,
@@ -907,7 +906,6 @@ mod gui {
                 only_ssm: false,
                 multi_account_ids: std::collections::HashSet::new(),
                 save_filter_name: String::new(),
-                filter_dropdown_open: false,
                 hidden_envs: initial_hidden_envs,
                 selected_saved_filter: String::new(),
                 selected_instance_id: String::new(),
@@ -3634,6 +3632,42 @@ mod gui {
 
             let colors_enabled = self.config.account_colors_enabled;
 
+            // Environment color legend — always show on connections page
+            if self.config.account_colors_enabled && !self.account_color_map.is_empty() {
+                let mut seen_envs = std::collections::HashSet::new();
+                let mut env_entries: Vec<(String, egui::Color32)> = self
+                    .account_color_map
+                    .iter()
+                    .filter_map(|(key, color)| {
+                        let (_, env) = key.split_once(':')?;
+                        let env_lower = env.to_ascii_lowercase();
+                        if self.hidden_envs.contains(&env_lower) {
+                            return None;
+                        }
+                        if seen_envs.insert(env_lower) {
+                            Some((env.to_string(), *color))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                env_entries.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+
+                if !env_entries.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        for (env, color) in &env_entries {
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(8.0, 8.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().circle_filled(rect.center(), 4.0, *color);
+                            ui.small(egui::RichText::new(env).weak());
+                        }
+                    });
+                    ui.separator();
+                }
+            }
+
             if tabs_snapshot.is_empty() {
                 ui.label("No active connections. Select an instance and click Connect.");
                 return;
@@ -3798,39 +3832,6 @@ mod gui {
                     }
                     if ui.button("Cancel").clicked() {
                         self.tab_rename_id = None;
-                    }
-                });
-            }
-
-            // Environment color legend on connections page
-            if self.config.account_colors_enabled && !self.account_color_map.is_empty() {
-                let mut seen_envs = std::collections::HashSet::new();
-                let mut env_entries: Vec<(String, egui::Color32)> = self
-                    .account_color_map
-                    .iter()
-                    .filter_map(|(key, color)| {
-                        let (_, env) = key.split_once(':')?;
-                        let env_lower = env.to_ascii_lowercase();
-                        if self.hidden_envs.contains(&env_lower) {
-                            return None;
-                        }
-                        if seen_envs.insert(env_lower) {
-                            Some((env.to_string(), *color))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                env_entries.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
-
-                ui.horizontal_wrapped(|ui| {
-                    for (env, color) in &env_entries {
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(8.0, 8.0),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter().circle_filled(rect.center(), 4.0, *color);
-                        ui.small(egui::RichText::new(env).weak());
                     }
                 });
             }
@@ -5924,17 +5925,13 @@ mod gui {
                     const SHOW_FAVORITES_LABEL: &str = "Show Favorites";
 
                     let filter_btn_text = if self.selected_saved_filter.is_empty() {
-                        "Choose Filter v".to_string()
+                        "Choose Filter".to_string()
                     } else {
-                        format!("{} v", self.selected_saved_filter)
+                        self.selected_saved_filter.clone()
                     };
-                    if ui.button(&filter_btn_text).clicked() {
-                        self.filter_dropdown_open = !self.filter_dropdown_open;
-                    }
-
-                    if self.filter_dropdown_open {
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            // Built-in "Show Favorites" option
+                    egui::ComboBox::from_id_salt("saved_filter_combo")
+                        .selected_text(filter_btn_text)
+                        .show_ui(ui, |ui| {
                             if ui
                                 .selectable_label(
                                     self.selected_saved_filter == SHOW_FAVORITES_LABEL,
@@ -5944,7 +5941,6 @@ mod gui {
                             {
                                 self.selected_saved_filter = SHOW_FAVORITES_LABEL.to_string();
                                 show_favorites_only = true;
-                                self.filter_dropdown_open = false;
                             }
                             ui.separator();
                             for saved in &scope_filters {
@@ -5958,7 +5954,6 @@ mod gui {
                                     {
                                         self.selected_saved_filter = saved.name.clone();
                                         auto_apply = true;
-                                        self.filter_dropdown_open = false;
                                     }
                                     if ui
                                         .small_button("x")
@@ -5970,7 +5965,6 @@ mod gui {
                                 });
                             }
                         });
-                    }
 
                     // Handle "Show Favorites" built-in filter
                     if show_favorites_only {
