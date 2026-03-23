@@ -5270,29 +5270,31 @@ mod gui {
                             && !self.account_color_map.is_empty()
                         {
                             ui.separator();
-                            // Show environment colors (keys with "profile:env" format)
-                            let mut env_entries: Vec<(String, String, egui::Color32)> = self
+                            // Show unique environment colors (dedup by env name)
+                            let mut seen_envs = std::collections::HashSet::new();
+                            let mut env_entries: Vec<(String, egui::Color32)> = self
                                 .account_color_map
                                 .iter()
                                 .filter_map(|(key, color)| {
-                                    let (pid, env) = key.split_once(':')?;
-                                    let account_name = self.config.profiles.iter()
-                                        .find(|p| p.profile_id == pid)
-                                        .map(|p| p.display_name.as_str())
-                                        .unwrap_or(pid);
-                                    Some((env.to_string(), account_name.to_string(), *color))
+                                    let (_, env) = key.split_once(':')?;
+                                    let env_lower = env.to_ascii_lowercase();
+                                    if seen_envs.insert(env_lower) {
+                                        Some((env.to_string(), *color))
+                                    } else {
+                                        None
+                                    }
                                 })
                                 .collect();
                             env_entries.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
 
-                            for (env, account, color) in &env_entries {
+                            for (env, color) in &env_entries {
                                 ui.horizontal(|ui| {
                                     let (rect, _) = ui.allocate_exact_size(
                                         egui::vec2(10.0, 10.0),
                                         egui::Sense::hover(),
                                     );
                                     ui.painter().circle_filled(rect.center(), 5.0, *color);
-                                    ui.label(format!("{env} ({account})"));
+                                    ui.label(env);
                                 });
                             }
                         }
@@ -5855,13 +5857,15 @@ mod gui {
                     let mut auto_apply = false;
                     let mut show_favorites_only = false;
                     const SHOW_FAVORITES_LABEL: &str = "Show Favorites";
-                    egui::ComboBox::from_id_salt("saved_filter_combo")
-                        .selected_text(if self.selected_saved_filter.is_empty() {
-                            "(choose)".to_string()
-                        } else {
-                            self.selected_saved_filter.clone()
-                        })
-                        .show_ui(ui, |ui| {
+                    let filter_header = if self.selected_saved_filter.is_empty() {
+                        "Saved Filters".to_string()
+                    } else {
+                        format!("Filter: {}", self.selected_saved_filter)
+                    };
+                    egui::CollapsingHeader::new(filter_header)
+                        .id_salt("saved_filter_list")
+                        .default_open(false)
+                        .show(ui, |ui| {
                             // Built-in "Show Favorites" option
                             if ui
                                 .selectable_label(
