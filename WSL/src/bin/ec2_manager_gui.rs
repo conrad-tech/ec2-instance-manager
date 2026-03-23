@@ -2191,6 +2191,8 @@ mod gui {
                             "refreshed profile={profile_id}: {} instances",
                             inventory.instances.len()
                         ));
+                        // Rebuild colors with fresh inventory data
+                        self.rebuild_account_colors();
 
                         // Update the active display if this is the selected profile
                         if is_selected {
