@@ -5868,9 +5868,11 @@ mod gui {
                         self.selected_saved_filter.clone()
                     };
                     let popup_id = ui.make_persistent_id("saved_filter_popup");
+                    #[allow(deprecated)]
                     let is_open = ui.memory(|m| m.is_popup_open(popup_id));
                     let btn_response = ui.button(format!("{filter_btn_text} \u{25BC}"));
                     if btn_response.clicked() {
+                        #[allow(deprecated)]
                         ui.memory_mut(|m| m.toggle_popup(popup_id));
                     }
 
@@ -5923,6 +5925,7 @@ mod gui {
 
                         // Close if filter was selected or user clicked outside the popup
                         if close_popup {
+                            #[allow(deprecated)]
                             ui.memory_mut(|m| m.toggle_popup(popup_id));
                         } else {
                             let popup_rect = area_response.response.rect;
@@ -5930,6 +5933,7 @@ mod gui {
                                 && !popup_rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()))
                                 && !btn_response.rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()));
                             if clicked_outside {
+                                #[allow(deprecated)]
                                 ui.memory_mut(|m| m.toggle_popup(popup_id));
                             }
                         }
