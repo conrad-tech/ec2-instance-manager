@@ -5868,12 +5868,10 @@ mod gui {
                         self.selected_saved_filter.clone()
                     };
                     let popup_id = ui.make_persistent_id("saved_filter_popup");
-                    #[allow(deprecated)]
-                    let is_open = ui.memory(|m| m.is_popup_open(popup_id));
-                    let btn_response = ui.button(format!("{filter_btn_text} \u{25BC}"));
+                    let is_open = is_popup_open_compat(ui, popup_id);
+                    let btn_response = ui.button(format!("{filter_btn_text} v"));
                     if btn_response.clicked() {
-                        #[allow(deprecated)]
-                        ui.memory_mut(|m| m.toggle_popup(popup_id));
+                        toggle_popup_compat(ui, popup_id);
                     }
 
                     if is_open {
@@ -5925,16 +5923,14 @@ mod gui {
 
                         // Close if filter was selected or user clicked outside the popup
                         if close_popup {
-                            #[allow(deprecated)]
-                            ui.memory_mut(|m| m.toggle_popup(popup_id));
+                            toggle_popup_compat(ui, popup_id);
                         } else {
                             let popup_rect = area_response.response.rect;
                             let clicked_outside = ui.input(|i| i.pointer.any_pressed())
                                 && !popup_rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()))
                                 && !btn_response.rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()));
                             if clicked_outside {
-                                #[allow(deprecated)]
-                                ui.memory_mut(|m| m.toggle_popup(popup_id));
+                                toggle_popup_compat(ui, popup_id);
                             }
                         }
                     }
@@ -7369,6 +7365,16 @@ mod gui {
 
     /// Create an `aws` CLI command with CREATE_NO_WINDOW on Windows
     /// so no console window flashes.
+    #[allow(deprecated)]
+    fn is_popup_open_compat(ui: &egui::Ui, id: egui::Id) -> bool {
+        ui.memory(|m| m.is_popup_open(id))
+    }
+
+    #[allow(deprecated)]
+    fn toggle_popup_compat(ui: &egui::Ui, id: egui::Id) {
+        ui.memory_mut(|m| m.toggle_popup(id));
+    }
+
     fn aws_command() -> std::process::Command {
         let mut cmd = std::process::Command::new("aws");
         #[cfg(target_os = "windows")]
