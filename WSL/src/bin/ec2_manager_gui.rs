@@ -4348,9 +4348,16 @@ mod gui {
                                     if dir_response.double_clicked() {
                                         actions.double_clicked_dir = Some(full_path.clone());
                                     }
-                                    // Prefetch subdirectory in background
+                                    // Prefetch: expanded dirs are high priority,
+                                    // collapsed dirs are low priority (background)
                                     if !dir_cache.contains_key(&full_path) && !fetching.contains(&full_path) {
-                                        actions.prefetch.push(full_path.clone());
+                                        if expanded.contains(&full_path) {
+                                            // Expanded dirs always fetch immediately
+                                            actions.prefetch.push(full_path.clone());
+                                        } else if actions.prefetch.len() < 2 {
+                                            // Collapsed dirs: trickle max 2 per frame
+                                            actions.prefetch.push(full_path.clone());
+                                        }
                                     }
                                 } else {
                                     ui.add_space(18.0); // align with arrow button width
