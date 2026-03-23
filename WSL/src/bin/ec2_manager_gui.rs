@@ -1025,6 +1025,39 @@ mod gui {
                 app.log_info("no selected profile, skipping disk cache");
             }
 
+            // Pre-load disk cache for all other authenticated profiles
+            // so multi-account lookup works immediately on startup.
+            let other_profiles: Vec<(String, String, String)> = app.config.profiles.iter()
+                .filter(|p| app.selected_profile.as_deref() != Some(p.profile_id.as_str()))
+                .filter(|p| app.profile_auth_infos.iter().any(|a| a.profile_id == p.profile_id && a.auth_status == AuthStatus::Ok))
+                .map(|p| {
+                    let region = p.region.clone()
+                        .or_else(|| app.config.default_region.clone())
+                        .unwrap_or_else(|| "us-east-1".to_string());
+                    (p.profile_id.clone(), p.account_id.clone(), region)
+                })
+                .collect();
+            for (pid, account_id, region) in other_profiles {
+                if let Some(cached) = ec2_manager::inventory::load_disk_cache(&pid, &region) {
+                    let count = cached.instances.len();
+                    let resolved = credentials::find_profile_by_account_id(&pid)
+                        .unwrap_or_else(|| pid.clone());
+                    let ctx = AwsContext {
+                        mode: app.options.mode.clone(),
+                        profile: resolved,
+                        account_id: Some(account_id),
+                        arn: None,
+                        user_id: None,
+                        region,
+                        auth_status: AuthStatus::Ok,
+                    };
+                    app.profile_inventory_cache.insert(pid.clone(), (cached, ctx));
+                    app.log_info(format!(
+                        "pre-loaded {count} instances from disk cache for profile={pid}"
+                    ));
+                }
+            }
+
             app.refresh_all_authenticated(true);
             app
         }
