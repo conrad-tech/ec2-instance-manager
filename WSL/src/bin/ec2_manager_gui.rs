@@ -2141,7 +2141,7 @@ mod gui {
                             inventory.instances.len()
                         ));
 
-                        // Only update the active display if this is the selected profile
+                        // Update the active display if this is the selected profile
                         if is_selected {
                             self.context = Some(context);
                             self.inventory = inventory;
@@ -2151,6 +2151,10 @@ mod gui {
                                 self.inventory.instances.len(),
                                 self.filtered.len()
                             );
+                        } else if self.multi_account_ids.contains(&profile_id) {
+                            // Re-apply filters so newly loaded multi-account
+                            // instances appear immediately
+                            self.apply_filters();
                         }
 
                         if let Some((account_id, region)) = config_update {
