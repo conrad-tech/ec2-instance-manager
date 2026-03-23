@@ -2191,9 +2191,6 @@ mod gui {
                             "refreshed profile={profile_id}: {} instances",
                             inventory.instances.len()
                         ));
-                        // Rebuild colors with fresh inventory data
-                        self.rebuild_account_colors();
-
                         // Update the active display if this is the selected profile
                         if is_selected {
                             self.context = Some(context);
@@ -2209,6 +2206,9 @@ mod gui {
                             // instances appear immediately
                             self.apply_filters();
                         }
+
+                        // Rebuild colors after inventory is updated
+                        self.rebuild_account_colors();
 
                         if let Some((account_id, region)) = config_update {
                             self.config.upsert_account_region(&account_id, &region);
@@ -6716,40 +6716,38 @@ mod gui {
             .map(|v| v.trim().to_string())
     }
 
-    /// Generate distinct shades from a base color for multiple environments.
-    /// Each shade is visually separated by varying brightness significantly.
-    /// Generate distinct shades from a base color for multiple environments.
-    /// Uses hue rotation + brightness shifts so shades are obviously different.
-    fn generate_env_shades(base: egui::Color32, count: usize) -> Vec<egui::Color32> {
-        if count == 0 {
-            return Vec::new();
-        }
-        if count == 1 {
-            return vec![base];
-        }
+    /// Generate dark-to-light shades of the base color for multiple environments.
+    /// Generate a deterministic shade of the base color for a given environment name.
+    /// Same env name always produces the same shade. 1 env = exact base color.
+    /// Uses a simple hash of the env name to pick a brightness level.
+    fn shade_for_env(base: egui::Color32, env: &str) -> egui::Color32 {
+        // Simple hash to get a stable value 0-255 for any env name
+        let hash: u32 = env.bytes().fold(5381u32, |h, b| h.wrapping_mul(33).wrapping_add(b as u32));
+        // Map to a brightness factor: 0.35 (dark) to 1.5 (light)
+        // Use 8 distinct levels so nearby envs don't look the same
+        let bucket = (hash % 8) as f32;
+        let factor = 0.35 + bucket * (1.15 / 7.0); // 0.35 to 1.5
+
         let r = base.r() as f32;
         let g = base.g() as f32;
         let b = base.b() as f32;
-        let mut shades = Vec::with_capacity(count);
-        for i in 0..count {
-            let t = i as f32 / (count as f32 - 1.0); // 0.0 to 1.0
-            // Alternate between darkening and shifting hue components
-            // so each shade looks distinctly different
-            let (nr, ng, nb) = match i % 4 {
-                0 => (r * 0.5, g * 0.9, b * 0.5),           // dark, green-shifted
-                1 => (r * 0.9 + 60.0, g * 0.5, b * 0.9),    // bright, red-shifted
-                2 => (r * 0.5, g * 0.5, b * 0.9 + 60.0),    // dark, blue-shifted
-                _ => (r * 0.9 + 40.0, g * 0.9 + 40.0, b * 0.5), // bright, yellow-shifted
-            };
-            // Also apply a brightness offset based on position
-            let brightness = (t - 0.5) * 80.0;
-            shades.push(egui::Color32::from_rgb(
-                (nr + brightness).clamp(20.0, 245.0) as u8,
-                (ng + brightness).clamp(20.0, 245.0) as u8,
-                (nb + brightness).clamp(20.0, 245.0) as u8,
-            ));
+
+        if factor <= 1.0 {
+            // Darken
+            egui::Color32::from_rgb(
+                (r * factor).clamp(15.0, 250.0) as u8,
+                (g * factor).clamp(15.0, 250.0) as u8,
+                (b * factor).clamp(15.0, 250.0) as u8,
+            )
+        } else {
+            // Lighten (blend toward white)
+            let blend = factor - 1.0;
+            egui::Color32::from_rgb(
+                (r + (255.0 - r) * blend).clamp(15.0, 250.0) as u8,
+                (g + (255.0 - g) * blend).clamp(15.0, 250.0) as u8,
+                (b + (255.0 - b) * blend).clamp(15.0, 250.0) as u8,
+            )
         }
-        shades
     }
 
     fn build_account_color_map(
@@ -6812,11 +6810,11 @@ mod gui {
             envs.sort();
             envs.dedup();
 
-            // Generate distinct shades for each environment
-            let shades = generate_env_shades(base_color, envs.len());
-            for (env_idx, env) in envs.iter().enumerate() {
+            // Generate a deterministic shade per environment
+            for env in &envs {
                 let key = format!("{}:{}", profile_id, env);
-                map.insert(key, shades[env_idx]);
+                let shade = shade_for_env(base_color, env);
+                map.insert(key, shade);
             }
         }
 
