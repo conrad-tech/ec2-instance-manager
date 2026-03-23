@@ -29,6 +29,8 @@ pub struct AppConfig {
     pub ui_scale: Option<f32>,
     pub account_colors_enabled: bool,
     pub account_colors: BTreeMap<String, String>,
+    /// Environment names excluded from the color legend
+    pub excluded_envs: Vec<String>,
     /// Saved window position/size from last close
     pub window_x: Option<f32>,
     pub window_y: Option<f32>,
@@ -67,6 +69,7 @@ impl Default for AppConfig {
             ui_scale: None,
             account_colors_enabled: true,
             account_colors: BTreeMap::new(),
+            excluded_envs: Vec::new(),
             window_x: None,
             window_y: None,
             window_w: None,
@@ -417,6 +420,9 @@ impl AppConfig {
                 "account_colors_enabled" => {
                     cfg.account_colors_enabled = !matches!(value, "0" | "false" | "FALSE");
                 }
+                "excluded_envs" => {
+                    cfg.excluded_envs = split_csv(value);
+                }
                 "last_selected_profile" => {
                     cfg.last_selected_profile = if value.is_empty() {
                         None
@@ -508,6 +514,10 @@ impl AppConfig {
 
         if !self.account_colors_enabled {
             lines.push("account_colors_enabled=0".to_string());
+        }
+
+        if !self.excluded_envs.is_empty() {
+            lines.push(format!("excluded_envs={}", self.excluded_envs.join(",")));
         }
 
         for (profile, color) in &self.account_colors {

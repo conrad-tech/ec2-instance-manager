@@ -765,6 +765,9 @@ mod gui {
         /// Additional account profile IDs to include in the instance list
         multi_account_ids: std::collections::HashSet<String>,
         save_filter_name: String,
+        filter_dropdown_open: bool,
+        /// Environments hidden from the color legend (toggled on the connections page)
+        hidden_envs: std::collections::HashSet<String>,
         selected_saved_filter: String,
         selected_instance_id: String,
         local_port: u16,
@@ -833,6 +836,8 @@ mod gui {
 
         fn new(options: GuiOptions) -> Self {
             let config = AppConfig::load().unwrap_or_default();
+            let initial_hidden_envs: std::collections::HashSet<String> =
+                config.excluded_envs.iter().cloned().collect();
             let dependencies = dependency_status();
             let (proc_tx, proc_rx) = mpsc::channel();
             let (wsl_setup_tx, wsl_setup_rx) = mpsc::channel();
@@ -902,6 +907,8 @@ mod gui {
                 only_ssm: false,
                 multi_account_ids: std::collections::HashSet::new(),
                 save_filter_name: String::new(),
+                filter_dropdown_open: false,
+                hidden_envs: initial_hidden_envs,
                 selected_saved_filter: String::new(),
                 selected_instance_id: String::new(),
                 local_port: 2222,
@@ -3551,12 +3558,14 @@ mod gui {
                             if self.config.account_colors_enabled {
                                 let profile_id = self.selected_profile.as_deref().unwrap_or("");
                                 if let Some(env) = instance_env(instance) {
-                                    let key = format!("{profile_id}:{env}");
-                                    if let Some(env_color) = self.account_color_map.get(&key) {
-                                        let tint = egui::Color32::from_rgba_unmultiplied(
-                                            env_color.r(), env_color.g(), env_color.b(), 25,
-                                        );
-                                        ui.painter().rect_filled(row_rect, 0.0, tint);
+                                    if !self.hidden_envs.contains(&env.to_ascii_lowercase()) {
+                                        let key = format!("{profile_id}:{env}");
+                                        if let Some(env_color) = self.account_color_map.get(&key) {
+                                            let tint = egui::Color32::from_rgba_unmultiplied(
+                                                env_color.r(), env_color.g(), env_color.b(), 25,
+                                            );
+                                            ui.painter().rect_filled(row_rect, 0.0, tint);
+                                        }
                                     }
                                 }
                             }
@@ -3789,6 +3798,39 @@ mod gui {
                     }
                     if ui.button("Cancel").clicked() {
                         self.tab_rename_id = None;
+                    }
+                });
+            }
+
+            // Environment color legend on connections page
+            if self.config.account_colors_enabled && !self.account_color_map.is_empty() {
+                let mut seen_envs = std::collections::HashSet::new();
+                let mut env_entries: Vec<(String, egui::Color32)> = self
+                    .account_color_map
+                    .iter()
+                    .filter_map(|(key, color)| {
+                        let (_, env) = key.split_once(':')?;
+                        let env_lower = env.to_ascii_lowercase();
+                        if self.hidden_envs.contains(&env_lower) {
+                            return None;
+                        }
+                        if seen_envs.insert(env_lower) {
+                            Some((env.to_string(), *color))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                env_entries.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+
+                ui.horizontal_wrapped(|ui| {
+                    for (env, color) in &env_entries {
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(8.0, 8.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().circle_filled(rect.center(), 4.0, *color);
+                        ui.small(egui::RichText::new(env).weak());
                     }
                 });
             }
@@ -5265,38 +5307,58 @@ mod gui {
                             self.main_tab = MainTab::Log;
                         }
 
-                        // Inline environment color legend
+                        // Environment visibility dropdown (next to Log)
                         if self.config.account_colors_enabled
                             && !self.account_color_map.is_empty()
                         {
-                            ui.separator();
-                            // Show unique environment colors (dedup by env name)
-                            let mut seen_envs = std::collections::HashSet::new();
-                            let mut env_entries: Vec<(String, egui::Color32)> = self
+                            let mut seen = std::collections::HashSet::new();
+                            let mut all_envs: Vec<(String, egui::Color32)> = self
                                 .account_color_map
                                 .iter()
                                 .filter_map(|(key, color)| {
                                     let (_, env) = key.split_once(':')?;
                                     let env_lower = env.to_ascii_lowercase();
-                                    if seen_envs.insert(env_lower) {
+                                    if seen.insert(env_lower) {
                                         Some((env.to_string(), *color))
                                     } else {
                                         None
                                     }
                                 })
                                 .collect();
-                            env_entries.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+                            all_envs.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
 
-                            for (env, color) in &env_entries {
-                                ui.horizontal(|ui| {
-                                    let (rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(10.0, 10.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().circle_filled(rect.center(), 5.0, *color);
-                                    ui.label(env);
+                            let hidden_count = self.hidden_envs.len();
+                            let env_label = if hidden_count > 0 {
+                                format!("Exclude Env ({hidden_count})")
+                            } else {
+                                "Exclude Env".to_string()
+                            };
+                            egui::ComboBox::from_id_salt("env_visibility")
+                                .selected_text(env_label)
+                                .show_ui(ui, |ui| {
+                                    for (env, color) in &all_envs {
+                                        let env_lower = env.to_ascii_lowercase();
+                                        let mut visible = !self.hidden_envs.contains(&env_lower);
+                                        ui.horizontal(|ui| {
+                                            let (rect, _) = ui.allocate_exact_size(
+                                                egui::vec2(8.0, 8.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().circle_filled(rect.center(), 4.0, *color);
+                                            if ui.checkbox(&mut visible, env).changed() {
+                                                if visible {
+                                                    self.hidden_envs.remove(&env_lower);
+                                                } else {
+                                                    self.hidden_envs.insert(env_lower);
+                                                }
+                                                // Persist to config
+                                                self.config.excluded_envs = self.hidden_envs.iter().cloned().collect();
+                                                self.config.excluded_envs.sort();
+                                                let _ = self.config.save();
+                                            }
+                                        });
+                                    }
                                 });
-                            }
                         }
                     });
 
@@ -5861,78 +5923,53 @@ mod gui {
                     let mut show_favorites_only = false;
                     const SHOW_FAVORITES_LABEL: &str = "Show Favorites";
 
-                    // Custom dropdown that only closes on filter select or click-outside
                     let filter_btn_text = if self.selected_saved_filter.is_empty() {
-                        "(choose)".to_string()
+                        "Choose Filter v".to_string()
                     } else {
-                        self.selected_saved_filter.clone()
+                        format!("{} v", self.selected_saved_filter)
                     };
-                    let popup_id = ui.make_persistent_id("saved_filter_popup");
-                    let is_open = is_popup_open_compat(ui, popup_id);
-                    let btn_response = ui.button(format!("{filter_btn_text} v"));
-                    if btn_response.clicked() {
-                        toggle_popup_compat(ui, popup_id);
+                    if ui.button(&filter_btn_text).clicked() {
+                        self.filter_dropdown_open = !self.filter_dropdown_open;
                     }
 
-                    if is_open {
-                        let mut close_popup = false;
-                        let area_response = egui::Area::new(popup_id)
-                            .order(egui::Order::Foreground)
-                            .fixed_pos(btn_response.rect.left_bottom())
-                            .show(ui.ctx(), |ui| {
-                                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                    ui.set_min_width(150.0);
-                                    // Built-in "Show Favorites" option
+                    if self.filter_dropdown_open {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            // Built-in "Show Favorites" option
+                            if ui
+                                .selectable_label(
+                                    self.selected_saved_filter == SHOW_FAVORITES_LABEL,
+                                    SHOW_FAVORITES_LABEL,
+                                )
+                                .clicked()
+                            {
+                                self.selected_saved_filter = SHOW_FAVORITES_LABEL.to_string();
+                                show_favorites_only = true;
+                                self.filter_dropdown_open = false;
+                            }
+                            ui.separator();
+                            for saved in &scope_filters {
+                                ui.horizontal(|ui| {
                                     if ui
                                         .selectable_label(
-                                            self.selected_saved_filter == SHOW_FAVORITES_LABEL,
-                                            SHOW_FAVORITES_LABEL,
+                                            self.selected_saved_filter == saved.name,
+                                            &saved.name,
                                         )
                                         .clicked()
                                     {
-                                        self.selected_saved_filter = SHOW_FAVORITES_LABEL.to_string();
-                                        show_favorites_only = true;
-                                        close_popup = true;
+                                        self.selected_saved_filter = saved.name.clone();
+                                        auto_apply = true;
+                                        self.filter_dropdown_open = false;
                                     }
-                                    ui.separator();
-                                    for saved in &scope_filters {
-                                        ui.horizontal(|ui| {
-                                            if ui
-                                                .selectable_label(
-                                                    self.selected_saved_filter == saved.name,
-                                                    &saved.name,
-                                                )
-                                                .clicked()
-                                            {
-                                                self.selected_saved_filter = saved.name.clone();
-                                                auto_apply = true;
-                                                close_popup = true;
-                                            }
-                                            if ui
-                                                .small_button("x")
-                                                .on_hover_text("Delete filter")
-                                                .clicked()
-                                            {
-                                                pending_delete_filter = Some(saved.name.clone());
-                                                // Do NOT close popup on delete
-                                            }
-                                        });
+                                    if ui
+                                        .small_button("x")
+                                        .on_hover_text("Delete filter")
+                                        .clicked()
+                                    {
+                                        pending_delete_filter = Some(saved.name.clone());
                                     }
                                 });
-                            });
-
-                        // Close if filter was selected or user clicked outside the popup
-                        if close_popup {
-                            toggle_popup_compat(ui, popup_id);
-                        } else {
-                            let popup_rect = area_response.response.rect;
-                            let clicked_outside = ui.input(|i| i.pointer.any_pressed())
-                                && !popup_rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()))
-                                && !btn_response.rect.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()));
-                            if clicked_outside {
-                                toggle_popup_compat(ui, popup_id);
                             }
-                        }
+                        });
                     }
 
                     // Handle "Show Favorites" built-in filter
@@ -7365,16 +7402,6 @@ mod gui {
 
     /// Create an `aws` CLI command with CREATE_NO_WINDOW on Windows
     /// so no console window flashes.
-    #[allow(deprecated)]
-    fn is_popup_open_compat(ui: &egui::Ui, id: egui::Id) -> bool {
-        ui.memory(|m| m.is_popup_open(id))
-    }
-
-    #[allow(deprecated)]
-    fn toggle_popup_compat(ui: &egui::Ui, id: egui::Id) {
-        ui.memory_mut(|m| m.toggle_popup(id));
-    }
-
     fn aws_command() -> std::process::Command {
         let mut cmd = std::process::Command::new("aws");
         #[cfg(target_os = "windows")]
