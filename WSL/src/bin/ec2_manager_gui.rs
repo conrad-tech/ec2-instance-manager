@@ -486,7 +486,7 @@ mod gui {
     ///   $
     /// with bold-green user@host, magenta "SSM", and bold-yellow path.
     const SSM_PS1_COMMAND: &[u8] =
-        b"bash\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\r";
+        b"bash\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\rclear\r";
 
     #[derive(Debug, PartialEq, Eq)]
     struct RowAction {
@@ -4566,6 +4566,9 @@ mod gui {
                 let native_ppp = ctx.native_pixels_per_point().unwrap_or(1.0);
                 if (native_ppp - self.last_native_ppp).abs() > 0.01 {
                     self.last_native_ppp = native_ppp;
+                    // Clear all terminal selections — the old pixel positions
+                    // are invalid after a DPI change (monitor switch).
+                    self.terminal_selections.clear();
                     ctx.set_pixels_per_point(self.ui_scale * native_ppp);
                 }
 
