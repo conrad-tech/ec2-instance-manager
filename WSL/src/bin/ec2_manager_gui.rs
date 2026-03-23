@@ -3552,21 +3552,6 @@ mod gui {
                                 .union(resp_env.rect)
                                 .union(resp_tag.rect);
 
-                            // Environment-based row tint
-                            if self.config.account_colors_enabled {
-                                let profile_id = self.selected_profile.as_deref().unwrap_or("");
-                                if let Some(env) = instance_env(instance) {
-                                    if !self.hidden_envs.contains(&env.to_ascii_lowercase()) {
-                                        let key = format!("{profile_id}:{env}");
-                                        if let Some(env_color) = self.account_color_map.get(&key) {
-                                            let tint = egui::Color32::from_rgba_unmultiplied(
-                                                env_color.r(), env_color.g(), env_color.b(), 60,
-                                            );
-                                            ui.painter().rect_filled(row_rect, 0.0, tint);
-                                        }
-                                    }
-                                }
-                            }
                             if selected || row_hovered {
                                 let color = if selected {
                                     egui::Color32::from_rgba_unmultiplied(70, 110, 170, 55)
@@ -3653,14 +3638,21 @@ mod gui {
                         }
                     })
                     .collect();
-                // Sort by account sort_order first, then alphabetically by env within each account
+                // Sort by account order (sort_order from accounts.json, then position in config),
+                // then alphabetically by env within each account
                 env_entries.sort_by(|a, b| {
-                    let pa = self.config.profiles.iter().find(|p| p.profile_id == a.0);
-                    let pb = self.config.profiles.iter().find(|p| p.profile_id == b.0);
+                    let (idx_a, pa) = self.config.profiles.iter().enumerate()
+                        .find(|(_, p)| p.profile_id == a.0)
+                        .map(|(i, p)| (i, Some(p)))
+                        .unwrap_or((usize::MAX, None));
+                    let (idx_b, pb) = self.config.profiles.iter().enumerate()
+                        .find(|(_, p)| p.profile_id == b.0)
+                        .map(|(i, p)| (i, Some(p)))
+                        .unwrap_or((usize::MAX, None));
                     let ord_a = pa.and_then(|p| p.sort_order).unwrap_or(u32::MAX);
                     let ord_b = pb.and_then(|p| p.sort_order).unwrap_or(u32::MAX);
                     ord_a.cmp(&ord_b)
-                        .then_with(|| a.0.cmp(&b.0))
+                        .then_with(|| idx_a.cmp(&idx_b))
                         .then_with(|| a.1.to_ascii_lowercase().cmp(&b.1.to_ascii_lowercase()))
                 });
 
@@ -3694,7 +3686,28 @@ mod gui {
             ui.horizontal_wrapped(|ui| {
                 for (id, title, profile_id, running) in &tabs_snapshot {
                     let tab_color = if colors_enabled {
-                        self.account_color_map.get(profile_id).copied()
+                        // Look up environment color for this tab's instance
+                        let tab_instance_id = self.connections.tabs().iter()
+                            .find(|t| t.id == *id)
+                            .map(|t| t.instance_id.clone());
+                        let env_color = tab_instance_id.and_then(|iid| {
+                            // Search current inventory and cached inventories
+                            let inst = find_instance(&self.inventory.instances, &iid)
+                                .or_else(|| {
+                                    self.profile_inventory_cache.values()
+                                        .find_map(|(inv, _)| find_instance(&inv.instances, &iid))
+                                });
+                            inst.and_then(|i| {
+                                let env = instance_env(i)?;
+                                if self.hidden_envs.contains(&env.to_ascii_lowercase()) {
+                                    return None;
+                                }
+                                let key = format!("{profile_id}:{env}");
+                                self.account_color_map.get(&key).copied()
+                            })
+                        });
+                        // Fall back to account base color if no env found
+                        env_color.or_else(|| self.account_color_map.get(profile_id).copied())
                     } else {
                         None
                     };
