@@ -1187,6 +1187,9 @@ mod gui {
                 &self.config.profiles,
                 &extra_ids,
                 &self.config.account_colors,
+                &self.profile_inventory_cache,
+                &self.inventory,
+                self.selected_profile.as_deref(),
             );
         }
 
@@ -3501,6 +3504,19 @@ mod gui {
                                 .union(resp_env.rect)
                                 .union(resp_tag.rect);
 
+                            // Environment-based row tint
+                            if self.config.account_colors_enabled {
+                                let profile_id = self.selected_profile.as_deref().unwrap_or("");
+                                if let Some(env) = instance_env(instance) {
+                                    let key = format!("{profile_id}:{env}");
+                                    if let Some(env_color) = self.account_color_map.get(&key) {
+                                        let tint = egui::Color32::from_rgba_unmultiplied(
+                                            env_color.r(), env_color.g(), env_color.b(), 25,
+                                        );
+                                        ui.painter().rect_filled(row_rect, 0.0, tint);
+                                    }
+                                }
+                            }
                             if selected || row_hovered {
                                 let color = if selected {
                                     egui::Color32::from_rgba_unmultiplied(70, 110, 170, 55)
@@ -5206,58 +5222,35 @@ mod gui {
                             self.main_tab = MainTab::Log;
                         }
 
-                        // Inline account color legend
+                        // Inline environment color legend
                         if self.config.account_colors_enabled
                             && !self.account_color_map.is_empty()
                         {
                             ui.separator();
-                            let mut profiles: Vec<(String, egui::Color32)> = self
+                            // Show environment colors (keys with "profile:env" format)
+                            let mut env_entries: Vec<(String, String, egui::Color32)> = self
                                 .account_color_map
                                 .iter()
-                                .map(|(k, v)| (k.clone(), *v))
+                                .filter_map(|(key, color)| {
+                                    let (pid, env) = key.split_once(':')?;
+                                    let account_name = self.config.profiles.iter()
+                                        .find(|p| p.profile_id == pid)
+                                        .map(|p| p.display_name.as_str())
+                                        .unwrap_or(pid);
+                                    Some((env.to_string(), account_name.to_string(), *color))
+                                })
                                 .collect();
-                            profiles.sort_by(|a, b| {
-                                let pa = self.config.profiles.iter().find(|p| p.profile_id == a.0);
-                                let pb = self.config.profiles.iter().find(|p| p.profile_id == b.0);
-                                profile_sort_key(pa, &a.0).cmp(&profile_sort_key(pb, &b.0))
-                            });
+                            env_entries.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
 
-                            let mut legend_pick_color: Option<String> = None;
-                            for (pid, color) in &profiles {
-                                let display_name = self
-                                    .config
-                                    .profiles
-                                    .iter()
-                                    .find(|p| &p.profile_id == pid)
-                                    .map(|p| p.display_name.as_str())
-                                    .unwrap_or(pid.as_str());
-
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(10.0, 10.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().circle_filled(rect.center(), 5.0, *color);
-                                let label_resp = ui.label(display_name);
-                                let pid_clone = pid.clone();
-                                label_resp.context_menu(|ui| {
-                                    if ui.button("Change Color").clicked() {
-                                        legend_pick_color = Some(pid_clone.clone());
-                                        ui.close();
-                                    }
+                            for (env, account, color) in &env_entries {
+                                ui.horizontal(|ui| {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(10.0, 10.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(rect.center(), 5.0, *color);
+                                    ui.label(format!("{env} ({account})"));
                                 });
-                            }
-                            if let Some(pid) = legend_pick_color {
-                                let current_color = self
-                                    .account_color_map
-                                    .get(&pid)
-                                    .copied()
-                                    .unwrap_or(egui::Color32::from_rgb(128, 128, 128));
-                                self.tab_color_picker_rgb = [
-                                    current_color.r() as f32 / 255.0,
-                                    current_color.g() as f32 / 255.0,
-                                    current_color.b() as f32 / 255.0,
-                                ];
-                                self.color_picker_profile = Some(pid);
                             }
                         }
                     });
@@ -5402,8 +5395,15 @@ mod gui {
 
                     if self.refreshing {
                         ui.add_enabled(false, egui::Button::new("Refreshing..."));
-                    } else if ui.button("Refresh Inventory").clicked() {
-                        self.refresh_context_and_inventory(true);
+                    } else {
+                        ui.horizontal(|ui| {
+                            if ui.button("Refresh").clicked() {
+                                self.refresh_context_and_inventory(true);
+                            }
+                            if ui.button("Refresh All").clicked() {
+                                self.refresh_all_authenticated(true);
+                            }
+                        });
                     }
 
                     if !self.config.profiles.is_empty() {
@@ -6516,10 +6516,39 @@ mod gui {
         }
     }
 
+    /// Extract the MMODAL_ENV tag value from an instance.
+    fn instance_env(instance: &Instance) -> Option<String> {
+        instance.tags.get("MMODAL_ENV")
+            .or_else(|| instance.tags.get("mmodal_env"))
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| v.trim().to_string())
+    }
+
+    /// Generate a lighter shade of a color (for the second environment variant).
+    fn lighter_shade(c: egui::Color32) -> egui::Color32 {
+        egui::Color32::from_rgb(
+            (c.r() as u16 + 60).min(255) as u8,
+            (c.g() as u16 + 60).min(255) as u8,
+            (c.b() as u16 + 60).min(255) as u8,
+        )
+    }
+
+    /// Generate a darker shade of a color (for the first environment variant).
+    fn darker_shade(c: egui::Color32) -> egui::Color32 {
+        egui::Color32::from_rgb(
+            (c.r() as i16 - 50).max(20) as u8,
+            (c.g() as i16 - 50).max(20) as u8,
+            (c.b() as i16 - 50).max(20) as u8,
+        )
+    }
+
     fn build_account_color_map(
         profiles: &[ProfileConfig],
         extra_profile_ids: &[String],
         custom_colors: &std::collections::BTreeMap<String, String>,
+        inventories: &HashMap<String, (Inventory, AwsContext)>,
+        current_inventory: &Inventory,
+        current_profile: Option<&str>,
     ) -> HashMap<String, egui::Color32> {
         let mut map = HashMap::new();
 
@@ -6530,8 +6559,6 @@ mod gui {
                 all_ids.push(id.clone());
             }
         }
-
-        // Sort by sort_order (from accounts.json), then alphabetical
         all_ids.sort_by(|a, b| {
             let pa = profiles.iter().find(|p| p.profile_id == *a);
             let pb = profiles.iter().find(|p| p.profile_id == *b);
@@ -6542,39 +6569,49 @@ mod gui {
         let palette_len = ACCOUNT_COLOR_PALETTE.len();
 
         for (idx, profile_id) in all_ids.iter().enumerate() {
-            // 1. User-customized color (from Edit > Account Tab Colors > Change Color)
-            if let Some(hex) = custom_colors.get(profile_id) {
-                if let Some(c) = parse_hex_color(hex) {
-                    map.insert(profile_id.clone(), c);
-                    continue;
-                }
-            }
+            // Determine base color for this account
+            let base_color = custom_colors.get(profile_id)
+                .and_then(|hex| parse_hex_color(hex))
+                .or_else(|| {
+                    profiles.iter().find(|p| &p.profile_id == profile_id)
+                        .and_then(|p| p.color.as_ref())
+                        .and_then(|hex| parse_hex_color(hex))
+                })
+                .unwrap_or_else(|| {
+                    let base_idx = idx % palette_len;
+                    let (r, g, b) = ACCOUNT_COLOR_PALETTE[base_idx];
+                    egui::Color32::from_rgb(r, g, b)
+                });
 
-            // 2. Color from accounts.json
-            if let Some(profile) = profiles.iter().find(|p| &p.profile_id == profile_id) {
-                if let Some(hex) = &profile.color {
-                    if let Some(c) = parse_hex_color(hex) {
-                        map.insert(profile_id.clone(), c);
-                        continue;
-                    }
-                }
-            }
+            // Always map the profile_id itself (used for connection tabs)
+            map.insert(profile_id.clone(), base_color);
 
-            // 3. Auto-assign from palette, wrapping with a brightness shift for overflow
-            let base_idx = idx % palette_len;
-            let cycle = idx / palette_len;
-            let (r, g, b) = ACCOUNT_COLOR_PALETTE[base_idx];
-            let color = if cycle == 0 {
-                egui::Color32::from_rgb(r, g, b)
+            // Collect unique environments for this account's instances
+            let instances: Vec<&Instance> = if current_profile == Some(profile_id.as_str()) {
+                current_inventory.instances.iter().collect()
+            } else if let Some((inv, _)) = inventories.get(profile_id) {
+                inv.instances.iter().collect()
             } else {
-                let shift = ((cycle as i16) * 40).min(120);
-                egui::Color32::from_rgb(
-                    (r as i16 + shift).clamp(0, 255) as u8,
-                    (g as i16 + shift).clamp(0, 255) as u8,
-                    (b as i16 + shift).clamp(0, 255) as u8,
-                )
+                Vec::new()
             };
-            map.insert(profile_id.clone(), color);
+
+            let mut envs: Vec<String> = instances.iter()
+                .filter_map(|i| instance_env(i))
+                .collect();
+            envs.sort();
+            envs.dedup();
+
+            // Assign dark/light shades to environments
+            // Spread shades so they're visually distinct
+            let dark = darker_shade(base_color);
+            let light = lighter_shade(base_color);
+            let shades = [dark, base_color, light];
+
+            for (env_idx, env) in envs.iter().enumerate() {
+                let shade = shades[env_idx % shades.len()];
+                let key = format!("{}:{}", profile_id, env);
+                map.insert(key, shade);
+            }
         }
 
         map

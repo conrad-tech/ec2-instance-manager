@@ -3,6 +3,7 @@ set -euo pipefail
 
 CLI_APP_NAME="ec2_manager"
 GUI_APP_NAME="ec2_manager_gui"
+APP_VERSION="1.0"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="${ROOT_DIR}/dist"
 LINUX_DIST_DIR="${DIST_DIR}/linux"
@@ -70,7 +71,20 @@ copy_artifact() {
   out_dir="$(target_output_dir "$target")"
   mkdir -p "$out_dir"
 
-  cp "${source_dir}/${artifact_name}" "${out_dir}/${artifact_name}"
+  # Rename with version: ec2_manager_gui.exe -> ec2_manager_gui_1.0.exe
+  local dest_name
+  if [[ "$artifact_name" == *.exe ]]; then
+    local base="${artifact_name%.exe}"
+    dest_name="${base}_${APP_VERSION}.exe"
+  elif [[ "$artifact_name" == *.* ]]; then
+    local base="${artifact_name%.*}"
+    local ext="${artifact_name##*.}"
+    dest_name="${base}_${APP_VERSION}.${ext}"
+  else
+    dest_name="${artifact_name}_${APP_VERSION}"
+  fi
+
+  cp "${source_dir}/${artifact_name}" "${out_dir}/${dest_name}"
 }
 
 copy_windows_runtime_dlls() {
@@ -116,10 +130,10 @@ copy_windows_runtime_dlls() {
 }
 
 package_windows_zip() {
-  local zip_path="${WINDOWS_DIST_DIR}/ec2_manager_windows.zip"
+  local zip_path="${WINDOWS_DIST_DIR}/ec2_manager_windows_${APP_VERSION}.zip"
   local candidates=(
-    "${WINDOWS_DIST_DIR}/${CLI_APP_NAME}.exe"
-    "${WINDOWS_DIST_DIR}/${GUI_APP_NAME}.exe"
+    "${WINDOWS_DIST_DIR}/${CLI_APP_NAME}_${APP_VERSION}.exe"
+    "${WINDOWS_DIST_DIR}/${GUI_APP_NAME}_${APP_VERSION}.exe"
     "${WINDOWS_DIST_DIR}/libgcc_s_seh-1.dll"
     "${WINDOWS_DIST_DIR}/libstdc++-6.dll"
     "${WINDOWS_DIST_DIR}/libwinpthread-1.dll"
@@ -180,10 +194,18 @@ build_for_target() {
 
   if [[ "$target" == "$HOST_TRIPLE" ]]; then
     (cd "$ROOT_DIR" && cargo build --release --bin "$CLI_APP_NAME")
-    copy_artifact "$target" "$CLI_APP_NAME"
+    if [[ "$target" == *"windows"* ]]; then
+      copy_artifact "$target" "${CLI_APP_NAME}.exe"
+    else
+      copy_artifact "$target" "$CLI_APP_NAME"
+    fi
 
     (cd "$ROOT_DIR" && cargo build --release --features gui --bin "$GUI_APP_NAME")
-    copy_artifact "$target" "$GUI_APP_NAME"
+    if [[ "$target" == *"windows"* ]]; then
+      copy_artifact "$target" "${GUI_APP_NAME}.exe"
+    else
+      copy_artifact "$target" "$GUI_APP_NAME"
+    fi
     if [[ "$target" == *"windows"* ]]; then
       copy_windows_runtime_dlls "$target"
       package_windows_zip
