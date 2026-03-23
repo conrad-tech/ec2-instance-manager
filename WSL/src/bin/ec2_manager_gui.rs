@@ -5815,8 +5815,8 @@ mod gui {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
-                rows: 45,
-                cols: 180,
+                rows: 24,
+                cols: 120,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -5874,7 +5874,7 @@ mod gui {
             child,
             master: Arc::new(Mutex::new(master)),
             writer: Arc::new(Mutex::new(writer)),
-            parser: vt100::Parser::new(45, 180, 10_000),
+            parser: vt100::Parser::new(24, 120, 10_000),
             last_size: None,
             bytes_received: 0,
             output_event_count: 0,
@@ -6751,7 +6751,6 @@ mod gui {
                         t.kind,
                         TerminalKind::PowerShell7
                             | TerminalKind::WindowsPowerShell
-                            | TerminalKind::Cmd
                             | TerminalKind::Wsl
                     )
                 })
