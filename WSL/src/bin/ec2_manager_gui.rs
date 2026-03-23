@@ -5748,11 +5748,10 @@ mod gui {
                         } else {
                             "Multi-account Lookup".to_string()
                         };
-                        egui::CollapsingHeader::new(multi_label)
-                            .id_salt("multi_account_lookup")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                let mut changed = false;
+                        let mut changed = false;
+                        egui::ComboBox::from_id_salt("multi_account_lookup")
+                            .selected_text(multi_label)
+                            .show_ui(ui, |ui| {
                                 for (pid, display, _) in &other_profiles {
                                     let mut checked = self.multi_account_ids.contains(pid);
                                     if ui.checkbox(&mut checked, display).changed() {
@@ -5764,10 +5763,10 @@ mod gui {
                                         changed = true;
                                     }
                                 }
-                                if changed {
-                                    self.apply_filters();
-                                }
                             });
+                        if changed {
+                            self.apply_filters();
+                        }
                     }
 
                     ui.separator();
