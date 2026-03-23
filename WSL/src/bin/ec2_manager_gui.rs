@@ -7149,13 +7149,25 @@ mod gui {
         Ok(entries)
     }
 
+    /// Create an `aws` CLI command with CREATE_NO_WINDOW on Windows
+    /// so no console window flashes.
+    fn aws_command() -> std::process::Command {
+        let mut cmd = std::process::Command::new("aws");
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        cmd
+    }
+
     fn ssm_send_command(
         profile: &str,
         region: &str,
         instance_id: &str,
         command: &str,
     ) -> std::result::Result<String, String> {
-        let output = std::process::Command::new("aws")
+        let output = aws_command()
             .args([
                 "ssm",
                 "send-command",
@@ -7195,7 +7207,7 @@ mod gui {
                 return Err("ssm command timed out after 30s".to_string());
             }
             std::thread::sleep(Duration::from_millis(100));
-            let output = std::process::Command::new("aws")
+            let output = aws_command()
                 .args([
                     "ssm",
                     "get-command-invocation",
@@ -7217,7 +7229,7 @@ mod gui {
             let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
             match status.as_str() {
                 "Success" => {
-                    let out = std::process::Command::new("aws")
+                    let out = aws_command()
                         .args([
                             "ssm",
                             "get-command-invocation",
