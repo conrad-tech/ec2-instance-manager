@@ -410,6 +410,12 @@ mod gui {
         active_editor: Option<usize>,
         /// In-memory cache of visited directory listings (cleared when tab closes)
         dir_cache: HashMap<String, Vec<FileEntry>>,
+        /// Directories currently expanded in the tree view
+        expanded_dirs: std::collections::HashSet<String>,
+        /// Directories currently being fetched in the background
+        fetching_dirs: std::collections::HashSet<String>,
+        /// Whether the terminal had focus last frame (for auto-refresh)
+        terminal_had_focus: bool,
     }
 
     impl Default for FileBrowserState {
@@ -426,6 +432,9 @@ mod gui {
                 editor_tabs: Vec::new(),
                 active_editor: None,
                 dir_cache: HashMap::new(),
+                expanded_dirs: std::collections::HashSet::new(),
+                fetching_dirs: std::collections::HashSet::new(),
+                terminal_had_focus: false,
             }
         }
     }
@@ -2281,6 +2290,54 @@ mod gui {
             });
         }
 
+        /// Fetch a directory listing in the background (for prefetching subdirs).
+        /// Does NOT change current_path or status. Results are cached via ListingCompleted.
+        fn request_bg_listing(&mut self, tab_id: u64, path: String) {
+            let Some(fb) = self.file_browsers.get_mut(&tab_id) else {
+                return;
+            };
+            // Skip if already cached or being fetched
+            if fb.dir_cache.contains_key(&path) || fb.fetching_dirs.contains(&path) {
+                return;
+            }
+            fb.fetching_dirs.insert(path.clone());
+
+            let tab = self.connections.tabs().iter()
+                .find(|t| t.id == tab_id).cloned();
+            let instance_id = tab.as_ref().map(|t| t.instance_id.clone()).unwrap_or_default();
+            let context = tab.as_ref()
+                .and_then(|t| {
+                    self.profile_inventory_cache.get(&t.profile_id)
+                        .map(|(_, ctx)| ctx.clone())
+                })
+                .or_else(|| self.context.clone());
+            let mode = self.options.mode.clone();
+            let tx = self.file_op_tx.clone();
+
+            std::thread::spawn(move || {
+                let result = if mode == Mode::Sim {
+                    list_files_local(&path)
+                } else if let Some(ctx) = &context {
+                    let cmd = format!("ls -la {path}");
+                    ssm_send_command(&ctx.profile, &ctx.region, &instance_id, &cmd)
+                        .and_then(|command_id| {
+                            ssm_wait_for_command(&ctx.profile, &ctx.region, &instance_id, &command_id)
+                        })
+                        .map(|output| parse_ls_output(&output))
+                } else {
+                    Err("no AWS context available".to_string())
+                };
+
+                if let Ok(entries) = result {
+                    let _ = tx.send(FileOpEvent::ListingCompleted {
+                        tab_id,
+                        path,
+                        entries,
+                    });
+                }
+            });
+        }
+
         fn request_file_download(
             &mut self,
             tab_id: u64,
@@ -2647,9 +2704,13 @@ mod gui {
                             entries.len()
                         ));
                         if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
-                            fb.dir_cache.insert(path, entries.clone());
-                            fb.entries = entries;
-                            fb.status = FileOpStatus::Idle;
+                            fb.fetching_dirs.remove(&path);
+                            fb.dir_cache.insert(path.clone(), entries.clone());
+                            // Only update the main listing if this is the current path
+                            if fb.current_path == path {
+                                fb.entries = entries;
+                                fb.status = FileOpStatus::Idle;
+                            }
                             fb.initialized = true;
                         }
                     }
@@ -4038,6 +4099,12 @@ mod gui {
                                     }
                                 }
                             }
+                            if terminal_focus_response.has_focus() || terminal_focus_response.hovered() {
+                                // Track that terminal had focus for auto-refresh
+                                if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                                    fb.terminal_had_focus = true;
+                                }
+                            }
                             if terminal_focus_response.has_focus() {
                                 ui.memory_mut(|mem| {
                                     mem.set_focus_lock_filter(
@@ -4079,6 +4146,31 @@ mod gui {
             let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
             if hovering {
                 ui.colored_label(egui::Color32::YELLOW, "Drop files here to upload");
+            }
+
+            // Auto-refresh: detect when user returns from the terminal
+            // (terminal had hover/focus last frame, now the file browser is hovered)
+            let fb_hovered = ui.rect_contains_pointer(ui.max_rect());
+            if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                if fb.terminal_had_focus && fb_hovered && fb.initialized {
+                    fb.terminal_had_focus = false;
+                    let path = fb.current_path.clone();
+                    // Collect expanded dirs to refresh alongside current dir
+                    let expanded: Vec<String> = fb.expanded_dirs.iter().cloned().collect();
+                    // Invalidate cache for current dir and expanded subdirs
+                    fb.dir_cache.remove(&path);
+                    for dir in &expanded {
+                        fb.dir_cache.remove(dir);
+                        fb.fetching_dirs.remove(dir);
+                    }
+                    drop(fb);
+                    // Refresh current directory
+                    self.request_file_listing(tab_id, path);
+                    // Refresh all expanded subdirectories
+                    for dir in expanded {
+                        self.request_bg_listing(tab_id, dir);
+                    }
+                }
             }
 
             ui.label("File Browser");
@@ -4180,71 +4272,130 @@ mod gui {
 
             ui.separator();
 
-            // File list
-            let mut new_selected = selected_entries.clone();
-            let mut new_last_clicked = last_clicked;
+            // File tree with expand/collapse
             let mut double_clicked_dir: Option<String> = None;
             let mut double_clicked_file: Option<String> = None;
-            let modifiers = ui.input(|i| i.modifiers);
+            let mut toggle_expand: Option<String> = None;
+            let mut dirs_to_prefetch: Vec<String> = Vec::new();
+
+            // Snapshot expanded dirs and cache for rendering
+            let expanded = self.file_browsers.get(&tab_id)
+                .map(|fb| fb.expanded_dirs.clone())
+                .unwrap_or_default();
+            let dir_cache = self.file_browsers.get(&tab_id)
+                .map(|fb| fb.dir_cache.clone())
+                .unwrap_or_default();
+            let fetching = self.file_browsers.get(&tab_id)
+                .map(|fb| fb.fetching_dirs.clone())
+                .unwrap_or_default();
+
             egui::ScrollArea::vertical()
                 .max_height(ui.available_height() - 40.0)
                 .show(ui, |ui| {
-                    for (idx, entry) in entries.iter().enumerate() {
-                        let prefix = if entry.is_dir { ">" } else { " " };
-                        let label = format!("{prefix} {}", entry.name);
-                        let is_selected = new_selected.contains(&idx);
-                        let response =
-                            ui.selectable_label(is_selected, truncate(&label, 30));
-                        if response.clicked() {
-                            if modifiers.shift {
-                                if let Some(anchor) = last_clicked {
-                                    let range = if anchor <= idx {
-                                        anchor..=idx
-                                    } else {
-                                        idx..=anchor
-                                    };
-                                    for i in range {
-                                        new_selected.insert(i);
+                    // Recursive tree render helper — collects actions to apply after
+                    struct TreeActions {
+                        double_clicked_dir: Option<String>,
+                        double_clicked_file: Option<String>,
+                        toggle_expand: Option<String>,
+                        prefetch: Vec<String>,
+                    }
+                    fn render_tree_level(
+                        ui: &mut egui::Ui,
+                        parent_path: &str,
+                        entries: &[FileEntry],
+                        expanded: &std::collections::HashSet<String>,
+                        dir_cache: &HashMap<String, Vec<FileEntry>>,
+                        fetching: &std::collections::HashSet<String>,
+                        depth: usize,
+                        actions: &mut TreeActions,
+                    ) {
+                        let indent = depth as f32 * 16.0;
+                        for entry in entries {
+                            let full_path = join_path(parent_path, &entry.name);
+                            ui.horizontal(|ui| {
+                                ui.add_space(indent);
+                                if entry.is_dir {
+                                    let is_expanded = expanded.contains(&full_path);
+                                    let arrow = if is_expanded { "\u{25BC}" } else { "\u{25B6}" };
+                                    if ui.small_button(arrow).clicked() {
+                                        actions.toggle_expand = Some(full_path.clone());
+                                    }
+                                    let dir_response = ui.selectable_label(false, &entry.name);
+                                    if dir_response.double_clicked() {
+                                        actions.double_clicked_dir = Some(full_path.clone());
+                                    }
+                                    // Prefetch subdirectory in background
+                                    if !dir_cache.contains_key(&full_path) && !fetching.contains(&full_path) {
+                                        actions.prefetch.push(full_path.clone());
                                     }
                                 } else {
-                                    new_selected.clear();
-                                    new_selected.insert(idx);
+                                    ui.add_space(18.0); // align with arrow button width
+                                    let file_response = ui.selectable_label(false, truncate(&entry.name, 25));
+                                    if file_response.double_clicked() {
+                                        actions.double_clicked_file = Some(full_path.clone());
+                                    }
                                 }
-                                new_last_clicked = Some(idx);
-                            } else if modifiers.command || modifiers.ctrl {
-                                if new_selected.contains(&idx) {
-                                    new_selected.remove(&idx);
-                                } else {
-                                    new_selected.insert(idx);
+                            });
+                            // Render children if expanded
+                            if entry.is_dir && expanded.contains(&full_path) {
+                                if let Some(children) = dir_cache.get(&full_path) {
+                                    render_tree_level(
+                                        ui, &full_path, children, expanded, dir_cache,
+                                        fetching, depth + 1, actions,
+                                    );
+                                } else if fetching.contains(&full_path) {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(indent + 16.0);
+                                        ui.spinner();
+                                        ui.small(egui::RichText::new("loading...").weak());
+                                    });
                                 }
-                                new_last_clicked = Some(idx);
-                            } else {
-                                new_selected.clear();
-                                new_selected.insert(idx);
-                                new_last_clicked = Some(idx);
-                            }
-                        }
-                        if response.double_clicked() {
-                            if entry.is_dir {
-                                double_clicked_dir =
-                                    Some(join_path(&current_path, &entry.name));
-                            } else {
-                                double_clicked_file =
-                                    Some(join_path(&current_path, &entry.name));
                             }
                         }
                     }
-                    if entries.is_empty()
-                        && matches!(status, FileOpStatus::Idle)
-                    {
+
+                    let mut actions = TreeActions {
+                        double_clicked_dir: None,
+                        double_clicked_file: None,
+                        toggle_expand: None,
+                        prefetch: Vec::new(),
+                    };
+
+                    render_tree_level(
+                        ui, &current_path, &entries, &expanded, &dir_cache,
+                        &fetching, 0, &mut actions,
+                    );
+
+                    if entries.is_empty() && matches!(status, FileOpStatus::Idle) {
                         ui.label("(empty)");
                     }
+
+                    double_clicked_dir = actions.double_clicked_dir;
+                    double_clicked_file = actions.double_clicked_file;
+                    toggle_expand = actions.toggle_expand;
+                    dirs_to_prefetch = actions.prefetch;
                 });
 
-            // Update selection
-            if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
-                fb.selected_entries = new_selected.clone();
-                fb.last_clicked_entry = new_last_clicked;
+            // Handle expand/collapse toggle
+            if let Some(dir_path) = &toggle_expand {
+                if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                    if fb.expanded_dirs.contains(dir_path) {
+                        fb.expanded_dirs.remove(dir_path);
+                    } else {
+                        fb.expanded_dirs.insert(dir_path.clone());
+                        // Fetch if not cached
+                        if !fb.dir_cache.contains_key(dir_path) {
+                            let p = dir_path.clone();
+                            drop(fb);
+                            self.request_bg_listing(tab_id, p);
+                        }
+                    }
+                }
+            }
+
+            // Prefetch subdirectories in background
+            for dir in dirs_to_prefetch {
+                self.request_bg_listing(tab_id, dir);
             }
 
             // Navigate on double-click dir
@@ -4262,7 +4413,7 @@ mod gui {
             // Upload / Download buttons
             ui.horizontal(|ui| {
                 // Gather selected file entries (non-dir)
-                let selected_files: Vec<usize> = new_selected
+                let selected_files: Vec<usize> = selected_entries
                     .iter()
                     .copied()
                     .filter(|&idx| {
