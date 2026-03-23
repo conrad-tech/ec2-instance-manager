@@ -408,6 +408,8 @@ mod gui {
         editor_tabs: Vec<EditorTab>,
         /// Index of the currently active editor tab
         active_editor: Option<usize>,
+        /// In-memory cache of visited directory listings (cleared when tab closes)
+        dir_cache: HashMap<String, Vec<FileEntry>>,
     }
 
     impl Default for FileBrowserState {
@@ -423,6 +425,7 @@ mod gui {
                 initialized: false,
                 editor_tabs: Vec::new(),
                 active_editor: None,
+                dir_cache: HashMap::new(),
             }
         }
     }
@@ -1721,7 +1724,7 @@ mod gui {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| "/".to_string())
             } else {
-                "/home/ssm-user".to_string()
+                "/home/ec2-user".to_string()
             };
             let mut fb_state = FileBrowserState {
                 current_path: default_path.clone(),
@@ -2201,16 +2204,30 @@ mod gui {
             let Some(fb) = self.file_browsers.get_mut(&tab_id) else {
                 return;
             };
+            // Show cached entries immediately if available
+            if let Some(cached) = fb.dir_cache.get(&path) {
+                fb.entries = cached.clone();
+                fb.initialized = true;
+            }
             fb.status = FileOpStatus::Listing;
             fb.current_path = path.clone();
             fb.path_input = path.clone();
             fb.selected_entries.clear();
             fb.last_clicked_entry = None;
 
-            let tab = self.connections.selected_ref().cloned();
-            let instance_id = tab.map(|t| t.instance_id.clone()).unwrap_or_default();
+            // Look up the tab by ID (not the selected tab) so the file
+            // browser always targets the correct EC2 instance.
+            let tab = self.connections.tabs().iter()
+                .find(|t| t.id == tab_id).cloned();
+            let instance_id = tab.as_ref().map(|t| t.instance_id.clone()).unwrap_or_default();
+            // Use the cached context for this tab's profile if available
+            let context = tab.as_ref()
+                .and_then(|t| {
+                    self.profile_inventory_cache.get(&t.profile_id)
+                        .map(|(_, ctx)| ctx.clone())
+                })
+                .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
-            let context = self.context.clone();
             let tx = self.file_op_tx.clone();
 
             std::thread::spawn(move || {
@@ -2262,10 +2279,16 @@ mod gui {
             };
             fb.status = FileOpStatus::Downloading;
 
-            let tab = self.connections.selected_ref().cloned();
-            let instance_id = tab.map(|t| t.instance_id.clone()).unwrap_or_default();
+            let tab = self.connections.tabs().iter()
+                .find(|t| t.id == tab_id).cloned();
+            let instance_id = tab.as_ref().map(|t| t.instance_id.clone()).unwrap_or_default();
+            let context = tab.as_ref()
+                .and_then(|t| {
+                    self.profile_inventory_cache.get(&t.profile_id)
+                        .map(|(_, ctx)| ctx.clone())
+                })
+                .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
-            let context = self.context.clone();
             let tx = self.file_op_tx.clone();
 
             std::thread::spawn(move || {
@@ -2328,10 +2351,16 @@ mod gui {
             remote_path: String,
             local_path: String,
         ) {
-            let tab = self.connections.selected_ref().cloned();
-            let instance_id = tab.map(|t| t.instance_id.clone()).unwrap_or_default();
+            let tab = self.connections.tabs().iter()
+                .find(|t| t.id == tab_id).cloned();
+            let instance_id = tab.as_ref().map(|t| t.instance_id.clone()).unwrap_or_default();
+            let context = tab.as_ref()
+                .and_then(|t| {
+                    self.profile_inventory_cache.get(&t.profile_id)
+                        .map(|(_, ctx)| ctx.clone())
+                })
+                .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
-            let context = self.context.clone();
             let tx = self.file_op_tx.clone();
 
             std::thread::spawn(move || {
@@ -2397,10 +2426,16 @@ mod gui {
             };
             fb.status = FileOpStatus::Uploading;
 
-            let tab = self.connections.selected_ref().cloned();
-            let instance_id = tab.map(|t| t.instance_id.clone()).unwrap_or_default();
+            let tab = self.connections.tabs().iter()
+                .find(|t| t.id == tab_id).cloned();
+            let instance_id = tab.as_ref().map(|t| t.instance_id.clone()).unwrap_or_default();
+            let context = tab.as_ref()
+                .and_then(|t| {
+                    self.profile_inventory_cache.get(&t.profile_id)
+                        .map(|(_, ctx)| ctx.clone())
+                })
+                .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
-            let context = self.context.clone();
             let tx = self.file_op_tx.clone();
             let file_name = std::path::Path::new(&local_path)
                 .file_name()
@@ -2464,10 +2499,16 @@ mod gui {
             };
             fb.status = FileOpStatus::Downloading;
 
-            let tab = self.connections.selected_ref().cloned();
-            let instance_id = tab.map(|t| t.instance_id.clone()).unwrap_or_default();
+            let tab = self.connections.tabs().iter()
+                .find(|t| t.id == tab_id).cloned();
+            let instance_id = tab.as_ref().map(|t| t.instance_id.clone()).unwrap_or_default();
+            let context = tab.as_ref()
+                .and_then(|t| {
+                    self.profile_inventory_cache.get(&t.profile_id)
+                        .map(|(_, ctx)| ctx.clone())
+                })
+                .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
-            let context = self.context.clone();
             let tx = self.file_op_tx.clone();
 
             std::thread::spawn(move || {
@@ -2531,10 +2572,16 @@ mod gui {
             et.status = "Saving...".to_string();
             fb.status = FileOpStatus::Uploading;
 
-            let tab = self.connections.selected_ref().cloned();
-            let instance_id = tab.map(|t| t.instance_id.clone()).unwrap_or_default();
+            let tab = self.connections.tabs().iter()
+                .find(|t| t.id == tab_id).cloned();
+            let instance_id = tab.as_ref().map(|t| t.instance_id.clone()).unwrap_or_default();
+            let context = tab.as_ref()
+                .and_then(|t| {
+                    self.profile_inventory_cache.get(&t.profile_id)
+                        .map(|(_, ctx)| ctx.clone())
+                })
+                .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
-            let context = self.context.clone();
             let tx = self.file_op_tx.clone();
 
             std::thread::spawn(move || {
@@ -2587,6 +2634,7 @@ mod gui {
                             entries.len()
                         ));
                         if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                            fb.dir_cache.insert(path, entries.clone());
                             fb.entries = entries;
                             fb.status = FileOpStatus::Idle;
                             fb.initialized = true;
@@ -2646,6 +2694,8 @@ mod gui {
                         ));
                         if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
                             fb.status = FileOpStatus::Idle;
+                            // Invalidate cache for this directory since a file was added
+                            fb.dir_cache.remove(&fb.current_path);
                             let path = fb.current_path.clone();
                             let tab_id_copy = tab_id;
                             // queue re-listing after upload
@@ -3777,12 +3827,17 @@ mod gui {
                                 terminal_focus_id,
                                 egui::Sense::click(),
                             );
-                            // Use the label's actual rendered rect so highlight and
-                            // mouse mapping align with text regardless of frame margins
-                            // or display-specific layout rounding.
+                            // Use the label's rendered rect for mouse mapping.
+                            // Recompute cell size from current font metrics to handle
+                            // DPI changes after moving between monitors.
                             let term_rect = terminal_response.inner.rect;
-                            let (sel_rows, sel_cols, sel_cell_w, sel_cell_h) =
-                                terminal_grid_and_cell_size(ui, &font_id, term_rect.size());
+                            let (sel_cell_w, sel_cell_h) = ui.fonts_mut(|f| {
+                                (f.glyph_width(&font_id, 'W'), f.row_height(&font_id))
+                            });
+                            let sel_cell_w = if sel_cell_w >= 1.0 { sel_cell_w } else { font_id.size * 0.6 };
+                            let sel_cell_h = if sel_cell_h >= 1.0 { sel_cell_h } else { font_id.size * 1.2 };
+                            let sel_cols = (term_rect.width() / sel_cell_w).floor().max(1.0) as u16;
+                            let sel_rows = (term_rect.height() / sel_cell_h).floor().max(1.0) as u16;
                             // Mouse drag selection using raw pointer state (absolute coords)
                             let pointer_pos = ui.input(|i| i.pointer.hover_pos());
                             let primary_down = ui.input(|i| i.pointer.primary_down());
@@ -6926,7 +6981,7 @@ mod gui {
             if Instant::now() > deadline {
                 return Err("ssm command timed out after 30s".to_string());
             }
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(Duration::from_millis(100));
             let output = std::process::Command::new("aws")
                 .args([
                     "ssm",
