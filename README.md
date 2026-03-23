@@ -55,6 +55,9 @@ Build scripts:
 
 ./scripts/build_binaries.sh windows
 
+# Windows with WSL
+./scripts/build_binaries.sh native
+
 # Linux OS
 
 ```bash

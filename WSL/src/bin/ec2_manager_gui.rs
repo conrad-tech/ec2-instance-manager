@@ -4151,25 +4151,25 @@ mod gui {
             // Auto-refresh: detect when user returns from the terminal
             // (terminal had hover/focus last frame, now the file browser is hovered)
             let fb_hovered = ui.rect_contains_pointer(ui.max_rect());
-            if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+            let auto_refresh = self.file_browsers.get_mut(&tab_id).and_then(|fb| {
                 if fb.terminal_had_focus && fb_hovered && fb.initialized {
                     fb.terminal_had_focus = false;
                     let path = fb.current_path.clone();
-                    // Collect expanded dirs to refresh alongside current dir
                     let expanded: Vec<String> = fb.expanded_dirs.iter().cloned().collect();
-                    // Invalidate cache for current dir and expanded subdirs
                     fb.dir_cache.remove(&path);
                     for dir in &expanded {
                         fb.dir_cache.remove(dir);
                         fb.fetching_dirs.remove(dir);
                     }
-                    drop(fb);
-                    // Refresh current directory
-                    self.request_file_listing(tab_id, path);
-                    // Refresh all expanded subdirectories
-                    for dir in expanded {
-                        self.request_bg_listing(tab_id, dir);
-                    }
+                    Some((path, expanded))
+                } else {
+                    None
+                }
+            });
+            if let Some((path, expanded)) = auto_refresh {
+                self.request_file_listing(tab_id, path);
+                for dir in expanded {
+                    self.request_bg_listing(tab_id, dir);
                 }
             }
 
@@ -4194,7 +4194,7 @@ mod gui {
                 current_path,
                 entries,
                 selected_entries,
-                last_clicked,
+                _last_clicked,
                 status,
                 pending_downloads,
             )) = fb_snapshot
@@ -4377,20 +4377,21 @@ mod gui {
                 });
 
             // Handle expand/collapse toggle
+            let mut expand_fetch: Option<String> = None;
             if let Some(dir_path) = &toggle_expand {
                 if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
                     if fb.expanded_dirs.contains(dir_path) {
                         fb.expanded_dirs.remove(dir_path);
                     } else {
                         fb.expanded_dirs.insert(dir_path.clone());
-                        // Fetch if not cached
                         if !fb.dir_cache.contains_key(dir_path) {
-                            let p = dir_path.clone();
-                            drop(fb);
-                            self.request_bg_listing(tab_id, p);
+                            expand_fetch = Some(dir_path.clone());
                         }
                     }
                 }
+            }
+            if let Some(p) = expand_fetch {
+                self.request_bg_listing(tab_id, p);
             }
 
             // Prefetch subdirectories in background
