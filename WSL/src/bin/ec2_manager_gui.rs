@@ -103,10 +103,21 @@ mod gui {
     ];
 
 
+    #[derive(Clone, Debug)]
+    struct VolumeInfo {
+        volume_id: String,
+        size_gb: String,
+        volume_type: String,
+        device: String,
+        state: String,
+        attach_time: String,
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MainTab {
         Inventory,
         Connections,
+        Details,
         Log,
     }
 
@@ -275,6 +286,7 @@ mod gui {
         Output { tab_id: u64, bytes: Vec<u8> },
         Exited { tab_id: u64, code: i32 },
         Error { tab_id: u64, error: String },
+        VolumeResult { volumes: std::result::Result<Vec<VolumeInfo>, String> },
     }
 
     enum RefreshEvent {
@@ -773,6 +785,12 @@ mod gui {
         hidden_envs: std::collections::HashSet<String>,
         selected_saved_filter: String,
         selected_instance_id: String,
+        /// Instance shown in the Details tab
+        detail_instance: Option<Instance>,
+        /// Volume info fetched for the Details tab
+        detail_volumes: Vec<VolumeInfo>,
+        detail_volumes_loading: bool,
+        detail_volumes_error: Option<String>,
         local_port: u16,
         remote_port: u16,
 
@@ -913,6 +931,10 @@ mod gui {
                 hidden_envs: initial_hidden_envs,
                 selected_saved_filter: String::new(),
                 selected_instance_id: String::new(),
+                detail_instance: None,
+                detail_volumes: Vec::new(),
+                detail_volumes_loading: false,
+                detail_volumes_error: None,
                 local_port: 2222,
                 remote_port: 22,
                 message: String::new(),
@@ -1814,12 +1836,20 @@ mod gui {
             ));
             // Use the config profile_id (account_id) so it matches the color map.
             // Fall back to finding a config profile by context.profile, then the raw value.
-            let tab_profile = self.selected_profile.clone().unwrap_or_else(|| {
-                self.config.profiles.iter()
-                    .find(|p| p.profile_id == context.profile || p.display_name == context.profile)
-                    .map(|p| p.profile_id.clone())
-                    .unwrap_or_else(|| context.profile.clone())
-            });
+            // Find the correct profile_id for this instance — it may belong
+            // to a different account than the currently selected one.
+            let tab_profile = self.profile_inventory_cache.iter()
+                .find(|(_, (inv, _))| {
+                    inv.instances.iter().any(|i| i.instance_id == instance_id)
+                })
+                .map(|(pid, _)| pid.clone())
+                .or_else(|| self.selected_profile.clone())
+                .unwrap_or_else(|| {
+                    self.config.profiles.iter()
+                        .find(|p| p.profile_id == context.profile || p.display_name == context.profile)
+                        .map(|p| p.profile_id.clone())
+                        .unwrap_or_else(|| context.profile.clone())
+                });
             let tab_id = self.connections.open(title.clone(), instance_id.clone(), tab_profile);
             self.rebuild_account_colors();
             let default_path = if context.mode == Mode::Sim {
@@ -2055,6 +2085,19 @@ mod gui {
                         self.connections
                             .append_line(tab_id, format!("[exit] code={code}"));
                         self.connections.set_running(tab_id, false);
+                    }
+                    ProcEvent::VolumeResult { volumes } => {
+                        self.detail_volumes_loading = false;
+                        match volumes {
+                            Ok(vols) => {
+                                self.log_info(format!("fetched {} volumes", vols.len()));
+                                self.detail_volumes = vols;
+                            }
+                            Err(err) => {
+                                self.log_error(format!("volume fetch failed: {err}"));
+                                self.detail_volumes_error = Some(err);
+                            }
+                        }
                     }
                 }
             }
@@ -3543,9 +3586,31 @@ mod gui {
                                 .union(resp_ami.clone())
                                 .union(resp_tag.clone());
 
+                            let detail_instance_clone = instance.clone();
                             row_response.context_menu(|ui| {
                                 if ui.button("Quick Connect").clicked() {
                                     quick_connect_clicked = true;
+                                    ui.close();
+                                }
+                                if ui.button("See Details").clicked() {
+                                    let iid = detail_instance_clone.instance_id.clone();
+                                    self.detail_instance = Some(detail_instance_clone.clone());
+                                    self.detail_volumes.clear();
+                                    self.detail_volumes_error = None;
+                                    self.detail_volumes_loading = true;
+                                    self.main_tab = MainTab::Details;
+                                    // Fetch volumes in background
+                                    let context = self.profile_inventory_cache.iter()
+                                        .find(|(_, (inv, _))| inv.instances.iter().any(|i| i.instance_id == iid))
+                                        .map(|(_, (_, ctx))| ctx.clone())
+                                        .or_else(|| self.context.clone());
+                                    if let Some(ctx) = context {
+                                        let tx = self.proc_tx.clone();
+                                        std::thread::spawn(move || {
+                                            let result = fetch_volumes(&ctx.profile, &ctx.region, &iid);
+                                            let _ = tx.send(ProcEvent::VolumeResult { volumes: result });
+                                        });
+                                    }
                                     ui.close();
                                 }
                             });
@@ -4897,6 +4962,145 @@ mod gui {
                 });
         }
 
+        fn render_details_panel(&mut self, ui: &mut egui::Ui) {
+            let Some(instance) = self.detail_instance.clone() else {
+                ui.label("No instance selected. Right-click an instance and choose 'See Details'.");
+                return;
+            };
+
+            ui.horizontal(|ui| {
+                ui.heading(instance.name.as_deref().unwrap_or("(unnamed)"));
+                if ui.button("Copy All").clicked() {
+                    let mut text = String::new();
+                    text.push_str(&format!("Instance ID: {}\n", instance.instance_id));
+                    text.push_str(&format!("Name: {}\n", instance.name.as_deref().unwrap_or("-")));
+                    text.push_str(&format!("State: {}\n", instance.state));
+                    text.push_str(&format!("Instance Type: {}\n", instance.instance_type.as_deref().unwrap_or("-")));
+                    text.push_str(&format!("AMI ID: {}\n", instance.image_id.as_deref().unwrap_or("-")));
+                    text.push_str(&format!("Private IP: {}\n", instance.private_ip.as_deref().unwrap_or("-")));
+                    text.push_str(&format!("AZ: {}\n", instance.az.as_deref().unwrap_or("-")));
+                    text.push_str(&format!("Environment: {}\n", instance.env.as_deref().unwrap_or("-")));
+                    text.push_str(&format!("App/Service: {}\n", instance.app_service.as_deref().unwrap_or("-")));
+                    text.push_str(&format!("Role: {}\n", instance.role.as_deref().unwrap_or("-")));
+                    text.push_str(&format!("Team/Owner: {}\n", instance.team_owner.as_deref().unwrap_or("-")));
+                    text.push_str(&format!("ASG: {}\n", instance.asg.as_deref().unwrap_or("-")));
+                    text.push_str(&format!("SSM Managed: {}\n", if instance.ssm_managed { "Yes" } else { "No" }));
+                    text.push_str(&format!("Launch Time: {}\n", instance.launch_time.as_deref().unwrap_or("-")));
+                    if !self.detail_volumes.is_empty() {
+                        text.push_str("\nVolumes:\n");
+                        for vol in &self.detail_volumes {
+                            text.push_str(&format!("  {} | {} | {} | {} | {} | {}\n",
+                                vol.volume_id, vol.size_gb, vol.volume_type, vol.device, vol.state, vol.attach_time));
+                        }
+                    }
+                    if !instance.tags.is_empty() {
+                        text.push_str("\nTags:\n");
+                        let mut tags: Vec<_> = instance.tags.iter().collect();
+                        tags.sort_by(|a, b| a.0.cmp(b.0));
+                        for (k, v) in tags {
+                            text.push_str(&format!("  {k}: {v}\n"));
+                        }
+                    }
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(&text);
+                    }
+                }
+                if ui.button("Close").clicked() {
+                    self.detail_instance = None;
+                    self.main_tab = MainTab::Inventory;
+                }
+            });
+            ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("detail_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        let row = |ui: &mut egui::Ui, label: &str, value: &str| {
+                            ui.strong(label);
+                            ui.label(value);
+                            ui.end_row();
+                        };
+
+                        row(ui, "Instance ID", &instance.instance_id);
+                        row(ui, "Name", instance.name.as_deref().unwrap_or("-"));
+                        row(ui, "State", &instance.state);
+                        row(ui, "Instance Type", instance.instance_type.as_deref().unwrap_or("-"));
+                        row(ui, "AMI ID", instance.image_id.as_deref().unwrap_or("-"));
+                        row(ui, "Private IP", instance.private_ip.as_deref().unwrap_or("-"));
+                        row(ui, "Availability Zone", instance.az.as_deref().unwrap_or("-"));
+                        row(ui, "Environment", instance.env.as_deref().unwrap_or("-"));
+                        row(ui, "App/Service", instance.app_service.as_deref().unwrap_or("-"));
+                        row(ui, "Role", instance.role.as_deref().unwrap_or("-"));
+                        row(ui, "Team/Owner", instance.team_owner.as_deref().unwrap_or("-"));
+                        row(ui, "Auto Scaling Group", instance.asg.as_deref().unwrap_or("-"));
+                        row(ui, "SSM Managed", if instance.ssm_managed { "Yes" } else { "No" });
+                        row(ui, "SSM Ping", instance.ssm_ping.as_deref().unwrap_or("-"));
+                        row(ui, "SSM Last Ping", instance.ssm_last_ping.as_deref().unwrap_or("-"));
+                        row(ui, "Launch Time", instance.launch_time.as_deref().unwrap_or("-"));
+                    });
+
+                // Volumes section
+                ui.add_space(12.0);
+                ui.heading("Volumes");
+                ui.separator();
+                if self.detail_volumes_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Fetching volumes...");
+                    });
+                } else if let Some(err) = &self.detail_volumes_error {
+                    ui.colored_label(egui::Color32::RED, format!("Error: {err}"));
+                } else if self.detail_volumes.is_empty() {
+                    ui.label("No volumes found");
+                } else {
+                    egui::Grid::new("detail_volumes_grid")
+                        .num_columns(6)
+                        .spacing([12.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.strong("Volume ID");
+                            ui.strong("Size");
+                            ui.strong("Type");
+                            ui.strong("Device");
+                            ui.strong("State");
+                            ui.strong("Attached");
+                            ui.end_row();
+                            for vol in &self.detail_volumes {
+                                ui.label(&vol.volume_id);
+                                ui.label(&vol.size_gb);
+                                ui.label(&vol.volume_type);
+                                ui.label(&vol.device);
+                                ui.label(&vol.state);
+                                ui.label(&vol.attach_time);
+                                ui.end_row();
+                            }
+                        });
+                }
+
+                if !instance.tags.is_empty() {
+                    ui.add_space(12.0);
+                    ui.heading("Tags");
+                    ui.separator();
+                    egui::Grid::new("detail_tags_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            let mut tags: Vec<(&String, &String)> = instance.tags.iter().collect();
+                            tags.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+                            for (key, value) in tags {
+                                ui.strong(key);
+                                ui.label(value);
+                                ui.end_row();
+                            }
+                        });
+                }
+
+            });
+        }
+
         fn render_log_panel(&mut self, ui: &mut egui::Ui) {
             ui.horizontal(|ui| {
                 ui.label("Application log");
@@ -4963,12 +5167,18 @@ mod gui {
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
-                    ui.add(
+                    let resp = ui.add(
                         egui::TextEdit::multiline(&mut log_text.as_str())
                             .font(egui::TextStyle::Monospace)
                             .desired_width(f32::INFINITY)
                             .frame(false),
                     );
+                    // Right-click: inject Ctrl+C key event to copy selection
+                    if resp.secondary_clicked() {
+                        ui.ctx().input_mut(|i| {
+                            i.events.push(egui::Event::Copy);
+                        });
+                    }
                 });
         }
     }
@@ -5314,9 +5524,9 @@ mod gui {
                                 if self.config.account_colors_enabled {
                                     ui.separator();
 
-                                    // Show unique environments with their colors
+                                    // Show unique environments sorted by account order then alpha
                                     let mut seen = std::collections::HashSet::new();
-                                    let mut env_list: Vec<(String, String, egui::Color32)> = self
+                                    let mut env_list: Vec<(String, String, String, egui::Color32)> = self
                                         .account_color_map
                                         .iter()
                                         .filter_map(|(key, color)| {
@@ -5328,15 +5538,29 @@ mod gui {
                                                     .find(|p| p.profile_id == pid)
                                                     .map(|p| p.display_name.as_str())
                                                     .unwrap_or(pid);
-                                                Some((format!("{env} ({label})"), key.clone(), *color))
+                                                Some((pid.to_string(), format!("{env} ({label})"), key.clone(), *color))
                                             } else {
                                                 None
                                             }
                                         })
                                         .collect();
-                                    env_list.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+                                    env_list.sort_by(|a, b| {
+                                        let (idx_a, pa) = self.config.profiles.iter().enumerate()
+                                            .find(|(_, p)| p.profile_id == a.0)
+                                            .map(|(i, p)| (i, Some(p)))
+                                            .unwrap_or((usize::MAX, None));
+                                        let (idx_b, pb) = self.config.profiles.iter().enumerate()
+                                            .find(|(_, p)| p.profile_id == b.0)
+                                            .map(|(i, p)| (i, Some(p)))
+                                            .unwrap_or((usize::MAX, None));
+                                        let ord_a = pa.and_then(|p| p.sort_order).unwrap_or(u32::MAX);
+                                        let ord_b = pb.and_then(|p| p.sort_order).unwrap_or(u32::MAX);
+                                        ord_a.cmp(&ord_b)
+                                            .then_with(|| idx_a.cmp(&idx_b))
+                                            .then_with(|| a.1.to_ascii_lowercase().cmp(&b.1.to_ascii_lowercase()))
+                                    });
 
-                                    for (display, _key, color) in &env_list {
+                                    for (_pid, display, _key, color) in &env_list {
                                         ui.horizontal(|ui| {
                                             let (rect, _) = ui.allocate_exact_size(
                                                 egui::vec2(12.0, 12.0),
@@ -5389,6 +5613,14 @@ mod gui {
                             .clicked()
                         {
                             self.main_tab = MainTab::Connections;
+                        }
+                        if self.detail_instance.is_some() {
+                            if ui
+                                .selectable_label(self.main_tab == MainTab::Details, "Details")
+                                .clicked()
+                            {
+                                self.main_tab = MainTab::Details;
+                            }
                         }
                         if ui
                             .selectable_label(self.main_tab == MainTab::Log, "Log")
@@ -6134,6 +6366,7 @@ mod gui {
                 egui::CentralPanel::default().show(ctx, |ui| match self.main_tab {
                     MainTab::Inventory => self.render_inventory_panel(ui),
                     MainTab::Connections => self.render_connections_panel(ui),
+                    MainTab::Details => self.render_details_panel(ui),
                     MainTab::Log => self.render_log_panel(ui),
                 });
             }));
@@ -7503,6 +7736,44 @@ mod gui {
 
     /// Create an `aws` CLI command with CREATE_NO_WINDOW on Windows
     /// so no console window flashes.
+    fn fetch_volumes(profile: &str, region: &str, instance_id: &str) -> std::result::Result<Vec<VolumeInfo>, String> {
+        let output = aws_command()
+            .args([
+                "ec2", "describe-volumes",
+                "--profile", profile,
+                "--region", region,
+                "--filters", &format!("Name=attachment.instance-id,Values={instance_id}"),
+                "--query", "Volumes[*].{VolumeId:VolumeId,Size:Size,VolumeType:VolumeType,Attachments:Attachments[0].{Device:Device,State:State,AttachTime:AttachTime}}",
+                "--output", "json",
+            ])
+            .output()
+            .map_err(|e| format!("describe-volumes failed: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("describe-volumes error: {stderr}"));
+        }
+
+        let json_str = String::from_utf8_lossy(&output.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str)
+            .map_err(|e| format!("JSON parse error: {e}"))?;
+
+        let volumes = parsed.as_array().ok_or("expected array")?;
+        let mut result = Vec::new();
+        for vol in volumes {
+            let attachments = vol.get("Attachments");
+            result.push(VolumeInfo {
+                volume_id: vol.get("VolumeId").and_then(|v| v.as_str()).unwrap_or("-").to_string(),
+                size_gb: vol.get("Size").map(|v| format!("{} GB", v)).unwrap_or("-".to_string()),
+                volume_type: vol.get("VolumeType").and_then(|v| v.as_str()).unwrap_or("-").to_string(),
+                device: attachments.and_then(|a| a.get("Device")).and_then(|v| v.as_str()).unwrap_or("-").to_string(),
+                state: attachments.and_then(|a| a.get("State")).and_then(|v| v.as_str()).unwrap_or("-").to_string(),
+                attach_time: attachments.and_then(|a| a.get("AttachTime")).and_then(|v| v.as_str()).unwrap_or("-").to_string(),
+            });
+        }
+        Ok(result)
+    }
+
     fn aws_command() -> std::process::Command {
         let mut cmd = std::process::Command::new("aws");
         #[cfg(target_os = "windows")]
