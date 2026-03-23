@@ -3656,6 +3656,17 @@ mod gui {
                         .then_with(|| a.1.to_ascii_lowercase().cmp(&b.1.to_ascii_lowercase()))
                 });
 
+                // Log legend entries for debugging duplicates
+                if !env_entries.is_empty() && self.debug_mode {
+                    for (pid, env, _color) in &env_entries {
+                        let label = self.config.profiles.iter()
+                            .find(|p| p.profile_id == *pid)
+                            .map(|p| p.display_name.as_str())
+                            .unwrap_or("?");
+                        self.log_debug(format!("legend entry: env={env} profile={pid} label={label}"));
+                    }
+                }
+
                 if !env_entries.is_empty() {
                     ui.horizontal_wrapped(|ui| {
                         for (_pid, env, color) in &env_entries {
@@ -3699,10 +3710,11 @@ mod gui {
                                 });
                             inst.and_then(|i| {
                                 let env = instance_env(i)?;
-                                if self.hidden_envs.contains(&env.to_ascii_lowercase()) {
+                                let env_lower = env.to_ascii_lowercase();
+                                if self.hidden_envs.contains(&env_lower) {
                                     return None;
                                 }
-                                let key = format!("{profile_id}:{env}");
+                                let key = format!("{profile_id}:{env_lower}");
                                 self.account_color_map.get(&key).copied()
                             })
                         });
@@ -6752,6 +6764,7 @@ mod gui {
 
             let mut envs: Vec<String> = instances.iter()
                 .filter_map(|i| instance_env(i))
+                .map(|e| e.to_ascii_lowercase())
                 .collect();
             envs.sort();
             envs.dedup();
