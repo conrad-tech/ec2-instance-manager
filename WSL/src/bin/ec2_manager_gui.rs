@@ -416,6 +416,8 @@ mod gui {
         fetching_dirs: std::collections::HashSet<String>,
         /// Whether the terminal had focus last frame (for auto-refresh)
         terminal_had_focus: bool,
+        /// Currently selected file in tree view (full_path, filename)
+        selected_file: Option<(String, String)>,
     }
 
     impl Default for FileBrowserState {
@@ -435,6 +437,7 @@ mod gui {
                 expanded_dirs: std::collections::HashSet::new(),
                 fetching_dirs: std::collections::HashSet::new(),
                 terminal_had_focus: false,
+                selected_file: None,
             }
         }
     }
@@ -759,6 +762,8 @@ mod gui {
         search_rules: Vec<SearchRuleInput>,
         selected_state_filter: String,
         only_ssm: bool,
+        /// Additional account profile IDs to include in the instance list
+        multi_account_ids: std::collections::HashSet<String>,
         save_filter_name: String,
         selected_saved_filter: String,
         selected_instance_id: String,
@@ -895,6 +900,7 @@ mod gui {
                 search_rules: vec![SearchRuleInput::default()],
                 selected_state_filter: "running".to_string(),
                 only_ssm: false,
+                multi_account_ids: std::collections::HashSet::new(),
                 save_filter_name: String::new(),
                 selected_saved_filter: String::new(),
                 selected_instance_id: String::new(),
@@ -1364,15 +1370,29 @@ mod gui {
 
         fn apply_filters(&mut self) {
             let (includes, excludes) = search_terms_from_rules(&self.search_rules);
-            self.filtered = apply_filters(
-                &self.inventory.instances,
-                &Filters {
-                    includes,
-                    excludes,
-                    states: states_from_state_filter(&self.selected_state_filter),
-                    only_ssm_managed: self.only_ssm,
-                },
-            );
+            let filters = Filters {
+                includes,
+                excludes,
+                states: states_from_state_filter(&self.selected_state_filter),
+                only_ssm_managed: self.only_ssm,
+            };
+
+            // Start with the current account's instances
+            let mut all_instances = self.inventory.instances.clone();
+
+            // Add instances from checked multi-account profiles
+            for extra_pid in &self.multi_account_ids {
+                if let Some((inv, _)) = self.profile_inventory_cache.get(extra_pid) {
+                    for inst in &inv.instances {
+                        // Avoid duplicates (same instance_id)
+                        if !all_instances.iter().any(|i| i.instance_id == inst.instance_id) {
+                            all_instances.push(inst.clone());
+                        }
+                    }
+                }
+            }
+
+            self.filtered = apply_filters(&all_instances, &filters);
 
             // Apply tag-specific rules using "TagKey: value" syntax.
             // Include rules with colon require the tag to match.
@@ -2415,6 +2435,7 @@ mod gui {
 
         /// Like `request_file_download` but does not set status to Downloading
         /// (the caller manages batch status and `pending_downloads`).
+        #[allow(dead_code)]
         fn request_batch_file_download(
             &mut self,
             tab_id: u64,
@@ -3024,6 +3045,14 @@ mod gui {
             let states = states_from_state_filter(&self.selected_state_filter);
             let (include_terms, exclude_terms) = search_terms_from_rules(&self.search_rules);
 
+            // Capture favorited instance IDs from the current filtered list
+            let account = self.account_scope();
+            let region = self.region_scope();
+            let pinned_ids: Vec<String> = self.filtered.iter()
+                .filter(|i| self.config.is_favorite(&account, &region, &i.instance_id))
+                .map(|i| i.instance_id.clone())
+                .collect();
+
             self.config.upsert_saved_filter(
                 "global",
                 "global",
@@ -3033,6 +3062,7 @@ mod gui {
                     exclude_terms,
                     states,
                     only_ssm_managed: self.only_ssm,
+                    pinned_ids,
                 },
             );
             self.config.save()?;
@@ -3065,6 +3095,15 @@ mod gui {
             self.selected_state_filter = state_filter_from_saved_states(&saved.states);
             self.only_ssm = saved.only_ssm_managed;
             self.apply_filters();
+
+            // If the saved filter has pinned instance IDs (favorites at save time),
+            // further restrict to only those instances.
+            if !saved.pinned_ids.is_empty() {
+                self.filtered.retain(|i| {
+                    saved.pinned_ids.iter().any(|pid| pid.eq_ignore_ascii_case(&i.instance_id))
+                });
+            }
+
             self.message = format!("Applied saved filter: {name}");
             self.log_info(self.message.clone());
             Ok(())
@@ -4169,7 +4208,7 @@ mod gui {
                 mut path_input,
                 current_path,
                 entries,
-                selected_entries,
+                _selected_entries,
                 _last_clicked,
                 status,
                 pending_downloads,
@@ -4276,6 +4315,7 @@ mod gui {
                         double_clicked_file: Option<String>,
                         toggle_expand: Option<String>,
                         prefetch: Vec<String>,
+                        selected_file: Option<(String, String)>, // (full_path, filename)
                     }
                     fn render_tree_level(
                         ui: &mut egui::Ui,
@@ -4339,7 +4379,12 @@ mod gui {
                                     }
                                 } else {
                                     ui.add_space(18.0); // align with arrow button width
-                                    let file_response = ui.selectable_label(false, truncate(&entry.name, 25));
+                                    let is_sel = actions.selected_file.as_ref()
+                                        .map(|(p, _)| p == &full_path).unwrap_or(false);
+                                    let file_response = ui.selectable_label(is_sel, truncate(&entry.name, 25));
+                                    if file_response.clicked() {
+                                        actions.selected_file = Some((full_path.clone(), entry.name.clone()));
+                                    }
                                     if file_response.double_clicked() {
                                         actions.double_clicked_file = Some(full_path.clone());
                                     }
@@ -4363,10 +4408,14 @@ mod gui {
                         }
                     }
 
+                    // Preserve current selection for highlighting
+                    let prev_selected = self.file_browsers.get(&tab_id)
+                        .and_then(|fb| fb.selected_file.clone());
                     let mut actions = TreeActions {
                         double_clicked_dir: None,
                         double_clicked_file: None,
                         toggle_expand: None,
+                        selected_file: prev_selected,
                         prefetch: Vec::new(),
                     };
 
@@ -4383,6 +4432,10 @@ mod gui {
                     double_clicked_file = actions.double_clicked_file;
                     toggle_expand = actions.toggle_expand;
                     dirs_to_prefetch = actions.prefetch;
+                    // Save selected file
+                    if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                        fb.selected_file = actions.selected_file;
+                    }
                 });
 
             // Handle expand/collapse toggle
@@ -4422,60 +4475,22 @@ mod gui {
 
             // Upload / Download buttons
             ui.horizontal(|ui| {
-                // Gather selected file entries (non-dir)
-                let selected_files: Vec<usize> = selected_entries
-                    .iter()
-                    .copied()
-                    .filter(|&idx| {
-                        entries.get(idx).map(|e| !e.is_dir).unwrap_or(false)
-                    })
-                    .collect();
-                let can_download = !selected_files.is_empty();
-                let download_label = if selected_files.len() > 1 {
-                    format!("Download ({})", selected_files.len())
-                } else {
-                    "Download".to_string()
-                };
+                let sel = self.file_browsers.get(&tab_id)
+                    .and_then(|fb| fb.selected_file.clone());
+                let can_download = sel.is_some();
                 if ui
-                    .add_enabled(can_download, egui::Button::new(download_label))
+                    .add_enabled(can_download, egui::Button::new("Download"))
                     .clicked()
                 {
-                    if selected_files.len() == 1 {
-                        // Single file: save-file dialog (existing behavior)
-                        if let Some(entry) = entries.get(selected_files[0]) {
-                            let remote = join_path(&current_path, &entry.name);
-                            let dialog = rfd::FileDialog::new()
-                                .set_file_name(&entry.name);
-                            if let Some(local) = dialog.save_file() {
-                                self.request_file_download(
-                                    tab_id,
-                                    remote,
-                                    local.to_string_lossy().to_string(),
-                                );
-                            }
-                        }
-                    } else {
-                        // Multiple files: pick destination folder
-                        let dialog = rfd::FileDialog::new();
-                        if let Some(dest_dir) = dialog.pick_folder() {
-                            let total = selected_files.len();
-                            if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
-                                fb.pending_downloads = total;
-                                fb.status = FileOpStatus::Downloading;
-                            }
-                            for idx in &selected_files {
-                                if let Some(entry) = entries.get(*idx) {
-                                    let remote =
-                                        join_path(&current_path, &entry.name);
-                                    let local = dest_dir
-                                        .join(&entry.name)
-                                        .to_string_lossy()
-                                        .to_string();
-                                    self.request_batch_file_download(
-                                        tab_id, remote, local,
-                                    );
-                                }
-                            }
+                    if let Some((remote_path, filename)) = sel {
+                        let dialog = rfd::FileDialog::new()
+                            .set_file_name(&filename);
+                        if let Some(local) = dialog.save_file() {
+                            self.request_file_download(
+                                tab_id,
+                                remote_path,
+                                local.to_string_lossy().to_string(),
+                            );
                         }
                     }
                 }
@@ -5464,6 +5479,8 @@ mod gui {
                             });
 
                         if self.selected_profile != before_profile {
+                            // Clear multi-account selections when switching profiles
+                            self.multi_account_ids.clear();
                             // Save current inventory to memory cache before switching
                             if let Some(ref old_profile) = before_profile {
                                 if let Some(ref ctx) = self.context {
@@ -5713,6 +5730,46 @@ mod gui {
                         self.apply_filters();
                     }
 
+                    // Multi-account lookup
+                    let selected_profile = self.selected_profile.clone().unwrap_or_default();
+                    let other_profiles: Vec<(String, String, bool)> = self.config.profiles.iter()
+                        .filter(|p| p.profile_id != selected_profile)
+                        .map(|p| {
+                            let is_auth = self.profile_auth_infos.iter()
+                                .any(|a| a.profile_id == p.profile_id && a.auth_status == AuthStatus::Ok);
+                            (p.profile_id.clone(), p.display_name.clone(), is_auth)
+                        })
+                        .filter(|(_, _, is_auth)| *is_auth)
+                        .collect();
+                    if !other_profiles.is_empty() {
+                        let checked_count = self.multi_account_ids.len();
+                        let multi_label = if checked_count > 0 {
+                            format!("Multi-account ({checked_count})")
+                        } else {
+                            "Multi-account Lookup".to_string()
+                        };
+                        egui::CollapsingHeader::new(multi_label)
+                            .id_salt("multi_account_lookup")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                let mut changed = false;
+                                for (pid, display, _) in &other_profiles {
+                                    let mut checked = self.multi_account_ids.contains(pid);
+                                    if ui.checkbox(&mut checked, display).changed() {
+                                        if checked {
+                                            self.multi_account_ids.insert(pid.clone());
+                                        } else {
+                                            self.multi_account_ids.remove(pid);
+                                        }
+                                        changed = true;
+                                    }
+                                }
+                                if changed {
+                                    self.apply_filters();
+                                }
+                            });
+                    }
+
                     ui.separator();
                     ui.label("Selected Instance ID");
                     ui.text_edit_singleline(&mut self.selected_instance_id);
@@ -5728,6 +5785,12 @@ mod gui {
                     ui.horizontal(|ui| {
                         ui.text_edit_singleline(&mut self.save_filter_name);
                         if ui.button("Save Current").clicked() {
+                            // Use selected filter name if the text field is empty
+                            if self.save_filter_name.trim().is_empty()
+                                && !self.selected_saved_filter.is_empty()
+                            {
+                                self.save_filter_name = self.selected_saved_filter.clone();
+                            }
                             if let Err(err) = self.save_current_filter() {
                                 self.message = format!("error: {err}");
                                 self.log_error(self.message.clone());
@@ -5737,11 +5800,15 @@ mod gui {
                         }
                     });
 
-                    let scope_filters = self
+                    let mut scope_filters = self
                         .config
                         .saved_filters_for_scope("global", "global");
+                    scope_filters.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
 
                     let mut pending_delete_filter: Option<String> = None;
+                    let mut auto_apply = false;
+                    let mut show_favorites_only = false;
+                    const SHOW_FAVORITES_LABEL: &str = "Show Favorites";
                     egui::ComboBox::from_id_salt("saved_filter_combo")
                         .selected_text(if self.selected_saved_filter.is_empty() {
                             "(choose)".to_string()
@@ -5749,6 +5816,18 @@ mod gui {
                             self.selected_saved_filter.clone()
                         })
                         .show_ui(ui, |ui| {
+                            // Built-in "Show Favorites" option
+                            if ui
+                                .selectable_label(
+                                    self.selected_saved_filter == SHOW_FAVORITES_LABEL,
+                                    SHOW_FAVORITES_LABEL,
+                                )
+                                .clicked()
+                            {
+                                self.selected_saved_filter = SHOW_FAVORITES_LABEL.to_string();
+                                show_favorites_only = true;
+                            }
+                            ui.separator();
                             for saved in &scope_filters {
                                 ui.horizontal(|ui| {
                                     if ui
@@ -5759,6 +5838,7 @@ mod gui {
                                         .clicked()
                                     {
                                         self.selected_saved_filter = saved.name.clone();
+                                        auto_apply = true;
                                     }
                                     if ui
                                         .small_button("x")
@@ -5770,6 +5850,32 @@ mod gui {
                                 });
                             }
                         });
+
+                    // Handle "Show Favorites" built-in filter
+                    if show_favorites_only {
+                        let account = self.account_scope();
+                        let region = self.region_scope();
+                        let fav_ids = self.config.favorites_for_scope(&account, &region);
+                        self.search_rules = vec![SearchRuleInput::default()];
+                        self.selected_state_filter = STATE_FILTER_NONE.to_string();
+                        self.only_ssm = false;
+                        self.apply_filters();
+                        if !fav_ids.is_empty() {
+                            self.filtered.retain(|i| {
+                                fav_ids.iter().any(|fid| fid.eq_ignore_ascii_case(&i.instance_id))
+                            });
+                        }
+                        self.message = format!("Showing {} favorites", self.filtered.len());
+                        self.log_info(self.message.clone());
+                    }
+
+                    // Auto-apply when selecting a saved filter from the dropdown
+                    if auto_apply {
+                        if let Err(err) = self.apply_saved_filter() {
+                            self.message = format!("error: {err}");
+                            self.log_error(self.message.clone());
+                        }
+                    }
 
                     if let Some(name) = pending_delete_filter {
                         self.config.delete_saved_filter(
@@ -5785,23 +5891,16 @@ mod gui {
                         self.log_info(self.message.clone());
                     }
 
-                    ui.horizontal(|ui| {
-                        if ui.button("Apply Saved").clicked() {
-                            if let Err(err) = self.apply_saved_filter() {
-                                self.message = format!("error: {err}");
-                                self.log_error(self.message.clone());
-                            }
-                        }
-                        if ui.button("Clear Filters").clicked() {
-                            self.search_rules = vec![SearchRuleInput::default()];
-                            self.selected_state_filter = STATE_FILTER_NONE.to_string();
-                            self.only_ssm = false;
-                            self.selected_saved_filter.clear();
-                            self.apply_filters();
-                            self.message = "Filters cleared".to_string();
-                            self.log_info(self.message.clone());
-                        }
-                    });
+                    if ui.button("Clear Filters").clicked() {
+                        self.search_rules = vec![SearchRuleInput::default()];
+                        self.selected_state_filter = STATE_FILTER_NONE.to_string();
+                        self.only_ssm = false;
+                        self.multi_account_ids.clear();
+                        self.selected_saved_filter.clear();
+                        self.apply_filters();
+                        self.message = "Filters cleared".to_string();
+                        self.log_info(self.message.clone());
+                    }
 
                     if ui.button("Run Diagnostics").clicked() {
                         self.run_diagnostics();

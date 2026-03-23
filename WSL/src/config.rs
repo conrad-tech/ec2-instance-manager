@@ -163,6 +163,7 @@ impl AppConfig {
             .unwrap_or(false)
     }
 
+
     pub fn toggle_favorite(&mut self, account_id: &str, region: &str, instance_id: &str) -> bool {
         let key = Self::scope_key(account_id, region);
         let entry = self.favorites.entry(key).or_default();
@@ -535,12 +536,13 @@ impl AppConfig {
         for (scope, filters) in &self.saved_filters {
             for saved in filters {
                 lines.push(format!(
-                    "saved_filter.{scope}={}|{}|{}|{}|{}",
+                    "saved_filter.{scope}={}|{}|{}|{}|{}|{}",
                     saved.name,
                     saved.include_terms.join(","),
                     saved.exclude_terms.join(","),
                     saved.states.join(","),
-                    if saved.only_ssm_managed { "1" } else { "0" }
+                    if saved.only_ssm_managed { "1" } else { "0" },
+                    saved.pinned_ids.join(",")
                 ));
             }
         }
@@ -590,6 +592,16 @@ fn parse_saved_filter(raw: &str) -> Option<SavedFilter> {
         return None;
     }
 
+    if fields.len() >= 6 {
+        return Some(SavedFilter {
+            name: name.to_string(),
+            include_terms: split_csv(fields[1]),
+            exclude_terms: split_csv(fields[2]),
+            states: split_csv(fields[3]),
+            only_ssm_managed: matches!(fields[4].trim(), "1" | "true" | "TRUE"),
+            pinned_ids: split_csv(fields[5]),
+        });
+    }
     if fields.len() >= 5 {
         return Some(SavedFilter {
             name: name.to_string(),
@@ -597,6 +609,7 @@ fn parse_saved_filter(raw: &str) -> Option<SavedFilter> {
             exclude_terms: split_csv(fields[2]),
             states: split_csv(fields[3]),
             only_ssm_managed: matches!(fields[4].trim(), "1" | "true" | "TRUE"),
+            pinned_ids: Vec::new(),
         });
     }
 
@@ -615,6 +628,7 @@ fn parse_saved_filter(raw: &str) -> Option<SavedFilter> {
         exclude_terms: Vec::new(),
         states: split_csv(fields[2]),
         only_ssm_managed: matches!(fields[3].trim(), "1" | "true" | "TRUE"),
+        pinned_ids: Vec::new(),
     })
 }
 
@@ -719,6 +733,7 @@ mod tests {
                 exclude_terms: Vec::new(),
                 states: vec!["running".to_string()],
                 only_ssm_managed: true,
+                pinned_ids: Vec::new(),
             },
         );
 
@@ -747,6 +762,7 @@ mod tests {
                 exclude_terms: vec!["legacy".to_string()],
                 states: vec![],
                 only_ssm_managed: false,
+                pinned_ids: Vec::new(),
             },
         );
         cfg.upsert_port_forward_preset(PortForwardPreset {

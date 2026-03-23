@@ -182,6 +182,7 @@ fn run() -> Result<()> {
                 exclude_terms: options.exclude_terms.clone(),
                 states: options.states.clone(),
                 only_ssm_managed: options.only_ssm,
+                pinned_ids: Vec::new(),
             },
         );
         config.save()?;
@@ -828,6 +829,7 @@ fn run_interactive_shell(
                     exclude_terms: exclude_terms.clone(),
                     states: states.clone(),
                     only_ssm_managed: only_ssm,
+                    pinned_ids: Vec::new(),
                 },
             );
             config.save()?;

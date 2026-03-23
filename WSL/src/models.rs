@@ -174,6 +174,8 @@ pub struct SavedFilter {
     pub exclude_terms: Vec<String>,
     pub states: Vec<String>,
     pub only_ssm_managed: bool,
+    /// If non-empty, only show these specific instance IDs (favorited at save time)
+    pub pinned_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
