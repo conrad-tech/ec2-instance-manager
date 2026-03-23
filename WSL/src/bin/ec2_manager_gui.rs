@@ -4316,8 +4316,32 @@ mod gui {
                                 ui.add_space(indent);
                                 if entry.is_dir {
                                     let is_expanded = expanded.contains(&full_path);
-                                    let arrow = if is_expanded { "\u{25BC}" } else { "\u{25B6}" };
-                                    if ui.small_button(arrow).clicked() {
+                                    // Draw a triangle arrow (right=collapsed, down=expanded)
+                                    let btn_size = egui::vec2(16.0, 16.0);
+                                    let (rect, btn_response) = ui.allocate_exact_size(btn_size, egui::Sense::click());
+                                    {
+                                        let center = rect.center();
+                                        let painter = ui.painter();
+                                        let color = ui.visuals().text_color();
+                                        if is_expanded {
+                                            // Down arrow
+                                            let points = vec![
+                                                egui::pos2(center.x - 4.0, center.y - 2.0),
+                                                egui::pos2(center.x + 4.0, center.y - 2.0),
+                                                egui::pos2(center.x, center.y + 4.0),
+                                            ];
+                                            painter.add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
+                                        } else {
+                                            // Right arrow (play symbol)
+                                            let points = vec![
+                                                egui::pos2(center.x - 2.0, center.y - 4.0),
+                                                egui::pos2(center.x + 4.0, center.y),
+                                                egui::pos2(center.x - 2.0, center.y + 4.0),
+                                            ];
+                                            painter.add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
+                                        }
+                                    }
+                                    if btn_response.clicked() {
                                         actions.toggle_expand = Some(full_path.clone());
                                     }
                                     let dir_response = ui.selectable_label(false, &entry.name);
