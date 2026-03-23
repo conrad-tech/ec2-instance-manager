@@ -312,6 +312,10 @@ mod gui {
         bytes_received: u64,
         output_event_count: u64,
         scroll_offset: usize,
+        /// Whether we've sent stty to sync the remote shell's terminal size.
+        /// Through WSL+SSM, ConPTY resize signals don't propagate, so we
+        /// send stty once after the session has produced enough output.
+        stty_sent: bool,
     }
 
     /// Absolute terminal position: scroll-invariant coordinate.
@@ -1892,6 +1896,18 @@ mod gui {
                             let evt = session.output_event_count;
                             let total = session.bytes_received;
                             session.parser.process(&bytes);
+                            // Send stty once after enough output to ensure
+                            // the remote shell knows the correct terminal size.
+                            // ConPTY resize doesn't propagate through WSL+SSM.
+                            if !session.stty_sent && total > 100 {
+                                session.stty_sent = true;
+                                if let Some((rows, cols)) = session.last_size {
+                                    if let Ok(mut writer) = session.writer.lock() {
+                                        let cmd = format!("stty rows {rows} cols {cols}\n");
+                                        let _ = writer.write_all(cmd.as_bytes());
+                                    }
+                                }
+                            }
                             // Clear selection when new output arrives and user is at bottom
                             if session.scroll_offset == 0 {
                                 if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
@@ -5879,6 +5895,7 @@ mod gui {
             bytes_received: 0,
             output_event_count: 0,
             scroll_offset: 0,
+            stty_sent: false,
         };
 
         Ok((session, reader))
