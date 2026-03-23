@@ -374,6 +374,10 @@ mod gui {
         Listing,
         Downloading,
         Uploading,
+        /// Opening a file in the editor
+        Initializing,
+        /// Saving editor changes back to EC2
+        Updating,
         Error(String),
     }
 
@@ -2645,7 +2649,7 @@ mod gui {
             let Some(fb) = self.file_browsers.get_mut(&tab_id) else {
                 return;
             };
-            fb.status = FileOpStatus::Downloading;
+            fb.status = FileOpStatus::Initializing;
 
             let tab = self.connections.tabs().iter()
                 .find(|t| t.id == tab_id).cloned();
