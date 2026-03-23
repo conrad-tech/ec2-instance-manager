@@ -312,10 +312,6 @@ mod gui {
         bytes_received: u64,
         output_event_count: u64,
         scroll_offset: usize,
-        /// Whether we've sent stty to sync the remote shell's terminal size.
-        /// Through WSL+SSM, ConPTY resize signals don't propagate, so we
-        /// send stty once after the session has produced enough output.
-        stty_sent: bool,
     }
 
     /// Absolute terminal position: scroll-invariant coordinate.
@@ -1896,18 +1892,6 @@ mod gui {
                             let evt = session.output_event_count;
                             let total = session.bytes_received;
                             session.parser.process(&bytes);
-                            // Send stty once after enough output to ensure
-                            // the remote shell knows the correct terminal size.
-                            // ConPTY resize doesn't propagate through WSL+SSM.
-                            if !session.stty_sent && total > 100 {
-                                session.stty_sent = true;
-                                if let Some((rows, cols)) = session.last_size {
-                                    if let Ok(mut writer) = session.writer.lock() {
-                                        let cmd = format!("stty rows {rows} cols {cols}\n");
-                                        let _ = writer.write_all(cmd.as_bytes());
-                                    }
-                                }
-                            }
                             // Clear selection when new output arrives and user is at bottom
                             if session.scroll_offset == 0 {
                                 if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
@@ -5708,9 +5692,14 @@ mod gui {
                 // because the credential_process tool ('fed') only exists on
                 // Windows.  Keeping --profile would cause aws to read the
                 // credentials file and try to run 'fed' inside WSL.
+                // Also set stty before launching SSM — ConPTY resize signals
+                // don't propagate through the WSL+SSM chain, so fullscreen
+                // apps like vim won't know the correct terminal size.
                 let wsl_cmd = strip_profile_flag(command_line);
                 let wrapped = format!(
-                    "export HOME=\"${{HOME:-$(getent passwd $(id -u) | cut -d: -f6)}}\" 2>/dev/null; {}",
+                    "export HOME=\"${{HOME:-$(getent passwd $(id -u) | cut -d: -f6)}}\" 2>/dev/null; \
+                     stty rows ${{LINES:-24}} cols ${{COLUMNS:-120}} 2>/dev/null; \
+                     {}",
                     wsl_cmd
                 );
                 PtyCommand {
@@ -5851,16 +5840,19 @@ mod gui {
         // Inject actual credentials as env vars so WSL's aws CLI doesn't
         // need to run credential_process tools (like 'fed') that are
         // only installed on Windows.
+        // Also set COLUMNS/LINES so the remote shell gets the correct
+        // terminal size — ConPTY resize doesn't propagate through WSL+SSM.
+        cmd.env("COLUMNS", "120");
+        cmd.env("LINES", "24");
         if let Some(creds) = credentials::read_profile_credentials(&context.profile) {
             cmd.env("AWS_ACCESS_KEY_ID", &creds.access_key_id);
             cmd.env("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
             if let Some(ref token) = creds.session_token {
                 cmd.env("AWS_SESSION_TOKEN", token);
             }
-            // Pass credential env vars through to WSL
-            cmd.env("WSLENV", "AWS_ACCESS_KEY_ID/u:AWS_SECRET_ACCESS_KEY/u:AWS_SESSION_TOKEN/u:AWS_REGION/u:AWS_PROFILE/u");
+            cmd.env("WSLENV", "AWS_ACCESS_KEY_ID/u:AWS_SECRET_ACCESS_KEY/u:AWS_SESSION_TOKEN/u:AWS_REGION/u:AWS_PROFILE/u:COLUMNS/u:LINES/u");
         } else {
-            cmd.env("WSLENV", "AWS_PROFILE/u:AWS_REGION/u");
+            cmd.env("WSLENV", "AWS_PROFILE/u:AWS_REGION/u:COLUMNS/u:LINES/u");
         }
         cmd.env("TERM", "xterm-256color");
         #[cfg(target_os = "windows")]
@@ -5895,7 +5887,6 @@ mod gui {
             bytes_received: 0,
             output_event_count: 0,
             scroll_offset: 0,
-            stty_sent: false,
         };
 
         Ok((session, reader))
