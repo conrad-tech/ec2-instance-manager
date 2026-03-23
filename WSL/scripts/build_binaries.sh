@@ -131,9 +131,15 @@ copy_windows_runtime_dlls() {
 
 package_windows_zip() {
   local zip_path="${WINDOWS_DIST_DIR}/ec2_manager_windows_${APP_VERSION}.zip"
+  # Copy walkthrough into dist dir for packaging
+  if [[ -f "${ROOT_DIR}/WALKTHROUGH.md" ]]; then
+    cp "${ROOT_DIR}/WALKTHROUGH.md" "${WINDOWS_DIST_DIR}/WALKTHROUGH.md"
+  fi
+
   local candidates=(
     "${WINDOWS_DIST_DIR}/${CLI_APP_NAME}_${APP_VERSION}.exe"
     "${WINDOWS_DIST_DIR}/${GUI_APP_NAME}_${APP_VERSION}.exe"
+    "${WINDOWS_DIST_DIR}/WALKTHROUGH.md"
     "${WINDOWS_DIST_DIR}/libgcc_s_seh-1.dll"
     "${WINDOWS_DIST_DIR}/libstdc++-6.dll"
     "${WINDOWS_DIST_DIR}/libwinpthread-1.dll"

@@ -2721,8 +2721,8 @@ mod gui {
             };
             let remote_path = et.remote_path.clone();
             let content = et.content.clone();
-            et.status = "Saving...".to_string();
-            fb.status = FileOpStatus::Uploading;
+            et.status = "Updating...".to_string();
+            fb.status = FileOpStatus::Updating;
 
             let tab = self.connections.tabs().iter()
                 .find(|t| t.id == tab_id).cloned();
@@ -4400,6 +4400,7 @@ mod gui {
             let busy = matches!(
                 status,
                 FileOpStatus::Listing | FileOpStatus::Downloading | FileOpStatus::Uploading
+                | FileOpStatus::Initializing | FileOpStatus::Updating
             );
             ui.horizontal(|ui| {
                 let response = ui.add(
@@ -4455,6 +4456,18 @@ mod gui {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label("Uploading...");
+                    });
+                }
+                FileOpStatus::Initializing => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Initializing...");
+                    });
+                }
+                FileOpStatus::Updating => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Updating...");
                     });
                 }
                 FileOpStatus::Error(err) => {
