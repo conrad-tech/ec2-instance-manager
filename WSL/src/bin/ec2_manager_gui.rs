@@ -1673,14 +1673,20 @@ mod gui {
         }
 
         fn connect_selected(&mut self) -> Result<()> {
-            let context = self
-                .context
-                .clone()
-                .ok_or_else(|| AppError::Parse("Context not loaded".to_string()))?;
             let instance = self
                 .selected_instance()
                 .ok_or_else(|| AppError::NotFound("Select an instance first".to_string()))?
                 .clone();
+
+            // Find the correct context for this instance — it may belong to
+            // a multi-account profile, not the currently selected one.
+            let context = self.profile_inventory_cache.iter()
+                .find(|(_, (inv, _))| {
+                    inv.instances.iter().any(|i| i.instance_id == instance.instance_id)
+                })
+                .map(|(_, (_, ctx))| ctx.clone())
+                .or_else(|| self.context.clone())
+                .ok_or_else(|| AppError::Parse("Context not loaded".to_string()))?;
             self.log_info(format!(
                 "connect requested for {}",
                 instance.instance_id
@@ -5297,7 +5303,7 @@ mod gui {
                                     }
                                 }
                             });
-                            ui.menu_button("Account Tab Colors", |ui| {
+                            ui.menu_button("Environment Colors", |ui| {
                                 if ui
                                     .selectable_label(self.config.account_colors_enabled, "Enabled")
                                     .clicked()
@@ -5308,50 +5314,37 @@ mod gui {
                                 if self.config.account_colors_enabled {
                                     ui.separator();
 
-                                    // Show each profile with its color and an edit button
-                                    let mut profiles_sorted: Vec<(String, String)> = self
-                                        .config
-                                        .profiles
+                                    // Show unique environments with their colors
+                                    let mut seen = std::collections::HashSet::new();
+                                    let mut env_list: Vec<(String, String, egui::Color32)> = self
+                                        .account_color_map
                                         .iter()
-                                        .map(|p| (p.profile_id.clone(), p.display_name.clone()))
+                                        .filter_map(|(key, color)| {
+                                            let (pid, env) = key.split_once(':')?;
+                                            let env_lower = env.to_ascii_lowercase();
+                                            let dedup = format!("{}:{}", pid, env_lower);
+                                            if seen.insert(dedup) {
+                                                let label = self.config.profiles.iter()
+                                                    .find(|p| p.profile_id == pid)
+                                                    .map(|p| p.display_name.as_str())
+                                                    .unwrap_or(pid);
+                                                Some((format!("{env} ({label})"), key.clone(), *color))
+                                            } else {
+                                                None
+                                            }
+                                        })
                                         .collect();
-                                    profiles_sorted.sort_by(|a, b| {
-                                        let pa = self.config.profiles.iter().find(|p| p.profile_id == a.0);
-                                        let pb = self.config.profiles.iter().find(|p| p.profile_id == b.0);
-                                        profile_sort_key(pa, &a.0).cmp(&profile_sort_key(pb, &b.0))
-                                    });
+                                    env_list.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
 
-                                    let mut pick_profile: Option<String> = None;
-                                    for (pid, display_name) in &profiles_sorted {
+                                    for (display, _key, color) in &env_list {
                                         ui.horizontal(|ui| {
-                                            if let Some(color) = self.account_color_map.get(pid) {
-                                                let (rect, _) = ui.allocate_exact_size(
-                                                    egui::vec2(12.0, 12.0),
-                                                    egui::Sense::hover(),
-                                                );
-                                                ui.painter().circle_filled(rect.center(), 6.0, *color);
-                                            }
-                                            ui.label(display_name.as_str());
-                                            if ui.small_button("Edit").clicked() {
-                                                pick_profile = Some(pid.clone());
-                                            }
+                                            let (rect, _) = ui.allocate_exact_size(
+                                                egui::vec2(12.0, 12.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().circle_filled(rect.center(), 6.0, *color);
+                                            ui.label(display.as_str());
                                         });
-                                    }
-
-                                    if let Some(pid) = pick_profile {
-                                        let current_color = self
-                                            .account_color_map
-                                            .get(&pid)
-                                            .copied()
-                                            .unwrap_or(egui::Color32::from_rgb(128, 128, 128));
-                                        self.tab_color_picker_rgb = [
-                                            current_color.r() as f32 / 255.0,
-                                            current_color.g() as f32 / 255.0,
-                                            current_color.b() as f32 / 255.0,
-                                        ];
-                                        // Use a sentinel: store profile_id in a new field
-                                        self.color_picker_profile = Some(pid);
-                                        ui.close();
                                     }
 
                                     ui.separator();
