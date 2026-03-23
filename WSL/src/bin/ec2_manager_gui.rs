@@ -3743,7 +3743,10 @@ mod gui {
                                         .fill(terminal_panel_fill())
                                         .inner_margin(egui::Margin::same(0))
                                         .show(ui, |ui| {
-                                            let available = ui.available_size();
+                                            // Reserve space at the bottom so the
+                                            // cursor/last line is always visible
+                                            let full = ui.available_size();
+                                            let available = egui::vec2(full.x, (full.y - 20.0).max(50.0));
                                             ui.allocate_ui_with_layout(
                                                 available,
                                                 egui::Layout::top_down(egui::Align::Min),
@@ -3827,17 +3830,16 @@ mod gui {
                                 terminal_focus_id,
                                 egui::Sense::click(),
                             );
-                            // Use the label's rendered rect for mouse mapping.
-                            // Recompute cell size from current font metrics to handle
-                            // DPI changes after moving between monitors.
+                            // Derive cell size from the rendered rect and the actual
+                            // parser grid dimensions.  This avoids font-metric drift
+                            // after DPI/monitor changes — the mapping always matches
+                            // the rendered text exactly.
                             let term_rect = terminal_response.inner.rect;
-                            let (sel_cell_w, sel_cell_h) = ui.fonts_mut(|f| {
-                                (f.glyph_width(&font_id, 'W'), f.row_height(&font_id))
-                            });
-                            let sel_cell_w = if sel_cell_w >= 1.0 { sel_cell_w } else { font_id.size * 0.6 };
-                            let sel_cell_h = if sel_cell_h >= 1.0 { sel_cell_h } else { font_id.size * 1.2 };
-                            let sel_cols = (term_rect.width() / sel_cell_w).floor().max(1.0) as u16;
-                            let sel_rows = (term_rect.height() / sel_cell_h).floor().max(1.0) as u16;
+                            let (sel_rows, sel_cols) = self.pty_sessions.get(&tab_id)
+                                .and_then(|s| s.last_size)
+                                .unwrap_or((24, 120));
+                            let sel_cell_w = if sel_cols > 0 { term_rect.width() / sel_cols as f32 } else { 8.0 };
+                            let sel_cell_h = if sel_rows > 0 { term_rect.height() / sel_rows as f32 } else { 16.0 };
                             // Mouse drag selection using raw pointer state (absolute coords)
                             let pointer_pos = ui.input(|i| i.pointer.hover_pos());
                             let primary_down = ui.input(|i| i.pointer.primary_down());
@@ -6419,8 +6421,7 @@ mod gui {
         let cell_w = if cell_w >= 1.0 { cell_w } else { font_id.size * 0.6 };
         let cell_h = if cell_h >= 1.0 { cell_h } else { font_id.size * 1.2 };
         let cols = (available.x / cell_w).floor().max(1.0) as u16;
-        // Reserve one row at the bottom so the cursor/last line is always visible
-        let rows = ((available.y / cell_h).floor() - 1.0).max(1.0) as u16;
+        let rows = (available.y / cell_h).floor().max(1.0) as u16;
         (rows, cols, cell_w, cell_h)
     }
 
