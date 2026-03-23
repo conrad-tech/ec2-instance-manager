@@ -696,11 +696,24 @@ mod gui {
     }
 
     fn default_native_options() -> eframe::NativeOptions {
+        let config = AppConfig::load().unwrap_or_default();
+        let mut viewport = egui::ViewportBuilder::default()
+            .with_min_inner_size([GUI_MIN_WIDTH, GUI_MIN_HEIGHT]);
+
+        if let (Some(w), Some(h)) = (config.window_w, config.window_h) {
+            viewport = viewport.with_inner_size([w, h]);
+        } else {
+            viewport = viewport.with_inner_size([GUI_DEFAULT_WIDTH, GUI_DEFAULT_HEIGHT]);
+        }
+
+        if let (Some(x), Some(y)) = (config.window_x, config.window_y) {
+            viewport = viewport.with_position([x, y]);
+        }
+
+        viewport = viewport.with_maximized(config.window_maximized.unwrap_or(true));
+
         eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_inner_size([GUI_DEFAULT_WIDTH, GUI_DEFAULT_HEIGHT])
-                .with_min_inner_size([GUI_MIN_WIDTH, GUI_MIN_HEIGHT])
-                .with_maximized(true),
+            viewport,
             ..Default::default()
         }
     }
@@ -4638,7 +4651,20 @@ mod gui {
                 }
 
                 // Intercept window close when there are active connections.
+                // Save window position/size so it reopens on the same monitor
+                if let Some(pos) = ctx.input(|i| i.viewport().inner_rect) {
+                    self.config.window_x = Some(pos.left());
+                    self.config.window_y = Some(pos.top());
+                    self.config.window_w = Some(pos.width());
+                    self.config.window_h = Some(pos.height());
+                }
+                self.config.window_maximized = Some(
+                    ctx.input(|i| i.viewport().maximized).unwrap_or(false)
+                );
+
                 if ctx.input(|i| i.viewport().close_requested()) {
+                    // Persist window state before closing
+                    let _ = self.config.save();
                     let active = self.pty_sessions.len();
                     if active > 0 {
                         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);

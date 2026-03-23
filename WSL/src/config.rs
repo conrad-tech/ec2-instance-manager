@@ -29,6 +29,12 @@ pub struct AppConfig {
     pub ui_scale: Option<f32>,
     pub account_colors_enabled: bool,
     pub account_colors: BTreeMap<String, String>,
+    /// Saved window position/size from last close
+    pub window_x: Option<f32>,
+    pub window_y: Option<f32>,
+    pub window_w: Option<f32>,
+    pub window_h: Option<f32>,
+    pub window_maximized: Option<bool>,
 }
 
 impl Default for AppConfig {
@@ -61,6 +67,11 @@ impl Default for AppConfig {
             ui_scale: None,
             account_colors_enabled: true,
             account_colors: BTreeMap::new(),
+            window_x: None,
+            window_y: None,
+            window_w: None,
+            window_h: None,
+            window_maximized: None,
         }
     }
 }
@@ -412,6 +423,11 @@ impl AppConfig {
                         Some(value.to_string())
                     };
                 }
+                "window_x" => { if let Ok(v) = value.parse::<f32>() { cfg.window_x = Some(v); } }
+                "window_y" => { if let Ok(v) = value.parse::<f32>() { cfg.window_y = Some(v); } }
+                "window_w" => { if let Ok(v) = value.parse::<f32>() { cfg.window_w = Some(v); } }
+                "window_h" => { if let Ok(v) = value.parse::<f32>() { cfg.window_h = Some(v); } }
+                "window_maximized" => { cfg.window_maximized = Some(matches!(value, "1" | "true" | "TRUE")); }
                 _ => {}
             }
         }
@@ -459,6 +475,12 @@ impl AppConfig {
         if let Some(val) = self.ui_scale {
             lines.push(format!("ui_scale={val}"));
         }
+
+        if let Some(v) = self.window_x { lines.push(format!("window_x={v}")); }
+        if let Some(v) = self.window_y { lines.push(format!("window_y={v}")); }
+        if let Some(v) = self.window_w { lines.push(format!("window_w={v}")); }
+        if let Some(v) = self.window_h { lines.push(format!("window_h={v}")); }
+        if let Some(v) = self.window_maximized { lines.push(format!("window_maximized={}", if v { "true" } else { "false" })); }
 
         for profile in &self.profiles {
             lines.push(format!(

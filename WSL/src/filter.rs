@@ -340,6 +340,7 @@ fn searchable_text(instance: &Instance) -> String {
     append(&mut out, &instance.instance_id);
     append_opt(&mut out, instance.name.as_deref());
     append_opt(&mut out, instance.private_ip.as_deref());
+    append_opt(&mut out, instance.image_id.as_deref());
 
     for (k, v) in &instance.tags {
         append(&mut out, k);
