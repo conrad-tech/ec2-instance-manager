@@ -84,6 +84,23 @@
 
 ---
 
+## Instance Details
+
+- **Right-click** any instance in the inventory and select **See Details**
+- Opens the **Details** tab with comprehensive instance information:
+  - Instance ID, Name, State, Instance Type, AMI ID, Private IP
+  - Availability Zone, Environment (from `MMODAL_ENV` tag)
+  - IAM Role (fetched on-demand from the instance profile)
+  - Auto Scaling Group, SSM status, Launch Time
+- **Volumes** section shows attached EBS volumes with:
+  - Volume ID, Size, Type, Device, State, and Attach Time
+  - Fetched automatically when Details opens
+- **Tags** section lists all instance tags in alphabetical order
+- **Copy All** button copies all details as formatted text to clipboard
+- Click **Close** to return to the Inventory page
+
+---
+
 ## Connecting to an EC2
 
 1. Select an instance from the list (click on it or type its Instance ID)
@@ -159,7 +176,6 @@ The file browser is the left sidebar in the Connections panel.
 - Filter by level: ERROR, WARN, INFO, DEBUG, TRACE
 - **Copy All** button copies all visible log lines to clipboard
 - **Highlight text** in the log and use **Ctrl+C** to copy specific lines
-- Use `--debug` flag when launching for verbose logging
 
 ---
 

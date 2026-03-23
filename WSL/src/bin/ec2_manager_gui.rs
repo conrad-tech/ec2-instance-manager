@@ -286,7 +286,10 @@ mod gui {
         Output { tab_id: u64, bytes: Vec<u8> },
         Exited { tab_id: u64, code: i32 },
         Error { tab_id: u64, error: String },
-        VolumeResult { volumes: std::result::Result<Vec<VolumeInfo>, String> },
+        VolumeResult {
+            volumes: std::result::Result<Vec<VolumeInfo>, String>,
+            iam_role: Option<String>,
+        },
     }
 
     enum RefreshEvent {
@@ -791,6 +794,8 @@ mod gui {
         detail_volumes: Vec<VolumeInfo>,
         detail_volumes_loading: bool,
         detail_volumes_error: Option<String>,
+        /// IAM role fetched for the Details tab
+        detail_iam_role: Option<String>,
         local_port: u16,
         remote_port: u16,
 
@@ -935,6 +940,7 @@ mod gui {
                 detail_volumes: Vec::new(),
                 detail_volumes_loading: false,
                 detail_volumes_error: None,
+                detail_iam_role: None,
                 local_port: 2222,
                 remote_port: 22,
                 message: String::new(),
@@ -2086,8 +2092,9 @@ mod gui {
                             .append_line(tab_id, format!("[exit] code={code}"));
                         self.connections.set_running(tab_id, false);
                     }
-                    ProcEvent::VolumeResult { volumes } => {
+                    ProcEvent::VolumeResult { volumes, iam_role } => {
                         self.detail_volumes_loading = false;
+                        self.detail_iam_role = iam_role;
                         match volumes {
                             Ok(vols) => {
                                 self.log_info(format!("fetched {} volumes", vols.len()));
@@ -3598,6 +3605,7 @@ mod gui {
                                     self.detail_volumes.clear();
                                     self.detail_volumes_error = None;
                                     self.detail_volumes_loading = true;
+                                    self.detail_iam_role = None;
                                     self.main_tab = MainTab::Details;
                                     // Fetch volumes in background
                                     let context = self.profile_inventory_cache.iter()
@@ -3608,7 +3616,8 @@ mod gui {
                                         let tx = self.proc_tx.clone();
                                         std::thread::spawn(move || {
                                             let result = fetch_volumes(&ctx.profile, &ctx.region, &iid);
-                                            let _ = tx.send(ProcEvent::VolumeResult { volumes: result });
+                                            let iam = fetch_iam_role(&ctx.profile, &ctx.region, &iid);
+                                            let _ = tx.send(ProcEvent::VolumeResult { volumes: result, iam_role: iam });
                                         });
                                     }
                                     ui.close();
@@ -4979,10 +4988,8 @@ mod gui {
                     text.push_str(&format!("AMI ID: {}\n", instance.image_id.as_deref().unwrap_or("-")));
                     text.push_str(&format!("Private IP: {}\n", instance.private_ip.as_deref().unwrap_or("-")));
                     text.push_str(&format!("AZ: {}\n", instance.az.as_deref().unwrap_or("-")));
-                    text.push_str(&format!("Environment: {}\n", instance.env.as_deref().unwrap_or("-")));
-                    text.push_str(&format!("App/Service: {}\n", instance.app_service.as_deref().unwrap_or("-")));
-                    text.push_str(&format!("Role: {}\n", instance.role.as_deref().unwrap_or("-")));
-                    text.push_str(&format!("Team/Owner: {}\n", instance.team_owner.as_deref().unwrap_or("-")));
+                    text.push_str(&format!("Environment: {}\n", instance_env(&instance).unwrap_or_else(|| "-".to_string())));
+                    text.push_str(&format!("IAM Role: {}\n", self.detail_iam_role.as_deref().unwrap_or("-")));
                     text.push_str(&format!("ASG: {}\n", instance.asg.as_deref().unwrap_or("-")));
                     text.push_str(&format!("SSM Managed: {}\n", if instance.ssm_managed { "Yes" } else { "No" }));
                     text.push_str(&format!("Launch Time: {}\n", instance.launch_time.as_deref().unwrap_or("-")));
@@ -5030,10 +5037,10 @@ mod gui {
                         row(ui, "AMI ID", instance.image_id.as_deref().unwrap_or("-"));
                         row(ui, "Private IP", instance.private_ip.as_deref().unwrap_or("-"));
                         row(ui, "Availability Zone", instance.az.as_deref().unwrap_or("-"));
-                        row(ui, "Environment", instance.env.as_deref().unwrap_or("-"));
-                        row(ui, "App/Service", instance.app_service.as_deref().unwrap_or("-"));
-                        row(ui, "Role", instance.role.as_deref().unwrap_or("-"));
-                        row(ui, "Team/Owner", instance.team_owner.as_deref().unwrap_or("-"));
+                        row(ui, "Environment", &instance_env(&instance).unwrap_or_else(|| "-".to_string()));
+                        row(ui, "IAM Role", self.detail_iam_role.as_deref().unwrap_or(
+                            if self.detail_volumes_loading { "loading..." } else { "-" }
+                        ));
                         row(ui, "Auto Scaling Group", instance.asg.as_deref().unwrap_or("-"));
                         row(ui, "SSM Managed", if instance.ssm_managed { "Yes" } else { "No" });
                         row(ui, "SSM Ping", instance.ssm_ping.as_deref().unwrap_or("-"));
@@ -7772,6 +7779,29 @@ mod gui {
             });
         }
         Ok(result)
+    }
+
+    fn fetch_iam_role(profile: &str, region: &str, instance_id: &str) -> Option<String> {
+        let output = aws_command()
+            .args([
+                "ec2", "describe-instances",
+                "--profile", profile,
+                "--region", region,
+                "--instance-ids", instance_id,
+                "--query", "Reservations[0].Instances[0].IamInstanceProfile.Arn",
+                "--output", "text",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let arn = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if arn.is_empty() || arn == "None" {
+            return None;
+        }
+        // Extract role name from ARN: arn:aws:iam::123:instance-profile/MyRole -> MyRole
+        arn.rsplit('/').next().map(|s| s.to_string())
     }
 
     fn aws_command() -> std::process::Command {
