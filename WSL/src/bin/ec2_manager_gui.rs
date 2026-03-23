@@ -3560,7 +3560,7 @@ mod gui {
                                         let key = format!("{profile_id}:{env}");
                                         if let Some(env_color) = self.account_color_map.get(&key) {
                                             let tint = egui::Color32::from_rgba_unmultiplied(
-                                                env_color.r(), env_color.g(), env_color.b(), 25,
+                                                env_color.r(), env_color.g(), env_color.b(), 60,
                                             );
                                             ui.painter().rect_filled(row_rect, 0.0, tint);
                                         }
@@ -3635,33 +3635,44 @@ mod gui {
             // Environment color legend — always show on connections page
             if self.config.account_colors_enabled && !self.account_color_map.is_empty() {
                 let mut seen_envs = std::collections::HashSet::new();
-                let mut env_entries: Vec<(String, egui::Color32)> = self
+                // Collect (profile_id, env, color) then sort by account order + alpha
+                let mut env_entries: Vec<(String, String, egui::Color32)> = self
                     .account_color_map
                     .iter()
                     .filter_map(|(key, color)| {
-                        let (_, env) = key.split_once(':')?;
+                        let (pid, env) = key.split_once(':')?;
                         let env_lower = env.to_ascii_lowercase();
                         if self.hidden_envs.contains(&env_lower) {
                             return None;
                         }
-                        if seen_envs.insert(env_lower) {
-                            Some((env.to_string(), *color))
+                        let dedup_key = format!("{}:{}", pid, env_lower);
+                        if seen_envs.insert(dedup_key) {
+                            Some((pid.to_string(), env.to_string(), *color))
                         } else {
                             None
                         }
                     })
                     .collect();
-                env_entries.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+                // Sort by account sort_order first, then alphabetically by env within each account
+                env_entries.sort_by(|a, b| {
+                    let pa = self.config.profiles.iter().find(|p| p.profile_id == a.0);
+                    let pb = self.config.profiles.iter().find(|p| p.profile_id == b.0);
+                    let ord_a = pa.and_then(|p| p.sort_order).unwrap_or(u32::MAX);
+                    let ord_b = pb.and_then(|p| p.sort_order).unwrap_or(u32::MAX);
+                    ord_a.cmp(&ord_b)
+                        .then_with(|| a.0.cmp(&b.0))
+                        .then_with(|| a.1.to_ascii_lowercase().cmp(&b.1.to_ascii_lowercase()))
+                });
 
                 if !env_entries.is_empty() {
                     ui.horizontal_wrapped(|ui| {
-                        for (env, color) in &env_entries {
+                        for (_pid, env, color) in &env_entries {
                             let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(8.0, 8.0),
+                                egui::vec2(10.0, 10.0),
                                 egui::Sense::hover(),
                             );
-                            ui.painter().circle_filled(rect.center(), 4.0, *color);
-                            ui.small(egui::RichText::new(env).weak());
+                            ui.painter().circle_filled(rect.center(), 5.0, *color);
+                            ui.label(env);
                         }
                     });
                     ui.separator();
@@ -6637,22 +6648,40 @@ mod gui {
             .map(|v| v.trim().to_string())
     }
 
-    /// Generate a lighter shade of a color (for the second environment variant).
-    fn lighter_shade(c: egui::Color32) -> egui::Color32 {
-        egui::Color32::from_rgb(
-            (c.r() as u16 + 60).min(255) as u8,
-            (c.g() as u16 + 60).min(255) as u8,
-            (c.b() as u16 + 60).min(255) as u8,
-        )
-    }
-
-    /// Generate a darker shade of a color (for the first environment variant).
-    fn darker_shade(c: egui::Color32) -> egui::Color32 {
-        egui::Color32::from_rgb(
-            (c.r() as i16 - 50).max(20) as u8,
-            (c.g() as i16 - 50).max(20) as u8,
-            (c.b() as i16 - 50).max(20) as u8,
-        )
+    /// Generate distinct shades from a base color for multiple environments.
+    /// Each shade is visually separated by varying brightness significantly.
+    /// Generate distinct shades from a base color for multiple environments.
+    /// Uses hue rotation + brightness shifts so shades are obviously different.
+    fn generate_env_shades(base: egui::Color32, count: usize) -> Vec<egui::Color32> {
+        if count == 0 {
+            return Vec::new();
+        }
+        if count == 1 {
+            return vec![base];
+        }
+        let r = base.r() as f32;
+        let g = base.g() as f32;
+        let b = base.b() as f32;
+        let mut shades = Vec::with_capacity(count);
+        for i in 0..count {
+            let t = i as f32 / (count as f32 - 1.0); // 0.0 to 1.0
+            // Alternate between darkening and shifting hue components
+            // so each shade looks distinctly different
+            let (nr, ng, nb) = match i % 4 {
+                0 => (r * 0.5, g * 0.9, b * 0.5),           // dark, green-shifted
+                1 => (r * 0.9 + 60.0, g * 0.5, b * 0.9),    // bright, red-shifted
+                2 => (r * 0.5, g * 0.5, b * 0.9 + 60.0),    // dark, blue-shifted
+                _ => (r * 0.9 + 40.0, g * 0.9 + 40.0, b * 0.5), // bright, yellow-shifted
+            };
+            // Also apply a brightness offset based on position
+            let brightness = (t - 0.5) * 80.0;
+            shades.push(egui::Color32::from_rgb(
+                (nr + brightness).clamp(20.0, 245.0) as u8,
+                (ng + brightness).clamp(20.0, 245.0) as u8,
+                (nb + brightness).clamp(20.0, 245.0) as u8,
+            ));
+        }
+        shades
     }
 
     fn build_account_color_map(
@@ -6714,16 +6743,11 @@ mod gui {
             envs.sort();
             envs.dedup();
 
-            // Assign dark/light shades to environments
-            // Spread shades so they're visually distinct
-            let dark = darker_shade(base_color);
-            let light = lighter_shade(base_color);
-            let shades = [dark, base_color, light];
-
+            // Generate distinct shades for each environment
+            let shades = generate_env_shades(base_color, envs.len());
             for (env_idx, env) in envs.iter().enumerate() {
-                let shade = shades[env_idx % shades.len()];
                 let key = format!("{}:{}", profile_id, env);
-                map.insert(key, shade);
+                map.insert(key, shades[env_idx]);
             }
         }
 
