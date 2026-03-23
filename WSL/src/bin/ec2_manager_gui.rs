@@ -4152,7 +4152,9 @@ mod gui {
             // (terminal had hover/focus last frame, now the file browser is hovered)
             let fb_hovered = ui.rect_contains_pointer(ui.max_rect());
             let auto_refresh = self.file_browsers.get_mut(&tab_id).and_then(|fb| {
-                if fb.terminal_had_focus && fb_hovered && fb.initialized {
+                let already_busy = matches!(fb.status, FileOpStatus::Listing)
+                    || !fb.fetching_dirs.is_empty();
+                if fb.terminal_had_focus && fb_hovered && fb.initialized && !already_busy {
                     fb.terminal_had_focus = false;
                     let path = fb.current_path.clone();
                     let expanded: Vec<String> = fb.expanded_dirs.iter().cloned().collect();
