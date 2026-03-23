@@ -3656,41 +3656,26 @@ mod gui {
                         .then_with(|| a.1.to_ascii_lowercase().cmp(&b.1.to_ascii_lowercase()))
                 });
 
-                // Log legend entries for debugging duplicates — show instance IDs per env
-                if !env_entries.is_empty() && self.debug_mode {
-                    // Count how many times each env name appears
-                    let mut env_counts: HashMap<String, Vec<String>> = HashMap::new();
-                    for (pid, env, _) in &env_entries {
-                        env_counts.entry(env.to_ascii_lowercase()).or_default().push(pid.clone());
-                    }
-                    for (pid, env, _) in &env_entries {
-                        let env_lower = env.to_ascii_lowercase();
-                        let is_dup = env_counts.get(&env_lower).map(|v| v.len() > 1).unwrap_or(false);
-                        if is_dup {
+                // Log legend entries once to debug duplicates (fires after Refresh)
+                {
+                    static LAST_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                    let current = env_entries.len();
+                    let prev = LAST_COUNT.swap(current, std::sync::atomic::Ordering::Relaxed);
+                    if self.debug_mode && current > 0 && current != prev {
+                        for (pid, env, color) in &env_entries {
                             let label = self.config.profiles.iter()
                                 .find(|p| p.profile_id == *pid)
                                 .map(|p| p.display_name.as_str())
                                 .unwrap_or("?");
-                            // Find instance IDs with this env in this account
-                            let instances: Vec<String> = if self.selected_profile.as_deref() == Some(pid.as_str()) {
-                                self.inventory.instances.iter()
-                                    .filter(|i| instance_env(i).map(|e| e.to_ascii_lowercase()) == Some(env_lower.clone()))
-                                    .map(|i| i.instance_id.clone())
-                                    .take(5)
-                                    .collect()
-                            } else if let Some((inv, _)) = self.profile_inventory_cache.get(pid) {
-                                inv.instances.iter()
-                                    .filter(|i| instance_env(i).map(|e| e.to_ascii_lowercase()) == Some(env_lower.clone()))
-                                    .map(|i| i.instance_id.clone())
-                                    .take(5)
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-                            self.log_debug(format!(
-                                "duplicate legend env={env} profile={pid} label={label} instances={instances:?}"
+                            self.log_info(format!(
+                                "legend: env={env} profile={pid} label={label} color=({},{},{})",
+                                color.r(), color.g(), color.b()
                             ));
                         }
+                        let map_keys: Vec<&String> = self.account_color_map.keys()
+                            .filter(|k| k.contains(':'))
+                            .collect();
+                        self.log_info(format!("color_map env keys: {map_keys:?}"));
                     }
                 }
 
