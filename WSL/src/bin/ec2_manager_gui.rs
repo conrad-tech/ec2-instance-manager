@@ -1384,14 +1384,24 @@ mod gui {
             let mut all_instances = self.inventory.instances.clone();
 
             // Add instances from checked multi-account profiles
-            for extra_pid in &self.multi_account_ids {
+            let multi_ids: Vec<String> = self.multi_account_ids.iter().cloned().collect();
+            let cache_keys: Vec<String> = self.profile_inventory_cache.keys().cloned().collect();
+            for extra_pid in &multi_ids {
                 if let Some((inv, _)) = self.profile_inventory_cache.get(extra_pid) {
+                    let before = all_instances.len();
                     for inst in &inv.instances {
-                        // Avoid duplicates (same instance_id)
                         if !all_instances.iter().any(|i| i.instance_id == inst.instance_id) {
                             all_instances.push(inst.clone());
                         }
                     }
+                    let added = all_instances.len() - before;
+                    self.log_debug(format!(
+                        "multi-account: added {added} instances from profile={extra_pid}"
+                    ));
+                } else {
+                    self.log_debug(format!(
+                        "multi-account: no cache for profile={extra_pid} (cache keys: {cache_keys:?})"
+                    ));
                 }
             }
 
