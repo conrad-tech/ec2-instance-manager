@@ -6516,10 +6516,20 @@ mod gui {
                 // don't propagate through the WSL+SSM chain, so fullscreen
                 // apps like vim won't know the correct terminal size.
                 let wsl_cmd = strip_profile_flag(command_line);
+                // Use `script -qfc` to allocate a real PTY inside WSL.
+                // Without this, long-running commands like `terraform apply`
+                // can have their output block-buffered by ConPTY, causing
+                // progress updates to appear delayed/batched instead of
+                // streaming in real time.
                 let wrapped = format!(
                     "export HOME=\"${{HOME:-$(getent passwd $(id -u) | cut -d: -f6)}}\" 2>/dev/null; \
                      stty rows ${{LINES:-24}} cols ${{COLUMNS:-120}} 2>/dev/null; \
-                     {}",
+                     if command -v script >/dev/null 2>&1; then \
+                       exec script -qfc '{}' /dev/null; \
+                     else \
+                       exec {}; \
+                     fi",
+                    wsl_cmd.replace('\'', "'\\''"),
                     wsl_cmd
                 );
                 PtyCommand {
@@ -6664,15 +6674,18 @@ mod gui {
         // terminal size — ConPTY resize doesn't propagate through WSL+SSM.
         cmd.env("COLUMNS", "120");
         cmd.env("LINES", "24");
+        // Prevent Python-based session-manager-plugin from buffering stdout,
+        // which can cause commands like `terraform apply` to appear hung.
+        cmd.env("PYTHONUNBUFFERED", "1");
         if let Some(creds) = credentials::read_profile_credentials(&context.profile) {
             cmd.env("AWS_ACCESS_KEY_ID", &creds.access_key_id);
             cmd.env("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
             if let Some(ref token) = creds.session_token {
                 cmd.env("AWS_SESSION_TOKEN", token);
             }
-            cmd.env("WSLENV", "AWS_ACCESS_KEY_ID/u:AWS_SECRET_ACCESS_KEY/u:AWS_SESSION_TOKEN/u:AWS_REGION/u:AWS_PROFILE/u:COLUMNS/u:LINES/u");
+            cmd.env("WSLENV", "AWS_ACCESS_KEY_ID/u:AWS_SECRET_ACCESS_KEY/u:AWS_SESSION_TOKEN/u:AWS_REGION/u:AWS_PROFILE/u:COLUMNS/u:LINES/u:PYTHONUNBUFFERED/u");
         } else {
-            cmd.env("WSLENV", "AWS_PROFILE/u:AWS_REGION/u:COLUMNS/u:LINES/u");
+            cmd.env("WSLENV", "AWS_PROFILE/u:AWS_REGION/u:COLUMNS/u:LINES/u:PYTHONUNBUFFERED/u");
         }
         cmd.env("TERM", "xterm-256color");
         #[cfg(target_os = "windows")]

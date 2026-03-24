@@ -1,2 +1,5 @@
 /target
 WSL/target/*
+dist/*
+WSL/dist/*
+
