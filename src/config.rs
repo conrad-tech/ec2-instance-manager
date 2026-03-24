@@ -29,6 +29,7 @@ pub struct AppConfig {
     pub ui_scale: Option<f32>,
     pub account_colors_enabled: bool,
     pub account_colors: BTreeMap<String, String>,
+    pub reset_filter_on_profile_switch: bool,
 }
 
 impl Default for AppConfig {
@@ -61,6 +62,7 @@ impl Default for AppConfig {
             ui_scale: None,
             account_colors_enabled: true,
             account_colors: BTreeMap::new(),
+            reset_filter_on_profile_switch: true,
         }
     }
 }
@@ -405,6 +407,9 @@ impl AppConfig {
                 "account_colors_enabled" => {
                     cfg.account_colors_enabled = !matches!(value, "0" | "false" | "FALSE");
                 }
+                "reset_filter_on_profile_switch" => {
+                    cfg.reset_filter_on_profile_switch = !matches!(value, "0" | "false" | "FALSE");
+                }
                 "last_selected_profile" => {
                     cfg.last_selected_profile = if value.is_empty() {
                         None
@@ -485,6 +490,10 @@ impl AppConfig {
 
         if !self.account_colors_enabled {
             lines.push("account_colors_enabled=0".to_string());
+        }
+
+        if !self.reset_filter_on_profile_switch {
+            lines.push("reset_filter_on_profile_switch=0".to_string());
         }
 
         for (profile, color) in &self.account_colors {

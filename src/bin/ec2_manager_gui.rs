@@ -305,7 +305,9 @@ mod gui {
     struct PtySession {
         child: Box<dyn portable_pty::Child + Send>,
         master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-        writer: Arc<Mutex<Box<dyn Write + Send>>>,
+        /// Non-blocking write channel — a background thread drains this and
+        /// calls `write_all` + `flush` so the UI never blocks on PTY writes.
+        write_tx: std::sync::mpsc::Sender<Vec<u8>>,
         parser: vt100::Parser,
         last_size: Option<(u16, u16)>,
         bytes_received: u64,
@@ -890,6 +892,15 @@ mod gui {
                 app.log_info("no selected profile, skipping disk cache");
             }
 
+            // Pre-warm the memory cache from disk for ALL profiles so it's
+            // available immediately when auth becomes OK (without re-reading disk).
+            let all_profile_ids: Vec<String> = app.config.profiles.iter()
+                .map(|p| p.profile_id.clone())
+                .collect();
+            for pid in &all_profile_ids {
+                app.prewarm_cache_for_profile(pid);
+            }
+
             app.refresh_all_authenticated(true);
             app
         }
@@ -938,10 +949,24 @@ mod gui {
                 return;
             }
             self.last_credentials_poll_at = Instant::now();
-            let current_mtime = credentials::credentials_mtime();
-            if current_mtime != self.last_credentials_mtime {
-                self.last_credentials_mtime = current_mtime;
 
+            // Check if any currently-OK profile has crossed its expiration time.
+            let now_epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let any_expired = self.profile_auth_infos.iter().any(|a| {
+                a.auth_status == AuthStatus::Ok
+                    && a.expires_at.map_or(false, |exp| exp <= now_epoch)
+            });
+
+            let current_mtime = credentials::credentials_mtime();
+            let file_changed = current_mtime != self.last_credentials_mtime;
+            if file_changed {
+                self.last_credentials_mtime = current_mtime;
+            }
+
+            if file_changed || any_expired {
                 // Remember which profiles were NOT authenticated before
                 let previously_unauthed: Vec<String> = self
                     .config
@@ -955,9 +980,48 @@ mod gui {
                     .map(|p| p.profile_id.clone())
                     .collect();
 
+                // Remember which profiles WERE authenticated before (for expiry detection)
+                let previously_authed: Vec<String> = self
+                    .config
+                    .profiles
+                    .iter()
+                    .filter(|p| {
+                        self.profile_auth_infos.iter().any(|a| {
+                            a.profile_id == p.profile_id && a.auth_status == AuthStatus::Ok
+                        })
+                    })
+                    .map(|p| p.profile_id.clone())
+                    .collect();
+
                 self.profile_auth_infos =
                     credentials::check_all_profiles_auth(&self.config.profiles);
-                self.log_debug("credentials file changed; refreshed profile auth status");
+
+                if file_changed {
+                    self.log_debug("credentials file changed; refreshed profile auth status");
+                }
+
+                // Log profiles whose auth just expired
+                for pid in &previously_authed {
+                    let is_now_expired = self.profile_auth_infos.iter().any(|a| {
+                        a.profile_id == *pid && a.auth_status != AuthStatus::Ok
+                    });
+                    if is_now_expired {
+                        self.log_warn(format!(
+                            "credentials expired for profile={pid}"
+                        ));
+                        // If the expired profile is currently selected, clear the display
+                        if self.selected_profile.as_deref() == Some(pid) {
+                            self.inventory = Inventory {
+                                instances: Vec::new(),
+                                fetched_at: std::time::SystemTime::now(),
+                            };
+                            self.filtered.clear();
+                            self.message = format!(
+                                "Credentials expired. Refresh credentials and retry."
+                            );
+                        }
+                    }
+                }
 
                 // Refresh any profiles that just became authenticated
                 for pid in &previously_unauthed {
@@ -1053,6 +1117,43 @@ mod gui {
                 &extra_ids,
                 &self.config.account_colors,
             );
+        }
+
+        /// Pre-warm the in-memory cache from disk for a profile without updating
+        /// the active display (inventory/filtered/context/message).
+        fn prewarm_cache_for_profile(&mut self, profile_id: &str) {
+            if self.profile_inventory_cache.contains_key(profile_id) {
+                return; // already cached
+            }
+            let profile_cfg = self.config.profiles.iter()
+                .find(|p| p.profile_id == profile_id);
+            let region = profile_cfg
+                .and_then(|p| p.region.clone())
+                .or_else(|| self.config.default_region.clone())
+                .unwrap_or_else(|| "us-east-1".to_string());
+            let account_id = profile_cfg
+                .map(|p| p.account_id.clone())
+                .filter(|s| !s.is_empty());
+
+            if let Some(cached) = ec2_manager::inventory::load_disk_cache(profile_id, &region) {
+                let count = cached.instances.len();
+                let resolved_profile = ec2_manager::credentials::find_profile_by_account_id(profile_id)
+                    .unwrap_or_else(|| profile_id.to_string());
+                let ctx = AwsContext {
+                    mode: self.options.mode.clone(),
+                    profile: resolved_profile,
+                    account_id,
+                    arn: None,
+                    user_id: None,
+                    region: region.clone(),
+                    auth_status: AuthStatus::Ok,
+                };
+                self.profile_inventory_cache
+                    .insert(profile_id.to_string(), (cached, ctx));
+                self.log_info(format!(
+                    "prewarmed memory cache for profile={profile_id}: {count} instances"
+                ));
+            }
         }
 
         /// Load cached inventory for a profile (in-memory first, then disk).
@@ -2040,9 +2141,9 @@ mod gui {
             if let Some(session) = self.pty_sessions.remove(&tab_id) {
                 self.log_debug(format!("tab={tab_id} closing PTY session, spawning cleanup thread"));
                 std::thread::spawn(move || {
-                    // Drop master/writer first to unblock reader and signal EOF to child
+                    // Drop master/write_tx first to unblock reader and signal EOF to child
                     drop(session.master);
-                    drop(session.writer);
+                    drop(session.write_tx);
                     drop(session.parser);
 
                     let mut child = session.child;
@@ -2435,12 +2536,7 @@ mod gui {
                 return;
             };
             session.scroll_offset = 0;
-            let Ok(mut stdin) = session.writer.lock() else {
-                return;
-            };
-            let write_result = stdin.write_all(payload).and_then(|()| stdin.flush());
-            drop(stdin);
-            if let Err(err) = write_result {
+            if let Err(err) = session.write_tx.send(payload.to_vec()) {
                 self.log_error(format!("tab={tab_id} write error: {err}"));
             }
         }
@@ -4188,6 +4284,17 @@ mod gui {
                                     }
                                 }
                             });
+                            if ui
+                                .selectable_label(
+                                    self.config.reset_filter_on_profile_switch,
+                                    "Reset Filter on Profile Switch",
+                                )
+                                .clicked()
+                            {
+                                self.config.reset_filter_on_profile_switch =
+                                    !self.config.reset_filter_on_profile_switch;
+                                let _ = self.config.save();
+                            }
                         });
                     });
 
@@ -4406,6 +4513,12 @@ mod gui {
                                     "profile selection changed to {}",
                                     self.selected_profile.as_deref().unwrap_or("(none)")
                                 ));
+                            }
+
+                            // Reset filters and saved-filter dropdown on profile switch
+                            if self.config.reset_filter_on_profile_switch {
+                                self.search_rules = vec![SearchRuleInput::default()];
+                                self.selected_saved_filter.clear();
                             }
 
                             // Load cached inventory for the new profile immediately
@@ -4976,10 +5089,26 @@ mod gui {
             .take_writer()
             .map_err(|err| AppError::Parse(format!("Failed to create PTY writer: {err}")))?;
 
+        // Spawn a background writer thread so PTY writes never block the UI.
+        let (write_tx, write_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        {
+            let mut writer = writer;
+            std::thread::Builder::new()
+                .name(format!("pty-writer-{tab_id}"))
+                .spawn(move || {
+                    while let Ok(data) = write_rx.recv() {
+                        if writer.write_all(&data).and_then(|()| writer.flush()).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .map_err(|err| AppError::Parse(format!("Failed to spawn PTY writer thread: {err}")))?;
+        }
+
         let session = PtySession {
             child,
             master: Arc::new(Mutex::new(master)),
-            writer: Arc::new(Mutex::new(writer)),
+            write_tx,
             parser: vt100::Parser::new(45, 180, 10_000),
             last_size: None,
             bytes_received: 0,
@@ -5041,20 +5170,14 @@ mod gui {
         if bytes.windows(4).any(|w| w == b"\x1b[6n") {
             let (row, col) = session.parser.screen().cursor_position();
             let response = format!("\x1b[{};{}R", row + 1, col + 1);
-            if let Ok(mut w) = session.writer.lock() {
-                let _ = w.write_all(response.as_bytes());
-                let _ = w.flush();
-            }
+            let _ = session.write_tx.send(response.into_bytes());
         }
         // ESC[0c or ESC[c — Primary Device Attributes (DA1).
         // Response: ESC[?1;0c  (VT101 with no options).
         if bytes.windows(3).any(|w| w == b"\x1b[c")
             || bytes.windows(4).any(|w| w == b"\x1b[0c")
         {
-            if let Ok(mut w) = session.writer.lock() {
-                let _ = w.write_all(b"\x1b[?1;0c");
-                let _ = w.flush();
-            }
+            let _ = session.write_tx.send(b"\x1b[?1;0c".to_vec());
         }
     }
 
