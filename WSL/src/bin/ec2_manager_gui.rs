@@ -772,6 +772,10 @@ mod gui {
         gui_smoke_auto_connect_attempted: bool,
         gui_smoke_should_close: bool,
         show_close_blocked: bool,
+        /// Set when "Close All & Exit" is clicked — the app defers the actual
+        /// close until cleanup threads have had time to send graceful exit
+        /// commands to remote SSM sessions.
+        pending_exit_at: Option<std::time::Instant>,
         config: AppConfig,
         context: Option<AwsContext>,
         dependencies: DependencyStatus,
@@ -920,6 +924,7 @@ mod gui {
                 gui_smoke_auto_connect_attempted: false,
                 gui_smoke_should_close: false,
                 show_close_blocked: false,
+                pending_exit_at: None,
                 config,
                 context: None,
                 dependencies,
@@ -2324,6 +2329,17 @@ mod gui {
             if let Some(session) = self.pty_sessions.remove(&tab_id) {
                 self.log_debug(format!("tab={tab_id} closing PTY session, spawning cleanup thread"));
                 std::thread::spawn(move || {
+                    // Send "exit" to gracefully terminate the remote SSM session
+                    // before killing the local process.  Without this, the SSM
+                    // agent on the instance keeps the session alive until it
+                    // times out, blocking new connections for ~30 s.
+                    if let Ok(mut w) = session.writer.lock() {
+                        let _ = w.write_all(b"\x03\nexit\n");
+                        let _ = w.flush();
+                    }
+                    // Give the remote session a moment to process the exit
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+
                     // Drop master/writer first to unblock reader and signal EOF to child
                     drop(session.master);
                     drop(session.writer);
@@ -5265,6 +5281,16 @@ mod gui {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     return;
                 }
+                // Deferred exit: wait for cleanup threads to finish sending
+                // graceful exit commands before actually closing the window.
+                if let Some(exit_at) = self.pending_exit_at {
+                    if std::time::Instant::now() >= exit_at {
+                        self.pending_exit_at = None;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        return;
+                    }
+                    ctx.request_repaint_after(Duration::from_millis(50));
+                }
 
                 // Intercept window close when there are active connections.
                 // Save window position/size so it reopens on the same monitor
@@ -5320,7 +5346,11 @@ mod gui {
                                             self.close_connection_tab(id);
                                         }
                                         self.show_close_blocked = false;
-                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                        // Defer the actual window close so cleanup
+                                        // threads have time to send graceful exit
+                                        // commands to remote SSM sessions.
+                                        self.pending_exit_at =
+                                            Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
                                     }
                                     if ui.button("Go Back").clicked() {
                                         self.show_close_blocked = false;
