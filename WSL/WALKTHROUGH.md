@@ -55,6 +55,11 @@
 - Click **Clear Filters** to reset everything
 - Saved filters are listed in alphabetical order
 
+### Reset Filter on Profile Switch
+- By default, switching accounts clears your active filters and saved-filter selection
+- To keep filters active across account switches, go to **Edit > Reset Filter on Profile Switch** and toggle it off
+- Example: set up a `bastion` filter, switch from Account A to Account B — with reset enabled (default), the filter clears; with reset disabled, the filter stays applied and shows Account B's matching instances
+
 ### Favorites & Pinned Filters
 - Click the star icon next to any instance to favorite it
 - Favorites are saved per-account and persist across sessions

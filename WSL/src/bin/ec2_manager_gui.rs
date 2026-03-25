@@ -2298,12 +2298,11 @@ mod gui {
                         self.log_warn(format!(
                             "auth not OK for {display} ({profile_id})"
                         ));
+                        // Keep the memory cache intact so it's available
+                        // immediately when auth becomes OK again. Only
+                        // clear the active display if this is the selected profile.
                         if is_selected {
                             self.context = Some(context);
-                            self.inventory = Inventory {
-                                instances: Vec::new(),
-                                fetched_at: std::time::SystemTime::now(),
-                            };
                             self.filtered.clear();
                             self.message = format!(
                                 "Auth is not OK for {display}. Refresh credentials and retry."
@@ -3879,7 +3878,7 @@ mod gui {
 
                             let selected = self.connections.selected() == Some(*id);
                             if ui
-                                .selectable_label(selected, truncate(title, 28))
+                                .selectable_label(selected, title.as_str())
                                 .clicked()
                             {
                                 to_select = Some(*id);
@@ -5619,6 +5618,17 @@ mod gui {
                                     }
                                 }
                             });
+                            if ui
+                                .selectable_label(
+                                    self.config.reset_filter_on_profile_switch,
+                                    "Reset Filter on Profile Switch",
+                                )
+                                .clicked()
+                            {
+                                self.config.reset_filter_on_profile_switch =
+                                    !self.config.reset_filter_on_profile_switch;
+                                let _ = self.config.save();
+                            }
                         });
                     });
 
@@ -5956,6 +5966,11 @@ mod gui {
                         if self.selected_profile != before_profile {
                             // Clear multi-account selections when switching profiles
                             self.multi_account_ids.clear();
+                            // Reset filters and saved-filter dropdown on profile switch
+                            if self.config.reset_filter_on_profile_switch {
+                                self.search_rules = vec![SearchRuleInput::default()];
+                                self.selected_saved_filter.clear();
+                            }
                             // Save current inventory to memory cache before switching
                             if let Some(ref old_profile) = before_profile {
                                 if let Some(ref ctx) = self.context {
@@ -5994,13 +6009,11 @@ mod gui {
                                 if is_auth_ok {
                                     self.load_cache_for_profile(&profile_id.clone());
                                 } else {
-                                    // Clear the display when switching to unauthed profile
-                                    self.inventory = Inventory {
-                                        instances: Vec::new(),
-                                        fetched_at: std::time::SystemTime::now(),
-                                    };
+                                    // Clear the active display but keep the memory
+                                    // cache so it's available when auth becomes OK.
                                     self.filtered.clear();
                                     self.context = None;
+                                    self.message = "Credentials not authenticated. Refresh credentials and retry.".to_string();
                                 }
                             }
 
@@ -6013,7 +6026,10 @@ mod gui {
                             // refreshed (e.g. from the initial parallel load at startup).
                             if let Some(ref pid) = self.selected_profile {
                                 if !self.refreshing_profiles.contains_key(pid) {
-                                    self.refresh_context_and_inventory(true);
+                                    // Refresh all authenticated profiles when
+                                    // switching accounts so cached data stays
+                                    // current across all accounts.
+                                    self.refresh_all_authenticated(true);
                                 }
                             }
                         }
