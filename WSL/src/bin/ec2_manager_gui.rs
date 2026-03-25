@@ -6722,35 +6722,24 @@ mod gui {
             "tab={tab_id} PTY spawn: program={} args={:?}",
             command.program, command.args
         );
-        // Only set AWS_PROFILE on the wsl.exe process for non-WSL terminals.
-        // For WSL, credentials are exported directly in the bash command string
-        // and setting AWS_PROFILE here can leak into WSL (even with WSLENV
-        // broken), causing `aws` to look for a profile that doesn't exist
-        // inside the WSL filesystem.
-        if command.program != "wsl.exe" {
+        let is_wsl = command.program == "wsl.exe";
+        // For WSL sessions, credentials and region are exported directly in
+        // the bash command string (bypassing WSLENV which can silently break).
+        // For other terminals (PowerShell/CMD), set them on the process env.
+        if !is_wsl {
             cmd.env("AWS_PROFILE", &context.profile);
+            cmd.env("AWS_REGION", &context.region);
+            if let Some(creds) = credentials::read_profile_credentials(&context.profile) {
+                cmd.env("AWS_ACCESS_KEY_ID", &creds.access_key_id);
+                cmd.env("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
+                if let Some(ref token) = creds.session_token {
+                    cmd.env("AWS_SESSION_TOKEN", token);
+                }
+            }
         }
-        cmd.env("AWS_REGION", &context.region);
-        // Inject actual credentials as env vars so WSL's aws CLI doesn't
-        // need to run credential_process tools (like 'fed') that are
-        // only installed on Windows.
-        // Also set COLUMNS/LINES so the remote shell gets the correct
-        // terminal size — ConPTY resize doesn't propagate through WSL+SSM.
+        // COLUMNS/LINES are needed for both WSL and non-WSL terminals.
         cmd.env("COLUMNS", "120");
         cmd.env("LINES", "24");
-        // Prevent Python-based session-manager-plugin from buffering stdout,
-        // which can cause commands like `terraform apply` to appear hung.
-        cmd.env("PYTHONUNBUFFERED", "1");
-        if let Some(creds) = credentials::read_profile_credentials(&context.profile) {
-            cmd.env("AWS_ACCESS_KEY_ID", &creds.access_key_id);
-            cmd.env("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
-            if let Some(ref token) = creds.session_token {
-                cmd.env("AWS_SESSION_TOKEN", token);
-            }
-            cmd.env("WSLENV", "AWS_ACCESS_KEY_ID/u:AWS_SECRET_ACCESS_KEY/u:AWS_SESSION_TOKEN/u:AWS_REGION/u:AWS_PROFILE/u:COLUMNS/u:LINES/u:PYTHONUNBUFFERED/u");
-        } else {
-            cmd.env("WSLENV", "AWS_PROFILE/u:AWS_REGION/u:COLUMNS/u:LINES/u:PYTHONUNBUFFERED/u");
-        }
         cmd.env("TERM", "xterm-256color");
         #[cfg(target_os = "windows")]
         {
