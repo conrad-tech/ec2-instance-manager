@@ -297,6 +297,30 @@ Related smoke harness checks:
 ./scripts/test_run_windows_gui_smoke_test.sh
 ```
 
+## Debug mode
+
+Run the GUI.exe with `--debug` to enable verbose logging in the built-in log panel:
+
+```bash
+# From source
+cargo run --features gui --bin ec2_manager_gui -- --debug
+
+# From built binary
+ec2_manager_gui.exe --debug
+```
+
+Debug mode shows detailed PTY output events, credential lookups, WSL command construction, and connection lifecycle in the log panel (View > Logs or the log area at the bottom of the GUI).
+
+To also capture low-level stderr output (PTY spawn commands, credential lookup results), redirect stderr to a file:
+
+```powershell
+# PowerShell
+.\ec2_manager_gui.exe --debug 2> debug.log
+
+# Git Bash
+./ec2_manager_gui.exe --debug 2> debug.log
+```
+
 ## Useful options
 
 - `--interactive`

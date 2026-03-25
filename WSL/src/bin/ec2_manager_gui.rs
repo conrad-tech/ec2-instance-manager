@@ -6721,7 +6721,14 @@ mod gui {
             "tab={tab_id} PTY spawn: program={} args={:?}",
             command.program, command.args
         );
-        cmd.env("AWS_PROFILE", &context.profile);
+        // Only set AWS_PROFILE on the wsl.exe process for non-WSL terminals.
+        // For WSL, credentials are exported directly in the bash command string
+        // and setting AWS_PROFILE here can leak into WSL (even with WSLENV
+        // broken), causing `aws` to look for a profile that doesn't exist
+        // inside the WSL filesystem.
+        if command.program != "wsl.exe" {
+            cmd.env("AWS_PROFILE", &context.profile);
+        }
         cmd.env("AWS_REGION", &context.region);
         // Inject actual credentials as env vars so WSL's aws CLI doesn't
         // need to run credential_process tools (like 'fed') that are
