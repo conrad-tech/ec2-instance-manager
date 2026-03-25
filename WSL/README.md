@@ -321,6 +321,30 @@ To also capture low-level stderr output (PTY spawn commands, credential lookup r
 ./ec2_manager_gui.exe --debug 2> debug.log
 ```
 
+## Troubleshooting
+
+### WSL running slow or connections timing out
+
+If WSL terminal connections are slow to establish or appear to hang, WSL may need a restart:
+
+```powershell
+wsl --shutdown
+```
+
+Then relaunch the app. This resets the WSL virtual machine and often resolves performance issues caused by WSL updates or long uptime.
+
+### WSLENV not forwarding environment variables
+
+If WSL connections fail with `The config profile (xxx) could not be found`, WSLENV variable forwarding may be broken. Test it:
+
+```powershell
+set WSLENV=TEST_VAR/u
+set TEST_VAR=hello
+wsl -- bash -lc "echo TEST_VAR=$TEST_VAR"
+```
+
+If `TEST_VAR` is empty, WSLENV forwarding is broken. Run `wsl --shutdown` and retry. If the issue persists after restart, check for pending Windows or WSL updates.
+
 ## Useful options
 
 - `--interactive`

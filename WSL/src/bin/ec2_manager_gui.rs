@@ -511,13 +511,15 @@ mod gui {
     }
 
     /// Git-bash-style PS1 prompt sent to the remote shell when the user
-    /// clicks "Update PS1".  Produces:
+    /// clicks "Update PS1".  Uses `sudo bash` to elevate to root (which
+    /// also primes the SSM output pipeline, preventing first-command
+    /// buffering issues).  Produces:
     ///   (blank line)
     ///   user@host SSM ~/working/dir
     ///   $
     /// with bold-green user@host, magenta "SSM", and bold-yellow path.
     const SSM_PS1_COMMAND: &[u8] =
-        b"bash\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\rclear\r";
+        b"sudo bash\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\rclear\r";
 
     #[derive(Debug, PartialEq, Eq)]
     struct RowAction {

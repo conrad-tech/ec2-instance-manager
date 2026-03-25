@@ -192,6 +192,22 @@ The file browser is the left sidebar in the Connections panel.
 
 ---
 
+## Troubleshooting
+
+### WSL connections are slow or timing out
+If logging into an EC2 via WSL takes much longer than usual or appears stuck, WSL may need a restart:
+
+```powershell
+wsl --shutdown
+```
+
+Then relaunch the app. This is common after Windows or WSL updates and resets the WSL virtual machine.
+
+### Connection fails with "config profile not found"
+If WSL connections fail but PowerShell connections work, WSL environment variable forwarding (WSLENV) may be broken. Run `wsl --shutdown` and retry. See the README troubleshooting section for a diagnostic test.
+
+---
+
 ## Tips
 
 - Use **Refresh All** before using multi-account lookup to ensure all accounts have the latest data
@@ -201,3 +217,4 @@ The file browser is the left sidebar in the Connections panel.
 - Use **Update PS1** after connecting to get a clean colored prompt (also clears the terminal)
 - Use `clear` in the terminal before running vim to avoid display issues after exiting
 - All AWS API calls for the file browser run silently (no console window flashes)
+- If WSL connections are slow, try `wsl --shutdown` in PowerShell and relaunch the app
