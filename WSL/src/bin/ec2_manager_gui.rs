@@ -4342,9 +4342,17 @@ mod gui {
                                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
                                         if let Ok(text) = clipboard.get_text() {
                                             if !text.is_empty() {
+                                                // Normalize line endings and wrap in
+                                                // bracketed paste so programs like vim
+                                                // treat it as pasted text rather than
+                                                // interpreting characters as commands.
+                                                let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+                                                let mut buf = b"\x1b[200~".to_vec();
+                                                buf.extend_from_slice(normalized.as_bytes());
+                                                buf.extend_from_slice(b"\x1b[201~");
                                                 self.send_raw_bytes_to_connection_tab(
                                                     tab_id,
-                                                    text.as_bytes(),
+                                                    &buf,
                                                 );
                                                 self.log_debug(format!(
                                                     "right-click paste tab={tab_id} bytes={}",
@@ -7559,11 +7567,15 @@ mod gui {
                 }
             }
             egui::Event::Paste(text) => {
+                // Normalize line endings: \r\n → \r, standalone \n → \r.
+                // Sources like OneNote use \r\n which causes double-execution
+                // of commands in the shell.  Terminals expect \r for Enter.
+                let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
                 // Wrap pasted text in bracketed-paste escape sequences so
                 // applications like vim know it is a paste (avoids auto-indent
                 // and auto-comment artifacts).
                 let mut buf = b"\x1b[200~".to_vec();
-                buf.extend_from_slice(text.as_bytes());
+                buf.extend_from_slice(normalized.as_bytes());
                 buf.extend_from_slice(b"\x1b[201~");
                 Some(buf)
             }
