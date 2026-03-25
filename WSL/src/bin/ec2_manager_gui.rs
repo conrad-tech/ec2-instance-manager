@@ -6546,20 +6546,10 @@ mod gui {
                 // don't propagate through the WSL+SSM chain, so fullscreen
                 // apps like vim won't know the correct terminal size.
                 let wsl_cmd = strip_profile_flag(command_line);
-                // Use `script -qfc` to allocate a real PTY inside WSL.
-                // Without this, long-running commands like `terraform apply`
-                // can have their output block-buffered by ConPTY, causing
-                // progress updates to appear delayed/batched instead of
-                // streaming in real time.
                 let wrapped = format!(
                     "export HOME=\"${{HOME:-$(getent passwd $(id -u) | cut -d: -f6)}}\" 2>/dev/null; \
                      stty rows ${{LINES:-24}} cols ${{COLUMNS:-120}} 2>/dev/null; \
-                     if command -v script >/dev/null 2>&1; then \
-                       exec script -qfc '{}' /dev/null; \
-                     else \
-                       exec {}; \
-                     fi",
-                    wsl_cmd.replace('\'', "'\\''"),
+                     {}",
                     wsl_cmd
                 );
                 PtyCommand {
