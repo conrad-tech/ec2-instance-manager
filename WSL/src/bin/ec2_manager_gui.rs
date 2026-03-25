@@ -6547,7 +6547,13 @@ mod gui {
                 // relying on WSLENV env-var forwarding, which can silently
                 // stop working after WSL updates.
                 let wsl_cmd = strip_profile_flag(command_line);
-                let cred_exports = match credentials::read_profile_credentials(&context.profile) {
+                let cred_result = credentials::read_profile_credentials(&context.profile);
+                eprintln!(
+                    "WSL cred lookup for profile='{}': found={}",
+                    context.profile,
+                    cred_result.is_some()
+                );
+                let cred_exports = match cred_result {
                     Some(creds) => {
                         let mut exports = format!(
                             "export AWS_ACCESS_KEY_ID='{}'; \
