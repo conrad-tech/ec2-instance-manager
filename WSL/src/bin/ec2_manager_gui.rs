@@ -6521,7 +6521,7 @@ mod gui {
         // inside the selected shell (PowerShell / CMD) lets the shell
         // mediate console I/O so output flows through the PTY pipe.
         if cfg!(windows) {
-            return shell_wrapped_pty_command(terminal, command_line);
+            return shell_wrapped_pty_command(terminal, command_line, context);
         }
         PtyCommand {
             program: "aws".to_string(),
@@ -6532,22 +6532,52 @@ mod gui {
     fn shell_wrapped_pty_command(
         terminal: Option<&TerminalOption>,
         command_line: &str,
+        context: &AwsContext,
     ) -> PtyCommand {
         let kind = terminal.map(|t| t.kind.clone()).unwrap_or(TerminalKind::Wsl);
 
         match kind {
             TerminalKind::Wsl => {
                 // Strip --profile from the command for WSL sessions.
-                // Credentials are injected via env vars (AWS_ACCESS_KEY_ID, etc.)
-                // because the credential_process tool ('fed') only exists on
-                // Windows.  Keeping --profile would cause aws to read the
-                // credentials file and try to run 'fed' inside WSL.
-                // Also set stty before launching SSM — ConPTY resize signals
-                // don't propagate through the WSL+SSM chain, so fullscreen
-                // apps like vim won't know the correct terminal size.
+                // The credential_process tool ('fed') only exists on Windows,
+                // so --profile would fail inside WSL.
+                //
+                // Credentials are read from the Windows-side ~/.aws/credentials
+                // and injected directly into the bash command string instead of
+                // relying on WSLENV env-var forwarding, which can silently
+                // stop working after WSL updates.
                 let wsl_cmd = strip_profile_flag(command_line);
+                let cred_exports = match credentials::read_profile_credentials(&context.profile) {
+                    Some(creds) => {
+                        let mut exports = format!(
+                            "export AWS_ACCESS_KEY_ID='{}'; \
+                             export AWS_SECRET_ACCESS_KEY='{}'; \
+                             export AWS_REGION='{}'; ",
+                            creds.access_key_id.replace('\'', "'\\''"),
+                            creds.secret_access_key.replace('\'', "'\\''"),
+                            context.region.replace('\'', "'\\''"),
+                        );
+                        if let Some(ref token) = creds.session_token {
+                            exports.push_str(&format!(
+                                "export AWS_SESSION_TOKEN='{}'; ",
+                                token.replace('\'', "'\\''"),
+                            ));
+                        }
+                        exports
+                    }
+                    None => {
+                        // No cached credentials — forward profile name and
+                        // hope WSL has matching AWS config (best-effort).
+                        format!(
+                            "export AWS_PROFILE='{}'; export AWS_REGION='{}'; ",
+                            context.profile.replace('\'', "'\\''"),
+                            context.region.replace('\'', "'\\''"),
+                        )
+                    }
+                };
                 let wrapped = format!(
                     "export HOME=\"${{HOME:-$(getent passwd $(id -u) | cut -d: -f6)}}\" 2>/dev/null; \
+                     {cred_exports}\
                      stty rows ${{LINES:-24}} cols ${{COLUMNS:-120}} 2>/dev/null; \
                      {}",
                     wsl_cmd
