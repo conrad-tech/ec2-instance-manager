@@ -2321,6 +2321,9 @@ mod gui {
                     UiEvent::PtyReady { tab_id, session } => {
                         self.log_info(format!("tab={tab_id} PTY session ready"));
                         self.pty_sessions.insert(tab_id, session);
+                        // Auto-send PS1 prompt while still as ec2-user
+                        // (sudo won't prompt for a password at this point).
+                        self.send_raw_bytes_to_connection_tab(tab_id, SSM_PS1_COMMAND);
                     }
                     UiEvent::Error { tab_id, error } => {
                         self.log_error(format!("tab={tab_id} PTY spawn error: {error}"));
