@@ -50,6 +50,7 @@ mod gui {
     const GUI_MIN_WIDTH: f32 = 1280.0;
     const GUI_MIN_HEIGHT: f32 = 760.0;
     const PROFILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+    const AUTH_EXPIRY_CHECK_INTERVAL: Duration = Duration::from_secs(10);
     const PROFILE_CHANGE_DEBOUNCE: Duration = Duration::from_secs(2);
     const GUI_SMOKE_MARKER_ENV: &str = "EC2_MANAGER_GUI_SMOKE_MARKER";
     const GUI_SMOKE_EXPECTED_TEXT_ENV: &str = "EC2_MANAGER_GUI_SMOKE_EXPECTED_TEXT";
@@ -157,6 +158,19 @@ mod gui {
         }
     }
 
+    const INVENTORY_HEADERS: &[(&str, SortColumn)] = &[
+        ("Favorite", SortColumn::Favorite),
+        ("InstanceId", SortColumn::InstanceId),
+        ("Name", SortColumn::Name),
+        ("State", SortColumn::State),
+        ("SSM", SortColumn::Ssm),
+        ("Private IP", SortColumn::PrivateIp),
+        ("AMI ID", SortColumn::AmiId),
+        ("Instance Type", SortColumn::InstanceType),
+        ("Environment", SortColumn::Env),
+        ("Match Tag", SortColumn::MatchTag),
+    ];
+
     impl SortColumn {
         fn default_width(self) -> f32 {
             match self {
@@ -240,7 +254,7 @@ mod gui {
                 error: true,
                 warn: true,
                 info: true,
-                debug: false,
+                debug: true,
                 trace: false,
             }
         }
@@ -511,15 +525,16 @@ mod gui {
     }
 
     /// Git-bash-style PS1 prompt sent to the remote shell when the user
-    /// clicks "Update PS1".  Uses `sudo bash` to elevate to root (which
-    /// also primes the SSM output pipeline, preventing first-command
-    /// buffering issues).  Produces:
+    /// clicks "Update PS1".  Enters root via `sudo bash` then immediately
+    /// exits back to the normal user.  This primes the SSM output pipeline
+    /// (preventing first-command buffering issues) without leaving the
+    /// session as root.  Then sets PS1 as the normal user.  Produces:
     ///   (blank line)
     ///   user@host SSM ~/working/dir
     ///   $
     /// with bold-green user@host, magenta "SSM", and bold-yellow path.
     const SSM_PS1_COMMAND: &[u8] =
-        b"sudo bash\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\rclear\r";
+        b"sudo bash\rexit\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\rclear\r";
 
     #[derive(Debug, PartialEq, Eq)]
     struct RowAction {
@@ -846,6 +861,7 @@ mod gui {
         profile_auth_infos: Vec<ProfileAuthInfo>,
         last_credentials_mtime: Option<SystemTime>,
         last_credentials_poll_at: Instant,
+        last_auth_expiry_check_at: Instant,
         account_color_map: HashMap<String, egui::Color32>,
         tab_rename_id: Option<u64>,
         tab_rename_buf: String,
@@ -996,6 +1012,7 @@ mod gui {
                 profile_auth_infos,
                 last_credentials_mtime,
                 last_credentials_poll_at: Instant::now(),
+                last_auth_expiry_check_at: Instant::now(),
                 account_color_map: HashMap::new(),
                 tab_rename_id: None,
                 tab_rename_buf: String::new(),
@@ -1154,15 +1171,26 @@ mod gui {
             if current_mtime != self.last_credentials_mtime {
                 self.last_credentials_mtime = current_mtime;
 
+                // Remember which profiles WERE authenticated before
+                let previously_authed: Vec<String> = self
+                    .config
+                    .profiles
+                    .iter()
+                    .filter(|p| {
+                        self.profile_auth_infos.iter().any(|a| {
+                            a.profile_id == p.profile_id && a.auth_status == AuthStatus::Ok
+                        })
+                    })
+                    .map(|p| p.profile_id.clone())
+                    .collect();
+
                 // Remember which profiles were NOT authenticated before
                 let previously_unauthed: Vec<String> = self
                     .config
                     .profiles
                     .iter()
                     .filter(|p| {
-                        !self.profile_auth_infos.iter().any(|a| {
-                            a.profile_id == p.profile_id && a.auth_status == AuthStatus::Ok
-                        })
+                        !previously_authed.contains(&p.profile_id)
                     })
                     .map(|p| p.profile_id.clone())
                     .collect();
@@ -1170,6 +1198,16 @@ mod gui {
                 self.profile_auth_infos =
                     credentials::check_all_profiles_auth(&self.config.profiles);
                 self.log_debug("credentials file changed; refreshed profile auth status");
+
+                // Handle profiles that just became expired
+                for pid in &previously_authed {
+                    let is_now_expired = self.profile_auth_infos.iter().any(|a| {
+                        a.profile_id == *pid && a.auth_status != AuthStatus::Ok
+                    });
+                    if is_now_expired {
+                        self.handle_profile_expired(pid);
+                    }
+                }
 
                 // Refresh any profiles that just became authenticated
                 for pid in &previously_unauthed {
@@ -1184,6 +1222,104 @@ mod gui {
                         self.refresh_profile(pid, true);
                     }
                 }
+            }
+        }
+
+        /// Periodically check whether any authenticated profile has expired
+        /// based on its `expires_at` timestamp (time-based, independent of
+        /// credentials file changes).
+        fn poll_auth_expiry(&mut self) {
+            if self.last_auth_expiry_check_at.elapsed() < AUTH_EXPIRY_CHECK_INTERVAL {
+                return;
+            }
+            self.last_auth_expiry_check_at = Instant::now();
+
+            if self.options.mode == Mode::Sim {
+                return;
+            }
+
+            let now = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            // Find profiles that are marked Ok but whose expires_at is in the past
+            let newly_expired: Vec<String> = self
+                .profile_auth_infos
+                .iter()
+                .filter(|a| {
+                    a.auth_status == AuthStatus::Ok
+                        && a.expires_at.is_some_and(|exp| exp <= now)
+                })
+                .map(|a| a.profile_id.clone())
+                .collect();
+
+            if newly_expired.is_empty() {
+                return;
+            }
+
+            // Re-check from the credentials file to confirm
+            self.profile_auth_infos =
+                credentials::check_all_profiles_auth(&self.config.profiles);
+
+            for pid in &newly_expired {
+                let still_expired = self.profile_auth_infos.iter().any(|a| {
+                    a.profile_id == *pid && a.auth_status != AuthStatus::Ok
+                });
+                if still_expired {
+                    self.handle_profile_expired(pid);
+                }
+            }
+        }
+
+        /// Handle a profile whose auth has expired: save cache to disk,
+        /// clear from active display, and show a message.
+        fn handle_profile_expired(&mut self, profile_id: &str) {
+            let display = self
+                .config
+                .profiles
+                .iter()
+                .find(|p| p.profile_id == profile_id)
+                .map(|p| p.display_name.as_str())
+                .unwrap_or(profile_id)
+                .to_string();
+
+            self.log_warn(format!(
+                "auth expired for {display} ({profile_id})"
+            ));
+
+            // Save current instances to disk cache before clearing
+            if let Some((inv, ctx)) = self.profile_inventory_cache.get(profile_id) {
+                if !inv.instances.is_empty() {
+                    ec2_manager::inventory::save_disk_cache(
+                        profile_id,
+                        &ctx.region,
+                        inv,
+                    );
+                    self.log_info(format!(
+                        "saved {} instances to disk cache for expired profile={profile_id}",
+                        inv.instances.len()
+                    ));
+                }
+            }
+
+            let is_selected = self.selected_profile.as_deref() == Some(profile_id);
+            if is_selected {
+                // Save current display inventory to disk before clearing
+                if !self.inventory.instances.is_empty() {
+                    if let Some(ref ctx) = self.context {
+                        ec2_manager::inventory::save_disk_cache(
+                            profile_id,
+                            &ctx.region,
+                            &self.inventory,
+                        );
+                    }
+                }
+                self.inventory.instances.clear();
+                self.filtered.clear();
+                self.message = format!(
+                    "Auth is not OK for {display}. Refresh credentials and retry."
+                );
             }
         }
 
@@ -3291,19 +3427,7 @@ mod gui {
                     .min_col_width(0.0)
                     .spacing(egui::vec2(2.0, 4.0))
                     .show(ui, |ui| {
-                        let header_columns: &[(&str, SortColumn)] = &[
-                            ("Favorite", SortColumn::Favorite),
-                            ("InstanceId", SortColumn::InstanceId),
-                            ("Name", SortColumn::Name),
-                            ("State", SortColumn::State),
-                            ("SSM", SortColumn::Ssm),
-                            ("Private IP", SortColumn::PrivateIp),
-                            ("AMI ID", SortColumn::AmiId),
-                            ("Instance Type", SortColumn::InstanceType),
-                            ("Environment", SortColumn::Env),
-                            ("Match Tag", SortColumn::MatchTag),
-                        ];
-                        for (label, col) in header_columns {
+                        for (label, col) in INVENTORY_HEADERS {
                             let col_key = *col as u8;
                             let width = self.column_widths.get(&col_key).copied().unwrap_or_else(|| col.default_width());
                             let arrow = if self.sort_column == Some(*col) {
@@ -4342,17 +4466,19 @@ mod gui {
                                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
                                         if let Ok(text) = clipboard.get_text() {
                                             if !text.is_empty() {
-                                                // Normalize line endings and wrap in
-                                                // bracketed paste so programs like vim
-                                                // treat it as pasted text rather than
-                                                // interpreting characters as commands.
-                                                let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
-                                                let mut buf = b"\x1b[200~".to_vec();
-                                                buf.extend_from_slice(normalized.as_bytes());
-                                                buf.extend_from_slice(b"\x1b[201~");
+                                                // Normalize pasted text for terminal:
+                                                // - U+00A0 → space (OneNote non-breaking spaces)
+                                                // - \r\n → \r, \n → \r (line endings)
+                                                // No bracketed paste — SSM sessions
+                                                // don't reliably pass the escape
+                                                // sequences through to the remote terminal.
+                                                let normalized = text
+                                                    .replace('\u{00a0}', " ")
+                                                    .replace("\r\n", "\r")
+                                                    .replace('\n', "\r");
                                                 self.send_raw_bytes_to_connection_tab(
                                                     tab_id,
-                                                    &buf,
+                                                    normalized.as_bytes(),
                                                 );
                                                 self.log_debug(format!(
                                                     "right-click paste tab={tab_id} bytes={}",
@@ -5267,6 +5393,7 @@ mod gui {
 
                 self.poll_profile_choice_changes();
                 self.poll_credentials_changes();
+                self.poll_auth_expiry();
                 self.poll_connection_events();
                 self.poll_refresh_events();
                 self.poll_file_op_events();
@@ -7567,17 +7694,17 @@ mod gui {
                 }
             }
             egui::Event::Paste(text) => {
-                // Normalize line endings: \r\n → \r, standalone \n → \r.
-                // Sources like OneNote use \r\n which causes double-execution
-                // of commands in the shell.  Terminals expect \r for Enter.
-                let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
-                // Wrap pasted text in bracketed-paste escape sequences so
-                // applications like vim know it is a paste (avoids auto-indent
-                // and auto-comment artifacts).
-                let mut buf = b"\x1b[200~".to_vec();
-                buf.extend_from_slice(normalized.as_bytes());
-                buf.extend_from_slice(b"\x1b[201~");
-                Some(buf)
+                // Normalize pasted text for terminal compatibility:
+                // - \r\n → \r, \n → \r: OneNote uses \r\n which double-executes
+                // - U+00A0 → space: OneNote/rich text editors insert non-breaking
+                //   spaces that look identical but break shell commands and PEM files
+                // No bracketed paste — SSM sessions don't reliably pass the
+                // escape sequences through to the remote terminal.
+                let normalized = text
+                    .replace('\u{00a0}', " ")
+                    .replace("\r\n", "\r")
+                    .replace('\n', "\r");
+                Some(normalized.into_bytes())
             }
             // Copy/Cut events carry no modifier info so we cannot
             // distinguish Ctrl+C from Ctrl+Shift+C here.  These are
@@ -8044,8 +8171,21 @@ mod gui {
                 "i-123".to_string(),
             ];
             let cmd = pty_command_for_context(None, &context, "ignored", &args);
-            assert_eq!(cmd.program, "aws");
-            assert_eq!(cmd.args, args);
+            if cfg!(windows) {
+                // On Windows, live sessions are shell-wrapped (WSL/PowerShell/CMD)
+                // rather than spawning `aws` directly, because ConPTY cannot
+                // capture session-manager-plugin output from a bare process.
+                assert!(
+                    cmd.program == "wsl.exe"
+                        || cmd.program.contains("powershell")
+                        || cmd.program.contains("cmd"),
+                    "expected shell wrapper on Windows, got: {}",
+                    cmd.program,
+                );
+            } else {
+                assert_eq!(cmd.program, "aws");
+                assert_eq!(cmd.args, args);
+            }
         }
 
         #[test]
@@ -8087,6 +8227,12 @@ mod gui {
                     program: "powershell.exe".to_string(),
                 },
                 TerminalOption {
+                    id: "wsl".to_string(),
+                    display_name: "WSL".to_string(),
+                    kind: TerminalKind::Wsl,
+                    program: "wsl.exe".to_string(),
+                },
+                TerminalOption {
                     id: "cmd".to_string(),
                     display_name: "Command Prompt".to_string(),
                     kind: TerminalKind::Cmd,
@@ -8100,7 +8246,7 @@ mod gui {
                     t.kind,
                     TerminalKind::PowerShell7
                         | TerminalKind::WindowsPowerShell
-                        | TerminalKind::Cmd
+                        | TerminalKind::Wsl
                 )
             }));
         }
@@ -8212,6 +8358,8 @@ mod gui {
                 mode: Mode::Sim,
                 region: None,
                 dry_run: true,
+                debug: false,
+                wsl_auto_setup: false,
             });
             let ok = app.guarded_action("test-action", |_app| {
                 Err(AppError::Parse("boom".to_string()))
@@ -8275,6 +8423,8 @@ mod gui {
                 mode: Mode::Sim,
                 region: None,
                 dry_run: true,
+                debug: false,
+                wsl_auto_setup: false,
             });
             let context = AwsContext {
                 mode: Mode::Sim,
@@ -8310,6 +8460,8 @@ mod gui {
                 mode: Mode::Sim,
                 region: None,
                 dry_run: false,
+                debug: false,
+                wsl_auto_setup: false,
             });
             let context = AwsContext {
                 mode: Mode::Sim,
@@ -8433,7 +8585,7 @@ mod gui {
         fn log_filters_include_expected_levels() {
             let mut filters = LogFilters::default();
             assert!(filters.includes(LogLevel::Info));
-            assert!(!filters.includes(LogLevel::Debug));
+            assert!(filters.includes(LogLevel::Debug));
             assert!(!filters.includes(LogLevel::Trace));
 
             filters.set_verbosity_high();
@@ -8447,6 +8599,8 @@ mod gui {
                 mode: Mode::Sim,
                 region: None,
                 dry_run: true,
+                debug: false,
+                wsl_auto_setup: false,
             });
 
             for i in 0..(Ec2GuiApp::MAX_LOG_LINES + 5) {
@@ -8678,12 +8832,16 @@ mod gui {
             );
 
             let paste = egui::Event::Paste("echo hi".to_string());
-            let mut expected_paste = b"\x1b[200~".to_vec();
-            expected_paste.extend_from_slice(b"echo hi");
-            expected_paste.extend_from_slice(b"\x1b[201~");
             assert_eq!(
                 terminal_event_payload_for_terminal(&paste, false, false),
-                Some(expected_paste)
+                Some(b"echo hi".to_vec())
+            );
+
+            // Verify \r\n line endings are normalized to \r
+            let paste_crlf = egui::Event::Paste("cd\r\nmkdir .ssh".to_string());
+            assert_eq!(
+                terminal_event_payload_for_terminal(&paste_crlf, false, false),
+                Some(b"cd\rmkdir .ssh".to_vec())
             );
         }
 

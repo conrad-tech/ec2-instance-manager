@@ -16,7 +16,7 @@ impl Default for GuiOptions {
             mode: Mode::Live,
             region: None,
             dry_run: false,
-            debug: false,
+            debug: true,
             wsl_auto_setup: false,
         }
     }
