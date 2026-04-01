@@ -341,6 +341,8 @@ mod gui {
         bytes_received: u64,
         output_event_count: u64,
         scroll_offset: usize,
+        /// Whether the auto-PS1 command has already been sent for this session.
+        ps1_auto_sent: bool,
     }
 
     /// Absolute terminal position: scroll-invariant coordinate.
@@ -2190,6 +2192,20 @@ mod gui {
                             // this at startup and block until they receive the
                             // response ESC[row;colR.
                             respond_to_terminal_queries(session, &bytes);
+                            // Auto-send PS1 once we detect a shell prompt
+                            // (ec2-user or root) so sudo won't need a password.
+                            if !session.ps1_auto_sent {
+                                let screen_text = session.parser.screen().contents();
+                                if screen_text.contains("ec2-user")
+                                    || screen_text.contains("root")
+                                {
+                                    session.ps1_auto_sent = true;
+                                    if let Ok(mut stdin) = session.writer.lock() {
+                                        let _ = stdin.write_all(SSM_PS1_COMMAND)
+                                            .and_then(|()| stdin.flush());
+                                    }
+                                }
+                            }
                             if evt <= 5 {
                                 let preview = String::from_utf8_lossy(
                                     &bytes[..bytes.len().min(200)]
@@ -2321,9 +2337,6 @@ mod gui {
                     UiEvent::PtyReady { tab_id, session } => {
                         self.log_info(format!("tab={tab_id} PTY session ready"));
                         self.pty_sessions.insert(tab_id, session);
-                        // Auto-send PS1 prompt while still as ec2-user
-                        // (sudo won't prompt for a password at this point).
-                        self.send_raw_bytes_to_connection_tab(tab_id, SSM_PS1_COMMAND);
                     }
                     UiEvent::Error { tab_id, error } => {
                         self.log_error(format!("tab={tab_id} PTY spawn error: {error}"));
@@ -4438,32 +4451,32 @@ mod gui {
                             }
                             if terminal_focus_response.secondary_clicked() {
                                 // If text is selected, copy it; otherwise paste.
-                                let has_selection = self
+                                // Extract the selected text first so we can tell
+                                // if the selection is meaningful (a bare click sets
+                                // anchor == end which yields empty/whitespace text).
+                                let copied_text = self
                                     .terminal_selections
                                     .get(&tab_id)
+                                    .cloned()
                                     .and_then(|sel| sel.normalized())
-                                    .is_some();
-                                if has_selection {
-                                    if let Some(sel) = self.terminal_selections.get(&tab_id).cloned() {
-                                        if let Some((start, end)) = sel.normalized() {
-                                            if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
-                                                let text = extract_selection_text(
-                                                    &mut session.parser, start, end,
-                                                );
-                                                if !text.is_empty() {
-                                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                                        let _ = clipboard.set_text(&text);
-                                                    }
-                                                    self.log_debug(format!(
-                                                        "right-click copy tab={tab_id} len={}",
-                                                        text.len()
-                                                    ));
-                                                }
-                                            }
-                                            if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
-                                                sel.clear();
-                                            }
-                                        }
+                                    .and_then(|(start, end)| {
+                                        self.pty_sessions.get_mut(&tab_id).map(|session| {
+                                            extract_selection_text(
+                                                &mut session.parser, start, end,
+                                            )
+                                        })
+                                    })
+                                    .filter(|t| !t.trim().is_empty());
+                                if let Some(text) = copied_text {
+                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                        let _ = clipboard.set_text(&text);
+                                    }
+                                    self.log_debug(format!(
+                                        "right-click copy tab={tab_id} len={}",
+                                        text.len()
+                                    ));
+                                    if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
+                                        sel.clear();
                                     }
                                 } else {
                                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
@@ -4472,16 +4485,19 @@ mod gui {
                                                 // Normalize pasted text for terminal:
                                                 // - U+00A0 → space (OneNote non-breaking spaces)
                                                 // - \r\n → \r, \n → \r (line endings)
-                                                // No bracketed paste — SSM sessions
-                                                // don't reliably pass the escape
-                                                // sequences through to the remote terminal.
+                                                // Wrap in bracketed paste escape sequences
+                                                // so vim etc. treat it as pasted content.
                                                 let normalized = text
                                                     .replace('\u{00a0}', " ")
                                                     .replace("\r\n", "\r")
                                                     .replace('\n', "\r");
+                                                let mut payload = Vec::with_capacity(normalized.len() + 12);
+                                                payload.extend_from_slice(b"\x1b[200~");
+                                                payload.extend_from_slice(normalized.as_bytes());
+                                                payload.extend_from_slice(b"\x1b[201~");
                                                 self.send_raw_bytes_to_connection_tab(
                                                     tab_id,
-                                                    normalized.as_bytes(),
+                                                    &payload,
                                                 );
                                                 self.log_debug(format!(
                                                     "right-click paste tab={tab_id} bytes={}",
@@ -6929,6 +6945,7 @@ mod gui {
             bytes_received: 0,
             output_event_count: 0,
             scroll_offset: 0,
+            ps1_auto_sent: false,
         };
 
         Ok((session, reader))
@@ -7701,13 +7718,18 @@ mod gui {
                 // - \r\n → \r, \n → \r: OneNote uses \r\n which double-executes
                 // - U+00A0 → space: OneNote/rich text editors insert non-breaking
                 //   spaces that look identical but break shell commands and PEM files
-                // No bracketed paste — SSM sessions don't reliably pass the
-                // escape sequences through to the remote terminal.
+                // Wrap in bracketed paste escape sequences so terminal
+                // applications (vim, etc.) can distinguish pasted text
+                // from typed input.
                 let normalized = text
                     .replace('\u{00a0}', " ")
                     .replace("\r\n", "\r")
                     .replace('\n', "\r");
-                Some(normalized.into_bytes())
+                let mut payload = Vec::with_capacity(normalized.len() + 12);
+                payload.extend_from_slice(b"\x1b[200~");
+                payload.extend_from_slice(normalized.as_bytes());
+                payload.extend_from_slice(b"\x1b[201~");
+                Some(payload)
             }
             // Copy/Cut events carry no modifier info so we cannot
             // distinguish Ctrl+C from Ctrl+Shift+C here.  These are
@@ -8834,17 +8856,18 @@ mod gui {
                 Some(vec![0x15])
             );
 
+            // Paste should be wrapped in bracketed paste escape sequences
             let paste = egui::Event::Paste("echo hi".to_string());
             assert_eq!(
                 terminal_event_payload_for_terminal(&paste, false, false),
-                Some(b"echo hi".to_vec())
+                Some(b"\x1b[200~echo hi\x1b[201~".to_vec())
             );
 
-            // Verify \r\n line endings are normalized to \r
+            // Verify \r\n line endings are normalized to \r, still bracketed
             let paste_crlf = egui::Event::Paste("cd\r\nmkdir .ssh".to_string());
             assert_eq!(
                 terminal_event_payload_for_terminal(&paste_crlf, false, false),
-                Some(b"cd\rmkdir .ssh".to_vec())
+                Some(b"\x1b[200~cd\rmkdir .ssh\x1b[201~".to_vec())
             );
         }
 
