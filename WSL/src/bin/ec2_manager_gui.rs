@@ -536,7 +536,7 @@ mod gui {
     ///   $
     /// with bold-green user@host, magenta "SSM", and bold-yellow path.
     const SSM_PS1_COMMAND: &[u8] =
-        b"sudo bash -c exit\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\rclear\r";
+        b"exec bash\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\rclear\r";
 
     #[derive(Debug, PartialEq, Eq)]
     struct RowAction {
@@ -3516,6 +3516,7 @@ mod gui {
                         let region_scope = self.region_scope();
                         let mut pending_connect: Option<String> = None;
                         let mut pending_fav_toggle: Option<String> = None;
+                        let mut pending_filter_term: Option<String> = None;
                         let (include_terms, _) = search_terms_from_rules(&self.search_rules);
 
                         // Sort filtered instances if a sort column is selected.
@@ -3758,11 +3759,48 @@ mod gui {
                                 .union(resp_tag.clone());
 
                             let detail_instance_clone = instance.clone();
+                            let filter_instance_clone = instance.clone();
+                            let mut add_filter_term: Option<String> = None;
                             row_response.context_menu(|ui| {
                                 if ui.button("Quick Connect").clicked() {
                                     quick_connect_clicked = true;
                                     ui.close();
                                 }
+                                ui.menu_button("Add to filter", |ui| {
+                                    let mut filter_items: Vec<(&str, String)> = Vec::new();
+                                    if let Some(name) = &filter_instance_clone.name {
+                                        if !name.is_empty() {
+                                            filter_items.push(("Name", name.clone()));
+                                        }
+                                    }
+                                    filter_items.push(("Instance ID", filter_instance_clone.instance_id.clone()));
+                                    if let Some(ip) = &filter_instance_clone.private_ip {
+                                        if !ip.is_empty() {
+                                            filter_items.push(("IP", ip.clone()));
+                                        }
+                                    }
+                                    if let Some(itype) = &filter_instance_clone.instance_type {
+                                        if !itype.is_empty() {
+                                            filter_items.push(("Type", itype.clone()));
+                                        }
+                                    }
+                                    for (key, val) in &filter_instance_clone.tags {
+                                        if !val.is_empty() {
+                                            filter_items.push(("Tag", format!("{key}: {val}")));
+                                        }
+                                    }
+                                    for (label, value) in filter_items {
+                                        let display = if label == "Tag" {
+                                            value.clone()
+                                        } else {
+                                            format!("{label}: {value}")
+                                        };
+                                        if ui.button(&display).clicked() {
+                                            add_filter_term = Some(value);
+                                            ui.close();
+                                        }
+                                    }
+                                });
                                 if ui.button("See Details").clicked() {
                                     let iid = detail_instance_clone.instance_id.clone();
                                     self.detail_instance = Some(detail_instance_clone.clone());
@@ -3787,6 +3825,10 @@ mod gui {
                                     ui.close();
                                 }
                             });
+
+                            if let Some(term) = add_filter_term {
+                                pending_filter_term = Some(term);
+                            }
 
                             if row_hovered {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -3851,6 +3893,14 @@ mod gui {
                                 );
                                 self.log_info(self.message.clone());
                             }
+                        }
+
+                        if let Some(term) = pending_filter_term {
+                            self.search_rules.push(SearchRuleInput {
+                                kind: SearchRuleKind::Include,
+                                term,
+                            });
+                            self.apply_filters();
                         }
                     });
                 ui.add_space(20.0);
@@ -4492,19 +4542,16 @@ mod gui {
                                                 // Normalize pasted text for terminal:
                                                 // - U+00A0 → space (OneNote non-breaking spaces)
                                                 // - \r\n → \r, \n → \r (line endings)
-                                                // Wrap in bracketed paste escape sequences
-                                                // so vim etc. treat it as pasted content.
+                                                // No bracketed paste — SSM sessions
+                                                // don't reliably pass the escape
+                                                // sequences through to the remote terminal.
                                                 let normalized = text
                                                     .replace('\u{00a0}', " ")
                                                     .replace("\r\n", "\r")
                                                     .replace('\n', "\r");
-                                                let mut payload = Vec::with_capacity(normalized.len() + 12);
-                                                payload.extend_from_slice(b"\x1b[200~");
-                                                payload.extend_from_slice(normalized.as_bytes());
-                                                payload.extend_from_slice(b"\x1b[201~");
                                                 self.send_raw_bytes_to_connection_tab(
                                                     tab_id,
-                                                    &payload,
+                                                    normalized.as_bytes(),
                                                 );
                                                 self.log_debug(format!(
                                                     "right-click paste tab={tab_id} bytes={}",
@@ -7725,18 +7772,13 @@ mod gui {
                 // - \r\n → \r, \n → \r: OneNote uses \r\n which double-executes
                 // - U+00A0 → space: OneNote/rich text editors insert non-breaking
                 //   spaces that look identical but break shell commands and PEM files
-                // Wrap in bracketed paste escape sequences so terminal
-                // applications (vim, etc.) can distinguish pasted text
-                // from typed input.
+                // No bracketed paste — SSM sessions don't reliably pass the
+                // escape sequences through to the remote terminal.
                 let normalized = text
                     .replace('\u{00a0}', " ")
                     .replace("\r\n", "\r")
                     .replace('\n', "\r");
-                let mut payload = Vec::with_capacity(normalized.len() + 12);
-                payload.extend_from_slice(b"\x1b[200~");
-                payload.extend_from_slice(normalized.as_bytes());
-                payload.extend_from_slice(b"\x1b[201~");
-                Some(payload)
+                Some(normalized.into_bytes())
             }
             // Copy/Cut events carry no modifier info so we cannot
             // distinguish Ctrl+C from Ctrl+Shift+C here.  These are
@@ -8863,18 +8905,18 @@ mod gui {
                 Some(vec![0x15])
             );
 
-            // Paste should be wrapped in bracketed paste escape sequences
+            // Paste should normalize line endings without bracketed paste
             let paste = egui::Event::Paste("echo hi".to_string());
             assert_eq!(
                 terminal_event_payload_for_terminal(&paste, false, false),
-                Some(b"\x1b[200~echo hi\x1b[201~".to_vec())
+                Some(b"echo hi".to_vec())
             );
 
-            // Verify \r\n line endings are normalized to \r, still bracketed
+            // Verify \r\n line endings are normalized to \r
             let paste_crlf = egui::Event::Paste("cd\r\nmkdir .ssh".to_string());
             assert_eq!(
                 terminal_event_payload_for_terminal(&paste_crlf, false, false),
-                Some(b"\x1b[200~cd\rmkdir .ssh\x1b[201~".to_vec())
+                Some(b"cd\rmkdir .ssh".to_vec())
             );
         }
 
