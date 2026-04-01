@@ -1211,18 +1211,25 @@ mod gui {
                     }
                 }
 
-                // Refresh any profiles that just became authenticated
-                for pid in &previously_unauthed {
-                    let is_now_ok = self.profile_auth_infos.iter().any(|a| {
-                        a.profile_id == *pid && a.auth_status == AuthStatus::Ok
-                    });
-                    if is_now_ok {
+                // Refresh all profiles that are now authenticated.
+                // This covers both newly-authenticated profiles AND
+                // already-OK profiles whose credentials were renewed.
+                let now_ok: Vec<String> = self.profile_auth_infos.iter()
+                    .filter(|a| a.auth_status == AuthStatus::Ok)
+                    .map(|a| a.profile_id.clone())
+                    .collect();
+                for pid in &now_ok {
+                    if previously_unauthed.contains(pid) {
                         self.log_info(format!(
                             "auth became OK for profile={pid}, loading cache and refreshing"
                         ));
                         self.load_cache_for_profile(pid);
-                        self.refresh_profile(pid, true);
+                    } else {
+                        self.log_info(format!(
+                            "credentials renewed for profile={pid}, refreshing"
+                        ));
                     }
+                    self.refresh_profile(pid, true);
                 }
             }
         }
