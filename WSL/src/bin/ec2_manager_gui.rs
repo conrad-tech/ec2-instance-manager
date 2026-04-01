@@ -1487,7 +1487,16 @@ mod gui {
 
             let mode = self.options.mode.clone();
             let config = self.config.clone();
-            let region_override = self.options.region.clone();
+            // Use the profile's own configured region, not the global
+            // region override, so Refresh All doesn't force every
+            // account to use the currently selected account's region.
+            let region_override = if self.selected_profile.as_deref() == Some(profile_id) {
+                self.options.region.clone()
+            } else {
+                self.config.profiles.iter()
+                    .find(|p| p.profile_id == pid)
+                    .and_then(|p| p.region.clone())
+            };
             let tx = self.refresh_tx.clone();
 
             std::thread::spawn(move || {
@@ -3516,7 +3525,7 @@ mod gui {
                         let region_scope = self.region_scope();
                         let mut pending_connect: Option<String> = None;
                         let mut pending_fav_toggle: Option<String> = None;
-                        let mut pending_filter_term: Option<String> = None;
+                        let mut pending_add_to_saved_filter: Option<(String, String)> = None;
                         let (include_terms, _) = search_terms_from_rules(&self.search_rules);
 
                         // Sort filtered instances if a sort column is selected.
@@ -3760,44 +3769,36 @@ mod gui {
 
                             let detail_instance_clone = instance.clone();
                             let filter_instance_clone = instance.clone();
-                            let mut add_filter_term: Option<String> = None;
+                            let mut add_to_saved_filter: Option<(String, String)> = None;
                             row_response.context_menu(|ui| {
                                 if ui.button("Quick Connect").clicked() {
                                     quick_connect_clicked = true;
                                     ui.close();
                                 }
                                 ui.menu_button("Add to filter", |ui| {
-                                    let mut filter_items: Vec<(&str, String)> = Vec::new();
-                                    if let Some(name) = &filter_instance_clone.name {
-                                        if !name.is_empty() {
-                                            filter_items.push(("Name", name.clone()));
-                                        }
-                                    }
-                                    filter_items.push(("Instance ID", filter_instance_clone.instance_id.clone()));
-                                    if let Some(ip) = &filter_instance_clone.private_ip {
-                                        if !ip.is_empty() {
-                                            filter_items.push(("IP", ip.clone()));
-                                        }
-                                    }
-                                    if let Some(itype) = &filter_instance_clone.instance_type {
-                                        if !itype.is_empty() {
-                                            filter_items.push(("Type", itype.clone()));
-                                        }
-                                    }
-                                    for (key, val) in &filter_instance_clone.tags {
-                                        if !val.is_empty() {
-                                            filter_items.push(("Tag", format!("{key}: {val}")));
-                                        }
-                                    }
-                                    for (label, value) in filter_items {
-                                        let display = if label == "Tag" {
-                                            value.clone()
-                                        } else {
-                                            format!("{label}: {value}")
-                                        };
-                                        if ui.button(&display).clicked() {
-                                            add_filter_term = Some(value);
-                                            ui.close();
+                                    let mut scope_filters = self
+                                        .config
+                                        .saved_filters_for_scope("global", "global");
+                                    scope_filters.sort_by(|a, b| {
+                                        a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())
+                                    });
+                                    if scope_filters.is_empty() {
+                                        ui.label("No saved filters");
+                                    } else {
+                                        let term = filter_instance_clone
+                                            .name
+                                            .as_deref()
+                                            .filter(|n| !n.is_empty())
+                                            .unwrap_or(&filter_instance_clone.instance_id)
+                                            .to_string();
+                                        for saved in &scope_filters {
+                                            if ui.button(&saved.name).clicked() {
+                                                add_to_saved_filter = Some((
+                                                    saved.name.clone(),
+                                                    term.clone(),
+                                                ));
+                                                ui.close();
+                                            }
                                         }
                                     }
                                 });
@@ -3826,8 +3827,8 @@ mod gui {
                                 }
                             });
 
-                            if let Some(term) = add_filter_term {
-                                pending_filter_term = Some(term);
+                            if let Some(entry) = add_to_saved_filter {
+                                pending_add_to_saved_filter = Some(entry);
                             }
 
                             if row_hovered {
@@ -3895,12 +3896,26 @@ mod gui {
                             }
                         }
 
-                        if let Some(term) = pending_filter_term {
-                            self.search_rules.push(SearchRuleInput {
-                                kind: SearchRuleKind::Include,
-                                term,
-                            });
-                            self.apply_filters();
+                        if let Some((filter_name, term)) = pending_add_to_saved_filter {
+                            let mut filters = self
+                                .config
+                                .saved_filters_for_scope("global", "global");
+                            if let Some(saved) = filters.iter_mut().find(|f| f.name == filter_name) {
+                                if !saved.include_terms.iter().any(|t| t == &term) {
+                                    saved.include_terms.push(term.clone());
+                                    let updated = saved.clone();
+                                    self.config.upsert_saved_filter("global", "global", updated);
+                                    if let Err(err) = self.config.save() {
+                                        self.message = format!("error: {err}");
+                                        self.log_error(self.message.clone());
+                                    } else {
+                                        self.message = format!("Added '{term}' to filter '{filter_name}'");
+                                        self.log_info(self.message.clone());
+                                    }
+                                } else {
+                                    self.message = format!("'{term}' already in filter '{filter_name}'");
+                                }
+                            }
                         }
                     });
                 ui.add_space(20.0);

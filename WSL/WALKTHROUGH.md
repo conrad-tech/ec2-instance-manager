@@ -17,9 +17,16 @@
 - Only authenticated accounts (valid credentials) are selectable
 - Switching accounts clears any multi-account selections
 
+### Authentication
+- The app reads `fed_aws_*` credentials and `fed_expire` directly from `~/.aws/credentials`
+- Authenticate externally (e.g., via `fed` / Okta) before or after launching the app
+- The app polls the credentials file for changes — when you re-authenticate, all accounts that become valid are **automatically refreshed**
+- AWS CLI calls use the cached credentials via environment variables, so `credential_process` helpers are never triggered by the app (no surprise terminal windows)
+
 ### Refreshing Inventory
 - **Refresh** — reloads EC2 instances for the current account
 - **Refresh All** — reloads all authenticated accounts in parallel (useful for multi-account lookup)
+- Re-authenticating (credentials file change) automatically triggers a refresh for all authenticated accounts
 
 ---
 
@@ -54,6 +61,13 @@
 - Click the **x** next to a filter name to delete it (the dropdown stays open)
 - Click **Clear Filters** to reset everything
 - Saved filters are listed in alphabetical order
+
+### Add to Saved Filter (Right-Click)
+- **Right-click** any instance in the inventory and select **Add to filter**
+- A submenu lists all your saved filters (e.g., "bastions", "prod-servers")
+- Click a filter name to add the instance's name (or instance ID if unnamed) as an include term to that saved filter
+- Duplicates are skipped — if the instance is already in the filter, nothing changes
+- The filter is saved to config immediately
 
 ### Reset Filter on Profile Switch
 - By default, switching accounts clears your active filters and saved-filter selection
@@ -119,7 +133,8 @@
 - Select your preferred shell from the terminal dropdown on the left panel
 
 ### Update PS1
-- Click **Update PS1** to set a colored prompt showing user, host, and working directory
+- Click **Update PS1** to switch to bash and set a colored prompt showing user, host, and working directory
+- SSM sessions start in `sh` which doesn't support color prompts — Update PS1 runs `exec bash` to switch to a proper bash shell first
 - This also runs `clear` to clean up the terminal
 
 ### Multiple Connections
@@ -192,7 +207,7 @@ The file browser is the left sidebar in the Connections panel.
 | `Ctrl+C` | Copy selected text (log panel, editor) |
 | `Enter` | Navigate to typed path in file browser |
 | Click terminal area | Focus terminal for keyboard input |
-| Right-click terminal | Copy selected text, or paste if nothing selected |
+| Right-click terminal | Copy selected text, or paste if nothing selected (normalizes OneNote/rich text characters) |
 | Scroll wheel | Scroll terminal history |
 
 ---
@@ -219,7 +234,7 @@ If WSL connections fail but PowerShell connections work, WSL environment variabl
 - Type full paths directly in the path bar instead of clicking through directories — saves multiple API calls
 - The directory cache makes revisiting paths instant — use Refresh to force a fresh listing
 - If the file browser gives an SSM error on first try, click Refresh or Go to retry
-- Use **Update PS1** after connecting to get a clean colored prompt (also clears the terminal)
+- Use **Update PS1** after connecting to get a clean colored prompt (switches to bash and clears the terminal)
 - Use `clear` in the terminal before running vim to avoid display issues after exiting
 - All AWS API calls for the file browser run silently (no console window flashes)
 - If WSL connections are slow, try `wsl --shutdown` in PowerShell and relaunch the app
