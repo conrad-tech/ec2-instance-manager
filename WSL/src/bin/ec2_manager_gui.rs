@@ -4515,7 +4515,47 @@ mod gui {
                                     }
                                 }
                             }
-                            if terminal_focus_response.clicked() {
+                            // Double-click → select word. Triple-click → select line.
+                            // These fire on release of the 2nd/3rd click; handle them
+                            // before the regular `clicked()` clear below.
+                            let double_clicked = terminal_focus_response.double_clicked();
+                            let triple_clicked = terminal_focus_response.triple_clicked();
+                            if (double_clicked || triple_clicked) && pointer_pos
+                                .is_some_and(|p| term_rect.contains(p))
+                            {
+                                let pos = pointer_pos.unwrap();
+                                let scroll_off = self.pty_sessions.get(&tab_id)
+                                    .map(|s| s.scroll_offset).unwrap_or(0);
+                                let (row, col) = pixel_to_grid_cell(
+                                    pos, term_rect, sel_cell_w, sel_cell_h, sel_rows, sel_cols,
+                                );
+                                let abs_row = screen_row_to_abs(row, scroll_off, sel_rows);
+                                if triple_clicked {
+                                    let sel = self.terminal_selections.entry(tab_id).or_default();
+                                    sel.anchor = Some(AbsPos { abs_row, col: 0 });
+                                    sel.end = Some(AbsPos {
+                                        abs_row,
+                                        col: sel_cols.saturating_sub(1),
+                                    });
+                                } else if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
+                                    let vr = session.parser.screen().size().0 as usize;
+                                    let cols_count = session.parser.screen().size().1;
+                                    session.parser.screen_mut().set_scrollback(abs_row);
+                                    let screen_row = vr.saturating_sub(1) as u16;
+                                    let row_text = session.parser.screen().contents_between(
+                                        screen_row, 0, screen_row, cols_count,
+                                    );
+                                    session.parser.screen_mut().set_scrollback(0);
+                                    let (start_col, end_col) = find_word_bounds(&row_text, col);
+                                    let sel = self.terminal_selections.entry(tab_id).or_default();
+                                    sel.anchor = Some(AbsPos { abs_row, col: start_col });
+                                    sel.end = Some(AbsPos { abs_row, col: end_col });
+                                }
+                            }
+                            if terminal_focus_response.clicked()
+                                && !double_clicked
+                                && !triple_clicked
+                            {
                                 if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
                                     sel.clear();
                                 }
@@ -7577,6 +7617,36 @@ mod gui {
 
     /// Extract selected text from a terminal parser across an absolute selection range.
     /// `start` has the higher abs_row (further into history), `end` has the lower.
+    /// Find word boundaries within a row of terminal text. Returns
+    /// (start_col, end_col) inclusive, where both bounds are the columns
+    /// of the first/last "word character" contiguous with the click
+    /// position. A word char here is alphanumeric or one of
+    /// `_ - . / : @` — covers identifiers, file paths, hostnames,
+    /// IP:port, and simple URLs. If the clicked cell isn't a word char,
+    /// returns (col, col).
+    fn find_word_bounds(row_text: &str, col: u16) -> (u16, u16) {
+        let chars: Vec<char> = row_text.chars().collect();
+        let idx = col as usize;
+        if chars.is_empty() || idx >= chars.len() {
+            return (col, col);
+        }
+        let is_word = |c: char| {
+            c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '@')
+        };
+        if !is_word(chars[idx]) {
+            return (col, col);
+        }
+        let mut start = idx;
+        let mut end = idx;
+        while start > 0 && is_word(chars[start - 1]) {
+            start -= 1;
+        }
+        while end + 1 < chars.len() && is_word(chars[end + 1]) {
+            end += 1;
+        }
+        (start as u16, end as u16)
+    }
+
     fn extract_selection_text(
         parser: &mut vt100::Parser,
         start: AbsPos,
