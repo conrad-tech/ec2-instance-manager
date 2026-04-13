@@ -526,17 +526,17 @@ mod gui {
         },
     }
 
-    /// Git-bash-style PS1 prompt sent to the remote shell when the user
-    /// clicks "Update PS1".  Runs `sudo bash -c exit` to prime the SSM
-    /// output pipeline (preventing first-command buffering issues) without
-    /// opening an interactive root shell that would consume the remaining
-    /// input buffer.  Then sets PS1 as the current user.  Produces:
+    /// Shell setup sent to the remote shell when the user clicks "Prep
+    /// Terminal".  Execs bash (SSM sessions start in `sh`), sets a
+    /// git-bash-style PS1, and appends `set paste` to `~/.vimrc` if not
+    /// already present (fixes staircase-indent on right-click paste into
+    /// vim).  Produces:
     ///   (blank line)
     ///   user@host SSM ~/working/dir
     ///   $
     /// with bold-green user@host, magenta "SSM", and bold-yellow path.
-    const SSM_PS1_COMMAND: &[u8] =
-        b"exec bash\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\rclear\r";
+    const PREP_TERMINAL_COMMAND: &[u8] =
+        b"exec bash\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\rgrep -qxF 'set paste' ~/.vimrc 2>/dev/null || echo 'set paste' >> ~/.vimrc\rclear\r";
 
     #[derive(Debug, PartialEq, Eq)]
     struct RowAction {
@@ -2217,7 +2217,7 @@ mod gui {
                                 {
                                     session.ps1_auto_sent = true;
                                     if let Ok(mut stdin) = session.writer.lock() {
-                                        let _ = stdin.write_all(SSM_PS1_COMMAND)
+                                        let _ = stdin.write_all(PREP_TERMINAL_COMMAND)
                                             .and_then(|()| stdin.flush());
                                     }
                                 }
@@ -2467,10 +2467,13 @@ mod gui {
                             "auth not OK for {display} ({profile_id})"
                         ));
                         // Keep the memory cache intact so it's available
-                        // immediately when auth becomes OK again. Only
-                        // clear the active display if this is the selected profile.
+                        // immediately when auth becomes OK again. For the
+                        // selected profile, blank the display entirely —
+                        // we don't show instances for an unauthorized
+                        // account.
                         if is_selected {
                             self.context = Some(context);
+                            self.inventory.instances.clear();
                             self.filtered.clear();
                             self.message = format!(
                                 "Auth is not OK for {display}. Refresh credentials and retry."
@@ -4240,8 +4243,8 @@ mod gui {
                         tab.running,
                         pty_bytes,
                     ));
-                    if tab.running && ui.small_button("Update PS1").clicked() {
-                        self.send_raw_bytes_to_connection_tab(tab.id, SSM_PS1_COMMAND);
+                    if tab.running && ui.small_button("Prep Terminal").clicked() {
+                        self.send_raw_bytes_to_connection_tab(tab.id, PREP_TERMINAL_COMMAND);
                     }
                 });
                 ui.separator();
@@ -6194,13 +6197,20 @@ mod gui {
                                 self.search_rules = vec![SearchRuleInput::default()];
                                 self.selected_saved_filter.clear();
                             }
-                            // Save current inventory to memory cache before switching
+                            // Save current inventory to memory cache before
+                            // switching — but only if the departing profile is
+                            // auth-ok, so we don't overwrite a last-good cache
+                            // with an empty display from an unauthorized state.
                             if let Some(ref old_profile) = before_profile {
                                 if let Some(ref ctx) = self.context {
-                                    self.profile_inventory_cache.insert(
-                                        old_profile.clone(),
-                                        (self.inventory.clone(), ctx.clone()),
-                                    );
+                                    if ctx.auth_status == AuthStatus::Ok
+                                        && !self.inventory.instances.is_empty()
+                                    {
+                                        self.profile_inventory_cache.insert(
+                                            old_profile.clone(),
+                                            (self.inventory.clone(), ctx.clone()),
+                                        );
+                                    }
                                 }
                             }
 
