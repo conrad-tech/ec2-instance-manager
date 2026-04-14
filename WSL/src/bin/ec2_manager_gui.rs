@@ -4040,7 +4040,11 @@ mod gui {
             let mut to_reopen: Option<(String, String)> = None;
             let mut to_pick_color: Option<(u64, String)> = None;
 
-            ui.horizontal_wrapped(|ui| {
+            egui::ScrollArea::horizontal()
+                .auto_shrink([false, true])
+                .id_salt("connection_tabs_scroll")
+                .show(ui, |ui| {
+            ui.horizontal(|ui| {
                 for (id, title, profile_id, running) in &tabs_snapshot {
                     let tab_color = if colors_enabled {
                         // Look up environment color for this tab's instance
@@ -4143,6 +4147,7 @@ mod gui {
                     close_all = true;
                 }
             });
+                });
 
             if let Some(id) = to_select {
                 self.connections.select(id);
