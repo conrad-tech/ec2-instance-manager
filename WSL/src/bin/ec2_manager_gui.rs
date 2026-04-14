@@ -3485,13 +3485,18 @@ mod gui {
             // between monitor moves is preserved.
             let current_ppp = ui.ctx().pixels_per_point();
             let native_ppp = ui.ctx().native_pixels_per_point().unwrap_or(1.0);
-            let (window_points, outer_pos) = ui.ctx().input(|i| {
+            let (monitor_points_w, outer_pos) = ui.ctx().input(|i| {
                 let vp = i.viewport();
-                let w = vp.inner_rect.map(|r| r.width()).unwrap_or(0.0);
+                // Prefer monitor width (stable across window resizes)
+                // but fall back to inner window width if not reported.
+                let mon_w = vp
+                    .monitor_size
+                    .map(|s| s.x)
+                    .unwrap_or_else(|| vp.inner_rect.map(|r| r.width()).unwrap_or(0.0));
                 let pos = vp.outer_rect.map(|r| r.min);
-                (w, pos)
+                (mon_w, pos)
             });
-            let window_pixels = window_points * current_ppp;
+            let window_pixels = monitor_points_w * current_ppp;
             // Short cooldown (150ms) only as a safety net against
             // pathological frame-to-frame jitter; monitor moves bypass
             // it so rapid Monitor A → B → A swaps still auto-fit.
@@ -3514,7 +3519,7 @@ mod gui {
                 // below 1.0x (content overflow is handled by scrollbars).
                 // Conservative factor (0.9) leaves a bit of breathing
                 // room so the auto-fit doesn't zoom one step too far.
-                const AUTO_FIT_CONSERVATIVE: f32 = 0.9;
+                const AUTO_FIT_CONSERVATIVE: f32 = 0.95;
                 let raw = window_pixels / (GUI_DEFAULT_WIDTH * native_ppp);
                 let target_scale = (raw * AUTO_FIT_CONSERVATIVE).max(1.0).min(3.0);
                 if (target_scale - self.ui_scale).abs() > 0.02 {
