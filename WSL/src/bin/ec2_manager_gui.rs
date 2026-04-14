@@ -858,9 +858,8 @@ mod gui {
         last_native_ppp: f32,
         /// Auto-fit zoom has been applied once after startup.
         auto_fit_applied: bool,
-        /// Last observed window outer position; used to detect monitor moves.
-        last_window_outer_pos: Option<egui::Pos2>,
-        /// Last width used to compute auto-fit; prevents re-fit on trivial resizes.
+        /// Last physical-pixel panel width used to compute auto-fit;
+        /// stable across zoom changes so we don't self-trigger.
         last_auto_fit_width: f32,
         sort_column: Option<SortColumn>,
         sort_direction: SortDirection,
@@ -1018,7 +1017,6 @@ mod gui {
                 ui_scale,
                 last_native_ppp: 0.0,
                 auto_fit_applied: false,
-                last_window_outer_pos: None,
                 last_auto_fit_width: 0.0,
                 sort_column: None,
                 sort_direction: SortDirection::Ascending,
@@ -3472,6 +3470,56 @@ mod gui {
         }
 
         fn render_inventory_panel(&mut self, ui: &mut egui::Ui) {
+            // Auto-fit zoom: fire once per unique physical-pixel panel
+            // width (startup + monitor moves / window resizes). Only
+            // zooms IN to fill empty space; if content already overflows
+            // the panel, set to 100%. Using physical pixels as the
+            // trigger (not points) prevents feedback loops when our own
+            // ppp change alters the points-unit width.
+            let current_ppp = ui.ctx().pixels_per_point();
+            let native_ppp = ui.ctx().native_pixels_per_point().unwrap_or(1.0);
+            let available_points = ui.available_width();
+            let available_pixels = available_points * current_ppp;
+            // Sum of base column widths (in points) — this is the
+            // natural content width of the table at 1.0x.
+            let content_points: f32 = INVENTORY_HEADERS
+                .iter()
+                .map(|(_, c)| {
+                    let k = *c as u8;
+                    self.column_widths
+                        .get(&k)
+                        .copied()
+                        .unwrap_or_else(|| c.default_width())
+                })
+                .sum::<f32>()
+                + (INVENTORY_HEADERS.len() as f32 * 2.0); // grid spacing
+            if available_pixels > 0.0
+                && content_points > 0.0
+                && (available_pixels - self.last_auto_fit_width).abs() > 100.0
+            {
+                const TARGET_FILL: f32 = 0.95;
+                let ideal_available_points = content_points / TARGET_FILL;
+                let new_ppp = if available_points <= content_points {
+                    // Content already overflows or matches — default to 100%
+                    native_ppp
+                } else {
+                    // Empty space — zoom in so content fills ~95% of panel
+                    (available_pixels / ideal_available_points).clamp(0.5 * native_ppp, 3.0 * native_ppp)
+                };
+                let new_scale = new_ppp / native_ppp;
+                if (new_scale - self.ui_scale).abs() > 0.02 {
+                    self.ui_scale = new_scale;
+                    self.config.ui_scale = Some(new_scale);
+                    let _ = self.config.save();
+                    ui.ctx().set_pixels_per_point(new_ppp);
+                    self.log_debug(format!(
+                        "auto-fit: avail_px={available_pixels:.0} content_pt={content_points:.0} -> ui_scale={new_scale:.2}"
+                    ));
+                }
+                self.last_auto_fit_width = available_pixels;
+                self.auto_fit_applied = true;
+            }
+
             ui.horizontal(|ui| {
                 ui.label(format!(
                     "Instances: {} filtered / {} total",
@@ -5531,39 +5579,8 @@ mod gui {
                     ctx.set_pixels_per_point(self.ui_scale * native_ppp);
                 }
 
-                // Auto-fit zoom: run once at startup and again whenever the
-                // window moves between monitors (detected via outer position
-                // jump or native-ppp change). Manual Ctrl+/Ctrl- zoom between
-                // monitor moves is preserved until the next move.
-                const AUTO_FIT_REFERENCE_WIDTH: f32 = 1200.0;
-                let outer_pos = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min));
-                let window_width = ctx.input(|i| i.content_rect().width());
-                let moved_monitor = match (self.last_window_outer_pos, outer_pos) {
-                    (Some(prev), Some(now)) => {
-                        (prev.x - now.x).abs() > 400.0 || (prev.y - now.y).abs() > 400.0
-                    }
-                    _ => false,
-                };
-                if outer_pos.is_some() {
-                    self.last_window_outer_pos = outer_pos;
-                }
-                let width_changed =
-                    (window_width - self.last_auto_fit_width).abs() > 50.0;
-                let should_auto_fit = (!self.auto_fit_applied && window_width > 0.0)
-                    || (moved_monitor && width_changed)
-                    || (ppp_changed && self.auto_fit_applied);
-                if should_auto_fit && window_width > 0.0 {
-                    let target = (window_width / AUTO_FIT_REFERENCE_WIDTH).clamp(0.5, 3.0);
-                    self.ui_scale = target;
-                    self.last_auto_fit_width = window_width;
-                    self.auto_fit_applied = true;
-                    self.config.ui_scale = Some(target);
-                    let _ = self.config.save();
-                    ctx.set_pixels_per_point(self.ui_scale * native_ppp);
-                    self.log_debug(format!(
-                        "auto-fit zoom: window_width={window_width:.0} -> ui_scale={target:.2}"
-                    ));
-                }
+                // (Auto-fit zoom applied inside render_inventory_panel
+                // where the inventory's actual available width is known.)
 
                 // Zoom hotkeys: Ctrl+= / Ctrl++ zoom in, Ctrl+- zoom out,
                 // Ctrl+0 reset to 1.0x (useful if DPI auto-detect missed a
