@@ -856,6 +856,12 @@ mod gui {
         scroll_sensitivity: f32,
         ui_scale: f32,
         last_native_ppp: f32,
+        /// Auto-fit zoom has been applied once after startup.
+        auto_fit_applied: bool,
+        /// Last observed window outer position; used to detect monitor moves.
+        last_window_outer_pos: Option<egui::Pos2>,
+        /// Last width used to compute auto-fit; prevents re-fit on trivial resizes.
+        last_auto_fit_width: f32,
         sort_column: Option<SortColumn>,
         sort_direction: SortDirection,
         column_widths: HashMap<u8, f32>,
@@ -1011,6 +1017,9 @@ mod gui {
                 scroll_sensitivity,
                 ui_scale,
                 last_native_ppp: 0.0,
+                auto_fit_applied: false,
+                last_window_outer_pos: None,
+                last_auto_fit_width: 0.0,
                 sort_column: None,
                 sort_direction: SortDirection::Ascending,
                 column_widths: default_column_widths(),
@@ -5513,12 +5522,47 @@ mod gui {
             let update_result = panic::catch_unwind(AssertUnwindSafe(|| {
                 // Re-apply scaling when native DPI changes (monitor switch)
                 let native_ppp = ctx.native_pixels_per_point().unwrap_or(1.0);
-                if (native_ppp - self.last_native_ppp).abs() > 0.01 {
+                let ppp_changed = (native_ppp - self.last_native_ppp).abs() > 0.01;
+                if ppp_changed {
                     self.last_native_ppp = native_ppp;
                     // Clear all terminal selections — the old pixel positions
                     // are invalid after a DPI change (monitor switch).
                     self.terminal_selections.clear();
                     ctx.set_pixels_per_point(self.ui_scale * native_ppp);
+                }
+
+                // Auto-fit zoom: run once at startup and again whenever the
+                // window moves between monitors (detected via outer position
+                // jump or native-ppp change). Manual Ctrl+/Ctrl- zoom between
+                // monitor moves is preserved until the next move.
+                const AUTO_FIT_REFERENCE_WIDTH: f32 = 1200.0;
+                let outer_pos = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min));
+                let window_width = ctx.input(|i| i.content_rect().width());
+                let moved_monitor = match (self.last_window_outer_pos, outer_pos) {
+                    (Some(prev), Some(now)) => {
+                        (prev.x - now.x).abs() > 400.0 || (prev.y - now.y).abs() > 400.0
+                    }
+                    _ => false,
+                };
+                if outer_pos.is_some() {
+                    self.last_window_outer_pos = outer_pos;
+                }
+                let width_changed =
+                    (window_width - self.last_auto_fit_width).abs() > 50.0;
+                let should_auto_fit = (!self.auto_fit_applied && window_width > 0.0)
+                    || (moved_monitor && width_changed)
+                    || (ppp_changed && self.auto_fit_applied);
+                if should_auto_fit && window_width > 0.0 {
+                    let target = (window_width / AUTO_FIT_REFERENCE_WIDTH).clamp(0.5, 3.0);
+                    self.ui_scale = target;
+                    self.last_auto_fit_width = window_width;
+                    self.auto_fit_applied = true;
+                    self.config.ui_scale = Some(target);
+                    let _ = self.config.save();
+                    ctx.set_pixels_per_point(self.ui_scale * native_ppp);
+                    self.log_debug(format!(
+                        "auto-fit zoom: window_width={window_width:.0} -> ui_scale={target:.2}"
+                    ));
                 }
 
                 // Zoom hotkeys: Ctrl+= / Ctrl++ zoom in, Ctrl+- zoom out,
