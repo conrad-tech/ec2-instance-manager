@@ -206,7 +206,12 @@ The file browser is the left sidebar in the Connections panel.
 |----------|--------|
 | `Ctrl+S` | Save the active editor file |
 | `Ctrl+C` | Copy selected text (log panel, editor) |
+| `Ctrl+=` / `Ctrl++` | Zoom in |
+| `Ctrl+-` | Zoom out |
+| `Ctrl+0` | Reset zoom to 100% (also fixes sizing if moving between monitors didn't auto-rescale) |
 | `Enter` | Navigate to typed path in file browser |
+| Double-click terminal text | Select word |
+| Triple-click terminal text | Select whole line |
 | Click terminal area | Focus terminal for keyboard input |
 | Right-click terminal | Copy selected text, or paste if nothing selected (normalizes OneNote/rich text characters) |
 | Scroll wheel | Scroll terminal history |

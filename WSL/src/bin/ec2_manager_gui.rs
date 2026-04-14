@@ -5521,6 +5521,39 @@ mod gui {
                     ctx.set_pixels_per_point(self.ui_scale * native_ppp);
                 }
 
+                // Zoom hotkeys: Ctrl+= / Ctrl++ zoom in, Ctrl+- zoom out,
+                // Ctrl+0 reset to 1.0x (useful if DPI auto-detect missed a
+                // monitor move).
+                let (zoom_in, zoom_out, zoom_reset) = ctx.input(|i| {
+                    let ctrl = i.modifiers.ctrl || i.modifiers.command;
+                    if !ctrl {
+                        return (false, false, false);
+                    }
+                    let zin = i.key_pressed(egui::Key::Plus)
+                        || i.key_pressed(egui::Key::Equals);
+                    let zout = i.key_pressed(egui::Key::Minus);
+                    let zreset = i.key_pressed(egui::Key::Num0);
+                    (zin, zout, zreset)
+                });
+                if zoom_in {
+                    self.ui_scale = (self.ui_scale + 0.1).min(3.0);
+                    self.config.ui_scale = Some(self.ui_scale);
+                    let _ = self.config.save();
+                    ctx.set_pixels_per_point(self.ui_scale * native_ppp);
+                }
+                if zoom_out {
+                    self.ui_scale = (self.ui_scale - 0.1).max(0.5);
+                    self.config.ui_scale = Some(self.ui_scale);
+                    let _ = self.config.save();
+                    ctx.set_pixels_per_point(self.ui_scale * native_ppp);
+                }
+                if zoom_reset {
+                    self.ui_scale = 1.0;
+                    self.config.ui_scale = Some(self.ui_scale);
+                    let _ = self.config.save();
+                    ctx.set_pixels_per_point(self.ui_scale * native_ppp);
+                }
+
                 // --- WSL Setup (non-blocking) ---
                 if matches!(self.wsl_setup_state, WslSetupState::Checking) {
                     if let Ok(status) = self.wsl_setup_rx.try_recv() {
