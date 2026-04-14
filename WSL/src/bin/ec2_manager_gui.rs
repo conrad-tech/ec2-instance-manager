@@ -861,6 +861,9 @@ mod gui {
         /// Last physical-pixel panel width used to compute auto-fit;
         /// stable across zoom changes so we don't self-trigger.
         last_auto_fit_width: f32,
+        /// When auto-fit last fired. Enforces a cooldown so transient
+        /// frame-to-frame math jitter can't cause oscillation.
+        last_auto_fit_at: Option<Instant>,
         sort_column: Option<SortColumn>,
         sort_direction: SortDirection,
         column_widths: HashMap<u8, f32>,
@@ -1018,6 +1021,7 @@ mod gui {
                 last_native_ppp: 0.0,
                 auto_fit_applied: false,
                 last_auto_fit_width: 0.0,
+                last_auto_fit_at: None,
                 sort_column: None,
                 sort_direction: SortDirection::Ascending,
                 column_widths: default_column_widths(),
@@ -3470,54 +3474,45 @@ mod gui {
         }
 
         fn render_inventory_panel(&mut self, ui: &mut egui::Ui) {
-            // Auto-fit zoom: fire once per unique physical-pixel panel
-            // width (startup + monitor moves / window resizes). Only
-            // zooms IN to fill empty space; if content already overflows
-            // the panel, set to 100%. Using physical pixels as the
-            // trigger (not points) prevents feedback loops when our own
-            // ppp change alters the points-unit width.
+            // Auto-fit zoom: trigger only when the *window's physical
+            // pixel width* changes (startup, resize, monitor move). This
+            // is stable regardless of our own ppp changes, so no
+            // feedback loop. Rule: only zoom IN to fill empty space
+            // relative to the design width (GUI_DEFAULT_WIDTH); never
+            // shrink below 100%.
             let current_ppp = ui.ctx().pixels_per_point();
             let native_ppp = ui.ctx().native_pixels_per_point().unwrap_or(1.0);
-            let available_points = ui.available_width();
-            let available_pixels = available_points * current_ppp;
-            // Sum of base column widths (in points) — this is the
-            // natural content width of the table at 1.0x.
-            let content_points: f32 = INVENTORY_HEADERS
-                .iter()
-                .map(|(_, c)| {
-                    let k = *c as u8;
-                    self.column_widths
-                        .get(&k)
-                        .copied()
-                        .unwrap_or_else(|| c.default_width())
-                })
-                .sum::<f32>()
-                + (INVENTORY_HEADERS.len() as f32 * 2.0); // grid spacing
-            if available_pixels > 0.0
-                && content_points > 0.0
-                && (available_pixels - self.last_auto_fit_width).abs() > 100.0
+            let window_points = ui.ctx().input(|i| i.viewport().inner_rect.map(|r| r.width()).unwrap_or(0.0));
+            let window_pixels = window_points * current_ppp;
+            // Cooldown: don't re-fire within 1 second of last auto-fit.
+            // Prevents transient frame-to-frame jitter after set_pixels_per_point
+            // from re-triggering the check.
+            let cooldown_elapsed = self
+                .last_auto_fit_at
+                .map(|t| t.elapsed() >= Duration::from_millis(1000))
+                .unwrap_or(true);
+            if window_pixels > 0.0
+                && cooldown_elapsed
+                && (window_pixels - self.last_auto_fit_width).abs() > 100.0
             {
-                const TARGET_FILL: f32 = 0.95;
-                let ideal_available_points = content_points / TARGET_FILL;
-                let new_ppp = if available_points <= content_points {
-                    // Content already overflows or matches — default to 100%
-                    native_ppp
-                } else {
-                    // Empty space — zoom in so content fills ~95% of panel
-                    (available_pixels / ideal_available_points).clamp(0.5 * native_ppp, 3.0 * native_ppp)
-                };
-                let new_scale = new_ppp / native_ppp;
-                if (new_scale - self.ui_scale).abs() > 0.02 {
-                    self.ui_scale = new_scale;
-                    self.config.ui_scale = Some(new_scale);
+                // GUI_DEFAULT_WIDTH (1720 pt) is the design width at
+                // 1.0x. Bigger window → scale up proportionally. Never
+                // below 1.0x (content overflow is handled by scrollbars).
+                let target_scale = (window_pixels / (GUI_DEFAULT_WIDTH * native_ppp))
+                    .max(1.0)
+                    .min(3.0);
+                if (target_scale - self.ui_scale).abs() > 0.02 {
+                    self.ui_scale = target_scale;
+                    self.config.ui_scale = Some(target_scale);
                     let _ = self.config.save();
-                    ui.ctx().set_pixels_per_point(new_ppp);
+                    ui.ctx().set_pixels_per_point(target_scale * native_ppp);
                     self.log_debug(format!(
-                        "auto-fit: avail_px={available_pixels:.0} content_pt={content_points:.0} -> ui_scale={new_scale:.2}"
+                        "auto-fit: window_px={window_pixels:.0} -> ui_scale={target_scale:.2}"
                     ));
                 }
-                self.last_auto_fit_width = available_pixels;
+                self.last_auto_fit_width = window_pixels;
                 self.auto_fit_applied = true;
+                self.last_auto_fit_at = Some(Instant::now());
             }
 
             ui.horizontal(|ui| {
