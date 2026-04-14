@@ -3492,9 +3492,12 @@ mod gui {
                 (w, pos)
             });
             let window_pixels = window_points * current_ppp;
-            let cooldown_elapsed = self
+            // Short cooldown (150ms) only as a safety net against
+            // pathological frame-to-frame jitter; monitor moves bypass
+            // it so rapid Monitor A → B → A swaps still auto-fit.
+            let short_cooldown_elapsed = self
                 .last_auto_fit_at
-                .map(|t| t.elapsed() >= Duration::from_millis(500))
+                .map(|t| t.elapsed() >= Duration::from_millis(150))
                 .unwrap_or(true);
             let is_first_fit = !self.auto_fit_applied;
             let monitor_moved = match (self.last_auto_fit_outer_pos, outer_pos) {
@@ -3504,8 +3507,7 @@ mod gui {
                 _ => false,
             };
             if window_pixels > 0.0
-                && cooldown_elapsed
-                && (is_first_fit || monitor_moved)
+                && (monitor_moved || (is_first_fit && short_cooldown_elapsed))
             {
                 // GUI_DEFAULT_WIDTH (1720 pt) is the design width at
                 // 1.0x. Bigger window → scale up proportionally. Never
