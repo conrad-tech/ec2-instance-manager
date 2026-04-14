@@ -2206,100 +2206,29 @@ mod gui {
             Ok(())
         }
 
-        fn poll_connection_events(&mut self) {
+        fn poll_connection_events(&mut self) -> bool {
             // Process PtyReady events BEFORE proc_rx output events,
             // so the session is inserted into pty_sessions before any
             // output arrives from the reader thread.
             self.poll_ui_events();
 
+            // Drain proc_rx with a per-frame cap so a flood of output
+            // (e.g., sudo su - motd, terraform plan diff, awk over
+            // /etc/passwd on large-NSS hosts) can't starve the UI thread
+            // and block keystrokes. Output events for the same tab are
+            // coalesced into one buffer so we call vt100::Parser::process
+            // once per tab per frame instead of once per chunk.
+            const MAX_EVENTS_PER_FRAME: usize = 200;
+            let mut pending_output: HashMap<u64, Vec<u8>> = HashMap::new();
+            let mut events_processed = 0;
+            let mut hit_cap = false;
             while let Ok(event) = self.proc_rx.try_recv() {
                 match event {
                     ProcEvent::Output { tab_id, bytes } => {
-                        // Filter the harmless WSL ConPTY getpwuid warning from
-                        // the terminal display, but log it for diagnostics.
-                        let bytes = {
-                            let text = String::from_utf8_lossy(&bytes);
-                            if text.contains("CreateProcessParseCommon:1005: getpwuid") {
-                                for line in text.lines() {
-                                    if line.contains("CreateProcessParseCommon:1005: getpwuid") {
-                                        self.log_debug(format!("tab={tab_id} filtered WSL noise: {line}"));
-                                    }
-                                }
-                                let cleaned: String = text.lines()
-                                    .filter(|l| !l.contains("CreateProcessParseCommon:1005: getpwuid"))
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                cleaned.into_bytes()
-                            } else {
-                                bytes
-                            }
-                        };
-                        let log_msg = if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
-                            session.bytes_received += bytes.len() as u64;
-                            session.output_event_count += 1;
-                            let evt = session.output_event_count;
-                            let total = session.bytes_received;
-                            session.parser.process(&bytes);
-                            // Clear selection when new output arrives and user is at bottom
-                            if session.scroll_offset == 0 {
-                                if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
-                                    if sel.is_active() {
-                                        sel.clear();
-                                    }
-                                }
-                            }
-                            // Respond to Device Status Report queries (ESC[6n =
-                            // cursor position request).  CMD and PowerShell send
-                            // this at startup and block until they receive the
-                            // response ESC[row;colR.
-                            respond_to_terminal_queries(session, &bytes);
-                            // Auto-send PS1 once we detect a shell prompt
-                            // (ec2-user or root) so sudo won't need a password.
-                            if !session.ps1_auto_sent {
-                                let screen_text = session.parser.screen().contents();
-                                if screen_text.contains("ec2-user")
-                                    || screen_text.contains("root")
-                                {
-                                    session.ps1_auto_sent = true;
-                                    if let Ok(mut stdin) = session.writer.lock() {
-                                        let _ = stdin.write_all(PREP_TERMINAL_COMMAND)
-                                            .and_then(|()| stdin.flush());
-                                    }
-                                }
-                            }
-                            if evt <= 5 {
-                                let preview = String::from_utf8_lossy(
-                                    &bytes[..bytes.len().min(200)]
-                                );
-                                let sanitized: String = preview.chars().map(|c| {
-                                    if c.is_control() && c != '\n' { '.' } else { c }
-                                }).collect();
-                                let hex: String = bytes.iter()
-                                    .take(64)
-                                    .map(|b| format!("{b:02x}"))
-                                    .collect::<Vec<_>>()
-                                    .join(" ");
-                                Some((LogLevel::Debug, format!(
-                                    "tab={tab_id} output #{evt} len={} total={total} hex=[{hex}] preview=[{sanitized}]",
-                                    bytes.len(),
-                                )))
-                            } else {
-                                Some((LogLevel::Trace, format!(
-                                    "tab={tab_id} output bytes={} total={total}",
-                                    bytes.len(),
-                                )))
-                            }
-                        } else {
-                            let text = String::from_utf8_lossy(&bytes).to_string();
-                            for line in text.lines() {
-                                self.connections.append_line(tab_id, line.to_string());
-                            }
-                            None
-                        };
-                        if let Some((level, msg)) = log_msg {
-                            self.log(level, msg);
-                        }
-                        self.maybe_record_gui_smoke_success(tab_id, &bytes);
+                        pending_output
+                            .entry(tab_id)
+                            .or_default()
+                            .extend_from_slice(&bytes);
                     }
                     ProcEvent::Error { tab_id, error } => {
                         self.log_error(format!("tab={tab_id} process error: {error}"));
@@ -2327,6 +2256,95 @@ mod gui {
                         }
                     }
                 }
+                events_processed += 1;
+                if events_processed >= MAX_EVENTS_PER_FRAME {
+                    hit_cap = true;
+                    break;
+                }
+            }
+
+            // Apply coalesced output per tab.
+            for (tab_id, bytes) in pending_output {
+                // Filter the harmless WSL ConPTY getpwuid warning.
+                let bytes = {
+                    let text = String::from_utf8_lossy(&bytes);
+                    if text.contains("CreateProcessParseCommon:1005: getpwuid") {
+                        for line in text.lines() {
+                            if line.contains("CreateProcessParseCommon:1005: getpwuid") {
+                                self.log_debug(format!("tab={tab_id} filtered WSL noise: {line}"));
+                            }
+                        }
+                        let cleaned: String = text.lines()
+                            .filter(|l| !l.contains("CreateProcessParseCommon:1005: getpwuid"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        cleaned.into_bytes()
+                    } else {
+                        bytes
+                    }
+                };
+                let log_msg = if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
+                    session.bytes_received += bytes.len() as u64;
+                    session.output_event_count += 1;
+                    let evt = session.output_event_count;
+                    let total = session.bytes_received;
+                    session.parser.process(&bytes);
+                    // Clear selection when new output arrives and user is at bottom
+                    if session.scroll_offset == 0 {
+                        if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
+                            if sel.is_active() {
+                                sel.clear();
+                            }
+                        }
+                    }
+                    // Respond to Device Status Report queries.
+                    respond_to_terminal_queries(session, &bytes);
+                    // Auto-send PS1 once we detect a shell prompt.
+                    if !session.ps1_auto_sent {
+                        let screen_text = session.parser.screen().contents();
+                        if screen_text.contains("ec2-user")
+                            || screen_text.contains("root")
+                        {
+                            session.ps1_auto_sent = true;
+                            if let Ok(mut stdin) = session.writer.lock() {
+                                let _ = stdin.write_all(PREP_TERMINAL_COMMAND)
+                                    .and_then(|()| stdin.flush());
+                            }
+                        }
+                    }
+                    if evt <= 5 {
+                        let preview = String::from_utf8_lossy(
+                            &bytes[..bytes.len().min(200)]
+                        );
+                        let sanitized: String = preview.chars().map(|c| {
+                            if c.is_control() && c != '\n' { '.' } else { c }
+                        }).collect();
+                        let hex: String = bytes.iter()
+                            .take(64)
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        Some((LogLevel::Debug, format!(
+                            "tab={tab_id} output #{evt} len={} total={total} hex=[{hex}] preview=[{sanitized}]",
+                            bytes.len(),
+                        )))
+                    } else {
+                        Some((LogLevel::Trace, format!(
+                            "tab={tab_id} output bytes={} total={total}",
+                            bytes.len(),
+                        )))
+                    }
+                } else {
+                    let text = String::from_utf8_lossy(&bytes).to_string();
+                    for line in text.lines() {
+                        self.connections.append_line(tab_id, line.to_string());
+                    }
+                    None
+                };
+                if let Some((level, msg)) = log_msg {
+                    self.log(level, msg);
+                }
+                self.maybe_record_gui_smoke_success(tab_id, &bytes);
             }
 
             let mut exited: Vec<(u64, i32)> = Vec::new();
@@ -2389,6 +2407,8 @@ mod gui {
                 self.terminal_selections.remove(&tab_id);
                 let _ = self.proc_tx.send(ProcEvent::Exited { tab_id, code });
             }
+
+            hit_cap
         }
 
         #[cfg(target_os = "windows")]
@@ -5603,19 +5623,16 @@ mod gui {
                 // (Auto-fit zoom applied inside render_inventory_panel
                 // where the inventory's actual available width is known.)
 
-                // Zoom hotkeys: Ctrl+= / Ctrl++ zoom in, Ctrl+- zoom out,
-                // Ctrl+0 reset to 1.0x (useful if DPI auto-detect missed a
-                // monitor move).
-                let (zoom_in, zoom_out, zoom_reset) = ctx.input(|i| {
+                // Zoom hotkeys: Ctrl+= / Ctrl++ zoom in, Ctrl+- zoom out.
+                let (zoom_in, zoom_out) = ctx.input(|i| {
                     let ctrl = i.modifiers.ctrl || i.modifiers.command;
                     if !ctrl {
-                        return (false, false, false);
+                        return (false, false);
                     }
                     let zin = i.key_pressed(egui::Key::Plus)
                         || i.key_pressed(egui::Key::Equals);
                     let zout = i.key_pressed(egui::Key::Minus);
-                    let zreset = i.key_pressed(egui::Key::Num0);
-                    (zin, zout, zreset)
+                    (zin, zout)
                 });
                 if zoom_in {
                     self.ui_scale = (self.ui_scale + 0.1).min(3.0);
@@ -5628,14 +5645,6 @@ mod gui {
                     self.config.ui_scale = Some(self.ui_scale);
                     let _ = self.config.save();
                     ctx.set_pixels_per_point(self.ui_scale * native_ppp);
-                }
-                if zoom_reset {
-                    // Ctrl+0 re-triggers auto-fit for the current monitor.
-                    // Clears the state the auto-fit block gates on so it
-                    // fires on the next inventory panel render.
-                    self.auto_fit_applied = false;
-                    self.last_auto_fit_width = 0.0;
-                    self.last_auto_fit_at = None;
                 }
 
                 // --- WSL Setup (non-blocking) ---
@@ -5678,7 +5687,11 @@ mod gui {
                 self.poll_profile_choice_changes();
                 self.poll_credentials_changes();
                 self.poll_auth_expiry();
-                self.poll_connection_events();
+                if self.poll_connection_events() {
+                    // More output queued than we processed this frame;
+                    // schedule another frame to drain the rest.
+                    ctx.request_repaint();
+                }
                 self.poll_refresh_events();
                 self.poll_file_op_events();
                 if self.refreshing {
@@ -8822,7 +8835,7 @@ mod gui {
                 .selected()
                 .expect("selected connection tab should exist");
             for _ in 0..60 {
-                app.poll_connection_events();
+                let _ = app.poll_connection_events();
                 let found = app
                     .connections
                     .selected_ref()

@@ -208,7 +208,6 @@ The file browser is the left sidebar in the Connections panel.
 | `Ctrl+C` | Copy selected text (log panel, editor) |
 | `Ctrl+=` / `Ctrl++` | Zoom in |
 | `Ctrl+-` | Zoom out |
-| `Ctrl+0` | Reset zoom to 100% (also fixes sizing if moving between monitors didn't auto-rescale) |
 | `Enter` | Navigate to typed path in file browser |
 | Double-click terminal text | Select word |
 | Triple-click terminal text | Select whole line |
