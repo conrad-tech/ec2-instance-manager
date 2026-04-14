@@ -858,11 +858,13 @@ mod gui {
         last_native_ppp: f32,
         /// Auto-fit zoom has been applied once after startup.
         auto_fit_applied: bool,
-        /// Last physical-pixel panel width used to compute auto-fit;
-        /// stable across zoom changes so we don't self-trigger.
+        /// Last physical-pixel window width auto-fit was computed for;
+        /// used alongside outer_pos to detect real monitor moves.
         last_auto_fit_width: f32,
-        /// When auto-fit last fired. Enforces a cooldown so transient
-        /// frame-to-frame math jitter can't cause oscillation.
+        /// Last observed window outer-rect top-left. A significant jump
+        /// here signals a monitor move.
+        last_auto_fit_outer_pos: Option<egui::Pos2>,
+        /// When auto-fit last fired. Debounce against transient jitter.
         last_auto_fit_at: Option<Instant>,
         sort_column: Option<SortColumn>,
         sort_direction: SortDirection,
@@ -1021,6 +1023,7 @@ mod gui {
                 last_native_ppp: 0.0,
                 auto_fit_applied: false,
                 last_auto_fit_width: 0.0,
+                last_auto_fit_outer_pos: None,
                 last_auto_fit_at: None,
                 sort_column: None,
                 sort_direction: SortDirection::Ascending,
@@ -3474,33 +3477,44 @@ mod gui {
         }
 
         fn render_inventory_panel(&mut self, ui: &mut egui::Ui) {
-            // Auto-fit zoom: trigger only when the *window's physical
-            // pixel width* changes (startup, resize, monitor move). This
-            // is stable regardless of our own ppp changes, so no
-            // feedback loop. Rule: only zoom IN to fill empty space
-            // relative to the design width (GUI_DEFAULT_WIDTH); never
-            // shrink below 100%.
+            // Auto-fit zoom: fire on startup and on real monitor moves.
+            // Detection uses the window's outer screen position — a
+            // significant jump (> 400 px) signals a monitor change,
+            // independent of our own ppp changes. Physical-pixel
+            // drift/jitter is NOT a trigger anymore, so manual zoom
+            // between monitor moves is preserved.
             let current_ppp = ui.ctx().pixels_per_point();
             let native_ppp = ui.ctx().native_pixels_per_point().unwrap_or(1.0);
-            let window_points = ui.ctx().input(|i| i.viewport().inner_rect.map(|r| r.width()).unwrap_or(0.0));
+            let (window_points, outer_pos) = ui.ctx().input(|i| {
+                let vp = i.viewport();
+                let w = vp.inner_rect.map(|r| r.width()).unwrap_or(0.0);
+                let pos = vp.outer_rect.map(|r| r.min);
+                (w, pos)
+            });
             let window_pixels = window_points * current_ppp;
-            // Cooldown: don't re-fire within 1 second of last auto-fit.
-            // Prevents transient frame-to-frame jitter after set_pixels_per_point
-            // from re-triggering the check.
             let cooldown_elapsed = self
                 .last_auto_fit_at
-                .map(|t| t.elapsed() >= Duration::from_millis(1000))
+                .map(|t| t.elapsed() >= Duration::from_millis(500))
                 .unwrap_or(true);
+            let is_first_fit = !self.auto_fit_applied;
+            let monitor_moved = match (self.last_auto_fit_outer_pos, outer_pos) {
+                (Some(prev), Some(now)) => {
+                    (prev.x - now.x).abs() > 400.0 || (prev.y - now.y).abs() > 400.0
+                }
+                _ => false,
+            };
             if window_pixels > 0.0
                 && cooldown_elapsed
-                && (window_pixels - self.last_auto_fit_width).abs() > 100.0
+                && (is_first_fit || monitor_moved)
             {
                 // GUI_DEFAULT_WIDTH (1720 pt) is the design width at
                 // 1.0x. Bigger window → scale up proportionally. Never
                 // below 1.0x (content overflow is handled by scrollbars).
-                let target_scale = (window_pixels / (GUI_DEFAULT_WIDTH * native_ppp))
-                    .max(1.0)
-                    .min(3.0);
+                // Conservative factor (0.9) leaves a bit of breathing
+                // room so the auto-fit doesn't zoom one step too far.
+                const AUTO_FIT_CONSERVATIVE: f32 = 0.9;
+                let raw = window_pixels / (GUI_DEFAULT_WIDTH * native_ppp);
+                let target_scale = (raw * AUTO_FIT_CONSERVATIVE).max(1.0).min(3.0);
                 if (target_scale - self.ui_scale).abs() > 0.02 {
                     self.ui_scale = target_scale;
                     self.config.ui_scale = Some(target_scale);
@@ -3511,8 +3525,13 @@ mod gui {
                     ));
                 }
                 self.last_auto_fit_width = window_pixels;
+                self.last_auto_fit_outer_pos = outer_pos;
                 self.auto_fit_applied = true;
                 self.last_auto_fit_at = Some(Instant::now());
+            } else if outer_pos.is_some() && self.last_auto_fit_outer_pos.is_none() {
+                // Seed outer_pos the first time we see it, so the next
+                // real move has a baseline to compare against.
+                self.last_auto_fit_outer_pos = outer_pos;
             }
 
             ui.horizontal(|ui| {
