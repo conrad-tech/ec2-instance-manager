@@ -933,6 +933,10 @@ mod gui {
 
             let debug_mode = options.debug;
             let wsl_auto_setup = true;
+            // Always start on region Auto; let the selected account's
+            // accounts.json region drive the effective region.
+            let mut options = options;
+            options.region = None;
             let mut app = Self {
                 wsl_setup_state,
                 wsl_setup_status: None,
@@ -1045,9 +1049,11 @@ mod gui {
             if let Some(profile_id) = app.selected_profile.clone() {
                 let profile_cfg = app.config.profiles.iter()
                     .find(|p| p.profile_id == profile_id);
+                // Use the profile's configured region from accounts.json only.
+                // Do NOT fall back to config.default_region (last-session region)
+                // because that leaks one account's region into another.
                 let region = profile_cfg
                     .and_then(|p| p.region.clone())
-                    .or_else(|| app.config.default_region.clone())
                     .unwrap_or_else(|| "us-east-1".to_string());
                 let account_id = profile_cfg
                     .map(|p| p.account_id.clone())
@@ -1417,7 +1423,33 @@ mod gui {
 
         /// Load cached inventory for a profile (in-memory first, then disk).
         /// Sets self.inventory, self.filtered, self.context, and self.message.
+        ///
+        /// Only loads cache when the current effective region matches the
+        /// profile's accounts.json region (or the combobox is on Auto).
+        /// If the user has picked an override region that differs from the
+        /// account's configured region, the cache is not shown — per the
+        /// rule that cache reflects the account's canonical region only.
         fn load_cache_for_profile(&mut self, profile_id: &str) {
+            let profile_cfg = self.config.profiles.iter()
+                .find(|p| p.profile_id == profile_id);
+            let profile_region = profile_cfg.and_then(|p| p.region.clone());
+
+            // Gate: if user has a non-Auto region override and it doesn't
+            // match the account's configured region, blank the display.
+            if let (Some(ref picked), Some(ref expected)) =
+                (self.options.region.as_ref(), profile_region.as_ref())
+            {
+                if picked != expected {
+                    self.inventory.instances.clear();
+                    self.filtered.clear();
+                    self.message = format!(
+                        "Region override {picked} differs from account's region {expected}. \
+                         Refresh to load this region's data."
+                    );
+                    return;
+                }
+            }
+
             // Try in-memory cache first
             if let Some((inv, ctx)) = self.profile_inventory_cache.get(profile_id) {
                 let count = inv.instances.len();
@@ -1431,12 +1463,11 @@ mod gui {
                 return;
             }
 
-            // Fall back to disk cache
-            let profile_cfg = self.config.profiles.iter()
-                .find(|p| p.profile_id == profile_id);
-            let region = profile_cfg
-                .and_then(|p| p.region.clone())
-                .or_else(|| self.config.default_region.clone())
+            // Fall back to disk cache — use accounts.json region only,
+            // not config.default_region, to avoid leaking one account's
+            // region into another.
+            let region = profile_region
+                .clone()
                 .unwrap_or_else(|| "us-east-1".to_string());
             let account_id = profile_cfg
                 .map(|p| p.account_id.clone())
@@ -6345,6 +6376,13 @@ mod gui {
                                     .clone()
                                     .unwrap_or_else(|| AWS_REGION_AUTO.to_string())
                             ));
+                        }
+                        // Re-evaluate cache display against the new region.
+                        // If new region doesn't match the account's accounts.json
+                        // region, load_cache_for_profile blanks the display;
+                        // otherwise it re-populates from the matching cache.
+                        if let Some(profile_id) = self.selected_profile.clone() {
+                            self.load_cache_for_profile(&profile_id);
                         }
                         self.refresh_context_and_inventory(true);
                     }

@@ -132,10 +132,11 @@
 - WSL is recommended for SSM sessions (uses credentials from Windows `~/.aws/credentials`)
 - Select your preferred shell from the terminal dropdown on the left panel
 
-### Update PS1
-- Click **Update PS1** to switch to bash and set a colored prompt showing user, host, and working directory
-- SSM sessions start in `sh` which doesn't support color prompts — Update PS1 runs `exec bash` to switch to a proper bash shell first
-- This also runs `clear` to clean up the terminal
+### Prep Terminal
+- Click **Prep Terminal** to switch to bash and set a colored prompt showing user, host, and working directory
+- SSM sessions start in `sh` which doesn't support color prompts — Prep Terminal runs `exec bash` to switch to a proper bash shell first
+- Appends `set paste` to `~/.vimrc` (if not already present) so right-click paste into vim doesn't staircase-indent
+- Also runs `clear` to clean up the terminal
 
 ### Multiple Connections
 - Connect to multiple instances across different accounts simultaneously
@@ -234,7 +235,7 @@ If WSL connections fail but PowerShell connections work, WSL environment variabl
 - Type full paths directly in the path bar instead of clicking through directories — saves multiple API calls
 - The directory cache makes revisiting paths instant — use Refresh to force a fresh listing
 - If the file browser gives an SSM error on first try, click Refresh or Go to retry
-- Use **Update PS1** after connecting to get a clean colored prompt (switches to bash and clears the terminal)
+- Use **Prep Terminal** after connecting to get a clean colored prompt and vim paste fix (switches to bash, configures vimrc, and clears the terminal)
 - Use `clear` in the terminal before running vim to avoid display issues after exiting
 - All AWS API calls for the file browser run silently (no console window flashes)
 - If WSL connections are slow, try `wsl --shutdown` in PowerShell and relaunch the app
