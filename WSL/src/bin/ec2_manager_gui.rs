@@ -5630,10 +5630,12 @@ mod gui {
                     ctx.set_pixels_per_point(self.ui_scale * native_ppp);
                 }
                 if zoom_reset {
-                    self.ui_scale = 1.0;
-                    self.config.ui_scale = Some(self.ui_scale);
-                    let _ = self.config.save();
-                    ctx.set_pixels_per_point(self.ui_scale * native_ppp);
+                    // Ctrl+0 re-triggers auto-fit for the current monitor.
+                    // Clears the state the auto-fit block gates on so it
+                    // fires on the next inventory panel render.
+                    self.auto_fit_applied = false;
+                    self.last_auto_fit_width = 0.0;
+                    self.last_auto_fit_at = None;
                 }
 
                 // --- WSL Setup (non-blocking) ---
