@@ -343,6 +343,18 @@ mod gui {
         scroll_offset: usize,
         /// Whether the auto-PS1 command has already been sent for this session.
         ps1_auto_sent: bool,
+        /// Accumulates user-typed bytes between Enter presses so we can
+        /// detect commands like `sudo su` / `sudo su - <user>` and re-run
+        /// the prep-terminal sequence after the new shell prompt appears.
+        input_line_buf: String,
+        /// Set when the most recently submitted line was a `sudo su` form;
+        /// the next prompt detected in output triggers re-prep.
+        pending_reprep: bool,
+        /// Trimmed text of the cursor-line prompt the last time PREP was
+        /// auto-fired. Used to ensure we only re-prep when a *new*
+        /// shell prompt appears (e.g., after `sudo su`), not on every
+        /// subsequent output flush.
+        last_prepped_prompt: String,
     }
 
     /// Absolute terminal position: scroll-invariant coordinate.
@@ -373,6 +385,7 @@ mod gui {
             }
         }
 
+        #[allow(dead_code)]
         fn is_active(&self) -> bool {
             self.anchor.is_some() && self.end.is_some()
         }
@@ -568,6 +581,32 @@ mod gui {
     /// Parse rules into include/exclude terms for general search.
     /// Terms with `TagKey: value` syntax are skipped here — they're handled
     /// as tag matches in apply_filters.
+    /// Returns the text of the line under the cursor, used to detect
+    /// fresh shell prompts after `sudo su` so we know when to re-fire
+    /// the prep-terminal sequence.
+    fn current_cursor_line(parser: &vt100::Parser) -> String {
+        let (row, _col) = parser.screen().cursor_position();
+        let (_, cols) = parser.screen().size();
+        parser.screen().contents_between(row, 0, row, cols)
+    }
+
+    /// Returns true when `line` is a `sudo su` form that switches user:
+    /// `sudo su`, `sudo su -`, `sudo su - <user>`, `sudo su <user>`,
+    /// optionally with extra whitespace. Used to schedule a re-run of the
+    /// prep-terminal sequence after the new shell prompt appears.
+    fn is_sudo_su_line(line: &str) -> bool {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.len() < 2 || tokens[0] != "sudo" || tokens[1] != "su" {
+            return false;
+        }
+        match tokens.len() {
+            2 => true,                                 // sudo su
+            3 => true,                                 // sudo su -   |   sudo su <user>
+            4 => tokens[2] == "-",                     // sudo su - <user>
+            _ => false,
+        }
+    }
+
     fn search_terms_from_rules(rules: &[SearchRuleInput]) -> (Vec<String>, Vec<String>) {
         let mut includes = Vec::new();
         let mut excludes = Vec::new();
@@ -856,6 +895,10 @@ mod gui {
         scroll_sensitivity: f32,
         ui_scale: f32,
         last_native_ppp: f32,
+        /// Stored egui Context, captured on the first update() call so
+        /// background reader threads can call request_repaint() to wake
+        /// the UI thread when terminal output arrives.
+        egui_ctx: Option<egui::Context>,
         /// Auto-fit zoom has been applied once after startup.
         auto_fit_applied: bool,
         /// Last physical-pixel window width auto-fit was computed for;
@@ -895,9 +938,17 @@ mod gui {
         const MAX_LOG_LINES: usize = 20_000;
 
         fn new(options: GuiOptions) -> Self {
-            let config = AppConfig::load().unwrap_or_default();
+            let mut config = AppConfig::load().unwrap_or_default();
+            if !config.shared_env_default_applied {
+                if !config.excluded_envs.iter().any(|e| e.eq_ignore_ascii_case("shared")) {
+                    config.excluded_envs.push("shared".to_string());
+                    config.excluded_envs.sort();
+                }
+                config.shared_env_default_applied = true;
+                let _ = config.save();
+            }
             let initial_hidden_envs: std::collections::HashSet<String> =
-                config.excluded_envs.iter().cloned().collect();
+                config.excluded_envs.iter().map(|s| s.to_ascii_lowercase()).collect();
             let dependencies = dependency_status();
             let (proc_tx, proc_rx) = mpsc::channel();
             let (wsl_setup_tx, wsl_setup_rx) = mpsc::channel();
@@ -1021,6 +1072,7 @@ mod gui {
                 scroll_sensitivity,
                 ui_scale,
                 last_native_ppp: 0.0,
+                egui_ctx: None,
                 auto_fit_applied: false,
                 last_auto_fit_width: 0.0,
                 last_auto_fit_outer_pos: None,
@@ -2142,6 +2194,7 @@ mod gui {
                 let proc_tx = self.proc_tx.clone();
                 let ui_tx = self.ui_tx.clone();
                 let pty_command = pty_command.clone();
+                let egui_ctx = self.egui_ctx.clone();
                 self.log_debug("spawning PTY command async");
                 std::thread::spawn(move || {
                     let result = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -2153,7 +2206,7 @@ mod gui {
                             // into pty_sessions before any reader output arrives.
                             let _ = ui_tx.send(UiEvent::PtyReady { tab_id, session });
                             // Start reader thread AFTER PtyReady is sent.
-                            start_pty_reader_thread(tab_id, reader, proc_tx);
+                            start_pty_reader_thread(tab_id, reader, proc_tx, egui_ctx);
                         }
                         Ok(Err(err)) => {
                             let _ = ui_tx.send(UiEvent::Error {
@@ -2202,7 +2255,7 @@ mod gui {
             let (session, reader) =
                 spawn_pty_session_parts(tab_id, &command, context)?;
             self.pty_sessions.insert(tab_id, session);
-            start_pty_reader_thread(tab_id, reader, self.proc_tx.clone());
+            start_pty_reader_thread(tab_id, reader, self.proc_tx.clone(), self.egui_ctx.clone());
             Ok(())
         }
 
@@ -2289,27 +2342,45 @@ mod gui {
                     let evt = session.output_event_count;
                     let total = session.bytes_received;
                     session.parser.process(&bytes);
-                    // Clear selection when new output arrives and user is at bottom
-                    if session.scroll_offset == 0 {
-                        if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
-                            if sel.is_active() {
-                                sel.clear();
-                            }
-                        }
-                    }
+                    // Selection coordinates are abs_row-based and remain
+                    // valid as scrollback grows, so we don't need to clear
+                    // them here. (Previously cleared on any output arriving
+                    // at scroll-bottom — which clobbered the user's
+                    // highlight before they could right-click to copy.)
                     // Respond to Device Status Report queries.
                     respond_to_terminal_queries(session, &bytes);
-                    // Auto-send PS1 once we detect a shell prompt.
-                    if !session.ps1_auto_sent {
+                    // Auto-send PREP_TERMINAL_COMMAND in two cases:
+                    //   1. Initial: first time we see a shell prompt
+                    //      anywhere on the screen (loose match — works for
+                    //      both `sh-4.2$` and `[ec2-user@host ~]$`).
+                    //   2. Re-prep after `sudo su` / `sudo su - <user>`:
+                    //      the user's typed line set `pending_reprep`. We
+                    //      wait until the *cursor line* shows a fresh
+                    //      `user@host`-style prompt different from the
+                    //      one we last prepped — this avoids firing
+                    //      prematurely on echo of the typed command (the
+                    //      old prompt is still in scrollback) and avoids
+                    //      firing into a `[sudo] password for ...` line.
+                    let cursor_line = current_cursor_line(&session.parser);
+                    let cursor_trimmed = cursor_line.trim_end().to_string();
+                    let cursor_is_user_host_prompt = cursor_trimmed.contains('@')
+                        && (cursor_trimmed.ends_with('$') || cursor_trimmed.ends_with('#'));
+
+                    let initial_match = !session.ps1_auto_sent && {
                         let screen_text = session.parser.screen().contents();
-                        if screen_text.contains("ec2-user")
-                            || screen_text.contains("root")
-                        {
-                            session.ps1_auto_sent = true;
-                            if let Ok(mut stdin) = session.writer.lock() {
-                                let _ = stdin.write_all(PREP_TERMINAL_COMMAND)
-                                    .and_then(|()| stdin.flush());
-                            }
+                        screen_text.contains("ec2-user") || screen_text.contains("root")
+                    };
+                    let reprep_match = session.pending_reprep
+                        && cursor_is_user_host_prompt
+                        && cursor_trimmed != session.last_prepped_prompt;
+
+                    if initial_match || reprep_match {
+                        session.ps1_auto_sent = true;
+                        session.pending_reprep = false;
+                        session.last_prepped_prompt = cursor_trimmed;
+                        if let Ok(mut stdin) = session.writer.lock() {
+                            let _ = stdin.write_all(PREP_TERMINAL_COMMAND)
+                                .and_then(|()| stdin.flush());
                         }
                     }
                     if evt <= 5 {
@@ -3255,6 +3326,29 @@ mod gui {
                 return;
             };
             session.scroll_offset = 0;
+            // Track typed line so we can detect `sudo su` / `sudo su - <user>`
+            // and re-trigger prep terminal when the new shell prompt appears.
+            for &b in payload {
+                match b {
+                    b'\r' | b'\n' => {
+                        if is_sudo_su_line(&session.input_line_buf) {
+                            session.pending_reprep = true;
+                        }
+                        session.input_line_buf.clear();
+                    }
+                    0x03 | 0x15 => {
+                        // Ctrl-C / Ctrl-U: line aborted/cleared.
+                        session.input_line_buf.clear();
+                    }
+                    0x7f | 0x08 => {
+                        session.input_line_buf.pop();
+                    }
+                    c if c >= 0x20 && c < 0x7f => {
+                        session.input_line_buf.push(c as char);
+                    }
+                    _ => {}
+                }
+            }
             let Ok(mut stdin) = session.writer.lock() else {
                 return;
             };
@@ -4699,31 +4793,50 @@ mod gui {
                                 ));
                             }
                             if terminal_focus_response.secondary_clicked() {
-                                // If text is selected, copy it; otherwise paste.
-                                // Extract the selected text first so we can tell
-                                // if the selection is meaningful (a bare click sets
-                                // anchor == end which yields empty/whitespace text).
-                                let copied_text = self
+                                // Decide copy-vs-paste based on whether the
+                                // user has an active selection (anchor + end
+                                // set, with start != end). This is robust
+                                // to extraction returning empty/whitespace —
+                                // we never silently fall through to a paste
+                                // when the user clearly intended a copy.
+                                let has_real_selection = self
                                     .terminal_selections
                                     .get(&tab_id)
-                                    .cloned()
                                     .and_then(|sel| sel.normalized())
-                                    .and_then(|(start, end)| {
-                                        self.pty_sessions.get_mut(&tab_id).map(|session| {
-                                            extract_selection_text(
-                                                &mut session.parser, start, end,
-                                            )
-                                        })
-                                    })
-                                    .filter(|t| !t.trim().is_empty());
-                                if let Some(text) = copied_text {
+                                    .is_some_and(|(s, e)| s != e);
+                                if has_real_selection {
+                                    // Clear the clipboard first so a failed
+                                    // extraction can never paste stale text
+                                    // on the next right-click.
                                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                        let _ = clipboard.set_text(&text);
+                                        let _ = clipboard.set_text("");
                                     }
-                                    self.log_debug(format!(
-                                        "right-click copy tab={tab_id} len={}",
-                                        text.len()
-                                    ));
+                                    let copied_text = self
+                                        .terminal_selections
+                                        .get(&tab_id)
+                                        .cloned()
+                                        .and_then(|sel| sel.normalized())
+                                        .and_then(|(start, end)| {
+                                            self.pty_sessions.get_mut(&tab_id).map(|session| {
+                                                extract_selection_text(
+                                                    &mut session.parser, start, end,
+                                                )
+                                            })
+                                        })
+                                        .filter(|t| !t.trim().is_empty());
+                                    if let Some(text) = copied_text {
+                                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                            let _ = clipboard.set_text(&text);
+                                        }
+                                        self.log_debug(format!(
+                                            "right-click copy tab={tab_id} len={}",
+                                            text.len()
+                                        ));
+                                    } else {
+                                        self.log_debug(format!(
+                                            "right-click copy tab={tab_id} extraction empty; clipboard cleared"
+                                        ));
+                                    }
                                     if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
                                         sel.clear();
                                     }
@@ -5608,6 +5721,9 @@ mod gui {
 
     impl eframe::App for Ec2GuiApp {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            if self.egui_ctx.is_none() {
+                self.egui_ctx = Some(ctx.clone());
+            }
             let update_result = panic::catch_unwind(AssertUnwindSafe(|| {
                 // Re-apply scaling when native DPI changes (monitor switch)
                 let native_ppp = ctx.native_pixels_per_point().unwrap_or(1.0);
@@ -5771,24 +5887,34 @@ mod gui {
                                     if active == 1 { "" } else { "s" },
                                 ));
                                 ui.add_space(8.0);
+                                // Space or Enter triggers Close All & Exit
+                                // for keyboard-only operation.
+                                let confirm_via_key = ui.input(|i| {
+                                    i.key_pressed(egui::Key::Space)
+                                        || i.key_pressed(egui::Key::Enter)
+                                });
+                                let mut do_close_all = confirm_via_key;
                                 ui.horizontal(|ui| {
                                     if ui.button("Close All & Exit").clicked() {
-                                        let tab_ids: Vec<u64> =
-                                            self.pty_sessions.keys().copied().collect();
-                                        for id in tab_ids {
-                                            self.close_connection_tab(id);
-                                        }
-                                        self.show_close_blocked = false;
-                                        // Defer the actual window close so cleanup
-                                        // threads have time to send graceful exit
-                                        // commands to remote SSM sessions.
-                                        self.pending_exit_at =
-                                            Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
+                                        do_close_all = true;
                                     }
                                     if ui.button("Go Back").clicked() {
                                         self.show_close_blocked = false;
                                     }
                                 });
+                                if do_close_all {
+                                    let tab_ids: Vec<u64> =
+                                        self.pty_sessions.keys().copied().collect();
+                                    for id in tab_ids {
+                                        self.close_connection_tab(id);
+                                    }
+                                    self.show_close_blocked = false;
+                                    // Defer the actual window close so cleanup
+                                    // threads have time to send graceful exit
+                                    // commands to remote SSM sessions.
+                                    self.pending_exit_at =
+                                        Some(std::time::Instant::now() + std::time::Duration::from_millis(600));
+                                }
                             });
                     }
                 }
@@ -6141,18 +6267,18 @@ mod gui {
                                 .show_ui(ui, |ui| {
                                     for (env, color) in &all_envs {
                                         let env_lower = env.to_ascii_lowercase();
-                                        let mut visible = !self.hidden_envs.contains(&env_lower);
+                                        let mut excluded = self.hidden_envs.contains(&env_lower);
                                         ui.horizontal(|ui| {
                                             let (rect, _) = ui.allocate_exact_size(
                                                 egui::vec2(8.0, 8.0),
                                                 egui::Sense::hover(),
                                             );
                                             ui.painter().circle_filled(rect.center(), 4.0, *color);
-                                            if ui.checkbox(&mut visible, env).changed() {
-                                                if visible {
-                                                    self.hidden_envs.remove(&env_lower);
-                                                } else {
+                                            if ui.checkbox(&mut excluded, env).changed() {
+                                                if excluded {
                                                     self.hidden_envs.insert(env_lower);
+                                                } else {
+                                                    self.hidden_envs.remove(&env_lower);
                                                 }
                                                 // Persist to config
                                                 self.config.excluded_envs = self.hidden_envs.iter().cloned().collect();
@@ -7238,6 +7364,9 @@ mod gui {
             output_event_count: 0,
             scroll_offset: 0,
             ps1_auto_sent: false,
+            input_line_buf: String::new(),
+            pending_reprep: false,
+            last_prepped_prompt: String::new(),
         };
 
         Ok((session, reader))
@@ -7249,6 +7378,7 @@ mod gui {
         tab_id: u64,
         mut reader: Box<dyn Read + Send>,
         proc_tx: Sender<ProcEvent>,
+        egui_ctx: Option<egui::Context>,
     ) {
         std::thread::spawn(move || {
             let mut buf = [0_u8; 8192];
@@ -7262,6 +7392,7 @@ mod gui {
                                 "PTY reader EOF after {total_bytes} bytes total"
                             ),
                         });
+                        if let Some(ctx) = &egui_ctx { ctx.request_repaint(); }
                         break;
                     }
                     Ok(n) => {
@@ -7270,6 +7401,9 @@ mod gui {
                             tab_id,
                             bytes: buf[..n].to_vec(),
                         });
+                        // Wake the UI thread so output is drained promptly
+                        // even when the user isn't generating input events.
+                        if let Some(ctx) = &egui_ctx { ctx.request_repaint(); }
                     }
                     Err(err) => {
                         let _ = proc_tx.send(ProcEvent::Error {
@@ -7278,6 +7412,7 @@ mod gui {
                                 "PTY reader error after {total_bytes} bytes: {err}"
                             ),
                         });
+                        if let Some(ctx) = &egui_ctx { ctx.request_repaint(); }
                         break;
                     }
                 }

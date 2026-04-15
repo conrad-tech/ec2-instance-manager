@@ -32,6 +32,8 @@ pub struct AppConfig {
     pub reset_filter_on_profile_switch: bool,
     /// Environment names excluded from the color legend
     pub excluded_envs: Vec<String>,
+    /// Whether the one-shot "shared excluded by default" migration has run.
+    pub shared_env_default_applied: bool,
     /// Saved window position/size from last close
     pub window_x: Option<f32>,
     pub window_y: Option<f32>,
@@ -72,6 +74,7 @@ impl Default for AppConfig {
             account_colors: BTreeMap::new(),
             reset_filter_on_profile_switch: true,
             excluded_envs: Vec::new(),
+            shared_env_default_applied: false,
             window_x: None,
             window_y: None,
             window_w: None,
@@ -428,6 +431,9 @@ impl AppConfig {
                 "excluded_envs" => {
                     cfg.excluded_envs = split_csv(value);
                 }
+                "shared_env_default_applied" => {
+                    cfg.shared_env_default_applied = matches!(value, "1" | "true" | "TRUE");
+                }
                 "last_selected_profile" => {
                     cfg.last_selected_profile = if value.is_empty() {
                         None
@@ -527,6 +533,10 @@ impl AppConfig {
 
         if !self.excluded_envs.is_empty() {
             lines.push(format!("excluded_envs={}", self.excluded_envs.join(",")));
+        }
+
+        if self.shared_env_default_applied {
+            lines.push("shared_env_default_applied=true".to_string());
         }
 
         for (profile, color) in &self.account_colors {
