@@ -3374,6 +3374,7 @@ mod gui {
                 )
             });
             let mut sent_etx = false;
+            let mut sent_can = false;
             let on_alt_screen = self.pty_sessions.get(&tab_id)
                 .map(|s| s.parser.screen().alternate_screen())
                 .unwrap_or(false);
@@ -3453,8 +3454,17 @@ mod gui {
                     }
                     continue;
                 }
-                // Let egui handle Cut natively (clipboard cut).
+                // egui emits Event::Cut for Ctrl+X regardless of shift.
+                // Plain Ctrl+X → send CAN (0x18) so TUIs like nano (exit)
+                // and emacs (prefix) see it. Ctrl+Shift+X → let egui cut.
                 if matches!(event, egui::Event::Cut) {
+                    if !current_modifiers.shift && !sent_can {
+                        self.log_trace(format!(
+                            "terminal input event tab={tab_id} kind=Cut→CAN"
+                        ));
+                        self.send_raw_bytes_to_connection_tab(tab_id, &[0x18]);
+                        sent_can = true;
+                    }
                     continue;
                 }
                 if let Some(payload) =
@@ -4805,12 +4815,13 @@ mod gui {
                                     .and_then(|sel| sel.normalized())
                                     .is_some_and(|(s, e)| s != e);
                                 if has_real_selection {
-                                    // Clear the clipboard first so a failed
-                                    // extraction can never paste stale text
-                                    // on the next right-click.
-                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                        let _ = clipboard.set_text("");
-                                    }
+                                    // Extract first, then do exactly one
+                                    // clipboard op. Two back-to-back
+                                    // arboard::Clipboard::new() + set_text
+                                    // calls (first clear, then real text)
+                                    // are racy on Windows — the "" can win
+                                    // and the real text is silently lost.
+                                    // Collapsing to one set_text avoids it.
                                     let copied_text = self
                                         .terminal_selections
                                         .get(&tab_id)
@@ -4824,17 +4835,34 @@ mod gui {
                                             })
                                         })
                                         .filter(|t| !t.trim().is_empty());
-                                    if let Some(text) = copied_text {
-                                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                            let _ = clipboard.set_text(&text);
+                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                        match &copied_text {
+                                            Some(text) => {
+                                                match clipboard.set_text(text.clone()) {
+                                                    Ok(()) => self.log_debug(format!(
+                                                        "right-click copy tab={tab_id} len={}",
+                                                        text.len()
+                                                    )),
+                                                    Err(err) => self.log_error(format!(
+                                                        "right-click copy tab={tab_id} set_text failed: {err}"
+                                                    )),
+                                                }
+                                            }
+                                            None => {
+                                                // Only clear on actual
+                                                // extraction failure, so
+                                                // unrelated clipboard
+                                                // contents are preserved
+                                                // when a copy fails.
+                                                let _ = clipboard.set_text(String::new());
+                                                self.log_debug(format!(
+                                                    "right-click copy tab={tab_id} extraction empty; clipboard cleared"
+                                                ));
+                                            }
                                         }
-                                        self.log_debug(format!(
-                                            "right-click copy tab={tab_id} len={}",
-                                            text.len()
-                                        ));
                                     } else {
-                                        self.log_debug(format!(
-                                            "right-click copy tab={tab_id} extraction empty; clipboard cleared"
+                                        self.log_error(format!(
+                                            "right-click copy tab={tab_id} Clipboard::new failed"
                                         ));
                                     }
                                     if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
@@ -7424,26 +7452,72 @@ mod gui {
     /// expected responses back through the writer.  Without these
     /// responses, programs like CMD and PowerShell hang at startup.
     fn respond_to_terminal_queries(session: &PtySession, bytes: &[u8]) {
+        let (row, col) = session.parser.screen().cursor_position();
+        let response = compute_terminal_query_response(bytes, row, col);
+        if !response.is_empty() {
+            if let Ok(mut w) = session.writer.lock() {
+                let _ = w.write_all(&response);
+                let _ = w.flush();
+            }
+        }
+    }
+
+    /// Build the reply for terminal queries embedded in `bytes`.
+    /// `cursor_row`/`cursor_col` are 0-based from vt100's parser and used
+    /// only for DSR (cursor position report). Returns an empty vec if no
+    /// known queries were present.
+    ///
+    /// Answering these matters: vim's t_RV (DA2) and OSC 11 background
+    /// query block its input loop for ~5s at startup if unanswered, which
+    /// manifests as keys being unresponsive right after `:e` / `vim file`.
+    fn compute_terminal_query_response(
+        bytes: &[u8],
+        cursor_row: u16,
+        cursor_col: u16,
+    ) -> Vec<u8> {
+        let mut response: Vec<u8> = Vec::new();
         // ESC[6n — Device Status Report (cursor position query).
         // Response: ESC[{row};{col}R  (1-based).
         if bytes.windows(4).any(|w| w == b"\x1b[6n") {
-            let (row, col) = session.parser.screen().cursor_position();
-            let response = format!("\x1b[{};{}R", row + 1, col + 1);
-            if let Ok(mut w) = session.writer.lock() {
-                let _ = w.write_all(response.as_bytes());
-                let _ = w.flush();
-            }
+            response.extend_from_slice(
+                format!("\x1b[{};{}R", cursor_row + 1, cursor_col + 1).as_bytes(),
+            );
         }
-        // ESC[0c or ESC[c — Primary Device Attributes (DA1).
+        // ESC[c or ESC[0c — Primary Device Attributes (DA1).
         // Response: ESC[?1;0c  (VT101 with no options).
-        if bytes.windows(3).any(|w| w == b"\x1b[c")
-            || bytes.windows(4).any(|w| w == b"\x1b[0c")
-        {
-            if let Ok(mut w) = session.writer.lock() {
-                let _ = w.write_all(b"\x1b[?1;0c");
-                let _ = w.flush();
-            }
+        // Match DA1 only when NOT preceded by '>' or '=' (DA2/DA3).
+        if has_csi_query(bytes, b"c") || has_csi_query(bytes, b"0c") {
+            response.extend_from_slice(b"\x1b[?1;0c");
         }
+        // ESC[>c or ESC[>0c — Secondary Device Attributes (DA2).
+        // Response: ESC[>41;0;0c  (VT220-compatible, version 0).
+        if bytes.windows(4).any(|w| w == b"\x1b[>c")
+            || bytes.windows(5).any(|w| w == b"\x1b[>0c")
+        {
+            response.extend_from_slice(b"\x1b[>41;0;0c");
+        }
+        // OSC 11 — background color query (ESC ] 11 ; ? BEL or ST).
+        // Reply with a dummy black background so the sender moves on.
+        if bytes.windows(6).any(|w| w == b"\x1b]11;?") {
+            response.extend_from_slice(b"\x1b]11;rgb:0000/0000/0000\x1b\\");
+        }
+        // XTGETTCAP (DCS + q ... ST) — terminfo capability query.
+        // Reply with an invalid (empty) response: ESC P 0 + r ESC \
+        if bytes.windows(4).any(|w| w == b"\x1bP+q") {
+            response.extend_from_slice(b"\x1bP0+r\x1b\\");
+        }
+        response
+    }
+
+    /// True if `bytes` contains `ESC [ {suffix}` with no `>` or `=` prefix
+    /// byte between the `[` and the suffix (i.e., a DA1, not DA2/DA3).
+    fn has_csi_query(bytes: &[u8], suffix: &[u8]) -> bool {
+        let needle_len = 2 + suffix.len();
+        bytes.windows(needle_len).any(|w| {
+            w[0] == 0x1b
+                && w[1] == b'['
+                && &w[2..] == suffix
+        })
     }
 
     #[cfg(test)]
@@ -9488,6 +9562,89 @@ mod gui {
                 terminal_event_payload_for_terminal(&ctrl_r, false, false),
                 Some(vec![0x12])
             );
+        }
+
+        #[test]
+        fn terminal_event_payload_ctrl_x_sends_can() {
+            // Ctrl+X is also intercepted as egui::Event::Cut upstream in
+            // forward_terminal_key_input; this covers the fallback path
+            // when the Key event is what we see (e.g., some layouts).
+            let ctrl_x = egui::Event::Key {
+                key: egui::Key::X,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers { ctrl: true, ..Default::default() },
+            };
+            assert_eq!(
+                terminal_event_payload_for_terminal(&ctrl_x, false, false),
+                Some(vec![0x18])
+            );
+        }
+
+        #[test]
+        fn compute_query_response_dsr_cursor_position() {
+            // Parser reports 0-based row/col; response is 1-based.
+            let r = compute_terminal_query_response(b"\x1b[6n", 4, 9);
+            assert_eq!(r, b"\x1b[5;10R");
+        }
+
+        #[test]
+        fn compute_query_response_da1_vt101() {
+            let r = compute_terminal_query_response(b"\x1b[c", 0, 0);
+            assert_eq!(r, b"\x1b[?1;0c");
+            let r = compute_terminal_query_response(b"\x1b[0c", 0, 0);
+            assert_eq!(r, b"\x1b[?1;0c");
+        }
+
+        #[test]
+        fn compute_query_response_da2_vt220() {
+            let r = compute_terminal_query_response(b"\x1b[>c", 0, 0);
+            assert_eq!(r, b"\x1b[>41;0;0c");
+            let r = compute_terminal_query_response(b"\x1b[>0c", 0, 0);
+            assert_eq!(r, b"\x1b[>41;0;0c");
+        }
+
+        #[test]
+        fn compute_query_response_da2_does_not_trigger_da1() {
+            // DA2 (\x1b[>c) must not also match DA1 (\x1b[c) — otherwise
+            // we'd send two conflicting replies.
+            let r = compute_terminal_query_response(b"\x1b[>c", 0, 0);
+            assert_eq!(r, b"\x1b[>41;0;0c");
+            assert!(!r.windows(7).any(|w| w == b"\x1b[?1;0c"));
+        }
+
+        #[test]
+        fn compute_query_response_osc_11_bg_color() {
+            let r = compute_terminal_query_response(b"\x1b]11;?\x07", 0, 0);
+            assert_eq!(r, b"\x1b]11;rgb:0000/0000/0000\x1b\\");
+        }
+
+        #[test]
+        fn compute_query_response_xtgettcap() {
+            let r = compute_terminal_query_response(
+                b"\x1bP+q436F6C6F7273\x1b\\",
+                0,
+                0,
+            );
+            assert_eq!(r, b"\x1bP0+r\x1b\\");
+        }
+
+        #[test]
+        fn compute_query_response_combined() {
+            // Vim often sends DA1 + DA2 + DSR in rapid succession;
+            // we should answer all three in one response buffer.
+            let input = b"\x1b[c\x1b[>c\x1b[6n";
+            let r = compute_terminal_query_response(input, 1, 2);
+            assert!(r.windows(7).any(|w| w == b"\x1b[?1;0c"));
+            assert!(r.windows(10).any(|w| w == b"\x1b[>41;0;0c"));
+            assert!(r.windows(6).any(|w| w == b"\x1b[2;3R"));
+        }
+
+        #[test]
+        fn compute_query_response_empty_when_no_queries() {
+            let r = compute_terminal_query_response(b"hello world\r\n", 0, 0);
+            assert!(r.is_empty());
         }
 
         #[test]

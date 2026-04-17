@@ -30,6 +30,7 @@ pub struct AppConfig {
     pub account_colors_enabled: bool,
     pub account_colors: BTreeMap<String, String>,
     pub reset_filter_on_profile_switch: bool,
+    pub remote_home_user_by_profile: BTreeMap<String, String>,
 }
 
 impl Default for AppConfig {
@@ -63,6 +64,7 @@ impl Default for AppConfig {
             account_colors_enabled: true,
             account_colors: BTreeMap::new(),
             reset_filter_on_profile_switch: true,
+            remote_home_user_by_profile: BTreeMap::new(),
         }
     }
 }
@@ -255,6 +257,25 @@ impl AppConfig {
         !self.profiles.is_empty()
     }
 
+    pub fn remote_user_for_profile(&self, profile_id: &str) -> Option<&str> {
+        self.remote_home_user_by_profile
+            .get(profile_id)
+            .map(String::as_str)
+    }
+
+    pub fn set_remote_user(&mut self, profile_id: &str, user: &str) {
+        let user = user.trim();
+        if profile_id.is_empty() {
+            return;
+        }
+        if user.is_empty() {
+            self.remote_home_user_by_profile.remove(profile_id);
+        } else {
+            self.remote_home_user_by_profile
+                .insert(profile_id.to_string(), user.to_string());
+        }
+    }
+
     fn parse(raw: &str) -> Self {
         let mut cfg = Self::default();
         cfg.recents.clear();
@@ -293,6 +314,14 @@ impl AppConfig {
             if let Some(rest) = key.strip_prefix("profile_account_id.") {
                 if !rest.is_empty() && !value.is_empty() {
                     profile_account_ids.insert(rest.to_string(), value.to_string());
+                }
+                continue;
+            }
+
+            if let Some(rest) = key.strip_prefix("remote_home_user.") {
+                if !rest.is_empty() && !value.is_empty() {
+                    cfg.remote_home_user_by_profile
+                        .insert(rest.to_string(), value.to_string());
                 }
                 continue;
             }
@@ -498,6 +527,10 @@ impl AppConfig {
 
         for (profile, color) in &self.account_colors {
             lines.push(format!("account_color.{profile}={color}"));
+        }
+
+        for (profile, user) in &self.remote_home_user_by_profile {
+            lines.push(format!("remote_home_user.{profile}={user}"));
         }
 
         for (account, region) in &self.account_regions {

@@ -387,6 +387,10 @@ mod gui {
         pending_downloads: usize,
         path_input: String,
         initialized: bool,
+        profile_id: String,
+        remote_user: String,
+        user_input: String,
+        available_users: Vec<String>,
     }
 
     impl Default for FileBrowserState {
@@ -400,6 +404,10 @@ mod gui {
                 pending_downloads: 0,
                 path_input: String::new(),
                 initialized: false,
+                profile_id: String::new(),
+                remote_user: String::new(),
+                user_input: String::new(),
+                available_users: Vec::new(),
             }
         }
     }
@@ -728,6 +736,7 @@ mod gui {
         /// Profile ID for the color picker (from Edit menu or right-click)
         color_picker_profile: Option<String>,
         file_browsers: HashMap<u64, FileBrowserState>,
+        ssh_config_users: Vec<String>,
         file_op_tx: Sender<FileOpEvent>,
         file_op_rx: Receiver<FileOpEvent>,
         #[cfg(target_os = "windows")]
@@ -834,6 +843,7 @@ mod gui {
                 tab_color_picker_rgb: [0.0, 0.0, 0.0],
                 color_picker_profile: None,
                 file_browsers: HashMap::new(),
+                ssh_config_users: ec2_manager::ssh_config::discover_ssh_users(),
                 file_op_tx,
                 file_op_rx,
                 #[cfg(target_os = "windows")]
@@ -1712,18 +1722,31 @@ mod gui {
                     .map(|p| p.profile_id.clone())
                     .unwrap_or_else(|| context.profile.clone())
             });
-            let tab_id = self.connections.open(title.clone(), instance_id.clone(), tab_profile);
+            let tab_id = self.connections.open(title.clone(), instance_id.clone(), tab_profile.clone());
             self.rebuild_account_colors();
+            let resolved_user = if context.mode == Mode::Sim {
+                String::new()
+            } else {
+                self.config
+                    .remote_user_for_profile(&tab_profile)
+                    .map(str::to_string)
+                    .or_else(|| self.ssh_config_users.first().cloned())
+                    .unwrap_or_else(|| "ssm-user".to_string())
+            };
             let default_path = if context.mode == Mode::Sim {
                 std::env::current_dir()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| "/".to_string())
             } else {
-                "/home/ssm-user".to_string()
+                format!("/home/{resolved_user}")
             };
             let mut fb_state = FileBrowserState {
                 current_path: default_path.clone(),
                 path_input: default_path.clone(),
+                profile_id: tab_profile.clone(),
+                remote_user: resolved_user.clone(),
+                user_input: resolved_user.clone(),
+                available_users: self.ssh_config_users.clone(),
                 ..Default::default()
             };
             fb_state.initialized = false;
@@ -3732,6 +3755,79 @@ mod gui {
             ui.label("File Browser");
             ui.separator();
 
+            // Remote-user selector (live mode only). Lets the user switch the
+            // default home directory without touching the PTY shell.
+            let is_live = self.options.mode == Mode::Live;
+            let user_snapshot = self.file_browsers.get(&tab_id).map(|fb| {
+                (
+                    fb.remote_user.clone(),
+                    fb.user_input.clone(),
+                    fb.available_users.clone(),
+                    fb.profile_id.clone(),
+                )
+            });
+            let mut apply_user: Option<String> = None;
+            if is_live {
+                if let Some((current_user, mut user_input, available_users, _profile_id)) =
+                    user_snapshot
+                {
+                    ui.horizontal(|ui| {
+                        ui.label("User:");
+                        let preview = if current_user.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            current_user.clone()
+                        };
+                        egui::ComboBox::from_id_salt(("fb_user_combo", tab_id))
+                            .selected_text(truncate(&preview, 18))
+                            .show_ui(ui, |ui| {
+                                for candidate in &available_users {
+                                    if ui
+                                        .selectable_label(
+                                            candidate == &current_user,
+                                            candidate,
+                                        )
+                                        .clicked()
+                                    {
+                                        user_input = candidate.clone();
+                                        apply_user = Some(candidate.clone());
+                                    }
+                                }
+                                for fallback in ["ssm-user", "ec2-user", "root"] {
+                                    if ui
+                                        .selectable_label(
+                                            fallback == current_user,
+                                            fallback,
+                                        )
+                                        .clicked()
+                                    {
+                                        user_input = fallback.to_string();
+                                        apply_user = Some(fallback.to_string());
+                                    }
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut user_input)
+                                .desired_width(110.0)
+                                .hint_text("custom user")
+                                .font(egui::TextStyle::Small),
+                        );
+                        let submitted = response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if ui.small_button("Apply").clicked() || submitted {
+                            apply_user = Some(user_input.clone());
+                        }
+                    });
+                    // Write back edited text so the input survives frames.
+                    if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                        fb.user_input = user_input;
+                    }
+                    ui.separator();
+                }
+            }
+
             // Collect state to avoid borrow conflicts
             let fb_snapshot = self.file_browsers.get(&tab_id).map(|fb| {
                 (
@@ -3966,6 +4062,30 @@ mod gui {
                     }
                 }
             });
+
+            // Apply a new remote user: cache per-profile and navigate to its home.
+            if let Some(new_user) = apply_user {
+                let trimmed = new_user.trim().to_string();
+                if !trimmed.is_empty() {
+                    let profile_id = self
+                        .file_browsers
+                        .get(&tab_id)
+                        .map(|fb| fb.profile_id.clone())
+                        .unwrap_or_default();
+                    if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                        fb.remote_user = trimmed.clone();
+                        fb.user_input = trimmed.clone();
+                    }
+                    if !profile_id.is_empty() {
+                        self.config.set_remote_user(&profile_id, &trimmed);
+                        if let Err(err) = self.config.save() {
+                            self.log_warn(format!("failed to save remote user: {err}"));
+                        }
+                    }
+                    let home = format!("/home/{trimmed}");
+                    navigate_to = Some(home);
+                }
+            }
 
             // Handle navigation
             if let Some(path) = navigate_to {
