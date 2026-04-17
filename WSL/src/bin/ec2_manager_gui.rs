@@ -4822,19 +4822,39 @@ mod gui {
                                     // are racy on Windows — the "" can win
                                     // and the real text is silently lost.
                                     // Collapsing to one set_text avoids it.
-                                    let copied_text = self
+                                    let sel_coords = self
                                         .terminal_selections
                                         .get(&tab_id)
                                         .cloned()
-                                        .and_then(|sel| sel.normalized())
-                                        .and_then(|(start, end)| {
-                                            self.pty_sessions.get_mut(&tab_id).map(|session| {
-                                                extract_selection_text(
-                                                    &mut session.parser, start, end,
-                                                )
-                                            })
-                                        })
-                                        .filter(|t| !t.trim().is_empty());
+                                        .and_then(|sel| sel.normalized());
+                                    let extraction: Option<(AbsPos, AbsPos, u16, String)> =
+                                        sel_coords.and_then(|(start, end)| {
+                                            let session = self.pty_sessions.get_mut(&tab_id)?;
+                                            let vr = session.parser.screen().size().0;
+                                            let t = extract_selection_text(
+                                                &mut session.parser, start, end,
+                                            );
+                                            Some((start, end, vr, t))
+                                        });
+                                    if let Some((start, end, vr, ref t)) = extraction {
+                                        let preview: String = t.chars().take(60)
+                                            .map(|c| if c.is_control() { '.' } else { c })
+                                            .collect();
+                                        self.log_debug(format!(
+                                            "right-click copy tab={tab_id} coords=(abs {}/{} → {}/{}) vr={} raw_len={} preview={preview:?}",
+                                            start.abs_row, start.col,
+                                            end.abs_row, end.col,
+                                            vr,
+                                            t.len(),
+                                        ));
+                                    }
+                                    // Preserve whitespace-only selections
+                                    // (e.g., intentional space copy) but
+                                    // still guard against a truly empty
+                                    // extraction.
+                                    let copied_text = extraction
+                                        .map(|(_, _, _, t)| t)
+                                        .filter(|t| !t.is_empty());
                                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
                                         match &copied_text {
                                             Some(text) => {
