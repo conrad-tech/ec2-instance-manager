@@ -4809,11 +4809,14 @@ mod gui {
                                 // to extraction returning empty/whitespace —
                                 // we never silently fall through to a paste
                                 // when the user clearly intended a copy.
-                                let has_real_selection = self
-                                    .terminal_selections
-                                    .get(&tab_id)
-                                    .and_then(|sel| sel.normalized())
+                                let raw_sel = self.terminal_selections.get(&tab_id).cloned();
+                                let normalized_sel = raw_sel.as_ref().and_then(|s| s.normalized());
+                                let has_real_selection = normalized_sel
                                     .is_some_and(|(s, e)| s != e);
+                                let session_present = self.pty_sessions.contains_key(&tab_id);
+                                self.log_debug(format!(
+                                    "right-click tab={tab_id} has_real_selection={has_real_selection} sel={raw_sel:?} session_present={session_present}"
+                                ));
                                 if has_real_selection {
                                     // Extract first, then do exactly one
                                     // clipboard op. Two back-to-back
@@ -4836,17 +4839,32 @@ mod gui {
                                             );
                                             Some((start, end, vr, t))
                                         });
-                                    if let Some((start, end, vr, ref t)) = extraction {
-                                        let preview: String = t.chars().take(60)
-                                            .map(|c| if c.is_control() { '.' } else { c })
-                                            .collect();
-                                        self.log_debug(format!(
-                                            "right-click copy tab={tab_id} coords=(abs {}/{} → {}/{}) vr={} raw_len={} preview={preview:?}",
-                                            start.abs_row, start.col,
-                                            end.abs_row, end.col,
-                                            vr,
-                                            t.len(),
-                                        ));
+                                    match &extraction {
+                                        Some((start, end, vr, t)) => {
+                                            let preview: String = t.chars().take(60)
+                                                .map(|c| if c.is_control() { '.' } else { c })
+                                                .collect();
+                                            self.log_debug(format!(
+                                                "right-click copy tab={tab_id} coords=(abs {}/{} → {}/{}) vr={} raw_len={} preview={preview:?}",
+                                                start.abs_row, start.col,
+                                                end.abs_row, end.col,
+                                                vr,
+                                                t.len(),
+                                            ));
+                                        }
+                                        None => {
+                                            // has_real_selection was true above,
+                                            // so coords should exist — if we got
+                                            // here, either the selection was
+                                            // cleared between checks or the
+                                            // pty session is missing.
+                                            let coords_present = sel_coords.is_some();
+                                            let session_present = self.pty_sessions.contains_key(&tab_id);
+                                            let sessions: Vec<u64> = self.pty_sessions.keys().copied().collect();
+                                            self.log_error(format!(
+                                                "right-click copy tab={tab_id} extraction=None coords_present={coords_present} session_present={session_present} sessions={sessions:?}"
+                                            ));
+                                        }
                                     }
                                     // Preserve whitespace-only selections
                                     // (e.g., intentional space copy) but
