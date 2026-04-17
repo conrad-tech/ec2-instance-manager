@@ -4309,7 +4309,12 @@ mod gui {
                                 c.account_id.as_deref().unwrap_or("unknown")
                             ));
                             ui.label(format!("Region: {}", c.region));
-                            ui.label(format!("Auth: {}", c.auth_status));
+                            let auth_label = if c.auth_status == AuthStatus::Ok {
+                                "Auth: OK".to_string()
+                            } else {
+                                format!("Auth is not OK ({})", c.auth_status)
+                            };
+                            ui.label(auth_label);
                         }
                     });
 
