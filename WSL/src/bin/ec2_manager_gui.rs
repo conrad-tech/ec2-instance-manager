@@ -4359,11 +4359,11 @@ mod gui {
 
             let mut to_select: Option<u64> = None;
             let mut to_close: Option<u64> = None;
-            let mut close_all = false;
             let mut to_rename: Option<u64> = None;
             let mut to_reopen: Option<(String, String)> = None;
             let mut to_pick_color: Option<(u64, String)> = None;
-            let mut reorder_request: Option<(u64, u64)> = None;
+            let mut dragged_tab_id: Option<u64> = None;
+            let mut tab_rects: Vec<(u64, egui::Rect)> = Vec::with_capacity(tabs_snapshot.len());
 
             egui::ScrollArea::horizontal()
                 .auto_shrink([false, true])
@@ -4410,7 +4410,9 @@ mod gui {
                     };
 
                     let drag_id = egui::Id::new(("conn_tab_drag", *id));
-                    let is_being_dragged = ui.ctx().is_being_dragged(drag_id);
+                    if ui.ctx().is_being_dragged(drag_id) {
+                        dragged_tab_id = Some(*id);
+                    }
                     let dnd_resp = ui.dnd_drag_source(drag_id, *id, |ui| {
                         frame.show(ui, |ui| {
                             ui.horizontal(|ui| {
@@ -4424,10 +4426,17 @@ mod gui {
                                 }
 
                                 let selected = self.connections.selected() == Some(*id);
-                                if ui
-                                    .selectable_label(selected, title.as_str())
-                                    .clicked()
-                                {
+                                let label_text = if selected {
+                                    egui::RichText::new(title.as_str()).strong()
+                                } else {
+                                    egui::RichText::new(title.as_str())
+                                };
+                                let label_resp = ui.add(
+                                    egui::Label::new(label_text)
+                                        .selectable(false)
+                                        .sense(egui::Sense::click_and_drag()),
+                                );
+                                if label_resp.clicked() {
                                     to_select = Some(*id);
                                 }
                                 if ui.small_button("x").clicked() {
@@ -4438,29 +4447,7 @@ mod gui {
                         .response
                     });
                     let frame_resp = dnd_resp.response;
-
-                    // Drop target: if another tab's payload is released on this one, reorder.
-                    if !is_being_dragged {
-                        if let Some(payload) = frame_resp.dnd_hover_payload::<u64>() {
-                            if *payload != *id {
-                                let stroke = egui::Stroke::new(
-                                    2.0,
-                                    ui.visuals().selection.bg_fill,
-                                );
-                                ui.painter().rect_stroke(
-                                    frame_resp.rect,
-                                    ui.visuals().widgets.active.corner_radius,
-                                    stroke,
-                                    egui::StrokeKind::Outside,
-                                );
-                            }
-                        }
-                        if let Some(payload) = frame_resp.dnd_release_payload::<u64>() {
-                            if *payload != *id {
-                                reorder_request = Some((*payload, *id));
-                            }
-                        }
-                    }
+                    tab_rects.push((*id, frame_resp.rect));
 
                     // Right-click context menu on the tab frame
                     let tab_id = *id;
@@ -4497,14 +4484,33 @@ mod gui {
                         }
                     });
                 }
-                if tabs_snapshot.len() > 1 && ui.button("Close All").clicked() {
-                    close_all = true;
-                }
             });
                 });
 
-            if let Some((from_id, to_id)) = reorder_request {
-                self.connections.reorder(from_id, to_id);
+            // Chrome-style live reorder: while a tab is being dragged, find the
+            // slot index under the cursor (by X) and move the dragged tab there
+            // each frame so sibling tabs shift in real time. The dragged tab
+            // itself floats above via dnd_drag_source's tooltip layer.
+            if let Some(dragged_id) = dragged_tab_id {
+                if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+                    let mut new_slot = tab_rects.len();
+                    for (i, (_tid, rect)) in tab_rects.iter().enumerate() {
+                        if pointer.x < rect.center().x {
+                            new_slot = i;
+                            break;
+                        }
+                    }
+                    let current_idx = tab_rects
+                        .iter()
+                        .position(|(tid, _)| *tid == dragged_id);
+                    if let Some(cur) = current_idx {
+                        let target_after_removal =
+                            if cur < new_slot { new_slot - 1 } else { new_slot };
+                        if target_after_removal != cur {
+                            self.connections.move_to(dragged_id, target_after_removal);
+                        }
+                    }
+                }
             }
             if let Some(id) = to_select {
                 self.connections.select(id);
@@ -4542,12 +4548,7 @@ mod gui {
                 ];
                 self.color_picker_profile = Some(profile_id);
             }
-            if close_all {
-                let tab_ids: Vec<u64> = tabs_snapshot.iter().map(|(id, _, _, _)| *id).collect();
-                for id in tab_ids {
-                    self.close_connection_tab(id);
-                }
-            } else if let Some(id) = to_close {
+            if let Some(id) = to_close {
                 self.close_connection_tab(id);
             }
 
@@ -6484,9 +6485,14 @@ mod gui {
                         }
 
                         let tab_count = self.connections.tabs().len();
+                        let close_all_label = if tab_count > 0 {
+                            format!("Close All ({tab_count})")
+                        } else {
+                            "Close All".to_string()
+                        };
                         let close_all = ui.add_enabled(
                             tab_count > 0,
-                            egui::Button::new(format!("Close All Connections ({tab_count})")),
+                            egui::Button::new(close_all_label),
                         );
                         if close_all.clicked() {
                             let ids: Vec<u64> = self

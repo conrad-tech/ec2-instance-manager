@@ -101,6 +101,23 @@ impl ConnectionTabs {
         true
     }
 
+    /// Move `from_id` to position `target_index` in the tab list after its own
+    /// removal. Indices are clamped to [0, tabs.len()] so callers can pass a
+    /// trailing slot to mean "place at the end".
+    pub fn move_to(&mut self, from_id: u64, target_index: usize) -> bool {
+        let Some(from_idx) = self.tabs.iter().position(|t| t.id == from_id) else {
+            return false;
+        };
+        let tab = self.tabs.remove(from_idx);
+        let clamped = target_index.min(self.tabs.len());
+        if clamped == from_idx {
+            self.tabs.insert(clamped, tab);
+            return false;
+        }
+        self.tabs.insert(clamped, tab);
+        true
+    }
+
     pub fn append_line(&mut self, id: u64, line: String) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
             tab.lines.push(line);
