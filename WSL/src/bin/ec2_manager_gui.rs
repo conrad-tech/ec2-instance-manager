@@ -52,6 +52,10 @@ mod gui {
     const PROFILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
     const AUTH_EXPIRY_CHECK_INTERVAL: Duration = Duration::from_secs(10);
     const PROFILE_CHANGE_DEBOUNCE: Duration = Duration::from_secs(2);
+    /// Auto-close a Connections tab this long after its PTY exited (e.g. SSM
+    /// inactivity logout).
+    const STALE_TAB_AUTOCLOSE: Duration = Duration::from_secs(3600);
+    const STALE_TAB_CHECK_INTERVAL: Duration = Duration::from_secs(60);
     const GUI_SMOKE_MARKER_ENV: &str = "EC2_MANAGER_GUI_SMOKE_MARKER";
     const GUI_SMOKE_EXPECTED_TEXT_ENV: &str = "EC2_MANAGER_GUI_SMOKE_EXPECTED_TEXT";
     const GUI_SMOKE_EXIT_ON_MARKER_ENV: &str = "EC2_MANAGER_GUI_SMOKE_EXIT_ON_MARKER";
@@ -355,6 +359,12 @@ mod gui {
         /// shell prompt appears (e.g., after `sudo su`), not on every
         /// subsequent output flush.
         last_prepped_prompt: String,
+        /// When the most recent paste was written to the PTY, and how many
+        /// bytes it contained. Used to log the echo-return latency of large
+        /// pastes so we can distinguish remote-buffering stalls from local
+        /// parse/render stalls. Cleared once we log the first inbound byte.
+        paste_write_at: Option<Instant>,
+        paste_write_bytes: usize,
     }
 
     /// Absolute terminal position: scroll-invariant coordinate.
@@ -541,15 +551,14 @@ mod gui {
 
     /// Shell setup sent to the remote shell when the user clicks "Prep
     /// Terminal".  Execs bash (SSM sessions start in `sh`), sets a
-    /// git-bash-style PS1, and appends `set paste` to `~/.vimrc` if not
+    /// git-bash-style PS1, appends `set paste` to `~/.vimrc` if not
     /// already present (fixes staircase-indent on right-click paste into
-    /// vim).  Produces:
-    ///   (blank line)
-    ///   user@host SSM ~/working/dir
-    ///   $
-    /// with bold-green user@host, magenta "SSM", and bold-yellow path.
+    /// vim), and writes an `~/.ssh/config` entry that auto-accepts new
+    /// host keys so `scp`/`ssh` don't stall on the fingerprint prompt.
+    /// The sudo-su re-prep hook re-runs this for the switched-to user,
+    /// so root (etc.) gets its own `~/.ssh/config` too.
     const PREP_TERMINAL_COMMAND: &[u8] =
-        b"exec bash\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\rgrep -qxF 'set paste' ~/.vimrc 2>/dev/null || echo 'set paste' >> ~/.vimrc\rclear\r";
+        b"exec bash\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\rgrep -qxF 'set paste' ~/.vimrc 2>/dev/null || echo 'set paste' >> ~/.vimrc\rmkdir -p ~/.ssh && chmod 700 ~/.ssh 2>/dev/null\rgrep -qs 'StrictHostKeyChecking accept-new' ~/.ssh/config 2>/dev/null || printf 'Host *\\n  StrictHostKeyChecking accept-new\\n  UserKnownHostsFile ~/.ssh/known_hosts\\n' >> ~/.ssh/config\rchmod 600 ~/.ssh/config 2>/dev/null\rclear\r";
 
     #[derive(Debug, PartialEq, Eq)]
     struct RowAction {
@@ -917,6 +926,7 @@ mod gui {
         last_credentials_mtime: Option<SystemTime>,
         last_credentials_poll_at: Instant,
         last_auth_expiry_check_at: Instant,
+        last_stale_tab_check_at: Instant,
         account_color_map: HashMap<String, egui::Color32>,
         tab_rename_id: Option<u64>,
         tab_rename_buf: String,
@@ -1085,6 +1095,7 @@ mod gui {
                 last_credentials_mtime,
                 last_credentials_poll_at: Instant::now(),
                 last_auth_expiry_check_at: Instant::now(),
+                last_stale_tab_check_at: Instant::now(),
                 account_color_map: HashMap::new(),
                 tab_rename_id: None,
                 tab_rename_buf: String::new(),
@@ -1303,6 +1314,23 @@ mod gui {
                     }
                     self.refresh_profile(pid, true);
                 }
+
+                // Safety net: if the selected profile is now Ok but its
+                // display was cleared (e.g. handle_profile_expired ran and
+                // the previously_unauthed list missed the transition because
+                // expiry and re-auth collapsed into one tick), reload from
+                // cache so the user doesn't see an empty list.
+                if let Some(ref selected) = self.selected_profile.clone() {
+                    let selected_ok = self.profile_auth_infos.iter().any(|a| {
+                        a.profile_id == *selected && a.auth_status == AuthStatus::Ok
+                    });
+                    if selected_ok && self.inventory.instances.is_empty() {
+                        self.log_info(format!(
+                            "selected profile={selected} is Ok but display is empty; reloading cache"
+                        ));
+                        self.load_cache_for_profile(selected);
+                    }
+                }
             }
         }
 
@@ -1350,6 +1378,24 @@ mod gui {
                 if still_expired {
                     self.handle_profile_expired(pid);
                 }
+            }
+        }
+
+        /// Close any Connections tabs whose PTY exited (e.g. SSM inactivity
+        /// logout) longer than `STALE_TAB_AUTOCLOSE` ago.
+        fn poll_stale_connection_tabs(&mut self) {
+            if self.last_stale_tab_check_at.elapsed() < STALE_TAB_CHECK_INTERVAL {
+                return;
+            }
+            self.last_stale_tab_check_at = Instant::now();
+
+            let stale = self.connections.stale_logged_out_ids(STALE_TAB_AUTOCLOSE);
+            for tab_id in stale {
+                self.log_info(format!(
+                    "auto-closing tab={tab_id}: disconnected > {}s",
+                    STALE_TAB_AUTOCLOSE.as_secs()
+                ));
+                self.close_connection_tab(tab_id);
             }
         }
 
@@ -2336,12 +2382,37 @@ mod gui {
                         bytes
                     }
                 };
+                let mut paste_diag: Option<String> = None;
                 let log_msg = if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
                     session.bytes_received += bytes.len() as u64;
                     session.output_event_count += 1;
                     let evt = session.output_event_count;
                     let total = session.bytes_received;
+                    // Paste-diagnostic timing: while paste_write_at is set,
+                    // each inbound event logs since-write latency + parse cost
+                    // so we can tell if a stall is outbound (remote) vs
+                    // inbound (local parse/render).
+                    let paste_info = session.paste_write_at.map(|at| {
+                        (at.elapsed(), session.paste_write_bytes)
+                    });
+                    let parse_start = Instant::now();
                     session.parser.process(&bytes);
+                    let parse_elapsed = parse_start.elapsed();
+                    if let Some((since_write, write_bytes)) = paste_info {
+                        let scrollback = session.parser.screen().scrollback();
+                        paste_diag = Some(format!(
+                            "paste-echo tab={tab_id} evt=#{evt} write_bytes={write_bytes} \
+                             since_write={}ms in_bytes={} parse={}us scrollback={}",
+                            since_write.as_millis(),
+                            bytes.len(),
+                            parse_elapsed.as_micros(),
+                            scrollback,
+                        ));
+                        // Close the diagnostic window 2s after the paste.
+                        if since_write > Duration::from_millis(2000) {
+                            session.paste_write_at = None;
+                        }
+                    }
                     // Selection coordinates are abs_row-based and remain
                     // valid as scrollback grows, so we don't need to clear
                     // them here. (Previously cleared on any output arriving
@@ -2414,6 +2485,9 @@ mod gui {
                 };
                 if let Some((level, msg)) = log_msg {
                     self.log(level, msg);
+                }
+                if let Some(msg) = paste_diag {
+                    self.log_debug(msg);
                 }
                 self.maybe_record_gui_smoke_success(tab_id, &bytes);
             }
@@ -3317,6 +3391,20 @@ mod gui {
             }
         }
 
+        /// Stamp the session so the next inbound output event logs the
+        /// round-trip latency of a large paste. Used to diagnose whether
+        /// paste stalls are outbound (remote buffering) or inbound
+        /// (local parse/render cost).
+        fn mark_paste_write(&mut self, tab_id: u64, len: usize) {
+            if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
+                session.paste_write_at = Some(Instant::now());
+                session.paste_write_bytes = len;
+            }
+            self.log_debug(format!(
+                "paste write tab={tab_id} bytes={len}"
+            ));
+        }
+
         fn send_raw_bytes_to_connection_tab(&mut self, tab_id: u64, payload: &[u8]) {
             self.log_trace(format!(
                 "sending input to tab={tab_id} bytes={}",
@@ -3482,6 +3570,9 @@ mod gui {
                         "terminal input event tab={tab_id} kind={}",
                         terminal_event_kind(&event)
                     ));
+                    if matches!(event, egui::Event::Paste(_)) {
+                        self.mark_paste_write(tab_id, payload.len());
+                    }
                     self.send_raw_bytes_to_connection_tab(tab_id, &payload);
                 }
             }
@@ -4272,6 +4363,7 @@ mod gui {
             let mut to_rename: Option<u64> = None;
             let mut to_reopen: Option<(String, String)> = None;
             let mut to_pick_color: Option<(u64, String)> = None;
+            let mut reorder_request: Option<(u64, u64)> = None;
 
             egui::ScrollArea::horizontal()
                 .auto_shrink([false, true])
@@ -4317,29 +4409,58 @@ mod gui {
                         egui::Frame::group(ui.style())
                     };
 
-                    let frame_resp = frame.show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            // Color dot indicator
-                            if let Some(color) = tab_color {
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(8.0, 8.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().circle_filled(rect.center(), 4.0, color);
-                            }
+                    let drag_id = egui::Id::new(("conn_tab_drag", *id));
+                    let is_being_dragged = ui.ctx().is_being_dragged(drag_id);
+                    let dnd_resp = ui.dnd_drag_source(drag_id, *id, |ui| {
+                        frame.show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                // Color dot indicator
+                                if let Some(color) = tab_color {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(8.0, 8.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(rect.center(), 4.0, color);
+                                }
 
-                            let selected = self.connections.selected() == Some(*id);
-                            if ui
-                                .selectable_label(selected, title.as_str())
-                                .clicked()
-                            {
-                                to_select = Some(*id);
-                            }
-                            if ui.small_button("x").clicked() {
-                                to_close = Some(*id);
-                            }
-                        });
+                                let selected = self.connections.selected() == Some(*id);
+                                if ui
+                                    .selectable_label(selected, title.as_str())
+                                    .clicked()
+                                {
+                                    to_select = Some(*id);
+                                }
+                                if ui.small_button("x").clicked() {
+                                    to_close = Some(*id);
+                                }
+                            });
+                        })
+                        .response
                     });
+                    let frame_resp = dnd_resp.response;
+
+                    // Drop target: if another tab's payload is released on this one, reorder.
+                    if !is_being_dragged {
+                        if let Some(payload) = frame_resp.dnd_hover_payload::<u64>() {
+                            if *payload != *id {
+                                let stroke = egui::Stroke::new(
+                                    2.0,
+                                    ui.visuals().selection.bg_fill,
+                                );
+                                ui.painter().rect_stroke(
+                                    frame_resp.rect,
+                                    ui.visuals().widgets.active.corner_radius,
+                                    stroke,
+                                    egui::StrokeKind::Outside,
+                                );
+                            }
+                        }
+                        if let Some(payload) = frame_resp.dnd_release_payload::<u64>() {
+                            if *payload != *id {
+                                reorder_request = Some((*payload, *id));
+                            }
+                        }
+                    }
 
                     // Right-click context menu on the tab frame
                     let tab_id = *id;
@@ -4352,7 +4473,7 @@ mod gui {
                         .unwrap_or_default();
                     let tab_profile = profile_id.clone();
                     let tab_running = *running;
-                    frame_resp.response.context_menu(|ui| {
+                    frame_resp.context_menu(|ui| {
                         if ui.button("Rename").clicked() {
                             to_rename = Some(tab_id);
                             ui.close();
@@ -4382,6 +4503,9 @@ mod gui {
             });
                 });
 
+            if let Some((from_id, to_id)) = reorder_request {
+                self.connections.reorder(from_id, to_id);
+            }
             if let Some(id) = to_select {
                 self.connections.select(id);
             }
@@ -4667,7 +4791,7 @@ mod gui {
                             let terminal_focus_response = ui.interact(
                                 terminal_response.response.rect,
                                 terminal_focus_id,
-                                egui::Sense::click(),
+                                egui::Sense::click_and_drag(),
                             );
                             // Derive cell size from the rendered rect and the actual
                             // parser grid dimensions.  This avoids font-metric drift
@@ -4920,6 +5044,8 @@ mod gui {
                                                     .replace('\u{00a0}', " ")
                                                     .replace("\r\n", "\r")
                                                     .replace('\n', "\r");
+                                                let paste_bytes = normalized.len();
+                                                self.mark_paste_write(tab_id, paste_bytes);
                                                 self.send_raw_bytes_to_connection_tab(
                                                     tab_id,
                                                     normalized.as_bytes(),
@@ -5869,6 +5995,7 @@ mod gui {
                 self.poll_profile_choice_changes();
                 self.poll_credentials_changes();
                 self.poll_auth_expiry();
+                self.poll_stale_connection_tabs();
                 if self.poll_connection_events() {
                     // More output queued than we processed this frame;
                     // schedule another frame to drain the rest.
@@ -6354,6 +6481,24 @@ mod gui {
                                         });
                                     }
                                 });
+                        }
+
+                        let tab_count = self.connections.tabs().len();
+                        let close_all = ui.add_enabled(
+                            tab_count > 0,
+                            egui::Button::new(format!("Close All Connections ({tab_count})")),
+                        );
+                        if close_all.clicked() {
+                            let ids: Vec<u64> = self
+                                .connections
+                                .tabs()
+                                .iter()
+                                .map(|t| t.id)
+                                .collect();
+                            self.log_info(format!("closing all {} connection tab(s)", ids.len()));
+                            for id in ids {
+                                self.close_connection_tab(id);
+                            }
                         }
                     });
 
@@ -7424,7 +7569,7 @@ mod gui {
             child,
             master: Arc::new(Mutex::new(master)),
             writer: Arc::new(Mutex::new(writer)),
-            parser: vt100::Parser::new(24, 120, 10_000),
+            parser: vt100::Parser::new(24, 120, 2_500),
             last_size: None,
             bytes_received: 0,
             output_event_count: 0,
@@ -7433,6 +7578,8 @@ mod gui {
             input_line_buf: String::new(),
             pending_reprep: false,
             last_prepped_prompt: String::new(),
+            paste_write_at: None,
+            paste_write_bytes: 0,
         };
 
         Ok((session, reader))

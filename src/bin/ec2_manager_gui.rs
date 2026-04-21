@@ -3224,6 +3224,7 @@ mod gui {
             let mut to_rename: Option<u64> = None;
             let mut to_reopen: Option<(String, String)> = None;
             let mut to_pick_color: Option<(u64, String)> = None;
+            let mut reorder_request: Option<(u64, u64)> = None;
 
             ui.horizontal_wrapped(|ui| {
                 for (id, title, profile_id, running) in &tabs_snapshot {
@@ -3243,33 +3244,62 @@ mod gui {
                         egui::Frame::group(ui.style())
                     };
 
-                    let frame_resp = frame.show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            // Color dot indicator
-                            if let Some(color) = tab_color {
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(8.0, 8.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().circle_filled(rect.center(), 4.0, color);
-                            }
+                    let drag_id = egui::Id::new(("conn_tab_drag", *id));
+                    let is_being_dragged = ui.ctx().is_being_dragged(drag_id);
+                    let dnd_resp = ui.dnd_drag_source(drag_id, *id, |ui| {
+                        frame.show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                // Color dot indicator
+                                if let Some(color) = tab_color {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(8.0, 8.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(rect.center(), 4.0, color);
+                                }
 
-                            let prefix = if *running { "" } else { "[done] " };
-                            let selected = self.connections.selected() == Some(*id);
-                            if ui
-                                .selectable_label(
-                                    selected,
-                                    format!("{}{}", prefix, truncate(title, 28)),
-                                )
-                                .clicked()
-                            {
-                                to_select = Some(*id);
-                            }
-                            if ui.small_button("x").clicked() {
-                                to_close = Some(*id);
-                            }
-                        });
+                                let prefix = if *running { "" } else { "[done] " };
+                                let selected = self.connections.selected() == Some(*id);
+                                if ui
+                                    .selectable_label(
+                                        selected,
+                                        format!("{}{}", prefix, truncate(title, 28)),
+                                    )
+                                    .clicked()
+                                {
+                                    to_select = Some(*id);
+                                }
+                                if ui.small_button("x").clicked() {
+                                    to_close = Some(*id);
+                                }
+                            });
+                        })
+                        .response
                     });
+                    let frame_resp = dnd_resp.response;
+
+                    // Drop target: if another tab's payload is released on this one, reorder.
+                    if !is_being_dragged {
+                        if let Some(payload) = frame_resp.dnd_hover_payload::<u64>() {
+                            if *payload != *id {
+                                let stroke = egui::Stroke::new(
+                                    2.0,
+                                    ui.visuals().selection.bg_fill,
+                                );
+                                ui.painter().rect_stroke(
+                                    frame_resp.rect,
+                                    ui.visuals().widgets.active.corner_radius,
+                                    stroke,
+                                    egui::StrokeKind::Outside,
+                                );
+                            }
+                        }
+                        if let Some(payload) = frame_resp.dnd_release_payload::<u64>() {
+                            if *payload != *id {
+                                reorder_request = Some((*payload, *id));
+                            }
+                        }
+                    }
 
                     // Right-click context menu on the tab frame
                     let tab_id = *id;
@@ -3282,7 +3312,7 @@ mod gui {
                         .unwrap_or_default();
                     let tab_profile = profile_id.clone();
                     let tab_running = *running;
-                    frame_resp.response.context_menu(|ui| {
+                    frame_resp.context_menu(|ui| {
                         if ui.button("Rename").clicked() {
                             to_rename = Some(tab_id);
                             ui.close();
@@ -3311,6 +3341,9 @@ mod gui {
                 }
             });
 
+            if let Some((from_id, to_id)) = reorder_request {
+                self.connections.reorder(from_id, to_id);
+            }
             if let Some(id) = to_select {
                 self.connections.select(id);
             }
@@ -3538,7 +3571,7 @@ mod gui {
                             let terminal_focus_response = ui.interact(
                                 terminal_response.response.rect,
                                 terminal_focus_id,
-                                egui::Sense::click(),
+                                egui::Sense::click_and_drag(),
                             );
                             // Use the label's actual rendered rect so highlight and
                             // mouse mapping align with text regardless of frame margins
@@ -3620,7 +3653,41 @@ mod gui {
                                     }
                                 }
                             }
-                            if terminal_focus_response.clicked() {
+                            if terminal_focus_response.double_clicked() {
+                                if let Some(pos) = pointer_pos {
+                                    if term_rect.contains(pos) {
+                                        let (row, col) = pixel_to_grid_cell(
+                                            pos, term_rect, sel_cell_w, sel_cell_h, sel_rows, sel_cols,
+                                        );
+                                        let scroll_off = self
+                                            .pty_sessions
+                                            .get(&tab_id)
+                                            .map(|s| s.scroll_offset)
+                                            .unwrap_or(0);
+                                        if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
+                                            session.parser.screen_mut().set_scrollback(scroll_off);
+                                            let (c_start, c_end) = word_bounds_at(
+                                                session.parser.screen(),
+                                                row,
+                                                col,
+                                                sel_cols,
+                                            );
+                                            session.parser.screen_mut().set_scrollback(0);
+                                            let abs_row = screen_row_to_abs(row, scroll_off, sel_rows);
+                                            let sel = self
+                                                .terminal_selections
+                                                .entry(tab_id)
+                                                .or_default();
+                                            sel.anchor = Some(AbsPos { abs_row, col: c_start });
+                                            sel.end = Some(AbsPos { abs_row, col: c_end });
+                                            self.log_debug(format!(
+                                                "double-click word select tab={tab_id} row={row} cols={c_start}..={c_end}"
+                                            ));
+                                        }
+                                    }
+                                }
+                                terminal_focus_response.request_focus();
+                            } else if terminal_focus_response.clicked() {
                                 if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
                                     sel.clear();
                                 }
@@ -5716,6 +5783,43 @@ mod gui {
         let col = (x / cell_w).floor().max(0.0) as u16;
         let row = (y / cell_h).floor().max(0.0) as u16;
         (row.min(rows.saturating_sub(1)), col.min(cols.saturating_sub(1)))
+    }
+
+    fn is_terminal_word_char(ch: char) -> bool {
+        ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '+' | ':' | '@' | '~' | '=')
+    }
+
+    /// Given a click at (row, col), expand to the surrounding word on that screen row.
+    /// Returns inclusive column bounds (start, end). Scrollback must already be set.
+    fn word_bounds_at(
+        screen: &vt100::Screen,
+        row: u16,
+        col: u16,
+        cols: u16,
+    ) -> (u16, u16) {
+        let cell_char = |r: u16, c: u16| -> Option<char> {
+            screen.cell(r, c).and_then(|cell| cell.contents().chars().next())
+        };
+        let hit = cell_char(row, col);
+        if !hit.map(is_terminal_word_char).unwrap_or(false) {
+            return (col, col);
+        }
+        let mut start = col;
+        while start > 0 {
+            match cell_char(row, start - 1) {
+                Some(ch) if is_terminal_word_char(ch) => start -= 1,
+                _ => break,
+            }
+        }
+        let mut end = col;
+        let max_col = cols.saturating_sub(1);
+        while end < max_col {
+            match cell_char(row, end + 1) {
+                Some(ch) if is_terminal_word_char(ch) => end += 1,
+                _ => break,
+            }
+        }
+        (start, end)
     }
 
     /// Convert a screen row to an absolute row (scroll-invariant).

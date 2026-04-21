@@ -90,6 +90,21 @@ impl ConnectionTabs {
         }
     }
 
+    pub fn reorder(&mut self, from_id: u64, to_id: u64) -> bool {
+        if from_id == to_id {
+            return false;
+        }
+        let Some(from_idx) = self.tabs.iter().position(|t| t.id == from_id) else {
+            return false;
+        };
+        let Some(to_idx) = self.tabs.iter().position(|t| t.id == to_id) else {
+            return false;
+        };
+        let tab = self.tabs.remove(from_idx);
+        self.tabs.insert(to_idx, tab);
+        true
+    }
+
     pub fn set_running(&mut self, id: u64, running: bool) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
             tab.running = running;

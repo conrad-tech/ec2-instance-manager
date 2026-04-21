@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectionTab {
     pub id: u64,
@@ -6,6 +8,9 @@ pub struct ConnectionTab {
     pub profile_id: String,
     pub running: bool,
     pub lines: Vec<String>,
+    /// When the PTY exited (e.g. SSM inactivity logout). Set by `set_running(id, false)`.
+    /// Used by the GUI to auto-close tabs that have been disconnected for too long.
+    pub logged_out_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -52,6 +57,7 @@ impl ConnectionTabs {
             profile_id,
             running: true,
             lines: Vec::new(),
+            logged_out_at: None,
         });
         self.selected = Some(id);
         id
@@ -80,6 +86,21 @@ impl ConnectionTabs {
         before != self.tabs.len()
     }
 
+    pub fn reorder(&mut self, from_id: u64, to_id: u64) -> bool {
+        if from_id == to_id {
+            return false;
+        }
+        let Some(from_idx) = self.tabs.iter().position(|t| t.id == from_id) else {
+            return false;
+        };
+        let Some(to_idx) = self.tabs.iter().position(|t| t.id == to_id) else {
+            return false;
+        };
+        let tab = self.tabs.remove(from_idx);
+        self.tabs.insert(to_idx, tab);
+        true
+    }
+
     pub fn append_line(&mut self, id: u64, line: String) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
             tab.lines.push(line);
@@ -92,8 +113,29 @@ impl ConnectionTabs {
 
     pub fn set_running(&mut self, id: u64, running: bool) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+            let was_running = tab.running;
             tab.running = running;
+            if was_running && !running {
+                tab.logged_out_at = Some(Instant::now());
+            } else if running {
+                tab.logged_out_at = None;
+            }
         }
+    }
+
+    /// Return ids of tabs that have been disconnected (PTY exited) for at
+    /// least `threshold` and should be auto-closed.
+    pub fn stale_logged_out_ids(&self, threshold: std::time::Duration) -> Vec<u64> {
+        self.tabs
+            .iter()
+            .filter(|t| {
+                !t.running
+                    && t.logged_out_at
+                        .map(|at| at.elapsed() >= threshold)
+                        .unwrap_or(false)
+            })
+            .map(|t| t.id)
+            .collect()
     }
 }
 
