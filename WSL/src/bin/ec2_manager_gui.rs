@@ -4412,46 +4412,71 @@ mod gui {
                     let drag_id = egui::Id::new(("conn_tab_drag", *id));
                     // Scope the whole tab frame with click+drag sense so clicks
                     // and drags anywhere on the tab (except the close button)
-                    // are handled uniformly with a normal cursor.
+                    // are handled uniformly with a normal cursor. While this
+                    // tab is being dragged, paint it on the Tooltip layer and
+                    // translate that layer so the tab visually follows the
+                    // cursor (Chrome-style), while its rest slot still
+                    // participates in the horizontal layout so sibling tabs
+                    // continue to determine midpoint crossings for reorder.
                     let selected = self.connections.selected() == Some(*id);
-                    let tab_scope = ui.scope_builder(
-                        egui::UiBuilder::new()
-                            .id_salt(drag_id)
-                            .sense(egui::Sense::click_and_drag()),
-                        |ui| {
-                            let hovered = ui.response().hovered()
-                                || ui.response().dragged()
-                                || ui.response().is_pointer_button_down_on();
-                            frame.show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    // Color dot indicator
-                                    if let Some(color) = tab_color {
-                                        let (rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(8.0, 8.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        ui.painter().circle_filled(rect.center(), 4.0, color);
-                                    }
+                    let is_being_dragged = ui.ctx().is_being_dragged(drag_id);
+                    let drag_layer_id = is_being_dragged
+                        .then(|| egui::LayerId::new(egui::Order::Tooltip, drag_id));
+                    let mut builder = egui::UiBuilder::new()
+                        .id_salt(drag_id)
+                        .sense(egui::Sense::click_and_drag());
+                    if let Some(lid) = drag_layer_id {
+                        builder = builder.layer_id(lid);
+                    }
+                    let tab_scope = ui.scope_builder(builder, |ui| {
+                        let hovered = ui.response().hovered()
+                            || ui.response().dragged()
+                            || ui.response().is_pointer_button_down_on();
+                        frame.show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                // Color dot indicator
+                                if let Some(color) = tab_color {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(8.0, 8.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(rect.center(), 4.0, color);
+                                }
 
-                                    let mut label_text = egui::RichText::new(title.as_str());
-                                    if selected {
-                                        label_text = label_text.strong();
-                                    }
-                                    if hovered && !selected {
-                                        label_text = label_text
-                                            .color(ui.visuals().widgets.hovered.text_color());
-                                    }
-                                    ui.add(egui::Label::new(label_text).selectable(false));
-                                    if ui.small_button("x").clicked() {
-                                        to_close = Some(*id);
-                                    }
-                                });
+                                let mut label_text = egui::RichText::new(title.as_str());
+                                if selected {
+                                    label_text = label_text.strong();
+                                }
+                                if hovered && !selected {
+                                    label_text = label_text
+                                        .color(ui.visuals().widgets.hovered.text_color());
+                                }
+                                ui.add(egui::Label::new(label_text).selectable(false));
+                                if ui.small_button("x").clicked() {
+                                    to_close = Some(*id);
+                                }
                             });
-                        },
-                    );
+                        });
+                    });
                     let frame_resp = tab_scope
                         .response
                         .on_hover_cursor(egui::CursorIcon::Default);
+                    // Chrome-style: anchor the dragged tab to the cursor so it
+                    // visually follows the mouse. We translate from the tab's
+                    // slot center to the current pointer position, preserving
+                    // the tab's vertical position so it doesn't jump rows.
+                    if let Some(lid) = drag_layer_id {
+                        if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+                            let delta = egui::vec2(
+                                pointer.x - frame_resp.rect.center().x,
+                                0.0,
+                            );
+                            ui.ctx().transform_layer_shapes(
+                                lid,
+                                egui::emath::TSTransform::from_translation(delta),
+                            );
+                        }
+                    }
                     if frame_resp.clicked() {
                         to_select = Some(*id);
                     }
@@ -4780,14 +4805,21 @@ mod gui {
                                                             egui::Align::Min,
                                                         ),
                                                         |ui| {
+                                                            // No sense on the label: all
+                                                            // terminal clicks/drags flow
+                                                            // through the outer
+                                                            // `terminal_focus_response`
+                                                            // (ui.interact) below.
+                                                            // A sensing label here steals
+                                                            // secondary_clicked/double_clicked
+                                                            // from that outer response and
+                                                            // breaks right-click copy and
+                                                            // double-click word selection.
                                                             ui.add(
                                                                 egui::Label::new(
                                                                     terminal_job,
                                                                 )
-                                                                .selectable(false)
-                                                                .sense(
-                                                                    egui::Sense::click(),
-                                                                ),
+                                                                .selectable(false),
                                                             )
                                                         },
                                                     )
