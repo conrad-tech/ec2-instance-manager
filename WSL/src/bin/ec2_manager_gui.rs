@@ -4410,43 +4410,54 @@ mod gui {
                     };
 
                     let drag_id = egui::Id::new(("conn_tab_drag", *id));
-                    if ui.ctx().is_being_dragged(drag_id) {
+                    // Scope the whole tab frame with click+drag sense so clicks
+                    // and drags anywhere on the tab (except the close button)
+                    // are handled uniformly with a normal cursor.
+                    let selected = self.connections.selected() == Some(*id);
+                    let tab_scope = ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .id_salt(drag_id)
+                            .sense(egui::Sense::click_and_drag()),
+                        |ui| {
+                            let hovered = ui.response().hovered()
+                                || ui.response().dragged()
+                                || ui.response().is_pointer_button_down_on();
+                            frame.show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    // Color dot indicator
+                                    if let Some(color) = tab_color {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(8.0, 8.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().circle_filled(rect.center(), 4.0, color);
+                                    }
+
+                                    let mut label_text = egui::RichText::new(title.as_str());
+                                    if selected {
+                                        label_text = label_text.strong();
+                                    }
+                                    if hovered && !selected {
+                                        label_text = label_text
+                                            .color(ui.visuals().widgets.hovered.text_color());
+                                    }
+                                    ui.add(egui::Label::new(label_text).selectable(false));
+                                    if ui.small_button("x").clicked() {
+                                        to_close = Some(*id);
+                                    }
+                                });
+                            });
+                        },
+                    );
+                    let frame_resp = tab_scope
+                        .response
+                        .on_hover_cursor(egui::CursorIcon::Default);
+                    if frame_resp.clicked() {
+                        to_select = Some(*id);
+                    }
+                    if frame_resp.dragged() {
                         dragged_tab_id = Some(*id);
                     }
-                    let dnd_resp = ui.dnd_drag_source(drag_id, *id, |ui| {
-                        frame.show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                // Color dot indicator
-                                if let Some(color) = tab_color {
-                                    let (rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(8.0, 8.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().circle_filled(rect.center(), 4.0, color);
-                                }
-
-                                let selected = self.connections.selected() == Some(*id);
-                                let label_text = if selected {
-                                    egui::RichText::new(title.as_str()).strong()
-                                } else {
-                                    egui::RichText::new(title.as_str())
-                                };
-                                let label_resp = ui.add(
-                                    egui::Label::new(label_text)
-                                        .selectable(false)
-                                        .sense(egui::Sense::click_and_drag()),
-                                );
-                                if label_resp.clicked() {
-                                    to_select = Some(*id);
-                                }
-                                if ui.small_button("x").clicked() {
-                                    to_close = Some(*id);
-                                }
-                            });
-                        })
-                        .response
-                    });
-                    let frame_resp = dnd_resp.response;
                     tab_rects.push((*id, frame_resp.rect));
 
                     // Right-click context menu on the tab frame
