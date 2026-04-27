@@ -111,7 +111,7 @@ fn load_live_inventory(context: &AwsContext, mapping: &TagMapping) -> Result<Inv
                 "--output",
                 "text",
                 "--query",
-                "Reservations[].Instances[].[InstanceId,State.Name,PrivateIpAddress,Placement.AvailabilityZone,InstanceType,ImageId,LaunchTime]",
+                "Reservations[].Instances[].[InstanceId,State.Name,PrivateIpAddress,Placement.AvailabilityZone,InstanceType,ImageId,LaunchTime,PrivateDnsName]",
             ],
         )
     });
@@ -203,6 +203,7 @@ fn parse_instance_basics(raw: &str) -> Result<BTreeMap<String, Instance>> {
         instance.instance_type = fields.get(4).and_then(|v| normalize_field(v));
         instance.image_id = fields.get(5).and_then(|v| normalize_field(v));
         instance.launch_time = fields.get(6).and_then(|v| normalize_field(v));
+        instance.private_dns = fields.get(7).and_then(|v| normalize_field(v));
 
         map.insert(instance_id.to_string(), instance);
     }

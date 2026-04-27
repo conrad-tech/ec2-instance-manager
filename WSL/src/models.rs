@@ -83,6 +83,8 @@ pub struct Instance {
     pub instance_id: String,
     pub state: String,
     pub private_ip: Option<String>,
+    #[serde(default)]
+    pub private_dns: Option<String>,
     pub az: Option<String>,
     pub instance_type: Option<String>,
     pub image_id: Option<String>,
@@ -105,6 +107,7 @@ impl Instance {
             instance_id,
             state,
             private_ip: None,
+            private_dns: None,
             az: None,
             instance_type: None,
             image_id: None,

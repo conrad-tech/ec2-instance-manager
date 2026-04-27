@@ -67,6 +67,7 @@ mod gui {
     const COL_STATE_W: f32 = 50.0;
     const COL_SSM_W: f32 = 40.0;
     const COL_IP_W: f32 = 83.0;
+    const COL_DNS_W: f32 = 220.0;
     const COL_ENV_W: f32 = 40.0;
     const COL_INSTANCE_TYPE_W: f32 = 95.0;
     const COL_AMI_W: f32 = 71.0;
@@ -134,6 +135,7 @@ mod gui {
         State,
         Ssm,
         PrivateIp,
+        PrivateDns,
         Env,
         InstanceType,
         AmiId,
@@ -169,6 +171,7 @@ mod gui {
         ("State", SortColumn::State),
         ("SSM", SortColumn::Ssm),
         ("Private IP", SortColumn::PrivateIp),
+        ("Private DNS", SortColumn::PrivateDns),
         ("AMI ID", SortColumn::AmiId),
         ("Instance Type", SortColumn::InstanceType),
         ("Environment", SortColumn::Env),
@@ -184,6 +187,7 @@ mod gui {
                 Self::State => COL_STATE_W,
                 Self::Ssm => COL_SSM_W,
                 Self::PrivateIp => COL_IP_W + COL_COPY_W,
+                Self::PrivateDns => COL_DNS_W + COL_COPY_W,
                 Self::AmiId => COL_AMI_W + COL_COPY_W,
                 Self::InstanceType => COL_INSTANCE_TYPE_W,
                 Self::Env => COL_ENV_W,
@@ -200,6 +204,7 @@ mod gui {
             SortColumn::State,
             SortColumn::Ssm,
             SortColumn::PrivateIp,
+            SortColumn::PrivateDns,
             SortColumn::AmiId,
             SortColumn::InstanceType,
             SortColumn::Env,
@@ -1846,6 +1851,7 @@ mod gui {
                 ("State", SortColumn::State),
                 ("SSM", SortColumn::Ssm),
                 ("Private IP", SortColumn::PrivateIp),
+                ("Private DNS", SortColumn::PrivateDns),
                 ("AMI ID", SortColumn::AmiId),
                 ("Instance Type", SortColumn::InstanceType),
                 ("Environment", SortColumn::Env),
@@ -1854,11 +1860,12 @@ mod gui {
             for (label, col) in headers {
                 // Header needs room for label + sort arrow + drag zone
                 let header_w = label.len() as f32 * char_w + pad + 14.0;
-                let has_copy = matches!(col, SortColumn::InstanceId | SortColumn::PrivateIp | SortColumn::AmiId);
+                let has_copy = matches!(col, SortColumn::InstanceId | SortColumn::PrivateIp | SortColumn::PrivateDns | SortColumn::AmiId);
                 let copy_extra = if has_copy { COL_COPY_W } else { 0.0 };
 
                 let copy_gap = match col {
                     SortColumn::PrivateIp => 15.0,
+                    SortColumn::PrivateDns => 15.0,
                     SortColumn::AmiId => 20.0,
                     _ => 0.0,
                 };
@@ -1872,6 +1879,7 @@ mod gui {
                             inst.ssm_ping.clone().unwrap_or_else(|| "Managed".to_string())
                         } else { "No".to_string() },
                         SortColumn::PrivateIp => inst.private_ip.clone().unwrap_or_default(),
+                        SortColumn::PrivateDns => inst.private_dns.clone().unwrap_or_default(),
                         SortColumn::AmiId => inst.image_id.clone().unwrap_or_default(),
                         SortColumn::InstanceType => inst.instance_type.clone().unwrap_or_default(),
                         SortColumn::Env => inst.tags.get("MMODAL_ENV").or_else(|| inst.tags.get("mmodal_env")).cloned().unwrap_or_default(),
@@ -3880,6 +3888,11 @@ mod gui {
                                         let ib = b.private_ip.as_deref().unwrap_or("");
                                         ia.cmp(ib)
                                     }
+                                    SortColumn::PrivateDns => {
+                                        let da = a.private_dns.as_deref().unwrap_or("");
+                                        let db = b.private_dns.as_deref().unwrap_or("");
+                                        da.to_ascii_lowercase().cmp(&db.to_ascii_lowercase())
+                                    }
                                     SortColumn::Env => {
                                         let ea = a.tags.get("MMODAL_ENV").or_else(|| a.tags.get("mmodal_env")).map(|s| s.as_str()).unwrap_or("");
                                         let eb = b.tags.get("MMODAL_ENV").or_else(|| b.tags.get("mmodal_env")).map(|s| s.as_str()).unwrap_or("");
@@ -3999,16 +4012,12 @@ mod gui {
                             // Copy button + Private IP grouped and centered in grid cell
                             let ip_w = cw(SortColumn::PrivateIp);
                             let ip_text = instance.private_ip.clone().unwrap_or_default();
-                            let ip_copy_gap = 15.0;
-                            let ip_content_w = ip_text.len() as f32 * 6.5 + COL_COPY_W + 4.0 + ip_copy_gap;
-                            let ip_pad = ((ip_w - ip_content_w) / 2.0).max(0.0);
                             let ip_resp = ui.allocate_ui_with_layout(
                                 egui::vec2(ip_w, 18.0),
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    ui.add_space(ip_pad);
-                                    ui.add_space(ip_copy_gap);
                                     Self::paint_copy_button(ui, &ip_text, "Copy IP Address");
+                                    ui.add_space(4.0);
                                     let resp_ip = ui.add(egui::Label::new(ip_text.clone()).sense(egui::Sense::click()));
                                     resp_ip
                                 },
@@ -4017,6 +4026,28 @@ mod gui {
                             row_clicked |= resp_ip.clicked();
                             row_double_clicked |= resp_ip.double_clicked();
                             row_hovered |= resp_ip.hovered();
+
+                            // Copy button + Private DNS grouped and centered in grid cell
+                            let dns_w = cw(SortColumn::PrivateDns);
+                            let dns_text = instance.private_dns.clone().unwrap_or_default();
+                            let dns_copy_gap = 15.0;
+                            let dns_content_w = dns_text.len() as f32 * 6.5 + COL_COPY_W + 4.0 + dns_copy_gap;
+                            let dns_pad = ((dns_w - dns_content_w) / 2.0).max(0.0);
+                            let dns_resp = ui.allocate_ui_with_layout(
+                                egui::vec2(dns_w, 18.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.add_space(dns_pad);
+                                    ui.add_space(dns_copy_gap);
+                                    Self::paint_copy_button(ui, &dns_text, "Copy Private DNS");
+                                    let resp_dns = ui.add(egui::Label::new(dns_text.clone()).sense(egui::Sense::click()));
+                                    resp_dns
+                                },
+                            );
+                            let resp_dns = dns_resp.inner;
+                            row_clicked |= resp_dns.clicked();
+                            row_double_clicked |= resp_dns.double_clicked();
+                            row_hovered |= resp_dns.hovered();
 
                             // Copy button + AMI ID grouped and centered in grid cell
                             let ami_w = cw(SortColumn::AmiId);
@@ -4089,6 +4120,7 @@ mod gui {
                                 .union(resp_state.clone())
                                 .union(resp_ssm.clone())
                                 .union(resp_ip.clone())
+                                .union(resp_dns.clone())
                                 .union(resp_env.clone())
                                 .union(resp_itype.clone())
                                 .union(resp_ami.clone())
@@ -4443,15 +4475,41 @@ mod gui {
                                     ui.painter().circle_filled(rect.center(), 4.0, color);
                                 }
 
-                                let mut label_text = egui::RichText::new(title.as_str());
+                                // Synthetic bold for the selected tab: egui's
+                                // default fonts have no bold variant, so we
+                                // lay out the galley ourselves and paint it
+                                // twice with a 1px X-offset to fake weight.
+                                let text_color = if selected {
+                                    ui.visuals().strong_text_color()
+                                } else if hovered {
+                                    ui.visuals().widgets.hovered.text_color()
+                                } else {
+                                    ui.visuals().text_color()
+                                };
+                                let font_id = egui::TextStyle::Button
+                                    .resolve(ui.style());
+                                let galley = ui.painter().layout_no_wrap(
+                                    title.clone(),
+                                    font_id,
+                                    text_color,
+                                );
+                                let text_size = galley.size();
+                                let extra_w = if selected { 1.0 } else { 0.0 };
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(
+                                        text_size.x + extra_w,
+                                        text_size.y,
+                                    ),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().galley(rect.min, galley.clone(), text_color);
                                 if selected {
-                                    label_text = label_text.strong();
+                                    ui.painter().galley(
+                                        rect.min + egui::vec2(1.0, 0.0),
+                                        galley,
+                                        text_color,
+                                    );
                                 }
-                                if hovered && !selected {
-                                    label_text = label_text
-                                        .color(ui.visuals().widgets.hovered.text_color());
-                                }
-                                ui.add(egui::Label::new(label_text).selectable(false));
                                 if ui.small_button("x").clicked() {
                                     to_close = Some(*id);
                                 }
@@ -4480,7 +4538,12 @@ mod gui {
                     if frame_resp.clicked() {
                         to_select = Some(*id);
                     }
-                    if frame_resp.dragged() {
+                    // Use the ctx-level drag state (keyed by drag_id) rather
+                    // than frame_resp.dragged(): once we move the scope onto
+                    // the Tooltip layer for the floating visual, the response
+                    // no longer reports .dragged() every frame, which made
+                    // the tab only reorder once per click-and-hold.
+                    if is_being_dragged || frame_resp.dragged() {
                         dragged_tab_id = Some(*id);
                     }
                     tab_rects.push((*id, frame_resp.rect));
@@ -5752,6 +5815,7 @@ mod gui {
                     text.push_str(&format!("Instance Type: {}\n", instance.instance_type.as_deref().unwrap_or("-")));
                     text.push_str(&format!("AMI ID: {}\n", instance.image_id.as_deref().unwrap_or("-")));
                     text.push_str(&format!("Private IP: {}\n", instance.private_ip.as_deref().unwrap_or("-")));
+                    text.push_str(&format!("Private DNS: {}\n", instance.private_dns.as_deref().unwrap_or("-")));
                     text.push_str(&format!("AZ: {}\n", instance.az.as_deref().unwrap_or("-")));
                     text.push_str(&format!("Environment: {}\n", instance_env(&instance).unwrap_or_else(|| "-".to_string())));
                     text.push_str(&format!("IAM Role: {}\n", self.detail_iam_role.as_deref().unwrap_or("-")));
@@ -5801,6 +5865,7 @@ mod gui {
                         row(ui, "Instance Type", instance.instance_type.as_deref().unwrap_or("-"));
                         row(ui, "AMI ID", instance.image_id.as_deref().unwrap_or("-"));
                         row(ui, "Private IP", instance.private_ip.as_deref().unwrap_or("-"));
+                        row(ui, "Private DNS", instance.private_dns.as_deref().unwrap_or("-"));
                         row(ui, "Availability Zone", instance.az.as_deref().unwrap_or("-"));
                         row(ui, "Environment", &instance_env(&instance).unwrap_or_else(|| "-".to_string()));
                         row(ui, "IAM Role", self.detail_iam_role.as_deref().unwrap_or(
@@ -6438,7 +6503,20 @@ mod gui {
                                 c.account_id.as_deref().unwrap_or("unknown")
                             ));
                             ui.label(format!("Region: {}", c.region));
-                            ui.label(format!("Auth: {}", c.auth_status));
+                            let live_auth = if self.options.mode == Mode::Sim {
+                                AuthStatus::Ok
+                            } else {
+                                self.selected_profile
+                                    .as_deref()
+                                    .and_then(|pid| {
+                                        self.profile_auth_infos
+                                            .iter()
+                                            .find(|a| a.profile_id == pid)
+                                            .map(|a| a.auth_status.clone())
+                                    })
+                                    .unwrap_or_else(|| c.auth_status.clone())
+                            };
+                            ui.label(format!("Auth: {}", live_auth));
                         }
                     });
 
