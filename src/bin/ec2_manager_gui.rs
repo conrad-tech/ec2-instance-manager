@@ -3262,11 +3262,26 @@ mod gui {
                         None
                     };
 
+                    let selected = self.connections.selected() == Some(*id);
+
+                    // Unselected styling stays exactly as before. Selected
+                    // tabs get a thicker, brighter stroke and a more opaque
+                    // fill so the active tab is unmistakable. The selection
+                    // indicator lives on the frame (not the inner label) so
+                    // the text renders cleanly without a competing bg layer.
                     let frame = if let Some(color) = tab_color {
+                        let (stroke_w, fill_alpha) = if selected { (3.0, 90) } else { (2.0, 25) };
                         egui::Frame::group(ui.style())
-                            .stroke(egui::Stroke::new(2.0, color))
+                            .stroke(egui::Stroke::new(stroke_w, color))
                             .fill(egui::Color32::from_rgba_unmultiplied(
-                                color.r(), color.g(), color.b(), 25,
+                                color.r(), color.g(), color.b(), fill_alpha,
+                            ))
+                    } else if selected {
+                        let accent = ui.visuals().selection.bg_fill;
+                        egui::Frame::group(ui.style())
+                            .stroke(egui::Stroke::new(3.0, accent))
+                            .fill(egui::Color32::from_rgba_unmultiplied(
+                                accent.r(), accent.g(), accent.b(), 90,
                             ))
                     } else {
                         egui::Frame::group(ui.style())
@@ -3280,24 +3295,30 @@ mod gui {
                     let dnd_resp = ui.dnd_drag_source(drag_id, *id, |ui| {
                         frame.show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                // Color dot indicator
+                                // Color dot, vertically centered with text.
                                 if let Some(color) = tab_color {
+                                    let row_h = ui.spacing().interact_size.y;
                                     let (rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(8.0, 8.0),
+                                        egui::vec2(10.0, row_h),
                                         egui::Sense::hover(),
                                     );
                                     ui.painter().circle_filled(rect.center(), 4.0, color);
                                 }
 
                                 let prefix = if *running { "" } else { "[done] " };
-                                let selected = self.connections.selected() == Some(*id);
-                                if ui
-                                    .selectable_label(
-                                        selected,
-                                        format!("{}{}", prefix, truncate(title, 28)),
-                                    )
-                                    .clicked()
-                                {
+                                let mut label_text = egui::RichText::new(format!(
+                                    "{}{}",
+                                    prefix,
+                                    truncate(title, 28)
+                                ));
+                                if selected {
+                                    label_text = label_text.strong();
+                                }
+                                let label_resp = ui.add(
+                                    egui::Label::new(label_text)
+                                        .sense(egui::Sense::click()),
+                                );
+                                if label_resp.clicked() {
                                     to_select = Some(*id);
                                 }
                                 if ui.small_button("x").clicked() {
