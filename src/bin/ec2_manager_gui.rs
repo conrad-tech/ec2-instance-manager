@@ -343,6 +343,7 @@ mod gui {
             }
         }
 
+        #[allow(dead_code)]
         fn is_active(&self) -> bool {
             self.anchor.is_some() && self.end.is_some()
         }
@@ -1914,14 +1915,12 @@ mod gui {
                             let evt = session.output_event_count;
                             let total = session.bytes_received;
                             session.parser.process(&bytes);
-                            // Clear selection when new output arrives and user is at bottom
-                            if session.scroll_offset == 0 {
-                                if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
-                                    if sel.is_active() {
-                                        sel.clear();
-                                    }
-                                }
-                            }
+                            // Don't clear the selection when output arrives —
+                            // bash emits bytes constantly (cursor blinks, prompt
+                            // redraws), and wiping the selection on each byte
+                            // makes double-click word-select look broken. The
+                            // selection persists until the user clicks
+                            // elsewhere or starts a new drag.
                             // Respond to Device Status Report queries (ESC[6n =
                             // cursor position request).  CMD and PowerShell send
                             // this at startup and block until they receive the
@@ -3048,7 +3047,10 @@ mod gui {
                             // Copy button + Private IP grouped and centered in grid cell
                             let ip_w = cw(SortColumn::PrivateIp);
                             let ip_text = instance.private_ip.clone().unwrap_or_default();
-                            let ip_copy_gap = 15.0;
+                            // Gap pushes the copy glyph to the right so its
+                            // distance from the IP text mirrors the instance
+                            // id column's copy → "i-…" spacing.
+                            let ip_copy_gap = 30.0;
                             let ip_content_w = ip_text.len() as f32 * 6.5 + COL_COPY_W + 4.0 + ip_copy_gap;
                             let ip_pad = ((ip_w - ip_content_w) / 2.0).max(0.0);
                             let ip_resp = ui.allocate_ui_with_layout(
@@ -3629,13 +3631,24 @@ mod gui {
                                 terminal_focus_id,
                                 egui::Sense::click_and_drag(),
                             );
-                            // If the user just switched to this tab (either by
-                                // clicking a different connection tab or returning
-                            // to the Connections main tab), grab focus so they
-                            // can start typing without an extra click.
-                            if self.pending_focus_tab_id == Some(tab_id) {
+                            // Auto-focus rules so the user never has to click
+                            // into the terminal to start typing:
+                            //   1. Explicit signal: a tab switch / right-click /
+                            //      ipc just told us to focus this tab.
+                            //   2. Implicit: nobody else has focus AND the
+                            //      terminal isn't already focused — claim it.
+                            // Without rule #2, secondary-clicks and tab switches
+                            // can race against egui's focus tracking and leave
+                            // focus dangling on a now-vanished widget.
+                            let nobody_focused = ui.ctx().memory(|m| m.focused().is_none());
+                            let need_explicit_focus = self.pending_focus_tab_id == Some(tab_id);
+                            if need_explicit_focus
+                                || (nobody_focused && !terminal_focus_response.has_focus())
+                            {
                                 terminal_focus_response.request_focus();
-                                self.pending_focus_tab_id = None;
+                                if need_explicit_focus {
+                                    self.pending_focus_tab_id = None;
+                                }
                             }
                             // Use the label's actual rendered rect so highlight and
                             // mouse mapping align with text regardless of frame margins
@@ -3835,20 +3848,15 @@ mod gui {
                                                 if text.is_empty() {
                                                     return;
                                                 }
-                                                let sanitized: String = text
-                                                    .replace("\r\n", " ")
-                                                    .replace('\r', " ")
-                                                    .replace('\n', " ")
-                                                    .trim_end()
-                                                    .to_string();
-                                                if sanitized.is_empty() {
+                                                let payload = build_paste_payload(&text);
+                                                if payload.is_empty() {
                                                     return;
                                                 }
                                                 eprintln!(
                                                     "tab={tab_id} right-click paste worker sending len={}",
-                                                    sanitized.len()
+                                                    payload.len()
                                                 );
-                                                let _ = write_tx.send(sanitized.into_bytes());
+                                                let _ = write_tx.send(payload);
                                             })
                                             .ok();
                                         self.log_debug(format!(
@@ -5936,7 +5944,10 @@ mod gui {
     }
 
     fn is_terminal_word_char(ch: char) -> bool {
-        ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '+' | ':' | '@' | '~' | '=')
+        // `@` and `:` are intentionally excluded so that double-click on
+        // tokens like `ec2-user@10.255.192.63` or `host:9094` selects just
+        // one side of the separator (matches WSL/bash xterm behavior).
+        ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '+' | '~' | '=')
     }
 
     /// Given a click at (row, col), expand to the surrounding word on that screen row.
@@ -6206,19 +6217,11 @@ mod gui {
                 }
             }
             egui::Event::Paste(text) => {
-                // Strip ALL newlines so a paste never auto-executes — embedded
-                // \r/\n become single spaces, and trailing newlines are dropped.
-                // The user must press Enter intentionally to run it.
-                let sanitized: String = text
-                    .replace("\r\n", " ")
-                    .replace('\r', " ")
-                    .replace('\n', " ")
-                    .trim_end()
-                    .to_string();
-                if sanitized.is_empty() {
+                let payload = build_paste_payload(text);
+                if payload.is_empty() {
                     None
                 } else {
-                    Some(sanitized.into_bytes())
+                    Some(payload)
                 }
             }
             // Copy/Cut events carry no modifier info so we cannot
@@ -6289,6 +6292,54 @@ mod gui {
                 }
             })
             .ok();
+    }
+
+    /// Convert clipboard text into the bytes we send to the PTY for paste.
+    ///
+    /// Behavior:
+    /// - **Single-line paste:** wrapped in bracketed-paste markers so bash's
+    ///   readline buffers it and does one clean redraw at the end. Without
+    ///   this, the per-character redraw + line-wrap math can produce a
+    ///   visually scrambled line (the pasted text itself is fine — only the
+    ///   display is wrong). Trailing whitespace is trimmed so a stray
+    ///   newline at the end never auto-executes the command.
+    /// - **Multi-line paste:** newlines are normalized to `\r` so bash runs
+    ///   each line as a separate command. The final line is left without a
+    ///   trailing `\r` so the user can review and press Enter intentionally.
+    ///   Bracketed paste is intentionally NOT used here — under bracketed
+    ///   paste readline treats the whole block as one literal line.
+    fn build_paste_payload(text: &str) -> Vec<u8> {
+        // Normalize line endings, then split. Preserves intentional empty
+        // lines in the middle of a multi-line paste; trims only trailing.
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let mut lines: Vec<&str> = normalized.split('\n').collect();
+        while lines.last().map(|s| s.is_empty()).unwrap_or(false) {
+            lines.pop();
+        }
+        if lines.is_empty() {
+            return Vec::new();
+        }
+        if lines.len() == 1 {
+            let line = lines[0].trim_end();
+            if line.is_empty() {
+                return Vec::new();
+            }
+            let mut buf = b"\x1b[200~".to_vec();
+            buf.extend_from_slice(line.as_bytes());
+            buf.extend_from_slice(b"\x1b[201~");
+            buf
+        } else {
+            // Each line gets a trailing \r except the last → bash runs each
+            // line, and the final line waits for the user to press Enter.
+            let mut buf: Vec<u8> = Vec::new();
+            for (idx, line) in lines.iter().enumerate() {
+                buf.extend_from_slice(line.as_bytes());
+                if idx + 1 < lines.len() {
+                    buf.push(b'\r');
+                }
+            }
+            buf
+        }
     }
 
     /// Render up to `max` bytes as a hex+ASCII preview for debug logs.
@@ -7297,19 +7348,36 @@ mod gui {
                 Some(vec![0x15])
             );
 
-            // Plain paste passes through verbatim.
+            // Single-line paste is wrapped in bracketed paste so bash
+            // redraws once cleanly and never auto-executes.
             let paste = egui::Event::Paste("echo hi".to_string());
+            let mut expected_single = b"\x1b[200~".to_vec();
+            expected_single.extend_from_slice(b"echo hi");
+            expected_single.extend_from_slice(b"\x1b[201~");
             assert_eq!(
                 terminal_event_payload_for_terminal(&paste, false, false),
-                Some(b"echo hi".to_vec())
+                Some(expected_single)
             );
 
-            // Embedded and trailing newlines are stripped so the paste
-            // can never auto-execute — Enter must be pressed intentionally.
+            // Multi-line paste joins with \r so bash executes each line
+            // except the last, which stays editable for an intentional Enter.
             let multiline = egui::Event::Paste("echo hi\r\necho bye\n".to_string());
             assert_eq!(
                 terminal_event_payload_for_terminal(&multiline, false, false),
-                Some(b"echo hi  echo bye".to_vec())
+                Some(b"echo hi\recho bye".to_vec())
+            );
+
+            // Trailing newlines on a single line still get trimmed so a
+            // stray newline never auto-executes.
+            let trailing_nl = egui::Event::Paste("echo hi\n".to_string());
+            assert_eq!(
+                terminal_event_payload_for_terminal(&trailing_nl, false, false),
+                Some({
+                    let mut v = b"\x1b[200~".to_vec();
+                    v.extend_from_slice(b"echo hi");
+                    v.extend_from_slice(b"\x1b[201~");
+                    v
+                })
             );
         }
 
