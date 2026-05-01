@@ -935,6 +935,14 @@ mod gui {
         account_color_map: HashMap<String, egui::Color32>,
         tab_rename_id: Option<u64>,
         tab_rename_buf: String,
+        /// Tab id currently being dragged in the connection tab strip.
+        /// Tracked on self because egui's `is_being_dragged(salt)` doesn't
+        /// match the salted id egui actually registers the drag under, so
+        /// we observe `drag_started()` from the response and clear on release.
+        dragging_tab_id: Option<u64>,
+        /// Pointer-x at drag start, used to anchor the floating visual to
+        /// the cursor instead of snapping to the slot center after reorders.
+        drag_grab_offset_x: f32,
         tab_color_picker_rgb: [f32; 3],
         /// Profile ID for the color picker (from Edit menu or right-click)
         color_picker_profile: Option<String>,
@@ -1103,6 +1111,8 @@ mod gui {
                 last_stale_tab_check_at: Instant::now(),
                 account_color_map: HashMap::new(),
                 tab_rename_id: None,
+                dragging_tab_id: None,
+                drag_grab_offset_x: 0.0,
                 tab_rename_buf: String::new(),
                 tab_color_picker_rgb: [0.0, 0.0, 0.0],
                 color_picker_profile: None,
@@ -4445,15 +4455,15 @@ mod gui {
                     // Scope the whole tab frame with click+drag sense so clicks
                     // and drags anywhere on the tab (except the close button)
                     // are handled uniformly with a normal cursor. While this
-                    // tab is being dragged, paint it on the Tooltip layer and
-                    // translate that layer so the tab visually follows the
+                    // tab is being dragged, paint it on the Foreground layer
+                    // and translate that layer so the tab visually follows the
                     // cursor (Chrome-style), while its rest slot still
                     // participates in the horizontal layout so sibling tabs
                     // continue to determine midpoint crossings for reorder.
                     let selected = self.connections.selected() == Some(*id);
-                    let is_being_dragged = ui.ctx().is_being_dragged(drag_id);
+                    let is_being_dragged = self.dragging_tab_id == Some(*id);
                     let drag_layer_id = is_being_dragged
-                        .then(|| egui::LayerId::new(egui::Order::Tooltip, drag_id));
+                        .then(|| egui::LayerId::new(egui::Order::Foreground, drag_id));
                     let mut builder = egui::UiBuilder::new()
                         .id_salt(drag_id)
                         .sense(egui::Sense::click_and_drag());
@@ -4475,10 +4485,6 @@ mod gui {
                                     ui.painter().circle_filled(rect.center(), 4.0, color);
                                 }
 
-                                // Synthetic bold for the selected tab: egui's
-                                // default fonts have no bold variant, so we
-                                // lay out the galley ourselves and paint it
-                                // twice with a 1px X-offset to fake weight.
                                 let text_color = if selected {
                                     ui.visuals().strong_text_color()
                                 } else if hovered {
@@ -4486,30 +4492,12 @@ mod gui {
                                 } else {
                                     ui.visuals().text_color()
                                 };
-                                let font_id = egui::TextStyle::Button
-                                    .resolve(ui.style());
-                                let galley = ui.painter().layout_no_wrap(
-                                    title.clone(),
-                                    font_id,
-                                    text_color,
-                                );
-                                let text_size = galley.size();
-                                let extra_w = if selected { 1.0 } else { 0.0 };
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(
-                                        text_size.x + extra_w,
-                                        text_size.y,
-                                    ),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().galley(rect.min, galley.clone(), text_color);
+                                let mut rich = egui::RichText::new(title.clone())
+                                    .color(text_color);
                                 if selected {
-                                    ui.painter().galley(
-                                        rect.min + egui::vec2(1.0, 0.0),
-                                        galley,
-                                        text_color,
-                                    );
+                                    rich = rich.strong();
                                 }
+                                ui.add(egui::Label::new(rich).selectable(false));
                                 if ui.small_button("x").clicked() {
                                     to_close = Some(*id);
                                 }
@@ -4519,14 +4507,14 @@ mod gui {
                     let frame_resp = tab_scope
                         .response
                         .on_hover_cursor(egui::CursorIcon::Default);
-                    // Chrome-style: anchor the dragged tab to the cursor so it
-                    // visually follows the mouse. We translate from the tab's
-                    // slot center to the current pointer position, preserving
-                    // the tab's vertical position so it doesn't jump rows.
+                    // Chrome-style: anchor the dragged tab to the cursor using
+                    // the grab offset captured at drag start, so the visual
+                    // doesn't snap to slot centers as we reorder under it.
                     if let Some(lid) = drag_layer_id {
                         if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+                            let target_left_x = pointer.x - self.drag_grab_offset_x;
                             let delta = egui::vec2(
-                                pointer.x - frame_resp.rect.center().x,
+                                target_left_x - frame_resp.rect.min.x,
                                 0.0,
                             );
                             ui.ctx().transform_layer_shapes(
@@ -4538,12 +4526,19 @@ mod gui {
                     if frame_resp.clicked() {
                         to_select = Some(*id);
                     }
-                    // Use the ctx-level drag state (keyed by drag_id) rather
-                    // than frame_resp.dragged(): once we move the scope onto
-                    // the Tooltip layer for the floating visual, the response
-                    // no longer reports .dragged() every frame, which made
-                    // the tab only reorder once per click-and-hold.
-                    if is_being_dragged || frame_resp.dragged() {
+                    // Detect drag start once and capture grab offset; from
+                    // there, self.dragging_tab_id keeps the drag alive across
+                    // reorders and layer transitions.
+                    if frame_resp.drag_started() {
+                        let pointer_x = ui
+                            .ctx()
+                            .pointer_interact_pos()
+                            .map(|p| p.x)
+                            .unwrap_or(frame_resp.rect.center().x);
+                        self.dragging_tab_id = Some(*id);
+                        self.drag_grab_offset_x = pointer_x - frame_resp.rect.min.x;
+                    }
+                    if is_being_dragged {
                         dragged_tab_id = Some(*id);
                     }
                     tab_rects.push((*id, frame_resp.rect));
@@ -4586,30 +4581,37 @@ mod gui {
             });
                 });
 
-            // Chrome-style live reorder: while a tab is being dragged, find the
-            // slot index under the cursor (by X) and move the dragged tab there
-            // each frame so sibling tabs shift in real time. The dragged tab
-            // itself floats above via dnd_drag_source's tooltip layer.
+            // Chrome-style live reorder: count how many non-dragged siblings
+            // sit left of the cursor — that's the dragged tab's target slot
+            // in the list-after-removal. Skipping the dragged tab itself
+            // avoids off-by-one slot stalls and lets a fast drag jump
+            // multiple positions in a single frame.
             if let Some(dragged_id) = dragged_tab_id {
                 if let Some(pointer) = ui.ctx().pointer_interact_pos() {
-                    let mut new_slot = tab_rects.len();
-                    for (i, (_tid, rect)) in tab_rects.iter().enumerate() {
-                        if pointer.x < rect.center().x {
-                            new_slot = i;
-                            break;
-                        }
-                    }
+                    let target_after_removal = tab_rects
+                        .iter()
+                        .filter(|(tid, _)| *tid != dragged_id)
+                        .filter(|(_, rect)| rect.center().x < pointer.x)
+                        .count();
                     let current_idx = tab_rects
                         .iter()
                         .position(|(tid, _)| *tid == dragged_id);
                     if let Some(cur) = current_idx {
-                        let target_after_removal =
-                            if cur < new_slot { new_slot - 1 } else { new_slot };
                         if target_after_removal != cur {
                             self.connections.move_to(dragged_id, target_after_removal);
                         }
                     }
                 }
+            }
+
+            // Clear our drag bookkeeping on mouse release; egui's own drag
+            // state is keyed on a salted id we don't have direct access to,
+            // so we mirror it here based on the primary button.
+            if self.dragging_tab_id.is_some()
+                && !ui.input(|i| i.pointer.primary_down())
+            {
+                self.dragging_tab_id = None;
+                self.drag_grab_offset_x = 0.0;
             }
             if let Some(id) = to_select {
                 self.connections.select(id);
@@ -5104,9 +5106,9 @@ mod gui {
                                     let copied_text = extraction
                                         .map(|(_, _, _, t)| t)
                                         .filter(|t| !t.is_empty());
-                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                        match &copied_text {
-                                            Some(text) => {
+                                    match &copied_text {
+                                        Some(text) => {
+                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
                                                 match clipboard.set_text(text.clone()) {
                                                     Ok(()) => self.log_debug(format!(
                                                         "right-click copy tab={tab_id} len={}",
@@ -5116,23 +5118,22 @@ mod gui {
                                                         "right-click copy tab={tab_id} set_text failed: {err}"
                                                     )),
                                                 }
-                                            }
-                                            None => {
-                                                // Only clear on actual
-                                                // extraction failure, so
-                                                // unrelated clipboard
-                                                // contents are preserved
-                                                // when a copy fails.
-                                                let _ = clipboard.set_text(String::new());
-                                                self.log_debug(format!(
-                                                    "right-click copy tab={tab_id} extraction empty; clipboard cleared"
+                                            } else {
+                                                self.log_error(format!(
+                                                    "right-click copy tab={tab_id} Clipboard::new failed"
                                                 ));
                                             }
                                         }
-                                    } else {
-                                        self.log_error(format!(
-                                            "right-click copy tab={tab_id} Clipboard::new failed"
-                                        ));
+                                        None => {
+                                            // Extraction failed or was empty.
+                                            // Leave the system clipboard alone
+                                            // — wiping it on a failed copy was
+                                            // the cause of the "right-click
+                                            // ate my clipboard" bug.
+                                            self.log_debug(format!(
+                                                "right-click copy tab={tab_id} extraction empty; clipboard preserved"
+                                            ));
+                                        }
                                     }
                                     if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
                                         sel.clear();

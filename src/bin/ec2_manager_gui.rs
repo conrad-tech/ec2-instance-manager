@@ -451,7 +451,7 @@ mod gui {
     ///   $
     /// with bold-green user@host, magenta "SSM", and bold-yellow path.
     const SSM_PS1_COMMAND: &[u8] =
-        b"bash\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\r";
+        b"bash\rexport TERM=xterm-256color\rexport COLORTERM=truecolor\rexport SYSTEMD_COLORS=1\rexport SYSTEMD_PAGER='less -R'\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\r";
 
     #[derive(Debug, PartialEq, Eq)]
     struct RowAction {
@@ -3729,13 +3729,22 @@ mod gui {
                                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
                                         if let Ok(text) = clipboard.get_text() {
                                             if !text.is_empty() {
+                                                // Strip trailing newlines and wrap in
+                                                // bracketed paste so the shell never
+                                                // auto-executes a pasted command — the
+                                                // user must press Enter intentionally.
+                                                let trimmed = text
+                                                    .trim_end_matches(|c| c == '\n' || c == '\r');
+                                                let normalized = trimmed.replace("\r\n", "\r");
+                                                let mut buf = b"\x1b[200~".to_vec();
+                                                buf.extend_from_slice(normalized.as_bytes());
+                                                buf.extend_from_slice(b"\x1b[201~");
                                                 self.send_raw_bytes_to_connection_tab(
-                                                    tab_id,
-                                                    text.as_bytes(),
+                                                    tab_id, &buf,
                                                 );
                                                 self.log_debug(format!(
-                                                    "right-click paste tab={tab_id} bytes={}",
-                                                    text.len()
+                                                    "right-click paste tab={tab_id} bytes={} (bracketed)",
+                                                    normalized.len()
                                                 ));
                                             }
                                         }
