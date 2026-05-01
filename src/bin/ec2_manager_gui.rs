@@ -1493,9 +1493,7 @@ mod gui {
                 p.rect_stroke(egui::Rect::from_min_size(rect.min + egui::vec2(4.0, 5.0), egui::vec2(8.0, 8.0)), 1.0, stroke, egui::StrokeKind::Outside);
             }
             if resp.clicked() {
-                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                    let _ = clipboard.set_text(text_to_copy);
-                }
+                set_clipboard_text(text_to_copy.to_string());
             }
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -2655,18 +2653,9 @@ mod gui {
                                     );
                                     if !text.is_empty() {
                                         let len = text.len();
-                                        // arboard set_text can block the UI on
-                                        // WSL — push it to a worker thread.
-                                        std::thread::Builder::new()
-                                            .name(format!("clipboard-copy-{tab_id}"))
-                                            .spawn(move || {
-                                                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                                    let _ = clipboard.set_text(&text);
-                                                }
-                                            })
-                                            .ok();
+                                        set_clipboard_text(text);
                                         self.log_debug(format!(
-                                            "copied selection tab={tab_id} abs ({},{})→({},{}) len={len} dispatched to worker",
+                                            "copied selection tab={tab_id} abs ({},{})→({},{}) len={len}",
                                             start.abs_row, start.col, end.abs_row, end.col
                                         ));
                                     }
@@ -3402,6 +3391,12 @@ mod gui {
             }
             if let Some(id) = to_select {
                 self.connections.select(id);
+                // Same-frame focus hand-off: terminal area renders later in
+                // this same call, so setting pending_focus_tab_id here means
+                // the terminal grabs focus on this frame instead of the next.
+                if self.pty_sessions.contains_key(&id) {
+                    self.pending_focus_tab_id = Some(id);
+                }
             }
             // Handle rename request
             if let Some(id) = to_rename {
@@ -3781,6 +3776,12 @@ mod gui {
                                 ));
                             }
                             if terminal_focus_response.secondary_clicked() {
+                                // egui only auto-focuses on primary clicks, so
+                                // a right-click would otherwise leave focus on
+                                // wherever it was — meaning Enter typed right
+                                // after a paste reaches nothing. Explicitly
+                                // grab focus here so typing/Enter goes through.
+                                terminal_focus_response.request_focus();
                                 // If text is selected, copy it; otherwise paste.
                                 let has_selection = self
                                     .terminal_selections
@@ -3797,17 +3798,9 @@ mod gui {
                                                 if !text.is_empty() {
                                                     let len = text.len();
                                                     // arboard set_text can block the UI on
-                                                    // WSL too — push it to a worker thread.
-                                                    std::thread::Builder::new()
-                                                        .name(format!("clipboard-copy-{tab_id}"))
-                                                        .spawn(move || {
-                                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                                                let _ = clipboard.set_text(&text);
-                                                            }
-                                                        })
-                                                        .ok();
+                                                    set_clipboard_text(text);
                                                     self.log_debug(format!(
-                                                        "right-click copy tab={tab_id} len={len} dispatched to worker"
+                                                        "right-click copy tab={tab_id} len={len}"
                                                     ));
                                                 }
                                             }
@@ -4642,6 +4635,14 @@ mod gui {
                             .clicked()
                         {
                             self.main_tab = MainTab::Connections;
+                            // Same-frame focus hand-off: the connections panel
+                            // is about to render — flag the active terminal so
+                            // the user can type immediately after switching tabs.
+                            if let Some(id) = self.connections.selected() {
+                                if self.pty_sessions.contains_key(&id) {
+                                    self.pending_focus_tab_id = Some(id);
+                                }
+                            }
                         }
                         if ui
                             .selectable_label(self.main_tab == MainTab::Log, "Log")
@@ -6261,6 +6262,33 @@ mod gui {
             },
             _ => None,
         }
+    }
+
+    /// Copy `text` to the system clipboard from a background thread.
+    ///
+    /// On Linux/WSL the X11 clipboard requires the *owner* process to remain
+    /// alive to serve paste requests, so we use `arboard::SetExtLinux::wait()`
+    /// which blocks the worker thread until something else takes over the
+    /// clipboard. On Windows/macOS, `set_text` is fully persistent on its own.
+    /// Either way, the UI thread is never blocked.
+    fn set_clipboard_text(text: String) {
+        std::thread::Builder::new()
+            .name("clipboard-set".to_string())
+            .spawn(move || {
+                let Ok(mut clipboard) = arboard::Clipboard::new() else {
+                    return;
+                };
+                #[cfg(target_os = "linux")]
+                {
+                    use arboard::SetExtLinux;
+                    let _ = clipboard.set().wait().text(text);
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = clipboard.set_text(text);
+                }
+            })
+            .ok();
     }
 
     /// Render up to `max` bytes as a hex+ASCII preview for debug logs.
