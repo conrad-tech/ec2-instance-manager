@@ -708,6 +708,21 @@ mod gui {
         connections: ConnectionTabs,
         pty_sessions: HashMap<u64, PtySession>,
         terminal_selections: HashMap<u64, TerminalSelection>,
+        /// Tab id whose terminal should grab focus on the next frame.
+        /// Set when the user switches connection tabs or returns to the
+        /// Connections main tab so they can start typing immediately.
+        pending_focus_tab_id: Option<u64>,
+        last_focused_connection_tab: Option<u64>,
+        last_main_tab: Option<MainTab>,
+        /// Most recently observed terminal grid size, used to seed the
+        /// initial PTY dimensions for new connections so the remote shell
+        /// starts at roughly the right cols/rows and line-wrap math stays
+        /// consistent with what we render.
+        last_terminal_grid: Option<(u16, u16)>,
+        /// The tab a connection-tab drag has most recently reordered onto.
+        /// Used to dedupe live Chrome-style reorder so we don't flip back
+        /// and forth every frame while the cursor sits over the same slot.
+        last_tab_drag_target: Option<u64>,
         proc_tx: Sender<ProcEvent>,
         proc_rx: Receiver<ProcEvent>,
         refresh_tx: Sender<RefreshEvent>,
@@ -818,6 +833,11 @@ mod gui {
                 connections: ConnectionTabs::new(),
                 pty_sessions: HashMap::new(),
                 terminal_selections: HashMap::new(),
+                pending_focus_tab_id: None,
+                last_focused_connection_tab: None,
+                last_main_tab: None,
+                last_terminal_grid: None,
+                last_tab_drag_target: None,
                 proc_tx,
                 proc_rx,
                 refresh_tx,
@@ -1815,10 +1835,11 @@ mod gui {
                 let proc_tx = self.proc_tx.clone();
                 let ui_tx = self.ui_tx.clone();
                 let pty_command = pty_command.clone();
+                let initial_size = self.last_terminal_grid;
                 self.log_debug("spawning PTY command async");
                 std::thread::spawn(move || {
                     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                        spawn_pty_session_parts(tab_id, &pty_command, &context)
+                        spawn_pty_session_parts(tab_id, &pty_command, &context, initial_size)
                     }));
                     match result {
                         Ok(Ok((session, reader))) => {
@@ -1872,8 +1893,9 @@ mod gui {
             command: PtyCommand,
             context: &AwsContext,
         ) -> Result<()> {
+            let initial_size = self.last_terminal_grid;
             let (session, reader) =
-                spawn_pty_session_parts(tab_id, &command, context)?;
+                spawn_pty_session_parts(tab_id, &command, context, initial_size)?;
             self.pty_sessions.insert(tab_id, session);
             start_pty_reader_thread(tab_id, reader, self.proc_tx.clone());
             Ok(())
@@ -1907,28 +1929,14 @@ mod gui {
                             // this at startup and block until they receive the
                             // response ESC[row;colR.
                             respond_to_terminal_queries(session, &bytes);
-                            if evt <= 5 {
-                                let preview = String::from_utf8_lossy(
-                                    &bytes[..bytes.len().min(200)]
-                                );
-                                let sanitized: String = preview.chars().map(|c| {
-                                    if c.is_control() && c != '\n' { '.' } else { c }
-                                }).collect();
-                                let hex: String = bytes.iter()
-                                    .take(64)
-                                    .map(|b| format!("{b:02x}"))
-                                    .collect::<Vec<_>>()
-                                    .join(" ");
-                                Some((LogLevel::Debug, format!(
-                                    "tab={tab_id} output #{evt} len={} total={total} hex=[{hex}] preview=[{sanitized}]",
-                                    bytes.len(),
-                                )))
-                            } else {
-                                Some((LogLevel::Trace, format!(
-                                    "tab={tab_id} output bytes={} total={total}",
-                                    bytes.len(),
-                                )))
-                            }
+                            // Always log every output arrival at debug so we
+                            // can correlate Enter sends with response timing
+                            // when diagnosing terminal stalls.
+                            let hex = hex_preview(&bytes, 64);
+                            Some((LogLevel::Debug, format!(
+                                "tab={tab_id} output #{evt} len={} total={total} hex={hex}",
+                                bytes.len(),
+                            )))
                         } else {
                             let text = String::from_utf8_lossy(&bytes).to_string();
                             for line in text.lines() {
@@ -2551,10 +2559,21 @@ mod gui {
         }
 
         fn send_raw_bytes_to_connection_tab(&mut self, tab_id: u64, payload: &[u8]) {
-            self.log_trace(format!(
-                "sending input to tab={tab_id} bytes={}",
-                payload.len()
-            ));
+            // Promote single-byte control sends (Enter \r, Ctrl+C, Tab,
+            // Ctrl+D, …) to debug so they are visible in the default
+            // log filter. Larger payloads stay at trace.
+            let is_short_control = payload.len() <= 4
+                && payload.iter().any(|b| *b < 0x20 || *b == 0x7f);
+            let line = format!(
+                "sending input to tab={tab_id} len={} hex={}",
+                payload.len(),
+                hex_preview(payload, 96)
+            );
+            if is_short_control {
+                self.log_debug(line);
+            } else {
+                self.log_trace(line);
+            }
             let Some(session) = self.pty_sessions.get_mut(&tab_id) else {
                 return;
             };
@@ -2635,12 +2654,20 @@ mod gui {
                                         &mut session.parser, start, end,
                                     );
                                     if !text.is_empty() {
-                                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                            let _ = clipboard.set_text(&text);
-                                        }
+                                        let len = text.len();
+                                        // arboard set_text can block the UI on
+                                        // WSL — push it to a worker thread.
+                                        std::thread::Builder::new()
+                                            .name(format!("clipboard-copy-{tab_id}"))
+                                            .spawn(move || {
+                                                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                                    let _ = clipboard.set_text(&text);
+                                                }
+                                            })
+                                            .ok();
                                         self.log_debug(format!(
-                                            "copied selection tab={tab_id} abs ({},{})→({},{}) len={}",
-                                            start.abs_row, start.col, end.abs_row, end.col, text.len()
+                                            "copied selection tab={tab_id} abs ({},{})→({},{}) len={len} dispatched to worker",
+                                            start.abs_row, start.col, end.abs_row, end.col
                                         ));
                                     }
                                 }
@@ -3225,6 +3252,7 @@ mod gui {
             let mut to_reopen: Option<(String, String)> = None;
             let mut to_pick_color: Option<(u64, String)> = None;
             let mut reorder_request: Option<(u64, u64)> = None;
+            let mut any_tab_dragging = false;
 
             ui.horizontal_wrapped(|ui| {
                 for (id, title, profile_id, running) in &tabs_snapshot {
@@ -3246,6 +3274,9 @@ mod gui {
 
                     let drag_id = egui::Id::new(("conn_tab_drag", *id));
                     let is_being_dragged = ui.ctx().is_being_dragged(drag_id);
+                    if is_being_dragged {
+                        any_tab_dragging = true;
+                    }
                     let dnd_resp = ui.dnd_drag_source(drag_id, *id, |ui| {
                         frame.show(ui, |ui| {
                             ui.horizontal(|ui| {
@@ -3278,24 +3309,23 @@ mod gui {
                     });
                     let frame_resp = dnd_resp.response;
 
-                    // Drop target: if another tab's payload is released on this one, reorder.
+                    // Chrome-style live reorder: as soon as the cursor enters a
+                    // different tab's frame while dragging, reorder immediately.
+                    // `last_tab_drag_target` dedupes so we only fire once per
+                    // slot transition, preventing flip-flop while the cursor
+                    // sits still over the now-displaced target.
                     if !is_being_dragged {
                         if let Some(payload) = frame_resp.dnd_hover_payload::<u64>() {
-                            if *payload != *id {
-                                let stroke = egui::Stroke::new(
-                                    2.0,
-                                    ui.visuals().selection.bg_fill,
-                                );
-                                ui.painter().rect_stroke(
-                                    frame_resp.rect,
-                                    ui.visuals().widgets.active.corner_radius,
-                                    stroke,
-                                    egui::StrokeKind::Outside,
-                                );
+                            if *payload != *id && self.last_tab_drag_target != Some(*id) {
+                                reorder_request = Some((*payload, *id));
+                                self.last_tab_drag_target = Some(*id);
                             }
                         }
+                        // Also accept the release payload as a final commit
+                        // — covers the case where the cursor crosses into a
+                        // tab and is released before our hover sample fires.
                         if let Some(payload) = frame_resp.dnd_release_payload::<u64>() {
-                            if *payload != *id {
+                            if *payload != *id && self.last_tab_drag_target != Some(*id) {
                                 reorder_request = Some((*payload, *id));
                             }
                         }
@@ -3343,6 +3373,11 @@ mod gui {
 
             if let Some((from_id, to_id)) = reorder_request {
                 self.connections.reorder(from_id, to_id);
+            }
+            // Reset the dedup target once no drag is in flight so the next
+            // drag can reorder onto any slot freely.
+            if !any_tab_dragging {
+                self.last_tab_drag_target = None;
             }
             if let Some(id) = to_select {
                 self.connections.select(id);
@@ -3500,6 +3535,11 @@ mod gui {
                                                         terminal_grid_and_cell_size(
                                                             ui, &font_id, size,
                                                         );
+                                                    // Remember this grid size so future
+                                                    // connections start the remote shell at
+                                                    // the right cols — avoids line-wrap math
+                                                    // mismatches before the first SIGWINCH.
+                                                    self.last_terminal_grid = Some((rows, cols));
                                                     let norm_sel = self.terminal_selections
                                                         .get(&tab_id)
                                                         .and_then(|s| s.normalized());
@@ -3573,6 +3613,14 @@ mod gui {
                                 terminal_focus_id,
                                 egui::Sense::click_and_drag(),
                             );
+                            // If the user just switched to this tab (either by
+                                // clicking a different connection tab or returning
+                            // to the Connections main tab), grab focus so they
+                            // can start typing without an extra click.
+                            if self.pending_focus_tab_id == Some(tab_id) {
+                                terminal_focus_response.request_focus();
+                                self.pending_focus_tab_id = None;
+                            }
                             // Use the label's actual rendered rect so highlight and
                             // mouse mapping align with text regardless of frame margins
                             // or display-specific layout rounding.
@@ -3688,12 +3736,27 @@ mod gui {
                                 }
                                 terminal_focus_response.request_focus();
                             } else if terminal_focus_response.clicked() {
-                                if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
-                                    sel.clear();
+                                // Only clear when there is no actual selection.
+                                // egui reports `clicked()` for very short drags
+                                // (below its click-vs-drag pixel threshold), so
+                                // a tight right-to-left selection would otherwise
+                                // be wiped on mouse release.
+                                let has_real_selection = self
+                                    .terminal_selections
+                                    .get(&tab_id)
+                                    .map(|s| match (s.anchor, s.end) {
+                                        (Some(a), Some(e)) => a != e,
+                                        _ => false,
+                                    })
+                                    .unwrap_or(false);
+                                if !has_real_selection {
+                                    if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
+                                        sel.clear();
+                                    }
                                 }
                                 terminal_focus_response.request_focus();
                                 self.log_debug(format!(
-                                    "terminal focus requested tab={tab_id}"
+                                    "terminal focus requested tab={tab_id} kept_selection={has_real_selection}"
                                 ));
                             }
                             if terminal_focus_response.secondary_clicked() {
@@ -3711,12 +3774,19 @@ mod gui {
                                                     &mut session.parser, start, end,
                                                 );
                                                 if !text.is_empty() {
-                                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                                        let _ = clipboard.set_text(&text);
-                                                    }
+                                                    let len = text.len();
+                                                    // arboard set_text can block the UI on
+                                                    // WSL too — push it to a worker thread.
+                                                    std::thread::Builder::new()
+                                                        .name(format!("clipboard-copy-{tab_id}"))
+                                                        .spawn(move || {
+                                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                                                let _ = clipboard.set_text(&text);
+                                                            }
+                                                        })
+                                                        .ok();
                                                     self.log_debug(format!(
-                                                        "right-click copy tab={tab_id} len={}",
-                                                        text.len()
+                                                        "right-click copy tab={tab_id} len={len} dispatched to worker"
                                                     ));
                                                 }
                                             }
@@ -3726,28 +3796,50 @@ mod gui {
                                         }
                                     }
                                 } else {
-                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                        if let Ok(text) = clipboard.get_text() {
-                                            if !text.is_empty() {
-                                                // Strip trailing newlines and wrap in
-                                                // bracketed paste so the shell never
-                                                // auto-executes a pasted command — the
-                                                // user must press Enter intentionally.
-                                                let trimmed = text
-                                                    .trim_end_matches(|c| c == '\n' || c == '\r');
-                                                let normalized = trimmed.replace("\r\n", "\r");
-                                                let mut buf = b"\x1b[200~".to_vec();
-                                                buf.extend_from_slice(normalized.as_bytes());
-                                                buf.extend_from_slice(b"\x1b[201~");
-                                                self.send_raw_bytes_to_connection_tab(
-                                                    tab_id, &buf,
+                                    // Read the clipboard on a worker thread.
+                                    // arboard::Clipboard::new() and get_text()
+                                    // can block the UI for seconds on WSL when
+                                    // the clipboard owner is a Windows app, so
+                                    // we never call them from the UI thread.
+                                    if let Some(session) = self.pty_sessions.get(&tab_id) {
+                                        let write_tx = session.write_tx.clone();
+                                        std::thread::Builder::new()
+                                            .name(format!("clipboard-paste-{tab_id}"))
+                                            .spawn(move || {
+                                                let Ok(mut clipboard) = arboard::Clipboard::new() else {
+                                                    eprintln!(
+                                                        "tab={tab_id} paste: failed to open clipboard"
+                                                    );
+                                                    return;
+                                                };
+                                                let Ok(text) = clipboard.get_text() else {
+                                                    eprintln!(
+                                                        "tab={tab_id} paste: failed to read clipboard"
+                                                    );
+                                                    return;
+                                                };
+                                                if text.is_empty() {
+                                                    return;
+                                                }
+                                                let sanitized: String = text
+                                                    .replace("\r\n", " ")
+                                                    .replace('\r', " ")
+                                                    .replace('\n', " ")
+                                                    .trim_end()
+                                                    .to_string();
+                                                if sanitized.is_empty() {
+                                                    return;
+                                                }
+                                                eprintln!(
+                                                    "tab={tab_id} right-click paste worker sending len={}",
+                                                    sanitized.len()
                                                 );
-                                                self.log_debug(format!(
-                                                    "right-click paste tab={tab_id} bytes={} (bracketed)",
-                                                    normalized.len()
-                                                ));
-                                            }
-                                        }
+                                                let _ = write_tx.send(sanitized.into_bytes());
+                                            })
+                                            .ok();
+                                        self.log_debug(format!(
+                                            "right-click paste tab={tab_id} dispatched to worker"
+                                        ));
                                     }
                                 }
                             }
@@ -5050,6 +5142,24 @@ mod gui {
                     });
                 }
 
+                // Detect main-tab or connection-tab change so the next
+                // render of the Connections panel auto-focuses the active
+                // terminal — saves the user a click after switching tabs.
+                let current_selected = self.connections.selected();
+                let main_tab_changed = self.last_main_tab != Some(self.main_tab);
+                let connection_changed = self.last_focused_connection_tab != current_selected;
+                if self.main_tab == MainTab::Connections
+                    && (main_tab_changed || connection_changed)
+                {
+                    if let Some(id) = current_selected {
+                        if self.pty_sessions.contains_key(&id) {
+                            self.pending_focus_tab_id = Some(id);
+                        }
+                    }
+                }
+                self.last_main_tab = Some(self.main_tab);
+                self.last_focused_connection_tab = current_selected;
+
                 egui::CentralPanel::default().show(ctx, |ui| match self.main_tab {
                     MainTab::Inventory => self.render_inventory_panel(ui),
                     MainTab::Connections => self.render_connections_panel(ui),
@@ -5245,12 +5355,19 @@ mod gui {
         tab_id: u64,
         command: &PtyCommand,
         context: &AwsContext,
+        initial_size: Option<(u16, u16)>,
     ) -> Result<(PtySession, Box<dyn Read + Send>)> {
+        // Use the most recently observed grid size if known so the remote
+        // shell starts at roughly our actual cols — prevents line-wrap
+        // glitches before the first SIGWINCH propagates over SSM.
+        let (init_rows, init_cols) = initial_size.unwrap_or((45, 180));
+        let init_rows = init_rows.max(1);
+        let init_cols = init_cols.max(1);
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
-                rows: 45,
-                cols: 180,
+                rows: init_rows,
+                cols: init_cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -5310,8 +5427,10 @@ mod gui {
             child,
             master: Arc::new(Mutex::new(master)),
             write_tx,
-            parser: vt100::Parser::new(45, 180, 10_000),
-            last_size: None,
+            // Seed the local vt100 parser with the same dimensions we
+            // gave the remote so wrap/cursor math starts in sync.
+            parser: vt100::Parser::new(init_rows, init_cols, 10_000),
+            last_size: Some((init_rows, init_cols)),
             bytes_received: 0,
             output_event_count: 0,
             scroll_offset: 0,
@@ -6065,13 +6184,20 @@ mod gui {
                 }
             }
             egui::Event::Paste(text) => {
-                // Wrap pasted text in bracketed-paste escape sequences so
-                // applications like vim know it is a paste (avoids auto-indent
-                // and auto-comment artifacts).
-                let mut buf = b"\x1b[200~".to_vec();
-                buf.extend_from_slice(text.as_bytes());
-                buf.extend_from_slice(b"\x1b[201~");
-                Some(buf)
+                // Strip ALL newlines so a paste never auto-executes — embedded
+                // \r/\n become single spaces, and trailing newlines are dropped.
+                // The user must press Enter intentionally to run it.
+                let sanitized: String = text
+                    .replace("\r\n", " ")
+                    .replace('\r', " ")
+                    .replace('\n', " ")
+                    .trim_end()
+                    .to_string();
+                if sanitized.is_empty() {
+                    None
+                } else {
+                    Some(sanitized.into_bytes())
+                }
             }
             // Copy/Cut events carry no modifier info so we cannot
             // distinguish Ctrl+C from Ctrl+Shift+C here.  These are
@@ -6114,6 +6240,30 @@ mod gui {
             },
             _ => None,
         }
+    }
+
+    /// Render up to `max` bytes as a hex+ASCII preview for debug logs.
+    /// Each byte appears as two hex digits; printable ASCII is shown
+    /// inside parentheses afterward so newlines and escapes are visible.
+    fn hex_preview(bytes: &[u8], max: usize) -> String {
+        let take = bytes.len().min(max);
+        let hex: String = bytes[..take]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let ascii: String = bytes[..take]
+            .iter()
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        let truncated = if bytes.len() > take { "…" } else { "" };
+        format!("[{hex}{truncated}] ({ascii}{truncated})")
     }
 
     fn terminal_event_kind(event: &egui::Event) -> String {
@@ -7098,13 +7248,19 @@ mod gui {
                 Some(vec![0x15])
             );
 
+            // Plain paste passes through verbatim.
             let paste = egui::Event::Paste("echo hi".to_string());
-            let mut expected_paste = b"\x1b[200~".to_vec();
-            expected_paste.extend_from_slice(b"echo hi");
-            expected_paste.extend_from_slice(b"\x1b[201~");
             assert_eq!(
                 terminal_event_payload_for_terminal(&paste, false, false),
-                Some(expected_paste)
+                Some(b"echo hi".to_vec())
+            );
+
+            // Embedded and trailing newlines are stripped so the paste
+            // can never auto-execute — Enter must be pressed intentionally.
+            let multiline = egui::Event::Paste("echo hi\r\necho bye\n".to_string());
+            assert_eq!(
+                terminal_event_payload_for_terminal(&multiline, false, false),
+                Some(b"echo hi  echo bye".to_vec())
             );
         }
 
