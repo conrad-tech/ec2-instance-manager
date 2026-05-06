@@ -946,6 +946,18 @@ mod gui {
         tab_color_picker_rgb: [f32; 3],
         /// Profile ID for the color picker (from Edit menu or right-click)
         color_picker_profile: Option<String>,
+        /// Tab id that should grab keyboard focus on the next render of the
+        /// connections panel. Set when a new connection opens, the active
+        /// connection tab changes, the user pastes via right-click, or
+        /// clicks Prep Terminal — so the user can start typing immediately
+        /// without a manual click into the terminal.
+        pending_terminal_focus: Option<u64>,
+        /// Used to detect main_tab transitions into Connections so we can
+        /// auto-focus the visible terminal on entry.
+        last_main_tab: MainTab,
+        /// Last selected connection tab id seen at the top of update();
+        /// a change vs `connections.selected()` triggers auto-focus.
+        last_connection_tab: Option<u64>,
         file_browsers: HashMap<u64, FileBrowserState>,
         /// Per-tab editor/terminal vertical split ratio (0.0-1.0, 0.5 = 50/50)
         editor_split: HashMap<u64, f32>,
@@ -1114,6 +1126,9 @@ mod gui {
                 dragging_tab_id: None,
                 drag_grab_offset_x: 0.0,
                 tab_rename_buf: String::new(),
+                pending_terminal_focus: None,
+                last_main_tab: MainTab::Inventory,
+                last_connection_tab: None,
                 tab_color_picker_rgb: [0.0, 0.0, 0.0],
                 color_picker_profile: None,
                 file_browsers: HashMap::new(),
@@ -3423,6 +3438,60 @@ mod gui {
             ));
         }
 
+        /// Drip-feed a paste payload to the remote PTY in line-sized chunks
+        /// with brief inter-chunk delays. SSM sessions don't reliably pass
+        /// bracketed paste sequences, and writing a large blob in one shot
+        /// causes the remote shell's TTY input buffer to drop characters
+        /// (most visible with multi-line content like RSA pem files). We
+        /// run the drip loop on a worker thread so the UI stays responsive.
+        fn paste_to_connection_tab(&mut self, tab_id: u64, payload: Vec<u8>) {
+            let Some(session) = self.pty_sessions.get_mut(&tab_id) else {
+                return;
+            };
+            session.scroll_offset = 0;
+            let writer = Arc::clone(&session.writer);
+            let total_len = payload.len();
+            self.log_debug(format!(
+                "paste worker spawn tab={tab_id} bytes={total_len}"
+            ));
+            std::thread::spawn(move || {
+                // Cap each write to ~256 bytes; split early at `\r` so each
+                // line lands as a discrete write with extra settle time
+                // between lines (the remote shell echoes after each \r and
+                // can't keep up if bytes arrive faster than the echo).
+                const MAX_CHUNK: usize = 256;
+                const INTER_CHUNK_DELAY: Duration = Duration::from_millis(8);
+                const POST_LINE_DELAY: Duration = Duration::from_millis(35);
+                let mut start = 0usize;
+                while start < payload.len() {
+                    let max_end = (start + MAX_CHUNK).min(payload.len());
+                    let end = payload[start..max_end]
+                        .iter()
+                        .position(|&b| b == b'\r')
+                        .map(|i| start + i + 1)
+                        .unwrap_or(max_end);
+                    let ended_on_cr = payload.get(end - 1) == Some(&b'\r');
+                    let chunk = &payload[start..end];
+                    {
+                        let Ok(mut w) = writer.lock() else { return; };
+                        if let Err(err) = w.write_all(chunk) {
+                            eprintln!("paste worker tab={tab_id} write error: {err}");
+                            return;
+                        }
+                        let _ = w.flush();
+                    }
+                    start = end;
+                    if start < payload.len() {
+                        std::thread::sleep(if ended_on_cr {
+                            POST_LINE_DELAY
+                        } else {
+                            INTER_CHUNK_DELAY
+                        });
+                    }
+                }
+            });
+        }
+
         fn send_raw_bytes_to_connection_tab(&mut self, tab_id: u64, payload: &[u8]) {
             self.log_trace(format!(
                 "sending input to tab={tab_id} bytes={}",
@@ -3537,8 +3606,10 @@ mod gui {
                                         &mut session.parser, start, end,
                                     );
                                     if !text.is_empty() {
-                                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                            let _ = clipboard.set_text(&text);
+                                        if let Err(err) = clipboard_set_text_with_retry(&text) {
+                                            self.log_error(format!(
+                                                "Ctrl+Shift+C copy tab={tab_id} set_text failed after retries: {err}"
+                                            ));
                                         }
                                         self.log_debug(format!(
                                             "copied selection tab={tab_id} abs ({},{})→({},{}) len={}",
@@ -3589,9 +3660,14 @@ mod gui {
                         terminal_event_kind(&event)
                     ));
                     if matches!(event, egui::Event::Paste(_)) {
+                        // Route Ctrl+V paste through the chunked drip-feed
+                        // path — single-shot writes lose bytes for long
+                        // multi-line content (RSA pem files, scripts).
                         self.mark_paste_write(tab_id, payload.len());
+                        self.paste_to_connection_tab(tab_id, payload);
+                    } else {
+                        self.send_raw_bytes_to_connection_tab(tab_id, &payload);
                     }
-                    self.send_raw_bytes_to_connection_tab(tab_id, &payload);
                 }
             }
         }
@@ -3709,19 +3785,14 @@ mod gui {
             }
         }
 
-        fn render_inventory_panel(&mut self, ui: &mut egui::Ui) {
-            // Auto-fit zoom: fire on startup and on real monitor moves.
-            // Detection uses the window's outer screen position — a
-            // significant jump (> 400 px) signals a monitor change,
-            // independent of our own ppp changes. Physical-pixel
-            // drift/jitter is NOT a trigger anymore, so manual zoom
-            // between monitor moves is preserved.
-            let current_ppp = ui.ctx().pixels_per_point();
-            let native_ppp = ui.ctx().native_pixels_per_point().unwrap_or(1.0);
-            let (monitor_points_w, outer_pos) = ui.ctx().input(|i| {
+        // Auto-fit zoom: fire on startup and on real monitor moves.
+        // Runs every frame from `update()` so it applies regardless of
+        // which main tab is active (Inventory, Connections, Details, Log).
+        fn apply_auto_fit_zoom(&mut self, ctx: &egui::Context) {
+            let current_ppp = ctx.pixels_per_point();
+            let native_ppp = ctx.native_pixels_per_point().unwrap_or(1.0);
+            let (monitor_points_w, outer_pos) = ctx.input(|i| {
                 let vp = i.viewport();
-                // Prefer monitor width (stable across window resizes)
-                // but fall back to inner window width if not reported.
                 let mon_w = vp
                     .monitor_size
                     .map(|s| s.x)
@@ -3730,9 +3801,6 @@ mod gui {
                 (mon_w, pos)
             });
             let window_pixels = monitor_points_w * current_ppp;
-            // Short cooldown (150ms) only as a safety net against
-            // pathological frame-to-frame jitter; monitor moves bypass
-            // it so rapid Monitor A → B → A swaps still auto-fit.
             let short_cooldown_elapsed = self
                 .last_auto_fit_at
                 .map(|t| t.elapsed() >= Duration::from_millis(150))
@@ -3747,11 +3815,6 @@ mod gui {
             if window_pixels > 0.0
                 && (monitor_moved || (is_first_fit && short_cooldown_elapsed))
             {
-                // GUI_DEFAULT_WIDTH (1720 pt) is the design width at
-                // 1.0x. Bigger window → scale up proportionally. Never
-                // below 1.0x (content overflow is handled by scrollbars).
-                // Conservative factor (0.9) leaves a bit of breathing
-                // room so the auto-fit doesn't zoom one step too far.
                 const AUTO_FIT_CONSERVATIVE: f32 = 0.95;
                 let raw = window_pixels / (GUI_DEFAULT_WIDTH * native_ppp);
                 let target_scale = (raw * AUTO_FIT_CONSERVATIVE).max(1.0).min(3.0);
@@ -3759,7 +3822,7 @@ mod gui {
                     self.ui_scale = target_scale;
                     self.config.ui_scale = Some(target_scale);
                     let _ = self.config.save();
-                    ui.ctx().set_pixels_per_point(target_scale * native_ppp);
+                    ctx.set_pixels_per_point(target_scale * native_ppp);
                     self.log_debug(format!(
                         "auto-fit: window_px={window_pixels:.0} -> ui_scale={target_scale:.2}"
                     ));
@@ -3773,7 +3836,9 @@ mod gui {
                 // real move has a baseline to compare against.
                 self.last_auto_fit_outer_pos = outer_pos;
             }
+        }
 
+        fn render_inventory_panel(&mut self, ui: &mut egui::Ui) {
             ui.horizontal(|ui| {
                 ui.label(format!(
                     "Instances: {} filtered / {} total",
@@ -4709,6 +4774,7 @@ mod gui {
                     ));
                     if tab.running && ui.small_button("Prep Terminal").clicked() {
                         self.send_raw_bytes_to_connection_tab(tab.id, PREP_TERMINAL_COMMAND);
+                        self.pending_terminal_focus = Some(tab.id);
                     }
                 });
                 ui.separator();
@@ -4902,6 +4968,15 @@ mod gui {
                                 terminal_focus_id,
                                 egui::Sense::click_and_drag(),
                             );
+                            // Honor a pending auto-focus request for this
+                            // tab (set on tab open, tab switch, prep, paste).
+                            if self.pending_terminal_focus == Some(tab_id) {
+                                terminal_focus_response.request_focus();
+                                self.pending_terminal_focus = None;
+                                self.log_debug(format!(
+                                    "terminal auto-focus tab={tab_id}"
+                                ));
+                            }
                             // Derive cell size from the rendered rect and the actual
                             // parser grid dimensions.  This avoids font-metric drift
                             // after DPI/monitor changes — the mapping always matches
@@ -5108,20 +5183,14 @@ mod gui {
                                         .filter(|t| !t.is_empty());
                                     match &copied_text {
                                         Some(text) => {
-                                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                                match clipboard.set_text(text.clone()) {
-                                                    Ok(()) => self.log_debug(format!(
-                                                        "right-click copy tab={tab_id} len={}",
-                                                        text.len()
-                                                    )),
-                                                    Err(err) => self.log_error(format!(
-                                                        "right-click copy tab={tab_id} set_text failed: {err}"
-                                                    )),
-                                                }
-                                            } else {
-                                                self.log_error(format!(
-                                                    "right-click copy tab={tab_id} Clipboard::new failed"
-                                                ));
+                                            match clipboard_set_text_with_retry(text) {
+                                                Ok(()) => self.log_debug(format!(
+                                                    "right-click copy tab={tab_id} len={}",
+                                                    text.len()
+                                                )),
+                                                Err(err) => self.log_error(format!(
+                                                    "right-click copy tab={tab_id} set_text failed after retries: {err}"
+                                                )),
                                             }
                                         }
                                         None => {
@@ -5139,31 +5208,33 @@ mod gui {
                                         sel.clear();
                                     }
                                 } else {
-                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                        if let Ok(text) = clipboard.get_text() {
-                                            if !text.is_empty() {
-                                                // Normalize pasted text for terminal:
-                                                // - U+00A0 → space (OneNote non-breaking spaces)
-                                                // - \r\n → \r, \n → \r (line endings)
-                                                // No bracketed paste — SSM sessions
-                                                // don't reliably pass the escape
-                                                // sequences through to the remote terminal.
-                                                let normalized = text
-                                                    .replace('\u{00a0}', " ")
-                                                    .replace("\r\n", "\r")
-                                                    .replace('\n', "\r");
-                                                let paste_bytes = normalized.len();
-                                                self.mark_paste_write(tab_id, paste_bytes);
-                                                self.send_raw_bytes_to_connection_tab(
-                                                    tab_id,
-                                                    normalized.as_bytes(),
-                                                );
-                                                self.log_debug(format!(
-                                                    "right-click paste tab={tab_id} bytes={}",
-                                                    text.len()
-                                                ));
-                                            }
+                                    match clipboard_get_text_with_retry() {
+                                        Ok(text) if !text.is_empty() => {
+                                            // Normalize pasted text for terminal:
+                                            // - U+00A0 → space (OneNote non-breaking spaces)
+                                            // - \r\n → \r, \n → \r (line endings)
+                                            // No bracketed paste — SSM sessions
+                                            // don't reliably pass the escape
+                                            // sequences through to the remote terminal.
+                                            let normalized = text
+                                                .replace('\u{00a0}', " ")
+                                                .replace("\r\n", "\r")
+                                                .replace('\n', "\r");
+                                            let paste_bytes = normalized.len();
+                                            self.mark_paste_write(tab_id, paste_bytes);
+                                            self.paste_to_connection_tab(
+                                                tab_id,
+                                                normalized.into_bytes(),
+                                            );
+                                            self.pending_terminal_focus = Some(tab_id);
+                                            self.log_debug(format!(
+                                                "right-click paste tab={tab_id} bytes={paste_bytes}"
+                                            ));
                                         }
+                                        Ok(_) => {}
+                                        Err(err) => self.log_error(format!(
+                                            "right-click paste tab={tab_id} clipboard read failed: {err}"
+                                        )),
                                     }
                                 }
                             }
@@ -6038,8 +6109,27 @@ mod gui {
                     ctx.set_pixels_per_point(self.ui_scale * native_ppp);
                 }
 
-                // (Auto-fit zoom applied inside render_inventory_panel
-                // where the inventory's actual available width is known.)
+                // Auto-fit zoom runs every frame so it triggers on
+                // monitor moves regardless of the active tab.
+                self.apply_auto_fit_zoom(ctx);
+
+                // Auto-focus the visible terminal when:
+                //   - the user just switched into the Connections tab
+                //   - the active connection tab changed (new tab opened
+                //     or user clicked a different tab in the strip)
+                // Explicit focus triggers (Prep Terminal click, right-click
+                // paste) set `pending_terminal_focus` directly.
+                let current_conn = self.connections.selected();
+                let entered_connections = self.main_tab == MainTab::Connections
+                    && self.last_main_tab != MainTab::Connections;
+                let switched_conn_tab = self.main_tab == MainTab::Connections
+                    && current_conn.is_some()
+                    && current_conn != self.last_connection_tab;
+                if (entered_connections || switched_conn_tab) && current_conn.is_some() {
+                    self.pending_terminal_focus = current_conn;
+                }
+                self.last_main_tab = self.main_tab;
+                self.last_connection_tab = current_conn;
 
                 // Zoom hotkeys: Ctrl+= / Ctrl++ zoom in, Ctrl+- zoom out.
                 let (zoom_in, zoom_out) = ctx.input(|i| {
@@ -8407,6 +8497,50 @@ mod gui {
 
         parser.screen_mut().set_scrollback(0);
         result
+    }
+
+    /// Set clipboard text with retry. On Windows, OpenClipboard fails
+    /// transiently when another process holds the clipboard (browsers,
+    /// Office, clipboard managers). arboard's internal retry loop is
+    /// short — wrap it with a longer outer retry so right-click copy
+    /// stops "intermittently failing" until the user closes/reopens
+    /// terminals.
+    fn clipboard_set_text_with_retry(text: &str) -> std::result::Result<(), String> {
+        const ATTEMPTS: u32 = 5;
+        const BACKOFF: Duration = Duration::from_millis(40);
+        let mut last_err: Option<String> = None;
+        for attempt in 0..ATTEMPTS {
+            match arboard::Clipboard::new() {
+                Ok(mut cb) => match cb.set_text(text) {
+                    Ok(()) => return Ok(()),
+                    Err(err) => last_err = Some(format!("set_text: {err}")),
+                },
+                Err(err) => last_err = Some(format!("Clipboard::new: {err}")),
+            }
+            if attempt + 1 < ATTEMPTS {
+                std::thread::sleep(BACKOFF);
+            }
+        }
+        Err(last_err.unwrap_or_else(|| "unknown clipboard error".to_string()))
+    }
+
+    fn clipboard_get_text_with_retry() -> std::result::Result<String, String> {
+        const ATTEMPTS: u32 = 5;
+        const BACKOFF: Duration = Duration::from_millis(40);
+        let mut last_err: Option<String> = None;
+        for attempt in 0..ATTEMPTS {
+            match arboard::Clipboard::new() {
+                Ok(mut cb) => match cb.get_text() {
+                    Ok(t) => return Ok(t),
+                    Err(err) => last_err = Some(format!("get_text: {err}")),
+                },
+                Err(err) => last_err = Some(format!("Clipboard::new: {err}")),
+            }
+            if attempt + 1 < ATTEMPTS {
+                std::thread::sleep(BACKOFF);
+            }
+        }
+        Err(last_err.unwrap_or_else(|| "unknown clipboard error".to_string()))
     }
 
     fn resize_pty_session(session: &mut PtySession, rows: u16, cols: u16) {
