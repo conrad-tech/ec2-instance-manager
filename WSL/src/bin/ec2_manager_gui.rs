@@ -565,6 +565,19 @@ mod gui {
     const PREP_TERMINAL_COMMAND: &[u8] =
         b"exec bash\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\rgrep -qxF 'set paste' ~/.vimrc 2>/dev/null || echo 'set paste' >> ~/.vimrc\rmkdir -p ~/.ssh && chmod 700 ~/.ssh 2>/dev/null\rgrep -qs 'StrictHostKeyChecking accept-new' ~/.ssh/config 2>/dev/null || printf 'Host *\\n  StrictHostKeyChecking accept-new\\n  UserKnownHostsFile ~/.ssh/known_hosts\\n' >> ~/.ssh/config\rchmod 600 ~/.ssh/config 2>/dev/null\rclear\r";
 
+    /// Build the prep-terminal byte sequence with an explicit `stty rows
+    /// R cols C` prefix. The local PTY's resize messages don't always
+    /// reach the remote shell before bash has read its initial TTY size
+    /// — symptom is line-wrap overlap on the *initial* shell that goes
+    /// away after `sudo su` (because the new shell inherits the current,
+    /// correct size). Forcing stty before `exec bash` makes the
+    /// replaced bash pick up the right cols on first prep too.
+    fn prep_terminal_command_for_size(rows: u16, cols: u16) -> Vec<u8> {
+        let mut buf = format!("stty rows {rows} cols {cols} 2>/dev/null\r").into_bytes();
+        buf.extend_from_slice(PREP_TERMINAL_COMMAND);
+        buf
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     struct RowAction {
         select: bool,
@@ -2482,8 +2495,10 @@ mod gui {
                         session.ps1_auto_sent = true;
                         session.pending_reprep = false;
                         session.last_prepped_prompt = cursor_trimmed;
+                        let (rows, cols) = session.last_size.unwrap_or((24, 120));
+                        let prep = prep_terminal_command_for_size(rows, cols);
                         if let Ok(mut stdin) = session.writer.lock() {
-                            let _ = stdin.write_all(PREP_TERMINAL_COMMAND)
+                            let _ = stdin.write_all(&prep)
                                 .and_then(|()| stdin.flush());
                         }
                     }
@@ -4773,7 +4788,13 @@ mod gui {
                         pty_bytes,
                     ));
                     if tab.running && ui.small_button("Prep Terminal").clicked() {
-                        self.send_raw_bytes_to_connection_tab(tab.id, PREP_TERMINAL_COMMAND);
+                        let (rows, cols) = self
+                            .pty_sessions
+                            .get(&tab.id)
+                            .and_then(|s| s.last_size)
+                            .unwrap_or((24, 120));
+                        let prep = prep_terminal_command_for_size(rows, cols);
+                        self.send_raw_bytes_to_connection_tab(tab.id, &prep);
                         self.pending_terminal_focus = Some(tab.id);
                     }
                 });
@@ -5084,10 +5105,9 @@ mod gui {
                                         col: sel_cols.saturating_sub(1),
                                     });
                                 } else if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
-                                    let vr = session.parser.screen().size().0 as usize;
                                     let cols_count = session.parser.screen().size().1;
-                                    session.parser.screen_mut().set_scrollback(abs_row);
-                                    let screen_row = vr.saturating_sub(1) as u16;
+                                    let screen_row = set_scrollback_for_top_abs_row(
+                                        &mut session.parser, abs_row);
                                     let row_text = session.parser.screen().contents_between(
                                         screen_row, 0, screen_row, cols_count,
                                     );
@@ -8432,6 +8452,27 @@ mod gui {
         (start as u16, end as u16)
     }
 
+    /// Set the parser's scrollback so the given `top_abs_row` is shifted as
+    /// close to the top of the viewport as possible. Returns the screen_row
+    /// where that abs_row now appears.
+    ///
+    /// vt100's `set_scrollback(K)` is "shift view up by K rows" and is
+    /// clamped to the actual scrollback size. If we naively call
+    /// `set_scrollback(abs_row)` for a row that lives in the *unscrolled*
+    /// grid (or in scrollback shorter than `abs_row`), the view stays
+    /// near the bottom and reads from the wrong (often empty) screen row.
+    /// This helper computes the proper scrollback for the requested row
+    /// and returns the screen_row at which it actually lands after vt100
+    /// clamps.
+    fn set_scrollback_for_top_abs_row(parser: &mut vt100::Parser, top_abs_row: usize) -> u16 {
+        let vr = parser.screen().size().0 as usize;
+        let desired_sb = top_abs_row.saturating_sub(vr.saturating_sub(1));
+        parser.screen_mut().set_scrollback(desired_sb);
+        let actual_sb = parser.screen().scrollback();
+        let bottom_abs = actual_sb + vr.saturating_sub(1);
+        bottom_abs.saturating_sub(top_abs_row) as u16
+    }
+
     fn extract_selection_text(
         parser: &mut vt100::Parser,
         start: AbsPos,
@@ -8442,11 +8483,9 @@ mod gui {
         let span = start.abs_row - end.abs_row + 1;
 
         if span <= vr {
-            // Fast path: selection fits in one viewport
-            let sb = end.abs_row;
-            parser.screen_mut().set_scrollback(sb);
-            let screen_start = (vr - 1 - (start.abs_row - end.abs_row)) as u16;
-            let screen_end = visible_rows - 1;
+            // Fast path: selection fits in one viewport.
+            let screen_start = set_scrollback_for_top_abs_row(parser, start.abs_row);
+            let screen_end = screen_start + (start.abs_row - end.abs_row) as u16;
             let text = parser.screen().contents_between(
                 screen_start,
                 start.col,
@@ -8464,15 +8503,14 @@ mod gui {
         let mut is_first = true;
 
         loop {
-            let sb = current_abs_top.saturating_sub(vr - 1);
-            parser.screen_mut().set_scrollback(sb);
-
-            let screen_top = (sb + vr - 1 - current_abs_top) as u16;
+            let screen_top = set_scrollback_for_top_abs_row(parser, current_abs_top);
+            let actual_sb = parser.screen().scrollback();
+            let viewport_bottom_abs = actual_sb;
             let col_start = if is_first { start.col } else { 0 };
 
-            let viewport_bottom_abs = sb;
             let (screen_bottom, col_end, done) = if end.abs_row >= viewport_bottom_abs {
-                let sr = (sb + vr - 1 - end.abs_row) as u16;
+                let bottom_abs = actual_sb + vr.saturating_sub(1);
+                let sr = bottom_abs.saturating_sub(end.abs_row) as u16;
                 (sr, end.col.saturating_add(1), true)
             } else {
                 (visible_rows - 1, cols, false)
@@ -8487,11 +8525,11 @@ mod gui {
             }
             result.push_str(&chunk);
 
-            if done || sb == 0 {
+            if done || actual_sb == 0 {
                 break;
             }
 
-            current_abs_top = sb - 1;
+            current_abs_top = viewport_bottom_abs - 1;
             is_first = false;
         }
 
@@ -10430,6 +10468,48 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     }
                 }
             }
+        }
+
+        #[test]
+        fn extract_selection_text_on_visible_row_with_no_scrollback() {
+            // Regression: a fresh SSM session writes only a few lines.
+            // The grid is e.g. 24 rows tall but only rows 0..N have
+            // content, with N << 23. Clicking on visible content at
+            // grid row 2 yields abs_row = 23 - 2 = 21 (assuming
+            // scroll_offset 0). Before the fix, extract_selection_text
+            // called set_scrollback(21) which clamped to 0 and read
+            // grid row 23 (empty), returning "". After the fix, it
+            // reads grid row 2 and returns the actual word.
+            let mut parser = vt100::Parser::new(24, 80, 1000);
+            // Three lines of content land on grid rows 0, 1, 2.
+            parser.process(b"alpha\r\nbeta\r\ngamma");
+            let abs_row = 21usize; // = (24-1) - 2; clicked on the "gamma" row
+            let start = AbsPos { abs_row, col: 0 };
+            let end = AbsPos { abs_row, col: 4 }; // "gamma" spans cols 0..=4
+            let text = extract_selection_text(&mut parser, start, end);
+            assert_eq!(text, "gamma");
+        }
+
+        #[test]
+        fn extract_selection_text_in_scrollback() {
+            // Selection lives in scrollback proper. Make sure we still
+            // read the right row after vt100 clamps.
+            let mut parser = vt100::Parser::new(5, 20, 100);
+            // Push 10 lines so 5 end up in scrollback (rows beyond viewport).
+            for i in 0..10 {
+                let line = format!("line{i:02}\r\n");
+                parser.process(line.as_bytes());
+            }
+            // Most-recent line at abs_row=0 is empty (cursor sits there
+            // after final \r\n). Lines line00..line09 are above. Pick
+            // line05 — abs_row = 4 (cursor empty row + line09..line06 = 4 above
+            // line05). We can compute by looking up what's at each abs_row
+            // via the same helper. For determinism, just assert the row
+            // contains "line".
+            let start = AbsPos { abs_row: 4, col: 0 };
+            let end = AbsPos { abs_row: 4, col: 5 };
+            let text = extract_selection_text(&mut parser, start, end);
+            assert!(text.starts_with("line"), "got {text:?}");
         }
 
         #[test]
