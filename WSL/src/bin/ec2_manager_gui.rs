@@ -2441,9 +2441,34 @@ mod gui {
                     let paste_info = session.paste_write_at.map(|at| {
                         (at.elapsed(), session.paste_write_bytes)
                     });
+                    // Capture scrollback length before processing so we can
+                    // shift any active selection by the number of lines that
+                    // get pushed into scrollback. abs_row is "lines back from
+                    // current bottom" — when new lines arrive the bottom
+                    // advances and the same abs_row would point to newer
+                    // content, making a copy land a few lines below the
+                    // visible selection. Shifting abs_row by the delta keeps
+                    // the selection pinned to the originally-selected content.
+                    let prev_max_sb = {
+                        let s = session.parser.screen_mut();
+                        let saved = s.scrollback();
+                        s.set_scrollback(usize::MAX);
+                        let m = s.scrollback();
+                        s.set_scrollback(saved);
+                        m
+                    };
                     let parse_start = Instant::now();
                     session.parser.process(&bytes);
                     let parse_elapsed = parse_start.elapsed();
+                    let new_max_sb = {
+                        let s = session.parser.screen_mut();
+                        let saved = s.scrollback();
+                        s.set_scrollback(usize::MAX);
+                        let m = s.scrollback();
+                        s.set_scrollback(saved);
+                        m
+                    };
+                    let scrollback_delta = new_max_sb.saturating_sub(prev_max_sb);
                     if let Some((since_write, write_bytes)) = paste_info {
                         let scrollback = session.parser.screen().scrollback();
                         paste_diag = Some(format!(
@@ -2459,11 +2484,16 @@ mod gui {
                             session.paste_write_at = None;
                         }
                     }
-                    // Selection coordinates are abs_row-based and remain
-                    // valid as scrollback grows, so we don't need to clear
-                    // them here. (Previously cleared on any output arriving
-                    // at scroll-bottom — which clobbered the user's
-                    // highlight before they could right-click to copy.)
+                    if scrollback_delta > 0 {
+                        if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
+                            if let Some(a) = sel.anchor.as_mut() {
+                                a.abs_row = a.abs_row.saturating_add(scrollback_delta);
+                            }
+                            if let Some(e) = sel.end.as_mut() {
+                                e.abs_row = e.abs_row.saturating_add(scrollback_delta);
+                            }
+                        }
+                    }
                     // Respond to Device Status Report queries.
                     respond_to_terminal_queries(session, &bytes);
                     // Auto-send PREP_TERMINAL_COMMAND in two cases:
