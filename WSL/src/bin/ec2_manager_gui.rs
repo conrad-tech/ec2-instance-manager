@@ -17,7 +17,7 @@ mod gui {
     #[cfg(test)]
     use std::process::{Child, Command, Stdio};
     use std::sync::mpsc::{self, Receiver, Sender};
-    use std::sync::{Arc, Mutex, Once};
+    use std::sync::{Arc, Condvar, Mutex, Once};
     use std::time::{Duration, Instant, SystemTime};
 
     use eframe::egui;
@@ -370,6 +370,14 @@ mod gui {
         /// parse/render stalls. Cleared once we log the first inbound byte.
         paste_write_at: Option<Instant>,
         paste_write_bytes: usize,
+        /// Counter incremented each time the parser observes a fresh shell
+        /// prompt at the cursor line. Paired with a Condvar so the paste
+        /// worker can wait for the remote shell to be ready between lines
+        /// instead of blindly sleeping a fixed delay. Without this, slow
+        /// commands (e.g. `sudo systemctl daemon-reload`) consume queued
+        /// stdin bytes as their own input, so subsequent pasted lines get
+        /// echoed but never executed.
+        prompt_ready: Arc<(Mutex<u64>, Condvar)>,
     }
 
     /// Absolute terminal position: scroll-invariant coordinate.
@@ -2512,6 +2520,27 @@ mod gui {
                     let cursor_trimmed = cursor_line.trim_end().to_string();
                     let cursor_is_user_host_prompt = cursor_trimmed.contains('@')
                         && (cursor_trimmed.ends_with('$') || cursor_trimmed.ends_with('#'));
+                    // A "ready for next command" signal for the paste worker.
+                    // The custom PS1 (see PREP_TERMINAL_COMMAND) ends with a
+                    // line that's just "$ " or "# " (no user@host on that row).
+                    // Detect that: cursor sits at col <= 2 on a line that
+                    // trims to just the prompt sigil. Also accept the
+                    // user@host-style prompt for sessions that haven't been
+                    // prep'd yet.
+                    let (cur_row, cur_col) = session.parser.screen().cursor_position();
+                    let bare_prompt = (cursor_trimmed == "$"
+                        || cursor_trimmed == "#"
+                        || cursor_trimmed.ends_with("\n$")
+                        || cursor_trimmed.ends_with("\n#"))
+                        && cur_col <= 2;
+                    let _ = cur_row;
+                    if bare_prompt || cursor_is_user_host_prompt {
+                        let (lock, cvar) = &*session.prompt_ready;
+                        if let Ok(mut count) = lock.lock() {
+                            *count = count.wrapping_add(1);
+                            cvar.notify_all();
+                        }
+                    }
 
                     let initial_match = !session.ps1_auto_sent && {
                         let screen_text = session.parser.screen().contents();
@@ -3495,18 +3524,31 @@ mod gui {
             };
             session.scroll_offset = 0;
             let writer = Arc::clone(&session.writer);
+            let prompt_ready = Arc::clone(&session.prompt_ready);
             let total_len = payload.len();
             self.log_debug(format!(
                 "paste worker spawn tab={tab_id} bytes={total_len}"
             ));
             std::thread::spawn(move || {
-                // Cap each write to ~256 bytes; split early at `\r` so each
-                // line lands as a discrete write with extra settle time
-                // between lines (the remote shell echoes after each \r and
-                // can't keep up if bytes arrive faster than the echo).
+                // Split the payload at each `\r` and write one command at a
+                // time. Between lines, wait for the remote shell to redraw
+                // its prompt (signalled via `prompt_ready`) before sending
+                // the next line — otherwise the next `\r` lands while the
+                // previous command is still running, and the line discipline
+                // hands the queued bytes to that command's stdin instead of
+                // letting bash read them as new commands. That's the
+                // multi-line-paste bug: all lines echo, only the first runs.
                 const MAX_CHUNK: usize = 256;
                 const INTER_CHUNK_DELAY: Duration = Duration::from_millis(8);
-                const POST_LINE_DELAY: Duration = Duration::from_millis(35);
+                // Generous fallback so a command that suppresses the prompt
+                // (e.g. a TUI we didn't recognise) doesn't stall paste
+                // forever. 2.5s is long enough for typical `sudo systemctl`
+                // / `aws ec2` calls but short enough to recover from a
+                // missed prompt-redraw detection.
+                const PROMPT_WAIT_TIMEOUT: Duration = Duration::from_millis(2500);
+                // Floor delay even when the prompt signal fires, so the
+                // remote line discipline has time to settle between writes.
+                const POST_PROMPT_DELAY: Duration = Duration::from_millis(20);
                 let mut start = 0usize;
                 while start < payload.len() {
                     let max_end = (start + MAX_CHUNK).min(payload.len());
@@ -3517,6 +3559,13 @@ mod gui {
                         .unwrap_or(max_end);
                     let ended_on_cr = payload.get(end - 1) == Some(&b'\r');
                     let chunk = &payload[start..end];
+                    // Snapshot the prompt-ready counter *before* writing so
+                    // we can detect the redraw that this line triggers, not
+                    // a stale prompt from before the paste started.
+                    let pre_counter = {
+                        let (lock, _) = &*prompt_ready;
+                        lock.lock().map(|g| *g).unwrap_or(0)
+                    };
                     {
                         let Ok(mut w) = writer.lock() else { return; };
                         if let Err(err) = w.write_all(chunk) {
@@ -3527,11 +3576,21 @@ mod gui {
                     }
                     start = end;
                     if start < payload.len() {
-                        std::thread::sleep(if ended_on_cr {
-                            POST_LINE_DELAY
+                        if ended_on_cr {
+                            let (lock, cvar) = &*prompt_ready;
+                            let Ok(guard) = lock.lock() else { return; };
+                            let (_g, _wait_res) = match cvar.wait_timeout_while(
+                                guard,
+                                PROMPT_WAIT_TIMEOUT,
+                                |count| *count == pre_counter,
+                            ) {
+                                Ok(pair) => pair,
+                                Err(_) => return,
+                            };
+                            std::thread::sleep(POST_PROMPT_DELAY);
                         } else {
-                            INTER_CHUNK_DELAY
-                        });
+                            std::thread::sleep(INTER_CHUNK_DELAY);
+                        }
                     }
                 }
             });
@@ -5033,9 +5092,21 @@ mod gui {
                             // after DPI/monitor changes — the mapping always matches
                             // the rendered text exactly.
                             let term_rect = terminal_response.inner.rect;
-                            let (sel_rows, sel_cols) = self.pty_sessions.get(&tab_id)
-                                .and_then(|s| s.last_size)
+                            // Pull grid dims from the parser's *live* screen
+                            // so pointer→cell mapping always matches what's
+                            // currently rendered. `last_size` is the size we
+                            // last sent to the PTY's resize ioctl and can
+                            // briefly disagree with parser.screen().size()
+                            // during a resize, producing wrong (row, col)
+                            // and an empty/wrong-row extraction even though
+                            // the highlight paints correctly.
+                            let (live_rows, live_cols) = self.pty_sessions.get(&tab_id)
+                                .map(|s| s.parser.screen().size())
                                 .unwrap_or((24, 120));
+                            let last_size = self.pty_sessions.get(&tab_id)
+                                .and_then(|s| s.last_size);
+                            let sel_rows = live_rows;
+                            let sel_cols = live_cols;
                             let sel_cell_w = if sel_cols > 0 { term_rect.width() / sel_cols as f32 } else { 8.0 };
                             let sel_cell_h = if sel_rows > 0 { term_rect.height() / sel_rows as f32 } else { 16.0 };
                             // Mouse drag selection using raw pointer state (absolute coords)
@@ -5056,6 +5127,14 @@ mod gui {
                                     let sel = self.terminal_selections.entry(tab_id).or_default();
                                     sel.anchor = Some(abs);
                                     sel.end = Some(abs);
+                                    self.log_trace(format!(
+                                        "primary_pressed tab={tab_id} pos=({:.1},{:.1}) rect=({:.1},{:.1},{:.1},{:.1}) cell=({:.2}x{:.2}) live=({live_rows}x{live_cols}) last_size={last_size:?} cell=({row},{col}) abs={} scroll_off={scroll_off}",
+                                        pos.x, pos.y,
+                                        term_rect.left(), term_rect.top(),
+                                        term_rect.width(), term_rect.height(),
+                                        sel_cell_w, sel_cell_h,
+                                        abs.abs_row,
+                                    ));
                                 } else if primary_down {
                                     let has_anchor = self.terminal_selections
                                         .get(&tab_id).is_some_and(|s| s.anchor.is_some());
@@ -5136,16 +5215,45 @@ mod gui {
                                     });
                                 } else if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
                                     let cols_count = session.parser.screen().size().1;
-                                    let screen_row = set_scrollback_for_top_abs_row(
+                                    let resolved = set_scrollback_for_top_abs_row_checked(
                                         &mut session.parser, abs_row);
-                                    let row_text = session.parser.screen().contents_between(
-                                        screen_row, 0, screen_row, cols_count,
-                                    );
-                                    session.parser.screen_mut().set_scrollback(0);
-                                    let (start_col, end_col) = find_word_bounds(&row_text, col);
-                                    let sel = self.terminal_selections.entry(tab_id).or_default();
-                                    sel.anchor = Some(AbsPos { abs_row, col: start_col });
-                                    sel.end = Some(AbsPos { abs_row, col: end_col });
+                                    match resolved {
+                                        Some((screen_row, actual_sb)) => {
+                                            let row_text = session.parser.screen().contents_between(
+                                                screen_row, 0, screen_row, cols_count,
+                                            );
+                                            session.parser.screen_mut().set_scrollback(0);
+                                            let (start_col, end_col) = find_word_bounds(&row_text, col);
+                                            let row_preview: String = row_text.chars().take(60)
+                                                .map(|c| if c.is_control() { '.' } else { c })
+                                                .collect();
+                                            self.log_debug(format!(
+                                                "double-click tab={tab_id} pos=({:.1},{:.1}) cell=({row},{col}) abs_row={abs_row} screen_row={screen_row} actual_sb={actual_sb} word=({start_col}..{end_col}) row={row_preview:?}",
+                                                pos.x, pos.y,
+                                            ));
+                                            if start_col == end_col {
+                                                // Most-common cause of "double-click did
+                                                // nothing": clicked on a non-word char
+                                                // (whitespace, punctuation outside the
+                                                // word-set, or the row was empty).
+                                                self.log_debug(format!(
+                                                    "double-click tab={tab_id} produced empty word selection at col={col}; clicked cell is not a word char"
+                                                ));
+                                            }
+                                            let sel = self.terminal_selections.entry(tab_id).or_default();
+                                            sel.anchor = Some(AbsPos { abs_row, col: start_col });
+                                            sel.end = Some(AbsPos { abs_row, col: end_col });
+                                        }
+                                        None => {
+                                            // abs_row is past the scrollback cap — the
+                                            // content the user double-clicked has been
+                                            // evicted from the 2500-line buffer.
+                                            session.parser.screen_mut().set_scrollback(0);
+                                            self.log_warn(format!(
+                                                "double-click tab={tab_id} abs_row={abs_row} clamped (past scrollback cap); no selection produced"
+                                            ));
+                                        }
+                                    }
                                 }
                             }
                             if terminal_focus_response.clicked()
@@ -7848,6 +7956,7 @@ mod gui {
             last_prepped_prompt: String::new(),
             paste_write_at: None,
             paste_write_bytes: 0,
+            prompt_ready: Arc::new((Mutex::new(0), Condvar::new())),
         };
 
         Ok((session, reader))
@@ -8495,12 +8604,31 @@ mod gui {
     /// and returns the screen_row at which it actually lands after vt100
     /// clamps.
     fn set_scrollback_for_top_abs_row(parser: &mut vt100::Parser, top_abs_row: usize) -> u16 {
+        set_scrollback_for_top_abs_row_checked(parser, top_abs_row)
+            .map(|(row, _)| row)
+            .unwrap_or(0)
+    }
+
+    /// Like `set_scrollback_for_top_abs_row` but reports whether vt100 was
+    /// able to honor the requested row exactly. Returns `Some((screen_row,
+    /// actual_sb))` on success and `None` if the request had to be clamped —
+    /// i.e. `top_abs_row` is beyond the parser's scrollback cap (lines past
+    /// the 2500-line buffer have been evicted). Callers that read content
+    /// based on the returned screen_row will read the *wrong* row on a
+    /// clamp, so they should treat `None` as "selection content is gone".
+    fn set_scrollback_for_top_abs_row_checked(
+        parser: &mut vt100::Parser,
+        top_abs_row: usize,
+    ) -> Option<(u16, usize)> {
         let vr = parser.screen().size().0 as usize;
         let desired_sb = top_abs_row.saturating_sub(vr.saturating_sub(1));
         parser.screen_mut().set_scrollback(desired_sb);
         let actual_sb = parser.screen().scrollback();
         let bottom_abs = actual_sb + vr.saturating_sub(1);
-        bottom_abs.saturating_sub(top_abs_row) as u16
+        if actual_sb < desired_sb || top_abs_row > bottom_abs {
+            return None;
+        }
+        Some(((bottom_abs - top_abs_row) as u16, actual_sb))
     }
 
     fn extract_selection_text(
@@ -8514,7 +8642,19 @@ mod gui {
 
         if span <= vr {
             // Fast path: selection fits in one viewport.
-            let screen_start = set_scrollback_for_top_abs_row(parser, start.abs_row);
+            let Some((screen_start, _actual_sb)) =
+                set_scrollback_for_top_abs_row_checked(parser, start.abs_row)
+            else {
+                // Selection's top row has been evicted from scrollback. Reading
+                // an arbitrary clamped row would silently produce wrong text;
+                // return empty so the caller leaves the clipboard alone.
+                parser.screen_mut().set_scrollback(0);
+                eprintln!(
+                    "extract_selection_text: start.abs_row={} clamped (past scrollback cap); returning empty",
+                    start.abs_row
+                );
+                return String::new();
+            };
             let screen_end = screen_start + (start.abs_row - end.abs_row) as u16;
             let text = parser.screen().contents_between(
                 screen_start,
