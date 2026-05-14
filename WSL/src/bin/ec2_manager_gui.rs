@@ -3526,17 +3526,33 @@ mod gui {
             let writer = Arc::clone(&session.writer);
             let prompt_ready = Arc::clone(&session.prompt_ready);
             let total_len = payload.len();
-            // When the remote is on the alternate screen (vim, less, htop,
-            // etc.) there is no shell prompt to wait for between lines —
-            // gating each `\r` on `prompt_ready` would stall the paste at
-            // the full timeout per line. TUIs read their own stdin and
-            // don't suffer from the line-discipline races that motivated
-            // the drip-feed, so just write the whole payload in one shot.
+            // When we're NOT sitting at a shell prompt (vim, less, htop,
+            // tail -f, any TUI or running command), gating each `\r` on
+            // `prompt_ready` stalls the paste at the full timeout per
+            // line because no new shell prompt will ever appear. TUIs
+            // and stdin-reading processes don't suffer from the
+            // line-discipline race that motivated the drip-feed, so
+            // just write the whole payload in one shot.
+            //
+            // Detection: alternate-screen (vim/less/htop with proper
+            // TERM) OR cursor not currently on a shell-prompt line.
+            // SSM often strips TERM so vim runs in dumb mode without
+            // alt-screen — the cursor-line check catches that.
             let on_alt_screen = session.parser.screen().alternate_screen();
+            let at_shell_prompt = {
+                let cursor_line = current_cursor_line(&session.parser);
+                let trimmed = cursor_line.trim_end();
+                let (_r, c) = session.parser.screen().cursor_position();
+                let user_host = trimmed.contains('@')
+                    && (trimmed.ends_with('$') || trimmed.ends_with('#'));
+                let bare = (trimmed == "$" || trimmed == "#") && c <= 2;
+                user_host || bare
+            };
+            let skip_dripfeed = on_alt_screen || !at_shell_prompt;
             self.log_debug(format!(
-                "paste worker spawn tab={tab_id} bytes={total_len} alt_screen={on_alt_screen}"
+                "paste worker spawn tab={tab_id} bytes={total_len} alt_screen={on_alt_screen} at_prompt={at_shell_prompt} skip_dripfeed={skip_dripfeed}"
             ));
-            if on_alt_screen {
+            if skip_dripfeed {
                 std::thread::spawn(move || {
                     let Ok(mut w) = writer.lock() else { return; };
                     if let Err(err) = w.write_all(&payload) {
