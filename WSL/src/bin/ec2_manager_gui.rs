@@ -3526,9 +3526,27 @@ mod gui {
             let writer = Arc::clone(&session.writer);
             let prompt_ready = Arc::clone(&session.prompt_ready);
             let total_len = payload.len();
+            // When the remote is on the alternate screen (vim, less, htop,
+            // etc.) there is no shell prompt to wait for between lines —
+            // gating each `\r` on `prompt_ready` would stall the paste at
+            // the full timeout per line. TUIs read their own stdin and
+            // don't suffer from the line-discipline races that motivated
+            // the drip-feed, so just write the whole payload in one shot.
+            let on_alt_screen = session.parser.screen().alternate_screen();
             self.log_debug(format!(
-                "paste worker spawn tab={tab_id} bytes={total_len}"
+                "paste worker spawn tab={tab_id} bytes={total_len} alt_screen={on_alt_screen}"
             ));
+            if on_alt_screen {
+                std::thread::spawn(move || {
+                    let Ok(mut w) = writer.lock() else { return; };
+                    if let Err(err) = w.write_all(&payload) {
+                        eprintln!("paste worker tab={tab_id} write error: {err}");
+                        return;
+                    }
+                    let _ = w.flush();
+                });
+                return;
+            }
             std::thread::spawn(move || {
                 // Split the payload at each `\r` and write one command at a
                 // time. Between lines, wait for the remote shell to redraw
