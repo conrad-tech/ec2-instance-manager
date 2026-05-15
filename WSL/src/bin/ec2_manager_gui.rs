@@ -3593,13 +3593,6 @@ mod gui {
                         .unwrap_or(max_end);
                     let ended_on_cr = payload.get(end - 1) == Some(&b'\r');
                     let chunk = &payload[start..end];
-                    // Snapshot the prompt-ready counter *before* writing so
-                    // we can detect the redraw that this line triggers, not
-                    // a stale prompt from before the paste started.
-                    let pre_counter = {
-                        let (lock, _) = &*prompt_ready;
-                        lock.lock().map(|g| *g).unwrap_or(0)
-                    };
                     {
                         let Ok(mut w) = writer.lock() else { return; };
                         if let Err(err) = w.write_all(chunk) {
@@ -3608,6 +3601,20 @@ mod gui {
                         }
                         let _ = w.flush();
                     }
+                    // Snapshot the prompt-ready counter *after* writing.
+                    // The parser runs on another thread, so any prompt
+                    // fire that happened before our write completed is
+                    // stale (it belongs to the previous line). By
+                    // snapshotting post-write we guarantee the wait
+                    // below only completes on a prompt redraw caused by
+                    // *this* line's command finishing. Without this,
+                    // two adjacent lines occasionally glue together
+                    // when the previous prompt arrives between our
+                    // snapshot and our write.
+                    let pre_counter = {
+                        let (lock, _) = &*prompt_ready;
+                        lock.lock().map(|g| *g).unwrap_or(0)
+                    };
                     start = end;
                     if start < payload.len() {
                         if ended_on_cr {
