@@ -7175,14 +7175,45 @@ mod gui {
                             }
 
                             self.config.last_selected_profile = self.selected_profile.clone();
-                            // Update region to match the selected account's region
-                            if let Some(ref profile_id) = self.selected_profile {
-                                if let Some(profile) = self.config.profiles.iter().find(|p| &p.profile_id == profile_id) {
-                                    if let Some(ref region) = profile.region {
-                                        self.options.region = Some(region.clone());
-                                    }
-                                }
+                            // Reset region to match the new profile's configured
+                            // region (or Auto if none). Always overwrite — never
+                            // carry the previous profile's region across a switch,
+                            // or it leaks into the new account's queries and
+                            // produces a spurious "region override differs from
+                            // account's region" banner once the new account's
+                            // canonical region is discovered.
+                            let new_profile_cfg = self.selected_profile.as_ref().and_then(|pid| {
+                                self.config.profiles.iter().find(|p| &p.profile_id == pid).cloned()
+                            });
+                            self.options.region = new_profile_cfg.as_ref().and_then(|p| p.region.clone());
+                            // Update preliminary context so the top-of-screen
+                            // account/region info reflects the new profile
+                            // immediately, instead of lingering on the old
+                            // profile's context until refresh completes.
+                            if let Some(ref pcfg) = new_profile_cfg {
+                                let resolved_profile = credentials::find_profile_by_account_id(&pcfg.profile_id)
+                                    .unwrap_or_else(|| pcfg.profile_id.clone());
+                                let ctx_region = pcfg.region.clone()
+                                    .unwrap_or_else(|| "us-east-1".to_string());
+                                let ctx_auth = self.profile_auth_infos.iter()
+                                    .find(|a| a.profile_id == pcfg.profile_id)
+                                    .map(|a| a.auth_status.clone())
+                                    .unwrap_or(AuthStatus::Expired);
+                                self.context = Some(AwsContext {
+                                    mode: self.options.mode.clone(),
+                                    profile: resolved_profile,
+                                    account_id: if pcfg.account_id.is_empty() { None } else { Some(pcfg.account_id.clone()) },
+                                    arn: None,
+                                    user_id: None,
+                                    region: ctx_region,
+                                    auth_status: ctx_auth,
+                                });
                             }
+                            // Clear stale inventory from the previous profile so
+                            // its instance count doesn't appear during the new
+                            // profile's refresh when the new profile has no cache.
+                            self.inventory.instances.clear();
+                            self.filtered.clear();
                             if let Err(err) = self.config.save() {
                                 self.message = format!("error: {err}");
                                 self.log_error(self.message.clone());
@@ -7202,10 +7233,10 @@ mod gui {
                                 if is_auth_ok {
                                     self.load_cache_for_profile(&profile_id.clone());
                                 } else {
-                                    // Clear the active display but keep the memory
-                                    // cache so it's available when auth becomes OK.
-                                    self.filtered.clear();
-                                    self.context = None;
+                                    // Display already cleared above; preliminary
+                                    // context already reflects the new profile so
+                                    // the user sees PB's account info, not the
+                                    // previous profile's, while unauthenticated.
                                     self.message = "Credentials not authenticated. Refresh credentials and retry.".to_string();
                                 }
                             }
