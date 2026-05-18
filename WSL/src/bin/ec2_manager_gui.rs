@@ -378,6 +378,14 @@ mod gui {
         /// stdin bytes as their own input, so subsequent pasted lines get
         /// echoed but never executed.
         prompt_ready: Arc<(Mutex<u64>, Condvar)>,
+        /// Whether the cursor was at a prompt at the end of the previous
+        /// parser frame. Used to bump `prompt_ready` only on a false→true
+        /// transition (cursor newly arrived at a prompt). Without this, idle
+        /// frames at the prompt keep bumping the counter, which lets the
+        /// paste worker's `wait_timeout_while` return prematurely between
+        /// snapshot and wait — gluing the next pasted line onto a still-
+        /// running command. See `paste_to_connection_tab`.
+        at_prompt_last_frame: bool,
     }
 
     /// Absolute terminal position: scroll-invariant coordinate.
@@ -2534,7 +2542,17 @@ mod gui {
                         || cursor_trimmed.ends_with("\n#"))
                         && cur_col <= 2;
                     let _ = cur_row;
-                    if bare_prompt || cursor_is_user_host_prompt {
+                    let is_at_prompt = bare_prompt || cursor_is_user_host_prompt;
+                    let was_at_prompt = session.at_prompt_last_frame;
+                    session.at_prompt_last_frame = is_at_prompt;
+                    // Only bump on the false→true transition. Idle frames
+                    // that re-observe the same prompt must NOT bump — they
+                    // race with the paste worker's pre-write snapshot and
+                    // cause the wait_timeout_while between lines to return
+                    // immediately, gluing the next line onto a still-running
+                    // command. Symptom: ~3 lines paste cleanly, then the 4th
+                    // gets concatenated with the 5th on one line.
+                    if is_at_prompt && !was_at_prompt {
                         let (lock, cvar) = &*session.prompt_ready;
                         if let Ok(mut count) = lock.lock() {
                             *count = count.wrapping_add(1);
@@ -8029,6 +8047,7 @@ mod gui {
             paste_write_at: None,
             paste_write_bytes: 0,
             prompt_ready: Arc::new((Mutex::new(0), Condvar::new())),
+            at_prompt_last_frame: false,
         };
 
         Ok((session, reader))
