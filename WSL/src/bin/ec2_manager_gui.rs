@@ -1362,10 +1362,21 @@ mod gui {
                     .collect();
                 for pid in &now_ok {
                     if previously_unauthed.contains(pid) {
-                        self.log_info(format!(
-                            "auth became OK for profile={pid}, loading cache and refreshing"
-                        ));
-                        self.load_cache_for_profile(pid);
+                        // Only load into the active display when this profile
+                        // is the selected one — otherwise load_cache_for_profile
+                        // would overwrite self.inventory/self.context with a
+                        // non-selected profile's data, leaving the dropdown on
+                        // (say) PA but the top-bar/inventory showing PB.
+                        if self.selected_profile.as_deref() == Some(pid.as_str()) {
+                            self.log_info(format!(
+                                "auth became OK for selected profile={pid}, loading cache and refreshing"
+                            ));
+                            self.load_cache_for_profile(pid);
+                        } else {
+                            self.log_info(format!(
+                                "auth became OK for profile={pid}, refreshing in background"
+                            ));
+                        }
                     } else {
                         self.log_info(format!(
                             "credentials renewed for profile={pid}, refreshing"
