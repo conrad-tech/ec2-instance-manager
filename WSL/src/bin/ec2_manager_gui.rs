@@ -16,6 +16,7 @@ mod gui {
     use std::path::PathBuf;
     #[cfg(test)]
     use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, Condvar, Mutex, Once};
     use std::time::{Duration, Instant, SystemTime};
@@ -472,6 +473,400 @@ mod gui {
                 .next()
                 .unwrap_or(&self.remote_path)
         }
+    }
+
+    /// Modal state for the "Open in VS Code" pem-selection prompt.
+    struct PemDialog {
+        /// Instance being opened.
+        instance_id: String,
+        /// Config profile_id this instance belongs to (config lookup key).
+        profile_id: String,
+        /// AWS profile name passed to `aws --profile` (SSM transport).
+        aws_profile: String,
+        /// AWS region for the SSM ProxyCommand.
+        region: String,
+        /// SSH login user (e.g. ec2-user).
+        ssh_user: String,
+        /// Remote directory VS Code should open.
+        remote_path: String,
+        /// Currently selected pem path (the field the user edits/picks).
+        pem_path: String,
+        /// "Don't ask again for this account" — unchecked by default.
+        dont_ask_again: bool,
+    }
+
+    /// Modal state for the Settings "Update VS Code Pem" dialog.
+    struct SettingsPemDialog {
+        /// profile_id whose default pem is being edited.
+        profile_id: String,
+        /// pem path being edited.
+        pem_path: String,
+        /// SSH login user being edited.
+        ssh_user: String,
+    }
+
+    /// Comment prefixes for a file extension, used by the editor's
+    /// lightweight syntax highlighter.
+    fn comment_prefixes(ext: &str) -> &'static [&'static str] {
+        match ext {
+            "rs" | "c" | "cc" | "cpp" | "h" | "hpp" | "js" | "ts" | "jsx" | "tsx"
+            | "go" | "java" | "kt" | "swift" | "json" | "css" | "scss" => &["//"],
+            "py" | "sh" | "bash" | "zsh" | "yaml" | "yml" | "toml" | "conf"
+            | "ini" | "cfg" | "rb" | "pl" | "tf" | "dockerfile" => &["#"],
+            "sql" | "lua" | "hs" => &["--"],
+            _ => &["#", "//"],
+        }
+    }
+
+    /// A broad union of keywords across common languages. Good enough for
+    /// the editor's at-a-glance highlighting without per-language grammars.
+    const HL_KEYWORDS: &[&str] = &[
+        "fn", "let", "mut", "pub", "use", "mod", "impl", "struct", "enum",
+        "trait", "match", "if", "else", "for", "while", "loop", "return",
+        "break", "continue", "const", "static", "ref", "as", "where", "self",
+        "super", "crate", "move", "async", "await", "dyn", "type", "in",
+        "def", "class", "import", "from", "lambda", "pass", "with", "try",
+        "except", "finally", "raise", "yield", "global", "nonlocal", "and",
+        "or", "not", "is", "None", "True", "False", "var", "function",
+        "func", "package", "interface", "public", "private", "protected",
+        "void", "int", "bool", "string", "new", "null", "nil", "true",
+        "false", "then", "do", "end", "echo", "export", "local", "elif",
+        "fi", "esac", "case", "default", "switch", "extends", "implements",
+    ];
+
+    /// Build a colorized `LayoutJob` for the in-app editor. Single-line
+    /// tokenizer: comments, strings, numbers, and keywords. Falls back to
+    /// plain text for very large files to keep per-frame layout cheap.
+    fn highlight_code(
+        text: &str,
+        ext: &str,
+        dark: bool,
+        font: egui::FontId,
+    ) -> egui::text::LayoutJob {
+        use egui::text::{LayoutJob, TextFormat};
+
+        let (c_comment, c_string, c_number, c_keyword, c_normal) = if dark {
+            (
+                egui::Color32::from_rgb(106, 153, 85),
+                egui::Color32::from_rgb(206, 145, 120),
+                egui::Color32::from_rgb(181, 206, 168),
+                egui::Color32::from_rgb(86, 156, 214),
+                egui::Color32::from_rgb(212, 212, 212),
+            )
+        } else {
+            (
+                egui::Color32::from_rgb(0, 128, 0),
+                egui::Color32::from_rgb(163, 21, 21),
+                egui::Color32::from_rgb(9, 134, 88),
+                egui::Color32::from_rgb(0, 0, 255),
+                egui::Color32::from_rgb(0, 0, 0),
+            )
+        };
+        let fmt = |color: egui::Color32| TextFormat {
+            font_id: font.clone(),
+            color,
+            ..Default::default()
+        };
+        let mut job = LayoutJob::default();
+
+        // Files past this size skip highlighting (layout runs every frame).
+        if text.len() > 200_000 {
+            job.append(text, 0.0, fmt(c_normal));
+            return job;
+        }
+
+        let comment_marks = comment_prefixes(ext);
+        for piece in text.split_inclusive('\n') {
+            let (content, newline) = match piece.strip_suffix('\n') {
+                Some(c) => (c, "\n"),
+                None => (piece, ""),
+            };
+            let chars: Vec<char> = content.chars().collect();
+            let mut i = 0usize;
+            while i < chars.len() {
+                let rest: String = chars[i..].iter().collect();
+                // Comment runs to end of line.
+                if comment_marks.iter().any(|m| rest.starts_with(m)) {
+                    job.append(&rest, 0.0, fmt(c_comment));
+                    break;
+                }
+                let ch = chars[i];
+                if ch == '"' || ch == '\'' {
+                    let quote = ch;
+                    let mut j = i + 1;
+                    while j < chars.len() {
+                        if chars[j] == '\\' {
+                            j += 2;
+                            continue;
+                        }
+                        if chars[j] == quote {
+                            j += 1;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    let tok: String = chars[i..j.min(chars.len())].iter().collect();
+                    job.append(&tok, 0.0, fmt(c_string));
+                    i = j.min(chars.len());
+                } else if ch.is_ascii_digit() {
+                    let mut j = i;
+                    while j < chars.len()
+                        && (chars[j].is_ascii_alphanumeric() || chars[j] == '.' || chars[j] == '_')
+                    {
+                        j += 1;
+                    }
+                    let tok: String = chars[i..j].iter().collect();
+                    job.append(&tok, 0.0, fmt(c_number));
+                    i = j;
+                } else if ch.is_alphabetic() || ch == '_' {
+                    let mut j = i;
+                    while j < chars.len()
+                        && (chars[j].is_alphanumeric() || chars[j] == '_')
+                    {
+                        j += 1;
+                    }
+                    let tok: String = chars[i..j].iter().collect();
+                    let color = if HL_KEYWORDS.contains(&tok.as_str()) {
+                        c_keyword
+                    } else {
+                        c_normal
+                    };
+                    job.append(&tok, 0.0, fmt(color));
+                    i = j;
+                } else {
+                    let tok: String = std::iter::once(ch).collect();
+                    job.append(&tok, 0.0, fmt(c_normal));
+                    i += 1;
+                }
+            }
+            if !newline.is_empty() {
+                job.append(newline, 0.0, fmt(c_normal));
+            }
+        }
+        job
+    }
+
+    /// Basename of a pem path, for compact display in dropdowns.
+    fn pem_basename(p: &str) -> String {
+        std::path::Path::new(p)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| p.to_string())
+    }
+
+    /// Render the validation feedback (and a "did you mean" suggestion
+    /// dropdown) for a pem path field. Returns true when the path points
+    /// at a usable private key. May mutate `pem_path` if the user picks
+    /// a suggestion.
+    fn pem_field_feedback(ui: &mut egui::Ui, pem_path: &mut String) -> bool {
+        use ec2_manager::ssh_config::PemValidation;
+        match ec2_manager::ssh_config::validate_pem(pem_path) {
+            PemValidation::Ok => {
+                ui.colored_label(
+                    egui::Color32::GREEN,
+                    "Key file found and looks valid.",
+                );
+                true
+            }
+            PemValidation::NotAKey => {
+                ui.colored_label(
+                    egui::Color32::RED,
+                    "File exists but does not look like a private key.",
+                );
+                false
+            }
+            PemValidation::Missing { parent_exists } => {
+                ui.colored_label(egui::Color32::RED, "Key file not found.");
+                if parent_exists {
+                    let suggestions =
+                        ec2_manager::ssh_config::suggest_keys_near(pem_path);
+                    if !suggestions.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label("Did you mean:");
+                            egui::ComboBox::from_id_salt("pem_suggest_combo")
+                                .selected_text("pick a nearby key")
+                                .width(220.0)
+                                .show_ui(ui, |ui| {
+                                    for s in &suggestions {
+                                        if ui
+                                            .selectable_label(false, pem_basename(s))
+                                            .on_hover_text(s)
+                                            .clicked()
+                                        {
+                                            *pem_path = s.clone();
+                                        }
+                                    }
+                                });
+                        });
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// A hidden, persistent SSM shell session used to run file-browser
+    /// commands without the per-invocation overhead of `ssm send-command`.
+    /// Each command is wrapped in sentinel markers so its combined output
+    /// and exit code can be extracted from the raw PTY byte stream.
+    struct ControlChannel {
+        /// Serializes commands so concurrent file ops don't interleave.
+        req_lock: Mutex<()>,
+        /// Raw bytes read from the control PTY, paired with a condvar the
+        /// reader thread notifies whenever new bytes arrive.
+        buf: Arc<(Mutex<Vec<u8>>, Condvar)>,
+        /// Writer half of the control PTY.
+        writer: Mutex<Box<dyn Write + Send>>,
+        /// Master PTY, kept alive for the channel's lifetime.
+        _master: Mutex<Box<dyn MasterPty + Send>>,
+        /// The `aws ssm start-session` child process.
+        child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
+        /// True once the shell handshake has completed.
+        ready: Arc<AtomicBool>,
+        /// True once the reader hit EOF (the session died).
+        dead: Arc<AtomicBool>,
+        /// Monotonic request id counter.
+        next_id: AtomicU64,
+    }
+
+    impl ControlChannel {
+        /// True when the channel finished its handshake and is still alive.
+        fn is_usable(&self) -> bool {
+            self.ready.load(Ordering::SeqCst) && !self.dead.load(Ordering::SeqCst)
+        }
+
+        /// Run a shell command in the persistent session and return its
+        /// combined stdout/stderr plus exit code. Serialized internally.
+        fn run(
+            &self,
+            command: &str,
+            timeout: Duration,
+        ) -> std::result::Result<(String, i32), String> {
+            let _guard = self
+                .req_lock
+                .lock()
+                .map_err(|_| "control channel poisoned".to_string())?;
+            if self.dead.load(Ordering::SeqCst) {
+                return Err("control channel session ended".to_string());
+            }
+            if !self.ready.load(Ordering::SeqCst) {
+                return Err("control channel not ready".to_string());
+            }
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            let begin = format!("CB_{id}_");
+            let end = format!("CE_{id}_");
+            // Clear accumulated bytes so we only see this command's output.
+            {
+                let (lock, _cv) = &*self.buf;
+                lock.lock()
+                    .map_err(|_| "control buffer poisoned".to_string())?
+                    .clear();
+            }
+            // Echo is disabled, so the only occurrence of each marker in the
+            // stream comes from these printfs actually executing.
+            let line = format!(
+                "printf '{begin}\\n'; {{ {command} ; }} 2>&1; \
+                 __rc=$?; printf '{end}%d_\\n' \"$__rc\"\n"
+            );
+            {
+                let mut w = self
+                    .writer
+                    .lock()
+                    .map_err(|_| "control writer poisoned".to_string())?;
+                w.write_all(line.as_bytes())
+                    .map_err(|e| format!("control write failed: {e}"))?;
+                w.flush()
+                    .map_err(|e| format!("control flush failed: {e}"))?;
+            }
+            let deadline = Instant::now() + timeout;
+            let (lock, cv) = &*self.buf;
+            let mut guard = lock
+                .lock()
+                .map_err(|_| "control buffer poisoned".to_string())?;
+            loop {
+                if let Some(result) = extract_channel_response(&guard, &begin, &end) {
+                    return Ok(result);
+                }
+                if self.dead.load(Ordering::SeqCst) {
+                    return Err("control channel session ended".to_string());
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err("control channel command timed out".to_string());
+                }
+                let wait = (deadline - now).min(Duration::from_millis(200));
+                let (g, _) = cv
+                    .wait_timeout(guard, wait)
+                    .map_err(|_| "control buffer poisoned".to_string())?;
+                guard = g;
+            }
+        }
+    }
+
+    impl Drop for ControlChannel {
+        fn drop(&mut self) {
+            if let Ok(mut child) = self.child.lock() {
+                let _ = child.kill();
+            }
+        }
+    }
+
+    /// Detect the handshake sentinel `CTRLRDY_<pid>_` in the raw stream.
+    /// Only a marker followed by digits counts — the echoed init line
+    /// contains the literal `%s` placeholder, not a number.
+    fn channel_handshake_done(raw: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(raw);
+        for (idx, _) in text.match_indices("CTRLRDY_") {
+            let after = &text[idx + "CTRLRDY_".len()..];
+            let digits: String =
+                after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() && after[digits.len()..].starts_with('_') {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Extract the output and exit code for one command from the raw
+    /// control-channel byte stream, given its begin/end marker prefixes.
+    fn extract_channel_response(
+        raw: &[u8],
+        begin: &str,
+        end: &str,
+    ) -> Option<(String, i32)> {
+        let text = String::from_utf8_lossy(raw);
+        let bpos = text.find(begin)?;
+        let after_begin = &text[bpos + begin.len()..];
+        let nl = after_begin.find('\n')?;
+        let out_start = bpos + begin.len() + nl + 1;
+        let tail = &text[out_start..];
+        let epos = tail.find(end)?;
+        let output = &tail[..epos];
+        let rest = &tail[epos + end.len()..];
+        let rc_end = rest.find('_')?;
+        let rc: i32 = rest[..rc_end].trim().parse().ok()?;
+        Some((output.replace('\r', ""), rc))
+    }
+
+    /// Run a remote shell command, preferring the persistent control
+    /// channel and falling back to one-shot `ssm send-command` when the
+    /// channel is unavailable. The command's own exit code is ignored —
+    /// this matches `send-command` semantics (success = the command ran).
+    fn exec_remote_command(
+        channel: &Option<Arc<ControlChannel>>,
+        ctx: &AwsContext,
+        instance_id: &str,
+        command: &str,
+        timeout: Duration,
+    ) -> std::result::Result<String, String> {
+        if let Some(ch) = channel {
+            if ch.is_usable() {
+                return ch.run(command, timeout).map(|(out, _rc)| out);
+            }
+        }
+        let command_id =
+            ssm_send_command(&ctx.profile, &ctx.region, instance_id, command)?;
+        ssm_wait_for_command(&ctx.profile, &ctx.region, instance_id, &command_id)
     }
 
     struct FileBrowserState {
@@ -988,6 +1383,21 @@ mod gui {
         /// a change vs `connections.selected()` triggers auto-focus.
         last_connection_tab: Option<u64>,
         file_browsers: HashMap<u64, FileBrowserState>,
+        /// Hidden persistent SSM shell per connection tab, used to run
+        /// file-browser commands fast (lazily spawned on first file op).
+        control_channels: HashMap<u64, Arc<ControlChannel>>,
+        /// Host blocks discovered by scanning ~/.ssh/config (for pem auto-detect).
+        discovered_ssh_hosts: Vec<ec2_manager::ssh_config::DiscoveredHost>,
+        /// When the ssh config was last scanned (for the periodic re-scan).
+        last_ssh_scan_at: Instant,
+        /// mtime of ~/.ssh/config at last scan, to detect external edits.
+        last_ssh_config_mtime: Option<SystemTime>,
+        /// Throttles how often poll_ssh_config stats the config file.
+        last_ssh_poll_at: Instant,
+        /// Active "Open in VS Code" pem prompt, if any.
+        pem_dialog: Option<PemDialog>,
+        /// Active Settings "Update VS Code Pem" dialog, if any.
+        settings_pem_dialog: Option<SettingsPemDialog>,
         /// Per-tab editor/terminal vertical split ratio (0.0-1.0, 0.5 = 50/50)
         editor_split: HashMap<u64, f32>,
         file_op_tx: Sender<FileOpEvent>,
@@ -1161,6 +1571,13 @@ mod gui {
                 tab_color_picker_rgb: [0.0, 0.0, 0.0],
                 color_picker_profile: None,
                 file_browsers: HashMap::new(),
+                control_channels: HashMap::new(),
+                discovered_ssh_hosts: Vec::new(),
+                last_ssh_scan_at: Instant::now(),
+                last_ssh_config_mtime: None,
+                last_ssh_poll_at: Instant::now(),
+                pem_dialog: None,
+                settings_pem_dialog: None,
                 editor_split: HashMap::new(),
                 file_op_tx,
                 file_op_rx,
@@ -1171,6 +1588,7 @@ mod gui {
             };
 
             app.rebuild_account_colors();
+            app.scan_ssh_hosts();
             app.log_info("application started");
             if let Some(smoke) = &app.gui_smoke {
                 app.log_info(format!(
@@ -2077,6 +2495,468 @@ mod gui {
             })
         }
 
+        /// Scan ~/.ssh/config for Host blocks and refresh the in-memory
+        /// list used for pem auto-detection. Also imports any discovered
+        /// pem paths into the global library so the dropdowns show them.
+        fn scan_ssh_hosts(&mut self) {
+            let hosts = ec2_manager::ssh_config::scan();
+            let mut added = false;
+            for pem in ec2_manager::ssh_config::all_pems(&hosts) {
+                if !self.config.ssh_pem_library.iter().any(|p| p == &pem) {
+                    self.config.ssh_pem_library.push(pem);
+                    added = true;
+                }
+            }
+            self.discovered_ssh_hosts = hosts;
+            self.last_ssh_scan_at = Instant::now();
+            self.last_ssh_config_mtime = ec2_manager::ssh_config::ssh_config_path()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .and_then(|m| m.modified().ok());
+            if added {
+                let _ = self.config.save();
+            }
+            self.log_info(format!(
+                "scanned ssh config: {} host blocks",
+                self.discovered_ssh_hosts.len()
+            ));
+        }
+
+        /// Re-scan ~/.ssh/config when it changes on disk, or every 2 hours
+        /// as a backstop. Throttled so the file is stat'd at most every 30s.
+        fn poll_ssh_config(&mut self) {
+            if self.last_ssh_poll_at.elapsed() < Duration::from_secs(30) {
+                return;
+            }
+            self.last_ssh_poll_at = Instant::now();
+            let mtime = ec2_manager::ssh_config::ssh_config_path()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .and_then(|m| m.modified().ok());
+            let mtime_changed = mtime != self.last_ssh_config_mtime;
+            let stale = self.last_ssh_scan_at.elapsed() >= Duration::from_secs(2 * 60 * 60);
+            if mtime_changed || stale {
+                self.scan_ssh_hosts();
+            }
+        }
+
+        /// Entry point for "Open in VS Code". Resolves the instance's
+        /// profile/context and either launches directly (when the pem is
+        /// known and the user opted out of the prompt) or opens the
+        /// pem-selection dialog.
+        fn open_in_vscode(&mut self, instance: &Instance) {
+            let resolved = self
+                .profile_inventory_cache
+                .iter()
+                .find(|(_, (inv, _))| {
+                    inv.instances.iter().any(|i| i.instance_id == instance.instance_id)
+                })
+                .map(|(pid, (_, ctx))| (pid.clone(), ctx.clone()))
+                .or_else(|| {
+                    self.selected_profile
+                        .clone()
+                        .zip(self.context.clone())
+                });
+            let Some((profile_id, context)) = resolved else {
+                self.message = "Context not loaded — refresh first".to_string();
+                self.log_error(self.message.clone());
+                return;
+            };
+
+            if !ec2_manager::ssh_config::vscode_cli_available() {
+                self.message =
+                    "VS Code CLI ('code') not found in PATH. Install VS Code \
+                     and enable the 'code' command, then retry."
+                        .to_string();
+                self.log_error(self.message.clone());
+                return;
+            }
+
+            let ssh_user = self.config.resolve_ssh_user(&profile_id);
+            let suppressed = self
+                .config
+                .vscode_pem_suppressed
+                .get(&profile_id)
+                .copied()
+                .unwrap_or(false);
+            let resolved_pem = self
+                .config
+                .resolve_pem(&profile_id, &instance.instance_id);
+
+            // Fast path: user opted out of the prompt and a pem is known.
+            if suppressed {
+                if let Some(pem) = resolved_pem.clone() {
+                    let remote = format!("/home/{ssh_user}");
+                    if let Err(err) = self.launch_vscode(
+                        &instance.instance_id,
+                        &context.profile,
+                        &context.region,
+                        &ssh_user,
+                        &pem,
+                        &remote,
+                    ) {
+                        self.message = format!("VS Code launch failed: {err}");
+                        self.log_error(self.message.clone());
+                    }
+                    return;
+                }
+            }
+
+            // Otherwise open the dialog, pre-filled with the best guess.
+            let discovered = &self.discovered_ssh_hosts;
+            let pem_prefill = resolved_pem
+                .or_else(|| {
+                    ec2_manager::ssh_config::pems_for_profile(discovered, &context.profile)
+                        .into_iter()
+                        .next()
+                })
+                .unwrap_or_default();
+            let user_prefill = discovered
+                .iter()
+                .find(|h| h.aws_profile.as_deref() == Some(context.profile.as_str()))
+                .and_then(|h| h.user.clone())
+                .unwrap_or(ssh_user);
+            self.pem_dialog = Some(PemDialog {
+                instance_id: instance.instance_id.clone(),
+                profile_id,
+                aws_profile: context.profile.clone(),
+                region: context.region.clone(),
+                remote_path: format!("/home/{user_prefill}"),
+                ssh_user: user_prefill,
+                pem_path: pem_prefill,
+                dont_ask_again: false,
+            });
+        }
+
+        /// Write the managed ssh config block and spawn VS Code Remote-SSH.
+        fn launch_vscode(
+            &mut self,
+            instance_id: &str,
+            aws_profile: &str,
+            region: &str,
+            ssh_user: &str,
+            pem: &str,
+            remote_path: &str,
+        ) -> std::result::Result<(), String> {
+            ec2_manager::ssh_config::ensure_include_directive()?;
+            let alias = ec2_manager::ssh_config::write_managed_block(
+                instance_id,
+                ssh_user,
+                pem,
+                aws_profile,
+                region,
+            )?;
+
+            let remote_arg = format!("ssh-remote+{alias}");
+            let spawn_result = if cfg!(windows) {
+                std::process::Command::new("cmd")
+                    .args(["/c", "code", "--remote", &remote_arg, remote_path])
+                    .spawn()
+            } else {
+                std::process::Command::new("code")
+                    .args(["--remote", &remote_arg, remote_path])
+                    .spawn()
+            };
+            spawn_result.map_err(|e| format!("could not start VS Code: {e}"))?;
+
+            self.config.add_pem_to_library(pem);
+            if let Err(err) = self.config.save() {
+                self.log_warn(format!("failed to save config after VS Code launch: {err}"));
+            }
+            self.message = format!("Opening {instance_id} in VS Code...");
+            self.log_info(format!(
+                "launched VS Code Remote-SSH host={alias} path={remote_path}"
+            ));
+            Ok(())
+        }
+
+        /// Render the "Open in VS Code" pem-selection modal, if active.
+        fn render_pem_dialog(&mut self, ctx: &egui::Context) {
+            let Some(mut dlg) = self.pem_dialog.take() else {
+                return;
+            };
+            let mut window_open = true;
+            let mut do_launch = false;
+            let mut do_cancel = false;
+
+            egui::Window::new("Open in VS Code")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("Instance: {}", dlg.instance_id));
+                    ui.label(format!(
+                        "Account: {}    Region: {}",
+                        dlg.aws_profile, dlg.region
+                    ));
+                    ui.separator();
+
+                    ui.label("SSH private key (pem):");
+                    ui.horizontal(|ui| {
+                        let selected_text = if dlg.pem_path.is_empty() {
+                            "(choose a key)".to_string()
+                        } else {
+                            pem_basename(&dlg.pem_path)
+                        };
+                        egui::ComboBox::from_id_salt("pem_library_combo")
+                            .selected_text(selected_text)
+                            .width(260.0)
+                            .show_ui(ui, |ui| {
+                                if self.config.ssh_pem_library.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("(library empty — use Add)")
+                                            .weak(),
+                                    );
+                                }
+                                for pem in &self.config.ssh_pem_library {
+                                    let resp = ui.selectable_label(
+                                        dlg.pem_path == *pem,
+                                        pem_basename(pem),
+                                    );
+                                    if resp.on_hover_text(pem).clicked() {
+                                        dlg.pem_path = pem.clone();
+                                    }
+                                }
+                            });
+                        if ui.button("+ Add pem...").clicked() {
+                            let mut dialog = rfd::FileDialog::new()
+                                .add_filter("SSH key", &["pem", "key"]);
+                            if let Some(home) = ec2_manager::util::home_dir() {
+                                dialog = dialog.set_directory(home.join(".ssh"));
+                            }
+                            if let Some(picked) = dialog.pick_file() {
+                                let path = picked.to_string_lossy().to_string();
+                                self.config.add_pem_to_library(&path);
+                                dlg.pem_path = path;
+                            }
+                        }
+                    });
+
+                    ui.add(
+                        egui::TextEdit::singleline(&mut dlg.pem_path)
+                            .hint_text("path to .pem")
+                            .desired_width(360.0),
+                    );
+
+                    // Live validation feedback.
+                    let pem_valid = pem_field_feedback(ui, &mut dlg.pem_path);
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("SSH user:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dlg.ssh_user)
+                                .desired_width(140.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Open folder:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dlg.remote_path)
+                                .desired_width(240.0),
+                        );
+                    });
+
+                    ui.add_space(4.0);
+                    ui.checkbox(
+                        &mut dlg.dont_ask_again,
+                        "Don't ask again for this account (change later in Edit \u{2192} Update VS Code Pem)",
+                    );
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(pem_valid, egui::Button::new("Open in VS Code"))
+                            .clicked()
+                        {
+                            do_launch = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+
+            if do_launch {
+                self.config
+                    .ssh_pem_default
+                    .insert(dlg.profile_id.clone(), dlg.pem_path.clone());
+                self.config
+                    .ssh_user_default
+                    .insert(dlg.profile_id.clone(), dlg.ssh_user.clone());
+                self.config.add_pem_to_library(&dlg.pem_path);
+                if dlg.dont_ask_again {
+                    self.config
+                        .vscode_pem_suppressed
+                        .insert(dlg.profile_id.clone(), true);
+                }
+                if let Err(err) = self.config.save() {
+                    self.log_warn(format!("failed to save pem config: {err}"));
+                }
+                if let Err(err) = self.launch_vscode(
+                    &dlg.instance_id,
+                    &dlg.aws_profile,
+                    &dlg.region,
+                    &dlg.ssh_user,
+                    &dlg.pem_path,
+                    &dlg.remote_path,
+                ) {
+                    self.message = format!("VS Code launch failed: {err}");
+                    self.log_error(self.message.clone());
+                }
+            } else if window_open && !do_cancel {
+                self.pem_dialog = Some(dlg);
+            }
+        }
+
+        /// Render the Settings "Update VS Code Pem" modal, if active.
+        fn render_settings_pem_dialog(&mut self, ctx: &egui::Context) {
+            let Some(mut dlg) = self.settings_pem_dialog.take() else {
+                return;
+            };
+            let mut window_open = true;
+            let mut do_save = false;
+            let mut do_cancel = false;
+
+            egui::Window::new("Update VS Code Pem")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("Account:");
+                    let current_label = self
+                        .config
+                        .profiles
+                        .iter()
+                        .find(|p| p.profile_id == dlg.profile_id)
+                        .map(|p| p.display_name.clone())
+                        .unwrap_or_else(|| {
+                            if dlg.profile_id.is_empty() {
+                                "(select account)".to_string()
+                            } else {
+                                dlg.profile_id.clone()
+                            }
+                        });
+                    egui::ComboBox::from_id_salt("settings_pem_account")
+                        .selected_text(current_label)
+                        .width(260.0)
+                        .show_ui(ui, |ui| {
+                            // Collect first to avoid borrowing self.config twice.
+                            let profiles: Vec<(String, String)> = self
+                                .config
+                                .profiles
+                                .iter()
+                                .map(|p| (p.profile_id.clone(), p.display_name.clone()))
+                                .collect();
+                            for (pid, display) in profiles {
+                                if ui
+                                    .selectable_label(dlg.profile_id == pid, &display)
+                                    .clicked()
+                                {
+                                    dlg.profile_id = pid.clone();
+                                    dlg.pem_path = self
+                                        .config
+                                        .ssh_pem_default
+                                        .get(&pid)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    dlg.ssh_user = self.config.resolve_ssh_user(&pid);
+                                }
+                            }
+                        });
+
+                    ui.separator();
+                    ui.label("SSH private key (pem):");
+                    ui.horizontal(|ui| {
+                        let selected_text = if dlg.pem_path.is_empty() {
+                            "(choose a key)".to_string()
+                        } else {
+                            pem_basename(&dlg.pem_path)
+                        };
+                        egui::ComboBox::from_id_salt("settings_pem_library")
+                            .selected_text(selected_text)
+                            .width(260.0)
+                            .show_ui(ui, |ui| {
+                                if self.config.ssh_pem_library.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("(library empty — use Add)")
+                                            .weak(),
+                                    );
+                                }
+                                for pem in &self.config.ssh_pem_library {
+                                    let resp = ui.selectable_label(
+                                        dlg.pem_path == *pem,
+                                        pem_basename(pem),
+                                    );
+                                    if resp.on_hover_text(pem).clicked() {
+                                        dlg.pem_path = pem.clone();
+                                    }
+                                }
+                            });
+                        if ui.button("+ Add pem...").clicked() {
+                            let mut dialog = rfd::FileDialog::new()
+                                .add_filter("SSH key", &["pem", "key"]);
+                            if let Some(home) = ec2_manager::util::home_dir() {
+                                dialog = dialog.set_directory(home.join(".ssh"));
+                            }
+                            if let Some(picked) = dialog.pick_file() {
+                                let path = picked.to_string_lossy().to_string();
+                                self.config.add_pem_to_library(&path);
+                                dlg.pem_path = path;
+                            }
+                        }
+                    });
+
+                    ui.add(
+                        egui::TextEdit::singleline(&mut dlg.pem_path)
+                            .hint_text("path to .pem")
+                            .desired_width(360.0),
+                    );
+                    let pem_valid = pem_field_feedback(ui, &mut dlg.pem_path);
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("SSH user:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dlg.ssh_user)
+                                .desired_width(140.0),
+                        );
+                    });
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let can_save = pem_valid && !dlg.profile_id.is_empty();
+                        if ui
+                            .add_enabled(can_save, egui::Button::new("Save"))
+                            .clicked()
+                        {
+                            do_save = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+
+            if do_save {
+                self.config
+                    .ssh_pem_default
+                    .insert(dlg.profile_id.clone(), dlg.pem_path.clone());
+                self.config
+                    .ssh_user_default
+                    .insert(dlg.profile_id.clone(), dlg.ssh_user.clone());
+                self.config.add_pem_to_library(&dlg.pem_path);
+                if let Err(err) = self.config.save() {
+                    self.message = format!("error: {err}");
+                    self.log_error(self.message.clone());
+                } else {
+                    self.message = "VS Code pem updated.".to_string();
+                }
+            } else if window_open && !do_cancel {
+                self.settings_pem_dialog = Some(dlg);
+            }
+        }
+
         fn connect_selected(&mut self) -> Result<()> {
             let instance = self
                 .selected_instance()
@@ -2240,7 +3120,10 @@ mod gui {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| "/".to_string())
             } else {
-                "/home/ec2-user".to_string()
+                self.config
+                    .default_remote_browser_path
+                    .clone()
+                    .unwrap_or_else(|| "/home/ec2-user".to_string())
             };
             let mut fb_state = FileBrowserState {
                 current_path: default_path.clone(),
@@ -2888,9 +3771,67 @@ mod gui {
                 });
             }
             self.file_browsers.remove(&tab_id);
+            // Dropping the Arc kills the hidden control-channel shell.
+            self.control_channels.remove(&tab_id);
             self.terminal_selections.remove(&tab_id);
             self.connections.close(tab_id);
             self.log_info(format!("closed connection tab id={tab_id}"));
+        }
+
+        /// Get the file-ops control channel for a tab, lazily spawning a
+        /// hidden persistent SSM shell on first use. Returns None in sim
+        /// mode or if the shell could not be spawned (callers then fall
+        /// back to one-shot `ssm send-command`).
+        fn ensure_control_channel(&mut self, tab_id: u64) -> Option<Arc<ControlChannel>> {
+            if self.options.mode == Mode::Sim {
+                return None;
+            }
+            if let Some(ch) = self.control_channels.get(&tab_id) {
+                if !ch.dead.load(Ordering::SeqCst) {
+                    return Some(Arc::clone(ch));
+                }
+                self.control_channels.remove(&tab_id);
+            }
+            let tab = self
+                .connections
+                .tabs()
+                .iter()
+                .find(|t| t.id == tab_id)
+                .cloned()?;
+            let context = self
+                .profile_inventory_cache
+                .get(&tab.profile_id)
+                .map(|(_, ctx)| ctx.clone())
+                .or_else(|| self.context.clone())?;
+            let command_args = build_ssm_session_args(
+                &tab.instance_id,
+                &context.region,
+                &context.profile,
+            );
+            let command_line = format!("aws {}", command_args.join(" "));
+            let terminal = self.selected_terminal().cloned();
+            let pty_cmd = pty_command_for_context(
+                terminal.as_ref(),
+                &context,
+                &command_line,
+                &command_args,
+            );
+            match spawn_control_channel(&pty_cmd, &context) {
+                Ok(ch) => {
+                    self.log_info(format!(
+                        "spawned file-ops control channel for tab={tab_id}"
+                    ));
+                    self.control_channels.insert(tab_id, Arc::clone(&ch));
+                    Some(ch)
+                }
+                Err(err) => {
+                    self.log_warn(format!(
+                        "control channel spawn failed for tab={tab_id}: {err} \
+                         (falling back to send-command)"
+                    ));
+                    None
+                }
+            }
         }
 
         fn request_file_listing(&mut self, tab_id: u64, path: String) {
@@ -2922,26 +3863,20 @@ mod gui {
                 .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
             let tx = self.file_op_tx.clone();
+            let channel = self.ensure_control_channel(tab_id);
 
             std::thread::spawn(move || {
                 let result = if mode == Mode::Sim {
                     list_files_local(&path)
                 } else if let Some(ctx) = &context {
-                    let cmd = format!("ls -la {path}");
-                    match ssm_send_command(&ctx.profile, &ctx.region, &instance_id, &cmd) {
-                        Ok(command_id) => {
-                            match ssm_wait_for_command(
-                                &ctx.profile,
-                                &ctx.region,
-                                &instance_id,
-                                &command_id,
-                            ) {
-                                Ok(output) => Ok(parse_ls_output(&output)),
-                                Err(e) => Err(e),
-                            }
-                        }
-                        Err(e) => Err(e),
-                    }
+                    exec_remote_command(
+                        &channel,
+                        ctx,
+                        &instance_id,
+                        &format!("ls -la {path}"),
+                        Duration::from_secs(20),
+                    )
+                    .map(|output| parse_ls_output(&output))
                 } else {
                     Err("no AWS context available".to_string())
                 };
@@ -2984,17 +3919,20 @@ mod gui {
                 .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
             let tx = self.file_op_tx.clone();
+            let channel = self.ensure_control_channel(tab_id);
 
             std::thread::spawn(move || {
                 let result = if mode == Mode::Sim {
                     list_files_local(&path)
                 } else if let Some(ctx) = &context {
-                    let cmd = format!("ls -la {path}");
-                    ssm_send_command(&ctx.profile, &ctx.region, &instance_id, &cmd)
-                        .and_then(|command_id| {
-                            ssm_wait_for_command(&ctx.profile, &ctx.region, &instance_id, &command_id)
-                        })
-                        .map(|output| parse_ls_output(&output))
+                    exec_remote_command(
+                        &channel,
+                        ctx,
+                        &instance_id,
+                        &format!("ls -la {path}"),
+                        Duration::from_secs(20),
+                    )
+                    .map(|output| parse_ls_output(&output))
                 } else {
                     Err("no AWS context available".to_string())
                 };
@@ -3031,6 +3969,7 @@ mod gui {
                 .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
             let tx = self.file_op_tx.clone();
+            let channel = self.ensure_control_channel(tab_id);
 
             std::thread::spawn(move || {
                 let result = if mode == Mode::Sim {
@@ -3042,28 +3981,25 @@ mod gui {
                         })
                         .map_err(|e| e.to_string())
                 } else if let Some(ctx) = &context {
-                    let cmd = format!("base64 {remote_path}");
-                    ssm_send_command(&ctx.profile, &ctx.region, &instance_id, &cmd)
-                        .and_then(|command_id| {
-                            ssm_wait_for_command(
-                                &ctx.profile,
-                                &ctx.region,
-                                &instance_id,
-                                &command_id,
-                            )
-                        })
-                        .and_then(|b64_output| {
-                            use base64::Engine;
-                            let cleaned: String =
-                                b64_output.chars().filter(|c| !c.is_whitespace()).collect();
-                            let data = base64::engine::general_purpose::STANDARD
-                                .decode(&cleaned)
-                                .map_err(|e| format!("base64 decode failed: {e}"))?;
-                            let bytes = data.len() as u64;
-                            std::fs::write(&local_path, &data)
-                                .map_err(|e| format!("write local file failed: {e}"))?;
-                            Ok(bytes)
-                        })
+                    exec_remote_command(
+                        &channel,
+                        ctx,
+                        &instance_id,
+                        &format!("base64 {remote_path}"),
+                        Duration::from_secs(60),
+                    )
+                    .and_then(|b64_output| {
+                        use base64::Engine;
+                        let cleaned: String =
+                            b64_output.chars().filter(|c| !c.is_whitespace()).collect();
+                        let data = base64::engine::general_purpose::STANDARD
+                            .decode(&cleaned)
+                            .map_err(|e| format!("base64 decode failed: {e}"))?;
+                        let bytes = data.len() as u64;
+                        std::fs::write(&local_path, &data)
+                            .map_err(|e| format!("write local file failed: {e}"))?;
+                        Ok(bytes)
+                    })
                 } else {
                     Err("no AWS context available".to_string())
                 };
@@ -3104,6 +4040,7 @@ mod gui {
                 .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
             let tx = self.file_op_tx.clone();
+            let channel = self.ensure_control_channel(tab_id);
 
             std::thread::spawn(move || {
                 let result = if mode == Mode::Sim {
@@ -3115,28 +4052,25 @@ mod gui {
                         })
                         .map_err(|e| e.to_string())
                 } else if let Some(ctx) = &context {
-                    let cmd = format!("base64 {remote_path}");
-                    ssm_send_command(&ctx.profile, &ctx.region, &instance_id, &cmd)
-                        .and_then(|command_id| {
-                            ssm_wait_for_command(
-                                &ctx.profile,
-                                &ctx.region,
-                                &instance_id,
-                                &command_id,
-                            )
-                        })
-                        .and_then(|b64_output| {
-                            use base64::Engine;
-                            let cleaned: String =
-                                b64_output.chars().filter(|c| !c.is_whitespace()).collect();
-                            let data = base64::engine::general_purpose::STANDARD
-                                .decode(&cleaned)
-                                .map_err(|e| format!("base64 decode failed: {e}"))?;
-                            let bytes = data.len() as u64;
-                            std::fs::write(&local_path, &data)
-                                .map_err(|e| format!("write local file failed: {e}"))?;
-                            Ok(bytes)
-                        })
+                    exec_remote_command(
+                        &channel,
+                        ctx,
+                        &instance_id,
+                        &format!("base64 {remote_path}"),
+                        Duration::from_secs(60),
+                    )
+                    .and_then(|b64_output| {
+                        use base64::Engine;
+                        let cleaned: String =
+                            b64_output.chars().filter(|c| !c.is_whitespace()).collect();
+                        let data = base64::engine::general_purpose::STANDARD
+                            .decode(&cleaned)
+                            .map_err(|e| format!("base64 decode failed: {e}"))?;
+                        let bytes = data.len() as u64;
+                        std::fs::write(&local_path, &data)
+                            .map_err(|e| format!("write local file failed: {e}"))?;
+                        Ok(bytes)
+                    })
                 } else {
                     Err("no AWS context available".to_string())
                 };
@@ -3179,6 +4113,7 @@ mod gui {
                 .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
             let tx = self.file_op_tx.clone();
+            let channel = self.ensure_control_channel(tab_id);
             let file_name = std::path::Path::new(&local_path)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -3203,15 +4138,13 @@ mod gui {
                             let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                             let cmd =
                                 format!("echo '{}' | base64 -d > {}", b64, remote_path);
-                            ssm_send_command(&ctx.profile, &ctx.region, &instance_id, &cmd)
-                                .and_then(|command_id| {
-                                    ssm_wait_for_command(
-                                        &ctx.profile,
-                                        &ctx.region,
-                                        &instance_id,
-                                        &command_id,
-                                    )
-                                })?;
+                            exec_remote_command(
+                                &channel,
+                                ctx,
+                                &instance_id,
+                                &cmd,
+                                Duration::from_secs(60),
+                            )?;
                             Ok(bytes)
                         })
                 } else {
@@ -3239,6 +4172,17 @@ mod gui {
             let Some(fb) = self.file_browsers.get_mut(&tab_id) else {
                 return;
             };
+            // Cache hit: the file is already open in an editor tab. Just
+            // activate it instead of paying another SSM round-trip — this
+            // makes re-opening a file instant.
+            if let Some(idx) = fb
+                .editor_tabs
+                .iter()
+                .position(|t| t.remote_path == remote_path)
+            {
+                fb.active_editor = Some(idx);
+                return;
+            }
             fb.status = FileOpStatus::Initializing;
 
             let tab = self.connections.tabs().iter()
@@ -3252,33 +4196,31 @@ mod gui {
                 .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
             let tx = self.file_op_tx.clone();
+            let channel = self.ensure_control_channel(tab_id);
 
             std::thread::spawn(move || {
                 let result = if mode == Mode::Sim {
                     std::fs::read_to_string(&remote_path)
                         .map_err(|e| e.to_string())
                 } else if let Some(ctx) = &context {
-                    let cmd = format!("base64 {remote_path}");
-                    ssm_send_command(&ctx.profile, &ctx.region, &instance_id, &cmd)
-                        .and_then(|command_id| {
-                            ssm_wait_for_command(
-                                &ctx.profile,
-                                &ctx.region,
-                                &instance_id,
-                                &command_id,
-                            )
-                        })
-                        .and_then(|b64_output| {
-                            use base64::Engine;
-                            let cleaned: String = b64_output.chars()
-                                .filter(|c| !c.is_whitespace())
-                                .collect();
-                            let data = base64::engine::general_purpose::STANDARD
-                                .decode(&cleaned)
-                                .map_err(|e| format!("base64 decode failed: {e}"))?;
-                            String::from_utf8(data)
-                                .map_err(|e| format!("file is not valid UTF-8 text: {e}"))
-                        })
+                    exec_remote_command(
+                        &channel,
+                        ctx,
+                        &instance_id,
+                        &format!("base64 {remote_path}"),
+                        Duration::from_secs(60),
+                    )
+                    .and_then(|b64_output| {
+                        use base64::Engine;
+                        let cleaned: String = b64_output.chars()
+                            .filter(|c| !c.is_whitespace())
+                            .collect();
+                        let data = base64::engine::general_purpose::STANDARD
+                            .decode(&cleaned)
+                            .map_err(|e| format!("base64 decode failed: {e}"))?;
+                        String::from_utf8(data)
+                            .map_err(|e| format!("file is not valid UTF-8 text: {e}"))
+                    })
                 } else {
                     Err("no AWS context available".to_string())
                 };
@@ -3325,6 +4267,7 @@ mod gui {
                 .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
             let tx = self.file_op_tx.clone();
+            let channel = self.ensure_control_channel(tab_id);
 
             std::thread::spawn(move || {
                 let result = if mode == Mode::Sim {
@@ -3335,16 +4278,14 @@ mod gui {
                     let b64 = base64::engine::general_purpose::STANDARD
                         .encode(content.as_bytes());
                     let cmd = format!("echo '{}' | base64 -d > {}", b64, remote_path);
-                    ssm_send_command(&ctx.profile, &ctx.region, &instance_id, &cmd)
-                        .and_then(|command_id| {
-                            ssm_wait_for_command(
-                                &ctx.profile,
-                                &ctx.region,
-                                &instance_id,
-                                &command_id,
-                            )
-                        })
-                        .map(|_| ())
+                    exec_remote_command(
+                        &channel,
+                        ctx,
+                        &instance_id,
+                        &cmd,
+                        Duration::from_secs(60),
+                    )
+                    .map(|_| ())
                 } else {
                     Err("no AWS context available".to_string())
                 };
@@ -3375,15 +4316,47 @@ mod gui {
                             "file listing completed tab={tab_id} path={path} entries={}",
                             entries.len()
                         ));
+                        // Decide whether to cascade prefetch one level deeper:
+                        // do it when this listing is for the current path or
+                        // an expanded directory, so the user can drill in
+                        // without waiting on each new level.
+                        let mut subdirs_to_prefetch: Vec<String> = Vec::new();
                         if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
                             fb.fetching_dirs.remove(&path);
                             fb.dir_cache.insert(path.clone(), entries.clone());
-                            // Only update the main listing if this is the current path
                             if fb.current_path == path {
-                                fb.entries = entries;
+                                fb.entries = entries.clone();
                                 fb.status = FileOpStatus::Idle;
                             }
                             fb.initialized = true;
+
+                            let should_cascade =
+                                fb.current_path == path || fb.expanded_dirs.contains(&path);
+                            // Cap total in-flight prefetches so a deep
+                            // expansion of a large tree doesn't flood SSM.
+                            const MAX_INFLIGHT_PREFETCH: usize = 8;
+                            if should_cascade {
+                                for entry in &entries {
+                                    if !entry.is_dir {
+                                        continue;
+                                    }
+                                    let child = join_path(&path, &entry.name);
+                                    if fb.dir_cache.contains_key(&child)
+                                        || fb.fetching_dirs.contains(&child)
+                                    {
+                                        continue;
+                                    }
+                                    if fb.fetching_dirs.len() + subdirs_to_prefetch.len()
+                                        >= MAX_INFLIGHT_PREFETCH
+                                    {
+                                        break;
+                                    }
+                                    subdirs_to_prefetch.push(child);
+                                }
+                            }
+                        }
+                        for child in subdirs_to_prefetch {
+                            self.request_bg_listing(tab_id, child);
                         }
                     }
                     FileOpEvent::ListingFailed { tab_id, error } => {
@@ -4108,6 +5081,7 @@ mod gui {
                         let account_scope = self.account_scope();
                         let region_scope = self.region_scope();
                         let mut pending_connect: Option<String> = None;
+                        let mut pending_open_vscode: Option<Instance> = None;
                         let mut pending_fav_toggle: Option<String> = None;
                         let mut pending_add_to_saved_filter: Option<(String, String)> = None;
                         let (include_terms, _) = search_terms_from_rules(&self.search_rules);
@@ -4378,9 +5352,14 @@ mod gui {
                             let detail_instance_clone = instance.clone();
                             let filter_instance_clone = instance.clone();
                             let mut add_to_saved_filter: Option<(String, String)> = None;
+                            let vscode_instance_clone = instance.clone();
                             row_response.context_menu(|ui| {
                                 if ui.button("Quick Connect").clicked() {
                                     quick_connect_clicked = true;
+                                    ui.close();
+                                }
+                                if ui.button("Open in VS Code").clicked() {
+                                    pending_open_vscode = Some(vscode_instance_clone.clone());
                                     ui.close();
                                 }
                                 ui.menu_button("Add to filter", |ui| {
@@ -4483,6 +5462,11 @@ mod gui {
                             if self.guarded_action("quick connect", |app| app.connect_selected()) {
                                 self.main_tab = MainTab::Connections;
                             }
+                        }
+
+                        if let Some(instance) = pending_open_vscode {
+                            self.selected_instance_id = instance.instance_id.clone();
+                            self.open_in_vscode(&instance);
                         }
 
                         if let Some(instance_id) = pending_fav_toggle {
@@ -5880,8 +6864,13 @@ mod gui {
                     .clicked()
                 {
                     if let Some((remote_path, filename)) = sel {
-                        let dialog = rfd::FileDialog::new()
+                        let mut dialog = rfd::FileDialog::new()
                             .set_file_name(&filename);
+                        if let Some(ref dir) = self.config.default_local_dialog_path {
+                            if !dir.is_empty() {
+                                dialog = dialog.set_directory(dir);
+                            }
+                        }
                         if let Some(local) = dialog.save_file() {
                             self.request_file_download(
                                 tab_id,
@@ -5892,7 +6881,12 @@ mod gui {
                     }
                 }
                 if ui.button("Upload").clicked() {
-                    let dialog = rfd::FileDialog::new();
+                    let mut dialog = rfd::FileDialog::new();
+                    if let Some(ref dir) = self.config.default_local_dialog_path {
+                        if !dir.is_empty() {
+                            dialog = dialog.set_directory(dir);
+                        }
+                    }
                     if let Some(local) = dialog.pick_file() {
                         self.request_file_upload(
                             tab_id,
@@ -6076,11 +7070,31 @@ mod gui {
                                 .interactive(false)
                                 .frame(false),
                         );
+                        let ext = remote_path
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        let dark = self.dark_mode;
+                        let mono = egui::TextStyle::Monospace.resolve(ui.style());
+                        let mut layouter = |ui: &egui::Ui,
+                                            buf: &dyn egui::TextBuffer,
+                                            wrap_width: f32| {
+                            let mut job = highlight_code(
+                                buf.as_str(),
+                                &ext,
+                                dark,
+                                mono.clone(),
+                            );
+                            job.wrap.max_width = wrap_width;
+                            ui.fonts_mut(|f| f.layout_job(job))
+                        };
                         let response = ui.add(
                             egui::TextEdit::multiline(&mut editor_content)
                                 .font(egui::TextStyle::Monospace)
                                 .desired_width(f32::INFINITY)
-                                .code_editor(),
+                                .code_editor()
+                                .layouter(&mut layouter),
                         );
                         if response.changed() {
                             if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
@@ -6423,6 +7437,7 @@ mod gui {
                 self.poll_profile_choice_changes();
                 self.poll_credentials_changes();
                 self.poll_auth_expiry();
+                self.poll_ssh_config();
                 self.poll_stale_connection_tabs();
                 if self.poll_connection_events() {
                     // More output queued than we processed this frame;
@@ -6541,6 +7556,9 @@ mod gui {
                 }
 
                 // WSL setup popup
+                self.render_pem_dialog(ctx);
+                self.render_settings_pem_dialog(ctx);
+
                 if self.wsl_show_password_popup {
                     let mut open = true;
                     egui::Window::new("WSL Setup Required")
@@ -6698,6 +7716,27 @@ mod gui {
                 egui::TopBottomPanel::top("top").show(ctx, |ui| {
                     egui::MenuBar::new().ui(ui, |ui| {
                         ui.menu_button("Edit", |ui| {
+                            if ui.button("Update VS Code Pem").clicked() {
+                                let profile_id = self
+                                    .selected_profile
+                                    .clone()
+                                    .unwrap_or_default();
+                                let pem_path = self
+                                    .config
+                                    .ssh_pem_default
+                                    .get(&profile_id)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let ssh_user =
+                                    self.config.resolve_ssh_user(&profile_id);
+                                self.settings_pem_dialog = Some(SettingsPemDialog {
+                                    profile_id,
+                                    pem_path,
+                                    ssh_user,
+                                });
+                                ui.close();
+                            }
+                            ui.separator();
                             ui.menu_button("Theme", |ui| {
                                 if ui
                                     .selectable_label(self.dark_mode, "Dark")
@@ -6808,6 +7847,73 @@ mod gui {
                                     !self.config.reset_filter_on_profile_switch;
                                 let _ = self.config.save();
                             }
+
+                            ui.menu_button("File Browser Defaults", |ui| {
+                                ui.label("Remote SSM browser default path:");
+                                let mut remote = self
+                                    .config
+                                    .default_remote_browser_path
+                                    .clone()
+                                    .unwrap_or_default();
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut remote)
+                                        .hint_text("/home/ec2-user")
+                                        .desired_width(260.0),
+                                );
+                                if resp.changed() {
+                                    self.config.default_remote_browser_path =
+                                        if remote.trim().is_empty() {
+                                            None
+                                        } else {
+                                            Some(remote.trim().to_string())
+                                        };
+                                }
+                                if resp.lost_focus() {
+                                    let _ = self.config.save();
+                                }
+
+                                ui.add_space(6.0);
+                                ui.label("Upload/Download dialog default folder:");
+                                let mut local = self
+                                    .config
+                                    .default_local_dialog_path
+                                    .clone()
+                                    .unwrap_or_default();
+                                let resp_local = ui.add(
+                                    egui::TextEdit::singleline(&mut local)
+                                        .hint_text("(OS default)")
+                                        .desired_width(260.0),
+                                );
+                                if resp_local.changed() {
+                                    self.config.default_local_dialog_path =
+                                        if local.trim().is_empty() {
+                                            None
+                                        } else {
+                                            Some(local.trim().to_string())
+                                        };
+                                }
+                                if resp_local.lost_focus() {
+                                    let _ = self.config.save();
+                                }
+                                if ui.button("Browse...").clicked() {
+                                    let mut dialog = rfd::FileDialog::new();
+                                    if !local.is_empty() {
+                                        dialog = dialog.set_directory(&local);
+                                    }
+                                    if let Some(picked) = dialog.pick_folder() {
+                                        self.config.default_local_dialog_path =
+                                            Some(picked.to_string_lossy().to_string());
+                                        let _ = self.config.save();
+                                    }
+                                }
+
+                                ui.add_space(6.0);
+                                if ui.button("Reset to Defaults").clicked() {
+                                    self.config.default_remote_browser_path = None;
+                                    self.config.default_local_dialog_path = None;
+                                    let _ = self.config.save();
+                                }
+                            });
                         });
                     });
 
@@ -7524,11 +8630,51 @@ mod gui {
                     ui.label("Selected Instance ID");
                     ui.text_edit_singleline(&mut self.selected_instance_id);
 
-                    if ui.button("Connect").clicked() {
-                        if self.guarded_action("connect", |app| app.connect_selected()) {
-                            self.main_tab = MainTab::Connections;
+                    ui.horizontal(|ui| {
+                        let mut action = self.config.default_connect_action.clone();
+                        egui::ComboBox::from_id_salt("connect_action_combo")
+                            .selected_text(if action == "vscode" {
+                                "Open in VS Code"
+                            } else {
+                                "Connect"
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut action,
+                                    "connect".to_string(),
+                                    "Connect",
+                                );
+                                ui.selectable_value(
+                                    &mut action,
+                                    "vscode".to_string(),
+                                    "Open in VS Code",
+                                );
+                            });
+                        if action != self.config.default_connect_action {
+                            self.config.default_connect_action = action.clone();
+                            let _ = self.config.save();
                         }
-                    }
+
+                        let btn_label = if action == "vscode" {
+                            "Open in VS Code"
+                        } else {
+                            "Connect"
+                        };
+                        if ui.button(btn_label).clicked() {
+                            if action == "vscode" {
+                                if let Some(inst) = self.selected_instance().cloned() {
+                                    self.open_in_vscode(&inst);
+                                } else {
+                                    self.message =
+                                        "Select an instance first".to_string();
+                                }
+                            } else if self
+                                .guarded_action("connect", |app| app.connect_selected())
+                            {
+                                self.main_tab = MainTab::Connections;
+                            }
+                        }
+                    });
 
                     ui.separator();
                     ui.label("Saved Filters");
@@ -7977,6 +9123,152 @@ mod gui {
     /// Returns the session and the reader handle separately so the caller
     /// can control when reading begins (important for avoiding the race
     /// between PtyReady and Output events on Windows).
+    /// Spawn a hidden persistent SSM shell for file-browser operations.
+    /// Starts a reader thread and a handshake thread; the returned channel
+    /// becomes usable once `ready` flips true (handshake completes async).
+    fn spawn_control_channel(
+        command: &PtyCommand,
+        context: &AwsContext,
+    ) -> Result<Arc<ControlChannel>> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 200,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|err| {
+                AppError::Parse(format!("control PTY alloc failed: {err}"))
+            })?;
+
+        let mut cmd = CommandBuilder::new(&command.program);
+        for arg in &command.args {
+            cmd.arg(arg);
+        }
+        let is_wsl = command.program == "wsl.exe";
+        if !is_wsl {
+            cmd.env("AWS_PROFILE", &context.profile);
+            cmd.env("AWS_REGION", &context.region);
+            if let Some(creds) = credentials::read_profile_credentials(&context.profile) {
+                cmd.env("AWS_ACCESS_KEY_ID", &creds.access_key_id);
+                cmd.env("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
+                if let Some(ref token) = creds.session_token {
+                    cmd.env("AWS_SESSION_TOKEN", token);
+                }
+            }
+        }
+        cmd.env("COLUMNS", "200");
+        cmd.env("LINES", "24");
+        cmd.env("TERM", "xterm-256color");
+        #[cfg(target_os = "windows")]
+        {
+            let system_root = windows_system_root();
+            let comspec = windows_cmd_path();
+            cmd.env("SystemRoot", &system_root);
+            cmd.env("WINDIR", &system_root);
+            cmd.env("ComSpec", &comspec);
+        }
+
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|err| {
+                AppError::Parse(format!("control channel spawn failed: {err}"))
+            })?;
+        drop(pair.slave);
+
+        let master = pair.master;
+        let mut reader = master.try_clone_reader().map_err(|err| {
+            AppError::Parse(format!("control reader failed: {err}"))
+        })?;
+        let writer = master.take_writer().map_err(|err| {
+            AppError::Parse(format!("control writer failed: {err}"))
+        })?;
+
+        let channel = Arc::new(ControlChannel {
+            req_lock: Mutex::new(()),
+            buf: Arc::new((Mutex::new(Vec::new()), Condvar::new())),
+            writer: Mutex::new(writer),
+            _master: Mutex::new(master),
+            child: Mutex::new(child),
+            ready: Arc::new(AtomicBool::new(false)),
+            dead: Arc::new(AtomicBool::new(false)),
+            next_id: AtomicU64::new(1),
+        });
+
+        // Reader thread: pump raw PTY bytes into the shared buffer.
+        {
+            let buf = Arc::clone(&channel.buf);
+            let dead = Arc::clone(&channel.dead);
+            std::thread::spawn(move || {
+                let mut tmp = [0_u8; 8192];
+                loop {
+                    match reader.read(&mut tmp) {
+                        Ok(0) | Err(_) => {
+                            dead.store(true, Ordering::SeqCst);
+                            let (_lock, cv) = &*buf;
+                            cv.notify_all();
+                            break;
+                        }
+                        Ok(n) => {
+                            let (lock, cv) = &*buf;
+                            if let Ok(mut b) = lock.lock() {
+                                // Soft cap so a runaway response can't OOM.
+                                if b.len() < 128 * 1024 * 1024 {
+                                    b.extend_from_slice(&tmp[..n]);
+                                }
+                            }
+                            cv.notify_all();
+                        }
+                    }
+                }
+            });
+        }
+
+        // Handshake thread: quiet the shell (disable echo, blank prompt)
+        // and wait for the ready sentinel before marking the channel up.
+        {
+            let ch = Arc::clone(&channel);
+            std::thread::spawn(move || {
+                // Let the SSM session establish its remote shell first.
+                std::thread::sleep(Duration::from_millis(600));
+                let init = "stty -echo 2>/dev/null; export PS1=''; \
+                            export PS2=''; unset PROMPT_COMMAND 2>/dev/null; \
+                            printf 'CTRLRDY_%s_\\n' \"$$\"\n";
+                if let Ok(mut w) = ch.writer.lock() {
+                    let _ = w.write_all(init.as_bytes());
+                    let _ = w.flush();
+                }
+                let deadline = Instant::now() + Duration::from_secs(25);
+                let (lock, cv) = &*ch.buf;
+                let mut guard = match lock.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                loop {
+                    if channel_handshake_done(&guard) {
+                        guard.clear();
+                        ch.ready.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    if ch.dead.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                        return;
+                    }
+                    let (g, _) = match cv
+                        .wait_timeout(guard, Duration::from_millis(300))
+                    {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    guard = g;
+                }
+            });
+        }
+
+        Ok(channel)
+    }
+
     fn spawn_pty_session_parts(
         tab_id: u64,
         command: &PtyCommand,
@@ -9924,6 +11216,43 @@ mod gui {
                 app.logs.back().map(|e| e.message.as_str()),
                 Some("line-20004")
             );
+        }
+
+        #[test]
+        fn control_channel_extracts_response_and_exit_code() {
+            // Simulated raw PTY stream for request id 7: begin marker,
+            // command output, end marker with exit code, carriage returns.
+            let raw = b"CB_7_\r\ntotal 4\r\ndrwxr-xr-x 2 ec2-user\r\nCE_7_0_\r\n";
+            let (out, rc) =
+                extract_channel_response(raw, "CB_7_", "CE_7_").expect("response");
+            assert_eq!(rc, 0);
+            assert_eq!(out, "total 4\ndrwxr-xr-x 2 ec2-user\n");
+        }
+
+        #[test]
+        fn control_channel_response_none_until_end_marker() {
+            // Begin + partial output but no end marker yet — must not match.
+            let raw = b"CB_3_\r\npartial output\r\n";
+            assert!(extract_channel_response(raw, "CB_3_", "CE_3_").is_none());
+        }
+
+        #[test]
+        fn control_channel_extracts_nonzero_exit_code() {
+            let raw = b"CB_9_\r\nbase64: missing: No such file\r\nCE_9_1_\r\n";
+            let (_out, rc) =
+                extract_channel_response(raw, "CB_9_", "CE_9_").expect("response");
+            assert_eq!(rc, 1);
+        }
+
+        #[test]
+        fn control_channel_handshake_ignores_echoed_placeholder() {
+            // The echoed init line contains the literal `%s`, not digits —
+            // it must not be mistaken for the ready sentinel.
+            let echo = b"printf 'CTRLRDY_%s_\\n' \"$$\"";
+            assert!(!channel_handshake_done(echo));
+            // The executed printf emits the real PID — that counts.
+            let real = b"printf 'CTRLRDY_%s_\\n' \"$$\"\r\nCTRLRDY_2451_\r\n";
+            assert!(channel_handshake_done(real));
         }
 
         #[test]

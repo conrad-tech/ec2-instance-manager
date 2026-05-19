@@ -40,6 +40,27 @@ pub struct AppConfig {
     pub window_w: Option<f32>,
     pub window_h: Option<f32>,
     pub window_maximized: Option<bool>,
+    /// Starting path used when opening the remote SSM file browser in a
+    /// new connection tab. Falls back to "/home/ec2-user" if unset.
+    pub default_remote_browser_path: Option<String>,
+    /// Starting directory used by the native Upload/Download file dialogs.
+    /// Falls back to the OS default (typically last-used) if unset.
+    pub default_local_dialog_path: Option<String>,
+    /// Global library of known SSH private-key (pem) paths the user has
+    /// added or that were discovered while scanning ~/.ssh/config.
+    pub ssh_pem_library: Vec<String>,
+    /// Per-profile default pem path (profile_id -> pem path).
+    pub ssh_pem_default: BTreeMap<String, String>,
+    /// Per-profile SSH login user (profile_id -> user, e.g. "ec2-user").
+    pub ssh_user_default: BTreeMap<String, String>,
+    /// Per-instance pem override (instance_id -> pem path). Takes
+    /// precedence over the profile default for that one instance.
+    pub ssh_pem_instance: BTreeMap<String, String>,
+    /// Per-profile "don't ask for pem again" flag (profile_id -> true).
+    pub vscode_pem_suppressed: BTreeMap<String, bool>,
+    /// Default left-pane action for the selected instance:
+    /// "connect" (embedded SSM terminal) or "vscode" (open in VS Code).
+    pub default_connect_action: String,
 }
 
 impl Default for AppConfig {
@@ -80,6 +101,14 @@ impl Default for AppConfig {
             window_w: None,
             window_h: None,
             window_maximized: None,
+            default_remote_browser_path: None,
+            default_local_dialog_path: None,
+            ssh_pem_library: Vec::new(),
+            ssh_pem_default: BTreeMap::new(),
+            ssh_user_default: BTreeMap::new(),
+            ssh_pem_instance: BTreeMap::new(),
+            vscode_pem_suppressed: BTreeMap::new(),
+            default_connect_action: "connect".to_string(),
         }
     }
 }
@@ -152,6 +181,31 @@ impl AppConfig {
             self.account_regions
                 .insert(account_id.to_string(), region.to_string());
         }
+    }
+
+    /// Add a pem path to the global library if not already present.
+    pub fn add_pem_to_library(&mut self, pem: &str) {
+        let pem = pem.trim();
+        if !pem.is_empty() && !self.ssh_pem_library.iter().any(|p| p == pem) {
+            self.ssh_pem_library.push(pem.to_string());
+        }
+    }
+
+    /// Resolve the pem to use for a given instance: per-instance override
+    /// first, then the profile default. Returns None if neither is set.
+    pub fn resolve_pem(&self, profile_id: &str, instance_id: &str) -> Option<String> {
+        self.ssh_pem_instance
+            .get(instance_id)
+            .or_else(|| self.ssh_pem_default.get(profile_id))
+            .cloned()
+    }
+
+    /// Resolve the SSH login user for a profile, defaulting to "ec2-user".
+    pub fn resolve_ssh_user(&self, profile_id: &str) -> String {
+        self.ssh_user_default
+            .get(profile_id)
+            .cloned()
+            .unwrap_or_else(|| "ec2-user".to_string())
     }
 
     pub fn scope_key(account_id: &str, region: &str) -> String {
@@ -331,6 +385,40 @@ impl AppConfig {
                 continue;
             }
 
+            if let Some(rest) = key.strip_prefix("ssh_pem.") {
+                if !rest.is_empty() && !value.is_empty() {
+                    cfg.ssh_pem_default
+                        .insert(rest.to_string(), value.to_string());
+                }
+                continue;
+            }
+
+            if let Some(rest) = key.strip_prefix("ssh_user.") {
+                if !rest.is_empty() && !value.is_empty() {
+                    cfg.ssh_user_default
+                        .insert(rest.to_string(), value.to_string());
+                }
+                continue;
+            }
+
+            if let Some(rest) = key.strip_prefix("ssh_pem_instance.") {
+                if !rest.is_empty() && !value.is_empty() {
+                    cfg.ssh_pem_instance
+                        .insert(rest.to_string(), value.to_string());
+                }
+                continue;
+            }
+
+            if let Some(rest) = key.strip_prefix("vscode_pem_suppress.") {
+                if !rest.is_empty() {
+                    cfg.vscode_pem_suppressed.insert(
+                        rest.to_string(),
+                        matches!(value, "1" | "true" | "TRUE"),
+                    );
+                }
+                continue;
+            }
+
             if let Some(rest) = key.strip_prefix("favorite.") {
                 if !rest.is_empty() {
                     cfg.favorites.insert(rest.to_string(), split_csv(value));
@@ -446,6 +534,32 @@ impl AppConfig {
                 "window_w" => { if let Ok(v) = value.parse::<f32>() { cfg.window_w = Some(v); } }
                 "window_h" => { if let Ok(v) = value.parse::<f32>() { cfg.window_h = Some(v); } }
                 "window_maximized" => { cfg.window_maximized = Some(matches!(value, "1" | "true" | "TRUE")); }
+                "ssh_pem_known" => {
+                    if !value.is_empty() && !cfg.ssh_pem_library.iter().any(|p| p == value) {
+                        cfg.ssh_pem_library.push(value.to_string());
+                    }
+                }
+                "default_connect_action" => {
+                    cfg.default_connect_action = if value == "vscode" {
+                        "vscode".to_string()
+                    } else {
+                        "connect".to_string()
+                    };
+                }
+                "default_remote_browser_path" => {
+                    cfg.default_remote_browser_path = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
+                "default_local_dialog_path" => {
+                    cfg.default_local_dialog_path = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
                 _ => {}
             }
         }
@@ -499,6 +613,34 @@ impl AppConfig {
         if let Some(v) = self.window_w { lines.push(format!("window_w={v}")); }
         if let Some(v) = self.window_h { lines.push(format!("window_h={v}")); }
         if let Some(v) = self.window_maximized { lines.push(format!("window_maximized={}", if v { "true" } else { "false" })); }
+
+        if let Some(ref p) = self.default_remote_browser_path {
+            lines.push(format!("default_remote_browser_path={p}"));
+        }
+        if let Some(ref p) = self.default_local_dialog_path {
+            lines.push(format!("default_local_dialog_path={p}"));
+        }
+
+        if self.default_connect_action == "vscode" {
+            lines.push("default_connect_action=vscode".to_string());
+        }
+        for pem in &self.ssh_pem_library {
+            lines.push(format!("ssh_pem_known={pem}"));
+        }
+        for (profile, pem) in &self.ssh_pem_default {
+            lines.push(format!("ssh_pem.{profile}={pem}"));
+        }
+        for (profile, user) in &self.ssh_user_default {
+            lines.push(format!("ssh_user.{profile}={user}"));
+        }
+        for (instance, pem) in &self.ssh_pem_instance {
+            lines.push(format!("ssh_pem_instance.{instance}={pem}"));
+        }
+        for (profile, suppressed) in &self.vscode_pem_suppressed {
+            if *suppressed {
+                lines.push(format!("vscode_pem_suppress.{profile}=1"));
+            }
+        }
 
         for profile in &self.profiles {
             lines.push(format!(
