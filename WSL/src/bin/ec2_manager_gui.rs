@@ -479,6 +479,8 @@ mod gui {
     struct PemDialog {
         /// Instance being opened.
         instance_id: String,
+        /// EC2 Name tag (used in the generated ssh Host alias).
+        instance_name: String,
         /// Config profile_id this instance belongs to (config lookup key).
         profile_id: String,
         /// AWS profile name passed to `aws --profile` (SSM transport).
@@ -493,6 +495,9 @@ mod gui {
         pem_path: String,
         /// "Don't ask again for this account" — unchecked by default.
         dont_ask_again: bool,
+        /// Set once VS Code has been launched: the dialog switches to an
+        /// "Opening…" spinner and auto-closes shortly after.
+        opening_since: Option<Instant>,
     }
 
     /// Modal state for the Settings "Update VS Code Pem" dialog.
@@ -925,6 +930,13 @@ mod gui {
         ListingFailed {
             tab_id: u64,
             error: String,
+        },
+        /// Bulk subtree listing from one `find` call: each entry is a
+        /// directory path and its children, used to pre-populate the
+        /// file tree so expansions are instant.
+        TreeListingCompleted {
+            tab_id: u64,
+            dirs: Vec<(String, Vec<FileEntry>)>,
         },
         DownloadCompleted {
             tab_id: u64,
@@ -1398,6 +1410,15 @@ mod gui {
         pem_dialog: Option<PemDialog>,
         /// Active Settings "Update VS Code Pem" dialog, if any.
         settings_pem_dialog: Option<SettingsPemDialog>,
+        /// Whether the "File Browser Defaults" modal is open.
+        show_file_browser_defaults: bool,
+        /// When set, the Edit menu briefly flashes to draw the user's
+        /// attention to it (e.g. after they tick "Don't ask again").
+        edit_menu_flash_start: Option<Instant>,
+        /// Cached result of the VS Code `code` CLI probe — computed once
+        /// in the background at startup so "Open in VS Code" never blocks
+        /// the UI thread on a subprocess spawn. None until the probe runs.
+        vscode_cli_ok: Arc<Mutex<Option<bool>>>,
         /// Per-tab editor/terminal vertical split ratio (0.0-1.0, 0.5 = 50/50)
         editor_split: HashMap<u64, f32>,
         file_op_tx: Sender<FileOpEvent>,
@@ -1578,6 +1599,9 @@ mod gui {
                 last_ssh_poll_at: Instant::now(),
                 pem_dialog: None,
                 settings_pem_dialog: None,
+                show_file_browser_defaults: false,
+                edit_menu_flash_start: None,
+                vscode_cli_ok: Arc::new(Mutex::new(None)),
                 editor_split: HashMap::new(),
                 file_op_tx,
                 file_op_rx,
@@ -1589,6 +1613,17 @@ mod gui {
 
             app.rebuild_account_colors();
             app.scan_ssh_hosts();
+            // Probe for the VS Code `code` CLI in the background so the
+            // "Open in VS Code" button never blocks on a subprocess spawn.
+            {
+                let flag = Arc::clone(&app.vscode_cli_ok);
+                std::thread::spawn(move || {
+                    let ok = ec2_manager::ssh_config::vscode_cli_available();
+                    if let Ok(mut g) = flag.lock() {
+                        *g = Some(ok);
+                    }
+                });
+            }
             app.log_info("application started");
             if let Some(smoke) = &app.gui_smoke {
                 app.log_info(format!(
@@ -2561,7 +2596,11 @@ mod gui {
                 return;
             };
 
-            if !ec2_manager::ssh_config::vscode_cli_available() {
+            // Use the cached probe result (computed in the background at
+            // startup). Only block when we positively know the CLI is
+            // missing; if the probe hasn't finished yet, proceed and let
+            // the launch surface any failure.
+            if *self.vscode_cli_ok.lock().unwrap() == Some(false) {
                 self.message =
                     "VS Code CLI ('code') not found in PATH. Install VS Code \
                      and enable the 'code' command, then retry."
@@ -2571,6 +2610,7 @@ mod gui {
             }
 
             let ssh_user = self.config.resolve_ssh_user(&profile_id);
+            let instance_name = instance.name.clone().unwrap_or_default();
             let suppressed = self
                 .config
                 .vscode_pem_suppressed
@@ -2587,6 +2627,7 @@ mod gui {
                     let remote = format!("/home/{ssh_user}");
                     if let Err(err) = self.launch_vscode(
                         &instance.instance_id,
+                        &instance_name,
                         &context.profile,
                         &context.region,
                         &ssh_user,
@@ -2616,6 +2657,7 @@ mod gui {
                 .unwrap_or(ssh_user);
             self.pem_dialog = Some(PemDialog {
                 instance_id: instance.instance_id.clone(),
+                instance_name,
                 profile_id,
                 aws_profile: context.profile.clone(),
                 region: context.region.clone(),
@@ -2623,13 +2665,16 @@ mod gui {
                 ssh_user: user_prefill,
                 pem_path: pem_prefill,
                 dont_ask_again: false,
+                opening_since: None,
             });
         }
 
         /// Write the managed ssh config block and spawn VS Code Remote-SSH.
+        #[allow(clippy::too_many_arguments)]
         fn launch_vscode(
             &mut self,
             instance_id: &str,
+            instance_name: &str,
             aws_profile: &str,
             region: &str,
             ssh_user: &str,
@@ -2637,8 +2682,11 @@ mod gui {
             remote_path: &str,
         ) -> std::result::Result<(), String> {
             ec2_manager::ssh_config::ensure_include_directive()?;
+            // The managed block is rewritten in full on every launch, so a
+            // changed SSH user or pem always takes effect on the next open.
             let alias = ec2_manager::ssh_config::write_managed_block(
                 instance_id,
+                instance_name,
                 ssh_user,
                 pem,
                 aws_profile,
@@ -2646,15 +2694,21 @@ mod gui {
             )?;
 
             let remote_arg = format!("ssh-remote+{alias}");
-            let spawn_result = if cfg!(windows) {
+            #[cfg(windows)]
+            let spawn_result = {
+                use std::os::windows::process::CommandExt;
+                // CREATE_NO_WINDOW: suppress the cmd console that would
+                // otherwise flash on screen while launching `code`.
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
                 std::process::Command::new("cmd")
                     .args(["/c", "code", "--remote", &remote_arg, remote_path])
-                    .spawn()
-            } else {
-                std::process::Command::new("code")
-                    .args(["--remote", &remote_arg, remote_path])
+                    .creation_flags(CREATE_NO_WINDOW)
                     .spawn()
             };
+            #[cfg(not(windows))]
+            let spawn_result = std::process::Command::new("code")
+                .args(["--remote", &remote_arg, remote_path])
+                .spawn();
             spawn_result.map_err(|e| format!("could not start VS Code: {e}"))?;
 
             self.config.add_pem_to_library(pem);
@@ -2673,6 +2727,35 @@ mod gui {
             let Some(mut dlg) = self.pem_dialog.take() else {
                 return;
             };
+
+            // Post-launch "Opening…" state: show a spinner and auto-close
+            // after a short delay (long enough for VS Code's window to
+            // appear — we can't observe a separate process directly).
+            if let Some(started) = dlg.opening_since {
+                let mut still_open = true;
+                egui::Window::new("Open in VS Code")
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut still_open)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(format!(
+                                "Opening {} in VS Code…",
+                                dlg.instance_id
+                            ));
+                        });
+                    });
+                if still_open
+                    && started.elapsed() < Duration::from_millis(2500)
+                {
+                    ctx.request_repaint();
+                    self.pem_dialog = Some(dlg);
+                }
+                return;
+            }
+
             let mut window_open = true;
             let mut do_launch = false;
             let mut do_cancel = false;
@@ -2757,10 +2840,15 @@ mod gui {
                     });
 
                     ui.add_space(4.0);
+                    let was_checked = dlg.dont_ask_again;
                     ui.checkbox(
                         &mut dlg.dont_ask_again,
-                        "Don't ask again for this account (change later in Edit \u{2192} Update VS Code Pem)",
+                        "Don't ask again for this account (change later in \
+                         Edit menu > Update VS Code Pem)",
                     );
+                    if dlg.dont_ask_again && !was_checked {
+                        self.edit_menu_flash_start = Some(Instant::now());
+                    }
 
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -2792,16 +2880,27 @@ mod gui {
                 if let Err(err) = self.config.save() {
                     self.log_warn(format!("failed to save pem config: {err}"));
                 }
-                if let Err(err) = self.launch_vscode(
+                match self.launch_vscode(
                     &dlg.instance_id,
+                    &dlg.instance_name,
                     &dlg.aws_profile,
                     &dlg.region,
                     &dlg.ssh_user,
                     &dlg.pem_path,
                     &dlg.remote_path,
                 ) {
-                    self.message = format!("VS Code launch failed: {err}");
-                    self.log_error(self.message.clone());
+                    Ok(()) => {
+                        // Switch the dialog to the "Opening…" state; it
+                        // auto-closes shortly after.
+                        dlg.opening_since = Some(Instant::now());
+                        self.pem_dialog = Some(dlg);
+                    }
+                    Err(err) => {
+                        self.message = format!("VS Code launch failed: {err}");
+                        self.log_error(self.message.clone());
+                        // Keep the dialog open so the user can retry.
+                        self.pem_dialog = Some(dlg);
+                    }
                 }
             } else if window_open && !do_cancel {
                 self.pem_dialog = Some(dlg);
@@ -2907,11 +3006,33 @@ mod gui {
                         }
                     });
 
-                    ui.add(
-                        egui::TextEdit::singleline(&mut dlg.pem_path)
-                            .hint_text("path to .pem")
-                            .desired_width(360.0),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dlg.pem_path)
+                                .hint_text("path to .pem")
+                                .desired_width(280.0),
+                        );
+                        if ui.button("Browse...").clicked() {
+                            let mut dialog = rfd::FileDialog::new()
+                                .add_filter("SSH key", &["pem", "key"]);
+                            let start_dir = std::path::Path::new(&dlg.pem_path)
+                                .parent()
+                                .filter(|p| p.is_dir())
+                                .map(|p| p.to_path_buf())
+                                .or_else(|| {
+                                    ec2_manager::util::home_dir()
+                                        .map(|h| h.join(".ssh"))
+                                });
+                            if let Some(dir) = start_dir {
+                                dialog = dialog.set_directory(dir);
+                            }
+                            if let Some(picked) = dialog.pick_file() {
+                                let path = picked.to_string_lossy().to_string();
+                                self.config.add_pem_to_library(&path);
+                                dlg.pem_path = path;
+                            }
+                        }
+                    });
                     let pem_valid = pem_field_feedback(ui, &mut dlg.pem_path);
 
                     ui.separator();
@@ -2954,6 +3075,99 @@ mod gui {
                 }
             } else if window_open && !do_cancel {
                 self.settings_pem_dialog = Some(dlg);
+            }
+        }
+
+        /// Render the "File Browser Defaults" modal, if open. This is a
+        /// real window (not a menu submenu) because egui closes a menu
+        /// when a text field inside it is clicked.
+        fn render_file_browser_defaults_dialog(&mut self, ctx: &egui::Context) {
+            if !self.show_file_browser_defaults {
+                return;
+            }
+            let mut window_open = true;
+            egui::Window::new("File Browser Defaults")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("Remote SSM browser default path:");
+                    let mut remote = self
+                        .config
+                        .default_remote_browser_path
+                        .clone()
+                        .unwrap_or_default();
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut remote)
+                            .hint_text("/home/ec2-user")
+                            .desired_width(320.0),
+                    );
+                    if resp.changed() {
+                        self.config.default_remote_browser_path =
+                            if remote.trim().is_empty() {
+                                None
+                            } else {
+                                Some(remote.trim().to_string())
+                            };
+                    }
+                    if resp.lost_focus() {
+                        let _ = self.config.save();
+                    }
+
+                    ui.add_space(8.0);
+                    ui.label("Upload/Download dialog default folder:");
+                    let mut local = self
+                        .config
+                        .default_local_dialog_path
+                        .clone()
+                        .unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        let resp_local = ui.add(
+                            egui::TextEdit::singleline(&mut local)
+                                .hint_text("(OS default)")
+                                .desired_width(240.0),
+                        );
+                        if resp_local.changed() {
+                            self.config.default_local_dialog_path =
+                                if local.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(local.trim().to_string())
+                                };
+                        }
+                        if resp_local.lost_focus() {
+                            let _ = self.config.save();
+                        }
+                        if ui.button("Browse...").clicked() {
+                            let mut dialog = rfd::FileDialog::new();
+                            if !local.is_empty() {
+                                dialog = dialog.set_directory(&local);
+                            }
+                            if let Some(picked) = dialog.pick_folder() {
+                                self.config.default_local_dialog_path =
+                                    Some(picked.to_string_lossy().to_string());
+                                let _ = self.config.save();
+                            }
+                        }
+                    });
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Reset to Defaults").clicked() {
+                            self.config.default_remote_browser_path = None;
+                            self.config.default_local_dialog_path = None;
+                            let _ = self.config.save();
+                        }
+                        if ui.button("Close").clicked() {
+                            let _ = self.config.save();
+                            self.show_file_browser_defaults = false;
+                        }
+                    });
+                });
+            if !window_open {
+                let _ = self.config.save();
+                self.show_file_browser_defaults = false;
             }
         }
 
@@ -3132,6 +3346,10 @@ mod gui {
             };
             fb_state.initialized = false;
             self.file_browsers.insert(tab_id, fb_state);
+            // Warm the hidden file-ops control channel now so it has
+            // finished its handshake by the time the user opens the file
+            // browser — the first listing/file-open is then already fast.
+            let _ = self.ensure_control_channel(tab_id);
             self.log_info(format!(
                 "opened connection tab id={tab_id} instance={instance_id}"
             ));
@@ -3864,6 +4082,7 @@ mod gui {
             let mode = self.options.mode.clone();
             let tx = self.file_op_tx.clone();
             let channel = self.ensure_control_channel(tab_id);
+            let tree_path = path.clone();
 
             std::thread::spawn(move || {
                 let result = if mode == Mode::Sim {
@@ -3891,6 +4110,66 @@ mod gui {
                     }
                     Err(error) => {
                         let _ = tx.send(FileOpEvent::ListingFailed { tab_id, error });
+                    }
+                }
+            });
+
+            // Also kick off a bulk subtree scan so expanding directories
+            // below this path is instant (served from cache).
+            self.request_tree_listing(tab_id, tree_path);
+        }
+
+        /// Run one `find` to enumerate the subtree under `root` and
+        /// pre-populate the file tree's directory cache, so expanding
+        /// folders within range is instant. Best-effort: silently does
+        /// nothing in sim mode or if no context/channel is available.
+        fn request_tree_listing(&mut self, tab_id: u64, root: String) {
+            if self.options.mode == Mode::Sim {
+                return;
+            }
+            let Some(tab) = self
+                .connections
+                .tabs()
+                .iter()
+                .find(|t| t.id == tab_id)
+                .cloned()
+            else {
+                return;
+            };
+            let instance_id = tab.instance_id.clone();
+            let Some(context) = self
+                .profile_inventory_cache
+                .get(&tab.profile_id)
+                .map(|(_, ctx)| ctx.clone())
+                .or_else(|| self.context.clone())
+            else {
+                return;
+            };
+            let channel = self.ensure_control_channel(tab_id);
+            let tx = self.file_op_tx.clone();
+
+            std::thread::spawn(move || {
+                // %y type, %M perms, %s size, date, %p path — one line each.
+                // Bounded by -maxdepth and a row cap so a huge tree can't
+                // flood the channel; deeper dirs fall back to lazy `ls`.
+                let cmd = format!(
+                    "find {root} -maxdepth 4 \
+                     -printf '%y\\t%M\\t%s\\t%TY-%Tm-%Td %TH:%TM\\t%p\\n' \
+                     2>/dev/null | head -n 20000"
+                );
+                if let Ok(output) = exec_remote_command(
+                    &channel,
+                    &context,
+                    &instance_id,
+                    &cmd,
+                    Duration::from_secs(30),
+                ) {
+                    let dirs = parse_find_output(&output, &root);
+                    if !dirs.is_empty() {
+                        let _ = tx.send(FileOpEvent::TreeListingCompleted {
+                            tab_id,
+                            dirs,
+                        });
                     }
                 }
             });
@@ -4366,6 +4645,25 @@ mod gui {
                         if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
                             fb.status = FileOpStatus::Error(error);
                         }
+                    }
+                    FileOpEvent::TreeListingCompleted { tab_id, dirs } => {
+                        let mut count = 0;
+                        if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                            for (dir, entries) in dirs {
+                                fb.fetching_dirs.remove(&dir);
+                                // Don't clobber the directory currently on
+                                // screen — its `ls` result is authoritative.
+                                if fb.current_path != dir
+                                    || !fb.dir_cache.contains_key(&dir)
+                                {
+                                    fb.dir_cache.insert(dir, entries);
+                                }
+                                count += 1;
+                            }
+                        }
+                        self.log_debug(format!(
+                            "tree listing pre-populated {count} dirs for tab={tab_id}"
+                        ));
                     }
                     FileOpEvent::DownloadCompleted {
                         tab_id,
@@ -7558,6 +7856,7 @@ mod gui {
                 // WSL setup popup
                 self.render_pem_dialog(ctx);
                 self.render_settings_pem_dialog(ctx);
+                self.render_file_browser_defaults_dialog(ctx);
 
                 if self.wsl_show_password_popup {
                     let mut open = true;
@@ -7715,7 +8014,7 @@ mod gui {
 
                 egui::TopBottomPanel::top("top").show(ctx, |ui| {
                     egui::MenuBar::new().ui(ui, |ui| {
-                        ui.menu_button("Edit", |ui| {
+                        let edit_menu_resp = ui.menu_button("Edit", |ui| {
                             if ui.button("Update VS Code Pem").clicked() {
                                 let profile_id = self
                                     .selected_profile
@@ -7836,85 +8135,42 @@ mod gui {
                                     }
                                 }
                             });
-                            if ui
-                                .selectable_label(
-                                    self.config.reset_filter_on_profile_switch,
-                                    "Reset Filter on Profile Switch",
-                                )
-                                .clicked()
-                            {
-                                self.config.reset_filter_on_profile_switch =
-                                    !self.config.reset_filter_on_profile_switch;
-                                let _ = self.config.save();
+                            if ui.button("File Browser Defaults...").clicked() {
+                                self.show_file_browser_defaults = true;
+                                ui.close();
                             }
 
-                            ui.menu_button("File Browser Defaults", |ui| {
-                                ui.label("Remote SSM browser default path:");
-                                let mut remote = self
-                                    .config
-                                    .default_remote_browser_path
-                                    .clone()
-                                    .unwrap_or_default();
-                                let resp = ui.add(
-                                    egui::TextEdit::singleline(&mut remote)
-                                        .hint_text("/home/ec2-user")
-                                        .desired_width(260.0),
-                                );
-                                if resp.changed() {
-                                    self.config.default_remote_browser_path =
-                                        if remote.trim().is_empty() {
-                                            None
-                                        } else {
-                                            Some(remote.trim().to_string())
-                                        };
-                                }
-                                if resp.lost_focus() {
-                                    let _ = self.config.save();
-                                }
-
-                                ui.add_space(6.0);
-                                ui.label("Upload/Download dialog default folder:");
-                                let mut local = self
-                                    .config
-                                    .default_local_dialog_path
-                                    .clone()
-                                    .unwrap_or_default();
-                                let resp_local = ui.add(
-                                    egui::TextEdit::singleline(&mut local)
-                                        .hint_text("(OS default)")
-                                        .desired_width(260.0),
-                                );
-                                if resp_local.changed() {
-                                    self.config.default_local_dialog_path =
-                                        if local.trim().is_empty() {
-                                            None
-                                        } else {
-                                            Some(local.trim().to_string())
-                                        };
-                                }
-                                if resp_local.lost_focus() {
-                                    let _ = self.config.save();
-                                }
-                                if ui.button("Browse...").clicked() {
-                                    let mut dialog = rfd::FileDialog::new();
-                                    if !local.is_empty() {
-                                        dialog = dialog.set_directory(&local);
-                                    }
-                                    if let Some(picked) = dialog.pick_folder() {
-                                        self.config.default_local_dialog_path =
-                                            Some(picked.to_string_lossy().to_string());
-                                        let _ = self.config.save();
-                                    }
-                                }
-
-                                ui.add_space(6.0);
-                                if ui.button("Reset to Defaults").clicked() {
-                                    self.config.default_remote_browser_path = None;
-                                    self.config.default_local_dialog_path = None;
-                                    let _ = self.config.save();
-                                }
-                            });
+                            ui.separator();
+                            if ui
+                                .checkbox(
+                                    &mut self.config.reset_filter_on_profile_switch,
+                                    "Reset Filter on Profile Switch",
+                                )
+                                .changed()
+                            {
+                                let _ = self.config.save();
+                            }
                         });
+
+                        // Flash the Edit menu briefly (3 pulses) to point
+                        // the user at where the VS Code pem setting lives.
+                        if let Some(start) = self.edit_menu_flash_start {
+                            let elapsed = start.elapsed();
+                            if elapsed >= Duration::from_millis(1200) {
+                                self.edit_menu_flash_start = None;
+                            } else {
+                                if (elapsed.as_millis() / 200) % 2 == 0 {
+                                    ui.painter().rect_filled(
+                                        edit_menu_resp.response.rect.expand(2.0),
+                                        3.0,
+                                        egui::Color32::from_rgba_unmultiplied(
+                                            255, 210, 0, 96,
+                                        ),
+                                    );
+                                }
+                                ctx.request_repaint();
+                            }
+                        }
                     });
 
                     ui.horizontal(|ui| {
@@ -8631,47 +8887,19 @@ mod gui {
                     ui.text_edit_singleline(&mut self.selected_instance_id);
 
                     ui.horizontal(|ui| {
-                        let mut action = self.config.default_connect_action.clone();
-                        egui::ComboBox::from_id_salt("connect_action_combo")
-                            .selected_text(if action == "vscode" {
-                                "Open in VS Code"
-                            } else {
-                                "Connect"
+                        if ui.button("Connect").clicked()
+                            && self.guarded_action("connect", |app| {
+                                app.connect_selected()
                             })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut action,
-                                    "connect".to_string(),
-                                    "Connect",
-                                );
-                                ui.selectable_value(
-                                    &mut action,
-                                    "vscode".to_string(),
-                                    "Open in VS Code",
-                                );
-                            });
-                        if action != self.config.default_connect_action {
-                            self.config.default_connect_action = action.clone();
-                            let _ = self.config.save();
+                        {
+                            self.main_tab = MainTab::Connections;
                         }
-
-                        let btn_label = if action == "vscode" {
-                            "Open in VS Code"
-                        } else {
-                            "Connect"
-                        };
-                        if ui.button(btn_label).clicked() {
-                            if action == "vscode" {
-                                if let Some(inst) = self.selected_instance().cloned() {
-                                    self.open_in_vscode(&inst);
-                                } else {
-                                    self.message =
-                                        "Select an instance first".to_string();
-                                }
-                            } else if self
-                                .guarded_action("connect", |app| app.connect_selected())
-                            {
-                                self.main_tab = MainTab::Connections;
+                        if ui.button("Open in VS Code").clicked() {
+                            if let Some(inst) = self.selected_instance().cloned() {
+                                self.open_in_vscode(&inst);
+                            } else {
+                                self.message =
+                                    "Select an instance first".to_string();
                             }
                         }
                     });
@@ -10518,6 +10746,57 @@ mod gui {
         }
         sort_file_entries(&mut entries);
         entries
+    }
+
+    /// Parse `find -printf '%y\t%M\t%s\t<date>\t%p'` output into a list of
+    /// (directory, child entries) pairs, for bulk-populating the file tree.
+    /// `root` (the find root) is itself excluded.
+    fn parse_find_output(output: &str, root: &str) -> Vec<(String, Vec<FileEntry>)> {
+        let root = root.trim_end_matches('/');
+        let mut by_dir: HashMap<String, Vec<FileEntry>> = HashMap::new();
+        for line in output.lines() {
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.splitn(5, '\t').collect();
+            if parts.len() < 5 {
+                continue;
+            }
+            let is_dir = parts[0] == "d";
+            let permissions = parts[1].to_string();
+            let size = parts[2].parse::<u64>().unwrap_or(0);
+            let modified = parts[3].to_string();
+            let path = parts[4].trim_end_matches('/');
+            // Skip the find root itself — only its descendants are entries.
+            if path.is_empty() || path == root {
+                continue;
+            }
+            let Some((parent, name)) = path.rsplit_once('/') else {
+                continue;
+            };
+            if name == "." || name == ".." {
+                continue;
+            }
+            let parent = if parent.is_empty() { "/" } else { parent };
+            by_dir
+                .entry(parent.to_string())
+                .or_default()
+                .push(FileEntry {
+                    name: name.to_string(),
+                    is_dir,
+                    size,
+                    permissions,
+                    modified,
+                });
+        }
+        by_dir
+            .into_iter()
+            .map(|(dir, mut entries)| {
+                sort_file_entries(&mut entries);
+                (dir, entries)
+            })
+            .collect()
     }
 
     fn sort_file_entries(entries: &mut [FileEntry]) {

@@ -345,9 +345,37 @@ pub fn suggest_keys_near(path: &str) -> Vec<String> {
     candidates
 }
 
-/// Stable Host alias used for our managed VS Code Remote-SSH entries.
-pub fn managed_alias(instance_id: &str) -> String {
-    format!("ec2mgr-{instance_id}")
+/// Sanitize a string for use as part of an ssh `Host` alias: keep only
+/// alphanumerics and `.`/`-`/`_`, collapsing any other run to a single
+/// dash and trimming leading/trailing dashes.
+pub fn sanitize_alias_part(raw: &str) -> String {
+    let mut out: String = raw
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    out.trim_matches('-').to_string()
+}
+
+/// Stable Host alias used for our managed VS Code Remote-SSH entries:
+/// `<ec2-name>-<instance-id>`, falling back to `ec2-<instance-id>` when
+/// the instance has no usable Name tag.
+pub fn managed_alias(name: &str, instance_id: &str) -> String {
+    let prefix = sanitize_alias_part(name);
+    if prefix.is_empty() {
+        format!("ec2-{instance_id}")
+    } else {
+        format!("{prefix}-{instance_id}")
+    }
 }
 
 /// Build a single managed `Host` block for VS Code Remote-SSH. The
@@ -355,12 +383,13 @@ pub fn managed_alias(instance_id: &str) -> String {
 /// port 22 is required. `%h`/`%p` are filled in by ssh at connect time.
 pub fn vscode_host_block(
     instance_id: &str,
+    name: &str,
     user: &str,
     pem: &str,
     profile: &str,
     region: &str,
 ) -> String {
-    let alias = managed_alias(instance_id);
+    let alias = managed_alias(name, instance_id);
     format!(
         "Host {alias}\n  \
          HostName {instance_id}\n  \
@@ -403,6 +432,7 @@ fn split_blocks(text: &str) -> Vec<(String, String)> {
 /// preserved. Returns the Host alias on success.
 pub fn write_managed_block(
     instance_id: &str,
+    name: &str,
     user: &str,
     pem: &str,
     profile: &str,
@@ -415,16 +445,20 @@ pub fn write_managed_block(
             .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
     }
 
-    let alias = managed_alias(instance_id);
+    let alias = managed_alias(name, instance_id);
+    // Drop any prior block for this alias *or* an older block for the
+    // same instance under a different name, so a renamed instance does
+    // not leave a stale duplicate entry behind.
+    let suffix = format!("-{instance_id}");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let mut kept: Vec<String> = Vec::new();
     for (block_alias, block_text) in split_blocks(&existing) {
-        if block_alias != alias {
+        if block_alias != alias && !block_alias.ends_with(&suffix) {
             kept.push(block_text.trim_end().to_string());
         }
     }
     kept.push(
-        vscode_host_block(instance_id, user, pem, profile, region)
+        vscode_host_block(instance_id, name, user, pem, profile, region)
             .trim_end()
             .to_string(),
     );
@@ -560,18 +594,34 @@ mod tests {
     fn vscode_host_block_has_required_directives() {
         let block = vscode_host_block(
             "i-0c7b5d62a1a086476",
+            "web server 01",
             "ec2-user",
             "C:\\keys\\pa.pem",
             "pa",
             "us-east-1",
         );
-        assert!(block.starts_with("Host ec2mgr-i-0c7b5d62a1a086476"));
+        // Name is sanitized and prefixed onto the instance id.
+        assert!(block.starts_with("Host web-server-01-i-0c7b5d62a1a086476"));
         assert!(block.contains("HostName i-0c7b5d62a1a086476"));
         assert!(block.contains("User ec2-user"));
         assert!(block.contains("IdentityFile \"C:\\keys\\pa.pem\""));
         assert!(block.contains("--profile pa"));
         assert!(block.contains("--region us-east-1"));
         assert!(block.contains("AWS-StartSSHSession"));
+    }
+
+    #[test]
+    fn managed_alias_uses_name_and_falls_back() {
+        assert_eq!(
+            managed_alias("Web Server", "i-123"),
+            "Web-Server-i-123"
+        );
+        assert_eq!(managed_alias("", "i-123"), "ec2-i-123");
+        assert_eq!(managed_alias("  ", "i-123"), "ec2-i-123");
+        assert_eq!(
+            sanitize_alias_part("prod/app (east)"),
+            "prod-app-east"
+        );
     }
 
     #[test]

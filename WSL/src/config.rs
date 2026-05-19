@@ -58,9 +58,6 @@ pub struct AppConfig {
     pub ssh_pem_instance: BTreeMap<String, String>,
     /// Per-profile "don't ask for pem again" flag (profile_id -> true).
     pub vscode_pem_suppressed: BTreeMap<String, bool>,
-    /// Default left-pane action for the selected instance:
-    /// "connect" (embedded SSM terminal) or "vscode" (open in VS Code).
-    pub default_connect_action: String,
 }
 
 impl Default for AppConfig {
@@ -108,7 +105,6 @@ impl Default for AppConfig {
             ssh_user_default: BTreeMap::new(),
             ssh_pem_instance: BTreeMap::new(),
             vscode_pem_suppressed: BTreeMap::new(),
-            default_connect_action: "connect".to_string(),
         }
     }
 }
@@ -539,13 +535,6 @@ impl AppConfig {
                         cfg.ssh_pem_library.push(value.to_string());
                     }
                 }
-                "default_connect_action" => {
-                    cfg.default_connect_action = if value == "vscode" {
-                        "vscode".to_string()
-                    } else {
-                        "connect".to_string()
-                    };
-                }
                 "default_remote_browser_path" => {
                     cfg.default_remote_browser_path = if value.is_empty() {
                         None
@@ -621,9 +610,6 @@ impl AppConfig {
             lines.push(format!("default_local_dialog_path={p}"));
         }
 
-        if self.default_connect_action == "vscode" {
-            lines.push("default_connect_action=vscode".to_string());
-        }
         for pem in &self.ssh_pem_library {
             lines.push(format!("ssh_pem_known={pem}"));
         }
