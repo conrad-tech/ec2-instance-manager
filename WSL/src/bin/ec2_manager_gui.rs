@@ -387,6 +387,11 @@ mod gui {
         /// snapshot and wait — gluing the next pasted line onto a still-
         /// running command. See `paste_to_connection_tab`.
         at_prompt_last_frame: bool,
+        /// When this PTY was spawned — used to log how long the SSM
+        /// session takes to connect (diagnosing slow connections).
+        spawned_at: Instant,
+        /// Whether the "SSM session connected" timing has been logged.
+        connect_logged: bool,
     }
 
     /// Absolute terminal position: scroll-invariant coordinate.
@@ -3697,9 +3702,29 @@ mod gui {
                     }
                 };
                 let mut paste_diag: Option<String> = None;
+                let mut connect_diag: Option<String> = None;
                 let log_msg = if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
                     session.bytes_received += bytes.len() as u64;
                     session.output_event_count += 1;
+                    // Connection timing: log first output and the moment
+                    // the SSM session reports "Starting session". A large
+                    // gap here points at the network/SSM/aws chain, not
+                    // the app (which only spawned the process).
+                    if session.output_event_count == 1 {
+                        connect_diag = Some(format!(
+                            "connect tab={tab_id}: first PTY output {}ms after spawn",
+                            session.spawned_at.elapsed().as_millis(),
+                        ));
+                    }
+                    if !session.connect_logged
+                        && String::from_utf8_lossy(&bytes).contains("Starting session")
+                    {
+                        session.connect_logged = true;
+                        connect_diag = Some(format!(
+                            "connect tab={tab_id}: SSM session established {}ms after spawn",
+                            session.spawned_at.elapsed().as_millis(),
+                        ));
+                    }
                     let evt = session.output_event_count;
                     let total = session.bytes_received;
                     // Paste-diagnostic timing: while paste_write_at is set,
@@ -3865,6 +3890,9 @@ mod gui {
                 }
                 if let Some(msg) = paste_diag {
                     self.log_debug(msg);
+                }
+                if let Some(msg) = connect_diag {
+                    self.log_info(msg);
                 }
                 self.maybe_record_gui_smoke_success(tab_id, &bytes);
             }
@@ -4241,7 +4269,7 @@ mod gui {
                         &channel,
                         ctx,
                         &instance_id,
-                        &format!("ls -la {path}"),
+                        &format!("sudo -n ls -la --color=never {path}"),
                         Duration::from_secs(20),
                     )
                     .map(|output| parse_ls_output(&output))
@@ -4306,7 +4334,7 @@ mod gui {
                 // Bounded by -maxdepth and a row cap so a huge tree can't
                 // flood the channel; deeper dirs fall back to lazy `ls`.
                 let cmd = format!(
-                    "find {root} -maxdepth 4 \
+                    "sudo -n find {root} -maxdepth 4 \
                      -printf '%y\\t%M\\t%s\\t%TY-%Tm-%Td %TH:%TM\\t%p\\n' \
                      2>/dev/null | head -n 20000"
                 );
@@ -4377,7 +4405,7 @@ mod gui {
                         &channel,
                         ctx,
                         &instance_id,
-                        &format!("ls -la {path}"),
+                        &format!("sudo -n ls -la --color=never {path}"),
                         Duration::from_secs(20),
                     )
                     .map(|output| parse_ls_output(&output))
@@ -4434,7 +4462,7 @@ mod gui {
                         &channel,
                         ctx,
                         &instance_id,
-                        &format!("base64 {remote_path}"),
+                        &format!("sudo -n base64 {remote_path}"),
                         Duration::from_secs(60),
                     )
                     .and_then(|b64_output| {
@@ -4506,7 +4534,7 @@ mod gui {
                         &channel,
                         ctx,
                         &instance_id,
-                        &format!("base64 {remote_path}"),
+                        &format!("sudo -n base64 {remote_path}"),
                         Duration::from_secs(60),
                     )
                     .and_then(|b64_output| {
@@ -4588,7 +4616,7 @@ mod gui {
                             let bytes = data.len() as u64;
                             let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
                             let cmd =
-                                format!("echo '{}' | base64 -d > {}", b64, remote_path);
+                                format!("echo '{}' | base64 -d | sudo -n tee {} > /dev/null", b64, remote_path);
                             exec_remote_command(
                                 &channel,
                                 ctx,
@@ -4662,7 +4690,7 @@ mod gui {
                         &channel,
                         ctx,
                         &instance_id,
-                        &format!("base64 {remote_path}"),
+                        &format!("sudo -n base64 {remote_path}"),
                         Duration::from_secs(60),
                     )
                     .and_then(|b64_output| {
@@ -4744,7 +4772,7 @@ mod gui {
                     use base64::Engine;
                     let b64 = base64::engine::general_purpose::STANDARD
                         .encode(content.as_bytes());
-                    let cmd = format!("echo '{}' | base64 -d > {}", b64, remote_path);
+                    let cmd = format!("echo '{}' | base64 -d | sudo -n tee {} > /dev/null", b64, remote_path);
                     exec_remote_command(
                         &channel,
                         ctx,
@@ -9820,6 +9848,8 @@ mod gui {
             paste_write_bytes: 0,
             prompt_ready: Arc::new((Mutex::new(0), Condvar::new())),
             at_prompt_last_frame: false,
+            spawned_at: Instant::now(),
+            connect_logged: false,
         };
 
         Ok((session, reader))
@@ -10955,9 +10985,48 @@ mod gui {
         }
     }
 
+    /// Strip ANSI escape sequences (CSI color codes, OSC, erase-line)
+    /// from a string — `ls --color` output otherwise leaks `\x1b[34m`
+    /// etc. into parsed file names.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                match chars.peek() {
+                    Some('[') => {
+                        chars.next();
+                        // Consume until the CSI final byte (0x40..=0x7e).
+                        while let Some(&n) = chars.peek() {
+                            chars.next();
+                            if ('\u{40}'..='\u{7e}').contains(&n) {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']') => {
+                        // OSC — consume until BEL.
+                        chars.next();
+                        while let Some(&n) = chars.peek() {
+                            chars.next();
+                            if n == '\u{07}' {
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
     fn parse_ls_output(output: &str) -> Vec<FileEntry> {
         let mut entries = Vec::new();
         for line in output.lines() {
+            let line = strip_ansi(line);
             let line = line.trim();
             if line.is_empty() || line.starts_with("total") {
                 continue;
