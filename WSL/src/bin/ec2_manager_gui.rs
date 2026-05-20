@@ -1742,6 +1742,10 @@ mod gui {
                     ));
                 }
             }
+            // Rebuild colors after the disk caches are loaded so the
+            // environment legend is populated from cached data right
+            // away, not only once a network refresh completes.
+            app.rebuild_account_colors();
 
             app.refresh_all_authenticated(true);
             app
@@ -2107,9 +2111,11 @@ mod gui {
                 .map(|i| i.tags.keys().take(12).cloned().collect())
                 .unwrap_or_default();
             self.log_info(format!(
-                "account colors rebuilt: profiles={} map_entries={} env_keys={env_keys} \
-                 selected={:?} inventory={} with_MMODAL_ENV={with_env} \
-                 cached_profiles={} first_instance_tags={sample_tags:?}",
+                "account colors rebuilt: enabled={} profiles={} map_entries={} \
+                 env_keys={env_keys} selected={:?} inventory={} \
+                 with_MMODAL_ENV={with_env} cached_profiles={} \
+                 first_instance_tags={sample_tags:?}",
+                self.config.account_colors_enabled,
                 self.config.profiles.len(),
                 self.account_color_map.len(),
                 self.selected_profile,
@@ -2157,6 +2163,10 @@ mod gui {
                 self.log_info(format!(
                     "loaded {count} instances from memory cache for profile={profile_id}"
                 ));
+                // Rebuild colors now that the inventory is populated —
+                // otherwise the environment legend stays empty until a
+                // network refresh happens to complete.
+                self.rebuild_account_colors();
                 return;
             }
 
@@ -2192,6 +2202,7 @@ mod gui {
                 self.apply_filters();
                 self.message = format!("Loaded {count} instances from cache (refreshing...)");
                 self.log_info(self.message.clone());
+                self.rebuild_account_colors();
             } else {
                 self.log_info("no disk cache found for this profile/region");
             }
