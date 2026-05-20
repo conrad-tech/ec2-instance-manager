@@ -860,6 +860,26 @@ mod gui {
         }
     }
 
+    /// Render the tail of a raw byte stream as a single safe log line:
+    /// newlines become `|`, other control bytes become `.`.
+    fn sanitize_for_log(bytes: &[u8], max_chars: usize) -> String {
+        let text = String::from_utf8_lossy(bytes);
+        let chars: Vec<char> = text.chars().collect();
+        let start = chars.len().saturating_sub(max_chars);
+        chars[start..]
+            .iter()
+            .map(|&c| {
+                if c == '\n' || c == '\r' {
+                    '|'
+                } else if c.is_control() {
+                    '.'
+                } else {
+                    c
+                }
+            })
+            .collect()
+    }
+
     /// Detect the handshake sentinel `CTRLRDY_<pid>_` in the raw stream.
     /// Only a marker followed by digits counts — the echoed init line
     /// contains the literal `%s` placeholder, not a number.
@@ -9654,17 +9674,24 @@ mod gui {
             let ch = Arc::clone(&channel);
             std::thread::spawn(move || {
                 let started = Instant::now();
-                // Let the SSM session establish its remote shell first.
-                std::thread::sleep(Duration::from_millis(600));
                 let init = "stty -echo 2>/dev/null; export PS1=''; \
                             export PS2=''; unset PROMPT_COMMAND 2>/dev/null; \
                             printf 'CTRLRDY_%s_\\n' \"$$\"\n";
-                if let Ok(mut g) = ch.io.lock() {
-                    if let Some(io) = g.as_mut() {
-                        let _ = io.writer.write_all(init.as_bytes());
-                        let _ = io.writer.flush();
+                let write_init = |ch: &ControlChannel| {
+                    if let Ok(mut g) = ch.io.lock() {
+                        if let Some(io) = g.as_mut() {
+                            let _ = io.writer.write_all(init.as_bytes());
+                            let _ = io.writer.flush();
+                        }
                     }
-                }
+                };
+                // Give the SSM session a moment, then send the init —
+                // and keep re-sending it: an early write can be lost if
+                // the remote shell isn't reading stdin yet, so we retry
+                // until the CTRLRDY sentinel comes back.
+                std::thread::sleep(Duration::from_millis(400));
+                write_init(&ch);
+                let mut last_write = Instant::now();
                 let deadline = Instant::now() + Duration::from_secs(60);
                 let (lock, cv) = &*ch.buf;
                 let mut guard = match lock.lock() {
@@ -9691,15 +9718,25 @@ mod gui {
                     if Instant::now() >= deadline {
                         // Mark dead so ensure_control_channel respawns it.
                         ch.dead.store(true, Ordering::SeqCst);
+                        // Dump what the hidden SSM session actually
+                        // produced so we can see why it never reached a
+                        // usable shell (error text, banner, or nothing).
+                        let dump = sanitize_for_log(&guard, 600);
                         let _ = diag_tx.send(FileOpEvent::OpDiag {
                             tab_id,
                             message: format!(
-                                "{} control channel handshake TIMED OUT after 60s \
-                                 — will respawn on next use",
+                                "{} control channel handshake TIMED OUT after 60s. \
+                                 Raw output ({} bytes): [{dump}]",
                                 lane.as_str(),
+                                guard.len(),
                             ),
                         });
                         return;
+                    }
+                    // Re-send the init periodically until it lands.
+                    if last_write.elapsed() >= Duration::from_millis(1500) {
+                        write_init(&ch);
+                        last_write = Instant::now();
                     }
                     let (g, _) = match cv
                         .wait_timeout(guard, Duration::from_millis(300))
