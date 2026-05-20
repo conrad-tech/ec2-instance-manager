@@ -2533,12 +2533,21 @@ mod gui {
                 authed_profiles.len()
             ));
 
-            // Stagger the starts: 2 profiles per ~1.2s batch, so the
-            // burst of describe-* API calls stays under the rate limit
-            // instead of all firing at once and triggering throttling.
-            for (idx, pid) in authed_profiles.iter().enumerate() {
-                let batch = idx / 2;
-                let delay = Duration::from_millis(batch as u64 * 1200);
+            // Refresh the selected account immediately (the user sees it
+            // first); trickle the rest one at a time, 2.5s apart, so the
+            // burst of SSM describe-* calls stays under the API rate
+            // limit. The SSM API is shared with `start-session`, so a
+            // gentle stagger keeps connections fast during a refresh.
+            let selected = self.selected_profile.clone();
+            let mut other_n: u64 = 0;
+            for pid in &authed_profiles {
+                let delay = if selected.as_deref() == Some(pid.as_str()) {
+                    Duration::ZERO
+                } else {
+                    let d = Duration::from_millis(2000 + other_n * 2500);
+                    other_n += 1;
+                    d
+                };
                 self.refresh_profile_delayed(pid, force, delay);
             }
         }
