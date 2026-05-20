@@ -4155,7 +4155,13 @@ mod gui {
                 &command_line,
                 &command_args,
             );
-            match spawn_control_channel(&pty_cmd, &context) {
+            match spawn_control_channel(
+                &pty_cmd,
+                &context,
+                tab_id,
+                lane,
+                self.file_op_tx.clone(),
+            ) {
                 Ok(ch) => {
                     self.log_info(format!(
                         "spawned {} control channel for tab={tab_id}",
@@ -8237,10 +8243,12 @@ mod gui {
                             });
                             ui.menu_button("Environment Colors", |ui| {
                                 if ui
-                                    .selectable_label(self.config.account_colors_enabled, "Enabled")
-                                    .clicked()
+                                    .checkbox(
+                                        &mut self.config.account_colors_enabled,
+                                        "Show environment colors",
+                                    )
+                                    .changed()
                                 {
-                                    self.config.account_colors_enabled = !self.config.account_colors_enabled;
                                     let _ = self.config.save();
                                 }
                                 if self.config.account_colors_enabled {
@@ -9524,6 +9532,9 @@ mod gui {
     fn spawn_control_channel(
         command: &PtyCommand,
         context: &AwsContext,
+        tab_id: u64,
+        lane: ChannelLane,
+        diag_tx: Sender<FileOpEvent>,
     ) -> Result<Arc<ControlChannel>> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -9623,9 +9634,12 @@ mod gui {
 
         // Handshake thread: quiet the shell (disable echo, blank prompt)
         // and wait for the ready sentinel before marking the channel up.
+        // On timeout the channel is marked dead so the next file op
+        // respawns it (the machine is often less loaded by then).
         {
             let ch = Arc::clone(&channel);
             std::thread::spawn(move || {
+                let started = Instant::now();
                 // Let the SSM session establish its remote shell first.
                 std::thread::sleep(Duration::from_millis(600));
                 let init = "stty -echo 2>/dev/null; export PS1=''; \
@@ -9635,7 +9649,7 @@ mod gui {
                     let _ = w.write_all(init.as_bytes());
                     let _ = w.flush();
                 }
-                let deadline = Instant::now() + Duration::from_secs(25);
+                let deadline = Instant::now() + Duration::from_secs(60);
                 let (lock, cv) = &*ch.buf;
                 let mut guard = match lock.lock() {
                     Ok(g) => g,
@@ -9645,9 +9659,30 @@ mod gui {
                     if channel_handshake_done(&guard) {
                         guard.clear();
                         ch.ready.store(true, Ordering::SeqCst);
+                        let _ = diag_tx.send(FileOpEvent::OpDiag {
+                            tab_id,
+                            message: format!(
+                                "{} control channel handshake OK ({}ms)",
+                                lane.as_str(),
+                                started.elapsed().as_millis(),
+                            ),
+                        });
                         return;
                     }
-                    if ch.dead.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                    if ch.dead.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if Instant::now() >= deadline {
+                        // Mark dead so ensure_control_channel respawns it.
+                        ch.dead.store(true, Ordering::SeqCst);
+                        let _ = diag_tx.send(FileOpEvent::OpDiag {
+                            tab_id,
+                            message: format!(
+                                "{} control channel handshake TIMED OUT after 60s \
+                                 — will respawn on next use",
+                                lane.as_str(),
+                            ),
+                        });
                         return;
                     }
                     let (g, _) = match cv
