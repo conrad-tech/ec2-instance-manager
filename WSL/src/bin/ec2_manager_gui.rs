@@ -924,6 +924,95 @@ mod gui {
         ssm_wait_for_command(&ctx.profile, &ctx.region, instance_id, &command_id)
     }
 
+    /// Up to this many path-completion matches are shown directly in the
+    /// dropdown; more triggers the "Show N matches?" confirmation.
+    const PATH_COMPLETION_INLINE_LIMIT: usize = 10;
+
+    /// One file/dir candidate for path-input tab completion.
+    #[derive(Clone)]
+    struct CompletionItem {
+        /// Full path produced when this item is selected.
+        path: String,
+        /// Basename label shown in the dropdown (dirs get a trailing /).
+        label: String,
+        is_dir: bool,
+    }
+
+    /// Active tab-completion dropdown state for a file-browser path box.
+    struct PathCompletion {
+        matches: Vec<CompletionItem>,
+        /// Highlighted row. In confirm mode: 0 = Yes, 1 = No.
+        selected: usize,
+        /// True while showing the "Show N matches?" Yes/No confirmation
+        /// (set when matches exceed PATH_COMPLETION_INLINE_LIMIT).
+        needs_confirm: bool,
+    }
+
+    /// Split a typed path into (parent_directory, prefix) for completion.
+    fn split_path_for_completion(input: &str) -> (String, String) {
+        match input.rsplit_once('/') {
+            Some((parent, prefix)) => {
+                let parent = if parent.is_empty() {
+                    "/".to_string()
+                } else {
+                    parent.to_string()
+                };
+                (parent, prefix.to_string())
+            }
+            None => ("/".to_string(), input.to_string()),
+        }
+    }
+
+    /// Longest common prefix of a set of strings (for terminal-style
+    /// "complete as far as unambiguous").
+    fn longest_common_prefix(items: &[&str]) -> String {
+        let Some(first) = items.first() else {
+            return String::new();
+        };
+        let mut prefix = (*first).to_string();
+        for s in &items[1..] {
+            while !s.starts_with(prefix.as_str()) {
+                prefix.pop();
+                if prefix.is_empty() {
+                    return String::new();
+                }
+            }
+        }
+        prefix
+    }
+
+    /// Compute path-completion candidates for `input` from the directory
+    /// cache: entries of the typed parent directory whose name starts
+    /// with the typed prefix. Directories sort before files.
+    fn compute_path_completions(
+        dir_cache: &HashMap<String, Vec<FileEntry>>,
+        input: &str,
+    ) -> Vec<CompletionItem> {
+        let (parent, prefix) = split_path_for_completion(input);
+        let Some(entries) = dir_cache.get(&parent) else {
+            return Vec::new();
+        };
+        let mut out: Vec<CompletionItem> = entries
+            .iter()
+            .filter(|e| e.name.starts_with(&prefix))
+            .map(|e| CompletionItem {
+                path: join_path(&parent, &e.name),
+                label: if e.is_dir {
+                    format!("{}/", e.name)
+                } else {
+                    e.name.clone()
+                },
+                is_dir: e.is_dir,
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.label.to_ascii_lowercase().cmp(&b.label.to_ascii_lowercase()))
+        });
+        out
+    }
+
     struct FileBrowserState {
         current_path: String,
         entries: Vec<FileEntry>,
@@ -947,6 +1036,12 @@ mod gui {
         terminal_had_focus: bool,
         /// Currently selected file in tree view (full_path, filename)
         selected_file: Option<(String, String)>,
+        /// When the connection tab was opened — used to delay the hidden
+        /// control channel so it doesn't compete with the visible
+        /// terminal's SSM connection.
+        opened_at: Instant,
+        /// Active path-input tab-completion dropdown, if any.
+        path_completion: Option<PathCompletion>,
     }
 
     impl Default for FileBrowserState {
@@ -967,6 +1062,8 @@ mod gui {
                 fetching_dirs: std::collections::HashSet::new(),
                 terminal_had_focus: false,
                 selected_file: None,
+                opened_at: Instant::now(),
+                path_completion: None,
             }
         }
     }
@@ -2283,6 +2380,18 @@ mod gui {
 
         /// Refresh a single profile in the background.
         fn refresh_profile(&mut self, profile_id: &str, force: bool) {
+            self.refresh_profile_delayed(profile_id, force, Duration::ZERO);
+        }
+
+        /// Refresh a single profile in the background, with an optional
+        /// start delay so a batch of refreshes can be staggered to stay
+        /// under the AWS API rate limit.
+        fn refresh_profile_delayed(
+            &mut self,
+            profile_id: &str,
+            force: bool,
+            start_delay: Duration,
+        ) {
             self.refresh_generation += 1;
             let gen = self.refresh_generation;
             let pid = profile_id.to_string();
@@ -2312,6 +2421,11 @@ mod gui {
             let tx = self.refresh_tx.clone();
 
             std::thread::spawn(move || {
+                // Staggered start: spread API calls so a batch refresh
+                // doesn't trip the AWS rate limiter all at once.
+                if !start_delay.is_zero() {
+                    std::thread::sleep(start_delay);
+                }
                 let context = match build_context_with_profile(
                     mode,
                     &config,
@@ -2405,12 +2519,17 @@ mod gui {
             }
 
             self.log_info(format!(
-                "refreshing {} authenticated profiles in parallel",
+                "refreshing {} authenticated profiles (staggered)",
                 authed_profiles.len()
             ));
 
-            for pid in &authed_profiles {
-                self.refresh_profile(pid, force);
+            // Stagger the starts: 2 profiles per ~1.2s batch, so the
+            // burst of describe-* API calls stays under the rate limit
+            // instead of all firing at once and triggering throttling.
+            for (idx, pid) in authed_profiles.iter().enumerate() {
+                let batch = idx / 2;
+                let delay = Duration::from_millis(batch as u64 * 1200);
+                self.refresh_profile_delayed(pid, force, delay);
             }
         }
 
@@ -4180,6 +4299,25 @@ mod gui {
                     return Some(Arc::clone(ch));
                 }
                 self.control_channels.remove(&tab_id);
+            }
+            // Hold off spawning the control channel until the visible
+            // terminal's SSM session has connected — a concurrent second
+            // `aws ssm start-session` competes for the throttled
+            // StartSession API and slows the user-facing connection.
+            // (Cap the wait at 30s so a stuck terminal doesn't block
+            // file ops forever — they fall back to send-command.)
+            let terminal_connected = self
+                .pty_sessions
+                .get(&tab_id)
+                .map(|s| s.connect_logged)
+                .unwrap_or(false);
+            let waited_long = self
+                .file_browsers
+                .get(&tab_id)
+                .map(|fb| fb.opened_at.elapsed() >= Duration::from_secs(30))
+                .unwrap_or(true);
+            if !terminal_connected && !waited_long {
+                return None;
             }
             let tab = self
                 .connections
@@ -7111,17 +7249,117 @@ mod gui {
                 FileOpStatus::Listing | FileOpStatus::Downloading | FileOpStatus::Uploading
                 | FileOpStatus::Initializing | FileOpStatus::Updating
             );
+            // Snapshot the directory cache + take the completion popup
+            // state so Tab can complete against cached listings.
+            let dir_cache_snapshot = self
+                .file_browsers
+                .get(&tab_id)
+                .map(|fb| fb.dir_cache.clone())
+                .unwrap_or_default();
+            let mut completion = self
+                .file_browsers
+                .get_mut(&tab_id)
+                .and_then(|fb| fb.path_completion.take());
+            let mut apply_completion: Option<CompletionItem> = None;
+
             ui.horizontal(|ui| {
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut path_input)
                         .desired_width(150.0)
                         .font(egui::TextStyle::Small),
                 );
-                if response.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                let focused = response.has_focus();
+
+                // Tab → complete the path (terminal-style).
+                if focused
+                    && ui.input_mut(|i| {
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                    })
                 {
-                    navigate_to = Some(path_input.clone());
+                    let comps =
+                        compute_path_completions(&dir_cache_snapshot, &path_input);
+                    if comps.len() == 1 {
+                        let item = &comps[0];
+                        path_input = if item.is_dir {
+                            format!("{}/", item.path)
+                        } else {
+                            item.path.clone()
+                        };
+                        completion = None;
+                    } else if comps.len() >= 2 {
+                        // Advance the text to the longest common prefix.
+                        let (parent, prefix) =
+                            split_path_for_completion(&path_input);
+                        let names: Vec<&str> = comps
+                            .iter()
+                            .map(|c| c.label.trim_end_matches('/'))
+                            .collect();
+                        let lcp = longest_common_prefix(&names);
+                        if lcp.len() > prefix.len() {
+                            path_input = join_path(&parent, &lcp);
+                        }
+                        let needs_confirm =
+                            comps.len() > PATH_COMPLETION_INLINE_LIMIT;
+                        completion = Some(PathCompletion {
+                            matches: comps,
+                            selected: 0,
+                            needs_confirm,
+                        });
+                    } else {
+                        completion = None;
+                    }
+                    response.request_focus();
                 }
+
+                // Arrow/Escape navigation while the dropdown is open.
+                if focused {
+                    if let Some(comp) = completion.as_mut() {
+                        if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                            let max = if comp.needs_confirm {
+                                1
+                            } else {
+                                comp.matches.len().saturating_sub(1)
+                            };
+                            comp.selected = (comp.selected + 1).min(max);
+                        }
+                        if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                            comp.selected = comp.selected.saturating_sub(1);
+                        }
+                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            completion = None;
+                        }
+                    }
+                }
+
+                // Enter: apply the completion if the popup is open,
+                // otherwise navigate to the typed path.
+                let enter = focused
+                    && ui.input_mut(|i| {
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                    });
+                if enter {
+                    if let Some(comp) = completion.take() {
+                        if comp.needs_confirm {
+                            if comp.selected == 0 {
+                                // Yes → expand to the full list.
+                                completion = Some(PathCompletion {
+                                    matches: comp.matches,
+                                    selected: 0,
+                                    needs_confirm: false,
+                                });
+                            }
+                            // No → leave closed.
+                        } else if let Some(item) =
+                            comp.matches.get(comp.selected)
+                        {
+                            apply_completion = Some(item.clone());
+                        }
+                        response.request_focus();
+                    } else {
+                        navigate_to = Some(path_input.clone());
+                    }
+                }
+
                 if ui.small_button("Go").clicked() {
                     navigate_to = Some(path_input.clone());
                 }
@@ -7132,10 +7370,100 @@ mod gui {
                     refresh_all = true;
                     navigate_to = Some(current_path.clone());
                 }
+
+                // Completion dropdown, anchored below the path box.
+                let mut row_clicked: Option<usize> = None;
+                let mut confirm_yes: Option<bool> = None;
+                if let Some(comp) = completion.as_ref() {
+                    egui::Area::new(egui::Id::new(("path_completion", tab_id)))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(response.rect.left_bottom())
+                        .show(ui.ctx(), |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.set_min_width(
+                                    response.rect.width().max(200.0),
+                                );
+                                if comp.needs_confirm {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Show {} matches?",
+                                            comp.matches.len()
+                                        ))
+                                        .weak(),
+                                    );
+                                    if ui
+                                        .selectable_label(
+                                            comp.selected == 0,
+                                            "Yes",
+                                        )
+                                        .clicked()
+                                    {
+                                        confirm_yes = Some(true);
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            comp.selected == 1,
+                                            "No",
+                                        )
+                                        .clicked()
+                                    {
+                                        confirm_yes = Some(false);
+                                    }
+                                } else {
+                                    egui::ScrollArea::vertical()
+                                        .max_height(220.0)
+                                        .show(ui, |ui| {
+                                            for (i, item) in
+                                                comp.matches.iter().enumerate()
+                                            {
+                                                let r = ui.selectable_label(
+                                                    comp.selected == i,
+                                                    &item.label,
+                                                );
+                                                if comp.selected == i {
+                                                    r.scroll_to_me(None);
+                                                }
+                                                if r.clicked() {
+                                                    row_clicked = Some(i);
+                                                }
+                                            }
+                                        });
+                                }
+                            });
+                        });
+                }
+                if let Some(yes) = confirm_yes {
+                    if let Some(comp) = completion.take() {
+                        if yes {
+                            completion = Some(PathCompletion {
+                                matches: comp.matches,
+                                selected: 0,
+                                needs_confirm: false,
+                            });
+                        }
+                    }
+                }
+                if let Some(i) = row_clicked {
+                    if let Some(comp) = completion.take() {
+                        if let Some(item) = comp.matches.get(i) {
+                            apply_completion = Some(item.clone());
+                        }
+                    }
+                }
             });
-            // Write back path_input
+
+            if let Some(item) = apply_completion {
+                path_input = if item.is_dir {
+                    format!("{}/", item.path)
+                } else {
+                    item.path.clone()
+                };
+            }
+
+            // Write back path_input + completion state.
             if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
                 fb.path_input = path_input;
+                fb.path_completion = completion;
             }
 
             // Up button
@@ -12432,6 +12760,78 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         fn parse_ls_output_handles_empty_output() {
             let entries = parse_ls_output("");
             assert!(entries.is_empty());
+        }
+
+        #[test]
+        fn strip_ansi_removes_color_codes() {
+            assert_eq!(
+                strip_ansi("\x1b[34m\x1b[1mhome\x1b[m\x1b[K"),
+                "home"
+            );
+            assert_eq!(strip_ansi("plain"), "plain");
+        }
+
+        #[test]
+        fn split_path_for_completion_splits_parent_and_prefix() {
+            assert_eq!(
+                split_path_for_completion("/efs/ho"),
+                ("/efs".to_string(), "ho".to_string())
+            );
+            assert_eq!(
+                split_path_for_completion("/efs/"),
+                ("/efs".to_string(), String::new())
+            );
+            assert_eq!(
+                split_path_for_completion("/x"),
+                ("/".to_string(), "x".to_string())
+            );
+        }
+
+        #[test]
+        fn longest_common_prefix_finds_shared_start() {
+            assert_eq!(longest_common_prefix(&["home", "homework"]), "home");
+            assert_eq!(longest_common_prefix(&["abc", "abd", "abe"]), "ab");
+            assert_eq!(longest_common_prefix(&["x", "y"]), "");
+            assert_eq!(longest_common_prefix(&["solo"]), "solo");
+        }
+
+        #[test]
+        fn compute_path_completions_filters_by_prefix() {
+            let mut cache: HashMap<String, Vec<FileEntry>> = HashMap::new();
+            cache.insert(
+                "/efs".to_string(),
+                vec![
+                    FileEntry {
+                        name: "home".into(),
+                        is_dir: true,
+                        size: 0,
+                        permissions: "drwxr-xr-x".into(),
+                        modified: String::new(),
+                    },
+                    FileEntry {
+                        name: "hosts".into(),
+                        is_dir: false,
+                        size: 0,
+                        permissions: "-rw-r--r--".into(),
+                        modified: String::new(),
+                    },
+                    FileEntry {
+                        name: "staging".into(),
+                        is_dir: true,
+                        size: 0,
+                        permissions: "drwxr-xr-x".into(),
+                        modified: String::new(),
+                    },
+                ],
+            );
+            let matches = compute_path_completions(&cache, "/efs/ho");
+            assert_eq!(matches.len(), 2);
+            // Directory sorts before the file.
+            assert_eq!(matches[0].path, "/efs/home");
+            assert!(matches[0].is_dir);
+            assert_eq!(matches[0].label, "home/");
+            assert_eq!(matches[1].path, "/efs/hosts");
+            assert!(compute_path_completions(&cache, "/efs/zzz").is_empty());
         }
 
         #[test]
