@@ -512,12 +512,18 @@ pub fn vscode_cli_available() -> bool {
     };
     for cmd in candidates {
         let probe = if cfg!(windows) { "where" } else { "which" };
-        if let Ok(status) = std::process::Command::new(probe)
+        let mut command = std::process::Command::new(probe);
+        command
             .arg(cmd)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .stderr(std::process::Stdio::null());
+        // Don't pop a console window for the probe on Windows.
+        #[cfg(windows)]
         {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        if let Ok(status) = command.status() {
             if status.success() {
                 return true;
             }

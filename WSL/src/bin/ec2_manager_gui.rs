@@ -743,8 +743,10 @@ mod gui {
         writer: Mutex<Box<dyn Write + Send>>,
         /// Master PTY, kept alive for the channel's lifetime.
         _master: Mutex<Box<dyn MasterPty + Send>>,
-        /// The `aws ssm start-session` child process.
-        child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
+        /// The `aws ssm start-session` child process. Wrapped in Option
+        /// so Drop can move it into a detached thread to kill it — a
+        /// synchronous ConPTY kill() on the UI thread can hang the app.
+        child: Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>,
         /// True once the shell handshake has completed.
         ready: Arc<AtomicBool>,
         /// True once the reader hit EOF (the session died).
@@ -829,8 +831,17 @@ mod gui {
 
     impl Drop for ControlChannel {
         fn drop(&mut self) {
-            if let Ok(mut child) = self.child.lock() {
-                let _ = child.kill();
+            // Kill the child on a detached thread: a ConPTY kill()/wait()
+            // can block, and doing it inline would freeze the UI thread
+            // when the channel is dropped during tab close / app exit.
+            let child = self.child.lock().ok().and_then(|mut g| g.take());
+            if let Some(mut child) = child {
+                std::thread::spawn(move || {
+                    let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }));
+                });
             }
         }
     }
@@ -1467,6 +1478,14 @@ mod gui {
                     config.excluded_envs.sort();
                 }
                 config.shared_env_default_applied = true;
+                let _ = config.save();
+            }
+            // One-time migration: environment colors should be on by
+            // default. Clears any stale disabled state once; after this
+            // the user's own toggle choice is respected.
+            if !config.colors_default_applied {
+                config.account_colors_enabled = true;
+                config.colors_default_applied = true;
                 let _ = config.save();
             }
             let initial_hidden_envs: std::collections::HashSet<String> =
@@ -9597,7 +9616,7 @@ mod gui {
             buf: Arc::new((Mutex::new(Vec::new()), Condvar::new())),
             writer: Mutex::new(writer),
             _master: Mutex::new(master),
-            child: Mutex::new(child),
+            child: Mutex::new(Some(child)),
             ready: Arc::new(AtomicBool::new(false)),
             dead: Arc::new(AtomicBool::new(false)),
             next_id: AtomicU64::new(1),
