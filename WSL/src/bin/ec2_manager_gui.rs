@@ -1488,6 +1488,13 @@ mod gui {
         refresh_generation: u64,
         /// Profiles currently being refreshed in background threads
         refreshing_profiles: HashMap<String, u64>,
+        /// Profiles waiting to be refreshed. Drained one at a time by
+        /// `pump_refresh_queue` so a bulk refresh never floods the
+        /// throttled AWS API. Each entry is (profile_id, force).
+        refresh_queue: VecDeque<(String, bool)>,
+        /// While set (and in the future), no new refresh is started —
+        /// used to keep the API clear right after the user connects.
+        refresh_pause_until: Option<Instant>,
         /// Per-profile in-memory inventory cache: profile_id -> (Inventory, AwsContext)
         profile_inventory_cache: HashMap<String, (Inventory, AwsContext)>,
         debug_mode: bool,
@@ -1715,6 +1722,8 @@ mod gui {
                 refreshing: false,
                 refresh_generation: 0,
                 refreshing_profiles: HashMap::new(),
+                refresh_queue: VecDeque::new(),
+                refresh_pause_until: None,
                 profile_inventory_cache: HashMap::new(),
                 debug_mode,
                 wsl_auto_setup,
@@ -2380,28 +2389,62 @@ mod gui {
 
         /// Refresh a single profile in the background.
         fn refresh_profile(&mut self, profile_id: &str, force: bool) {
-            self.refresh_profile_delayed(profile_id, force, Duration::ZERO);
+            // Single user-initiated refreshes jump the queue (front).
+            self.enqueue_refresh(profile_id, force, true);
         }
 
-        /// Refresh a single profile in the background, with an optional
-        /// start delay so a batch of refreshes can be staggered to stay
-        /// under the AWS API rate limit.
-        fn refresh_profile_delayed(
-            &mut self,
-            profile_id: &str,
-            force: bool,
-            start_delay: Duration,
-        ) {
-            // Don't start a second refresh for a profile that's already
-            // refreshing — a duplicate (from Refresh All, or switching
-            // A → B → A) just wastes an API call; the in-flight refresh
-            // already delivers fresh data.
-            if self.refreshing_profiles.contains_key(profile_id) {
+        /// Add a profile to the refresh queue (skipping duplicates), then
+        /// pump the queue. `front` = true puts it ahead of pending bulk
+        /// refreshes (used for the account the user is looking at).
+        fn enqueue_refresh(&mut self, profile_id: &str, force: bool, front: bool) {
+            // Skip if it's already refreshing or already queued — a
+            // duplicate (Refresh All, or switching A → B → A) just wastes
+            // a throttled API call.
+            if self.refreshing_profiles.contains_key(profile_id)
+                || self.refresh_queue.iter().any(|(p, _)| p == profile_id)
+            {
                 self.log_debug(format!(
-                    "refresh skipped for profile={profile_id}: already refreshing"
+                    "refresh skipped for profile={profile_id}: already queued/refreshing"
                 ));
                 return;
             }
+            let entry = (profile_id.to_string(), force);
+            if front {
+                self.refresh_queue.push_front(entry);
+            } else {
+                self.refresh_queue.push_back(entry);
+            }
+            self.pump_refresh_queue();
+        }
+
+        /// Start queued refreshes one at a time. Running a single refresh
+        /// at a time keeps the throttled SSM/EC2 API from being flooded,
+        /// so `aws ssm start-session` (connecting) stays fast.
+        fn pump_refresh_queue(&mut self) {
+            // Hold off right after the user connects so the connection's
+            // own API call gets a clear window.
+            if let Some(until) = self.refresh_pause_until {
+                if Instant::now() < until {
+                    return;
+                }
+                self.refresh_pause_until = None;
+            }
+            // One refresh at a time.
+            while self.refreshing_profiles.is_empty() {
+                let Some((pid, force)) = self.refresh_queue.pop_front() else {
+                    break;
+                };
+                if self.refreshing_profiles.contains_key(&pid) {
+                    continue;
+                }
+                self.spawn_refresh(&pid, force);
+            }
+        }
+
+        /// Spawn the background thread that actually refreshes one
+        /// profile. Callers should go through `enqueue_refresh` so the
+        /// concurrency limit is respected.
+        fn spawn_refresh(&mut self, profile_id: &str, force: bool) {
             self.refresh_generation += 1;
             let gen = self.refresh_generation;
             let pid = profile_id.to_string();
@@ -2431,11 +2474,6 @@ mod gui {
             let tx = self.refresh_tx.clone();
 
             std::thread::spawn(move || {
-                // Staggered start: spread API calls so a batch refresh
-                // doesn't trip the AWS rate limiter all at once.
-                if !start_delay.is_zero() {
-                    std::thread::sleep(start_delay);
-                }
                 let context = match build_context_with_profile(
                     mode,
                     &config,
@@ -2529,26 +2567,24 @@ mod gui {
             }
 
             self.log_info(format!(
-                "refreshing {} authenticated profiles (staggered)",
+                "queueing {} authenticated profiles for refresh",
                 authed_profiles.len()
             ));
 
-            // Refresh the selected account immediately (the user sees it
-            // first); trickle the rest one at a time, 2.5s apart, so the
-            // burst of SSM describe-* calls stays under the API rate
-            // limit. The SSM API is shared with `start-session`, so a
-            // gentle stagger keeps connections fast during a refresh.
+            // Queue every account; the queue runs one refresh at a time
+            // so the throttled SSM/EC2 API isn't flooded. Enqueue the
+            // selected account first (front) so the user sees its data
+            // refreshed soonest; the rest follow in order.
             let selected = self.selected_profile.clone();
-            let mut other_n: u64 = 0;
+            if let Some(sel) = selected.as_deref() {
+                if authed_profiles.iter().any(|p| p == sel) {
+                    self.enqueue_refresh(sel, force, true);
+                }
+            }
             for pid in &authed_profiles {
-                let delay = if selected.as_deref() == Some(pid.as_str()) {
-                    Duration::ZERO
-                } else {
-                    let d = Duration::from_millis(2000 + other_n * 2500);
-                    other_n += 1;
-                    d
-                };
-                self.refresh_profile_delayed(pid, force, delay);
+                if selected.as_deref() != Some(pid.as_str()) {
+                    self.enqueue_refresh(pid, force, false);
+                }
             }
         }
 
@@ -3460,6 +3496,12 @@ mod gui {
                 .selected_instance()
                 .ok_or_else(|| AppError::NotFound("Select an instance first".to_string()))?
                 .clone();
+
+            // Pause queued background refreshes so the connection's own
+            // `aws ssm start-session` API call gets a clear, unthrottled
+            // window. Refreshes resume after the pause.
+            self.refresh_pause_until =
+                Some(Instant::now() + Duration::from_secs(30));
 
             // Find the correct context for this instance — it may belong to
             // a multi-account profile, not the currently selected one.
@@ -8317,9 +8359,17 @@ mod gui {
                     ctx.request_repaint();
                 }
                 self.poll_refresh_events();
+                // Start the next queued refresh once the running one
+                // finishes (and once any post-connect pause elapses).
+                self.pump_refresh_queue();
                 self.poll_file_op_events();
                 if self.refreshing {
                     ctx.request_repaint_after(Duration::from_millis(100));
+                }
+                // Keep ticking while refreshes are queued/paused so the
+                // pump runs even when the user is idle.
+                if !self.refresh_queue.is_empty() {
+                    ctx.request_repaint_after(Duration::from_millis(500));
                 }
                 if self.main_tab == MainTab::Connections && !self.pty_sessions.is_empty() {
                     ctx.request_repaint_after(Duration::from_millis(16));
