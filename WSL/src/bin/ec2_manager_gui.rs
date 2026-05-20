@@ -710,6 +710,25 @@ mod gui {
         }
     }
 
+    /// Which control-channel lane a file op runs on. Interactive ops the
+    /// user is actively waiting on (open/save/download/upload, current
+    /// directory listing) get their own lane so they never queue behind a
+    /// slow speculative `find`/prefetch on the Background lane.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    enum ChannelLane {
+        Interactive,
+        Background,
+    }
+
+    impl ChannelLane {
+        fn as_str(self) -> &'static str {
+            match self {
+                ChannelLane::Interactive => "interactive",
+                ChannelLane::Background => "background",
+            }
+        }
+    }
+
     /// A hidden, persistent SSM shell session used to run file-browser
     /// commands without the per-invocation overhead of `ssm send-command`.
     /// Each command is wrapped in sentinel markers so its combined output
@@ -930,6 +949,12 @@ mod gui {
         ListingFailed {
             tab_id: u64,
             error: String,
+        },
+        /// Diagnostic line from a file-op worker thread (timing, which
+        /// channel lane / fallback path was used). Logged on arrival.
+        OpDiag {
+            tab_id: u64,
+            message: String,
         },
         /// Bulk subtree listing from one `find` call: each entry is a
         /// directory path and its children, used to pre-populate the
@@ -1395,9 +1420,11 @@ mod gui {
         /// a change vs `connections.selected()` triggers auto-focus.
         last_connection_tab: Option<u64>,
         file_browsers: HashMap<u64, FileBrowserState>,
-        /// Hidden persistent SSM shell per connection tab, used to run
-        /// file-browser commands fast (lazily spawned on first file op).
-        control_channels: HashMap<u64, Arc<ControlChannel>>,
+        /// Hidden persistent SSM shells per connection tab, keyed by
+        /// (tab_id, lane). The Interactive lane serves ops the user is
+        /// waiting on; the Background lane serves speculative `find`/
+        /// prefetch traffic, so the two never block each other.
+        control_channels: HashMap<(u64, ChannelLane), Arc<ControlChannel>>,
         /// Host blocks discovered by scanning ~/.ssh/config (for pem auto-detect).
         discovered_ssh_hosts: Vec<ec2_manager::ssh_config::DiscoveredHost>,
         /// When the ssh config was last scanned (for the periodic re-scan).
@@ -2061,6 +2088,34 @@ mod gui {
                 &self.inventory,
                 self.selected_profile.as_deref(),
             );
+            // Diagnostic: why might the environment color legend be empty?
+            let env_keys = self
+                .account_color_map
+                .keys()
+                .filter(|k| k.contains(':'))
+                .count();
+            let with_env = self
+                .inventory
+                .instances
+                .iter()
+                .filter(|i| instance_env(i).is_some())
+                .count();
+            let sample_tags: Vec<String> = self
+                .inventory
+                .instances
+                .first()
+                .map(|i| i.tags.keys().take(12).cloned().collect())
+                .unwrap_or_default();
+            self.log_info(format!(
+                "account colors rebuilt: profiles={} map_entries={} env_keys={env_keys} \
+                 selected={:?} inventory={} with_MMODAL_ENV={with_env} \
+                 cached_profiles={} first_instance_tags={sample_tags:?}",
+                self.config.profiles.len(),
+                self.account_color_map.len(),
+                self.selected_profile,
+                self.inventory.instances.len(),
+                self.profile_inventory_cache.len(),
+            ));
         }
 
         /// Load cached inventory for a profile (in-memory first, then disk).
@@ -3393,10 +3448,11 @@ mod gui {
             };
             fb_state.initialized = false;
             self.file_browsers.insert(tab_id, fb_state);
-            // Warm the hidden file-ops control channel now so it has
-            // finished its handshake by the time the user opens the file
+            // Warm both hidden file-ops control channels now so they have
+            // finished their handshake by the time the user opens the file
             // browser — the first listing/file-open is then already fast.
-            let _ = self.ensure_control_channel(tab_id);
+            let _ = self.ensure_control_channel(tab_id, ChannelLane::Interactive);
+            let _ = self.ensure_control_channel(tab_id, ChannelLane::Background);
             self.log_info(format!(
                 "opened connection tab id={tab_id} instance={instance_id}"
             ));
@@ -4036,26 +4092,33 @@ mod gui {
                 });
             }
             self.file_browsers.remove(&tab_id);
-            // Dropping the Arc kills the hidden control-channel shell.
-            self.control_channels.remove(&tab_id);
+            // Dropping the Arcs kills both hidden control-channel shells.
+            self.control_channels
+                .remove(&(tab_id, ChannelLane::Interactive));
+            self.control_channels
+                .remove(&(tab_id, ChannelLane::Background));
             self.terminal_selections.remove(&tab_id);
             self.connections.close(tab_id);
             self.log_info(format!("closed connection tab id={tab_id}"));
         }
 
-        /// Get the file-ops control channel for a tab, lazily spawning a
-        /// hidden persistent SSM shell on first use. Returns None in sim
-        /// mode or if the shell could not be spawned (callers then fall
-        /// back to one-shot `ssm send-command`).
-        fn ensure_control_channel(&mut self, tab_id: u64) -> Option<Arc<ControlChannel>> {
+        /// Get a file-ops control channel for a tab + lane, lazily
+        /// spawning a hidden persistent SSM shell on first use. Returns
+        /// None in sim mode or if the shell could not be spawned (callers
+        /// then fall back to one-shot `ssm send-command`).
+        fn ensure_control_channel(
+            &mut self,
+            tab_id: u64,
+            lane: ChannelLane,
+        ) -> Option<Arc<ControlChannel>> {
             if self.options.mode == Mode::Sim {
                 return None;
             }
-            if let Some(ch) = self.control_channels.get(&tab_id) {
+            if let Some(ch) = self.control_channels.get(&(tab_id, lane)) {
                 if !ch.dead.load(Ordering::SeqCst) {
                     return Some(Arc::clone(ch));
                 }
-                self.control_channels.remove(&tab_id);
+                self.control_channels.remove(&(tab_id, lane));
             }
             let tab = self
                 .connections
@@ -4084,15 +4147,18 @@ mod gui {
             match spawn_control_channel(&pty_cmd, &context) {
                 Ok(ch) => {
                     self.log_info(format!(
-                        "spawned file-ops control channel for tab={tab_id}"
+                        "spawned {} control channel for tab={tab_id}",
+                        lane.as_str()
                     ));
-                    self.control_channels.insert(tab_id, Arc::clone(&ch));
+                    self.control_channels
+                        .insert((tab_id, lane), Arc::clone(&ch));
                     Some(ch)
                 }
                 Err(err) => {
                     self.log_warn(format!(
-                        "control channel spawn failed for tab={tab_id}: {err} \
-                         (falling back to send-command)"
+                        "control channel spawn failed for tab={tab_id} lane={}: {err} \
+                         (falling back to send-command)",
+                        lane.as_str()
                     ));
                     None
                 }
@@ -4128,7 +4194,8 @@ mod gui {
                 .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
             let tx = self.file_op_tx.clone();
-            let channel = self.ensure_control_channel(tab_id);
+            let channel =
+                self.ensure_control_channel(tab_id, ChannelLane::Interactive);
             let tree_path = path.clone();
 
             std::thread::spawn(move || {
@@ -4192,10 +4259,14 @@ mod gui {
             else {
                 return;
             };
-            let channel = self.ensure_control_channel(tab_id);
+            let channel =
+                self.ensure_control_channel(tab_id, ChannelLane::Background);
             let tx = self.file_op_tx.clone();
 
             std::thread::spawn(move || {
+                let started = Instant::now();
+                let channel_usable =
+                    channel.as_ref().map(|c| c.is_usable()).unwrap_or(false);
                 // %y type, %M perms, %s size, date, %p path — one line each.
                 // Bounded by -maxdepth and a row cap so a huge tree can't
                 // flood the channel; deeper dirs fall back to lazy `ls`.
@@ -4204,21 +4275,36 @@ mod gui {
                      -printf '%y\\t%M\\t%s\\t%TY-%Tm-%Td %TH:%TM\\t%p\\n' \
                      2>/dev/null | head -n 20000"
                 );
-                if let Ok(output) = exec_remote_command(
+                let outcome = exec_remote_command(
                     &channel,
                     &context,
                     &instance_id,
                     &cmd,
                     Duration::from_secs(30),
-                ) {
-                    let dirs = parse_find_output(&output, &root);
-                    if !dirs.is_empty() {
-                        let _ = tx.send(FileOpEvent::TreeListingCompleted {
-                            tab_id,
-                            dirs,
-                        });
+                );
+                let dir_count = match &outcome {
+                    Ok(output) => {
+                        let dirs = parse_find_output(output, &root);
+                        let n = dirs.len();
+                        if !dirs.is_empty() {
+                            let _ = tx.send(FileOpEvent::TreeListingCompleted {
+                                tab_id,
+                                dirs,
+                            });
+                        }
+                        n
                     }
-                }
+                    Err(_) => 0,
+                };
+                let _ = tx.send(FileOpEvent::OpDiag {
+                    tab_id,
+                    message: format!(
+                        "tree scan {root}: lane=background path={} \
+                         channel_usable={channel_usable} elapsed={}ms dirs={dir_count}",
+                        if channel_usable { "control-channel" } else { "send-command" },
+                        started.elapsed().as_millis(),
+                    ),
+                });
             });
         }
 
@@ -4245,7 +4331,8 @@ mod gui {
                 .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
             let tx = self.file_op_tx.clone();
-            let channel = self.ensure_control_channel(tab_id);
+            let channel =
+                self.ensure_control_channel(tab_id, ChannelLane::Background);
 
             std::thread::spawn(move || {
                 let result = if mode == Mode::Sim {
@@ -4295,7 +4382,8 @@ mod gui {
                 .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
             let tx = self.file_op_tx.clone();
-            let channel = self.ensure_control_channel(tab_id);
+            let channel =
+                self.ensure_control_channel(tab_id, ChannelLane::Interactive);
 
             std::thread::spawn(move || {
                 let result = if mode == Mode::Sim {
@@ -4366,7 +4454,8 @@ mod gui {
                 .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
             let tx = self.file_op_tx.clone();
-            let channel = self.ensure_control_channel(tab_id);
+            let channel =
+                self.ensure_control_channel(tab_id, ChannelLane::Interactive);
 
             std::thread::spawn(move || {
                 let result = if mode == Mode::Sim {
@@ -4439,7 +4528,8 @@ mod gui {
                 .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
             let tx = self.file_op_tx.clone();
-            let channel = self.ensure_control_channel(tab_id);
+            let channel =
+                self.ensure_control_channel(tab_id, ChannelLane::Interactive);
             let file_name = std::path::Path::new(&local_path)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -4522,9 +4612,13 @@ mod gui {
                 .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
             let tx = self.file_op_tx.clone();
-            let channel = self.ensure_control_channel(tab_id);
+            let channel =
+                self.ensure_control_channel(tab_id, ChannelLane::Interactive);
 
             std::thread::spawn(move || {
+                let started = Instant::now();
+                let channel_usable =
+                    channel.as_ref().map(|c| c.is_usable()).unwrap_or(false);
                 let result = if mode == Mode::Sim {
                     std::fs::read_to_string(&remote_path)
                         .map_err(|e| e.to_string())
@@ -4551,6 +4645,17 @@ mod gui {
                     Err("no AWS context available".to_string())
                 };
 
+                let _ = tx.send(FileOpEvent::OpDiag {
+                    tab_id,
+                    message: format!(
+                        "open file {remote_path}: lane=interactive \
+                         channel_usable={channel_usable} \
+                         path={} elapsed={}ms ok={}",
+                        if channel_usable { "control-channel" } else { "send-command" },
+                        started.elapsed().as_millis(),
+                        result.is_ok(),
+                    ),
+                });
                 match result {
                     Ok(content) => {
                         let _ = tx.send(FileOpEvent::FileReadCompleted {
@@ -4593,7 +4698,8 @@ mod gui {
                 .or_else(|| self.context.clone());
             let mode = self.options.mode.clone();
             let tx = self.file_op_tx.clone();
-            let channel = self.ensure_control_channel(tab_id);
+            let channel =
+                self.ensure_control_channel(tab_id, ChannelLane::Interactive);
 
             std::thread::spawn(move || {
                 let result = if mode == Mode::Sim {
@@ -4692,6 +4798,9 @@ mod gui {
                         if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
                             fb.status = FileOpStatus::Error(error);
                         }
+                    }
+                    FileOpEvent::OpDiag { tab_id, message } => {
+                        self.log_info(format!("[fileops tab={tab_id}] {message}"));
                     }
                     FileOpEvent::TreeListingCompleted { tab_id, dirs } => {
                         let mut count = 0;
