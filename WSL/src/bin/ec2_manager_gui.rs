@@ -733,20 +733,26 @@ mod gui {
     /// commands without the per-invocation overhead of `ssm send-command`.
     /// Each command is wrapped in sentinel markers so its combined output
     /// and exit code can be extracted from the raw PTY byte stream.
+    /// The PTY resources for a control channel. Bundled behind one
+    /// `Mutex<Option<_>>` so Drop can move the whole set into a detached
+    /// thread — tearing down a ConPTY (kill child, drop master/writer)
+    /// can block, and doing it on the UI thread freezes the app.
+    struct ChannelIo {
+        writer: Box<dyn Write + Send>,
+        /// Held only to keep the PTY alive; dropped (off-thread) on close.
+        #[allow(dead_code)]
+        master: Box<dyn MasterPty + Send>,
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+    }
+
     struct ControlChannel {
         /// Serializes commands so concurrent file ops don't interleave.
         req_lock: Mutex<()>,
         /// Raw bytes read from the control PTY, paired with a condvar the
         /// reader thread notifies whenever new bytes arrive.
         buf: Arc<(Mutex<Vec<u8>>, Condvar)>,
-        /// Writer half of the control PTY.
-        writer: Mutex<Box<dyn Write + Send>>,
-        /// Master PTY, kept alive for the channel's lifetime.
-        _master: Mutex<Box<dyn MasterPty + Send>>,
-        /// The `aws ssm start-session` child process. Wrapped in Option
-        /// so Drop can move it into a detached thread to kill it — a
-        /// synchronous ConPTY kill() on the UI thread can hang the app.
-        child: Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>,
+        /// PTY writer + master + child, taken out wholesale on Drop.
+        io: Mutex<Option<ChannelIo>>,
         /// True once the shell handshake has completed.
         ready: Arc<AtomicBool>,
         /// True once the reader hit EOF (the session died).
@@ -795,13 +801,18 @@ mod gui {
                  __rc=$?; printf '{end}%d_\\n' \"$__rc\"\n"
             );
             {
-                let mut w = self
-                    .writer
+                let mut io_guard = self
+                    .io
                     .lock()
-                    .map_err(|_| "control writer poisoned".to_string())?;
-                w.write_all(line.as_bytes())
+                    .map_err(|_| "control io poisoned".to_string())?;
+                let io = io_guard
+                    .as_mut()
+                    .ok_or_else(|| "control channel closed".to_string())?;
+                io.writer
+                    .write_all(line.as_bytes())
                     .map_err(|e| format!("control write failed: {e}"))?;
-                w.flush()
+                io.writer
+                    .flush()
                     .map_err(|e| format!("control flush failed: {e}"))?;
             }
             let deadline = Instant::now() + timeout;
@@ -831,16 +842,19 @@ mod gui {
 
     impl Drop for ControlChannel {
         fn drop(&mut self) {
-            // Kill the child on a detached thread: a ConPTY kill()/wait()
-            // can block, and doing it inline would freeze the UI thread
-            // when the channel is dropped during tab close / app exit.
-            let child = self.child.lock().ok().and_then(|mut g| g.take());
-            if let Some(mut child) = child {
+            // Tear the PTY down on a detached thread: a ConPTY kill()/
+            // wait() and master/writer drop can all block, and doing it
+            // inline would freeze the UI thread when the channel is
+            // dropped during tab close / app exit.
+            let io = self.io.lock().ok().and_then(|mut g| g.take());
+            if let Some(mut io) = io {
                 std::thread::spawn(move || {
                     let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        let _ = io.child.kill();
+                        let _ = io.child.wait();
                     }));
+                    // writer + master + child drop here, off the UI thread.
+                    drop(io);
                 });
             }
         }
@@ -1480,14 +1494,8 @@ mod gui {
                 config.shared_env_default_applied = true;
                 let _ = config.save();
             }
-            // One-time migration: environment colors should be on by
-            // default. Clears any stale disabled state once; after this
-            // the user's own toggle choice is respected.
-            if !config.colors_default_applied {
-                config.account_colors_enabled = true;
-                config.colors_default_applied = true;
-                let _ = config.save();
-            }
+            // Environment colors are always on — there is no toggle.
+            config.account_colors_enabled = true;
             let initial_hidden_envs: std::collections::HashSet<String> =
                 config.excluded_envs.iter().map(|s| s.to_ascii_lowercase()).collect();
             let dependencies = dependency_status();
@@ -8261,72 +8269,61 @@ mod gui {
                                 }
                             });
                             ui.menu_button("Environment Colors", |ui| {
-                                if ui
-                                    .checkbox(
-                                        &mut self.config.account_colors_enabled,
-                                        "Show environment colors",
-                                    )
-                                    .changed()
-                                {
-                                    let _ = self.config.save();
-                                }
-                                if self.config.account_colors_enabled {
-                                    ui.separator();
+                                ui.label("Click an account to edit its color:");
+                                ui.separator();
 
-                                    // Show unique environments sorted by account order then alpha
-                                    let mut seen = std::collections::HashSet::new();
-                                    let mut env_list: Vec<(String, String, String, egui::Color32)> = self
-                                        .account_color_map
-                                        .iter()
-                                        .filter_map(|(key, color)| {
-                                            let (pid, env) = key.split_once(':')?;
-                                            let env_lower = env.to_ascii_lowercase();
-                                            let dedup = format!("{}:{}", pid, env_lower);
-                                            if seen.insert(dedup) {
-                                                let label = self.config.profiles.iter()
-                                                    .find(|p| p.profile_id == pid)
-                                                    .map(|p| p.display_name.as_str())
-                                                    .unwrap_or(pid);
-                                                Some((pid.to_string(), format!("{env} ({label})"), key.clone(), *color))
-                                            } else {
-                                                None
-                                            }
+                                // One row per account, alphabetical, with
+                                // its base color swatch.
+                                let mut accounts: Vec<(String, String, egui::Color32)> =
+                                    self.config.profiles.iter()
+                                        .map(|p| {
+                                            let color = self
+                                                .account_color_map
+                                                .get(&p.profile_id)
+                                                .copied()
+                                                .unwrap_or(egui::Color32::GRAY);
+                                            (
+                                                p.profile_id.clone(),
+                                                p.display_name.clone(),
+                                                color,
+                                            )
                                         })
                                         .collect();
-                                    env_list.sort_by(|a, b| {
-                                        let (idx_a, pa) = self.config.profiles.iter().enumerate()
-                                            .find(|(_, p)| p.profile_id == a.0)
-                                            .map(|(i, p)| (i, Some(p)))
-                                            .unwrap_or((usize::MAX, None));
-                                        let (idx_b, pb) = self.config.profiles.iter().enumerate()
-                                            .find(|(_, p)| p.profile_id == b.0)
-                                            .map(|(i, p)| (i, Some(p)))
-                                            .unwrap_or((usize::MAX, None));
-                                        let ord_a = pa.and_then(|p| p.sort_order).unwrap_or(u32::MAX);
-                                        let ord_b = pb.and_then(|p| p.sort_order).unwrap_or(u32::MAX);
-                                        ord_a.cmp(&ord_b)
-                                            .then_with(|| idx_a.cmp(&idx_b))
-                                            .then_with(|| a.1.to_ascii_lowercase().cmp(&b.1.to_ascii_lowercase()))
+                                accounts.sort_by(|a, b| {
+                                    a.1.to_ascii_lowercase()
+                                        .cmp(&b.1.to_ascii_lowercase())
+                                });
+
+                                let mut pick: Option<(String, egui::Color32)> = None;
+                                for (pid, name, color) in &accounts {
+                                    ui.horizontal(|ui| {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(12.0, 12.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter()
+                                            .circle_filled(rect.center(), 6.0, *color);
+                                        if ui.button(name.as_str()).clicked() {
+                                            pick = Some((pid.clone(), *color));
+                                        }
                                     });
+                                }
+                                if let Some((pid, color)) = pick {
+                                    self.tab_color_picker_rgb = [
+                                        color.r() as f32 / 255.0,
+                                        color.g() as f32 / 255.0,
+                                        color.b() as f32 / 255.0,
+                                    ];
+                                    self.color_picker_profile = Some(pid);
+                                    ui.close();
+                                }
 
-                                    for (_pid, display, _key, color) in &env_list {
-                                        ui.horizontal(|ui| {
-                                            let (rect, _) = ui.allocate_exact_size(
-                                                egui::vec2(12.0, 12.0),
-                                                egui::Sense::hover(),
-                                            );
-                                            ui.painter().circle_filled(rect.center(), 6.0, *color);
-                                            ui.label(display.as_str());
-                                        });
-                                    }
-
-                                    ui.separator();
-                                    if ui.button("Reset All to Defaults").clicked() {
-                                        self.config.account_colors.clear();
-                                        self.rebuild_account_colors();
-                                        let _ = self.config.save();
-                                        ui.close();
-                                    }
+                                ui.separator();
+                                if ui.button("Reset All to Defaults").clicked() {
+                                    self.config.account_colors.clear();
+                                    self.rebuild_account_colors();
+                                    let _ = self.config.save();
+                                    ui.close();
                                 }
                             });
                             if ui.button("File Browser Defaults...").clicked() {
@@ -9614,9 +9611,7 @@ mod gui {
         let channel = Arc::new(ControlChannel {
             req_lock: Mutex::new(()),
             buf: Arc::new((Mutex::new(Vec::new()), Condvar::new())),
-            writer: Mutex::new(writer),
-            _master: Mutex::new(master),
-            child: Mutex::new(Some(child)),
+            io: Mutex::new(Some(ChannelIo { writer, master, child })),
             ready: Arc::new(AtomicBool::new(false)),
             dead: Arc::new(AtomicBool::new(false)),
             next_id: AtomicU64::new(1),
@@ -9664,9 +9659,11 @@ mod gui {
                 let init = "stty -echo 2>/dev/null; export PS1=''; \
                             export PS2=''; unset PROMPT_COMMAND 2>/dev/null; \
                             printf 'CTRLRDY_%s_\\n' \"$$\"\n";
-                if let Ok(mut w) = ch.writer.lock() {
-                    let _ = w.write_all(init.as_bytes());
-                    let _ = w.flush();
+                if let Ok(mut g) = ch.io.lock() {
+                    if let Some(io) = g.as_mut() {
+                        let _ = io.writer.write_all(init.as_bytes());
+                        let _ = io.writer.flush();
+                    }
                 }
                 let deadline = Instant::now() + Duration::from_secs(60);
                 let (lock, cv) = &*ch.buf;
