@@ -1820,6 +1820,9 @@ mod gui {
                         // would overwrite self.inventory/self.context with a
                         // non-selected profile's data, leaving the dropdown on
                         // (say) PA but the top-bar/inventory showing PB.
+                        // Non-selected profiles still get their disk cache
+                        // primed (no display change) so the environment
+                        // color map and multi-account lookups stay populated.
                         if self.selected_profile.as_deref() == Some(pid.as_str()) {
                             self.log_info(format!(
                                 "auth became OK for selected profile={pid}, loading cache and refreshing"
@@ -1827,8 +1830,9 @@ mod gui {
                             self.load_cache_for_profile(pid);
                         } else {
                             self.log_info(format!(
-                                "auth became OK for profile={pid}, refreshing in background"
+                                "auth became OK for profile={pid}, priming cache and refreshing"
                             ));
+                            self.prime_cache_from_disk(pid);
                         }
                     } else {
                         self.log_info(format!(
@@ -1837,6 +1841,9 @@ mod gui {
                     }
                     self.refresh_profile(pid, true);
                 }
+                // Rebuild colors so newly-primed profiles appear in the
+                // environment color map / legend immediately.
+                self.rebuild_account_colors();
 
                 // Safety net: if the selected profile is now Ok but its
                 // display was cleared (e.g. handle_profile_expired ran and
@@ -2132,6 +2139,46 @@ mod gui {
                 self.log_info(self.message.clone());
             } else {
                 self.log_info("no disk cache found for this profile/region");
+            }
+        }
+
+        /// Populate the in-memory inventory cache for a profile from its
+        /// disk cache *without* touching the active display. Used so
+        /// non-selected profiles still feed the account/environment color
+        /// map (and multi-account lookups) without stomping the inventory
+        /// shown for the currently selected profile.
+        fn prime_cache_from_disk(&mut self, profile_id: &str) {
+            if self.profile_inventory_cache.contains_key(profile_id) {
+                return;
+            }
+            let profile_cfg = self
+                .config
+                .profiles
+                .iter()
+                .find(|p| p.profile_id == profile_id);
+            let region = profile_cfg
+                .and_then(|p| p.region.clone())
+                .unwrap_or_else(|| "us-east-1".to_string());
+            let account_id = profile_cfg
+                .map(|p| p.account_id.clone())
+                .filter(|s| !s.is_empty());
+            if let Some(cached) =
+                ec2_manager::inventory::load_disk_cache(profile_id, &region)
+            {
+                let resolved_profile =
+                    credentials::find_profile_by_account_id(profile_id)
+                        .unwrap_or_else(|| profile_id.to_string());
+                let ctx = AwsContext {
+                    mode: self.options.mode.clone(),
+                    profile: resolved_profile,
+                    account_id,
+                    arn: None,
+                    user_id: None,
+                    region,
+                    auth_status: AuthStatus::Ok,
+                };
+                self.profile_inventory_cache
+                    .insert(profile_id.to_string(), (cached, ctx));
             }
         }
 
