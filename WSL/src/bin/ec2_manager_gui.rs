@@ -9607,10 +9607,15 @@ mod gui {
             next_id: AtomicU64::new(1),
         });
 
-        // Reader thread: pump raw PTY bytes into the shared buffer.
+        // Reader thread: pump raw PTY bytes into the shared buffer, and
+        // answer terminal startup queries (cursor-position / device-
+        // attributes). Without these replies the remote shell startup
+        // hangs waiting — which is why an unanswered control channel
+        // produced only the 4-byte `ESC[6n` query and nothing else.
         {
             let buf = Arc::clone(&channel.buf);
             let dead = Arc::clone(&channel.dead);
+            let ch = Arc::clone(&channel);
             std::thread::spawn(move || {
                 let mut tmp = [0_u8; 8192];
                 loop {
@@ -9622,11 +9627,24 @@ mod gui {
                             break;
                         }
                         Ok(n) => {
+                            let chunk = &tmp[..n];
+                            // Reply to terminal queries (cursor pos is
+                            // irrelevant for a hidden shell — use 1;1).
+                            let reply =
+                                compute_terminal_query_response(chunk, 0, 0);
+                            if !reply.is_empty() {
+                                if let Ok(mut g) = ch.io.lock() {
+                                    if let Some(io) = g.as_mut() {
+                                        let _ = io.writer.write_all(&reply);
+                                        let _ = io.writer.flush();
+                                    }
+                                }
+                            }
                             let (lock, cv) = &*buf;
                             if let Ok(mut b) = lock.lock() {
                                 // Soft cap so a runaway response can't OOM.
                                 if b.len() < 128 * 1024 * 1024 {
-                                    b.extend_from_slice(&tmp[..n]);
+                                    b.extend_from_slice(chunk);
                                 }
                             }
                             cv.notify_all();
