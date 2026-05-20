@@ -2392,6 +2392,16 @@ mod gui {
             force: bool,
             start_delay: Duration,
         ) {
+            // Don't start a second refresh for a profile that's already
+            // refreshing — a duplicate (from Refresh All, or switching
+            // A → B → A) just wastes an API call; the in-flight refresh
+            // already delivers fresh data.
+            if self.refreshing_profiles.contains_key(profile_id) {
+                self.log_debug(format!(
+                    "refresh skipped for profile={profile_id}: already refreshing"
+                ));
+                return;
+            }
             self.refresh_generation += 1;
             let gen = self.refresh_generation;
             let pid = profile_id.to_string();
@@ -4300,24 +4310,28 @@ mod gui {
                 }
                 self.control_channels.remove(&tab_id);
             }
-            // Hold off spawning the control channel until the visible
-            // terminal's SSM session has connected — a concurrent second
-            // `aws ssm start-session` competes for the throttled
-            // StartSession API and slows the user-facing connection.
-            // (Cap the wait at 30s so a stuck terminal doesn't block
-            // file ops forever — they fall back to send-command.)
-            let terminal_connected = self
-                .pty_sessions
-                .get(&tab_id)
-                .map(|s| s.connect_logged)
-                .unwrap_or(false);
-            let waited_long = self
-                .file_browsers
-                .get(&tab_id)
-                .map(|fb| fb.opened_at.elapsed() >= Duration::from_secs(30))
-                .unwrap_or(true);
-            if !terminal_connected && !waited_long {
-                return None;
+            // Only hold off spawning the control channel during a real
+            // refresh storm (2+ accounts refreshing) — that's when a
+            // concurrent second `aws ssm start-session` competes for the
+            // throttled API and slows the user-facing connection. With 1
+            // or 0 accounts refreshing there's little contention, so
+            // spawn right away for a smooth file-browser experience.
+            // (Cap the wait at 30s so a stuck terminal can't block file
+            // ops forever — they fall back to send-command.)
+            if self.refreshing_profiles.len() > 1 {
+                let terminal_connected = self
+                    .pty_sessions
+                    .get(&tab_id)
+                    .map(|s| s.connect_logged)
+                    .unwrap_or(false);
+                let waited_long = self
+                    .file_browsers
+                    .get(&tab_id)
+                    .map(|fb| fb.opened_at.elapsed() >= Duration::from_secs(30))
+                    .unwrap_or(true);
+                if !terminal_connected && !waited_long {
+                    return None;
+                }
             }
             let tab = self
                 .connections
@@ -7263,19 +7277,23 @@ mod gui {
             let mut apply_completion: Option<CompletionItem> = None;
 
             ui.horizontal(|ui| {
+                // lock_focus(true) makes the TextEdit capture Tab (insert
+                // a '\t') instead of egui moving focus to the next widget.
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut path_input)
                         .desired_width(150.0)
-                        .font(egui::TextStyle::Small),
+                        .font(egui::TextStyle::Small)
+                        .lock_focus(true),
                 );
                 let focused = response.has_focus();
 
-                // Tab → complete the path (terminal-style).
-                if focused
-                    && ui.input_mut(|i| {
-                        i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
-                    })
-                {
+                // Tab → complete the path (terminal-style). The captured
+                // tab arrives as a literal '\t' in the text; strip it.
+                let tab_pressed = path_input.contains('\t');
+                if tab_pressed {
+                    path_input.retain(|c| c != '\t');
+                }
+                if tab_pressed {
                     let comps =
                         compute_path_completions(&dir_cache_snapshot, &path_input);
                     if comps.len() == 1 {
