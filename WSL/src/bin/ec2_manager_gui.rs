@@ -1886,6 +1886,13 @@ mod gui {
             // away, not only once a network refresh completes.
             app.rebuild_account_colors();
 
+            // Hold the startup refresh queue for a few seconds: if the
+            // user connects to a (disk-cached) instance right away, that
+            // connection's API call gets a clear window before the
+            // refresh storm begins. Set the pause *before* enqueuing so
+            // the pump doesn't start anything yet.
+            app.refresh_pause_until =
+                Some(Instant::now() + Duration::from_secs(8));
             app.refresh_all_authenticated(true);
             app
         }
@@ -4361,28 +4368,25 @@ mod gui {
                 }
                 self.control_channels.remove(&tab_id);
             }
-            // Only hold off spawning the control channel during a real
-            // refresh storm (2+ accounts refreshing) — that's when a
-            // concurrent second `aws ssm start-session` competes for the
-            // throttled API and slows the user-facing connection. With 1
-            // or 0 accounts refreshing there's little contention, so
-            // spawn right away for a smooth file-browser experience.
-            // (Cap the wait at 30s so a stuck terminal can't block file
-            // ops forever — they fall back to send-command.)
-            if self.refreshing_profiles.len() > 1 {
-                let terminal_connected = self
-                    .pty_sessions
-                    .get(&tab_id)
-                    .map(|s| s.connect_logged)
-                    .unwrap_or(false);
-                let waited_long = self
-                    .file_browsers
-                    .get(&tab_id)
-                    .map(|fb| fb.opened_at.elapsed() >= Duration::from_secs(30))
-                    .unwrap_or(true);
-                if !terminal_connected && !waited_long {
-                    return None;
-                }
+            // Wait until the visible terminal's SSM session has actually
+            // connected before spawning the control channel. They both
+            // run `aws ssm start-session`; spawning the 2nd while the
+            // 1st is still connecting makes them race and slows the
+            // user-facing connection. (Cap the wait at 45s so a stuck
+            // terminal can't block file ops forever — they fall back to
+            // send-command until then.)
+            let terminal_connected = self
+                .pty_sessions
+                .get(&tab_id)
+                .map(|s| s.connect_logged)
+                .unwrap_or(false);
+            let waited_long = self
+                .file_browsers
+                .get(&tab_id)
+                .map(|fb| fb.opened_at.elapsed() >= Duration::from_secs(45))
+                .unwrap_or(true);
+            if !terminal_connected && !waited_long {
+                return None;
             }
             let tab = self
                 .connections
