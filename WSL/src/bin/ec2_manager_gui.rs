@@ -656,6 +656,117 @@ mod gui {
         job
     }
 
+    /// A single find-in-file match: a byte range into the source text.
+    #[derive(Clone, Copy)]
+    struct FindMatch {
+        byte_start: usize,
+        byte_end: usize,
+    }
+
+    /// Cap on the number of matches tracked at once — keeps the per-frame
+    /// recompute and the layout-section split bounded on huge files.
+    const FIND_MAX_MATCHES: usize = 5000;
+
+    /// Find every (case-insensitive) occurrence of `query` in `text`.
+    /// Matches are non-overlapping, returned in order. Comparison is
+    /// ASCII-case-insensitive (non-ASCII compares exactly), which keeps
+    /// the returned ranges on valid char boundaries.
+    fn find_matches_in_text(text: &str, query: &str) -> Vec<FindMatch> {
+        let mut out = Vec::new();
+        if query.is_empty() {
+            return out;
+        }
+        let q: Vec<char> = query.chars().collect();
+        let m = q.len();
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let n = chars.len();
+        if m == 0 || m > n {
+            return out;
+        }
+        let mut i = 0usize;
+        while i + m <= n {
+            let mut k = 0usize;
+            while k < m
+                && chars[i + k].1.to_ascii_lowercase() == q[k].to_ascii_lowercase()
+            {
+                k += 1;
+            }
+            if k == m {
+                let byte_start = chars[i].0;
+                let byte_end = if i + m < n { chars[i + m].0 } else { text.len() };
+                out.push(FindMatch {
+                    byte_start,
+                    byte_end,
+                });
+                if out.len() >= FIND_MAX_MATCHES {
+                    break;
+                }
+                i += m;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Overlay search-match backgrounds onto an already-built syntax-highlight
+    /// `LayoutJob`. Sections that straddle a match boundary are split so each
+    /// matched span gets a background colour; the match at `current` byte range
+    /// gets the stronger `current_bg`. Ranges past the job's text are clamped.
+    fn apply_find_highlights(
+        job: &mut egui::text::LayoutJob,
+        matches: &[FindMatch],
+        current: Option<(usize, usize)>,
+        match_bg: egui::Color32,
+        current_bg: egui::Color32,
+    ) {
+        if matches.is_empty() {
+            return;
+        }
+        let mut new_sections = Vec::with_capacity(job.sections.len());
+        for section in &job.sections {
+            let s = section.byte_range.start;
+            let e = section.byte_range.end;
+            // Cut points inside this section where a match starts or ends.
+            let mut points = vec![s, e];
+            for m in matches {
+                if m.byte_end > s && m.byte_start < e {
+                    if m.byte_start > s && m.byte_start < e {
+                        points.push(m.byte_start);
+                    }
+                    if m.byte_end > s && m.byte_end < e {
+                        points.push(m.byte_end);
+                    }
+                }
+            }
+            points.sort_unstable();
+            points.dedup();
+            for w in points.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                if a >= b {
+                    continue;
+                }
+                let mut fmt = section.format.clone();
+                if let Some(m) = matches
+                    .iter()
+                    .find(|m| m.byte_start <= a && b <= m.byte_end)
+                {
+                    fmt.background = if current == Some((m.byte_start, m.byte_end)) {
+                        current_bg
+                    } else {
+                        match_bg
+                    };
+                }
+                new_sections.push(egui::text::LayoutSection {
+                    leading_space: section.leading_space,
+                    byte_range: a..b,
+                    format: fmt,
+                });
+            }
+        }
+        job.sections = new_sections;
+    }
+
     /// Basename of a pem path, for compact display in dropdowns.
     fn pem_basename(p: &str) -> String {
         std::path::Path::new(p)
@@ -1042,6 +1153,16 @@ mod gui {
         opened_at: Instant,
         /// Active path-input tab-completion dropdown, if any.
         path_completion: Option<PathCompletion>,
+        /// Whether the in-editor find bar (Ctrl+F) is visible.
+        editor_find_open: bool,
+        /// Current find-in-file query text.
+        editor_find_query: String,
+        /// Index of the currently focused match within the active editor.
+        editor_find_current: usize,
+        /// Request focus on the find query input next frame.
+        editor_find_focus: bool,
+        /// Scroll the editor to the current match next frame.
+        editor_find_scroll: bool,
     }
 
     impl Default for FileBrowserState {
@@ -1064,6 +1185,11 @@ mod gui {
                 selected_file: None,
                 opened_at: Instant::now(),
                 path_completion: None,
+                editor_find_open: false,
+                editor_find_query: String::new(),
+                editor_find_current: 0,
+                editor_find_focus: false,
+                editor_find_scroll: false,
             }
         }
     }
@@ -7924,6 +8050,59 @@ mod gui {
                 return;
             };
 
+            // Find-in-file (Ctrl+F) state for the active editor.
+            let (mut find_open, mut find_query, mut find_current, mut want_focus) = self
+                .file_browsers
+                .get(&tab_id)
+                .map(|fb| {
+                    (
+                        fb.editor_find_open,
+                        fb.editor_find_query.clone(),
+                        fb.editor_find_current,
+                        fb.editor_find_focus,
+                    )
+                })
+                .unwrap_or((false, String::new(), 0, false));
+
+            // Keyboard shortcuts: Ctrl+F toggles the find bar, Esc closes it,
+            // F3 / Shift+F3 cycle matches.
+            let (ctrl_f, esc_pressed, mut do_next, mut do_prev) = ui.input(|i| {
+                let mut cf = false;
+                let mut esc = false;
+                let mut nx = false;
+                let mut pv = false;
+                for e in &i.events {
+                    if let egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } = e
+                    {
+                        match key {
+                            egui::Key::F if modifiers.ctrl || modifiers.command => cf = true,
+                            egui::Key::Escape => esc = true,
+                            egui::Key::F3 => {
+                                if modifiers.shift {
+                                    pv = true;
+                                } else {
+                                    nx = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                (cf, esc, nx, pv)
+            });
+            if ctrl_f {
+                find_open = true;
+                want_focus = true;
+            }
+            if esc_pressed && find_open {
+                find_open = false;
+            }
+
             // Status + save bar
             ui.horizontal(|ui| {
                 ui.label(&remote_path);
@@ -7971,10 +8150,152 @@ mod gui {
                 }
             });
 
+            // Find bar (Ctrl+F). Matches are recomputed each frame against the
+            // current editor text so the highlight stays in sync with edits.
+            let mut matches: Vec<FindMatch> = Vec::new();
+            let mut query_changed = false;
+            if find_open {
+                let prev_query = find_query.clone();
+                ui.horizontal(|ui| {
+                    ui.label("Find:");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut find_query)
+                            .desired_width(220.0)
+                            .hint_text("search text"),
+                    );
+                    if want_focus {
+                        resp.request_focus();
+                        want_focus = false;
+                    }
+                    // Enter / Shift+Enter inside the box jumps to next / prev
+                    // and keeps the box focused for continued navigation.
+                    if resp.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
+                        if ui.input(|i| i.modifiers.shift) {
+                            do_prev = true;
+                        } else {
+                            do_next = true;
+                        }
+                        want_focus = true;
+                    }
+
+                    matches = find_matches_in_text(&editor_content, &find_query);
+
+                    if ui
+                        .small_button("◀")
+                        .on_hover_text("Previous (Shift+Enter / Shift+F3)")
+                        .clicked()
+                    {
+                        do_prev = true;
+                    }
+                    if ui
+                        .small_button("▶")
+                        .on_hover_text("Next (Enter / F3)")
+                        .clicked()
+                    {
+                        do_next = true;
+                    }
+
+                    let counter = if find_query.is_empty() {
+                        String::new()
+                    } else if matches.is_empty() {
+                        "No matches".to_string()
+                    } else {
+                        let shown = find_current.min(matches.len() - 1) + 1;
+                        format!("{shown}/{}", matches.len())
+                    };
+                    ui.label(counter);
+
+                    if ui
+                        .small_button("✕")
+                        .on_hover_text("Close (Esc)")
+                        .clicked()
+                    {
+                        find_open = false;
+                    }
+                });
+                query_changed = find_query != prev_query;
+                ui.separator();
+            }
+
+            // Resolve navigation into a concrete match index + scroll request.
+            let mut do_scroll = false;
+            if query_changed {
+                find_current = 0;
+                if !matches.is_empty() {
+                    do_scroll = true;
+                }
+            }
+            if matches.is_empty() {
+                find_current = 0;
+            } else {
+                if find_current >= matches.len() {
+                    find_current = 0;
+                }
+                if do_next {
+                    find_current = (find_current + 1) % matches.len();
+                    do_scroll = true;
+                }
+                if do_prev {
+                    find_current = (find_current + matches.len() - 1) % matches.len();
+                    do_scroll = true;
+                }
+            }
+            let current_match = matches
+                .get(find_current)
+                .map(|m| (m.byte_start, m.byte_end));
+
+            // Compute the scroll offset that brings the current match into view.
+            let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+            let mut scroll_offset: Option<f32> = None;
+            if do_scroll {
+                if let Some(m) = matches.get(find_current) {
+                    let upto = m.byte_start.min(editor_content.len());
+                    let line_idx = editor_content[..upto].matches('\n').count();
+                    let target = (line_idx as f32) * row_height - row_height * 3.0;
+                    scroll_offset = Some(target.max(0.0));
+                }
+            }
+
+            let dark = self.dark_mode;
+            let (match_bg, current_bg) = if dark {
+                (
+                    egui::Color32::from_rgb(94, 94, 40),
+                    egui::Color32::from_rgb(170, 120, 30),
+                )
+            } else {
+                (
+                    egui::Color32::from_rgb(255, 235, 130),
+                    egui::Color32::from_rgb(255, 170, 60),
+                )
+            };
+
+            // VSCode-style scrollbars: thin, floating (overlay) handles that
+            // stay faintly visible when idle so it's clear there's more to see,
+            // and brighten on hover/drag. No opaque track.
+            {
+                let mut ss = egui::style::ScrollStyle::floating();
+                ss.bar_width = 10.0;
+                ss.floating_width = 10.0;
+                ss.floating_allocated_width = 12.0;
+                ss.handle_min_length = 24.0;
+                ss.dormant_handle_opacity = 0.6;
+                ss.active_handle_opacity = 1.0;
+                ss.interact_handle_opacity = 0.9;
+                ss.dormant_background_opacity = 0.0;
+                ss.active_background_opacity = 0.0;
+                ss.interact_background_opacity = 0.0;
+                ss.foreground_color = false;
+                ui.style_mut().spacing.scroll = ss;
+            }
+
             // Code editor with line numbers
-            egui::ScrollArea::both()
-                .id_salt(("editor_scroll", tab_id))
-                .show(ui, |ui| {
+            let mut scroll = egui::ScrollArea::both().id_salt(("editor_scroll", tab_id));
+            if let Some(off) = scroll_offset {
+                scroll = scroll.vertical_scroll_offset(off);
+            }
+            scroll.show(ui, |ui| {
                     ui.horizontal_top(|ui| {
                         let line_count = editor_content.lines().count().max(1);
                         let line_numbers: String = (1..=line_count)
@@ -7993,8 +8314,8 @@ mod gui {
                             .next()
                             .unwrap_or("")
                             .to_ascii_lowercase();
-                        let dark = self.dark_mode;
                         let mono = egui::TextStyle::Monospace.resolve(ui.style());
+                        let matches_ref = &matches;
                         let mut layouter = |ui: &egui::Ui,
                                             buf: &dyn egui::TextBuffer,
                                             wrap_width: f32| {
@@ -8004,7 +8325,18 @@ mod gui {
                                 dark,
                                 mono.clone(),
                             );
-                            job.wrap.max_width = wrap_width;
+                            apply_find_highlights(
+                                &mut job,
+                                matches_ref,
+                                current_match,
+                                match_bg,
+                                current_bg,
+                            );
+                            // No word wrap: each logical line stays on one row so
+                            // the line-number gutter aligns and long lines scroll
+                            // horizontally instead of wrapping.
+                            let _ = wrap_width;
+                            job.wrap.max_width = f32::INFINITY;
                             ui.fonts_mut(|f| f.layout_job(job))
                         };
                         let response = ui.add(
@@ -8029,6 +8361,15 @@ mod gui {
                         }
                     });
                 });
+
+            // Persist find state back onto the browser.
+            if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                fb.editor_find_open = find_open;
+                fb.editor_find_query = find_query;
+                fb.editor_find_current = find_current;
+                fb.editor_find_focus = want_focus;
+                fb.editor_find_scroll = do_scroll;
+            }
         }
 
         fn render_details_panel(&mut self, ui: &mut egui::Ui) {

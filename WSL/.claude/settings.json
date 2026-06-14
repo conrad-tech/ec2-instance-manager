@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build *)",
+      "Bash(find ~/.cargo/registry/src -name \"vt100*\" -type d 2>/dev/null | head -5)",
+      "Read(//home/bconrad/.cargo/registry/src/**)",
+      "Bash(cargo test *)",
+      "Bash(grep -n \"ProcEvent::Output { tab_id, bytes }\\\\|session.parser.process\\(&bytes\\)\" \"/mnt/d/Work Projects/ec2-instance-manager/WSL/src/bin/ec2_manager_gui.rs\")",
+      "Bash(~/.cargo/bin/cargo build *)"
+    ]
+  }
+}

@@ -98,7 +98,7 @@ cargo run --features gui --bin ec2_manager_gui
 From built binary:
 
 ```bash
-./dist/ec2_manager_gui
+./dist/ec2_manager_gui_1.0
 ```
 
 Flags:
