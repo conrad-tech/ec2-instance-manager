@@ -526,6 +526,8 @@ mod gui {
         env_profile_id: String,
         /// Create mode: whether to pass `--sudo` (grant NOPASSWD:ALL).
         grant_sudo: bool,
+        /// Delete mode: confirmation checkbox — Delete is disabled until set.
+        confirm_delete: bool,
         /// Text typed in the primary-bastion filter box.
         primary_query: String,
         /// Text typed in the secondary-bastion filter box.
@@ -1203,32 +1205,42 @@ mod gui {
         tx: Sender<VerifyOutcome>,
     ) {
         // The user's private key lives in the shared EFS home, so it's
-        // reachable (and identical) from both bastions.
+        // reachable (and identical) from both bastions. Run both SSH checks
+        // and the PEM pull concurrently — each is a separate SSM round-trip.
         let user_pem = format!("/efs/home/{username}/.ssh/{username}.pem");
-        let p2s = ssh_cross_login_test(
-            &primary_ctx,
-            &primary_id,
-            &user_pem,
-            &username,
-            &secondary_ip,
-        );
-        let s2p = ssh_cross_login_test(
-            &secondary_ctx,
-            &secondary_id,
-            &user_pem,
-            &username,
-            &primary_ip,
-        );
+        let p2s_handle = {
+            let (ctx, id, pem, user, ip) = (
+                primary_ctx.clone(),
+                primary_id.clone(),
+                user_pem.clone(),
+                username.clone(),
+                secondary_ip.clone(),
+            );
+            std::thread::spawn(move || ssh_cross_login_test(&ctx, &id, &pem, &user, &ip))
+        };
+        let s2p_handle = {
+            let (ctx, id, pem, user, ip) = (
+                secondary_ctx.clone(),
+                secondary_id.clone(),
+                user_pem.clone(),
+                username.clone(),
+                primary_ip.clone(),
+            );
+            std::thread::spawn(move || ssh_cross_login_test(&ctx, &id, &pem, &user, &ip))
+        };
+        let pem_result =
+            pull_pem_to_downloads(&primary_ctx, &primary_id, &username, &mmodal_env);
+        let p2s = p2s_handle.join().unwrap_or(false);
+        let s2p = s2p_handle.join().unwrap_or(false);
 
         let mut error: Option<String> = None;
-        let pem_path =
-            match pull_pem_to_downloads(&primary_ctx, &primary_id, &username, &mmodal_env) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    error = Some(e);
-                    None
-                }
-            };
+        let pem_path = match pem_result {
+            Ok(p) => Some(p),
+            Err(e) => {
+                error = Some(e);
+                None
+            }
+        };
         // If SSH didn't fully pass, gather a diagnostic report from both
         // bastions so the failure popup can show what's actually on disk.
         let diagnostics = if p2s && s2p {
@@ -2278,6 +2290,9 @@ mod gui {
         /// Worker → UI: a script run's tab finished all its steps.
         script_done_tx: Sender<u64>,
         script_done_rx: Receiver<u64>,
+        /// Worker → UI: per-step timing/progress log lines.
+        script_log_tx: Sender<String>,
+        script_log_rx: Receiver<String>,
         /// Verify worker → UI: cross-login test results + saved PEM path.
         verify_tx: Sender<VerifyOutcome>,
         verify_rx: Receiver<VerifyOutcome>,
@@ -2330,6 +2345,7 @@ mod gui {
             let (refresh_tx, refresh_rx) = mpsc::channel();
             let (file_op_tx, file_op_rx) = mpsc::channel();
             let (script_done_tx, script_done_rx) = mpsc::channel();
+            let (script_log_tx, script_log_rx) = mpsc::channel();
             let (verify_tx, verify_rx) = mpsc::channel();
             let (preflight_tx, preflight_rx) = mpsc::channel();
             let features = ec2_manager::features::load();
@@ -2490,6 +2506,8 @@ mod gui {
                 preflight_rx,
                 script_done_tx,
                 script_done_rx,
+                script_log_tx,
+                script_log_rx,
                 verify_tx,
                 verify_rx,
                 vscode_cli_ok: Arc::new(Mutex::new(None)),
@@ -4256,7 +4274,7 @@ mod gui {
                 self.prime_cache_from_disk(&dlg.env_profile_id);
             }
             // (id, name) for running instances in the chosen environment.
-            let instances: Vec<(String, String)> = self
+            let mut instances: Vec<(String, String)> = self
                 .profile_inventory_cache
                 .get(&dlg.env_profile_id)
                 .map(|(inv, _)| {
@@ -4269,6 +4287,14 @@ mod gui {
                         .collect()
                 })
                 .unwrap_or_default();
+            // Alphabetical by name (case-insensitive), then instance id, so
+            // the bastion dropdowns list in a stable, readable order.
+            instances.sort_by(|(a_id, a_name), (b_id, b_name)| {
+                a_name
+                    .to_ascii_lowercase()
+                    .cmp(&b_name.to_ascii_lowercase())
+                    .then_with(|| a_id.cmp(b_id))
+            });
             let profiles: Vec<(String, String)> = self
                 .config
                 .profiles
@@ -4372,10 +4398,29 @@ mod gui {
                         ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
                     }
 
+                    if dlg.delete {
+                        ui.add_space(6.0);
+                        let confirm_text = if dlg.username.trim().is_empty() {
+                            "Yes, permanently delete this user".to_string()
+                        } else {
+                            format!(
+                                "Yes, permanently delete '{}'",
+                                dlg.username.trim()
+                            )
+                        };
+                        ui.checkbox(&mut dlg.confirm_delete, confirm_text);
+                    }
+
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         let run_label = if dlg.delete { "Delete" } else { "Run" };
-                        if ui.button(run_label).clicked() {
+                        // In delete mode the button is disabled until the
+                        // confirmation checkbox is ticked.
+                        let run_enabled = !dlg.delete || dlg.confirm_delete;
+                        if ui
+                            .add_enabled(run_enabled, egui::Button::new(run_label))
+                            .clicked()
+                        {
                             do_run = true;
                         }
                         if ui.button("Cancel").clicked() {
@@ -4937,6 +4982,11 @@ mod gui {
         /// SSH cross-login + PEM pull for a create, or an account-absent
         /// check for a delete — then surface the outcome.
         fn poll_script_events(&mut self) {
+            // Drain per-step timing logs from the worker threads.
+            while let Ok(line) = self.script_log_rx.try_recv() {
+                self.log_info(line);
+            }
+
             // Delete pre-flight results: proceed only if both bastions are
             // clear, otherwise report why the delete was aborted.
             while let Ok(outcome) = self.preflight_rx.try_recv() {
@@ -5217,6 +5267,7 @@ mod gui {
             /// Send each command, waiting for the remote shell prompt to
             /// redraw before the next (falling back to a timeout so a
             /// missed prompt-redraw never wedges the run).
+            #[allow(clippy::too_many_arguments)]
             fn run_script_worker(
                 writer: Arc<Mutex<Box<dyn Write + Send>>>,
                 prompt_ready: Arc<(Mutex<u64>, Condvar)>,
@@ -5224,9 +5275,18 @@ mod gui {
                 wait_for_login: bool,
                 done_tx: Sender<u64>,
                 tab_id: u64,
+                log_tx: Sender<String>,
+                label: String,
             ) {
                 const LOGIN_WAIT: Duration = Duration::from_secs(45);
-                const STEP_WAIT: Duration = Duration::from_secs(20);
+                // Quick commands (assignments, cd, groupadd, useradd) return
+                // instantly when their prompt-bump fires; the timeout only
+                // bites when a bump is missed (echo + new prompt arrived in
+                // one frame), so keep it short. The create script does
+                // 4096-bit keygen (slow); delete is quicker.
+                const STEP_WAIT: Duration = Duration::from_secs(6);
+                const CREATE_WAIT: Duration = Duration::from_secs(30);
+                const DELETE_WAIT: Duration = Duration::from_secs(15);
                 const SETTLE: Duration = Duration::from_millis(150);
                 // The prep sequence is several local commands (exec bash,
                 // PS1, vim, ssh-config, clear); give it time to run through
@@ -5238,23 +5298,53 @@ mod gui {
                     let (lock, _) = &*prompt_ready;
                     lock.lock().map(|g| *g).unwrap_or(0)
                 };
-                let wait_advance = |pre: u64, timeout: Duration| {
+                // Returns true if it timed out (prompt bump missed).
+                let wait_advance = |pre: u64, timeout: Duration| -> bool {
                     let (lock, cvar) = &*prompt_ready;
-                    if let Ok(guard) = lock.lock() {
-                        let _ = cvar
-                            .wait_timeout_while(guard, timeout, |c| *c == pre);
+                    match lock.lock() {
+                        Ok(guard) => match cvar
+                            .wait_timeout_while(guard, timeout, |c| *c == pre)
+                        {
+                            Ok((_g, res)) => res.timed_out(),
+                            Err(_) => true,
+                        },
+                        Err(_) => true,
                     }
                 };
 
                 if wait_for_login {
                     let pre = snapshot();
-                    wait_advance(pre, LOGIN_WAIT);
+                    let t = Instant::now();
+                    let to = wait_advance(pre, LOGIN_WAIT);
+                    let _ = log_tx.send(format!(
+                        "[{label}] login wait {}ms{}",
+                        t.elapsed().as_millis(),
+                        if to { " (timeout)" } else { "" }
+                    ));
                     std::thread::sleep(SETTLE);
                 }
 
-                for step in steps {
+                let total = steps.len();
+                for (i, step) in steps.into_iter().enumerate() {
                     let pre = snapshot();
                     let is_prep = step == PREP_STEP_SENTINEL;
+                    let step_wait = if step.starts_with("bash /root/create_new_user.sh") {
+                        CREATE_WAIT
+                    } else if step.starts_with("bash /root/delete_user.sh") {
+                        DELETE_WAIT
+                    } else {
+                        STEP_WAIT
+                    };
+                    let shown = if is_prep {
+                        "prep terminal".to_string()
+                    } else {
+                        truncate(&step, 70)
+                    };
+                    let _ = log_tx.send(format!(
+                        "[{label}] step {}/{} → {shown}",
+                        i + 1,
+                        total
+                    ));
                     {
                         let Ok(mut w) = writer.lock() else {
                             return;
@@ -5278,7 +5368,19 @@ mod gui {
                         // final prompt redraw before continuing.
                         std::thread::sleep(PREP_SETTLE);
                     }
-                    wait_advance(pre, STEP_WAIT);
+                    let t = Instant::now();
+                    let timed_out = wait_advance(pre, step_wait);
+                    let _ = log_tx.send(format!(
+                        "[{label}] step {}/{} done in {}ms{}",
+                        i + 1,
+                        total,
+                        t.elapsed().as_millis(),
+                        if timed_out {
+                            " (TIMEOUT — prompt bump missed)"
+                        } else {
+                            ""
+                        }
+                    ));
                     std::thread::sleep(SETTLE);
                 }
                 // Signal that this tab's steps are all done (used to trigger
@@ -5298,6 +5400,8 @@ mod gui {
                     let steps = run.steps.clone();
                     let wait_for_login = run.wait_for_login;
                     let done_tx = self.script_done_tx.clone();
+                    let log_tx = self.script_log_tx.clone();
+                    let label = run.label.clone();
                     let tab_id = run.tab_id;
                     logs.push(format!(
                         "script run starting: {} ({} steps)",
@@ -5312,6 +5416,8 @@ mod gui {
                             wait_for_login,
                             done_tx,
                             tab_id,
+                            log_tx,
+                            label,
                         )
                     });
                     spawned_idx.push(idx);
@@ -11022,6 +11128,7 @@ mod gui {
                                     username: String::new(),
                                     env_profile_id: env,
                                     grant_sudo: false,
+                                    confirm_delete: false,
                                     primary_query,
                                     secondary_query,
                                     primary_id,
