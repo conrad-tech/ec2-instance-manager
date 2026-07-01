@@ -387,6 +387,13 @@ mod gui {
         /// snapshot and wait — gluing the next pasted line onto a still-
         /// running command. See `paste_to_connection_tab`.
         at_prompt_last_frame: bool,
+        /// Absolute row (scrollback lines + cursor row) where we last bumped
+        /// `prompt_ready`. A fresh prompt after a command lands on a *new*
+        /// absolute row, so we can bump even when the command's echo and the
+        /// redrawn prompt arrive in the same parser frame (no false→true
+        /// dip). An idle re-observation stays on the same row, so it still
+        /// won't bump (which would glue pasted lines). See the bump site.
+        last_prompt_abs_row: Option<usize>,
         /// When this PTY was spawned — used to log how long the SSM
         /// session takes to connect (diagnosing slow connections).
         spawned_at: Instant,
@@ -569,6 +576,10 @@ mod gui {
         secondary_ctx: AwsContext,
         primary_done: bool,
         secondary_done: bool,
+        /// Terminal screen text captured when each bastion's steps finished,
+        /// so a failure popup can surface the script's actual error output.
+        primary_output: Option<String>,
+        secondary_output: Option<String>,
         /// Set once the verify worker has been spawned.
         verify_started: bool,
     }
@@ -1574,6 +1585,40 @@ mod gui {
         let path = downloads.join(file_name);
         std::fs::write(&path, &bytes).map_err(|e| format!("could not write PEM: {e}"))?;
         Ok(path.to_string_lossy().to_string())
+    }
+
+    /// Pull error-looking lines out of a captured terminal screen so a
+    /// failure popup can surface what the script actually complained about
+    /// (bash errors, `ssh-keygen`/`useradd` failures, the script's own
+    /// `ERROR:`/`ABORTED` messages) rather than only after-the-fact checks.
+    fn extract_script_errors(output: &str) -> String {
+        let mut out: Vec<String> = Vec::new();
+        for raw in output.lines() {
+            let line = raw.trim_end();
+            if line.is_empty() {
+                continue;
+            }
+            let ll = line.to_ascii_lowercase();
+            let hit = ll.contains("error")
+                || ll.contains("no such file")
+                || ll.contains("permission denied")
+                || ll.contains("command not found")
+                || ll.contains("cannot")
+                || ll.contains("fail")
+                || ll.contains("aborted")
+                || ll.contains("denied")
+                || ll.contains("not permitted")
+                || ll.contains("overwrite")
+                || ll.contains("already exists")
+                || ll.starts_with("useradd:")
+                || ll.starts_with("groupadd:")
+                || ll.starts_with("userdel:")
+                || ll.contains("ssh-keygen");
+            if hit && !out.iter().any(|e| e == line) {
+                out.push(line.to_string());
+            }
+        }
+        out.join("\n")
     }
 
     /// Keep only filename-safe characters (alnum, dash, underscore, dot);
@@ -4915,6 +4960,8 @@ mod gui {
                         secondary_ctx: ctx,
                         primary_done: false,
                         secondary_done: false,
+                        primary_output: None,
+                        secondary_output: None,
                         verify_started: false,
                     });
                 } else {
@@ -5085,14 +5132,20 @@ mod gui {
                 }
             }
 
-            // Mark tabs done as their workers report in.
+            // Mark tabs done as their workers report in, and snapshot the
+            // terminal screen so a failure can surface the script's output.
             while let Ok(tab_id) = self.script_done_rx.try_recv() {
+                let output = self
+                    .pty_sessions
+                    .get(&tab_id)
+                    .map(|s| s.parser.screen().contents());
                 if let Some(run) = self.create_user_run.as_mut() {
                     if tab_id == run.primary_tab {
                         run.primary_done = true;
-                    }
-                    if Some(tab_id) == run.secondary_tab {
+                        run.primary_output = output;
+                    } else if Some(tab_id) == run.secondary_tab {
                         run.secondary_done = true;
+                        run.secondary_output = output;
                     }
                 }
             }
@@ -5222,7 +5275,28 @@ mod gui {
 
             // Verification results.
             while let Ok(outcome) = self.verify_rx.try_recv() {
-                self.create_user_run = None;
+                let finished = self.create_user_run.take();
+                // Error lines pulled from each bastion's captured terminal
+                // output, shown above the on-disk diagnostics on failure.
+                let script_errs = {
+                    let mut s = String::new();
+                    if let Some(r) = &finished {
+                        for (label, out) in [
+                            ("primary", &r.primary_output),
+                            ("secondary", &r.secondary_output),
+                        ] {
+                            if let Some(o) = out {
+                                let e = extract_script_errors(o);
+                                if !e.is_empty() {
+                                    s.push_str(&format!(
+                                        "{label} script errors:\n{e}\n\n"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    s
+                };
                 match outcome {
                     VerifyOutcome::Created {
                         username,
@@ -5269,12 +5343,18 @@ mod gui {
                             if let Some(d) = &diagnostics {
                                 self.log_error(format!("create diagnostics:\n{d}"));
                             }
+                            let mut details = script_errs.clone();
+                            if let Some(d) = diagnostics {
+                                details.push_str(&d);
+                            }
+                            let details =
+                                if details.trim().is_empty() { None } else { Some(details) };
                             self.show_script_result(
                                 "Create Failed",
                                 msg,
                                 false,
                                 pem_path,
-                                diagnostics,
+                                details,
                             );
                         }
                     }
@@ -5308,12 +5388,18 @@ mod gui {
                             if let Some(d) = &diagnostics {
                                 self.log_error(format!("delete diagnostics:\n{d}"));
                             }
+                            let mut details = script_errs.clone();
+                            if let Some(d) = diagnostics {
+                                details.push_str(&d);
+                            }
+                            let details =
+                                if details.trim().is_empty() { None } else { Some(details) };
                             self.show_script_result(
                                 "Delete Incomplete",
                                 msg,
                                 false,
                                 None,
-                                diagnostics,
+                                details,
                             );
                         }
                     }
@@ -6031,23 +6117,33 @@ mod gui {
                     let cont_prompt = (cursor_trimmed == ">"
                         || cursor_trimmed.ends_with("\n>"))
                         && cur_col <= 2;
-                    let _ = cur_row;
                     let is_at_prompt =
                         bare_prompt || cont_prompt || cursor_is_user_host_prompt;
                     let was_at_prompt = session.at_prompt_last_frame;
                     session.at_prompt_last_frame = is_at_prompt;
-                    // Only bump on the false→true transition. Idle frames
-                    // that re-observe the same prompt must NOT bump — they
-                    // race with the paste worker's pre-write snapshot and
-                    // cause the wait_timeout_while between lines to return
-                    // immediately, gluing the next line onto a still-running
-                    // command. Symptom: ~3 lines paste cleanly, then the 4th
-                    // gets concatenated with the 5th on one line.
-                    if is_at_prompt && !was_at_prompt {
-                        let (lock, cvar) = &*session.prompt_ready;
-                        if let Ok(mut count) = lock.lock() {
-                            *count = count.wrapping_add(1);
-                            cvar.notify_all();
+                    // Bump `prompt_ready` when we're at a prompt AND it's a
+                    // *fresh* one — either the cursor just arrived at a prompt
+                    // (false→true), OR the prompt is on a new absolute row
+                    // (`new_max_sb` = lines scrolled above the visible top,
+                    // plus the cursor row). The row check catches the case a
+                    // fast, no-output command's echo and its redrawn prompt
+                    // arrive in a single parser frame, so the "not at prompt"
+                    // dip is never observed and the false→true transition is
+                    // missed (symptom: quick commands stall on the worker's
+                    // fallback timeout). An idle re-observation stays on the
+                    // same row, so it still won't bump — which would let the
+                    // paste worker glue the next line onto a running command.
+                    if is_at_prompt {
+                        let abs_row = new_max_sb + cur_row as usize;
+                        let fresh = !was_at_prompt
+                            || session.last_prompt_abs_row != Some(abs_row);
+                        if fresh {
+                            session.last_prompt_abs_row = Some(abs_row);
+                            let (lock, cvar) = &*session.prompt_ready;
+                            if let Ok(mut count) = lock.lock() {
+                                *count = count.wrapping_add(1);
+                                cvar.notify_all();
+                            }
                         }
                     }
 
@@ -12556,6 +12652,7 @@ mod gui {
             paste_write_bytes: 0,
             prompt_ready: Arc::new((Mutex::new(0), Condvar::new())),
             at_prompt_last_frame: false,
+            last_prompt_abs_row: None,
             spawned_at: Instant::now(),
             connect_logged: false,
         };
