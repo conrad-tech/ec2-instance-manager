@@ -17,6 +17,10 @@ Rust-only EC2 + SSM instance explorer with:
 - Favorites, recents, saved filters, and port-forward presets persisted to config.
 - Diagnostics for auth/dependencies/permissions.
 - Interactive Rust shell mode (`--interactive`) for local operation without JS/HTML.
+- **Scripts menu** (GUI, Connections page) — run bastion helper scripts against a
+  primary/secondary bastion pair: `create_new_user.sh` (create a user, verify
+  cross-bastion SSH, pull the PEM to your local Downloads) and an admin-gated
+  `delete_user.sh`. See [Scripts menu (bastion user management)](#scripts-menu-bastion-user-management).
 
 ## Prerequisites
 
@@ -447,4 +451,82 @@ Use any hex color code (`#RRGGBB`). Here are some suggested defaults:
 | Brown | `#b4783c` | Legacy |
 
 Colors can also be customized at runtime via **right-click on a legend item** or **Edit > Account Tab Colors > Edit**. Runtime overrides are saved to `config.ini` and take priority over `accounts.json`.
+
+## Scripts menu (bastion user management)
+
+On the **Connections** page there is a **`Scripts (N)`** dropdown (to the right of
+**Close All**), where `N` is the number of available scripts. It runs helper
+scripts against a **primary + secondary bastion pair** in a chosen environment.
+
+Each script opens a dialog with:
+
+- **User** — the username to act on.
+- **Environment** — which account/profile's bastions to target.
+- **Primary Bastion** / **Secondary Bastion** — type-to-filter pickers that match
+  on instance **name or instance id** and display as `Name  i-0abc…`.
+
+The selected bastion pair is cached per environment in `config.ini`
+(`bastion_pair.<env>=<primary>|<secondary>`) and pre-filled on the next run.
+
+For each bastion the app reuses an already-connected tab if one exists, otherwise
+opens a new SSM session; it then elevates with `sudo su`, `cd ~`, and runs the
+script. Commands are drip-fed one line at a time, waiting for the shell prompt
+between lines.
+
+### create_new_user.sh
+
+- **Grant sudo (NOPASSWD:ALL)** checkbox (off by default) passes `--sudo`.
+- Runs `create_new_user.sh` on the **primary** (creates the user and generates a
+  PEM key), and mirrors the matching UID/GID `groupadd`/`useradd` (and sudoers,
+  if `--sudo`) on the **secondary** from the shared EFS home.
+- After both finish it verifies SSH login **primary → secondary** and
+  **secondary → primary** as the new user, then pulls the generated PEM back to
+  your **local Downloads folder** as `<username>-<MMODAL_ENV>.pem` (the
+  `MMODAL_ENV` tag is read from the primary bastion).
+- On success the status line reports all tests passed and the saved PEM path.
+
+### delete_user.sh (admin-gated)
+
+This entry is **hidden unless enabled at build time** (see
+[Feature flags (features.json)](#feature-flags-featuresjson)).
+
+- **Also remove home directory (/efs/home/&lt;user&gt;)** checkbox (off by default).
+- Runs `delete_user.sh` on both bastions: the primary removes the account, group,
+  sudoers entry, generated PEM, and (optionally) the shared home; the secondary
+  removes only its local account/group/sudoers.
+- After both finish it confirms the account is gone on both bastions and reports
+  the result.
+
+> **Active users are never deleted.** Before running, a pre-flight check
+> (`who` + `pgrep -u`) runs on **both** bastions; if the user has any login
+> session or running process on either one — or the check can't be verified —
+> the delete is aborted and the status line reports where and why. The script
+> re-checks on the host and refuses (exit 3) as a safety net, and surfaces the
+> real `userdel` error if one occurs. No sessions are ever killed; ask the user
+> to log out and re-run.
+
+The script sources live in `assets/scripts/` (`create_new_user.sh`,
+`delete_user.sh`) and are compiled into the binary; edit them and rebuild to
+change behavior.
+
+## Feature flags (features.json)
+
+Build-time feature gates live in `assets/features.json`, which is compiled into
+the binary (like `accounts.json`). An admin edits the file and **rebuilds** —
+end users cannot change these at runtime. This is intentional for destructive
+actions.
+
+```json
+{
+  "allow_delete_user": false
+}
+```
+
+| Field               | Default | Description |
+|---------------------|---------|-------------|
+| `allow_delete_user` | `false` | Exposes the destructive `delete_user.sh` entry in the Scripts menu. |
+
+Parsing **fails closed**: if the file is malformed, every gate defaults to off.
+To ship a build for admins who need user deletion, set `"allow_delete_user": true`
+and rebuild.
 

@@ -515,14 +515,19 @@ mod gui {
         ssh_user: String,
     }
 
-    /// Modal state for the "Scripts → create_new_user.sh" dialog.
+    /// Modal state for the "Scripts → create_new_user.sh / delete_user.sh"
+    /// dialog. The same modal serves both actions; `delete` selects which.
     struct CreateUserDialog {
-        /// New username to create.
+        /// Delete mode (delete_user.sh) rather than create.
+        delete: bool,
+        /// New username to create (or the user to delete).
         username: String,
         /// Environment (config profile_id) whose bastions we target.
         env_profile_id: String,
-        /// Whether to pass `--sudo` (grant NOPASSWD:ALL).
+        /// Create mode: whether to pass `--sudo` (grant NOPASSWD:ALL).
         grant_sudo: bool,
+        /// Delete mode: whether to also remove the shared EFS home dir.
+        remove_home: bool,
         /// Text typed in the primary-bastion filter box.
         primary_query: String,
         /// Text typed in the secondary-bastion filter box.
@@ -540,6 +545,8 @@ mod gui {
     /// `script_done`), we can verify cross-bastion SSH login as the new
     /// user and pull the generated PEM back to the local Downloads folder.
     struct CreateUserRun {
+        /// Delete run (confirm removal) rather than create (SSH + PEM pull).
+        delete: bool,
         username: String,
         /// MMODAL_ENV tag of the primary bastion (used in the PEM filename).
         mmodal_env: String,
@@ -557,9 +564,30 @@ mod gui {
         verify_started: bool,
     }
 
-    /// Result of the post-create verification worker.
+    /// A delete request awaiting its pre-flight active-session check. Once
+    /// the check clears (nobody logged in on either bastion), this is
+    /// turned into the actual delete runs.
+    struct PendingDelete {
+        username: String,
+        env: String,
+        remove_home: bool,
+        primary_id: String,
+        secondary_id: String,
+    }
+
+    /// Result of the delete pre-flight active-session check.
+    struct PreflightOutcome {
+        /// True when neither bastion has an active session/process for the
+        /// user (safe to delete).
+        clear: bool,
+        /// Human-readable summary shown when not clear (or on check error).
+        report: String,
+    }
+
+    /// Result of a post-run verification worker.
     enum VerifyOutcome {
-        Done {
+        /// create_new_user.sh verification.
+        Created {
             username: String,
             /// primary → secondary SSH login succeeded.
             p2s: bool,
@@ -569,6 +597,14 @@ mod gui {
             pem_path: Option<String>,
             /// Any error encountered (SSH or PEM pull).
             error: Option<String>,
+        },
+        /// delete_user.sh verification (confirm the account is gone).
+        Deleted {
+            username: String,
+            /// User absent on the primary bastion.
+            primary_absent: bool,
+            /// User absent on the secondary bastion.
+            secondary_absent: bool,
         },
     }
 
@@ -1154,12 +1190,99 @@ mod gui {
                     None
                 }
             };
-        let _ = tx.send(VerifyOutcome::Done {
+        let _ = tx.send(VerifyOutcome::Created {
             username,
             p2s,
             s2p,
             pem_path,
             error,
+        });
+    }
+
+    /// Delete pre-flight: check whether the user is currently active
+    /// (logged-in session or any running process) on either bastion. We
+    /// refuse to delete an active user, so this must clear first. A check
+    /// that errors is treated as "not clear" (fail safe).
+    fn run_delete_preflight_worker(
+        username: String,
+        primary_id: String,
+        secondary_id: String,
+        primary_ctx: AwsContext,
+        secondary_ctx: AwsContext,
+        tx: Sender<PreflightOutcome>,
+    ) {
+        // base64-wrapped so quoting survives `aws ssm send-command`.
+        let script = format!(
+            "if id {u} >/dev/null 2>&1; then \
+               s=\"$(who 2>/dev/null | awk -v u={u} '$1==u {{print}}')\"; \
+               p=\"$(pgrep -u {u} 2>/dev/null | tr '\\n' ' ')\"; \
+               if [ -n \"$s\" ] || [ -n \"$p\" ]; then \
+                 echo CNU_ACTIVE; \
+                 [ -n \"$s\" ] && echo \"sessions: $s\"; \
+                 [ -n \"$p\" ] && echo \"procs: $p\"; \
+               else echo CNU_IDLE; fi; \
+             else echo CNU_ABSENT; fi",
+            u = username,
+        );
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
+        let cmd = format!("echo {b64} | base64 -d | bash");
+
+        // Returns (active, detail). On error, active=true (fail safe).
+        let check = |ctx: &AwsContext, id: &str| -> (bool, String) {
+            match exec_remote_command(&None, ctx, id, &cmd, Duration::from_secs(30)) {
+                Ok(out) => (out.contains("CNU_ACTIVE"), out.trim().to_string()),
+                Err(e) => (true, format!("check failed: {e}")),
+            }
+        };
+
+        let (p_active, p_detail) = check(&primary_ctx, &primary_id);
+        let (s_active, s_detail) = check(&secondary_ctx, &secondary_id);
+        let clear = !p_active && !s_active;
+        let report = if clear {
+            String::new()
+        } else {
+            let mut r = format!(
+                "Delete aborted for '{username}': user is active (or its status \
+                 could not be verified) on one or more bastions."
+            );
+            if p_active {
+                r.push_str(&format!("\n[primary {primary_id}] {p_detail}"));
+            }
+            if s_active {
+                r.push_str(&format!("\n[secondary {secondary_id}] {s_detail}"));
+            }
+            r
+        };
+        let _ = tx.send(PreflightOutcome { clear, report });
+    }
+
+    /// Post-delete verification: confirm the account is gone on both
+    /// bastions by running `id <user>` on each. Reports on `tx`.
+    fn run_delete_verify_worker(
+        username: String,
+        primary_id: String,
+        secondary_id: String,
+        primary_ctx: AwsContext,
+        secondary_ctx: AwsContext,
+        tx: Sender<VerifyOutcome>,
+    ) {
+        // Prints CNU_ABSENT when the account no longer exists (always exits
+        // 0 so `aws ssm` reports Success either way).
+        let cmd = format!(
+            "id {username} >/dev/null 2>&1 && echo CNU_PRESENT || echo CNU_ABSENT"
+        );
+        let absent = |ctx: &AwsContext, id: &str| -> bool {
+            exec_remote_command(&None, ctx, id, &cmd, Duration::from_secs(30))
+                .map(|out| out.contains("CNU_ABSENT"))
+                .unwrap_or(false)
+        };
+        let primary_absent = absent(&primary_ctx, &primary_id);
+        let secondary_absent = absent(&secondary_ctx, &secondary_id);
+        let _ = tx.send(VerifyOutcome::Deleted {
+            username,
+            primary_absent,
+            secondary_absent,
         });
     }
 
@@ -1918,9 +2041,17 @@ mod gui {
         create_user_dialog: Option<CreateUserDialog>,
         /// Queued script runs waiting for their PTY session to come up.
         pending_script_runs: Vec<PendingScriptRun>,
+        /// Build-time gate: whether the destructive "delete_user.sh" entry
+        /// is exposed in the Scripts menu (from assets/features.json).
+        allow_delete_user: bool,
         /// In-flight create-user run (post-create SSH verification + PEM
         /// pull), if any.
         create_user_run: Option<CreateUserRun>,
+        /// Delete awaiting its pre-flight active-session check, if any.
+        pending_delete: Option<PendingDelete>,
+        /// Pre-flight worker → UI: active-session check result.
+        preflight_tx: Sender<PreflightOutcome>,
+        preflight_rx: Receiver<PreflightOutcome>,
         /// Worker → UI: a script run's tab finished all its steps.
         script_done_tx: Sender<u64>,
         script_done_rx: Receiver<u64>,
@@ -1977,6 +2108,7 @@ mod gui {
             let (file_op_tx, file_op_rx) = mpsc::channel();
             let (script_done_tx, script_done_rx) = mpsc::channel();
             let (verify_tx, verify_rx) = mpsc::channel();
+            let (preflight_tx, preflight_rx) = mpsc::channel();
             #[cfg(target_os = "windows")]
             let (ui_tx, ui_rx) = mpsc::channel();
             let profile_choice_path = profile_choice_path();
@@ -2121,7 +2253,11 @@ mod gui {
                 edit_menu_flash_start: None,
                 create_user_dialog: None,
                 pending_script_runs: Vec::new(),
+                allow_delete_user: ec2_manager::features::load().allow_delete_user,
                 create_user_run: None,
+                pending_delete: None,
+                preflight_tx,
+                preflight_rx,
                 script_done_tx,
                 script_done_rx,
                 verify_tx,
@@ -3914,7 +4050,12 @@ mod gui {
             let mut do_run = false;
             let mut do_cancel = false;
 
-            egui::Window::new("Scripts — create_new_user.sh")
+            let title = if dlg.delete {
+                "Scripts — delete_user.sh"
+            } else {
+                "Scripts — create_new_user.sh"
+            };
+            egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut window_open)
@@ -3962,7 +4103,14 @@ mod gui {
                         });
 
                     ui.add_space(4.0);
-                    ui.checkbox(&mut dlg.grant_sudo, "Grant sudo (NOPASSWD:ALL)");
+                    if dlg.delete {
+                        ui.checkbox(
+                            &mut dlg.remove_home,
+                            "Also remove home directory (/efs/home/<user>)",
+                        );
+                    } else {
+                        ui.checkbox(&mut dlg.grant_sudo, "Grant sudo (NOPASSWD:ALL)");
+                    }
                     ui.add_space(6.0);
 
                     // Primary bastion picker.
@@ -3992,7 +4140,8 @@ mod gui {
 
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Run").clicked() {
+                        let run_label = if dlg.delete { "Delete" } else { "Run" };
+                        if ui.button(run_label).clicked() {
                             do_run = true;
                         }
                         if ui.button("Cancel").clicked() {
@@ -4044,10 +4193,12 @@ mod gui {
                     &dlg.secondary_id,
                 );
                 let _ = self.config.save();
-                self.start_create_user_run(
+                self.start_user_script_run(
+                    dlg.delete,
                     &username,
                     &dlg.env_profile_id,
                     dlg.grant_sudo,
+                    dlg.remove_home,
                     &dlg.primary_id,
                     &dlg.secondary_id,
                 );
@@ -4181,64 +4332,183 @@ mod gui {
             Some((tab_id, true))
         }
 
-        /// Build the command plan for the primary + secondary bastions and
-        /// enqueue them. The actual sending happens on a worker thread once
-        /// each session's PTY is up (see `pump_script_runs`).
-        fn start_create_user_run(
+        /// Dispatch a Scripts action. Create runs immediately; delete first
+        /// runs a pre-flight active-session check across both bastions and
+        /// only proceeds once it clears (see `poll_script_events`).
+        #[allow(clippy::too_many_arguments)]
+        fn start_user_script_run(
             &mut self,
+            delete: bool,
             username: &str,
             env: &str,
             grant_sudo: bool,
+            remove_home: bool,
+            primary_id: &str,
+            secondary_id: &str,
+        ) {
+            if delete {
+                self.begin_delete_preflight(
+                    username,
+                    env,
+                    remove_home,
+                    primary_id,
+                    secondary_id,
+                );
+            } else {
+                self.enqueue_user_script(
+                    false,
+                    username,
+                    env,
+                    grant_sudo,
+                    remove_home,
+                    primary_id,
+                    secondary_id,
+                );
+            }
+        }
+
+        /// Kick off the delete pre-flight active-session check. On success
+        /// (both bastions idle) `poll_script_events` enqueues the delete.
+        fn begin_delete_preflight(
+            &mut self,
+            username: &str,
+            env: &str,
+            remove_home: bool,
+            primary_id: &str,
+            secondary_id: &str,
+        ) {
+            let ctx = self
+                .profile_inventory_cache
+                .get(env)
+                .map(|(_, c)| c.clone())
+                .or_else(|| self.context.clone());
+            let Some(ctx) = ctx else {
+                self.message =
+                    "delete_user: no AWS context; cannot check sessions".to_string();
+                self.log_error(self.message.clone());
+                return;
+            };
+            self.pending_delete = Some(PendingDelete {
+                username: username.to_string(),
+                env: env.to_string(),
+                remove_home,
+                primary_id: primary_id.to_string(),
+                secondary_id: secondary_id.to_string(),
+            });
+            let tx = self.preflight_tx.clone();
+            let username_owned = username.to_string();
+            let primary = primary_id.to_string();
+            let secondary = secondary_id.to_string();
+            let primary_ctx = ctx.clone();
+            let secondary_ctx = ctx;
+            self.message = format!(
+                "Checking for active sessions before deleting '{username}'…"
+            );
+            self.log_info(format!(
+                "delete_user: pre-flight active-session check for '{username}'"
+            ));
+            std::thread::spawn(move || {
+                run_delete_preflight_worker(
+                    username_owned,
+                    primary,
+                    secondary,
+                    primary_ctx,
+                    secondary_ctx,
+                    tx,
+                )
+            });
+        }
+
+        /// Build the command plan for the primary + secondary bastions and
+        /// enqueue them. The actual sending happens on a worker thread once
+        /// each session's PTY is up (see `pump_script_runs`). `delete`
+        /// selects delete_user.sh instead of create_new_user.sh.
+        #[allow(clippy::too_many_arguments)]
+        fn enqueue_user_script(
+            &mut self,
+            delete: bool,
+            username: &str,
+            env: &str,
+            grant_sudo: bool,
+            remove_home: bool,
             primary_id: &str,
             secondary_id: &str,
         ) {
             use base64::Engine;
-            const SCRIPT: &str =
-                include_str!("../../assets/scripts/create_new_user.sh");
-            let b64 = base64::engine::general_purpose::STANDARD.encode(SCRIPT);
-            let remote_path = "/root/create_new_user.sh";
-
-            // Primary: drop the script and run it as root from $HOME.
-            let run_line = if grant_sudo {
-                format!("bash {remote_path} --user {username} --sudo")
+            let (primary_steps, secondary_steps) = if delete {
+                const SCRIPT: &str =
+                    include_str!("../../assets/scripts/delete_user.sh");
+                let b64 = base64::engine::general_purpose::STANDARD.encode(SCRIPT);
+                let remote_path = "/root/delete_user.sh";
+                let write = format!("echo '{b64}' | base64 -d > {remote_path}");
+                let primary_run = if remove_home {
+                    format!("bash {remote_path} --user {username} --remove-home")
+                } else {
+                    format!("bash {remote_path} --user {username}")
+                };
+                let primary = vec![
+                    "sudo su".to_string(),
+                    "cd ~".to_string(),
+                    write.clone(),
+                    primary_run,
+                ];
+                let secondary = vec![
+                    "sudo su".to_string(),
+                    "cd ~".to_string(),
+                    write,
+                    format!("bash {remote_path} --user {username} --secondary"),
+                ];
+                (primary, secondary)
             } else {
-                format!("bash {remote_path} --user {username}")
+                const SCRIPT: &str =
+                    include_str!("../../assets/scripts/create_new_user.sh");
+                let b64 = base64::engine::general_purpose::STANDARD.encode(SCRIPT);
+                let remote_path = "/root/create_new_user.sh";
+
+                // Primary: drop the script and run it as root from $HOME.
+                let run_line = if grant_sudo {
+                    format!("bash {remote_path} --user {username} --sudo")
+                } else {
+                    format!("bash {remote_path} --user {username}")
+                };
+                let primary = vec![
+                    "sudo su".to_string(),
+                    "cd ~".to_string(),
+                    format!("echo '{b64}' | base64 -d > {remote_path}"),
+                    run_line,
+                ];
+
+                // Secondary: mirror the UID/GID from the shared EFS home.
+                // These are the same commands the primary script echoes.
+                let suffix = username.replace('.', "-");
+                let mut secondary = vec![
+                    "sudo su".to_string(),
+                    "cd ~".to_string(),
+                    format!("UID_NUM=$(stat -c %u /efs/home/{username})"),
+                    format!("GID_NUM=$(stat -c %g /efs/home/{username})"),
+                    format!("groupadd -g $GID_NUM {username}"),
+                    format!(
+                        "useradd -u $UID_NUM -g $GID_NUM -d /efs/home/{username} {username}"
+                    ),
+                ];
+                if grant_sudo {
+                    secondary.push(format!(
+                        "echo '{username} ALL=(ALL) NOPASSWD:ALL' | tee /etc/sudoers.d/zz-{suffix}-nopasswd > /dev/null"
+                    ));
+                    secondary.push(format!(
+                        "visudo -cf /etc/sudoers.d/zz-{suffix}-nopasswd"
+                    ));
+                    secondary.push(format!(
+                        "chmod 0440 /etc/sudoers.d/zz-{suffix}-nopasswd"
+                    ));
+                    secondary.push(format!(
+                        "chown root:root /etc/sudoers.d/zz-{suffix}-nopasswd"
+                    ));
+                }
+                (primary, secondary)
             };
-            let primary_steps = vec![
-                "sudo su".to_string(),
-                "cd ~".to_string(),
-                format!("echo '{b64}' | base64 -d > {remote_path}"),
-                run_line,
-            ];
 
-            // Secondary: mirror the UID/GID from the shared EFS home. These
-            // are the same commands the primary script echoes at the end.
-            let suffix = username.replace('.', "-");
-            let mut secondary_steps = vec![
-                "sudo su".to_string(),
-                "cd ~".to_string(),
-                format!("UID_NUM=$(stat -c %u /efs/home/{username})"),
-                format!("GID_NUM=$(stat -c %g /efs/home/{username})"),
-                format!("groupadd -g $GID_NUM {username}"),
-                format!(
-                    "useradd -u $UID_NUM -g $GID_NUM -d /efs/home/{username} {username}"
-                ),
-            ];
-            if grant_sudo {
-                secondary_steps.push(format!(
-                    "echo '{username} ALL=(ALL) NOPASSWD:ALL' | tee /etc/sudoers.d/zz-{suffix}-nopasswd > /dev/null"
-                ));
-                secondary_steps.push(format!(
-                    "visudo -cf /etc/sudoers.d/zz-{suffix}-nopasswd"
-                ));
-                secondary_steps.push(format!(
-                    "chmod 0440 /etc/sudoers.d/zz-{suffix}-nopasswd"
-                ));
-                secondary_steps.push(format!(
-                    "chown root:root /etc/sudoers.d/zz-{suffix}-nopasswd"
-                ));
-            }
-
+            let action = if delete { "delete_user" } else { "create_new_user" };
             let primary_tab = match self.ensure_bastion_session(primary_id, env) {
                 Some((tab_id, wait_for_login)) => {
                     self.pending_script_runs.push(PendingScriptRun {
@@ -4252,7 +4522,7 @@ mod gui {
                 }
                 None => {
                     self.log_error(format!(
-                        "create_new_user: could not open primary bastion {primary_id}"
+                        "{action}: could not open primary bastion {primary_id}"
                     ));
                     None
                 }
@@ -4270,13 +4540,13 @@ mod gui {
                 }
                 None => {
                     self.log_error(format!(
-                        "create_new_user: could not open secondary bastion {secondary_id}"
+                        "{action}: could not open secondary bastion {secondary_id}"
                     ));
                     None
                 }
             };
 
-            // If both sessions are queued, set up post-create verification.
+            // If both sessions are queued, set up post-run verification.
             if let (Some(primary_tab), Some(secondary_tab)) = (primary_tab, secondary_tab) {
                 let ctx = self
                     .profile_inventory_cache
@@ -4304,6 +4574,7 @@ mod gui {
                     .unwrap_or_default();
                 if let Some(ctx) = ctx {
                     self.create_user_run = Some(CreateUserRun {
+                        delete,
                         username: username.to_string(),
                         mmodal_env,
                         primary_tab,
@@ -4320,24 +4591,48 @@ mod gui {
                     });
                 } else {
                     self.create_user_run = None;
-                    self.log_error(
-                        "create_new_user: no AWS context; skipping SSH verification"
-                            .to_string(),
-                    );
+                    self.log_error(format!(
+                        "{action}: no AWS context; skipping post-run verification"
+                    ));
                 }
             } else {
                 self.create_user_run = None;
             }
 
             self.main_tab = MainTab::Connections;
-            self.message =
-                format!("Running create_new_user.sh for '{username}'…");
+            self.message = format!("Running {action}.sh for '{username}'…");
         }
 
         /// Poll script-run completion and verification results: once both
-        /// bastions finish their create steps, spawn the SSH cross-login +
-        /// PEM-pull worker; when it reports back, surface the outcome.
+        /// bastions finish their steps, spawn the matching verify worker —
+        /// SSH cross-login + PEM pull for a create, or an account-absent
+        /// check for a delete — then surface the outcome.
         fn poll_script_events(&mut self) {
+            // Delete pre-flight results: proceed only if both bastions are
+            // clear, otherwise report why the delete was aborted.
+            while let Ok(outcome) = self.preflight_rx.try_recv() {
+                if let Some(pd) = self.pending_delete.take() {
+                    if outcome.clear {
+                        self.log_info(format!(
+                            "delete_user: no active sessions; deleting '{}'",
+                            pd.username
+                        ));
+                        self.enqueue_user_script(
+                            true,
+                            &pd.username,
+                            &pd.env,
+                            false,
+                            pd.remove_home,
+                            &pd.primary_id,
+                            &pd.secondary_id,
+                        );
+                    } else {
+                        self.log_error(outcome.report.clone());
+                        self.message = outcome.report;
+                    }
+                }
+            }
+
             // Mark tabs done as their workers report in.
             while let Ok(tab_id) = self.script_done_rx.try_recv() {
                 if let Some(run) = self.create_user_run.as_mut() {
@@ -4362,6 +4657,7 @@ mod gui {
                 }
                 if let Some(run) = self.create_user_run.as_ref() {
                     let tx = self.verify_tx.clone();
+                    let delete = run.delete;
                     let username = run.username.clone();
                     let mmodal_env = run.mmodal_env.clone();
                     let primary_id = run.primary_id.clone();
@@ -4370,64 +4666,107 @@ mod gui {
                     let secondary_ip = run.secondary_ip.clone();
                     let primary_ctx = run.primary_ctx.clone();
                     let secondary_ctx = run.secondary_ctx.clone();
-                    self.log_info(format!(
-                        "create_new_user: create finished, verifying SSH for '{username}'…"
-                    ));
-                    self.message =
-                        format!("Verifying SSH login for '{username}'…");
-                    std::thread::spawn(move || {
-                        run_verify_worker(
-                            username,
-                            mmodal_env,
-                            primary_id,
-                            secondary_id,
-                            primary_ip,
-                            secondary_ip,
-                            primary_ctx,
-                            secondary_ctx,
-                            tx,
-                        )
-                    });
+                    if delete {
+                        self.log_info(format!(
+                            "delete_user: delete finished, confirming removal of '{username}'…"
+                        ));
+                        self.message =
+                            format!("Confirming removal of '{username}'…");
+                        std::thread::spawn(move || {
+                            run_delete_verify_worker(
+                                username,
+                                primary_id,
+                                secondary_id,
+                                primary_ctx,
+                                secondary_ctx,
+                                tx,
+                            )
+                        });
+                    } else {
+                        self.log_info(format!(
+                            "create_new_user: create finished, verifying SSH for '{username}'…"
+                        ));
+                        self.message =
+                            format!("Verifying SSH login for '{username}'…");
+                        std::thread::spawn(move || {
+                            run_verify_worker(
+                                username,
+                                mmodal_env,
+                                primary_id,
+                                secondary_id,
+                                primary_ip,
+                                secondary_ip,
+                                primary_ctx,
+                                secondary_ctx,
+                                tx,
+                            )
+                        });
+                    }
                 }
             }
 
             // Verification results.
-            while let Ok(VerifyOutcome::Done {
-                username,
-                p2s,
-                s2p,
-                pem_path,
-                error,
-            }) = self.verify_rx.try_recv()
-            {
+            while let Ok(outcome) = self.verify_rx.try_recv() {
                 self.create_user_run = None;
-                if p2s && s2p {
-                    let mut msg = format!(
-                        "User '{username}' created. All tests passed (primary↔secondary SSH OK)."
-                    );
-                    if let Some(path) = &pem_path {
-                        msg.push_str(&format!(" PEM saved to {path}"));
-                    } else if let Some(err) = &error {
-                        msg.push_str(&format!(" (PEM not saved: {err})"));
+                match outcome {
+                    VerifyOutcome::Created {
+                        username,
+                        p2s,
+                        s2p,
+                        pem_path,
+                        error,
+                    } => {
+                        if p2s && s2p {
+                            let mut msg = format!(
+                                "User '{username}' created. All tests passed (primary↔secondary SSH OK)."
+                            );
+                            if let Some(path) = &pem_path {
+                                msg.push_str(&format!(" PEM saved to {path}"));
+                            } else if let Some(err) = &error {
+                                msg.push_str(&format!(" (PEM not saved: {err})"));
+                            }
+                            self.log_info(msg.clone());
+                            self.message = msg;
+                        } else {
+                            let dir = |ok: bool| if ok { "OK" } else { "FAILED" };
+                            let mut msg = format!(
+                                "User '{username}' created, but SSH test failed \
+                                 (primary→secondary: {}, secondary→primary: {}).",
+                                dir(p2s),
+                                dir(s2p),
+                            );
+                            if let Some(path) = &pem_path {
+                                msg.push_str(&format!(" PEM saved to {path}"));
+                            }
+                            if let Some(err) = &error {
+                                msg.push_str(&format!(" {err}"));
+                            }
+                            self.log_error(msg.clone());
+                            self.message = msg;
+                        }
                     }
-                    self.log_info(msg.clone());
-                    self.message = msg;
-                } else {
-                    let dir = |ok: bool| if ok { "OK" } else { "FAILED" };
-                    let mut msg = format!(
-                        "User '{username}' created, but SSH test failed \
-                         (primary→secondary: {}, secondary→primary: {}).",
-                        dir(p2s),
-                        dir(s2p),
-                    );
-                    if let Some(path) = &pem_path {
-                        msg.push_str(&format!(" PEM saved to {path}"));
+                    VerifyOutcome::Deleted {
+                        username,
+                        primary_absent,
+                        secondary_absent,
+                    } => {
+                        if primary_absent && secondary_absent {
+                            let msg = format!(
+                                "User '{username}' deleted (confirmed removed from both bastions)."
+                            );
+                            self.log_info(msg.clone());
+                            self.message = msg;
+                        } else {
+                            let state = |gone: bool| if gone { "removed" } else { "STILL PRESENT" };
+                            let msg = format!(
+                                "delete_user '{username}': primary {}, secondary {}.",
+                                state(primary_absent),
+                                state(secondary_absent),
+                            );
+                            self.log_error(msg.clone());
+                            self.message = msg;
+                        }
                     }
-                    if let Some(err) = &error {
-                        msg.push_str(&format!(" {err}"));
-                    }
-                    self.log_error(msg.clone());
-                    self.message = msg;
                 }
             }
         }
@@ -10196,8 +10535,24 @@ mod gui {
                             }
                         }
 
-                        ui.menu_button("Scripts", |ui| {
-                            if ui.button("create_new_user.sh…").clicked() {
+                        let script_count = 1 + usize::from(self.allow_delete_user);
+                        let mut open_dialog: Option<bool> = None;
+                        egui::ComboBox::from_id_salt("scripts_menu")
+                            .selected_text(format!("Scripts ({script_count})"))
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(false, "create_new_user.sh…").clicked() {
+                                    open_dialog = Some(false);
+                                    ui.close();
+                                }
+                                if self.allow_delete_user
+                                    && ui.selectable_label(false, "delete_user.sh…").clicked()
+                                {
+                                    open_dialog = Some(true);
+                                    ui.close();
+                                }
+                            });
+                        {
+                            if let Some(delete) = open_dialog {
                                 let env = self.selected_profile.clone().unwrap_or_default();
                                 if !env.is_empty() {
                                     self.prime_cache_from_disk(&env);
@@ -10209,18 +10564,19 @@ mod gui {
                                 let primary_query = self.bastion_label(&env, &primary_id);
                                 let secondary_query = self.bastion_label(&env, &secondary_id);
                                 self.create_user_dialog = Some(CreateUserDialog {
+                                    delete,
                                     username: String::new(),
                                     env_profile_id: env,
                                     grant_sudo: false,
+                                    remove_home: false,
                                     primary_query,
                                     secondary_query,
                                     primary_id,
                                     secondary_id,
                                     error: None,
                                 });
-                                ui.close();
                             }
-                        });
+                        }
                     });
 
                     if !self.message.is_empty() {

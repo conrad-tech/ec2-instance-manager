@@ -1,0 +1,4 @@
+{
+  "_comment": "Build-time feature gates. Edit and rebuild to change. allow_delete_user exposes the destructive 'delete_user.sh' entry in the Scripts menu; keep it false unless the build is intended for admins who need it.",
+  "allow_delete_user": false
+}
