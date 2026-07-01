@@ -548,10 +548,19 @@ mod gui {
         /// Delete run (confirm removal) rather than create (SSH + PEM pull).
         delete: bool,
         username: String,
+        /// Environment/profile_id (used to open the secondary session).
+        env: String,
         /// MMODAL_ENV tag of the primary bastion (used in the PEM filename).
         mmodal_env: String,
         primary_tab: u64,
-        secondary_tab: u64,
+        /// Secondary tab id — None until the secondary is opened, which
+        /// happens only after the primary finishes (the secondary reads the
+        /// UID/GID from the shared EFS home the primary creates).
+        secondary_tab: Option<u64>,
+        /// Steps to run on the secondary once the primary completes.
+        secondary_steps: Vec<String>,
+        /// Set once the secondary session has been opened + queued.
+        secondary_started: bool,
         primary_id: String,
         secondary_id: String,
         primary_ip: String,
@@ -573,6 +582,17 @@ mod gui {
         remove_home: bool,
         primary_id: String,
         secondary_id: String,
+    }
+
+    /// Visual state of the Scripts status line in the Connections toolbar.
+    #[derive(Clone, Copy, PartialEq)]
+    enum ScriptState {
+        /// A run is in progress — shown yellow, slow-flashing.
+        Running,
+        /// The run failed — shown solid red.
+        Failed,
+        /// The run finished successfully — shown solid green.
+        Done,
     }
 
     /// Result of the delete pre-flight active-session check.
@@ -2053,6 +2073,8 @@ mod gui {
         create_user_run: Option<CreateUserRun>,
         /// Delete awaiting its pre-flight active-session check, if any.
         pending_delete: Option<PendingDelete>,
+        /// Colored Scripts status line (text + visual state), if any.
+        script_status: Option<(String, ScriptState)>,
         /// Pre-flight worker → UI: active-session check result.
         preflight_tx: Sender<PreflightOutcome>,
         preflight_rx: Receiver<PreflightOutcome>,
@@ -2263,6 +2285,7 @@ mod gui {
                 secondary_bastion_filter: features.secondary_bastion_filter.clone(),
                 create_user_run: None,
                 pending_delete: None,
+                script_status: None,
                 preflight_tx,
                 preflight_rx,
                 script_done_tx,
@@ -4399,9 +4422,9 @@ mod gui {
                 .map(|(_, c)| c.clone())
                 .or_else(|| self.context.clone());
             let Some(ctx) = ctx else {
-                self.message =
-                    "delete_user: no AWS context; cannot check sessions".to_string();
-                self.log_error(self.message.clone());
+                let msg = "delete_user: no AWS context; cannot check sessions";
+                self.log_error(msg);
+                self.set_script_status(msg, ScriptState::Failed);
                 return;
             };
             self.pending_delete = Some(PendingDelete {
@@ -4417,12 +4440,13 @@ mod gui {
             let secondary = secondary_id.to_string();
             let primary_ctx = ctx.clone();
             let secondary_ctx = ctx;
-            self.message = format!(
-                "Checking for active sessions before deleting '{username}'…"
-            );
             self.log_info(format!(
                 "delete_user: pre-flight active-session check for '{username}'"
             ));
+            self.set_script_status(
+                format!("Checking for active sessions before deleting '{username}'…"),
+                ScriptState::Running,
+            );
             std::thread::spawn(move || {
                 run_delete_preflight_worker(
                     username_owned,
@@ -4454,7 +4478,10 @@ mod gui {
             let (primary_steps, secondary_steps) = if delete {
                 const SCRIPT: &str =
                     include_str!("../../assets/scripts/delete_user.sh");
-                let b64 = base64::engine::general_purpose::STANDARD.encode(SCRIPT);
+                // Strip CR so a Windows (autocrlf) checkout doesn't ship a
+                // CRLF script that bash chokes on ($'\r': command not found).
+                let b64 = base64::engine::general_purpose::STANDARD
+                    .encode(SCRIPT.replace('\r', ""));
                 let remote_path = "/root/delete_user.sh";
                 let write = format!("echo '{b64}' | base64 -d > {remote_path}");
                 let primary_run = if remove_home {
@@ -4478,7 +4505,9 @@ mod gui {
             } else {
                 const SCRIPT: &str =
                     include_str!("../../assets/scripts/create_new_user.sh");
-                let b64 = base64::engine::general_purpose::STANDARD.encode(SCRIPT);
+                // Strip CR (see delete branch) — Windows autocrlf checkout.
+                let b64 = base64::engine::general_purpose::STANDARD
+                    .encode(SCRIPT.replace('\r', ""));
                 let remote_path = "/root/create_new_user.sh";
 
                 // Primary: drop the script and run it as root from $HOME.
@@ -4525,6 +4554,11 @@ mod gui {
             };
 
             let action = if delete { "delete_user" } else { "create_new_user" };
+
+            // Open the PRIMARY now and queue its steps. The SECONDARY is
+            // deferred until the primary finishes — it reads the UID/GID
+            // from the shared EFS home the primary creates, so it must not
+            // race the primary (see `poll_script_events`).
             let primary_tab = match self.ensure_bastion_session(primary_id, env) {
                 Some((tab_id, wait_for_login)) => {
                     self.pending_script_runs.push(PendingScriptRun {
@@ -4543,27 +4577,8 @@ mod gui {
                     None
                 }
             };
-            let secondary_tab = match self.ensure_bastion_session(secondary_id, env) {
-                Some((tab_id, wait_for_login)) => {
-                    self.pending_script_runs.push(PendingScriptRun {
-                        tab_id,
-                        steps: secondary_steps,
-                        wait_for_login,
-                        spawned: false,
-                        label: format!("secondary {secondary_id}"),
-                    });
-                    Some(tab_id)
-                }
-                None => {
-                    self.log_error(format!(
-                        "{action}: could not open secondary bastion {secondary_id}"
-                    ));
-                    None
-                }
-            };
 
-            // If both sessions are queued, set up post-run verification.
-            if let (Some(primary_tab), Some(secondary_tab)) = (primary_tab, secondary_tab) {
+            if let Some(primary_tab) = primary_tab {
                 let ctx = self
                     .profile_inventory_cache
                     .get(env)
@@ -4592,9 +4607,12 @@ mod gui {
                     self.create_user_run = Some(CreateUserRun {
                         delete,
                         username: username.to_string(),
+                        env: env.to_string(),
                         mmodal_env,
                         primary_tab,
-                        secondary_tab,
+                        secondary_tab: None,
+                        secondary_steps,
+                        secondary_started: false,
                         primary_id: primary_id.to_string(),
                         secondary_id: secondary_id.to_string(),
                         primary_ip,
@@ -4616,7 +4634,18 @@ mod gui {
             }
 
             self.main_tab = MainTab::Connections;
-            self.message = format!("Running {action}.sh for '{username}'…");
+            self.set_script_status(
+                format!("Running {action}.sh on the primary bastion for '{username}'…"),
+                ScriptState::Running,
+            );
+        }
+
+        /// Set the colored Scripts status line. Supersedes the plain
+        /// `message` line for the duration of a run so the run status is the
+        /// only thing shown (yellow while running, red on failure).
+        fn set_script_status(&mut self, text: impl Into<String>, state: ScriptState) {
+            self.script_status = Some((text.into(), state));
+            self.message = String::new();
         }
 
         /// Poll script-run completion and verification results: once both
@@ -4644,7 +4673,7 @@ mod gui {
                         );
                     } else {
                         self.log_error(outcome.report.clone());
-                        self.message = outcome.report;
+                        self.set_script_status(outcome.report, ScriptState::Failed);
                     }
                 }
             }
@@ -4655,13 +4684,60 @@ mod gui {
                     if tab_id == run.primary_tab {
                         run.primary_done = true;
                     }
-                    if tab_id == run.secondary_tab {
+                    if Some(tab_id) == run.secondary_tab {
                         run.secondary_done = true;
                     }
                 }
             }
 
-            // Both create steps finished → kick off verification once.
+            // Primary finished → now open the secondary and queue its steps
+            // (deferred so it never races the primary's EFS home creation).
+            let start_secondary = self
+                .create_user_run
+                .as_ref()
+                .map(|r| r.primary_done && !r.secondary_started)
+                .unwrap_or(false);
+            if start_secondary {
+                let (secondary_id, env, steps) = {
+                    let r = self.create_user_run.as_ref().unwrap();
+                    (r.secondary_id.clone(), r.env.clone(), r.secondary_steps.clone())
+                };
+                match self.ensure_bastion_session(&secondary_id, &env) {
+                    Some((tab_id, wait_for_login)) => {
+                        self.pending_script_runs.push(PendingScriptRun {
+                            tab_id,
+                            steps,
+                            wait_for_login,
+                            spawned: false,
+                            label: format!("secondary {secondary_id}"),
+                        });
+                        if let Some(r) = self.create_user_run.as_mut() {
+                            r.secondary_tab = Some(tab_id);
+                            r.secondary_started = true;
+                        }
+                        self.log_info(format!(
+                            "primary finished; running secondary bastion {secondary_id}"
+                        ));
+                        self.set_script_status(
+                            "Primary finished — running on the secondary bastion…",
+                            ScriptState::Running,
+                        );
+                    }
+                    None => {
+                        // Couldn't open the secondary — mark it done so the
+                        // verify/confirm step can still report the outcome.
+                        self.log_error(format!(
+                            "could not open secondary bastion {secondary_id}"
+                        ));
+                        if let Some(r) = self.create_user_run.as_mut() {
+                            r.secondary_started = true;
+                            r.secondary_done = true;
+                        }
+                    }
+                }
+            }
+
+            // Both stages finished → kick off verification once.
             let launch = self
                 .create_user_run
                 .as_ref()
@@ -4686,8 +4762,10 @@ mod gui {
                         self.log_info(format!(
                             "delete_user: delete finished, confirming removal of '{username}'…"
                         ));
-                        self.message =
-                            format!("Confirming removal of '{username}'…");
+                        self.set_script_status(
+                            format!("Confirming removal of '{username}'…"),
+                            ScriptState::Running,
+                        );
                         std::thread::spawn(move || {
                             run_delete_verify_worker(
                                 username,
@@ -4702,8 +4780,10 @@ mod gui {
                         self.log_info(format!(
                             "create_new_user: create finished, verifying SSH for '{username}'…"
                         ));
-                        self.message =
-                            format!("Verifying SSH login for '{username}'…");
+                        self.set_script_status(
+                            format!("Verifying SSH login for '{username}'…"),
+                            ScriptState::Running,
+                        );
                         std::thread::spawn(move || {
                             run_verify_worker(
                                 username,
@@ -4742,7 +4822,7 @@ mod gui {
                                 msg.push_str(&format!(" (PEM not saved: {err})"));
                             }
                             self.log_info(msg.clone());
-                            self.message = msg;
+                            self.set_script_status(msg, ScriptState::Done);
                         } else {
                             let dir = |ok: bool| if ok { "OK" } else { "FAILED" };
                             let mut msg = format!(
@@ -4758,7 +4838,7 @@ mod gui {
                                 msg.push_str(&format!(" {err}"));
                             }
                             self.log_error(msg.clone());
-                            self.message = msg;
+                            self.set_script_status(msg, ScriptState::Failed);
                         }
                     }
                     VerifyOutcome::Deleted {
@@ -4771,7 +4851,7 @@ mod gui {
                                 "User '{username}' deleted (confirmed removed from both bastions)."
                             );
                             self.log_info(msg.clone());
-                            self.message = msg;
+                            self.set_script_status(msg, ScriptState::Done);
                         } else {
                             let state = |gone: bool| if gone { "removed" } else { "STILL PRESENT" };
                             let msg = format!(
@@ -4780,7 +4860,7 @@ mod gui {
                                 state(secondary_absent),
                             );
                             self.log_error(msg.clone());
-                            self.message = msg;
+                            self.set_script_status(msg, ScriptState::Failed);
                         }
                     }
                 }
@@ -10595,6 +10675,29 @@ mod gui {
                         }
                     });
 
+                    if let Some((text, state)) = self.script_status.clone() {
+                        let color = match state {
+                            ScriptState::Running => {
+                                // Slow flash (~0.7 Hz) by oscillating alpha.
+                                let t = ui.input(|i| i.time);
+                                let phase = 0.5
+                                    + 0.5
+                                        * (t * std::f64::consts::TAU * 0.7).sin();
+                                let alpha = (70.0 + 185.0 * phase) as u8;
+                                ui.ctx().request_repaint();
+                                egui::Color32::from_rgba_unmultiplied(
+                                    255, 205, 0, alpha,
+                                )
+                            }
+                            ScriptState::Failed => {
+                                egui::Color32::from_rgb(220, 60, 60)
+                            }
+                            ScriptState::Done => {
+                                egui::Color32::from_rgb(90, 200, 90)
+                            }
+                        };
+                        ui.colored_label(color, text);
+                    }
                     if !self.message.is_empty() {
                         ui.label(self.message.clone());
                     }
