@@ -55,6 +55,26 @@ if [[ ! "$USERNAME" =~ ^[a-z_][a-z0-9_.-]*[$]?$ ]]; then
   exit 1
 fi
 
+# Safety backstop (defense in depth — the app enforces its own list too):
+# never delete protected / system accounts.
+PROTECTED_USERS="root ec2-user ssm-user ssm-agent ubuntu centos admin sshd nobody daemon bin sys sync"
+USERNAME_LC="$(printf '%s' "$USERNAME" | tr '[:upper:]' '[:lower:]')"
+for p in $PROTECTED_USERS; do
+  if [[ "$USERNAME_LC" == "$p" ]]; then
+    echo "ERROR: refusing to delete protected user '$USERNAME'."
+    exit 2
+  fi
+done
+# Also refuse system UIDs (< 1000). Users created by create_new_user.sh get
+# UIDs >= 1000, so this can never block a legitimately-created user.
+if id "$USERNAME" >/dev/null 2>&1; then
+  UID_OF="$(id -u "$USERNAME" 2>/dev/null || echo 0)"
+  if [[ "$UID_OF" -lt 1000 ]]; then
+    echo "ERROR: refusing to delete system user '$USERNAME' (uid $UID_OF < 1000)."
+    exit 2
+  fi
+fi
+
 echo "Deleting user '$USERNAME'..."
 
 if id "$USERNAME" >/dev/null 2>&1; then

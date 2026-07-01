@@ -2360,6 +2360,8 @@ mod gui {
         /// dialog primary/secondary bastion dropdowns.
         primary_bastion_filter: String,
         secondary_bastion_filter: String,
+        /// Usernames delete_user must never remove (from features.json).
+        protected_users: Vec<String>,
         /// In-flight create-user run (post-create SSH verification + PEM
         /// pull), if any.
         create_user_run: Option<CreateUserRun>,
@@ -2588,6 +2590,7 @@ mod gui {
                 allow_delete_user: features.allow_delete_user,
                 primary_bastion_filter: features.primary_bastion_filter.clone(),
                 secondary_bastion_filter: features.secondary_bastion_filter.clone(),
+                protected_users: features.protected_users.clone(),
                 create_user_run: None,
                 pending_delete: None,
                 script_status: None,
@@ -4542,6 +4545,13 @@ mod gui {
                     self.create_user_dialog = Some(dlg);
                     return;
                 }
+                if dlg.delete && self.is_protected_user(&username) {
+                    dlg.error = Some(format!(
+                        "'{username}' is a protected user and cannot be deleted."
+                    ));
+                    self.create_user_dialog = Some(dlg);
+                    return;
+                }
                 if dlg.env_profile_id.is_empty() {
                     dlg.error = Some("Choose an environment.".to_string());
                     self.create_user_dialog = Some(dlg);
@@ -4734,6 +4744,17 @@ mod gui {
             }
         }
 
+        /// True when `name` is on the protected never-delete list (from
+        /// features.json). Case- and whitespace-insensitive.
+        fn is_protected_user(&self, name: &str) -> bool {
+            let n = name.trim().to_ascii_lowercase();
+            !n.is_empty()
+                && self
+                    .protected_users
+                    .iter()
+                    .any(|p| p.trim().to_ascii_lowercase() == n)
+        }
+
         /// Kick off the delete pre-flight active-session check. On success
         /// (both bastions idle) `poll_script_events` enqueues the delete.
         fn begin_delete_preflight(
@@ -4743,6 +4764,15 @@ mod gui {
             primary_id: &str,
             secondary_id: &str,
         ) {
+            // Safety backstop: never delete a protected/system account.
+            if self.is_protected_user(username) {
+                let msg = format!(
+                    "Refusing to delete protected user '{username}'."
+                );
+                self.log_error(msg.clone());
+                self.show_script_result("Delete Blocked", msg, false, None, None);
+                return;
+            }
             let ctx = self
                 .profile_inventory_cache
                 .get(env)

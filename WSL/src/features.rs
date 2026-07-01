@@ -22,6 +22,27 @@ pub struct Features {
     pub primary_bastion_filter: String,
     /// Substring filter for the secondary-bastion dropdown.
     pub secondary_bastion_filter: String,
+    /// Usernames that delete_user must never remove (case-insensitive).
+    /// Defaults to a safe built-in set; edit in features.json to extend.
+    pub protected_users: Vec<String>,
+}
+
+/// Built-in never-delete list (system / critical accounts).
+fn default_protected_users() -> Vec<String> {
+    [
+        "root",
+        "ec2-user",
+        "ssm-user",
+        "ssm-agent",
+        "ubuntu",
+        "centos",
+        "admin",
+        "sshd",
+        "nobody",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 impl Default for Features {
@@ -30,7 +51,19 @@ impl Default for Features {
             allow_delete_user: false,
             primary_bastion_filter: "bastion".to_string(),
             secondary_bastion_filter: "bastion".to_string(),
+            protected_users: default_protected_users(),
         }
+    }
+}
+
+impl Features {
+    /// True when `name` is on the protected never-delete list (case- and
+    /// whitespace-insensitive).
+    pub fn is_protected_user(&self, name: &str) -> bool {
+        let n = name.trim().to_ascii_lowercase();
+        self.protected_users
+            .iter()
+            .any(|p| p.trim().to_ascii_lowercase() == n)
     }
 }
 
@@ -85,5 +118,20 @@ mod tests {
         .expect("should parse");
         assert_eq!(f.primary_bastion_filter, "prod-a");
         assert_eq!(f.secondary_bastion_filter, "prod-b");
+    }
+
+    #[test]
+    fn protected_users_default_and_case_insensitive() {
+        let f = Features::default();
+        assert!(f.is_protected_user("ec2-user"));
+        assert!(f.is_protected_user("SSM-User"));
+        assert!(f.is_protected_user(" root "));
+        assert!(!f.is_protected_user("test.user"));
+    }
+
+    #[test]
+    fn protected_users_missing_key_uses_defaults() {
+        let f: Features = serde_json::from_str("{}").expect("should parse");
+        assert!(f.is_protected_user("ssm-user"));
     }
 }

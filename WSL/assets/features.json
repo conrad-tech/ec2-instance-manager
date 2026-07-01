@@ -1,6 +1,17 @@
 {
-  "_comment": "Build-time feature gates. Edit and rebuild to change. allow_delete_user exposes the destructive 'delete_user.sh' entry in the Scripts menu; keep it false unless the build is intended for admins who need it. primary_bastion_filter / secondary_bastion_filter narrow the Scripts dialog bastion dropdowns to instances whose name or id contains the given text (case-insensitive); empty shows all.",
+  "_comment": "Build-time feature gates. Edit and rebuild to change. allow_delete_user exposes the destructive 'delete_user.sh' entry in the Scripts menu; keep it false unless the build is intended for admins who need it. primary_bastion_filter / secondary_bastion_filter narrow the Scripts dialog bastion dropdowns to instances whose name or id contains the given text (case-insensitive); empty shows all. protected_users are never deleted by delete_user (case-insensitive); the script also hardcodes system-account protection as a backstop.",
   "allow_delete_user": false,
   "primary_bastion_filter": "bastion",
-  "secondary_bastion_filter": "bastion"
+  "secondary_bastion_filter": "bastion",
+  "protected_users": [
+    "root",
+    "ec2-user",
+    "ssm-user",
+    "ssm-agent",
+    "ubuntu",
+    "centos",
+    "admin",
+    "sshd",
+    "nobody"
+  ]
 }
