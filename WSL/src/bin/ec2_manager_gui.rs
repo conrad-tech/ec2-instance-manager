@@ -1202,34 +1202,49 @@ mod gui {
         secondary_ip: String,
         primary_ctx: AwsContext,
         secondary_ctx: AwsContext,
+        primary_channel: Option<Arc<ControlChannel>>,
+        secondary_channel: Option<Arc<ControlChannel>>,
         tx: Sender<VerifyOutcome>,
     ) {
         // The user's private key lives in the shared EFS home, so it's
         // reachable (and identical) from both bastions. Run both SSH checks
-        // and the PEM pull concurrently — each is a separate SSM round-trip.
+        // and the PEM pull concurrently. Each command runs on the bastion it
+        // logs in *from*, so use that bastion's control channel (falls back
+        // to `send-command` when the channel isn't up yet).
         let user_pem = format!("/efs/home/{username}/.ssh/{username}.pem");
         let p2s_handle = {
-            let (ctx, id, pem, user, ip) = (
+            let (ch, ctx, id, pem, user, ip) = (
+                primary_channel.clone(),
                 primary_ctx.clone(),
                 primary_id.clone(),
                 user_pem.clone(),
                 username.clone(),
                 secondary_ip.clone(),
             );
-            std::thread::spawn(move || ssh_cross_login_test(&ctx, &id, &pem, &user, &ip))
+            std::thread::spawn(move || {
+                ssh_cross_login_test(&ch, &ctx, &id, &pem, &user, &ip)
+            })
         };
         let s2p_handle = {
-            let (ctx, id, pem, user, ip) = (
+            let (ch, ctx, id, pem, user, ip) = (
+                secondary_channel.clone(),
                 secondary_ctx.clone(),
                 secondary_id.clone(),
                 user_pem.clone(),
                 username.clone(),
                 primary_ip.clone(),
             );
-            std::thread::spawn(move || ssh_cross_login_test(&ctx, &id, &pem, &user, &ip))
+            std::thread::spawn(move || {
+                ssh_cross_login_test(&ch, &ctx, &id, &pem, &user, &ip)
+            })
         };
-        let pem_result =
-            pull_pem_to_downloads(&primary_ctx, &primary_id, &username, &mmodal_env);
+        let pem_result = pull_pem_to_downloads(
+            &primary_channel,
+            &primary_ctx,
+            &primary_id,
+            &username,
+            &mmodal_env,
+        );
         let p2s = p2s_handle.join().unwrap_or(false);
         let s2p = s2p_handle.join().unwrap_or(false);
 
@@ -1247,9 +1262,15 @@ mod gui {
             None
         } else {
             let mut r = format!("[primary {primary_id}]\n");
-            r.push_str(&run_create_diagnostics(&primary_ctx, &primary_id, &username));
+            r.push_str(&run_create_diagnostics(
+                &primary_channel,
+                &primary_ctx,
+                &primary_id,
+                &username,
+            ));
             r.push_str(&format!("\n\n[secondary {secondary_id}]\n"));
             r.push_str(&run_create_diagnostics(
+                &secondary_channel,
                 &secondary_ctx,
                 &secondary_id,
                 &username,
@@ -1270,6 +1291,7 @@ mod gui {
     /// account (/etc/passwd), primary group, home dir + perms, `.ssh` perms,
     /// authorized_keys, and the PEM copies. Used in the failure popup.
     fn run_create_diagnostics(
+        channel: &Option<Arc<ControlChannel>>,
         ctx: &AwsContext,
         instance_id: &str,
         username: &str,
@@ -1300,7 +1322,7 @@ mod gui {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
         let cmd = format!("echo {b64} | base64 -d | bash");
-        match exec_remote_command(&None, ctx, instance_id, &cmd, Duration::from_secs(30)) {
+        match exec_remote_command(channel, ctx, instance_id, &cmd, Duration::from_secs(30)) {
             Ok(out) => out.trim_end().to_string(),
             Err(e) => format!("(diagnostics failed: {e})"),
         }
@@ -1384,6 +1406,8 @@ mod gui {
         secondary_id: String,
         primary_ctx: AwsContext,
         secondary_ctx: AwsContext,
+        primary_channel: Option<Arc<ControlChannel>>,
+        secondary_channel: Option<Arc<ControlChannel>>,
         tx: Sender<VerifyOutcome>,
     ) {
         // Prints CNU_ABSENT when the account no longer exists (always exits
@@ -1391,13 +1415,27 @@ mod gui {
         let cmd = format!(
             "id {username} >/dev/null 2>&1 && echo CNU_PRESENT || echo CNU_ABSENT"
         );
-        let absent = |ctx: &AwsContext, id: &str| -> bool {
-            exec_remote_command(&None, ctx, id, &cmd, Duration::from_secs(30))
+        let absent = |ch: &Option<Arc<ControlChannel>>, ctx: &AwsContext, id: &str| -> bool {
+            exec_remote_command(ch, ctx, id, &cmd, Duration::from_secs(30))
                 .map(|out| out.contains("CNU_ABSENT"))
                 .unwrap_or(false)
         };
-        let primary_absent = absent(&primary_ctx, &primary_id);
-        let secondary_absent = absent(&secondary_ctx, &secondary_id);
+        // Check both bastions concurrently.
+        let sec_handle = {
+            let (ch, ctx, id, cmd) = (
+                secondary_channel.clone(),
+                secondary_ctx.clone(),
+                secondary_id.clone(),
+                cmd.clone(),
+            );
+            std::thread::spawn(move || {
+                exec_remote_command(&ch, &ctx, &id, &cmd, Duration::from_secs(30))
+                    .map(|out| out.contains("CNU_ABSENT"))
+                    .unwrap_or(false)
+            })
+        };
+        let primary_absent = absent(&primary_channel, &primary_ctx, &primary_id);
+        let secondary_absent = sec_handle.join().unwrap_or(false);
         // If the user survived on a bastion, gather a report from that
         // bastion showing what's left / what's blocking removal.
         let diagnostics = if primary_absent && secondary_absent {
@@ -1406,7 +1444,12 @@ mod gui {
             let mut r = String::new();
             if !primary_absent {
                 r.push_str(&format!("[primary {primary_id}]\n"));
-                r.push_str(&run_delete_diagnostics(&primary_ctx, &primary_id, &username));
+                r.push_str(&run_delete_diagnostics(
+                    &primary_channel,
+                    &primary_ctx,
+                    &primary_id,
+                    &username,
+                ));
             }
             if !secondary_absent {
                 if !r.is_empty() {
@@ -1414,6 +1457,7 @@ mod gui {
                 }
                 r.push_str(&format!("[secondary {secondary_id}]\n"));
                 r.push_str(&run_delete_diagnostics(
+                    &secondary_channel,
                     &secondary_ctx,
                     &secondary_id,
                     &username,
@@ -1433,6 +1477,7 @@ mod gui {
     /// account, group, active sessions + processes (the usual `userdel`
     /// blockers), the home dir (did `--remove-home` work?), and sudoers.
     fn run_delete_diagnostics(
+        channel: &Option<Arc<ControlChannel>>,
         ctx: &AwsContext,
         instance_id: &str,
         username: &str,
@@ -1455,7 +1500,7 @@ mod gui {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
         let cmd = format!("echo {b64} | base64 -d | bash");
-        match exec_remote_command(&None, ctx, instance_id, &cmd, Duration::from_secs(30)) {
+        match exec_remote_command(channel, ctx, instance_id, &cmd, Duration::from_secs(30)) {
             Ok(out) => out.trim_end().to_string(),
             Err(e) => format!("(diagnostics failed: {e})"),
         }
@@ -1465,6 +1510,7 @@ mod gui {
     /// shared EFS key. Retries a few times so a freshly created account has
     /// time to settle. Returns true on a successful login.
     fn ssh_cross_login_test(
+        channel: &Option<Arc<ControlChannel>>,
         ctx: &AwsContext,
         instance_id: &str,
         user_pem: &str,
@@ -1488,7 +1534,7 @@ mod gui {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
         let cmd = format!("echo {b64} | base64 -d | bash");
-        match exec_remote_command(&None, ctx, instance_id, &cmd, Duration::from_secs(30)) {
+        match exec_remote_command(channel, ctx, instance_id, &cmd, Duration::from_secs(30)) {
             Ok(out) => out.contains("CNU_PASS"),
             Err(_) => false,
         }
@@ -1497,6 +1543,7 @@ mod gui {
     /// Pull `/root/<user>.pem` from the primary bastion and save it locally
     /// as `~/Downloads/<user>-<env>.pem`. Returns the saved path.
     fn pull_pem_to_downloads(
+        channel: &Option<Arc<ControlChannel>>,
         ctx: &AwsContext,
         instance_id: &str,
         username: &str,
@@ -1504,7 +1551,7 @@ mod gui {
     ) -> std::result::Result<String, String> {
         let cmd = format!("base64 -w0 /root/{username}.pem");
         let out =
-            exec_remote_command(&None, ctx, instance_id, &cmd, Duration::from_secs(30))?;
+            exec_remote_command(channel, ctx, instance_id, &cmd, Duration::from_secs(30))?;
         use base64::Engine;
         let cleaned: String = out.split_whitespace().collect();
         let bytes = base64::engine::general_purpose::STANDARD
@@ -4719,19 +4766,22 @@ mod gui {
                     .encode(SCRIPT.replace('\r', ""));
                 let remote_path = "/root/delete_user.sh";
                 let write = format!("echo '{b64}' | base64 -d > {remote_path}");
+                // `cd ~` is folded into the next command: on its own it's a
+                // zero-latency builtin whose prompt-redraw arrives in the
+                // same frame as its echo, so the prompt-bump is missed and
+                // the worker eats the full fallback timeout. Chaining it onto
+                // a command that touches the filesystem avoids that.
                 // Delete always removes the shared EFS home too.
                 let primary = vec![
                     "sudo su".to_string(),
                     PREP_STEP_SENTINEL.to_string(),
-                    "cd ~".to_string(),
-                    write.clone(),
+                    format!("cd ~ && {write}"),
                     format!("bash {remote_path} --user {username} --remove-home"),
                 ];
                 let secondary = vec![
                     "sudo su".to_string(),
                     PREP_STEP_SENTINEL.to_string(),
-                    "cd ~".to_string(),
-                    write,
+                    format!("cd ~ && {write}"),
                     format!("bash {remote_path} --user {username} --secondary"),
                 ];
                 (primary, secondary)
@@ -4752,8 +4802,8 @@ mod gui {
                 let primary = vec![
                     "sudo su".to_string(),
                     PREP_STEP_SENTINEL.to_string(),
-                    "cd ~".to_string(),
-                    format!("echo '{b64}' | base64 -d > {remote_path}"),
+                    // `cd ~` folded into the write (see delete branch note).
+                    format!("cd ~ && echo '{b64}' | base64 -d > {remote_path}"),
                     run_line,
                 ];
 
@@ -4767,8 +4817,8 @@ mod gui {
                 let mut secondary = vec![
                     "sudo su".to_string(),
                     PREP_STEP_SENTINEL.to_string(),
-                    "cd ~".to_string(),
-                    format!("UID_NUM=$(stat -c %u /efs/home/{username})"),
+                    // `cd ~` folded into the first stat (see delete note).
+                    format!("cd ~ && UID_NUM=$(stat -c %u /efs/home/{username})"),
                     format!("GID_NUM=$(stat -c %g /efs/home/{username})"),
                     format!("groupadd -g $GID_NUM {username} 2>/dev/null || true"),
                     format!(
@@ -4987,6 +5037,24 @@ mod gui {
                 self.log_info(line);
             }
 
+            // Pre-warm each bastion's control channel while its script runs,
+            // so the post-run SSH/confirm/diagnostics commands can reuse a
+            // warm session instead of paying `send-command` latency. Idempotent
+            // and cheap once established (only spawns after the visible
+            // terminal has connected).
+            let (warm_p, warm_s) = self
+                .create_user_run
+                .as_ref()
+                .filter(|r| !r.verify_started)
+                .map(|r| (Some(r.primary_tab), r.secondary_tab))
+                .unwrap_or((None, None));
+            if let Some(t) = warm_p {
+                let _ = self.ensure_control_channel(t);
+            }
+            if let Some(t) = warm_s {
+                let _ = self.ensure_control_channel(t);
+            }
+
             // Delete pre-flight results: proceed only if both bastions are
             // clear, otherwise report why the delete was aborted.
             while let Ok(outcome) = self.preflight_rx.try_recv() {
@@ -5098,6 +5166,13 @@ mod gui {
                     let secondary_ip = run.secondary_ip.clone();
                     let primary_ctx = run.primary_ctx.clone();
                     let secondary_ctx = run.secondary_ctx.clone();
+                    // Reuse each bastion's warm control channel if it's up
+                    // (pre-warmed while the script ran); else send-command.
+                    let primary_channel =
+                        self.control_channels.get(&run.primary_tab).cloned();
+                    let secondary_channel = run
+                        .secondary_tab
+                        .and_then(|t| self.control_channels.get(&t).cloned());
                     if delete {
                         self.log_info(format!(
                             "delete_user: delete finished, confirming removal of '{username}'…"
@@ -5113,6 +5188,8 @@ mod gui {
                                 secondary_id,
                                 primary_ctx,
                                 secondary_ctx,
+                                primary_channel,
+                                secondary_channel,
                                 tx,
                             )
                         });
@@ -5134,6 +5211,8 @@ mod gui {
                                 secondary_ip,
                                 primary_ctx,
                                 secondary_ctx,
+                                primary_channel,
+                                secondary_channel,
                                 tx,
                             )
                         });
