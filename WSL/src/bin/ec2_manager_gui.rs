@@ -515,6 +515,83 @@ mod gui {
         ssh_user: String,
     }
 
+    /// Modal state for the "Scripts → create_new_user.sh" dialog.
+    struct CreateUserDialog {
+        /// New username to create.
+        username: String,
+        /// Environment (config profile_id) whose bastions we target.
+        env_profile_id: String,
+        /// Whether to pass `--sudo` (grant NOPASSWD:ALL).
+        grant_sudo: bool,
+        /// Text typed in the primary-bastion filter box.
+        primary_query: String,
+        /// Text typed in the secondary-bastion filter box.
+        secondary_query: String,
+        /// Chosen primary bastion instance id (empty until picked).
+        primary_id: String,
+        /// Chosen secondary bastion instance id (empty until picked).
+        secondary_id: String,
+        /// Inline validation error, shown in red.
+        error: Option<String>,
+    }
+
+    /// Tracks an in-flight create_new_user.sh run so that once both the
+    /// primary and secondary create steps finish (signalled per-tab via
+    /// `script_done`), we can verify cross-bastion SSH login as the new
+    /// user and pull the generated PEM back to the local Downloads folder.
+    struct CreateUserRun {
+        username: String,
+        /// MMODAL_ENV tag of the primary bastion (used in the PEM filename).
+        mmodal_env: String,
+        primary_tab: u64,
+        secondary_tab: u64,
+        primary_id: String,
+        secondary_id: String,
+        primary_ip: String,
+        secondary_ip: String,
+        primary_ctx: AwsContext,
+        secondary_ctx: AwsContext,
+        primary_done: bool,
+        secondary_done: bool,
+        /// Set once the verify worker has been spawned.
+        verify_started: bool,
+    }
+
+    /// Result of the post-create verification worker.
+    enum VerifyOutcome {
+        Done {
+            username: String,
+            /// primary → secondary SSH login succeeded.
+            p2s: bool,
+            /// secondary → primary SSH login succeeded.
+            s2p: bool,
+            /// Local path the PEM was saved to, if the pull succeeded.
+            pem_path: Option<String>,
+            /// Any error encountered (SSH or PEM pull).
+            error: Option<String>,
+        },
+    }
+
+    /// A queued run of a script against one connection tab. Spawned onto a
+    /// background worker (see `run_script_worker`) once the tab's PTY
+    /// session exists. Commands are sent one-per-line, each waiting for the
+    /// remote shell prompt to redraw (via `prompt_ready`) before the next.
+    struct PendingScriptRun {
+        /// Connection tab whose PTY session receives the commands.
+        tab_id: u64,
+        /// Shell commands to send, in order (no trailing CR — the worker
+        /// appends it).
+        steps: Vec<String>,
+        /// Wait for the initial login prompt before the first command
+        /// (true for freshly opened sessions; false when reusing an
+        /// already-logged-in tab).
+        wait_for_login: bool,
+        /// Set once the worker thread has been spawned.
+        spawned: bool,
+        /// Human-readable label for logging (e.g. "primary i-0abc…").
+        label: String,
+    }
+
     /// Comment prefixes for a file extension, used by the editor's
     /// lightweight syntax highlighter.
     fn comment_prefixes(ext: &str) -> &'static [&'static str] {
@@ -1033,6 +1110,140 @@ mod gui {
         let command_id =
             ssm_send_command(&ctx.profile, &ctx.region, instance_id, command)?;
         ssm_wait_for_command(&ctx.profile, &ctx.region, instance_id, &command_id)
+    }
+
+    /// Post-create verification: SSH from primary→secondary and
+    /// secondary→primary as the new user, then pull the generated PEM to
+    /// the local Downloads folder. Reports the outcome on `tx`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_verify_worker(
+        username: String,
+        mmodal_env: String,
+        primary_id: String,
+        secondary_id: String,
+        primary_ip: String,
+        secondary_ip: String,
+        primary_ctx: AwsContext,
+        secondary_ctx: AwsContext,
+        tx: Sender<VerifyOutcome>,
+    ) {
+        // The user's private key lives in the shared EFS home, so it's
+        // reachable (and identical) from both bastions.
+        let user_pem = format!("/efs/home/{username}/.ssh/{username}.pem");
+        let p2s = ssh_cross_login_test(
+            &primary_ctx,
+            &primary_id,
+            &user_pem,
+            &username,
+            &secondary_ip,
+        );
+        let s2p = ssh_cross_login_test(
+            &secondary_ctx,
+            &secondary_id,
+            &user_pem,
+            &username,
+            &primary_ip,
+        );
+
+        let mut error: Option<String> = None;
+        let pem_path =
+            match pull_pem_to_downloads(&primary_ctx, &primary_id, &username, &mmodal_env) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    error = Some(e);
+                    None
+                }
+            };
+        let _ = tx.send(VerifyOutcome::Done {
+            username,
+            p2s,
+            s2p,
+            pem_path,
+            error,
+        });
+    }
+
+    /// Run `ssh <user>@<target_ip> 'echo …'` from `instance_id` using the
+    /// shared EFS key. Retries a few times so a freshly created account has
+    /// time to settle. Returns true on a successful login.
+    fn ssh_cross_login_test(
+        ctx: &AwsContext,
+        instance_id: &str,
+        user_pem: &str,
+        username: &str,
+        target_ip: &str,
+    ) -> bool {
+        if target_ip.trim().is_empty() {
+            return false;
+        }
+        // base64-wrap the script so quoting survives `aws ssm send-command`.
+        let script = format!(
+            "for i in 1 2 3; do if ssh -i {pem} -o BatchMode=yes \
+             -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
+             -o ConnectTimeout=5 {user}@{ip} 'echo CNU_SSH_OK' 2>/dev/null \
+             | grep -q CNU_SSH_OK; then echo CNU_PASS; exit 0; fi; sleep 2; done; \
+             echo CNU_FAIL",
+            pem = user_pem,
+            user = username,
+            ip = target_ip,
+        );
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
+        let cmd = format!("echo {b64} | base64 -d | bash");
+        match exec_remote_command(&None, ctx, instance_id, &cmd, Duration::from_secs(30)) {
+            Ok(out) => out.contains("CNU_PASS"),
+            Err(_) => false,
+        }
+    }
+
+    /// Pull `/root/<user>.pem` from the primary bastion and save it locally
+    /// as `~/Downloads/<user>-<env>.pem`. Returns the saved path.
+    fn pull_pem_to_downloads(
+        ctx: &AwsContext,
+        instance_id: &str,
+        username: &str,
+        mmodal_env: &str,
+    ) -> std::result::Result<String, String> {
+        let cmd = format!("base64 -w0 /root/{username}.pem");
+        let out =
+            exec_remote_command(&None, ctx, instance_id, &cmd, Duration::from_secs(30))?;
+        use base64::Engine;
+        let cleaned: String = out.split_whitespace().collect();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(cleaned.as_bytes())
+            .map_err(|e| format!("PEM base64 decode failed: {e}"))?;
+        if bytes.is_empty() {
+            return Err("PEM pull returned no data".to_string());
+        }
+        let home = ec2_manager::util::home_dir()
+            .ok_or_else(|| "could not resolve home directory".to_string())?;
+        let downloads = home.join("Downloads");
+        std::fs::create_dir_all(&downloads)
+            .map_err(|e| format!("could not create Downloads dir: {e}"))?;
+        let env_part = sanitize_filename_part(mmodal_env);
+        let file_name = if env_part.is_empty() {
+            format!("{username}.pem")
+        } else {
+            format!("{username}-{env_part}.pem")
+        };
+        let path = downloads.join(file_name);
+        std::fs::write(&path, &bytes).map_err(|e| format!("could not write PEM: {e}"))?;
+        Ok(path.to_string_lossy().to_string())
+    }
+
+    /// Keep only filename-safe characters (alnum, dash, underscore, dot);
+    /// everything else becomes a dash.
+    fn sanitize_filename_part(s: &str) -> String {
+        s.trim()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
     }
 
     /// Up to this many path-completion matches are shown directly in the
@@ -1703,6 +1914,19 @@ mod gui {
         /// When set, the Edit menu briefly flashes to draw the user's
         /// attention to it (e.g. after they tick "Don't ask again").
         edit_menu_flash_start: Option<Instant>,
+        /// Active "Scripts → create_new_user.sh" dialog, if any.
+        create_user_dialog: Option<CreateUserDialog>,
+        /// Queued script runs waiting for their PTY session to come up.
+        pending_script_runs: Vec<PendingScriptRun>,
+        /// In-flight create-user run (post-create SSH verification + PEM
+        /// pull), if any.
+        create_user_run: Option<CreateUserRun>,
+        /// Worker → UI: a script run's tab finished all its steps.
+        script_done_tx: Sender<u64>,
+        script_done_rx: Receiver<u64>,
+        /// Verify worker → UI: cross-login test results + saved PEM path.
+        verify_tx: Sender<VerifyOutcome>,
+        verify_rx: Receiver<VerifyOutcome>,
         /// Cached result of the VS Code `code` CLI probe — computed once
         /// in the background at startup so "Open in VS Code" never blocks
         /// the UI thread on a subprocess spawn. None until the probe runs.
@@ -1751,6 +1975,8 @@ mod gui {
             };
             let (refresh_tx, refresh_rx) = mpsc::channel();
             let (file_op_tx, file_op_rx) = mpsc::channel();
+            let (script_done_tx, script_done_rx) = mpsc::channel();
+            let (verify_tx, verify_rx) = mpsc::channel();
             #[cfg(target_os = "windows")]
             let (ui_tx, ui_rx) = mpsc::channel();
             let profile_choice_path = profile_choice_path();
@@ -1893,6 +2119,13 @@ mod gui {
                 settings_pem_dialog: None,
                 show_file_browser_defaults: false,
                 edit_menu_flash_start: None,
+                create_user_dialog: None,
+                pending_script_runs: Vec::new(),
+                create_user_run: None,
+                script_done_tx,
+                script_done_rx,
+                verify_tx,
+                verify_rx,
                 vscode_cli_ok: Arc::new(Mutex::new(None)),
                 editor_split: HashMap::new(),
                 file_op_tx,
@@ -3621,6 +3854,683 @@ mod gui {
             if !window_open {
                 let _ = self.config.save();
                 self.show_file_browser_defaults = false;
+            }
+        }
+
+        /// Best-effort "Name  i-id" label for a bastion instance in an
+        /// environment, falling back to the bare id when the name isn't
+        /// cached. Returns "" for an empty id.
+        fn bastion_label(&self, env: &str, id: &str) -> String {
+            if id.is_empty() {
+                return String::new();
+            }
+            let name = self
+                .profile_inventory_cache
+                .get(env)
+                .and_then(|(inv, _)| {
+                    inv.instances.iter().find(|i| i.instance_id == id)
+                })
+                .and_then(|i| i.name.clone())
+                .unwrap_or_default();
+            if name.trim().is_empty() {
+                id.to_string()
+            } else {
+                format!("{name}  {id}")
+            }
+        }
+
+        /// Render the "Scripts → create_new_user.sh" modal.
+        fn render_create_user_dialog(&mut self, ctx: &egui::Context) {
+            let Some(mut dlg) = self.create_user_dialog.take() else {
+                return;
+            };
+            // Make sure the chosen environment's inventory is loaded so the
+            // bastion pickers have something to filter.
+            if !dlg.env_profile_id.is_empty() {
+                self.prime_cache_from_disk(&dlg.env_profile_id);
+            }
+            // (id, name) for running instances in the chosen environment.
+            let instances: Vec<(String, String)> = self
+                .profile_inventory_cache
+                .get(&dlg.env_profile_id)
+                .map(|(inv, _)| {
+                    inv.instances
+                        .iter()
+                        .filter(|i| i.state.eq_ignore_ascii_case("running"))
+                        .map(|i| {
+                            (i.instance_id.clone(), i.name.clone().unwrap_or_default())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let profiles: Vec<(String, String)> = self
+                .config
+                .profiles
+                .iter()
+                .map(|p| (p.profile_id.clone(), p.display_name.clone()))
+                .collect();
+
+            let mut window_open = true;
+            let mut do_run = false;
+            let mut do_cancel = false;
+
+            egui::Window::new("Scripts — create_new_user.sh")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    egui::Grid::new("cnu_grid")
+                        .num_columns(2)
+                        .spacing([10.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("User:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut dlg.username)
+                                    .hint_text("new username")
+                                    .desired_width(320.0),
+                            );
+                            ui.end_row();
+
+                            ui.label("Environment:");
+                            let env_label = profiles
+                                .iter()
+                                .find(|(id, _)| *id == dlg.env_profile_id)
+                                .map(|(_, name)| name.clone())
+                                .unwrap_or_else(|| "Select…".to_string());
+                            let prev_env = dlg.env_profile_id.clone();
+                            egui::ComboBox::from_id_salt("cnu_env")
+                                .selected_text(env_label)
+                                .width(320.0)
+                                .show_ui(ui, |ui| {
+                                    for (id, name) in &profiles {
+                                        ui.selectable_value(
+                                            &mut dlg.env_profile_id,
+                                            id.clone(),
+                                            name.clone(),
+                                        );
+                                    }
+                                });
+                            if dlg.env_profile_id != prev_env {
+                                // Chosen bastions belong to the old env — reset.
+                                dlg.primary_id.clear();
+                                dlg.primary_query.clear();
+                                dlg.secondary_id.clear();
+                                dlg.secondary_query.clear();
+                            }
+                            ui.end_row();
+                        });
+
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut dlg.grant_sudo, "Grant sudo (NOPASSWD:ALL)");
+                    ui.add_space(6.0);
+
+                    // Primary bastion picker.
+                    Self::bastion_picker_ui(
+                        ui,
+                        "cnu_primary",
+                        "Type/Choose Primary Bastion",
+                        &mut dlg.primary_query,
+                        &mut dlg.primary_id,
+                        &instances,
+                    );
+                    ui.add_space(6.0);
+                    // Secondary bastion picker.
+                    Self::bastion_picker_ui(
+                        ui,
+                        "cnu_secondary",
+                        "Type/Choose Secondary Bastion",
+                        &mut dlg.secondary_query,
+                        &mut dlg.secondary_id,
+                        &instances,
+                    );
+
+                    if let Some(err) = &dlg.error {
+                        ui.add_space(6.0);
+                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+                    }
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Run").clicked() {
+                            do_run = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+
+            if do_cancel || !window_open {
+                self.create_user_dialog = None;
+                return;
+            }
+
+            if do_run {
+                let username = dlg.username.trim().to_string();
+                let valid_user = !username.is_empty()
+                    && username
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_lowercase() || c == '_')
+                        .unwrap_or(false)
+                    && username
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-'));
+                if !valid_user {
+                    dlg.error = Some("Enter a valid username (lowercase, starts with a letter/underscore).".to_string());
+                    self.create_user_dialog = Some(dlg);
+                    return;
+                }
+                if dlg.env_profile_id.is_empty() {
+                    dlg.error = Some("Choose an environment.".to_string());
+                    self.create_user_dialog = Some(dlg);
+                    return;
+                }
+                if dlg.primary_id.is_empty() {
+                    dlg.error = Some("Choose a primary bastion.".to_string());
+                    self.create_user_dialog = Some(dlg);
+                    return;
+                }
+                if dlg.secondary_id.is_empty() {
+                    dlg.error = Some("Choose a secondary bastion.".to_string());
+                    self.create_user_dialog = Some(dlg);
+                    return;
+                }
+                // Remember the selection for next time.
+                self.config.set_bastion_selection(
+                    &dlg.env_profile_id,
+                    &dlg.primary_id,
+                    &dlg.secondary_id,
+                );
+                let _ = self.config.save();
+                self.start_create_user_run(
+                    &username,
+                    &dlg.env_profile_id,
+                    dlg.grant_sudo,
+                    &dlg.primary_id,
+                    &dlg.secondary_id,
+                );
+                self.create_user_dialog = None;
+                return;
+            }
+
+            self.create_user_dialog = Some(dlg);
+        }
+
+        /// A filter box + inline dropdown for choosing one bastion instance.
+        /// The list filters live on the typed text (matching instance id OR
+        /// name) and is hidden once a selection is made and the box loses
+        /// focus.
+        fn bastion_picker_ui(
+            ui: &mut egui::Ui,
+            id_salt: &str,
+            hint: &str,
+            query: &mut String,
+            chosen_id: &mut String,
+            instances: &[(String, String)],
+        ) {
+            ui.label(hint);
+            let resp = ui.add(
+                egui::TextEdit::singleline(query)
+                    .hint_text(hint)
+                    .desired_width(320.0),
+            );
+            // Typing invalidates a prior selection until a row is re-picked.
+            if resp.changed() {
+                chosen_id.clear();
+            }
+            let show_list = resp.has_focus() || chosen_id.is_empty();
+            if !show_list || instances.is_empty() {
+                return;
+            }
+            let needle = query.to_ascii_lowercase();
+            egui::ScrollArea::vertical()
+                .id_salt(id_salt)
+                .max_height(120.0)
+                .show(ui, |ui| {
+                    for (id, name) in instances.iter().filter(|(id, name)| {
+                        needle.is_empty()
+                            || id.to_ascii_lowercase().contains(&needle)
+                            || name.to_ascii_lowercase().contains(&needle)
+                    }) {
+                        let shown = if name.trim().is_empty() {
+                            format!("(no name)  {id}")
+                        } else {
+                            format!("{name}  {id}")
+                        };
+                        if ui
+                            .selectable_label(chosen_id == id, shown.clone())
+                            .clicked()
+                        {
+                            *chosen_id = id.clone();
+                            *query = if name.trim().is_empty() {
+                                id.clone()
+                            } else {
+                                format!("{name}  {id}")
+                            };
+                        }
+                    }
+                });
+        }
+
+        /// Find a logged-in tab for `instance_id`, or open a new session to
+        /// it in the given environment. Returns `(tab_id, wait_for_login)`
+        /// where `wait_for_login` is true for a freshly opened session.
+        fn ensure_bastion_session(
+            &mut self,
+            instance_id: &str,
+            env: &str,
+        ) -> Option<(u64, bool)> {
+            // Reuse an existing running session for this instance.
+            let existing: Vec<u64> = self
+                .connections
+                .tabs()
+                .iter()
+                .filter(|t| t.instance_id == instance_id && t.running)
+                .map(|t| t.id)
+                .collect();
+            if let Some(id) = existing
+                .into_iter()
+                .find(|id| self.pty_sessions.contains_key(id))
+            {
+                self.log_info(format!(
+                    "script run reusing session tab={id} instance={instance_id}"
+                ));
+                return Some((id, false));
+            }
+
+            // Otherwise open a fresh connection in the target environment.
+            let ctx = self
+                .profile_inventory_cache
+                .get(env)
+                .map(|(_, c)| c.clone())
+                .or_else(|| self.context.clone())?;
+            let name = self
+                .profile_inventory_cache
+                .get(env)
+                .and_then(|(inv, _)| {
+                    inv.instances.iter().find(|i| i.instance_id == instance_id)
+                })
+                .and_then(|i| i.name.clone())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| instance_id.to_string());
+
+            let command_args =
+                build_ssm_session_args(instance_id, &ctx.region, &ctx.profile);
+            let command_line = format!("aws {}", command_args.join(" "));
+            let command = if ctx.mode == Mode::Sim {
+                let kind = self
+                    .selected_terminal()
+                    .map(|t| t.kind.clone())
+                    .unwrap_or(TerminalKind::Wsl);
+                format_sim_command(kind, &command_line, instance_id, None)
+            } else {
+                command_line
+            };
+            if self
+                .open_connection_tab(name, instance_id.to_string(), command, command_args, &ctx)
+                .is_err()
+            {
+                return None;
+            }
+            let tab_id = self.connections.selected()?;
+            self.log_info(format!(
+                "script run opened session tab={tab_id} instance={instance_id}"
+            ));
+            Some((tab_id, true))
+        }
+
+        /// Build the command plan for the primary + secondary bastions and
+        /// enqueue them. The actual sending happens on a worker thread once
+        /// each session's PTY is up (see `pump_script_runs`).
+        fn start_create_user_run(
+            &mut self,
+            username: &str,
+            env: &str,
+            grant_sudo: bool,
+            primary_id: &str,
+            secondary_id: &str,
+        ) {
+            use base64::Engine;
+            const SCRIPT: &str =
+                include_str!("../../assets/scripts/create_new_user.sh");
+            let b64 = base64::engine::general_purpose::STANDARD.encode(SCRIPT);
+            let remote_path = "/root/create_new_user.sh";
+
+            // Primary: drop the script and run it as root from $HOME.
+            let run_line = if grant_sudo {
+                format!("bash {remote_path} --user {username} --sudo")
+            } else {
+                format!("bash {remote_path} --user {username}")
+            };
+            let primary_steps = vec![
+                "sudo su".to_string(),
+                "cd ~".to_string(),
+                format!("echo '{b64}' | base64 -d > {remote_path}"),
+                run_line,
+            ];
+
+            // Secondary: mirror the UID/GID from the shared EFS home. These
+            // are the same commands the primary script echoes at the end.
+            let suffix = username.replace('.', "-");
+            let mut secondary_steps = vec![
+                "sudo su".to_string(),
+                "cd ~".to_string(),
+                format!("UID_NUM=$(stat -c %u /efs/home/{username})"),
+                format!("GID_NUM=$(stat -c %g /efs/home/{username})"),
+                format!("groupadd -g $GID_NUM {username}"),
+                format!(
+                    "useradd -u $UID_NUM -g $GID_NUM -d /efs/home/{username} {username}"
+                ),
+            ];
+            if grant_sudo {
+                secondary_steps.push(format!(
+                    "echo '{username} ALL=(ALL) NOPASSWD:ALL' | tee /etc/sudoers.d/zz-{suffix}-nopasswd > /dev/null"
+                ));
+                secondary_steps.push(format!(
+                    "visudo -cf /etc/sudoers.d/zz-{suffix}-nopasswd"
+                ));
+                secondary_steps.push(format!(
+                    "chmod 0440 /etc/sudoers.d/zz-{suffix}-nopasswd"
+                ));
+                secondary_steps.push(format!(
+                    "chown root:root /etc/sudoers.d/zz-{suffix}-nopasswd"
+                ));
+            }
+
+            let primary_tab = match self.ensure_bastion_session(primary_id, env) {
+                Some((tab_id, wait_for_login)) => {
+                    self.pending_script_runs.push(PendingScriptRun {
+                        tab_id,
+                        steps: primary_steps,
+                        wait_for_login,
+                        spawned: false,
+                        label: format!("primary {primary_id}"),
+                    });
+                    Some(tab_id)
+                }
+                None => {
+                    self.log_error(format!(
+                        "create_new_user: could not open primary bastion {primary_id}"
+                    ));
+                    None
+                }
+            };
+            let secondary_tab = match self.ensure_bastion_session(secondary_id, env) {
+                Some((tab_id, wait_for_login)) => {
+                    self.pending_script_runs.push(PendingScriptRun {
+                        tab_id,
+                        steps: secondary_steps,
+                        wait_for_login,
+                        spawned: false,
+                        label: format!("secondary {secondary_id}"),
+                    });
+                    Some(tab_id)
+                }
+                None => {
+                    self.log_error(format!(
+                        "create_new_user: could not open secondary bastion {secondary_id}"
+                    ));
+                    None
+                }
+            };
+
+            // If both sessions are queued, set up post-create verification.
+            if let (Some(primary_tab), Some(secondary_tab)) = (primary_tab, secondary_tab) {
+                let ctx = self
+                    .profile_inventory_cache
+                    .get(env)
+                    .map(|(_, c)| c.clone())
+                    .or_else(|| self.context.clone());
+                let ip_of = |id: &str| -> String {
+                    self.profile_inventory_cache
+                        .get(env)
+                        .and_then(|(inv, _)| {
+                            inv.instances.iter().find(|i| i.instance_id == id)
+                        })
+                        .and_then(|i| i.private_ip.clone())
+                        .unwrap_or_default()
+                };
+                let primary_ip = ip_of(primary_id);
+                let secondary_ip = ip_of(secondary_id);
+                let mmodal_env = self
+                    .profile_inventory_cache
+                    .get(env)
+                    .and_then(|(inv, _)| {
+                        inv.instances.iter().find(|i| i.instance_id == primary_id)
+                    })
+                    .and_then(instance_env)
+                    .unwrap_or_default();
+                if let Some(ctx) = ctx {
+                    self.create_user_run = Some(CreateUserRun {
+                        username: username.to_string(),
+                        mmodal_env,
+                        primary_tab,
+                        secondary_tab,
+                        primary_id: primary_id.to_string(),
+                        secondary_id: secondary_id.to_string(),
+                        primary_ip,
+                        secondary_ip,
+                        primary_ctx: ctx.clone(),
+                        secondary_ctx: ctx,
+                        primary_done: false,
+                        secondary_done: false,
+                        verify_started: false,
+                    });
+                } else {
+                    self.create_user_run = None;
+                    self.log_error(
+                        "create_new_user: no AWS context; skipping SSH verification"
+                            .to_string(),
+                    );
+                }
+            } else {
+                self.create_user_run = None;
+            }
+
+            self.main_tab = MainTab::Connections;
+            self.message =
+                format!("Running create_new_user.sh for '{username}'…");
+        }
+
+        /// Poll script-run completion and verification results: once both
+        /// bastions finish their create steps, spawn the SSH cross-login +
+        /// PEM-pull worker; when it reports back, surface the outcome.
+        fn poll_script_events(&mut self) {
+            // Mark tabs done as their workers report in.
+            while let Ok(tab_id) = self.script_done_rx.try_recv() {
+                if let Some(run) = self.create_user_run.as_mut() {
+                    if tab_id == run.primary_tab {
+                        run.primary_done = true;
+                    }
+                    if tab_id == run.secondary_tab {
+                        run.secondary_done = true;
+                    }
+                }
+            }
+
+            // Both create steps finished → kick off verification once.
+            let launch = self
+                .create_user_run
+                .as_ref()
+                .map(|r| r.primary_done && r.secondary_done && !r.verify_started)
+                .unwrap_or(false);
+            if launch {
+                if let Some(run) = self.create_user_run.as_mut() {
+                    run.verify_started = true;
+                }
+                if let Some(run) = self.create_user_run.as_ref() {
+                    let tx = self.verify_tx.clone();
+                    let username = run.username.clone();
+                    let mmodal_env = run.mmodal_env.clone();
+                    let primary_id = run.primary_id.clone();
+                    let secondary_id = run.secondary_id.clone();
+                    let primary_ip = run.primary_ip.clone();
+                    let secondary_ip = run.secondary_ip.clone();
+                    let primary_ctx = run.primary_ctx.clone();
+                    let secondary_ctx = run.secondary_ctx.clone();
+                    self.log_info(format!(
+                        "create_new_user: create finished, verifying SSH for '{username}'…"
+                    ));
+                    self.message =
+                        format!("Verifying SSH login for '{username}'…");
+                    std::thread::spawn(move || {
+                        run_verify_worker(
+                            username,
+                            mmodal_env,
+                            primary_id,
+                            secondary_id,
+                            primary_ip,
+                            secondary_ip,
+                            primary_ctx,
+                            secondary_ctx,
+                            tx,
+                        )
+                    });
+                }
+            }
+
+            // Verification results.
+            while let Ok(VerifyOutcome::Done {
+                username,
+                p2s,
+                s2p,
+                pem_path,
+                error,
+            }) = self.verify_rx.try_recv()
+            {
+                self.create_user_run = None;
+                if p2s && s2p {
+                    let mut msg = format!(
+                        "User '{username}' created. All tests passed (primary↔secondary SSH OK)."
+                    );
+                    if let Some(path) = &pem_path {
+                        msg.push_str(&format!(" PEM saved to {path}"));
+                    } else if let Some(err) = &error {
+                        msg.push_str(&format!(" (PEM not saved: {err})"));
+                    }
+                    self.log_info(msg.clone());
+                    self.message = msg;
+                } else {
+                    let dir = |ok: bool| if ok { "OK" } else { "FAILED" };
+                    let mut msg = format!(
+                        "User '{username}' created, but SSH test failed \
+                         (primary→secondary: {}, secondary→primary: {}).",
+                        dir(p2s),
+                        dir(s2p),
+                    );
+                    if let Some(path) = &pem_path {
+                        msg.push_str(&format!(" PEM saved to {path}"));
+                    }
+                    if let Some(err) = &error {
+                        msg.push_str(&format!(" {err}"));
+                    }
+                    self.log_error(msg.clone());
+                    self.message = msg;
+                }
+            }
+        }
+
+        /// Spawn worker threads for any queued script runs whose PTY session
+        /// now exists. Each worker sends its commands one line at a time,
+        /// waiting for the shell prompt between them.
+        fn pump_script_runs(&mut self) {
+            if self.pending_script_runs.is_empty() {
+                return;
+            }
+
+            /// Send each command, waiting for the remote shell prompt to
+            /// redraw before the next (falling back to a timeout so a
+            /// missed prompt-redraw never wedges the run).
+            fn run_script_worker(
+                writer: Arc<Mutex<Box<dyn Write + Send>>>,
+                prompt_ready: Arc<(Mutex<u64>, Condvar)>,
+                steps: Vec<String>,
+                wait_for_login: bool,
+                done_tx: Sender<u64>,
+                tab_id: u64,
+            ) {
+                const LOGIN_WAIT: Duration = Duration::from_secs(45);
+                const STEP_WAIT: Duration = Duration::from_secs(20);
+                const SETTLE: Duration = Duration::from_millis(150);
+
+                let snapshot = || {
+                    let (lock, _) = &*prompt_ready;
+                    lock.lock().map(|g| *g).unwrap_or(0)
+                };
+                let wait_advance = |pre: u64, timeout: Duration| {
+                    let (lock, cvar) = &*prompt_ready;
+                    if let Ok(guard) = lock.lock() {
+                        let _ = cvar
+                            .wait_timeout_while(guard, timeout, |c| *c == pre);
+                    }
+                };
+
+                if wait_for_login {
+                    let pre = snapshot();
+                    wait_advance(pre, LOGIN_WAIT);
+                    std::thread::sleep(SETTLE);
+                }
+
+                for step in steps {
+                    let pre = snapshot();
+                    {
+                        let Ok(mut w) = writer.lock() else {
+                            return;
+                        };
+                        let mut line = step.into_bytes();
+                        line.push(b'\r');
+                        if w.write_all(&line).is_err() {
+                            return;
+                        }
+                        let _ = w.flush();
+                    }
+                    wait_advance(pre, STEP_WAIT);
+                    std::thread::sleep(SETTLE);
+                }
+                // Signal that this tab's steps are all done (used to trigger
+                // post-create SSH verification once both bastions finish).
+                let _ = done_tx.send(tab_id);
+            }
+
+            let mut spawned_idx: Vec<usize> = Vec::new();
+            let mut logs: Vec<String> = Vec::new();
+            for (idx, run) in self.pending_script_runs.iter().enumerate() {
+                if run.spawned {
+                    continue;
+                }
+                if let Some(session) = self.pty_sessions.get(&run.tab_id) {
+                    let writer = Arc::clone(&session.writer);
+                    let prompt_ready = Arc::clone(&session.prompt_ready);
+                    let steps = run.steps.clone();
+                    let wait_for_login = run.wait_for_login;
+                    let done_tx = self.script_done_tx.clone();
+                    let tab_id = run.tab_id;
+                    logs.push(format!(
+                        "script run starting: {} ({} steps)",
+                        run.label,
+                        steps.len()
+                    ));
+                    std::thread::spawn(move || {
+                        run_script_worker(
+                            writer,
+                            prompt_ready,
+                            steps,
+                            wait_for_login,
+                            done_tx,
+                            tab_id,
+                        )
+                    });
+                    spawned_idx.push(idx);
+                }
+            }
+            for idx in spawned_idx {
+                self.pending_script_runs[idx].spawned = true;
+            }
+            self.pending_script_runs.retain(|r| !r.spawned);
+            for msg in logs {
+                self.log_info(msg);
             }
         }
 
@@ -8840,6 +9750,9 @@ mod gui {
                 self.render_pem_dialog(ctx);
                 self.render_settings_pem_dialog(ctx);
                 self.render_file_browser_defaults_dialog(ctx);
+                self.render_create_user_dialog(ctx);
+                self.pump_script_runs();
+                self.poll_script_events();
 
                 if self.wsl_show_password_popup {
                     let mut open = true;
@@ -9282,6 +10195,32 @@ mod gui {
                                 self.close_connection_tab(id);
                             }
                         }
+
+                        ui.menu_button("Scripts", |ui| {
+                            if ui.button("create_new_user.sh…").clicked() {
+                                let env = self.selected_profile.clone().unwrap_or_default();
+                                if !env.is_empty() {
+                                    self.prime_cache_from_disk(&env);
+                                }
+                                let (primary_id, secondary_id) = self
+                                    .config
+                                    .bastion_selection(&env)
+                                    .unwrap_or_default();
+                                let primary_query = self.bastion_label(&env, &primary_id);
+                                let secondary_query = self.bastion_label(&env, &secondary_id);
+                                self.create_user_dialog = Some(CreateUserDialog {
+                                    username: String::new(),
+                                    env_profile_id: env,
+                                    grant_sudo: false,
+                                    primary_query,
+                                    secondary_query,
+                                    primary_id,
+                                    secondary_id,
+                                    error: None,
+                                });
+                                ui.close();
+                            }
+                        });
                     });
 
                     if !self.message.is_empty() {
@@ -11981,7 +12920,9 @@ mod gui {
     }
 
     fn aws_command() -> std::process::Command {
-        let mut cmd = std::process::Command::new("aws");
+        let cmd = std::process::Command::new("aws");
+        #[cfg(target_os = "windows")]
+        let mut cmd = cmd;
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;

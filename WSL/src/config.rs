@@ -58,6 +58,11 @@ pub struct AppConfig {
     pub ssh_pem_instance: BTreeMap<String, String>,
     /// Per-profile "don't ask for pem again" flag (profile_id -> true).
     pub vscode_pem_suppressed: BTreeMap<String, bool>,
+    /// Last primary/secondary bastion pair selected in the create-user
+    /// script dialog, keyed by environment/profile_id. Value is
+    /// "primary_instance_id|secondary_instance_id" (either side may be
+    /// empty). Used to pre-fill the dialog on the next run.
+    pub bastion_selections: BTreeMap<String, String>,
 }
 
 impl Default for AppConfig {
@@ -105,6 +110,7 @@ impl Default for AppConfig {
             ssh_user_default: BTreeMap::new(),
             ssh_pem_instance: BTreeMap::new(),
             vscode_pem_suppressed: BTreeMap::new(),
+            bastion_selections: BTreeMap::new(),
         }
     }
 }
@@ -202,6 +208,22 @@ impl AppConfig {
             .get(profile_id)
             .cloned()
             .unwrap_or_else(|| "ec2-user".to_string())
+    }
+
+    /// Last (primary, secondary) bastion instance ids selected for the
+    /// create-user script in the given environment/profile.
+    pub fn bastion_selection(&self, env: &str) -> Option<(String, String)> {
+        let raw = self.bastion_selections.get(env)?;
+        let mut parts = raw.splitn(2, '|');
+        let primary = parts.next().unwrap_or("").to_string();
+        let secondary = parts.next().unwrap_or("").to_string();
+        Some((primary, secondary))
+    }
+
+    /// Remember the primary/secondary bastion pair for an environment.
+    pub fn set_bastion_selection(&mut self, env: &str, primary: &str, secondary: &str) {
+        self.bastion_selections
+            .insert(env.to_string(), format!("{primary}|{secondary}"));
     }
 
     pub fn scope_key(account_id: &str, region: &str) -> String {
@@ -400,6 +422,14 @@ impl AppConfig {
             if let Some(rest) = key.strip_prefix("ssh_pem_instance.") {
                 if !rest.is_empty() && !value.is_empty() {
                     cfg.ssh_pem_instance
+                        .insert(rest.to_string(), value.to_string());
+                }
+                continue;
+            }
+
+            if let Some(rest) = key.strip_prefix("bastion_pair.") {
+                if !rest.is_empty() && !value.is_empty() {
+                    cfg.bastion_selections
                         .insert(rest.to_string(), value.to_string());
                 }
                 continue;
@@ -621,6 +651,9 @@ impl AppConfig {
         }
         for (instance, pem) in &self.ssh_pem_instance {
             lines.push(format!("ssh_pem_instance.{instance}={pem}"));
+        }
+        for (env, pair) in &self.bastion_selections {
+            lines.push(format!("bastion_pair.{env}={pair}"));
         }
         for (profile, suppressed) in &self.vscode_pem_suppressed {
             if *suppressed {
