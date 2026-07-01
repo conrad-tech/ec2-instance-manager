@@ -83,4 +83,64 @@ fn main() {
             problems.join("\n")
         );
     }
+
+    validate_features();
+}
+
+/// Validate `assets/features.json` at compile time. Every documented flag
+/// must be present with the correct type; a missing (or mistyped) field
+/// fails the build rather than silently defaulting.
+fn validate_features() {
+    // This is the file bundled via `include_str!("../assets/features.json")`
+    // from `src/`, i.e. `<manifest_dir>/assets/features.json`.
+    let path = Path::new("assets/features.json");
+    println!("cargo:rerun-if-changed={}", path.display());
+
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(err) => panic!(
+            "Build failed: could not read {}: {err}",
+            path.display()
+        ),
+    };
+
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(err) => panic!(
+            "Build failed: {} is not valid JSON: {err}",
+            path.display()
+        ),
+    };
+
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => panic!(
+            "Build failed: {} must be a JSON object",
+            path.display()
+        ),
+    };
+
+    let mut missing: Vec<&str> = Vec::new();
+    if !obj
+        .get("allow_delete_user")
+        .map(|v| v.is_boolean())
+        .unwrap_or(false)
+    {
+        missing.push("allow_delete_user (boolean)");
+    }
+    for field in ["primary_bastion_filter", "secondary_bastion_filter"] {
+        if !obj.get(field).map(|v| v.is_string()).unwrap_or(false) {
+            missing.push(field);
+        }
+    }
+
+    if !missing.is_empty() {
+        panic!(
+            "Build failed: {} is missing required field(s): {}\n\
+             Required: allow_delete_user (boolean), primary_bastion_filter \
+             (string), secondary_bastion_filter (string).",
+            path.display(),
+            missing.join(", ")
+        );
+    }
 }

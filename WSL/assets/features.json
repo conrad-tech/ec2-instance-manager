@@ -1,4 +1,6 @@
 {
-  "_comment": "Build-time feature gates. Edit and rebuild to change. allow_delete_user exposes the destructive 'delete_user.sh' entry in the Scripts menu; keep it false unless the build is intended for admins who need it.",
-  "allow_delete_user": false
+  "_comment": "Build-time feature gates. Edit and rebuild to change. allow_delete_user exposes the destructive 'delete_user.sh' entry in the Scripts menu; keep it false unless the build is intended for admins who need it. primary_bastion_filter / secondary_bastion_filter narrow the Scripts dialog bastion dropdowns to instances whose name or id contains the given text (case-insensitive); empty shows all.",
+  "allow_delete_user": false,
+  "primary_bastion_filter": "bastion",
+  "secondary_bastion_filter": "bastion"
 }

@@ -2044,6 +2044,10 @@ mod gui {
         /// Build-time gate: whether the destructive "delete_user.sh" entry
         /// is exposed in the Scripts menu (from assets/features.json).
         allow_delete_user: bool,
+        /// Substring filters (from features.json) narrowing the Scripts
+        /// dialog primary/secondary bastion dropdowns.
+        primary_bastion_filter: String,
+        secondary_bastion_filter: String,
         /// In-flight create-user run (post-create SSH verification + PEM
         /// pull), if any.
         create_user_run: Option<CreateUserRun>,
@@ -2109,6 +2113,7 @@ mod gui {
             let (script_done_tx, script_done_rx) = mpsc::channel();
             let (verify_tx, verify_rx) = mpsc::channel();
             let (preflight_tx, preflight_rx) = mpsc::channel();
+            let features = ec2_manager::features::load();
             #[cfg(target_os = "windows")]
             let (ui_tx, ui_rx) = mpsc::channel();
             let profile_choice_path = profile_choice_path();
@@ -2253,7 +2258,9 @@ mod gui {
                 edit_menu_flash_start: None,
                 create_user_dialog: None,
                 pending_script_runs: Vec::new(),
-                allow_delete_user: ec2_manager::features::load().allow_delete_user,
+                allow_delete_user: features.allow_delete_user,
+                primary_bastion_filter: features.primary_bastion_filter.clone(),
+                secondary_bastion_filter: features.secondary_bastion_filter.clone(),
                 create_user_run: None,
                 pending_delete: None,
                 preflight_tx,
@@ -4045,6 +4052,8 @@ mod gui {
                 .iter()
                 .map(|p| (p.profile_id.clone(), p.display_name.clone()))
                 .collect();
+            let primary_filter = self.primary_bastion_filter.clone();
+            let secondary_filter = self.secondary_bastion_filter.clone();
 
             let mut window_open = true;
             let mut do_run = false;
@@ -4068,7 +4077,7 @@ mod gui {
                             ui.label("User:");
                             ui.add(
                                 egui::TextEdit::singleline(&mut dlg.username)
-                                    .hint_text("new username")
+                                    .hint_text("firstname.lastname")
                                     .desired_width(320.0),
                             );
                             ui.end_row();
@@ -4113,23 +4122,25 @@ mod gui {
                     }
                     ui.add_space(6.0);
 
-                    // Primary bastion picker.
-                    Self::bastion_picker_ui(
+                    // Primary bastion dropdown (filtered by features.json).
+                    Self::bastion_combo_ui(
                         ui,
                         "cnu_primary",
-                        "Type/Choose Primary Bastion",
-                        &mut dlg.primary_query,
+                        "Primary Bastion:",
+                        &primary_filter,
                         &mut dlg.primary_id,
+                        &mut dlg.primary_query,
                         &instances,
                     );
                     ui.add_space(6.0);
-                    // Secondary bastion picker.
-                    Self::bastion_picker_ui(
+                    // Secondary bastion dropdown (filtered by features.json).
+                    Self::bastion_combo_ui(
                         ui,
                         "cnu_secondary",
-                        "Type/Choose Secondary Bastion",
-                        &mut dlg.secondary_query,
+                        "Secondary Bastion:",
+                        &secondary_filter,
                         &mut dlg.secondary_id,
+                        &mut dlg.secondary_query,
                         &instances,
                     );
 
@@ -4209,42 +4220,50 @@ mod gui {
             self.create_user_dialog = Some(dlg);
         }
 
-        /// A filter box + inline dropdown for choosing one bastion instance.
-        /// The list filters live on the typed text (matching instance id OR
-        /// name) and is hidden once a selection is made and the box loses
-        /// focus.
-        fn bastion_picker_ui(
+        /// A labelled dropdown (`choose ▾`) for picking one bastion. The
+        /// list is narrowed by `filter` (a substring from features.json
+        /// matched against instance id OR name); an empty filter shows all.
+        /// `chosen_label` holds the selected "Name  id" text for display.
+        fn bastion_combo_ui(
             ui: &mut egui::Ui,
             id_salt: &str,
-            hint: &str,
-            query: &mut String,
+            label: &str,
+            filter: &str,
             chosen_id: &mut String,
+            chosen_label: &mut String,
             instances: &[(String, String)],
         ) {
-            ui.label(hint);
-            let resp = ui.add(
-                egui::TextEdit::singleline(query)
-                    .hint_text(hint)
-                    .desired_width(320.0),
-            );
-            // Typing invalidates a prior selection until a row is re-picked.
-            if resp.changed() {
-                chosen_id.clear();
+            ui.label(label);
+            let matches_needle = |needle: &str, id: &str, name: &str| -> bool {
+                needle.is_empty()
+                    || id.to_ascii_lowercase().contains(needle)
+                    || name.to_ascii_lowercase().contains(needle)
+            };
+            let needle = filter.trim().to_ascii_lowercase();
+            let mut filtered: Vec<&(String, String)> = instances
+                .iter()
+                .filter(|(id, name)| matches_needle(&needle, id, name))
+                .collect();
+            // If the configured filter matches nothing, fall back to the
+            // default "bastion" filter so the dropdown isn't empty.
+            if filtered.is_empty() && needle != "bastion" {
+                filtered = instances
+                    .iter()
+                    .filter(|(id, name)| matches_needle("bastion", id, name))
+                    .collect();
             }
-            let show_list = resp.has_focus() || chosen_id.is_empty();
-            if !show_list || instances.is_empty() {
-                return;
-            }
-            let needle = query.to_ascii_lowercase();
-            egui::ScrollArea::vertical()
-                .id_salt(id_salt)
-                .max_height(120.0)
-                .show(ui, |ui| {
-                    for (id, name) in instances.iter().filter(|(id, name)| {
-                        needle.is_empty()
-                            || id.to_ascii_lowercase().contains(&needle)
-                            || name.to_ascii_lowercase().contains(&needle)
-                    }) {
+            let selected_text = if chosen_id.is_empty() {
+                "choose".to_string()
+            } else if !chosen_label.is_empty() {
+                chosen_label.clone()
+            } else {
+                chosen_id.clone()
+            };
+            egui::ComboBox::from_id_salt(id_salt)
+                .selected_text(selected_text)
+                .width(320.0)
+                .show_ui(ui, |ui| {
+                    for (id, name) in filtered {
                         let shown = if name.trim().is_empty() {
                             format!("(no name)  {id}")
                         } else {
@@ -4255,11 +4274,8 @@ mod gui {
                             .clicked()
                         {
                             *chosen_id = id.clone();
-                            *query = if name.trim().is_empty() {
-                                id.clone()
-                            } else {
-                                format!("{name}  {id}")
-                            };
+                            *chosen_label = shown;
+                            ui.close();
                         }
                     }
                 });

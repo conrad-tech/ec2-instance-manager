@@ -462,8 +462,10 @@ Each script opens a dialog with:
 
 - **User** — the username to act on.
 - **Environment** — which account/profile's bastions to target.
-- **Primary Bastion** / **Secondary Bastion** — type-to-filter pickers that match
-  on instance **name or instance id** and display as `Name  i-0abc…`.
+- **Primary Bastion** / **Secondary Bastion** — dropdowns (`choose ▾`) whose
+  contents are narrowed by the `primary_bastion_filter` / `secondary_bastion_filter`
+  values in `features.json` (substring match on instance **name or id**). Items
+  display as `Name  i-0abc…`.
 
 The selected bastion pair is cached per environment in `config.ini`
 (`bastion_pair.<env>=<primary>|<secondary>`) and pre-filled on the next run.
@@ -518,13 +520,17 @@ actions.
 
 ```json
 {
-  "allow_delete_user": false
+  "allow_delete_user": false,
+  "primary_bastion_filter": "bastion",
+  "secondary_bastion_filter": "bastion"
 }
 ```
 
-| Field               | Default | Description |
-|---------------------|---------|-------------|
-| `allow_delete_user` | `false` | Exposes the destructive `delete_user.sh` entry in the Scripts menu. |
+| Field                      | Default     | Description |
+|----------------------------|-------------|-------------|
+| `allow_delete_user`        | `false`     | Exposes the destructive `delete_user.sh` entry in the Scripts menu. |
+| `primary_bastion_filter`   | `"bastion"` | Substring that narrows the **Primary Bastion** dropdown (matches instance name or id, case-insensitive). Empty shows all. |
+| `secondary_bastion_filter` | `"bastion"` | Same, for the **Secondary Bastion** dropdown. |
 
 Parsing **fails closed**: if the file is malformed, every gate defaults to off.
 To ship a build for admins who need user deletion, set `"allow_delete_user": true`

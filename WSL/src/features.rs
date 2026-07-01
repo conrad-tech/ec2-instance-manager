@@ -11,11 +11,27 @@ use serde::Deserialize;
 /// Compiled-in feature flags from `assets/features.json`.
 const BUNDLED_FEATURES: &str = include_str!("../assets/features.json");
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct Features {
     /// Expose the destructive "delete_user.sh" entry in the Scripts menu.
     pub allow_delete_user: bool,
+    /// Substring filter for the primary-bastion dropdown in the Scripts
+    /// dialog: only instances whose name or id contains this (case-
+    /// insensitive) are shown. Empty means show all.
+    pub primary_bastion_filter: String,
+    /// Substring filter for the secondary-bastion dropdown.
+    pub secondary_bastion_filter: String,
+}
+
+impl Default for Features {
+    fn default() -> Self {
+        Self {
+            allow_delete_user: false,
+            primary_bastion_filter: "bastion".to_string(),
+            secondary_bastion_filter: "bastion".to_string(),
+        }
+    }
 }
 
 /// Parse the bundled feature flags, falling back to all-off if the JSON is
@@ -50,5 +66,24 @@ mod tests {
     fn missing_key_defaults_off() {
         let f: Features = serde_json::from_str("{}").expect("should parse");
         assert!(!f.allow_delete_user);
+    }
+
+    #[test]
+    fn bastion_filters_default_to_bastion() {
+        // Missing filter keys fall back to "bastion".
+        let f: Features =
+            serde_json::from_str(r#"{"allow_delete_user":true}"#).expect("should parse");
+        assert_eq!(f.primary_bastion_filter, "bastion");
+        assert_eq!(f.secondary_bastion_filter, "bastion");
+    }
+
+    #[test]
+    fn bastion_filters_can_be_overridden() {
+        let f: Features = serde_json::from_str(
+            r#"{"primary_bastion_filter":"prod-a","secondary_bastion_filter":"prod-b"}"#,
+        )
+        .expect("should parse");
+        assert_eq!(f.primary_bastion_filter, "prod-a");
+        assert_eq!(f.secondary_bastion_filter, "prod-b");
     }
 }
