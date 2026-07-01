@@ -4131,8 +4131,22 @@ mod gui {
                         || cursor_trimmed.ends_with("\n$")
                         || cursor_trimmed.ends_with("\n#"))
                         && cur_col <= 2;
+                    // Backslash-continued commands (`aws ec2 … \` split over
+                    // several lines) put the shell at bash's default PS2
+                    // continuation prompt (`> `), NOT the main PS1 prompt.
+                    // The prep command doesn't override PS2. Without this,
+                    // every continuation line pasted burns the full 2.5s
+                    // paste-worker timeout because no PS1 redraw ever comes.
+                    // During a continuation the shell is in readline, not
+                    // running a command, so there's no line-discipline race —
+                    // signalling ready here is safe and lets the next line
+                    // go as soon as `> ` appears.
+                    let cont_prompt = (cursor_trimmed == ">"
+                        || cursor_trimmed.ends_with("\n>"))
+                        && cur_col <= 2;
                     let _ = cur_row;
-                    let is_at_prompt = bare_prompt || cursor_is_user_host_prompt;
+                    let is_at_prompt =
+                        bare_prompt || cont_prompt || cursor_is_user_host_prompt;
                     let was_at_prompt = session.at_prompt_last_frame;
                     session.at_prompt_last_frame = is_at_prompt;
                     // Only bump on the false→true transition. Idle frames
