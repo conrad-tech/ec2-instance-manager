@@ -492,10 +492,9 @@ between lines.
 This entry is **hidden unless enabled at build time** (see
 [Feature flags (features.json)](#feature-flags-featuresjson)).
 
-- **Also remove home directory (/efs/home/&lt;user&gt;)** checkbox (off by default).
 - Runs `delete_user.sh` on both bastions: the primary removes the account, group,
-  sudoers entry, generated PEM, and (optionally) the shared home; the secondary
-  removes only its local account/group/sudoers.
+  sudoers entry, generated PEM, **and the shared EFS home** (`/efs/home/<user>`);
+  the secondary removes only its local account/group/sudoers.
 - After both finish it confirms the account is gone on both bastions and reports
   the result.
 

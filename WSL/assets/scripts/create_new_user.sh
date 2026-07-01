@@ -117,14 +117,17 @@ else
   if id "$USERNAME" >/dev/null 2>&1; then
     echo "Skipping group creation because user '$USERNAME' already exists."
   else
-    groupadd "$USERNAME"
+    # Suppress benign useradd/groupadd warnings (GROUP=100 default, skel,
+    # "home already exists") so they don't look like real errors. A genuine
+    # failure still aborts via `set -e`.
+    groupadd "$USERNAME" 2>/dev/null
   fi
 fi
 
 if id "$USERNAME" >/dev/null 2>&1; then
   echo "Skipping user creation because user '$USERNAME' already exists."
 else
-  useradd -m -d "$HOME_DIR" -g "$USERNAME" "$USERNAME"
+  useradd -m -d "$HOME_DIR" -g "$USERNAME" "$USERNAME" 2>/dev/null
   USER_CREATED=1
 fi
 

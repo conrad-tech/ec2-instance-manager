@@ -526,8 +526,6 @@ mod gui {
         env_profile_id: String,
         /// Create mode: whether to pass `--sudo` (grant NOPASSWD:ALL).
         grant_sudo: bool,
-        /// Delete mode: whether to also remove the shared EFS home dir.
-        remove_home: bool,
         /// Text typed in the primary-bastion filter box.
         primary_query: String,
         /// Text typed in the secondary-bastion filter box.
@@ -579,20 +577,36 @@ mod gui {
     struct PendingDelete {
         username: String,
         env: String,
-        remove_home: bool,
         primary_id: String,
         secondary_id: String,
     }
 
+    /// Modal shown when a create/delete run finishes, so the result stays
+    /// visible until the user dismisses it.
+    struct ScriptResultPopup {
+        /// Window title (e.g. "User Created", "Delete Aborted").
+        title: String,
+        /// Result text.
+        message: String,
+        /// Green when true, red when false.
+        success: bool,
+        /// Saved PEM path (Some for a successful create) — enables the
+        /// "Open Downloads folder" button.
+        pem_path: Option<String>,
+        /// Optional diagnostic report shown in a scrollable monospace box
+        /// (e.g. account/home/perms/keys checks after an SSH failure).
+        details: Option<String>,
+    }
+
     /// Visual state of the Scripts status line in the Connections toolbar.
+    /// Final results (success/failure) are shown in a popup instead, so the
+    /// status line only ever shows progress or an early failure.
     #[derive(Clone, Copy, PartialEq)]
     enum ScriptState {
         /// A run is in progress — shown yellow, slow-flashing.
         Running,
-        /// The run failed — shown solid red.
+        /// The run failed before it could start — shown solid red.
         Failed,
-        /// The run finished successfully — shown solid green.
-        Done,
     }
 
     /// Result of the delete pre-flight active-session check.
@@ -617,6 +631,8 @@ mod gui {
             pem_path: Option<String>,
             /// Any error encountered (SSH or PEM pull).
             error: Option<String>,
+            /// On-bastion diagnostic report, gathered when SSH didn't pass.
+            diagnostics: Option<String>,
         },
         /// delete_user.sh verification (confirm the account is gone).
         Deleted {
@@ -625,6 +641,9 @@ mod gui {
             primary_absent: bool,
             /// User absent on the secondary bastion.
             secondary_absent: bool,
+            /// On-bastion report gathered when the user is still present
+            /// (what's left / what's blocking removal).
+            diagnostics: Option<String>,
         },
     }
 
@@ -1210,19 +1229,85 @@ mod gui {
                     None
                 }
             };
+        // If SSH didn't fully pass, gather a diagnostic report from both
+        // bastions so the failure popup can show what's actually on disk.
+        let diagnostics = if p2s && s2p {
+            None
+        } else {
+            let mut r = format!("[primary {primary_id}]\n");
+            r.push_str(&run_create_diagnostics(&primary_ctx, &primary_id, &username));
+            r.push_str(&format!("\n\n[secondary {secondary_id}]\n"));
+            r.push_str(&run_create_diagnostics(
+                &secondary_ctx,
+                &secondary_id,
+                &username,
+            ));
+            Some(r)
+        };
         let _ = tx.send(VerifyOutcome::Created {
             username,
             p2s,
             s2p,
             pem_path,
             error,
+            diagnostics,
         });
+    }
+
+    /// Collect a compact report about the just-created user on one bastion:
+    /// account (/etc/passwd), primary group, home dir + perms, `.ssh` perms,
+    /// authorized_keys, and the PEM copies. Used in the failure popup.
+    fn run_create_diagnostics(
+        ctx: &AwsContext,
+        instance_id: &str,
+        username: &str,
+    ) -> String {
+        let script = format!(
+            "U=\"{u}\"\n\
+             HOME_DIR=\"$(getent passwd \"$U\" | cut -d: -f6)\"\n\
+             echo \"account : $(getent passwd \"$U\" 2>/dev/null || echo MISSING)\"\n\
+             echo \"group   : $(getent group \"$U\" 2>/dev/null || echo MISSING)\"\n\
+             if [ -n \"$HOME_DIR\" ]; then \
+               if [ -d \"$HOME_DIR\" ]; then echo \"home    : $(ls -ld \"$HOME_DIR\")\"; \
+               else echo \"home    : MISSING ($HOME_DIR)\"; fi; \
+               if [ -d \"$HOME_DIR/.ssh\" ]; then echo \".ssh    : $(ls -ld \"$HOME_DIR/.ssh\")\"; \
+               else echo \".ssh    : MISSING\"; fi; \
+               AK=\"$HOME_DIR/.ssh/authorized_keys\"; \
+               if [ -f \"$AK\" ]; then echo \"authkeys: $(ls -l \"$AK\") [$(grep -c . \"$AK\" 2>/dev/null) key line(s)]\"; \
+               else echo \"authkeys: MISSING\"; fi; \
+               UP=\"$HOME_DIR/.ssh/$U.pem\"; \
+               if [ -f \"$UP\" ]; then echo \"userpem : $(ls -l \"$UP\")\"; \
+               else echo \"userpem : MISSING\"; fi; \
+             else echo \"home    : NO HOME (account missing?)\"; fi\n\
+             if [ -f \"/root/$U.pem\" ]; then echo \"rootpem : $(ls -l \"/root/$U.pem\")\"; \
+             else echo \"rootpem : MISSING\"; fi\n\
+             SF=\"/etc/sudoers.d/zz-$(echo \"$U\" | tr '.' '-')-nopasswd\"\n\
+             if [ -f \"$SF\" ]; then echo \"sudoers : $(ls -l \"$SF\")\"; fi\n",
+            u = username,
+        );
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
+        let cmd = format!("echo {b64} | base64 -d | bash");
+        match exec_remote_command(&None, ctx, instance_id, &cmd, Duration::from_secs(30)) {
+            Ok(out) => out.trim_end().to_string(),
+            Err(e) => format!("(diagnostics failed: {e})"),
+        }
+    }
+
+    /// Run the base64-wrapped active-session probe on one instance.
+    /// Returns (active, detail). On error, active=true (fail safe).
+    fn preflight_active_check(ctx: &AwsContext, id: &str, cmd: &str) -> (bool, String) {
+        match exec_remote_command(&None, ctx, id, cmd, Duration::from_secs(30)) {
+            Ok(out) => (out.contains("CNU_ACTIVE"), out.trim().to_string()),
+            Err(e) => (true, format!("check failed: {e}")),
+        }
     }
 
     /// Delete pre-flight: check whether the user is currently active
     /// (logged-in session or any running process) on either bastion. We
     /// refuse to delete an active user, so this must clear first. A check
-    /// that errors is treated as "not clear" (fail safe).
+    /// that errors is treated as "not clear" (fail safe). Both bastions are
+    /// probed concurrently.
     fn run_delete_preflight_worker(
         username: String,
         primary_id: String,
@@ -1248,16 +1333,18 @@ mod gui {
         let b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
         let cmd = format!("echo {b64} | base64 -d | bash");
 
-        // Returns (active, detail). On error, active=true (fail safe).
-        let check = |ctx: &AwsContext, id: &str| -> (bool, String) {
-            match exec_remote_command(&None, ctx, id, &cmd, Duration::from_secs(30)) {
-                Ok(out) => (out.contains("CNU_ACTIVE"), out.trim().to_string()),
-                Err(e) => (true, format!("check failed: {e}")),
-            }
+        // Probe both bastions concurrently: secondary on its own thread,
+        // primary on this one, then join.
+        let sec_handle = {
+            let cmd = cmd.clone();
+            let ctx = secondary_ctx.clone();
+            let id = secondary_id.clone();
+            std::thread::spawn(move || preflight_active_check(&ctx, &id, &cmd))
         };
-
-        let (p_active, p_detail) = check(&primary_ctx, &primary_id);
-        let (s_active, s_detail) = check(&secondary_ctx, &secondary_id);
+        let (p_active, p_detail) = preflight_active_check(&primary_ctx, &primary_id, &cmd);
+        let (s_active, s_detail) = sec_handle
+            .join()
+            .unwrap_or((true, "secondary check thread panicked".to_string()));
         let clear = !p_active && !s_active;
         let report = if clear {
             String::new()
@@ -1299,11 +1386,67 @@ mod gui {
         };
         let primary_absent = absent(&primary_ctx, &primary_id);
         let secondary_absent = absent(&secondary_ctx, &secondary_id);
+        // If the user survived on a bastion, gather a report from that
+        // bastion showing what's left / what's blocking removal.
+        let diagnostics = if primary_absent && secondary_absent {
+            None
+        } else {
+            let mut r = String::new();
+            if !primary_absent {
+                r.push_str(&format!("[primary {primary_id}]\n"));
+                r.push_str(&run_delete_diagnostics(&primary_ctx, &primary_id, &username));
+            }
+            if !secondary_absent {
+                if !r.is_empty() {
+                    r.push_str("\n\n");
+                }
+                r.push_str(&format!("[secondary {secondary_id}]\n"));
+                r.push_str(&run_delete_diagnostics(
+                    &secondary_ctx,
+                    &secondary_id,
+                    &username,
+                ));
+            }
+            Some(r)
+        };
         let _ = tx.send(VerifyOutcome::Deleted {
             username,
             primary_absent,
             secondary_absent,
+            diagnostics,
         });
+    }
+
+    /// Collect a report about a user that survived a delete on one bastion:
+    /// account, group, active sessions + processes (the usual `userdel`
+    /// blockers), the home dir (did `--remove-home` work?), and sudoers.
+    fn run_delete_diagnostics(
+        ctx: &AwsContext,
+        instance_id: &str,
+        username: &str,
+    ) -> String {
+        let script = format!(
+            "U=\"{u}\"\n\
+             echo \"account : $(getent passwd \"$U\" 2>/dev/null || echo GONE)\"\n\
+             echo \"group   : $(getent group \"$U\" 2>/dev/null || echo GONE)\"\n\
+             S=\"$(who 2>/dev/null | awk -v u=\"$U\" '$1==u {{print}}')\"\n\
+             if [ -n \"$S\" ]; then echo \"sessions: $(echo \"$S\" | tr '\\n' ';')\"; \
+             else echo \"sessions: none\"; fi\n\
+             P=\"$(pgrep -u \"$U\" 2>/dev/null | tr '\\n' ' ')\"\n\
+             if [ -n \"$P\" ]; then echo \"procs   : $P\"; else echo \"procs   : none\"; fi\n\
+             if [ -d \"/efs/home/$U\" ]; then echo \"home    : $(ls -ld \"/efs/home/$U\")\"; \
+             else echo \"home    : removed\"; fi\n\
+             SF=\"/etc/sudoers.d/zz-$(echo \"$U\" | tr '.' '-')-nopasswd\"\n\
+             if [ -f \"$SF\" ]; then echo \"sudoers : present ($SF)\"; else echo \"sudoers : removed\"; fi\n",
+            u = username,
+        );
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
+        let cmd = format!("echo {b64} | base64 -d | bash");
+        match exec_remote_command(&None, ctx, instance_id, &cmd, Duration::from_secs(30)) {
+            Ok(out) => out.trim_end().to_string(),
+            Err(e) => format!("(diagnostics failed: {e})"),
+        }
     }
 
     /// Run `ssh <user>@<target_ip> 'echo …'` from `instance_id` using the
@@ -1387,6 +1530,44 @@ mod gui {
                 }
             })
             .collect()
+    }
+
+    /// Slow-flashing color (~0.7 Hz alpha pulse) for the Scripts status
+    /// line. Requests a repaint so the pulse keeps animating.
+    fn flashing_color(ui: &egui::Ui, r: u8, g: u8, b: u8) -> egui::Color32 {
+        let t = ui.input(|i| i.time);
+        let phase = 0.5 + 0.5 * (t * std::f64::consts::TAU * 0.7).sin();
+        let alpha = (70.0 + 185.0 * phase) as u8;
+        ui.ctx().request_repaint();
+        egui::Color32::from_rgba_unmultiplied(r, g, b, alpha)
+    }
+
+    /// Slow-flashing yellow — used for the "running" status and the "PEM
+    /// saved" highlight.
+    fn flashing_yellow(ui: &egui::Ui) -> egui::Color32 {
+        flashing_color(ui, 255, 205, 0)
+    }
+
+    /// Open the OS file manager showing `path`. On Windows this opens
+    /// Explorer with the file highlighted (`/select,`); elsewhere it opens
+    /// the containing folder via `xdg-open`. Best-effort; errors ignored.
+    fn reveal_in_file_manager(path: &str) {
+        #[cfg(target_os = "windows")]
+        {
+            // explorer parses its own command line, so pass "/select,<path>"
+            // as a single argument.
+            let _ = std::process::Command::new("explorer.exe")
+                .arg(format!("/select,{path}"))
+                .spawn();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let target = std::path::Path::new(path)
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from(path));
+            let _ = std::process::Command::new("xdg-open").arg(target).spawn();
+        }
     }
 
     /// Up to this many path-completion matches are shown directly in the
@@ -1633,6 +1814,13 @@ mod gui {
         buf.extend_from_slice(PREP_TERMINAL_COMMAND);
         buf
     }
+
+    /// Sentinel "step" in a scripted run (see `run_script_worker`): instead
+    /// of a shell command, the worker sends `PREP_TERMINAL_COMMAND` (the
+    /// same prep the "Prep Terminal" button runs) and waits for it to
+    /// settle. Inserted right after `sudo su` so the root shell gets the
+    /// custom PS1 / vim-paste / ssh-config setup before the script runs.
+    const PREP_STEP_SENTINEL: &str = "\u{0}__prep_terminal__\u{0}";
 
     #[derive(Debug, PartialEq, Eq)]
     struct RowAction {
@@ -2075,6 +2263,15 @@ mod gui {
         pending_delete: Option<PendingDelete>,
         /// Colored Scripts status line (text + visual state), if any.
         script_status: Option<(String, ScriptState)>,
+        /// Extra status segment always shown flashing-yellow after the main
+        /// status text (e.g. "PEM saved to <path>").
+        script_status_highlight: Option<String>,
+        /// Connection tabs the current Scripts status refers to. Once the
+        /// user closes all of them, the status line is cleared (they've seen
+        /// the result / retrieved the PEM).
+        script_status_tabs: Vec<u64>,
+        /// Result modal for a finished create/delete run, if any.
+        script_result_popup: Option<ScriptResultPopup>,
         /// Pre-flight worker → UI: active-session check result.
         preflight_tx: Sender<PreflightOutcome>,
         preflight_rx: Receiver<PreflightOutcome>,
@@ -2286,6 +2483,9 @@ mod gui {
                 create_user_run: None,
                 pending_delete: None,
                 script_status: None,
+                script_status_highlight: None,
+                script_status_tabs: Vec::new(),
+                script_result_popup: None,
                 preflight_tx,
                 preflight_rx,
                 script_done_tx,
@@ -4136,9 +4336,9 @@ mod gui {
 
                     ui.add_space(4.0);
                     if dlg.delete {
-                        ui.checkbox(
-                            &mut dlg.remove_home,
-                            "Also remove home directory (/efs/home/<user>)",
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 150, 60),
+                            "⚠ Removes the account, keys, and home directory (/efs/home/<user>).",
                         );
                     } else {
                         ui.checkbox(&mut dlg.grant_sudo, "Grant sudo (NOPASSWD:ALL)");
@@ -4232,7 +4432,6 @@ mod gui {
                     &username,
                     &dlg.env_profile_id,
                     dlg.grant_sudo,
-                    dlg.remove_home,
                     &dlg.primary_id,
                     &dlg.secondary_id,
                 );
@@ -4381,25 +4580,17 @@ mod gui {
             username: &str,
             env: &str,
             grant_sudo: bool,
-            remove_home: bool,
             primary_id: &str,
             secondary_id: &str,
         ) {
             if delete {
-                self.begin_delete_preflight(
-                    username,
-                    env,
-                    remove_home,
-                    primary_id,
-                    secondary_id,
-                );
+                self.begin_delete_preflight(username, env, primary_id, secondary_id);
             } else {
                 self.enqueue_user_script(
                     false,
                     username,
                     env,
                     grant_sudo,
-                    remove_home,
                     primary_id,
                     secondary_id,
                 );
@@ -4412,7 +4603,6 @@ mod gui {
             &mut self,
             username: &str,
             env: &str,
-            remove_home: bool,
             primary_id: &str,
             secondary_id: &str,
         ) {
@@ -4430,7 +4620,6 @@ mod gui {
             self.pending_delete = Some(PendingDelete {
                 username: username.to_string(),
                 env: env.to_string(),
-                remove_home,
                 primary_id: primary_id.to_string(),
                 secondary_id: secondary_id.to_string(),
             });
@@ -4443,6 +4632,8 @@ mod gui {
             self.log_info(format!(
                 "delete_user: pre-flight active-session check for '{username}'"
             ));
+            // New run: forget the previous run's tabs.
+            self.script_status_tabs.clear();
             self.set_script_status(
                 format!("Checking for active sessions before deleting '{username}'…"),
                 ScriptState::Running,
@@ -4470,7 +4661,6 @@ mod gui {
             username: &str,
             env: &str,
             grant_sudo: bool,
-            remove_home: bool,
             primary_id: &str,
             secondary_id: &str,
         ) {
@@ -4484,19 +4674,17 @@ mod gui {
                     .encode(SCRIPT.replace('\r', ""));
                 let remote_path = "/root/delete_user.sh";
                 let write = format!("echo '{b64}' | base64 -d > {remote_path}");
-                let primary_run = if remove_home {
-                    format!("bash {remote_path} --user {username} --remove-home")
-                } else {
-                    format!("bash {remote_path} --user {username}")
-                };
+                // Delete always removes the shared EFS home too.
                 let primary = vec![
                     "sudo su".to_string(),
+                    PREP_STEP_SENTINEL.to_string(),
                     "cd ~".to_string(),
                     write.clone(),
-                    primary_run,
+                    format!("bash {remote_path} --user {username} --remove-home"),
                 ];
                 let secondary = vec![
                     "sudo su".to_string(),
+                    PREP_STEP_SENTINEL.to_string(),
                     "cd ~".to_string(),
                     write,
                     format!("bash {remote_path} --user {username} --secondary"),
@@ -4518,6 +4706,7 @@ mod gui {
                 };
                 let primary = vec![
                     "sudo su".to_string(),
+                    PREP_STEP_SENTINEL.to_string(),
                     "cd ~".to_string(),
                     format!("echo '{b64}' | base64 -d > {remote_path}"),
                     run_line,
@@ -4526,14 +4715,22 @@ mod gui {
                 // Secondary: mirror the UID/GID from the shared EFS home.
                 // These are the same commands the primary script echoes.
                 let suffix = username.replace('.', "-");
+                // `-M` (don't create home — it already exists on shared
+                // EFS) and `2>/dev/null` keep useradd/groupadd quiet: the
+                // GROUP=100/skel/"home exists" lines are benign noise. A
+                // real failure still shows via the SSH verification step.
                 let mut secondary = vec![
                     "sudo su".to_string(),
+                    PREP_STEP_SENTINEL.to_string(),
                     "cd ~".to_string(),
                     format!("UID_NUM=$(stat -c %u /efs/home/{username})"),
                     format!("GID_NUM=$(stat -c %g /efs/home/{username})"),
-                    format!("groupadd -g $GID_NUM {username}"),
+                    format!("groupadd -g $GID_NUM {username} 2>/dev/null || true"),
                     format!(
-                        "useradd -u $UID_NUM -g $GID_NUM -d /efs/home/{username} {username}"
+                        "useradd -u $UID_NUM -g $GID_NUM -M -d /efs/home/{username} {username} 2>/dev/null || true"
+                    ),
+                    format!(
+                        "id {username} >/dev/null 2>&1 && echo \"secondary: {username} ready\" || echo \"secondary: FAILED to create {username}\""
                     ),
                 ];
                 if grant_sudo {
@@ -4577,6 +4774,8 @@ mod gui {
                     None
                 }
             };
+            // Track this run's tabs so the status clears once they're closed.
+            self.script_status_tabs = primary_tab.map(|id| vec![id]).unwrap_or_default();
 
             if let Some(primary_tab) = primary_tab {
                 let ctx = self
@@ -4645,7 +4844,92 @@ mod gui {
         /// only thing shown (yellow while running, red on failure).
         fn set_script_status(&mut self, text: impl Into<String>, state: ScriptState) {
             self.script_status = Some((text.into(), state));
+            self.script_status_highlight = None;
             self.message = String::new();
+        }
+
+        /// Show the final result of a create/delete run in a modal popup and
+        /// clear the transient flashing status line (the popup now owns the
+        /// result, and stays until the user dismisses it).
+        fn show_script_result(
+            &mut self,
+            title: impl Into<String>,
+            message: String,
+            success: bool,
+            pem_path: Option<String>,
+            details: Option<String>,
+        ) {
+            self.script_status = None;
+            self.script_status_highlight = None;
+            self.script_status_tabs.clear();
+            self.script_result_popup = Some(ScriptResultPopup {
+                title: title.into(),
+                message,
+                success,
+                pem_path,
+                details,
+            });
+        }
+
+        /// Render the create/delete result modal, if open.
+        fn render_script_result_popup(&mut self, ctx: &egui::Context) {
+            let Some(popup) = self.script_result_popup.take() else {
+                return;
+            };
+            let mut window_open = true;
+            let mut do_close = false;
+            let mut open_downloads = false;
+            egui::Window::new(&popup.title)
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    let color = if popup.success {
+                        egui::Color32::from_rgb(90, 200, 90)
+                    } else {
+                        egui::Color32::from_rgb(220, 60, 60)
+                    };
+                    ui.colored_label(color, &popup.message);
+                    if let Some(path) = &popup.pem_path {
+                        ui.add_space(8.0);
+                        ui.label("PEM saved to:");
+                        ui.monospace(path);
+                        ui.add_space(8.0);
+                        if ui.button("📂 Open Downloads folder").clicked() {
+                            open_downloads = true;
+                        }
+                    }
+                    if let Some(details) = &popup.details {
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.label("Diagnostics:");
+                        egui::ScrollArea::vertical()
+                            .id_salt("script_result_details")
+                            .max_height(240.0)
+                            .show(ui, |ui| {
+                                ui.monospace(details);
+                            });
+                        ui.add_space(4.0);
+                        if ui.button("📋 Copy diagnostics").clicked() {
+                            ui.ctx().copy_text(details.clone());
+                        }
+                    }
+                    ui.add_space(10.0);
+                    if ui.button("Close").clicked() {
+                        do_close = true;
+                    }
+                });
+            if open_downloads {
+                if let Some(path) = &popup.pem_path {
+                    reveal_in_file_manager(path);
+                }
+            }
+            // Keep the popup open unless the user dismissed it (Close or X);
+            // clicking "Open Downloads" leaves it up.
+            if !do_close && window_open {
+                self.script_result_popup = Some(popup);
+            }
         }
 
         /// Poll script-run completion and verification results: once both
@@ -4667,13 +4951,18 @@ mod gui {
                             &pd.username,
                             &pd.env,
                             false,
-                            pd.remove_home,
                             &pd.primary_id,
                             &pd.secondary_id,
                         );
                     } else {
                         self.log_error(outcome.report.clone());
-                        self.set_script_status(outcome.report, ScriptState::Failed);
+                        self.show_script_result(
+                            "Delete Aborted",
+                            outcome.report,
+                            false,
+                            None,
+                            None,
+                        );
                     }
                 }
             }
@@ -4715,6 +5004,7 @@ mod gui {
                             r.secondary_tab = Some(tab_id);
                             r.secondary_started = true;
                         }
+                        self.script_status_tabs.push(tab_id);
                         self.log_info(format!(
                             "primary finished; running secondary bastion {secondary_id}"
                         ));
@@ -4811,58 +5101,107 @@ mod gui {
                         s2p,
                         pem_path,
                         error,
+                        diagnostics,
                     } => {
+                        let pem_note = pem_path
+                            .as_ref()
+                            .map(|p| format!(" PEM saved to {p}"))
+                            .unwrap_or_default();
                         if p2s && s2p {
                             let mut msg = format!(
                                 "User '{username}' created. All tests passed (primary↔secondary SSH OK)."
                             );
-                            if let Some(path) = &pem_path {
-                                msg.push_str(&format!(" PEM saved to {path}"));
-                            } else if let Some(err) = &error {
-                                msg.push_str(&format!(" (PEM not saved: {err})"));
+                            if pem_path.is_none() {
+                                if let Some(err) = &error {
+                                    msg.push_str(&format!(" (PEM not saved: {err})"));
+                                }
                             }
-                            self.log_info(msg.clone());
-                            self.set_script_status(msg, ScriptState::Done);
+                            self.log_info(format!("{msg}{pem_note}"));
+                            self.show_script_result(
+                                "User Created",
+                                msg,
+                                true,
+                                pem_path,
+                                None,
+                            );
                         } else {
                             let dir = |ok: bool| if ok { "OK" } else { "FAILED" };
                             let mut msg = format!(
                                 "User '{username}' created, but SSH test failed \
-                                 (primary→secondary: {}, secondary→primary: {}).",
+                                 (primary→secondary: {}, secondary→primary: {}). \
+                                 See diagnostics below.",
                                 dir(p2s),
                                 dir(s2p),
                             );
-                            if let Some(path) = &pem_path {
-                                msg.push_str(&format!(" PEM saved to {path}"));
-                            }
                             if let Some(err) = &error {
                                 msg.push_str(&format!(" {err}"));
                             }
-                            self.log_error(msg.clone());
-                            self.set_script_status(msg, ScriptState::Failed);
+                            self.log_error(format!("{msg}{pem_note}"));
+                            if let Some(d) = &diagnostics {
+                                self.log_error(format!("create diagnostics:\n{d}"));
+                            }
+                            self.show_script_result(
+                                "Create Failed",
+                                msg,
+                                false,
+                                pem_path,
+                                diagnostics,
+                            );
                         }
                     }
                     VerifyOutcome::Deleted {
                         username,
                         primary_absent,
                         secondary_absent,
+                        diagnostics,
                     } => {
                         if primary_absent && secondary_absent {
                             let msg = format!(
                                 "User '{username}' deleted (confirmed removed from both bastions)."
                             );
                             self.log_info(msg.clone());
-                            self.set_script_status(msg, ScriptState::Done);
+                            self.show_script_result(
+                                "User Deleted",
+                                msg,
+                                true,
+                                None,
+                                None,
+                            );
                         } else {
                             let state = |gone: bool| if gone { "removed" } else { "STILL PRESENT" };
                             let msg = format!(
-                                "delete_user '{username}': primary {}, secondary {}.",
+                                "delete_user '{username}': primary {}, secondary {}. \
+                                 See diagnostics below.",
                                 state(primary_absent),
                                 state(secondary_absent),
                             );
                             self.log_error(msg.clone());
-                            self.set_script_status(msg, ScriptState::Failed);
+                            if let Some(d) = &diagnostics {
+                                self.log_error(format!("delete diagnostics:\n{d}"));
+                            }
+                            self.show_script_result(
+                                "Delete Incomplete",
+                                msg,
+                                false,
+                                None,
+                                diagnostics,
+                            );
                         }
                     }
+                }
+            }
+
+            // Clear the Scripts status once the user has closed all the
+            // bastion tabs it referred to (they've seen the result and, for
+            // a create, retrieved the PEM).
+            if self.script_status.is_some() && !self.script_status_tabs.is_empty() {
+                let any_open = self.script_status_tabs.iter().any(|id| {
+                    self.connections.tabs().iter().any(|t| t.id == *id)
+                });
+                if !any_open {
+                    self.script_status = None;
+                    self.script_status_highlight = None;
+                    self.script_status_tabs.clear();
                 }
             }
         }
@@ -4889,6 +5228,11 @@ mod gui {
                 const LOGIN_WAIT: Duration = Duration::from_secs(45);
                 const STEP_WAIT: Duration = Duration::from_secs(20);
                 const SETTLE: Duration = Duration::from_millis(150);
+                // The prep sequence is several local commands (exec bash,
+                // PS1, vim, ssh-config, clear); give it time to run through
+                // before the prompt-wait so we don't send the next step into
+                // the middle of it.
+                const PREP_SETTLE: Duration = Duration::from_millis(800);
 
                 let snapshot = || {
                     let (lock, _) = &*prompt_ready;
@@ -4910,16 +5254,29 @@ mod gui {
 
                 for step in steps {
                     let pre = snapshot();
+                    let is_prep = step == PREP_STEP_SENTINEL;
                     {
                         let Ok(mut w) = writer.lock() else {
                             return;
                         };
-                        let mut line = step.into_bytes();
-                        line.push(b'\r');
-                        if w.write_all(&line).is_err() {
+                        let ok = if is_prep {
+                            // Send the prep-terminal sequence (it already
+                            // ends in CR); no extra command line.
+                            w.write_all(PREP_TERMINAL_COMMAND).is_ok()
+                        } else {
+                            let mut line = step.into_bytes();
+                            line.push(b'\r');
+                            w.write_all(&line).is_ok()
+                        };
+                        if !ok {
                             return;
                         }
                         let _ = w.flush();
+                    }
+                    if is_prep {
+                        // Let the whole prep sequence run, then wait for the
+                        // final prompt redraw before continuing.
+                        std::thread::sleep(PREP_SETTLE);
                     }
                     wait_advance(pre, STEP_WAIT);
                     std::thread::sleep(SETTLE);
@@ -10186,6 +10543,7 @@ mod gui {
                 self.render_settings_pem_dialog(ctx);
                 self.render_file_browser_defaults_dialog(ctx);
                 self.render_create_user_dialog(ctx);
+                self.render_script_result_popup(ctx);
                 self.pump_script_runs();
                 self.poll_script_events();
 
@@ -10664,7 +11022,6 @@ mod gui {
                                     username: String::new(),
                                     env_profile_id: env,
                                     grant_sudo: false,
-                                    remove_home: false,
                                     primary_query,
                                     secondary_query,
                                     primary_id,
@@ -10677,26 +11034,13 @@ mod gui {
 
                     if let Some((text, state)) = self.script_status.clone() {
                         let color = match state {
-                            ScriptState::Running => {
-                                // Slow flash (~0.7 Hz) by oscillating alpha.
-                                let t = ui.input(|i| i.time);
-                                let phase = 0.5
-                                    + 0.5
-                                        * (t * std::f64::consts::TAU * 0.7).sin();
-                                let alpha = (70.0 + 185.0 * phase) as u8;
-                                ui.ctx().request_repaint();
-                                egui::Color32::from_rgba_unmultiplied(
-                                    255, 205, 0, alpha,
-                                )
-                            }
-                            ScriptState::Failed => {
-                                egui::Color32::from_rgb(220, 60, 60)
-                            }
-                            ScriptState::Done => {
-                                egui::Color32::from_rgb(90, 200, 90)
-                            }
+                            ScriptState::Running => flashing_yellow(ui),
+                            ScriptState::Failed => egui::Color32::from_rgb(220, 60, 60),
                         };
                         ui.colored_label(color, text);
+                    }
+                    if let Some(hl) = self.script_status_highlight.clone() {
+                        ui.colored_label(flashing_yellow(ui), hl);
                     }
                     if !self.message.is_empty() {
                         ui.label(self.message.clone());
@@ -12956,13 +13300,14 @@ mod gui {
             egui::Event::Text(text) => {
                 // BS (\x08) may arrive as a Text event on some platforms
                 // when egui does not emit Key::Backspace.  Forward it as
-                // the terminal backspace byte, but only when no explicit
+                // DEL (0x7f) — the erase char Unix line discipline expects
+                // (stty erase = ^?) — but only when no explicit
                 // Key::Backspace event is present (to avoid double-send).
                 if text == "\x08" {
                     if has_key_backspace {
                         None
                     } else {
-                        Some(vec![0x08])
+                        Some(vec![0x7f])
                     }
                 } else if text.chars().any(|c| c.is_control()) {
                     None
@@ -12995,7 +13340,10 @@ mod gui {
                 ..
             } => match key {
                 egui::Key::Enter => Some(b"\r".to_vec()),
-                egui::Key::Backspace => Some(vec![0x08]),
+                // Send DEL (0x7f), not BS (0x08): Unix line discipline sets
+                // `stty erase = ^?` (0x7f), so 0x08 echoes as a literal ^H
+                // at a `read` prompt instead of erasing the previous char.
+                egui::Key::Backspace => Some(vec![0x7f]),
                 egui::Key::Tab => Some(b"\t".to_vec()),
                 egui::Key::Escape => Some(vec![0x1b]),
                 egui::Key::ArrowUp => Some(b"\x1b[A".to_vec()),
@@ -14290,7 +14638,9 @@ mod gui {
         }
 
         #[test]
-        fn terminal_event_payload_backspace_sends_bs() {
+        fn terminal_event_payload_backspace_sends_del() {
+            // Backspace must send DEL (0x7f), the erase char Unix line
+            // discipline expects; 0x08 would echo as a literal ^H.
             let bs = egui::Event::Key {
                 key: egui::Key::Backspace,
                 physical_key: None,
@@ -14300,7 +14650,7 @@ mod gui {
             };
             assert_eq!(
                 terminal_event_payload_for_terminal(&bs, false, false),
-                Some(vec![0x08])
+                Some(vec![0x7f])
             );
         }
 
@@ -14345,11 +14695,11 @@ mod gui {
         #[test]
         fn terminal_event_payload_text_bs_without_key_backspace() {
             // When no Key::Backspace event is present, Text("\x08")
-            // should be forwarded as BS (0x08).
+            // should be forwarded as DEL (0x7f).
             let text_bs = egui::Event::Text("\u{8}".to_string());
             assert_eq!(
                 terminal_event_payload_for_terminal(&text_bs, false, false),
-                Some(vec![0x08])
+                Some(vec![0x7f])
             );
         }
 
