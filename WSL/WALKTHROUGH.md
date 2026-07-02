@@ -2,11 +2,37 @@
 
 ## Getting Started
 
+### Prerequisite: Install WSL (Ubuntu 24.04) — one-time
+The app runs AWS CLI and the Session Manager Plugin inside **WSL** using
+**Ubuntu 24.04**. Set this up once before first launch:
+
+1. Open **PowerShell as Administrator** (Start → type `PowerShell` → right-click → **Run as administrator**).
+2. Update WSL first (avoids a stale distro catalog): `wsl --update`.
+   If `wsl` isn't recognized, run `wsl --install --no-distribution`, reboot, then continue.
+3. Install Ubuntu 24.04:
+   ```powershell
+   wsl --install -d Ubuntu-24.04 --web-download
+   ```
+   `--web-download` bypasses the Microsoft Store — needed on work laptops where the Store is
+   blocked by IT policy (that block is why `wsl --list --online` may show **no Ubuntu**). On a
+   personal machine you can drop the flag.
+4. **Reboot** if Windows prompts you to.
+5. When Ubuntu finishes installing, create a **UNIX username** and **password** when asked.
+   This password is the **sudo password** the app needs on first launch — remember it.
+6. Verify with `wsl --list --verbose`; you should see `Ubuntu-24.04` at `VERSION 2`.
+
+> **`wsl --list --online` shows no Ubuntu?** WSL is outdated or the Store is blocked. Run
+> `wsl --update`, then install with `--web-download` as above; as a last resort install
+> **"Ubuntu 24.04.1 LTS"** from the Microsoft Store.
+> If you already use a different distro, install Ubuntu 24.04 alongside it and set it as
+> default: `wsl --set-default Ubuntu-24.04`.
+
 ### First Launch
 1. Double-click `ec2_manager_gui_1.1.exe` to open the application
 2. On first launch, a **WSL Setup** dialog will appear automatically
-3. Enter your WSL sudo password to install AWS CLI and Session Manager Plugin inside WSL
+3. Enter your WSL sudo password (the one you set when creating your Ubuntu user) to install AWS CLI and Session Manager Plugin inside Ubuntu 24.04
 4. Once setup completes, the app caches the result so you won't be prompted again
+5. If the app reports **"WSL is not installed"**, complete the **Prerequisite: Install WSL** steps above, then click **Initialize WSL**
 
 ---
 
