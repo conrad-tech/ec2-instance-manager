@@ -10,7 +10,7 @@ manage by hand.
    **Extract All…** (or use your preferred unzip tool). Keep every file together
    in the one extracted folder — don't move the `.exe` out on its own.
 2. Open the extracted **`ec2_manager_windows`** folder.
-3. Double-click **`ec2_manager_gui_1.0.exe`** (the GUI app) to launch it.
+3. Double-click **`ec2_manager_gui_1.1.exe`** (the GUI app) to launch it.
 4. On first launch it installs AWS CLI + the Session Manager plugin inside WSL —
    enter your WSL sudo password when prompted. This is a one-time step and is
    remembered afterward.

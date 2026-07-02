@@ -1,9 +1,9 @@
-# EC2 Manager GUI v1.0 - Walkthrough
+# EC2 Manager GUI v1.1 - Walkthrough
 
 ## Getting Started
 
 ### First Launch
-1. Double-click `ec2_manager_gui_1.0.exe` to open the application
+1. Double-click `ec2_manager_gui_1.1.exe` to open the application
 2. On first launch, a **WSL Setup** dialog will appear automatically
 3. Enter your WSL sudo password to install AWS CLI and Session Manager Plugin inside WSL
 4. Once setup completes, the app caches the result so you won't be prompted again

@@ -3,7 +3,7 @@ set -euo pipefail
 
 CLI_APP_NAME="ec2_manager"
 GUI_APP_NAME="ec2_manager_gui"
-APP_VERSION="1.0"
+APP_VERSION="1.1"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="${ROOT_DIR}/dist"
 LINUX_DIST_DIR="${DIST_DIR}/linux"
@@ -71,7 +71,7 @@ copy_artifact() {
   out_dir="$(target_output_dir "$target")"
   mkdir -p "$out_dir"
 
-  # Rename with version: ec2_manager_gui.exe -> ec2_manager_gui_1.0.exe
+  # Rename with version suffix, e.g. ec2_manager_gui.exe -> ec2_manager_gui_${APP_VERSION}.exe
   local dest_name
   if [[ "$artifact_name" == *.exe ]]; then
     local base="${artifact_name%.exe}"
