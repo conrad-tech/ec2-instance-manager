@@ -164,6 +164,12 @@ package_windows_zip() {
   zip -q -j "$zip_path" "${files[@]}"
   mkdir -p "$extract_dir"
   unzip -qo "$zip_path" -d "$extract_dir"
+  # User-facing README goes ONLY in the extracted folder (not the zip), so
+  # someone opening the folder has a quick "what is this / how to run" guide.
+  # The WALKTHROUGH is in both (it's a zip candidate above).
+  if [[ -f "${ROOT_DIR}/USER_README.md" ]]; then
+    cp "${ROOT_DIR}/USER_README.md" "${extract_dir}/README.md"
+  fi
   echo "info: packaged Windows zip: $zip_path"
   echo "info: extracted to: $extract_dir"
 }

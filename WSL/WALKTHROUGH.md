@@ -138,6 +138,15 @@
 - Appends `set paste` to `~/.vimrc` (if not already present) so right-click paste into vim doesn't staircase-indent
 - Also runs `clear` to clean up the terminal
 
+### Copy & Paste
+- **Select text** by dragging in the terminal; **double-click** selects a word,
+  **triple-click** selects a line
+- **Right-click** copies the selection, or pastes the clipboard if nothing is
+  selected (rich text from Slack/OneNote/Notepad is normalized to plain text)
+- **Multi-line paste** works: paste several commands at once and they run one at a
+  time (the app waits for each command's prompt before sending the next, so lines
+  don't get dropped)
+
 ### Multiple Connections
 - Connect to multiple instances across different accounts simultaneously
 - Each connection gets its own tab, colored by environment
@@ -180,6 +189,52 @@ The file browser is the left sidebar in the Connections panel.
 - Click **Download** to save it to your local machine (status shows "Downloading...")
 - Click **Upload** to upload a local file to the current directory (status shows "Uploading...")
 - **Drag and drop** files from Windows Explorer onto the file browser to upload
+
+---
+
+## Scripts — Bastion User Management
+
+On the **Connections** page there is a **`Scripts (N)`** dropdown (to the right of
+**Close All**), where `N` is the number of available scripts. It automates
+creating (and, for admin builds, deleting) a Linux user across a **primary +
+secondary bastion pair**, so you don't have to run the steps by hand.
+
+### The dialog
+Each script opens a small window with:
+- **User** — the username to create/delete (e.g. `firstname.lastname`).
+- **Environment** — which account's bastions to target.
+- **Primary Bastion** / **Secondary Bastion** — dropdowns (`choose ▾`) narrowed to
+  the relevant instances. Pick one of each. Your last pick is remembered per
+  environment and pre-filled next time.
+
+While a script runs, the status line at the top flashes **yellow**; on success it
+flashes **green**; on failure it turns solid **red**.
+
+### create_new_user.sh
+- Optional **Grant sudo (NOPASSWD:ALL)** checkbox.
+- Opens (or reuses) a terminal session to each bastion, elevates to root, preps
+  the terminal, and runs the script — you can watch it happen in the tabs.
+- On the **primary** it creates the account, generates an SSH key (PEM), and
+  installs the public key. On the **secondary** it mirrors the matching UID/GID
+  from the shared EFS home. The secondary runs only **after** the primary
+  finishes.
+- It then **verifies** the new user really works, and **pulls the PEM back to your
+  local Downloads folder** as `<username>-<environment>.pem`.
+- A **result popup** shows the outcome and, on success, an **Open Downloads
+  folder** button that opens Explorer with the `.pem` highlighted.
+- If something fails, the popup shows a **diagnostics report** (the script's
+  actual error plus account/home/keys checks) so you can see exactly what broke.
+
+### delete_user.sh (admin builds only)
+This entry only appears in builds where an administrator has enabled it.
+- A **confirmation checkbox** must be ticked before the **Delete** button works.
+- Removes the account, group, sudoers entry, generated key, **and** the shared
+  home directory on both bastions.
+- **Safety:** protected/system users (`root`, `ec2-user`, `ssm-user`, etc.) can
+  never be deleted, and it **refuses to delete a user who is currently logged in**
+  (it tells you which session/process is holding them) — no active session is
+  ever killed.
+- After it runs it confirms the account is actually gone from both bastions.
 
 ---
 

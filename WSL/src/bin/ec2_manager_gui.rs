@@ -1250,7 +1250,6 @@ mod gui {
             })
         };
         let pem_result = pull_pem_to_downloads(
-            &primary_channel,
             &primary_ctx,
             &primary_id,
             &username,
@@ -1560,7 +1559,6 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
     /// Pull `/root/<user>.pem` from the primary bastion and save it locally
     /// as `~/Downloads/<user>-<env>.pem`. Returns the saved path.
     fn pull_pem_to_downloads(
-        channel: &Option<Arc<ControlChannel>>,
         ctx: &AwsContext,
         instance_id: &str,
         username: &str,
@@ -1573,8 +1571,12 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         let cmd = format!(
             "sudo -n -u {username} base64 -w0 /efs/home/{username}/.ssh/{username}.pem"
         );
+        // Force the `send-command` path (channel = None): a control channel is
+        // an interactive terminal, and reading a long base64 blob through it
+        // gets corrupted by escape/wrap sequences. send-command returns clean
+        // stdout.
         let out =
-            exec_remote_command(channel, ctx, instance_id, &cmd, Duration::from_secs(30))?;
+            exec_remote_command(&None, ctx, instance_id, &cmd, Duration::from_secs(30))?;
         use base64::Engine;
         // Guard against a shell/permission error landing in stdout — real
         // base64 has no ':' (which appears in "sudo: …" / "base64: …" errors).
@@ -1584,7 +1586,12 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 out.lines().next().unwrap_or("").trim()
             ));
         }
-        let cleaned: String = out.split_whitespace().collect();
+        // Keep only the base64 alphabet — strips any stray whitespace/newlines
+        // (and, defensively, control characters).
+        let cleaned: String = out
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
+            .collect();
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(cleaned.as_bytes())
             .map_err(|e| format!("PEM base64 decode failed: {e}"))?;
