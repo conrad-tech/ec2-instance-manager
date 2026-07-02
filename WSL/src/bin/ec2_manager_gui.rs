@@ -240,6 +240,9 @@ mod gui {
     struct LogEntry {
         level: LogLevel,
         message: String,
+        /// Wall-clock timestamp in the local machine timezone, captured when
+        /// logged (e.g. "2026-07-02 16:20:33 CDT").
+        time: String,
     }
 
     #[derive(Clone, Debug)]
@@ -1310,7 +1313,7 @@ mod gui {
     /// account (/etc/passwd), primary group, home dir + perms, `.ssh` perms,
     /// authorized_keys, and the PEM copies. Used in the failure popup.
     fn run_create_diagnostics(
-        channel: &Option<Arc<ControlChannel>>,
+        _channel: &Option<Arc<ControlChannel>>,
         ctx: &AwsContext,
         instance_id: &str,
         username: &str,
@@ -1342,7 +1345,7 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
         let cmd = format!("echo {b64} | base64 -d | bash");
-        match exec_remote_command(channel, ctx, instance_id, &cmd, Duration::from_secs(30)) {
+        match exec_remote_command(&None, ctx, instance_id, &cmd, Duration::from_secs(30)) {
             Ok(out) => out.trim_end().to_string(),
             Err(e) => format!("(diagnostics failed: {e})"),
         }
@@ -1426,35 +1429,31 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         secondary_id: String,
         primary_ctx: AwsContext,
         secondary_ctx: AwsContext,
-        primary_channel: Option<Arc<ControlChannel>>,
-        secondary_channel: Option<Arc<ControlChannel>>,
+        _primary_channel: Option<Arc<ControlChannel>>,
+        _secondary_channel: Option<Arc<ControlChannel>>,
         tx: Sender<VerifyOutcome>,
     ) {
         // Prints CNU_ABSENT when the account no longer exists (always exits
-        // 0 so `aws ssm` reports Success either way).
+        // 0 so `aws ssm` reports Success either way). Uses `send-command`
+        // (channel = None): the control channel is an interactive terminal
+        // and has *timed out* here, which was being read as "still present".
         let cmd = format!(
             "id {username} >/dev/null 2>&1 && echo CNU_PRESENT || echo CNU_ABSENT"
         );
-        let absent = |ch: &Option<Arc<ControlChannel>>, ctx: &AwsContext, id: &str| -> bool {
-            exec_remote_command(ch, ctx, id, &cmd, Duration::from_secs(30))
-                .map(|out| out.contains("CNU_ABSENT"))
-                .unwrap_or(false)
-        };
         // Check both bastions concurrently.
         let sec_handle = {
-            let (ch, ctx, id, cmd) = (
-                secondary_channel.clone(),
-                secondary_ctx.clone(),
-                secondary_id.clone(),
-                cmd.clone(),
-            );
+            let (ctx, id, cmd) =
+                (secondary_ctx.clone(), secondary_id.clone(), cmd.clone());
             std::thread::spawn(move || {
-                exec_remote_command(&ch, &ctx, &id, &cmd, Duration::from_secs(30))
+                exec_remote_command(&None, &ctx, &id, &cmd, Duration::from_secs(30))
                     .map(|out| out.contains("CNU_ABSENT"))
                     .unwrap_or(false)
             })
         };
-        let primary_absent = absent(&primary_channel, &primary_ctx, &primary_id);
+        let primary_absent =
+            exec_remote_command(&None, &primary_ctx, &primary_id, &cmd, Duration::from_secs(30))
+                .map(|out| out.contains("CNU_ABSENT"))
+                .unwrap_or(false);
         let secondary_absent = sec_handle.join().unwrap_or(false);
         // If the user survived on a bastion, gather a report from that
         // bastion showing what's left / what's blocking removal.
@@ -1465,7 +1464,7 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
             if !primary_absent {
                 r.push_str(&format!("[primary {primary_id}]\n"));
                 r.push_str(&run_delete_diagnostics(
-                    &primary_channel,
+                    &None,
                     &primary_ctx,
                     &primary_id,
                     &username,
@@ -1477,7 +1476,7 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 }
                 r.push_str(&format!("[secondary {secondary_id}]\n"));
                 r.push_str(&run_delete_diagnostics(
-                    &secondary_channel,
+                    &None,
                     &secondary_ctx,
                     &secondary_id,
                     &username,
@@ -1497,7 +1496,7 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
     /// account, group, active sessions + processes (the usual `userdel`
     /// blockers), the home dir (did `--remove-home` work?), and sudoers.
     fn run_delete_diagnostics(
-        channel: &Option<Arc<ControlChannel>>,
+        _channel: &Option<Arc<ControlChannel>>,
         ctx: &AwsContext,
         instance_id: &str,
         username: &str,
@@ -1520,7 +1519,7 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
         let cmd = format!("echo {b64} | base64 -d | bash");
-        match exec_remote_command(channel, ctx, instance_id, &cmd, Duration::from_secs(30)) {
+        match exec_remote_command(&None, ctx, instance_id, &cmd, Duration::from_secs(30)) {
             Ok(out) => out.trim_end().to_string(),
             Err(e) => format!("(diagnostics failed: {e})"),
         }
@@ -1530,7 +1529,10 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
     /// shared EFS key. Retries a few times so a freshly created account has
     /// time to settle. Returns true on a successful login.
     fn ssh_cross_login_test(
-        channel: &Option<Arc<ControlChannel>>,
+        // Reserved for future use; verification uses `send-command` (see
+        // below) — a control channel is an interactive terminal and has
+        // proven unreliable (timeouts / escape-sequence corruption) here.
+        _channel: &Option<Arc<ControlChannel>>,
         ctx: &AwsContext,
         instance_id: &str,
         user_pem: &str,
@@ -1559,7 +1561,7 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         // needs no password for root and drops to the user's uid, which EFS
         // maps through normally.
         let cmd = format!("echo {b64} | base64 -d | sudo -n -u {username} -H bash");
-        match exec_remote_command(channel, ctx, instance_id, &cmd, Duration::from_secs(30)) {
+        match exec_remote_command(&None, ctx, instance_id, &cmd, Duration::from_secs(30)) {
             Ok(out) => out.contains("CNU_PASS"),
             Err(_) => false,
         }
@@ -3208,7 +3210,8 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
             if message.trim().is_empty() {
                 message = "<empty>".to_string();
             }
-            self.logs.push_back(LogEntry { level, message });
+            let time = local_timestamp_now();
+            self.logs.push_back(LogEntry { level, message, time });
             if self.logs.len() > Self::MAX_LOG_LINES {
                 let overflow = self.logs.len() - Self::MAX_LOG_LINES;
                 self.logs.drain(0..overflow);
@@ -5330,24 +5333,6 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
             // Drain per-step timing logs from the worker threads.
             while let Ok(line) = self.script_log_rx.try_recv() {
                 self.log_info(line);
-            }
-
-            // Pre-warm each bastion's control channel while its script runs,
-            // so the post-run SSH/confirm/diagnostics commands can reuse a
-            // warm session instead of paying `send-command` latency. Idempotent
-            // and cheap once established (only spawns after the visible
-            // terminal has connected).
-            let (warm_p, warm_s) = self
-                .create_user_run
-                .as_ref()
-                .filter(|r| !r.verify_started)
-                .map(|r| (Some(r.primary_tab), r.secondary_tab))
-                .unwrap_or((None, None));
-            if let Some(t) = warm_p {
-                let _ = self.ensure_control_channel(t);
-            }
-            if let Some(t) = warm_s {
-                let _ = self.ensure_control_channel(t);
             }
 
             // Delete pre-flight results: proceed only if both bastions are
@@ -10802,7 +10787,7 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 if ui.button("Copy All").clicked() {
                     let text: String = self.logs.iter()
                         .filter(|e| self.log_filters.includes(e.level))
-                        .map(|e| format!("[{}] {}", e.level.as_str(), e.message))
+                        .map(|e| format!("[{}] [{}] {}", e.time, e.level.as_str(), e.message))
                         .collect::<Vec<_>>()
                         .join("\n");
                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
@@ -10819,7 +10804,12 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 if !log_text.is_empty() {
                     log_text.push('\n');
                 }
-                log_text.push_str(&format!("[{}] {}", entry.level.as_str(), entry.message));
+                log_text.push_str(&format!(
+                    "[{}] [{}] {}",
+                    entry.time,
+                    entry.level.as_str(),
+                    entry.message
+                ));
             }
 
             egui::ScrollArea::vertical()
@@ -13080,6 +13070,13 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+
+    /// Current wall-clock time in the **local machine's** timezone, e.g.
+    /// `2026-07-02 16:20:33 CDT`. Uses `chrono::Local`, which reads the OS
+    /// timezone (and DST) — so it's correct wherever the app runs.
+    fn local_timestamp_now() -> String {
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z").to_string()
     }
 
     fn profile_choice_mtime(path: Option<&std::path::Path>) -> Option<SystemTime> {
