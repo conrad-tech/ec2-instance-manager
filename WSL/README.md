@@ -84,19 +84,19 @@ Artifacts are written to:
 - `dist/windows/`
 
 Expected files (Windows — built on Windows with MSVC):
-- `dist/windows/ec2_manager.exe`
-- `dist/windows/ec2_manager_gui.exe`
+- `dist/windows/ec2_manager_1.0.exe`
+- `dist/windows/ec2_manager_gui_1.0.exe`
 
 Expected files (Windows — cross-compiled from Linux with MinGW):
-- `dist/windows/ec2_manager.exe`
-- `dist/windows/ec2_manager_gui.exe`
+- `dist/windows/ec2_manager_1.0.exe`
+- `dist/windows/ec2_manager_gui_1.0.exe`
 - `dist/windows/libgcc_s_seh-1.dll`
 - `dist/windows/libstdc++-6.dll`
 - `dist/windows/libwinpthread-1.dll`
 
 Expected files (Linux):
-- `dist/linux/ec2_manager`
-- `dist/linux/ec2_manager_gui`
+- `dist/linux/ec2_manager_1.0`
+- `dist/linux/ec2_manager_gui_1.0`
 
 ## Launch Desktop GUI (Pop!_OS 24.04)
 
@@ -109,7 +109,7 @@ cargo run --features gui --bin ec2_manager_gui
 From built binary:
 
 ```bash
-./dist/ec2_manager_gui_1.0
+./dist/linux/ec2_manager_gui_1.0
 ```
 
 Flags:
@@ -134,13 +134,13 @@ From built binary (from the project root or any directory):
 
 ```bash
 # Windows (Git Bash)
-./dist/windows/ec2_manager_windows/ec2_manager_gui.exe --mode sim
+./dist/windows/ec2_manager_windows/ec2_manager_gui_1.0.exe --mode sim
 
 # Windows (PowerShell/CMD)
-.\dist\windows\ec2_manager_windows\ec2_manager_gui.exe --mode sim
+.\dist\windows\ec2_manager_windows\ec2_manager_gui_1.0.exe --mode sim
 
 # Linux
-./dist/windows/ec2_manager_windows/ec2_manager_gui.exe --mode sim
+./dist/windows/ec2_manager_windows/ec2_manager_gui_1.0.exe --mode sim
 ```
 
 The `--mode sim` flag starts the GUI with simulated inventory data. You can test sorting, filtering, favorites, copy buttons, column resizing, and saved filters without connecting to AWS.
@@ -186,16 +186,16 @@ The GUI embeds a terminal via ConPTY. Supported embedded shells on Windows:
 #### Built on Windows (MSVC)
 
 1. Copy the `.exe` files to your Windows machine:
-   - `ec2_manager.exe`
-   - `ec2_manager_gui.exe`
+   - `ec2_manager_1.0.exe`
+   - `ec2_manager_gui_1.0.exe`
 2. No DLLs needed — everything is statically linked.
 
 #### Cross-compiled from Linux (MinGW)
 
 1. Copy the entire `dist/windows/` folder to your Windows machine.
 2. Keep the `.exe` files and the three DLLs in the **same folder**:
-   - `ec2_manager.exe`
-   - `ec2_manager_gui.exe`
+   - `ec2_manager_1.0.exe`
+   - `ec2_manager_gui_1.0.exe`
    - `libgcc_s_seh-1.dll`
    - `libstdc++-6.dll`
    - `libwinpthread-1.dll`
@@ -211,7 +211,7 @@ The GUI embeds a terminal via ConPTY. Supported embedded shells on Windows:
    - `%USERPROFILE%\\.aws\\profileChoice`
    - plus normal AWS config/credentials as needed by your profile.
 3. Launch GUI:
-   - `ec2_manager_gui.exe` (defaults to `--mode live`)
+   - `ec2_manager_gui_1.0.exe` (defaults to `--mode live`)
 
 
 If Windows reports a missing DLL, it means the DLL is not next to the `.exe`.
@@ -224,8 +224,8 @@ Example target layout on Windows:
 
 ```text
 C:\tools\ec2-manager\windows\
-  ec2_manager.exe
-  ec2_manager_gui.exe
+  ec2_manager_1.0.exe
+  ec2_manager_gui_1.0.exe
   libgcc_s_seh-1.dll
   libstdc++-6.dll
   libwinpthread-1.dll
@@ -235,7 +235,7 @@ Run from that folder:
 
 ```powershell
 cd C:\tools\ec2-manager\windows
-.\ec2_manager_gui.exe
+.\ec2_manager_gui_1.0.exe
 ```
 
 Do not put these DLLs in `C:\Windows\System32`; keep them beside the `.exe`.
@@ -244,7 +244,7 @@ Do not put these DLLs in `C:\Windows\System32`; keep them beside the `.exe`.
 
 ```powershell
 # From project root
-.\dist\windows\ec2_manager_gui.exe --mode sim
+.\dist\windows\ec2_manager_gui_1.0.exe --mode sim
 ```
 
 Commands:
@@ -317,7 +317,7 @@ Run the GUI.exe with `--debug` to enable verbose logging in the built-in log pan
 cargo run --features gui --bin ec2_manager_gui -- --debug
 
 # From built binary
-ec2_manager_gui.exe --debug
+ec2_manager_gui_1.0.exe --debug
 ```
 
 Debug mode shows detailed PTY output events, credential lookups, WSL command construction, and connection lifecycle in the log panel (View > Logs or the log area at the bottom of the GUI).
@@ -326,10 +326,10 @@ To also capture low-level stderr output (PTY spawn commands, credential lookup r
 
 ```powershell
 # PowerShell
-.\ec2_manager_gui.exe --debug 2> debug.log
+.\ec2_manager_gui_1.0.exe --debug 2> debug.log
 
 # Git Bash
-./ec2_manager_gui.exe --debug 2> debug.log
+./ec2_manager_gui_1.0.exe --debug 2> debug.log
 ```
 
 ## Troubleshooting
