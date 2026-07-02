@@ -4916,18 +4916,28 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 // EFS) and `2>/dev/null` keep useradd/groupadd quiet: the
                 // GROUP=100/skel/"home exists" lines are benign noise. A
                 // real failure still shows via the SSH verification step.
+                // One compound step: wait for the shared EFS home to be
+                // visible on THIS bastion — busting the NFS negative cache
+                // (re-listing the parent) and retrying, since after a delete
+                // the secondary may have cached "no such user" for up to the
+                // attribute-cache TTL — then mirror the UID/GID and create
+                // the local account. Kept as a single step so the retry loop
+                // doesn't race the drip-feed. The `stat -c %u /efs/home`
+                // substring flags it for the longer worker timeout.
                 let mut secondary = vec![
                     "sudo su".to_string(),
                     PREP_STEP_SENTINEL.to_string(),
-                    // `cd ~` folded into the first stat (see delete note).
-                    format!("cd ~ && UID_NUM=$(stat -c %u /efs/home/{username})"),
-                    format!("GID_NUM=$(stat -c %g /efs/home/{username})"),
-                    format!("groupadd -g $GID_NUM {username} 2>/dev/null || true"),
                     format!(
-                        "useradd -u $UID_NUM -g $GID_NUM -M -d /efs/home/{username} {username} 2>/dev/null || true"
-                    ),
-                    format!(
-                        "id {username} >/dev/null 2>&1 && echo \"secondary: {username} ready\" || echo \"secondary: FAILED to create {username}\""
+                        "cd ~ && H=/efs/home/{username}; \
+                         for i in $(seq 1 12); do ls /efs/home >/dev/null 2>&1; [ -e \"$H\" ] && break; sleep 2; done; \
+                         UID_NUM=$(stat -c %u \"$H\" 2>/dev/null); GID_NUM=$(stat -c %g \"$H\" 2>/dev/null); \
+                         if [ -z \"$UID_NUM\" ] || [ -z \"$GID_NUM\" ]; then \
+                           echo \"secondary: ERROR /efs/home/{username} not visible from this bastion (do both bastions mount the same EFS?)\"; \
+                         else \
+                           groupadd -g \"$GID_NUM\" {username} 2>/dev/null || true; \
+                           useradd -u \"$UID_NUM\" -g \"$GID_NUM\" -M -d \"$H\" {username} 2>/dev/null || true; \
+                         fi; \
+                         id {username} >/dev/null 2>&1 && echo \"secondary: {username} ready\" || echo \"secondary: FAILED to create {username}\""
                     ),
                 ];
                 if grant_sudo {
@@ -5554,6 +5564,9 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                         CREATE_WAIT
                     } else if step.starts_with("bash /root/delete_user.sh") {
                         DELETE_WAIT
+                    } else if step.contains("stat -c %u /efs/home") {
+                        // Secondary EFS-home wait + mirror (retries up to ~24s).
+                        Duration::from_secs(40)
                     } else {
                         STEP_WAIT
                     };
