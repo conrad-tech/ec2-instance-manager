@@ -135,11 +135,17 @@ package_windows_zip() {
   if [[ -f "${ROOT_DIR}/WALKTHROUGH.md" ]]; then
     cp "${ROOT_DIR}/WALKTHROUGH.md" "${WINDOWS_DIST_DIR}/WALKTHROUGH.md"
   fi
+  # Ship the auto-renew helper next to the exe so fed_renew::script_path()
+  # finds it (it looks for fedup.py beside the executable).
+  if [[ -f "${ROOT_DIR}/scripts/fedup.py" ]]; then
+    cp "${ROOT_DIR}/scripts/fedup.py" "${WINDOWS_DIST_DIR}/fedup.py"
+  fi
 
   local candidates=(
     "${WINDOWS_DIST_DIR}/${CLI_APP_NAME}_${APP_VERSION}.exe"
     "${WINDOWS_DIST_DIR}/${GUI_APP_NAME}_${APP_VERSION}.exe"
     "${WINDOWS_DIST_DIR}/WALKTHROUGH.md"
+    "${WINDOWS_DIST_DIR}/fedup.py"
     "${WINDOWS_DIST_DIR}/libgcc_s_seh-1.dll"
     "${WINDOWS_DIST_DIR}/libstdc++-6.dll"
     "${WINDOWS_DIST_DIR}/libwinpthread-1.dll"
