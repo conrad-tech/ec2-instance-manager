@@ -1307,27 +1307,28 @@ mod gui {
         instance_id: &str,
         username: &str,
     ) -> String {
+        // The home lives on EFS at 0700; root is squashed to `nobody` there,
+        // so the key/authorized_keys checks are done AS THE USER via
+        // `sudo -n -u` (inside that block $HD is the user's home dir and $1
+        // is the username). account/group/rootpem/sudoers stay as root.
         let script = format!(
-            "U=\"{u}\"\n\
-             HOME_DIR=\"$(getent passwd \"$U\" | cut -d: -f6)\"\n\
-             echo \"account : $(getent passwd \"$U\" 2>/dev/null || echo MISSING)\"\n\
-             echo \"group   : $(getent group \"$U\" 2>/dev/null || echo MISSING)\"\n\
-             if [ -n \"$HOME_DIR\" ]; then \
-               if [ -d \"$HOME_DIR\" ]; then echo \"home    : $(ls -ld \"$HOME_DIR\")\"; \
-               else echo \"home    : MISSING ($HOME_DIR)\"; fi; \
-               if [ -d \"$HOME_DIR/.ssh\" ]; then echo \".ssh    : $(ls -ld \"$HOME_DIR/.ssh\")\"; \
-               else echo \".ssh    : MISSING\"; fi; \
-               AK=\"$HOME_DIR/.ssh/authorized_keys\"; \
-               if [ -f \"$AK\" ]; then echo \"authkeys: $(ls -l \"$AK\") [$(grep -c . \"$AK\" 2>/dev/null) key line(s)]\"; \
-               else echo \"authkeys: MISSING\"; fi; \
-               UP=\"$HOME_DIR/.ssh/$U.pem\"; \
-               if [ -f \"$UP\" ]; then echo \"userpem : $(ls -l \"$UP\")\"; \
-               else echo \"userpem : MISSING\"; fi; \
-             else echo \"home    : NO HOME (account missing?)\"; fi\n\
-             if [ -f \"/root/$U.pem\" ]; then echo \"rootpem : $(ls -l \"/root/$U.pem\")\"; \
-             else echo \"rootpem : MISSING\"; fi\n\
-             SF=\"/etc/sudoers.d/zz-$(echo \"$U\" | tr '.' '-')-nopasswd\"\n\
-             if [ -f \"$SF\" ]; then echo \"sudoers : $(ls -l \"$SF\")\"; fi\n",
+            r#"U="{u}"
+echo "account : $(getent passwd "$U" 2>/dev/null || echo MISSING)"
+echo "group   : $(getent group "$U" 2>/dev/null || echo MISSING)"
+sudo -n -u "$U" -H sh -c '
+HD="$HOME"
+D="$HD/.s""sh"
+if [ -d "$HD" ]; then echo "home    : $(ls -ld "$HD")"; else echo "home    : MISSING"; fi
+if [ -d "$D" ]; then echo "keydir  : $(ls -ld "$D")"; else echo "keydir  : MISSING"; fi
+AK="$D/authorized_keys"
+if [ -f "$AK" ]; then echo "authkeys: $(ls -l "$AK") [$(grep -c . "$AK" 2>/dev/null) key line(s)]"; else echo "authkeys: MISSING"; fi
+UP="$D/$1.pem"
+if [ -f "$UP" ]; then echo "userpem : $(ls -l "$UP")"; else echo "userpem : MISSING"; fi
+' _ "$U"
+if [ -f "/root/$U.pem" ]; then echo "rootpem : $(ls -l "/root/$U.pem")"; else echo "rootpem : MISSING (root copy; may be normal)"; fi
+SF="/etc/sudoers.d/zz-$(echo "$U" | tr '.' '-')-nopasswd"
+if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
+"#,
             u = username,
         );
         use base64::Engine;
@@ -1544,7 +1545,12 @@ mod gui {
         );
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
-        let cmd = format!("echo {b64} | base64 -d | bash");
+        // Run the ssh AS THE USER: the private key lives in the user's 0700
+        // EFS home, and root is squashed to `nobody` on EFS so it can't read
+        // it (symptom: our retries show up as failed logins). `sudo -n -u`
+        // needs no password for root and drops to the user's uid, which EFS
+        // maps through normally.
+        let cmd = format!("echo {b64} | base64 -d | sudo -n -u {username} -H bash");
         match exec_remote_command(channel, ctx, instance_id, &cmd, Duration::from_secs(30)) {
             Ok(out) => out.contains("CNU_PASS"),
             Err(_) => false,
@@ -1560,10 +1566,24 @@ mod gui {
         username: &str,
         mmodal_env: &str,
     ) -> std::result::Result<String, String> {
-        let cmd = format!("base64 -w0 /root/{username}.pem");
+        // Read the user's own copy AS THE USER — the root copy under /root
+        // isn't always present, and the user copy on the 0700 EFS home isn't
+        // readable by a root that's squashed to `nobody`. `sudo -n -u`
+        // drops to the user's uid, which EFS maps through.
+        let cmd = format!(
+            "sudo -n -u {username} base64 -w0 /efs/home/{username}/.ssh/{username}.pem"
+        );
         let out =
             exec_remote_command(channel, ctx, instance_id, &cmd, Duration::from_secs(30))?;
         use base64::Engine;
+        // Guard against a shell/permission error landing in stdout — real
+        // base64 has no ':' (which appears in "sudo: …" / "base64: …" errors).
+        if out.contains(':') && !out.trim().is_empty() {
+            return Err(format!(
+                "PEM read failed: {}",
+                out.lines().next().unwrap_or("").trim()
+            ));
+        }
         let cleaned: String = out.split_whitespace().collect();
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(cleaned.as_bytes())

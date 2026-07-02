@@ -139,3 +139,28 @@ if [[ $SECONDARY -eq 0 ]]; then
 fi
 
 echo "Done for '$USERNAME'."
+
+# Self-verify AS ROOT — the account is gone now, so `sudo -u` won't work;
+# root checks for anything left behind. Visible right here in the terminal.
+echo ""
+echo "=== Verification ==="
+if id "$USERNAME" >/dev/null 2>&1; then
+  echo "VERIFY: account STILL PRESENT (uid $(id -u "$USERNAME"))."
+else
+  echo "VERIFY: account removed."
+fi
+if getent group "$USERNAME" >/dev/null 2>&1; then
+  echo "VERIFY: group STILL PRESENT."
+else
+  echo "VERIFY: group removed."
+fi
+if [[ -d "/efs/home/${USERNAME}" ]]; then
+  echo "VERIFY: home /efs/home/${USERNAME} STILL PRESENT."
+else
+  echo "VERIFY: home removed."
+fi
+if [[ -e "$SUDOERS_FILE" ]]; then
+  echo "VERIFY: sudoers file STILL PRESENT."
+else
+  echo "VERIFY: sudoers entry removed."
+fi

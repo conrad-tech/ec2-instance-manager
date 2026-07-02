@@ -190,3 +190,17 @@ echo "PEM file (root copy): $PEM_PATH"
 echo "PEM file (user copy): $USER_PEM_PATH"
 echo ""
 echo "Use this key as $USERNAME: --private-key=$USER_PEM_PATH"
+
+# Self-verify AS THE USER. The home is 0700 on EFS and root is squashed to
+# 'nobody' there, so root cannot read inside it — only the user can. This
+# prints the result right here in the terminal so it's visible.
+echo ""
+echo "=== Verification (as $USERNAME) ==="
+if sudo -n -u "$USERNAME" test -s "$AUTH_KEYS" \
+   && sudo -n -u "$USERNAME" test -f "$USER_PEM_PATH"; then
+  echo "VERIFY OK: authorized_keys and private key are present."
+else
+  echo "VERIFY FAILED: expected key files are missing."
+fi
+sudo -n -u "$USERNAME" ls -la "$SSH_DIR" 2>&1 || \
+  echo "(could not list key dir as $USERNAME)"
