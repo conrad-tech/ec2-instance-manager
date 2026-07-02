@@ -140,12 +140,16 @@ package_windows_zip() {
   if [[ -f "${ROOT_DIR}/scripts/fedup.py" ]]; then
     cp "${ROOT_DIR}/scripts/fedup.py" "${WINDOWS_DIST_DIR}/fedup.py"
   fi
+  if [[ -f "${ROOT_DIR}/scripts/secrets.env.example" ]]; then
+    cp "${ROOT_DIR}/scripts/secrets.env.example" "${WINDOWS_DIST_DIR}/secrets.env.example"
+  fi
 
   local candidates=(
     "${WINDOWS_DIST_DIR}/${CLI_APP_NAME}_${APP_VERSION}.exe"
     "${WINDOWS_DIST_DIR}/${GUI_APP_NAME}_${APP_VERSION}.exe"
     "${WINDOWS_DIST_DIR}/WALKTHROUGH.md"
     "${WINDOWS_DIST_DIR}/fedup.py"
+    "${WINDOWS_DIST_DIR}/secrets.env.example"
     "${WINDOWS_DIST_DIR}/libgcc_s_seh-1.dll"
     "${WINDOWS_DIST_DIR}/libstdc++-6.dll"
     "${WINDOWS_DIST_DIR}/libwinpthread-1.dll"

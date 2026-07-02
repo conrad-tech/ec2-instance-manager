@@ -6353,8 +6353,22 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                     let cont_prompt = (cursor_trimmed == ">"
                         || cursor_trimmed.ends_with("\n>"))
                         && cur_col <= 2;
-                    let is_at_prompt =
-                        bare_prompt || cont_prompt || cursor_is_user_host_prompt;
+                    // The raw SSM shell (before prep / sudo su) shows bash's
+                    // default `sh-5.2$` / `bash-4.2#` prompt — no `@`, not a
+                    // bare `$`, so nothing above matches and a freshly-opened
+                    // session's login-wait would sit on its full 45s fallback.
+                    // Match that specific shape (a single `sh-`/`bash-` token
+                    // ending in the sigil) — narrow enough not to fire on
+                    // command output.
+                    let default_shell_prompt = (cursor_trimmed.ends_with('$')
+                        || cursor_trimmed.ends_with('#'))
+                        && (cursor_trimmed.starts_with("sh-")
+                            || cursor_trimmed.starts_with("bash-"))
+                        && !cursor_trimmed.contains(char::is_whitespace);
+                    let is_at_prompt = bare_prompt
+                        || cont_prompt
+                        || cursor_is_user_host_prompt
+                        || default_shell_prompt;
                     let was_at_prompt = session.at_prompt_last_frame;
                     session.at_prompt_last_frame = is_at_prompt;
                     // Bump `prompt_ready` when we're at a prompt AND it's a
