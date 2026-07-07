@@ -30,7 +30,6 @@ mod gui {
     use ec2_manager::connection_tabs::ConnectionTabs;
     use ec2_manager::diagnostics::run_diagnostics;
     use ec2_manager::error::{AppError, Result};
-    use ec2_manager::fed_renew;
     use ec2_manager::filter::{apply_filters, matching_tags, Filters};
     use ec2_manager::gui_cli::{gui_help_text, parse_gui_args, GuiOptions};
     use ec2_manager::inventory::load_inventory;
@@ -338,14 +337,6 @@ mod gui {
             profile_id: String,
             error: String,
         },
-    }
-
-    /// Worker → UI events for the federated-auth renewal (`fedup.py run`).
-    enum RenewEvent {
-        /// A line of output from the renewal subprocess.
-        Log(String),
-        /// The renewal subprocess finished.
-        Done { success: bool, message: String },
     }
 
     #[cfg(target_os = "windows")]
@@ -2295,18 +2286,6 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         refresh_tx: Sender<RefreshEvent>,
         refresh_rx: Receiver<RefreshEvent>,
         refreshing: bool,
-        /// Renewal worker → UI: `fedup.py run` output + completion.
-        renew_tx: Sender<RenewEvent>,
-        renew_rx: Receiver<RenewEvent>,
-        /// True while a renewal subprocess is running (guards concurrency).
-        renewing: bool,
-        /// Cached `secrets.env` (loaded at startup). `None` when the feature
-        /// is not configured on this machine. Drives the allowlist gate,
-        /// `AUTO_RENEW`, and `HEADLESS`.
-        renew_secrets: Option<fed_renew::Secrets>,
-        /// Profiles already auto-renewed this expiry cycle, so `AUTO_RENEW`
-        /// fires once per expiry rather than every poll tick.
-        renew_auto_fired: std::collections::HashSet<String>,
         refresh_generation: u64,
         /// Profiles currently being refreshed in background threads
         refreshing_profiles: HashMap<String, u64>,
@@ -2487,7 +2466,6 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 WslSetupState::Checking
             };
             let (refresh_tx, refresh_rx) = mpsc::channel();
-            let (renew_tx, renew_rx) = mpsc::channel();
             let (file_op_tx, file_op_rx) = mpsc::channel();
             let (script_done_tx, script_done_rx) = mpsc::channel();
             let (script_log_tx, script_log_rx) = mpsc::channel();
@@ -2589,11 +2567,6 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 refresh_tx,
                 refresh_rx,
                 refreshing: false,
-                renew_tx,
-                renew_rx,
-                renewing: false,
-                renew_secrets: fed_renew::load_secrets(),
-                renew_auto_fired: std::collections::HashSet::new(),
                 refresh_generation: 0,
                 refreshing_profiles: HashMap::new(),
                 refresh_queue: VecDeque::new(),
@@ -2884,11 +2857,6 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                     .filter(|a| a.auth_status == AuthStatus::Ok)
                     .map(|a| a.profile_id.clone())
                     .collect();
-                // Reset the AUTO_RENEW one-shot guard for profiles whose auth
-                // recovered, so it can fire again on a future expiry.
-                for pid in &now_ok {
-                    self.renew_auto_fired.remove(pid);
-                }
                 for pid in &now_ok {
                     if previously_unauthed.contains(pid) {
                         // Only load into the active display when this profile
@@ -3053,155 +3021,6 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 self.message = format!(
                     "Auth is not OK for {display}. Refresh credentials and retry."
                 );
-            }
-
-            // If the operator opted into automatic renewal and this OS user is
-            // allowed, kick off the renewal flow now (once per expiry cycle).
-            if let Some(secrets) = self.renew_secrets.clone() {
-                if secrets.auto_renew()
-                    && fed_renew::current_user_allowed(&secrets)
-                    && !self.renewing
-                    && !self.renew_auto_fired.contains(profile_id)
-                {
-                    self.renew_auto_fired.insert(profile_id.to_string());
-                    self.log_info(format!(
-                        "AUTO_RENEW: starting renewal after expiry of {profile_id}"
-                    ));
-                    self.spawn_renew();
-                }
-            }
-        }
-
-        /// True when the renewal feature is configured and the current OS user
-        /// is on the `ALLOWED_USERS` list. Cheap — reads the cached secrets.
-        fn renew_allowed(&self) -> bool {
-            self.renew_secrets
-                .as_ref()
-                .map(fed_renew::current_user_allowed)
-                .unwrap_or(false)
-        }
-
-        /// Spawn the federated-auth renewal flow (`fedup.py run`) on a
-        /// background thread, streaming its output to the log/status line.
-        /// Fresh credentials it writes are picked up by the existing
-        /// `poll_credentials_changes` path.
-        fn spawn_renew(&mut self) {
-            if self.renewing {
-                return;
-            }
-            let cmd = match fed_renew::build_renew_command() {
-                Ok(c) => c,
-                Err(reason) => {
-                    self.log_warn(format!("renew unavailable: {reason}"));
-                    self.set_script_status(
-                        format!("Renew unavailable: {reason}"),
-                        ScriptState::Failed,
-                    );
-                    return;
-                }
-            };
-
-            self.renewing = true;
-            self.set_script_status(
-                "Renewing authentication…",
-                ScriptState::Running,
-            );
-            self.log_info(format!(
-                "renew: launching {} {}",
-                cmd.program,
-                cmd.args.join(" ")
-            ));
-
-            let tx = self.renew_tx.clone();
-            let egui_ctx = self.egui_ctx.clone();
-            let repaint = move |ctx: &Option<egui::Context>| {
-                if let Some(c) = ctx {
-                    c.request_repaint();
-                }
-            };
-            std::thread::spawn(move || {
-                let mut command = std::process::Command::new(&cmd.program);
-                command
-                    .args(&cmd.args)
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped());
-                #[cfg(target_os = "windows")]
-                {
-                    use std::os::windows::process::CommandExt;
-                    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                    command.creation_flags(CREATE_NO_WINDOW);
-                }
-
-                let mut child = match command.spawn() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = tx.send(RenewEvent::Done {
-                            success: false,
-                            message: format!("Failed to launch renewal: {e}"),
-                        });
-                        repaint(&egui_ctx);
-                        return;
-                    }
-                };
-
-                // Stream stdout line-by-line back to the UI.
-                if let Some(out) = child.stdout.take() {
-                    use std::io::{BufRead, BufReader};
-                    let reader = BufReader::new(out);
-                    for line in reader.lines().map_while(std::result::Result::ok) {
-                        let _ = tx.send(RenewEvent::Log(line));
-                        repaint(&egui_ctx);
-                    }
-                }
-
-                let status = child.wait();
-                let (success, message) = match status {
-                    Ok(s) if s.success() => (true, "Authentication renewed.".to_string()),
-                    Ok(s) => {
-                        // Read any stderr for the failure message.
-                        let mut err = String::new();
-                        if let Some(mut e) = child.stderr.take() {
-                            use std::io::Read as _;
-                            let _ = e.read_to_string(&mut err);
-                        }
-                        let code = s.code().unwrap_or(-1);
-                        let detail = err.trim();
-                        let msg = if detail.is_empty() {
-                            format!("Renewal failed (exit {code}).")
-                        } else {
-                            format!("Renewal failed (exit {code}): {detail}")
-                        };
-                        (false, msg)
-                    }
-                    Err(e) => (false, format!("Renewal error: {e}")),
-                };
-                let _ = tx.send(RenewEvent::Done { success, message });
-                repaint(&egui_ctx);
-            });
-        }
-
-        /// Drain renewal worker events: log output lines and reflect the final
-        /// result in the status line.
-        fn poll_renew_events(&mut self) {
-            while let Ok(event) = self.renew_rx.try_recv() {
-                match event {
-                    RenewEvent::Log(line) => {
-                        self.log_info(format!("[renew] {line}"));
-                    }
-                    RenewEvent::Done { success, message } => {
-                        self.renewing = false;
-                        if success {
-                            self.log_info(format!("renew: {message}"));
-                            // Credentials poll will flip auth to Ok and refresh.
-                            self.script_status = None;
-                            self.script_status_highlight = None;
-                            self.message = message;
-                        } else {
-                            self.log_warn(format!("renew: {message}"));
-                            self.set_script_status(message, ScriptState::Failed);
-                        }
-                    }
-                }
             }
         }
 
@@ -10956,7 +10775,6 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                     ctx.request_repaint();
                 }
                 self.poll_refresh_events();
-                self.poll_renew_events();
                 // Start the next queued refresh once the running one
                 // finishes (and once any post-connect pause elapses).
                 self.pump_refresh_queue();
@@ -11582,32 +11400,6 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                     }
                     if !self.message.is_empty() {
                         ui.label(self.message.clone());
-                    }
-
-                    // Offer a manual "Renew authentication" button when the
-                    // selected profile's auth is not OK, this OS user is on the
-                    // ALLOWED_USERS list, and no renewal is already running.
-                    let can_renew = self.renew_allowed()
-                        && !self.renewing
-                        && self
-                            .selected_profile
-                            .as_deref()
-                            .map(|sel| {
-                                self.profile_auth_infos.iter().any(|a| {
-                                    a.profile_id == sel
-                                        && a.auth_status != AuthStatus::Ok
-                                })
-                            })
-                            .unwrap_or(false);
-                    if can_renew
-                        && ui
-                            .button("🔄 Renew authentication")
-                            .on_hover_text(
-                                "Run the fed-up device activation flow to refresh credentials",
-                            )
-                            .clicked()
-                    {
-                        self.spawn_renew();
                     }
                 });
 

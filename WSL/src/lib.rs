@@ -6,7 +6,6 @@ pub mod connection_tabs;
 pub mod credentials;
 pub mod diagnostics;
 pub mod error;
-pub mod fed_renew;
 pub mod features;
 pub mod filter;
 pub mod gui_cli;

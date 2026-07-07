@@ -16,13 +16,6 @@ Rust-only EC2 + SSM instance explorer with:
 - SSM connect and port-forward launch plans.
 - Favorites, recents, saved filters, and port-forward presets persisted to config.
 - Diagnostics for auth/dependencies/permissions.
-- **Auto-renew on auth expiry** (GUI) — when a profile's federated auth expires,
-  offers a **Renew authentication** action that drives `scripts/fedup.py`
-  (`fed up` + Chrome via Playwright). Gated by `~/.fedup/secrets.env`: only OS
-  users listed in `ALLOWED_USERS` can use it. `AUTO_RENEW=true` starts it
-  automatically; `HEADLESS` controls Chrome visibility. Logic lives in
-  `src/fed_renew.rs` (parse/allowlist/command-build) with GUI wiring
-  (`spawn_renew`/`poll_renew_events`) in `src/bin/ec2_manager_gui.rs`.
 - Interactive Rust shell mode (`--interactive`) for local operation without JS/HTML.
 - **Scripts menu** (GUI, Connections page) — run bastion helper scripts against a
   primary/secondary bastion pair: `create_new_user.sh` (create a user, verify
@@ -382,31 +375,6 @@ If `TEST_VAR` is empty, WSLENV forwarding is broken. Run `wsl --shutdown` and re
 
 - Linux: `~/.config/ec2-manager/config.ini`
 - Windows: `%APPDATA%\ec2-manager\config.ini`
-
-## Auto-renew secrets path (secrets.env)
-
-The auto-renew feature reads its config from a plaintext `secrets.env` that is
-locked to the owning user (`chmod 600`, plus `icacls` on Windows):
-
-- Linux/WSL: `~/.fedup/secrets.env`
-- Windows: `%USERPROFILE%\.fedup\secrets.env`
-
-Create/edit it with `python scripts/fedup.py init` (or `edit`). The path is
-defined by `fed_renew::secrets_path()` in `src/fed_renew.rs` (resolves `~` from
-`USERPROFILE` on Windows, `HOME` elsewhere) and mirrored by `SECRETS_FILE` in
-`scripts/fedup.py`. Keys:
-
-| Var             | Meaning                                              |
-|-----------------|------------------------------------------------------|
-| `ALLOWED_USERS` | Comma-separated OS usernames allowed to renew        |
-| `USERNAME`      | Account username the login pages ask for             |
-| `PASSWORD`      | Account password (plaintext — file-perms protected)  |
-| `FED_CMD`       | Command that starts the flow (default `fed up`)      |
-| `HEADLESS`      | `true` = drive Chrome invisibly, `false` = show it   |
-| `AUTO_RENEW`    | `true` = start renewal automatically on expiry       |
-
-If the current OS user isn't in `ALLOWED_USERS` (or the file is missing), the
-feature is inert — no Renew button, and `fedup.py run` exits non-zero.
 
 ## Account configuration (accounts.json)
 
