@@ -5,7 +5,11 @@
 use std::path::Path;
 
 fn main() {
-    let path = Path::new("../assets/accounts.json");
+    // Validate the file the binary actually embeds via
+    // `include_str!("../assets/accounts.json")` from `src/`, i.e.
+    // `<manifest_dir>/assets/accounts.json` (the WSL copy) — NOT the stale
+    // root-level `../assets/accounts.json`. Mirrors the features.json check.
+    let path = Path::new("assets/accounts.json");
     println!("cargo:rerun-if-changed={}", path.display());
 
     let raw = match std::fs::read_to_string(path) {

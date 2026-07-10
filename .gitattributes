@@ -1,0 +1,8 @@
+# Shell scripts must stay LF even on Windows checkouts. Otherwise the
+# bundled create/delete user scripts (assets/scripts/*.sh) and the build
+# scripts get CRLF via git autocrlf, and bash rejects the shebang
+# (/usr/bin/env: 'bash\r': No such file or directory).
+*.sh text eol=lf
+
+# PowerShell helpers run on Windows; keep them CRLF for native tools.
+*.ps1 text eol=crlf

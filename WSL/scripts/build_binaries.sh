@@ -8,7 +8,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="${ROOT_DIR}/dist"
 LINUX_DIST_DIR="${DIST_DIR}/linux"
 WINDOWS_DIST_DIR="${DIST_DIR}/windows"
-HOST_TRIPLE="$(rustc -vV | awk '/host:/ {print $2}')"
+# HOST_TRIPLE is computed in main() AFTER ensure_rust(), since rustc may not be
+# installed yet on a fresh WSL/machine.
+HOST_TRIPLE=""
 
 usage() {
   cat <<USAGE
@@ -34,6 +36,52 @@ require_cmd() {
     echo "error: required command not found: $cmd" >&2
     exit 1
   fi
+}
+
+# Ensure the Rust toolchain (rustc + cargo + rustup) is present. If Rust is
+# installed but not on PATH, load ~/.cargo/env; if it's missing entirely,
+# install it non-interactively via rustup. Safe to run every build.
+ensure_rust() {
+  # Always load an existing rustup/cargo install first, so it's visible even in
+  # a non-login shell whose PATH doesn't include ~/.cargo/bin. This is what makes
+  # the "already installed" check below short-circuit instead of reinstalling.
+  if [[ -f "$HOME/.cargo/env" ]]; then
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+  fi
+
+  # cargo + rustc are all we need to build; if present, Rust is already set up.
+  if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
+    echo "info: using $(rustc --version)"
+    return 0
+  fi
+
+  echo "info: Rust toolchain not found - installing via rustup (non-interactive)..."
+  require_cmd curl
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  # shellcheck disable=SC1091
+  source "$HOME/.cargo/env"
+  require_cmd cargo
+  require_cmd rustc
+  echo "info: installed $(rustc --version)"
+}
+
+# Ensure the mingw-w64 cross toolchain (x86_64-w64-mingw32-gcc) is present for
+# the Windows GNU target. Auto-installs via apt when available.
+ensure_mingw() {
+  if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "info: mingw-w64 cross toolchain not found - installing..."
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update && sudo apt-get install -y mingw-w64
+  else
+    echo "error: missing cross-linker x86_64-w64-mingw32-gcc for Windows GNU target." >&2
+    echo "hint: install the mingw-w64 toolchain for your distro." >&2
+    exit 1
+  fi
+  require_cmd x86_64-w64-mingw32-gcc
 }
 
 ensure_target() {
@@ -229,11 +277,7 @@ build_for_target() {
   ensure_target "$target"
 
   if [[ "$target" == "x86_64-pc-windows-gnu" ]]; then
-    if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
-      echo "error: missing cross-linker x86_64-w64-mingw32-gcc for Windows GNU target." >&2
-      echo "hint: on Pop!_OS install: sudo apt-get install -y mingw-w64" >&2
-      exit 1
-    fi
+    ensure_mingw
     export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
   fi
 
@@ -289,10 +333,6 @@ resolve_targets() {
 }
 
 main() {
-  require_cmd cargo
-  require_cmd rustup
-  require_cmd rustc
-
   local mode="${1:-all}"
   case "$mode" in
     -h|--help)
@@ -300,6 +340,10 @@ main() {
       exit 0
       ;;
   esac
+
+  # Bootstrap the toolchain before anything that needs rustc (e.g. HOST_TRIPLE).
+  ensure_rust
+  HOST_TRIPLE="$(rustc -vV | awk '/host:/ {print $2}')"
 
   mkdir -p "$LINUX_DIST_DIR" "$WINDOWS_DIST_DIR"
 
