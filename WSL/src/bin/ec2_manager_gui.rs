@@ -597,6 +597,17 @@ mod gui {
         secondary_id: String,
     }
 
+    /// Ready-to-run "send access email" command lines, one per terminal. The
+    /// app never runs these — the "Send Email Command" menu copies the chosen
+    /// one to the clipboard and the user runs it themselves (so the Outlook
+    /// automation runs under the user's shell, not the unsigned GUI process,
+    /// which is what keeps EDR/CrowdStrike from quarantining it).
+    struct EmailCommand {
+        powershell: String,
+        wsl: String,
+        git_bash: String,
+    }
+
     /// Modal shown when a create/delete run finishes, so the result stays
     /// visible until the user dismisses it.
     struct ScriptResultPopup {
@@ -612,6 +623,12 @@ mod gui {
         /// Optional diagnostic report shown in a scrollable monospace box
         /// (e.g. account/home/perms/keys checks after an SSH failure).
         details: Option<String>,
+        /// Per-terminal send-email commands (Some after a successful create
+        /// when the access-email feature is enabled) — powers the "Send Email
+        /// Command" menu.
+        email_cmd: Option<EmailCommand>,
+        /// Set once the user has copied a command, to show the confirmation.
+        email_copied: bool,
     }
 
     /// Visual state of the Scripts status line in the Connections toolbar.
@@ -1703,6 +1720,82 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         }
     }
 
+    /// Build the ready-to-run "send access email" command for each terminal
+    /// (PowerShell, WSL, Git Bash). The app deliberately does NOT run these —
+    /// the user copies one and runs it in their own shell, so the Outlook
+    /// automation runs under the user (a trusted, human-initiated action)
+    /// rather than being spawned by the unsigned GUI process (which EDRs like
+    /// CrowdStrike quarantine). Returns None if the feature is disabled.
+    ///
+    /// Each command invokes the `send_access_email.ps1` that ships next to the
+    /// executable, passing the same args the automation used to. The script
+    /// still encrypts, resolves the recipient, and opens Outlook ready to send.
+    fn build_email_command(
+        cfg: &ec2_manager::features::AccessEmailConfig,
+        username: &str,
+        env: &str,
+        primary_id: &str,
+        secondary_id: &str,
+        pem_path: &str,
+    ) -> Option<EmailCommand> {
+        if !cfg.enabled {
+            return None;
+        }
+        // Windows path to the helper script shipped beside the exe.
+        let script = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|d| d.join("send_access_email.ps1")))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "send_access_email.ps1".to_string());
+
+        // Ordered (flag, value) pairs passed to the script.
+        let args: Vec<(&str, String)> = vec![
+            ("-Username", username.to_string()),
+            ("-EnvTag", env.to_string()),
+            ("-Primary", primary_id.to_string()),
+            ("-Secondary", secondary_id.to_string()),
+            ("-Pem", pem_path.to_string()),
+            ("-TemplateGuid", cfg.encrypt_template_guid.clone()),
+            ("-Permission", cfg.encrypt_permission.to_string()),
+            ("-PermissionService", cfg.encrypt_permission_service.to_string()),
+            ("-SmimeFlag", cfg.encrypt_smime_flag.to_string()),
+            ("-EncryptSendKeys", cfg.encrypt_sendkeys.clone()),
+        ];
+
+        // bash single-quote (escape embedded single quotes): 'a'\''b'.
+        let bash_q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        // PowerShell single-quote (double embedded single quotes): 'a''b'.
+        let ps_q = |s: &str| format!("'{}'", s.replace('\'', "''"));
+
+        let bash_args = args
+            .iter()
+            .map(|(f, v)| format!("{f} {}", bash_q(v)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let ps_args = args
+            .iter()
+            .map(|(f, v)| format!("{f} {}", ps_q(v)))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // From bash (WSL / Git Bash) we call the Windows powershell.exe via
+        // interop; from PowerShell we call powershell directly.
+        let bash_cmd = format!(
+            "powershell.exe -ExecutionPolicy Bypass -File {} {bash_args}",
+            bash_q(&script)
+        );
+        let ps_cmd = format!(
+            "powershell -ExecutionPolicy Bypass -File {} {ps_args}",
+            ps_q(&script)
+        );
+
+        Some(EmailCommand {
+            powershell: ps_cmd,
+            wsl: bash_cmd.clone(),
+            git_bash: bash_cmd,
+        })
+    }
+
     /// Up to this many path-completion matches are shown directly in the
     /// dropdown; more triggers the "Show N matches?" confirmation.
     const PATH_COMPLETION_INLINE_LIMIT: usize = 10;
@@ -2391,6 +2484,8 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         secondary_bastion_filter: String,
         /// Usernames delete_user must never remove (from features.json).
         protected_users: Vec<String>,
+        /// Outlook access-email automation config (from features.json).
+        access_email: ec2_manager::features::AccessEmailConfig,
         /// In-flight create-user run (post-create SSH verification + PEM
         /// pull), if any.
         create_user_run: Option<CreateUserRun>,
@@ -2620,6 +2715,7 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 primary_bastion_filter: features.primary_bastion_filter.clone(),
                 secondary_bastion_filter: features.secondary_bastion_filter.clone(),
                 protected_users: features.protected_users.clone(),
+                access_email: features.access_email.clone(),
                 create_user_run: None,
                 pending_delete: None,
                 script_status: None,
@@ -5080,17 +5176,20 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 success,
                 pem_path,
                 details,
+                email_cmd: None,
+                email_copied: false,
             });
         }
 
         /// Render the create/delete result modal, if open.
         fn render_script_result_popup(&mut self, ctx: &egui::Context) {
-            let Some(popup) = self.script_result_popup.take() else {
+            let Some(mut popup) = self.script_result_popup.take() else {
                 return;
             };
             let mut window_open = true;
             let mut do_close = false;
             let mut open_downloads = false;
+            let mut email_copied_now = false;
             egui::Window::new(&popup.title)
                 .collapsible(false)
                 .resizable(false)
@@ -5108,8 +5207,40 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                         ui.label("PEM saved to:");
                         ui.monospace(path);
                         ui.add_space(8.0);
-                        if ui.button("📂 Open Downloads folder").clicked() {
-                            open_downloads = true;
+                        ui.horizontal(|ui| {
+                            if ui.button("📂 Open Downloads folder").clicked() {
+                                open_downloads = true;
+                            }
+                            // "Send Email Command" — copies the send command for
+                            // the chosen terminal; the user runs it themselves.
+                            if let Some(cmd) = &popup.email_cmd {
+                                ui.menu_button("✉ Send Email Command", |ui| {
+                                    ui.label("Choose Terminal");
+                                    ui.separator();
+                                    if ui.button("WSL").clicked() {
+                                        ui.ctx().copy_text(cmd.wsl.clone());
+                                        email_copied_now = true;
+                                        ui.close();
+                                    }
+                                    if ui.button("Git Bash").clicked() {
+                                        ui.ctx().copy_text(cmd.git_bash.clone());
+                                        email_copied_now = true;
+                                        ui.close();
+                                    }
+                                    if ui.button("PowerShell").clicked() {
+                                        ui.ctx().copy_text(cmd.powershell.clone());
+                                        email_copied_now = true;
+                                        ui.close();
+                                    }
+                                });
+                            }
+                        });
+                        if popup.email_copied {
+                            ui.add_space(4.0);
+                            ui.colored_label(
+                                egui::Color32::from_rgb(90, 200, 90),
+                                "Command copied. Now run it in your terminal.",
+                            );
                         }
                     }
                     if let Some(details) = &popup.details {
@@ -5136,6 +5267,9 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 if let Some(path) = &popup.pem_path {
                     reveal_in_file_manager(path);
                 }
+            }
+            if email_copied_now {
+                popup.email_copied = true;
             }
             // Keep the popup open unless the user dismissed it (Close or X);
             // clicking "Open Downloads" leaves it up.
@@ -5372,6 +5506,24 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                                 }
                             }
                             self.log_info(format!("{msg}{pem_note}"));
+                            // Build (but do NOT run) the per-terminal send-email
+                            // command. Only when the PEM was saved — the email
+                            // body promises it as an attachment. The user copies
+                            // it from the "Send Email Command" menu and runs it
+                            // in their own shell (keeps the Outlook automation
+                            // out of the unsigned GUI process, so EDR leaves it
+                            // alone).
+                            let email_cmd = match (&pem_path, &finished) {
+                                (Some(pem), Some(run)) => build_email_command(
+                                    &self.access_email,
+                                    &username,
+                                    &run.mmodal_env,
+                                    &run.primary_id,
+                                    &run.secondary_id,
+                                    pem,
+                                ),
+                                _ => None,
+                            };
                             self.show_script_result(
                                 "User Created",
                                 msg,
@@ -5379,6 +5531,9 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                                 pem_path,
                                 None,
                             );
+                            if let Some(popup) = &mut self.script_result_popup {
+                                popup.email_cmd = email_cmd;
+                            }
                         } else {
                             let dir = |ok: bool| if ok { "OK" } else { "FAILED" };
                             let mut msg = format!(
