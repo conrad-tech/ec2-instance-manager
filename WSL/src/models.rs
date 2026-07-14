@@ -188,6 +188,18 @@ pub struct PortForwardPreset {
     pub remote_port: u16,
 }
 
+/// A user-authored shell script from the Scripts menu ("Add Script").
+/// The body is pasted into the focused connection tab when the entry is
+/// picked from the menu or its hotkey fires.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PersonalScript {
+    pub name: String,
+    /// Canonical hotkey string ("Ctrl+Shift+K", "F5"), empty when unbound.
+    pub hotkey: String,
+    /// The script body, verbatim as the user pasted it.
+    pub body: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileConfig {
     pub profile_id: String,

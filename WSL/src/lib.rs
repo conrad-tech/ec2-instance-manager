@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod alerts;
 pub mod aws_cli;
 pub mod aws_context;
 pub mod config;

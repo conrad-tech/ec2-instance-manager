@@ -57,12 +57,13 @@ test_package_linux_zip_creates_archive_with_artifacts() {
   local original_linux_dist_dir="$LINUX_DIST_DIR"
   LINUX_DIST_DIR="$tmpdir"
 
-  touch "$LINUX_DIST_DIR/$CLI_APP_NAME"
-  touch "$LINUX_DIST_DIR/$GUI_APP_NAME"
+  # Same versioned names copy_artifact writes, e.g. ec2_manager_gui_1.1.
+  touch "$LINUX_DIST_DIR/${CLI_APP_NAME}_${APP_VERSION}"
+  touch "$LINUX_DIST_DIR/${GUI_APP_NAME}_${APP_VERSION}"
 
   package_linux_zip
 
-  local zip_path="$LINUX_DIST_DIR/ec2_manager_linux.zip"
+  local zip_path="$LINUX_DIST_DIR/ec2_manager_linux_${APP_VERSION}.zip"
   if [[ ! -f "$zip_path" ]]; then
     echo "assertion failed: linux zip was not created" >&2
     exit 1
@@ -88,7 +89,7 @@ test_package_linux_zip_skips_when_no_artifacts() {
 
   package_linux_zip
 
-  if [[ -f "$LINUX_DIST_DIR/ec2_manager_linux.zip" ]]; then
+  if [[ -f "$LINUX_DIST_DIR/ec2_manager_linux_${APP_VERSION}.zip" ]]; then
     echo "assertion failed: linux zip should not be created without artifacts" >&2
     exit 1
   fi

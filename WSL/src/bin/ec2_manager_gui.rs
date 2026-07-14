@@ -24,6 +24,7 @@ mod gui {
     use eframe::egui;
     use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
+    use ec2_manager::alerts;
     use ec2_manager::aws_context::build_context_with_profile;
     use ec2_manager::config::AppConfig;
     use ec2_manager::credentials;
@@ -34,8 +35,8 @@ mod gui {
     use ec2_manager::gui_cli::{gui_help_text, parse_gui_args, GuiOptions};
     use ec2_manager::inventory::load_inventory;
     use ec2_manager::models::{
-        AuthStatus, AwsContext, DependencyStatus, Instance, Inventory, Mode, ProfileAuthInfo,
-        ProfileConfig, SavedFilter, TerminalKind, TerminalOption,
+        AuthStatus, AwsContext, DependencyStatus, Instance, Inventory, Mode, PersonalScript,
+        ProfileAuthInfo, ProfileConfig, SavedFilter, TerminalKind, TerminalOption,
     };
     use ec2_manager::profile_choice::profile_choice_path;
     use ec2_manager::terminal::{
@@ -623,6 +624,59 @@ mod gui {
         Running,
         /// The run failed before it could start — shown solid red.
         Failed,
+    }
+
+    /// Time windows offered in the Alerts window, in minutes.
+    const ALERT_WINDOWS: [(i64, &str); 5] = [
+        (10, "Last 10 min"),
+        (30, "Last 30 min"),
+        (60, "Last 1 hour"),
+        (240, "Last 4 hours"),
+        (1440, "Last 24 hours"),
+    ];
+
+    /// How often the Alerts window refreshes when auto-refresh is on.
+    const ALERTS_REFRESH_EVERY: Duration = Duration::from_secs(10);
+
+    /// State of the on-call Alerts window.
+    struct AlertsWindow {
+        /// Lookback in minutes (one of `ALERT_WINDOWS`).
+        window_min: i64,
+        /// Poll on a timer rather than only on demand.
+        auto_refresh: bool,
+        /// Rows from the last successful fetch, newest first.
+        rows: Vec<alerts::Alert>,
+        /// Error from the last fetch, if it failed.
+        error: Option<String>,
+        /// A fetch is in flight — used to keep the timer from stacking
+        /// requests when the API is slow.
+        loading: bool,
+        /// When the last fetch was kicked off (drives auto-refresh).
+        last_fetch: Option<Instant>,
+        /// Local-time clock reading of the last successful fetch.
+        fetched_at: Option<chrono::DateTime<chrono::Local>>,
+    }
+
+    impl AlertsWindow {
+        fn new() -> Self {
+            Self {
+                window_min: ALERT_WINDOWS[0].0,
+                auto_refresh: true,
+                rows: Vec::new(),
+                error: None,
+                loading: false,
+                last_fetch: None,
+                fetched_at: None,
+            }
+        }
+    }
+
+    /// Alerts worker → UI: the result of one fetch.
+    struct AlertsFetch {
+        /// The window the fetch was for. A result for a window the user has
+        /// since changed away from is dropped.
+        window_min: i64,
+        result: std::result::Result<Vec<alerts::Alert>, String>,
     }
 
     /// Result of the delete pre-flight active-session check.
@@ -1665,6 +1719,60 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
             .collect()
     }
 
+    /// Render an alert's UTC `createdAt` in the user's local timezone. Falls
+    /// back to the raw string if the API sent something unparseable.
+    fn format_local_time(created_at: &str) -> String {
+        match chrono::DateTime::parse_from_rfc3339(created_at) {
+            Ok(dt) => dt
+                .with_timezone(&chrono::Local)
+                .format("%b %d %-I:%M:%S %p")
+                .to_string(),
+            Err(_) => created_at.to_string(),
+        }
+    }
+
+    /// Short label for the local timezone offset, e.g. "UTC-05:00" — shown in
+    /// the Time column header so it's unambiguous which clock is in use.
+    fn local_tz_label() -> String {
+        use chrono::Offset;
+        let offset = chrono::Local::now().offset().fix();
+        let secs = offset.local_minus_utc();
+        let sign = if secs < 0 { '-' } else { '+' };
+        let secs = secs.abs();
+        format!("UTC{sign}{:02}:{:02}", secs / 3600, (secs % 3600) / 60)
+    }
+
+    /// P1/P2 read as urgent, P3 as warning, the rest neutral.
+    fn priority_color(priority: &str) -> egui::Color32 {
+        match priority.trim().to_ascii_uppercase().as_str() {
+            "P1" | "P2" => egui::Color32::from_rgb(220, 60, 60),
+            "P3" => egui::Color32::from_rgb(220, 160, 60),
+            _ => egui::Color32::GRAY,
+        }
+    }
+
+    /// Tab-separated rendering of the alerts table for the clipboard.
+    fn alerts_as_text(rows: &[alerts::Alert]) -> String {
+        let mut out = format!(
+            "Time ({})\tID\tPri\tStatus\tAck\tAccount\tEnv\tMessage\n",
+            local_tz_label()
+        );
+        for a in rows {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                format_local_time(&a.created_at),
+                a.tiny_id,
+                a.priority,
+                a.status,
+                if a.acknowledged { "ack" } else { "unack" },
+                a.account,
+                a.environment,
+                a.message,
+            ));
+        }
+        out
+    }
+
     /// Slow-flashing color (~0.7 Hz alpha pulse) for the Scripts status
     /// line. Requests a repaint so the pulse keeps animating.
     fn flashing_color(ui: &egui::Ui, r: u8, g: u8, b: u8) -> egui::Color32 {
@@ -1942,10 +2050,188 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
     /// away after `sudo su` (because the new shell inherits the current,
     /// correct size). Forcing stty before `exec bash` makes the
     /// replaced bash pick up the right cols on first prep too.
-    fn prep_terminal_command_for_size(rows: u16, cols: u16) -> Vec<u8> {
+    fn prep_terminal_command_for_size(
+        rows: u16,
+        cols: u16,
+        git_env: Option<(&str, &str)>,
+    ) -> Vec<u8> {
         let mut buf = format!("stty rows {rows} cols {cols} 2>/dev/null\r").into_bytes();
-        buf.extend_from_slice(PREP_TERMINAL_COMMAND);
+        buf.extend_from_slice(&prep_terminal_command(git_env));
         buf
+    }
+
+    /// Wrap `raw` in single quotes for the remote shell.
+    fn shell_single_quote(raw: &str) -> String {
+        format!("'{}'", raw.replace('\'', "'\\''"))
+    }
+
+    /// The prep-terminal sequence, with the git credential exports spliced
+    /// in ahead of the trailing `clear`.
+    ///
+    /// `git_env` is `(username, pat)` for users on the `personal_scripts`
+    /// allow-list who have cached a PAT — the remote shell gets `GIT_USER`
+    /// and `GIT_PAT` for that session only, so `git clone` / `git pull` over
+    /// HTTPS can use them. `HISTCONTROL=ignorespace` plus the leading space
+    /// on the export line keeps the token out of the remote shell history,
+    /// and the trailing `clear` wipes it from the visible screen.
+    fn prep_terminal_command(git_env: Option<(&str, &str)>) -> Vec<u8> {
+        const CLEAR: &[u8] = b"clear\r";
+        let setup = PREP_TERMINAL_COMMAND
+            .strip_suffix(CLEAR)
+            .unwrap_or(PREP_TERMINAL_COMMAND);
+        let mut buf = setup.to_vec();
+        if let Some((user, pat)) = git_env {
+            if !pat.is_empty() {
+                buf.extend_from_slice(b"export HISTCONTROL=ignorespace:ignoredups\r");
+                buf.extend_from_slice(
+                    format!(
+                        " export GIT_USER={} GIT_PAT={}\r",
+                        shell_single_quote(user),
+                        shell_single_quote(pat)
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+        buf.extend_from_slice(CLEAR);
+        buf
+    }
+
+    /// Output that means a git operation was rejected for bad/expired
+    /// credentials. Matched case-insensitively against the remote shell's
+    /// output so the app can offer to update the cached PAT.
+    const GIT_AUTH_FAILURE_MARKERS: &[&str] = &[
+        "fatal: authentication failed",
+        "invalid username or password",
+        "support for password authentication was removed",
+        "http basic: access denied",
+        "could not read username for",
+        "authentication failed for",
+        "remote: unauthorized",
+    ];
+
+    /// True when `text` (a chunk of remote shell output) looks like a git
+    /// credential rejection.
+    fn looks_like_git_auth_failure(text: &str) -> bool {
+        let lower = text.to_ascii_lowercase();
+        GIT_AUTH_FAILURE_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
+    }
+
+    /// A key combination bound to a personal script. Fires only while the
+    /// app is the focused window.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Hotkey {
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+        key: egui::Key,
+    }
+
+    impl Hotkey {
+        /// Build from a captured key press. `None` for a combination we
+        /// refuse to bind (see `is_bindable`).
+        fn from_press(key: egui::Key, modifiers: egui::Modifiers) -> Option<Self> {
+            let hk = Self {
+                ctrl: modifiers.ctrl || modifiers.command,
+                alt: modifiers.alt,
+                shift: modifiers.shift,
+                key,
+            };
+            hk.is_bindable().then_some(hk)
+        }
+
+        /// A bare key (or Shift+key) would swallow ordinary typing in the
+        /// terminal, so a binding must hold Ctrl or Alt — unless it's a
+        /// function key, which types nothing on its own.
+        fn is_bindable(&self) -> bool {
+            if self.key == egui::Key::Escape {
+                return false;
+            }
+            let function_key = self.key != egui::Key::F
+                && self.key.name().starts_with('F')
+                && self.key.name()[1..].chars().all(|c| c.is_ascii_digit());
+            self.ctrl || self.alt || function_key
+        }
+
+        fn matches(&self, key: egui::Key, modifiers: egui::Modifiers) -> bool {
+            self.key == key
+                && self.ctrl == (modifiers.ctrl || modifiers.command)
+                && self.alt == modifiers.alt
+                && self.shift == modifiers.shift
+        }
+
+        /// Canonical string form, as stored in config.ini ("Ctrl+Shift+K").
+        fn label(&self) -> String {
+            let mut out = String::new();
+            if self.ctrl {
+                out.push_str("Ctrl+");
+            }
+            if self.alt {
+                out.push_str("Alt+");
+            }
+            if self.shift {
+                out.push_str("Shift+");
+            }
+            out.push_str(self.key.name());
+            out
+        }
+
+        fn parse(raw: &str) -> Option<Self> {
+            let mut ctrl = false;
+            let mut alt = false;
+            let mut shift = false;
+            let mut key = None;
+            for part in raw.split('+').map(str::trim).filter(|p| !p.is_empty()) {
+                match part.to_ascii_lowercase().as_str() {
+                    "ctrl" | "control" | "cmd" | "command" => ctrl = true,
+                    "alt" | "option" => alt = true,
+                    "shift" => shift = true,
+                    _ => key = egui::Key::from_name(part),
+                }
+            }
+            Some(Self {
+                ctrl,
+                alt,
+                shift,
+                key: key?,
+            })
+        }
+    }
+
+    /// Turn a script body into terminal bytes: one CR-terminated line each,
+    /// exactly as if the user had pasted it (the drip-feed in
+    /// `paste_to_connection_tab` then waits for a prompt between lines).
+    fn script_payload(body: &str) -> Vec<u8> {
+        let mut out = String::new();
+        for line in body.replace("\r\n", "\n").replace('\r', "\n").lines() {
+            out.push_str(line);
+            out.push('\r');
+        }
+        out.into_bytes()
+    }
+
+    /// The "Add Script" / "Edit Script" modal.
+    struct ScriptEditor {
+        /// Index into `config.personal_scripts` when editing; `None` = new.
+        index: Option<usize>,
+        name: String,
+        hotkey: Option<Hotkey>,
+        /// True while the hotkey box is listening for a key press.
+        capturing: bool,
+        body: String,
+        error: Option<String>,
+    }
+
+    /// The git-PAT prompt: shown once on launch for allow-listed users, from
+    /// the Scripts menu's edit button, and again when git rejects the token.
+    struct PatDialog {
+        pat: String,
+        /// Eyeball toggle — off means the field renders as dots.
+        reveal: bool,
+        /// Why the prompt appeared (e.g. a git auth failure), if not routine.
+        reason: Option<String>,
     }
 
     /// Sentinel "step" in a scripted run (see `run_script_worker`): instead
@@ -2391,6 +2677,33 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         secondary_bastion_filter: String,
         /// Usernames delete_user must never remove (from features.json).
         protected_users: Vec<String>,
+        /// Build-time gate: whether the current OS user may add personal
+        /// scripts (features.json `personal_scripts.allowed_users`). Also
+        /// gates the git-PAT prompt and the GIT_USER/GIT_PAT exports.
+        personal_scripts_enabled: bool,
+        /// Active "Add Script" / "Edit Script" modal, if any.
+        script_editor: Option<ScriptEditor>,
+        /// Personal script awaiting delete confirmation (index into
+        /// `config.personal_scripts`).
+        pending_script_delete: Option<usize>,
+        /// Active git-PAT prompt, if any.
+        pat_dialog: Option<PatDialog>,
+        /// Set for one frame when a personal-script hotkey fired, so the key
+        /// press isn't also typed into the focused terminal.
+        hotkey_consumed_frame: bool,
+        /// When the PAT prompt was last raised by a git auth failure — used
+        /// to avoid re-prompting on every line of a failing command's output.
+        last_git_failure_prompt: Option<Instant>,
+        /// Build-time gate: whether the on-call Alerts button is shown to the
+        /// current OS user (features.json `alerts.allowed_users`).
+        alerts_enabled: bool,
+        /// Jira site + credentials for the alerts API (features.json).
+        alerts_auth: alerts::AlertsAuth,
+        /// Alerts window state; `None` while the window is closed.
+        alerts_window: Option<AlertsWindow>,
+        /// Alerts fetch worker → UI.
+        alerts_tx: Sender<AlertsFetch>,
+        alerts_rx: Receiver<AlertsFetch>,
         /// In-flight create-user run (post-create SSH verification + PEM
         /// pull), if any.
         create_user_run: Option<CreateUserRun>,
@@ -2471,6 +2784,7 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
             let (script_log_tx, script_log_rx) = mpsc::channel();
             let (verify_tx, verify_rx) = mpsc::channel();
             let (preflight_tx, preflight_rx) = mpsc::channel();
+            let (alerts_tx, alerts_rx) = mpsc::channel();
             let features = ec2_manager::features::load();
             #[cfg(target_os = "windows")]
             let (ui_tx, ui_rx) = mpsc::channel();
@@ -2479,6 +2793,22 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
             let terminals = filter_embedded_terminals(discover_terminals());
             let selected_terminal_id = initial_terminal_id(&config, &terminals);
             let gui_smoke = gui_smoke_config_from_env();
+            let personal_scripts_enabled =
+                features.personal_scripts_visible_for(&ec2_manager::features::current_os_user());
+            // Allow-listed users are prompted for their git PAT on first
+            // launch; afterwards it's cached in config.ini and updated from
+            // the Scripts menu (or when git rejects it).
+            let pat_dialog = (personal_scripts_enabled
+                && config.git_pat.as_deref().unwrap_or("").is_empty())
+            .then(|| PatDialog {
+                pat: String::new(),
+                reveal: false,
+                reason: Some(
+                    "Prep Terminal exports this to the remote shell as GIT_PAT so git can \
+                     authenticate. Leave it blank to skip."
+                        .to_string(),
+                ),
+            });
             let dark_mode = config.theme.as_deref() != Some("light");
             let scroll_sensitivity = config.scroll_sensitivity.unwrap_or(10.0);
             let ui_scale = config.ui_scale.unwrap_or(1.0);
@@ -2620,6 +2950,18 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 primary_bastion_filter: features.primary_bastion_filter.clone(),
                 secondary_bastion_filter: features.secondary_bastion_filter.clone(),
                 protected_users: features.protected_users.clone(),
+                personal_scripts_enabled,
+                script_editor: None,
+                pending_script_delete: None,
+                pat_dialog,
+                hotkey_consumed_frame: false,
+                last_git_failure_prompt: None,
+                alerts_enabled: features
+                    .alerts_visible_for(&ec2_manager::features::current_os_user()),
+                alerts_auth: features.alerts_auth(),
+                alerts_window: None,
+                alerts_tx,
+                alerts_rx,
                 create_user_run: None,
                 pending_delete: None,
                 script_status: None,
@@ -4388,6 +4730,686 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
             }
         }
 
+        /// Kick off a background alerts fetch for the window's current
+        /// lookback. No-op while one is already in flight.
+        fn start_alerts_fetch(&mut self) {
+            let Some(win) = self.alerts_window.as_mut() else {
+                return;
+            };
+            if win.loading {
+                return;
+            }
+            win.loading = true;
+            win.last_fetch = Some(Instant::now());
+            let window_min = win.window_min;
+            let auth = self.alerts_auth.clone();
+            let tx = self.alerts_tx.clone();
+            std::thread::spawn(move || {
+                let result = alerts::fetch_recent(&auth, window_min)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(AlertsFetch { window_min, result });
+            });
+        }
+
+        /// Drain finished alerts fetches into the window.
+        fn poll_alerts_events(&mut self) {
+            while let Ok(fetch) = self.alerts_rx.try_recv() {
+                let Some(win) = self.alerts_window.as_mut() else {
+                    continue; // window closed while the fetch was in flight
+                };
+                win.loading = false;
+                if fetch.window_min != win.window_min {
+                    // The user changed the lookback mid-flight; this result is
+                    // for the old window. A fresh fetch is already queued.
+                    continue;
+                }
+                match fetch.result {
+                    Ok(rows) => {
+                        win.rows = rows;
+                        win.error = None;
+                        win.fetched_at = Some(chrono::Local::now());
+                    }
+                    Err(err) => {
+                        self.log_error(format!("alerts: {err}"));
+                        if let Some(win) = self.alerts_window.as_mut() {
+                            win.error = Some(err);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Render the on-call Alerts window. Times are shown in the user's
+        /// local timezone; the API reports UTC.
+        fn render_alerts_window(&mut self, ctx: &egui::Context) {
+            if self.alerts_window.is_none() {
+                return;
+            }
+            let mut open = true;
+            let mut refresh_now = false;
+            // Copy out the bits the closure needs so it can borrow `self`
+            // mutably for logging without fighting the window borrow.
+            let (mut window_min, mut auto_refresh) = {
+                let win = self.alerts_window.as_ref().expect("checked above");
+                (win.window_min, win.auto_refresh)
+            };
+            let mut copy_text: Option<String> = None;
+
+            egui::Window::new("On-Call Alerts")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([980.0, 460.0])
+                .show(ctx, |ui| {
+                    let win = self.alerts_window.as_ref().expect("checked above");
+                    let loading = win.loading;
+                    let error = win.error.clone();
+                    let fetched_at = win.fetched_at;
+                    let rows = win.rows.clone();
+
+                    ui.horizontal(|ui| {
+                        let label = ALERT_WINDOWS
+                            .iter()
+                            .find(|(m, _)| *m == window_min)
+                            .map(|(_, l)| *l)
+                            .unwrap_or("Last 10 min");
+                        egui::ComboBox::from_id_salt("alerts_window")
+                            .selected_text(label)
+                            .show_ui(ui, |ui| {
+                                for (mins, label) in ALERT_WINDOWS {
+                                    if ui
+                                        .selectable_label(window_min == mins, label)
+                                        .clicked()
+                                    {
+                                        window_min = mins;
+                                        refresh_now = true;
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        if ui
+                            .add_enabled(!loading, egui::Button::new("Refresh"))
+                            .clicked()
+                        {
+                            refresh_now = true;
+                        }
+                        ui.checkbox(&mut auto_refresh, "Auto");
+                        if loading {
+                            ui.spinner();
+                        }
+                        if !rows.is_empty() {
+                            ui.label(format!("{} alert(s)", rows.len()));
+                        }
+                        if let Some(t) = fetched_at {
+                            ui.weak(format!("updated {}", t.format("%-I:%M:%S %p")));
+                        }
+                        if ui.button("Copy").clicked() {
+                            copy_text = Some(alerts_as_text(&rows));
+                        }
+                    });
+
+                    if let Some(err) = &error {
+                        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
+                    }
+                    ui.separator();
+
+                    if rows.is_empty() {
+                        if !loading && error.is_none() {
+                            ui.label("(no alerts in window)");
+                        }
+                        return;
+                    }
+
+                    // Column widths are fixed so rows line up; the message
+                    // column takes whatever is left and wraps.
+                    egui::ScrollArea::vertical()
+                        .id_salt("alerts_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            egui::Grid::new("alerts_grid")
+                                .num_columns(8)
+                                .striped(true)
+                                .spacing([12.0, 6.0])
+                                .show(ui, |ui| {
+                                    let head = |ui: &mut egui::Ui, s: &str| {
+                                        ui.strong(s);
+                                    };
+                                    head(ui, &format!("Time ({})", local_tz_label()));
+                                    head(ui, "ID");
+                                    head(ui, "Pri");
+                                    head(ui, "Status");
+                                    head(ui, "Ack");
+                                    head(ui, "Account");
+                                    head(ui, "Env");
+                                    head(ui, "Message");
+                                    ui.end_row();
+
+                                    for a in &rows {
+                                        ui.label(format_local_time(&a.created_at));
+                                        ui.label(if a.tiny_id.is_empty() {
+                                            "-".to_string()
+                                        } else {
+                                            format!("#{}", a.tiny_id)
+                                        });
+                                        ui.colored_label(
+                                            priority_color(&a.priority),
+                                            if a.priority.is_empty() {
+                                                "-"
+                                            } else {
+                                                &a.priority
+                                            },
+                                        );
+                                        ui.label(if a.status.is_empty() {
+                                            "?"
+                                        } else {
+                                            &a.status
+                                        });
+                                        if a.acknowledged {
+                                            ui.label("ack");
+                                        } else {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(220, 160, 60),
+                                                "unack",
+                                            );
+                                        }
+                                        ui.label(if a.account.is_empty() {
+                                            "-"
+                                        } else {
+                                            &a.account
+                                        });
+                                        ui.label(if a.environment.is_empty() {
+                                            "-"
+                                        } else {
+                                            &a.environment
+                                        });
+                                        ui.label(&a.message).on_hover_text(&a.message);
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                });
+
+            if let Some(text) = copy_text {
+                ctx.copy_text(text);
+                self.log_info("alerts: copied table to clipboard");
+            }
+
+            if !open {
+                self.alerts_window = None;
+                return;
+            }
+
+            let due = {
+                let win = self.alerts_window.as_mut().expect("checked above");
+                let changed = win.window_min != window_min;
+                win.window_min = window_min;
+                win.auto_refresh = auto_refresh;
+                let stale = win.auto_refresh
+                    && win
+                        .last_fetch
+                        .map(|t| t.elapsed() >= ALERTS_REFRESH_EVERY)
+                        .unwrap_or(true);
+                refresh_now || changed || stale
+            };
+            if due {
+                self.start_alerts_fetch();
+            }
+            // Keep the clock/auto-refresh ticking even when the app is idle.
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+
+        /// `(username, PAT)` to export to the remote shell on Prep Terminal,
+        /// when the user is allow-listed and has cached a token.
+        fn git_env(&self) -> Option<(String, String)> {
+            if !self.personal_scripts_enabled {
+                return None;
+            }
+            let pat = self
+                .config
+                .git_pat
+                .clone()
+                .filter(|pat| !pat.trim().is_empty())?;
+            Some((ec2_manager::features::current_os_user(), pat))
+        }
+
+        /// Prep-terminal bytes for `tab_id`, sized to its PTY and carrying
+        /// the git exports when configured.
+        fn prep_bytes_for_tab(&self, tab_id: u64) -> Vec<u8> {
+            let (rows, cols) = self
+                .pty_sessions
+                .get(&tab_id)
+                .and_then(|s| s.last_size)
+                .unwrap_or((24, 120));
+            let git = self.git_env();
+            prep_terminal_command_for_size(
+                rows,
+                cols,
+                git.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
+            )
+        }
+
+        /// Paste a personal script into the focused connection tab.
+        fn run_personal_script(&mut self, index: usize) {
+            let Some(script) = self.config.personal_scripts.get(index).cloned() else {
+                return;
+            };
+            let tab_id = self
+                .connections
+                .selected()
+                .filter(|id| {
+                    self.connections
+                        .tabs()
+                        .iter()
+                        .any(|t| t.id == *id && t.running)
+                })
+                .filter(|id| self.pty_sessions.contains_key(id));
+            let Some(tab_id) = tab_id else {
+                let msg = format!(
+                    "Script '{}': no live connection tab — connect to an instance first.",
+                    script.name
+                );
+                self.log_error(msg.clone());
+                self.set_script_status(msg, ScriptState::Failed);
+                return;
+            };
+            let payload = script_payload(&script.body);
+            if payload.is_empty() {
+                let msg = format!("Script '{}' is empty.", script.name);
+                self.log_error(msg.clone());
+                self.set_script_status(msg, ScriptState::Failed);
+                return;
+            }
+            self.log_info(format!(
+                "running script '{}' in tab {tab_id} ({} bytes)",
+                script.name,
+                payload.len()
+            ));
+            self.main_tab = MainTab::Connections;
+            self.mark_paste_write(tab_id, payload.len());
+            self.paste_to_connection_tab(tab_id, payload);
+            self.pending_terminal_focus = Some(tab_id);
+        }
+
+        /// Open the script modal — `Some(index)` to edit, `None` to add.
+        fn open_script_editor(&mut self, index: Option<usize>) {
+            let existing = index.and_then(|i| self.config.personal_scripts.get(i)).cloned();
+            self.script_editor = Some(ScriptEditor {
+                index,
+                name: existing.as_ref().map(|s| s.name.clone()).unwrap_or_default(),
+                hotkey: existing.as_ref().and_then(|s| Hotkey::parse(&s.hotkey)),
+                capturing: false,
+                body: existing.map(|s| s.body).unwrap_or_default(),
+                error: None,
+            });
+        }
+
+        /// Open the git-PAT prompt, pre-filled with the cached token.
+        fn open_pat_dialog(&mut self, reason: Option<String>) {
+            self.pat_dialog = Some(PatDialog {
+                pat: self.config.git_pat.clone().unwrap_or_default(),
+                reveal: false,
+                reason,
+            });
+        }
+
+        /// Raise the PAT prompt after git rejected the current token. Rate-
+        /// limited: a failing `git pull` prints several matching lines.
+        fn prompt_pat_update_from_git_failure(&mut self) {
+            if !self.personal_scripts_enabled || self.pat_dialog.is_some() {
+                return;
+            }
+            if let Some(at) = self.last_git_failure_prompt {
+                if at.elapsed() < Duration::from_secs(30) {
+                    return;
+                }
+            }
+            self.last_git_failure_prompt = Some(Instant::now());
+            self.log_info("git authentication failed — prompting for an updated PAT");
+            self.open_pat_dialog(Some(
+                "git rejected these credentials. Enter a current PAT, then click Prep \
+                 Terminal on the tab to re-export it."
+                    .to_string(),
+            ));
+        }
+
+        /// Persist `config.personal_scripts` / `config.git_pat`, logging (but
+        /// not surfacing) an I/O failure.
+        fn save_config_quietly(&mut self, what: &str) {
+            if let Err(err) = self.config.save() {
+                self.log_error(format!("failed to save {what}: {err}"));
+            }
+        }
+
+        /// Fire a personal script whose hotkey was pressed this frame. Only
+        /// while the app owns the OS focus and no modal is up.
+        fn poll_script_hotkeys(&mut self, ctx: &egui::Context) {
+            self.hotkey_consumed_frame = false;
+            if self.script_editor.is_some()
+                || self.pat_dialog.is_some()
+                || self.pending_script_delete.is_some()
+                || self.config.personal_scripts.is_empty()
+            {
+                return;
+            }
+            if !ctx.input(|i| i.focused) {
+                return;
+            }
+            let bindings: Vec<(usize, Hotkey)> = self
+                .config
+                .personal_scripts
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| Hotkey::parse(&s.hotkey).map(|hk| (i, hk)))
+                .collect();
+            if bindings.is_empty() {
+                return;
+            }
+            let fired = ctx.input(|i| {
+                i.raw.events.iter().find_map(|event| match event {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => bindings
+                        .iter()
+                        .find(|(_, hk)| hk.matches(*key, *modifiers))
+                        .map(|(idx, _)| *idx),
+                    _ => None,
+                })
+            });
+            if let Some(index) = fired {
+                // Swallow the key press for this frame so it isn't also typed
+                // into the terminal that has keyboard focus.
+                self.hotkey_consumed_frame = true;
+                self.run_personal_script(index);
+            }
+        }
+
+        /// Render the "Add Script" / "Edit Script" modal.
+        fn render_script_editor(&mut self, ctx: &egui::Context) {
+            let Some(mut dlg) = self.script_editor.take() else {
+                return;
+            };
+
+            // While the hotkey box is listening, the next key press becomes
+            // the binding. Escape aborts the capture (not the dialog).
+            if dlg.capturing {
+                let press = ctx.input(|i| {
+                    i.raw.events.iter().find_map(|event| match event {
+                        egui::Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } => Some((*key, *modifiers)),
+                        _ => None,
+                    })
+                });
+                if let Some((key, modifiers)) = press {
+                    if key == egui::Key::Escape {
+                        dlg.capturing = false;
+                    } else if let Some(hk) = Hotkey::from_press(key, modifiers) {
+                        dlg.hotkey = Some(hk);
+                        dlg.capturing = false;
+                        dlg.error = None;
+                    } else {
+                        dlg.capturing = false;
+                        dlg.error = Some(
+                            "A hotkey needs Ctrl or Alt (or a function key) — a bare key \
+                             would swallow normal typing in the terminal."
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+
+            let editing = dlg.index.is_some();
+            let title = if editing { "Edit Script" } else { "Add Script" };
+            let mut window_open = true;
+            let mut do_save = false;
+            let mut do_cancel = false;
+
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(true)
+                .default_width(560.0)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Name:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dlg.name)
+                                .desired_width(320.0)
+                                .hint_text("Deploy web app"),
+                        );
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Hotkey:");
+                        let label = if dlg.capturing {
+                            "Press keys…".to_string()
+                        } else {
+                            dlg.hotkey
+                                .map(|hk| hk.label())
+                                .unwrap_or_else(|| "Click, then press keys".to_string())
+                        };
+                        let btn = ui.add(
+                            egui::Button::new(label)
+                                .min_size(egui::vec2(200.0, 0.0))
+                                .selected(dlg.capturing),
+                        );
+                        if btn.clicked() {
+                            dlg.capturing = true;
+                            // Drop TextEdit focus, or the capture keys would
+                            // be typed into the name/body field.
+                            ui.memory_mut(|m| m.stop_text_input());
+                        }
+                        if ui
+                            .small_button("✖")
+                            .on_hover_text("Clear hotkey")
+                            .clicked()
+                        {
+                            dlg.hotkey = None;
+                            dlg.capturing = false;
+                        }
+                        ui.label("(optional — fires while this app is the active window)");
+                    });
+
+                    ui.add_space(4.0);
+                    ui.label("Script:");
+                    egui::ScrollArea::vertical()
+                        .id_salt("script_editor_body")
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut dlg.body)
+                                    .code_editor()
+                                    .desired_rows(14)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("Paste the shell script to run in the open session"),
+                            );
+                        });
+
+                    if let Some(err) = &dlg.error {
+                        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
+                    }
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(if editing { "Save" } else { "Add" }).clicked() {
+                            do_save = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+
+            if do_cancel || !window_open {
+                return;
+            }
+
+            if do_save {
+                let name = dlg.name.trim().to_string();
+                let hotkey = dlg.hotkey.map(|hk| hk.label()).unwrap_or_default();
+                if name.is_empty() {
+                    dlg.error = Some("Give the script a name.".to_string());
+                } else if dlg.body.trim().is_empty() {
+                    dlg.error = Some("The script is empty.".to_string());
+                } else if let Some(clash) = self
+                    .config
+                    .personal_scripts
+                    .iter()
+                    .enumerate()
+                    .find(|(i, s)| {
+                        !hotkey.is_empty()
+                            && s.hotkey == hotkey
+                            && Some(*i) != dlg.index
+                    })
+                    .map(|(_, s)| s.name.clone())
+                {
+                    dlg.error = Some(format!("{hotkey} is already bound to '{clash}'."));
+                } else {
+                    let script = PersonalScript {
+                        name: name.clone(),
+                        hotkey,
+                        body: dlg.body.clone(),
+                    };
+                    match dlg.index {
+                        Some(i) if i < self.config.personal_scripts.len() => {
+                            self.config.personal_scripts[i] = script;
+                            self.log_info(format!("updated script '{name}'"));
+                        }
+                        _ => {
+                            self.config.personal_scripts.push(script);
+                            self.log_info(format!("added script '{name}'"));
+                        }
+                    }
+                    self.save_config_quietly("scripts");
+                    return;
+                }
+            }
+
+            self.script_editor = Some(dlg);
+        }
+
+        /// Render the "delete this script?" confirmation.
+        fn render_script_delete_confirm(&mut self, ctx: &egui::Context) {
+            let Some(index) = self.pending_script_delete else {
+                return;
+            };
+            let Some(name) = self
+                .config
+                .personal_scripts
+                .get(index)
+                .map(|s| s.name.clone())
+            else {
+                self.pending_script_delete = None;
+                return;
+            };
+            let mut window_open = true;
+            let mut do_delete = false;
+            let mut do_cancel = false;
+            egui::Window::new("Delete Script")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("Delete the script '{name}'?"));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete").clicked() {
+                            do_delete = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+            if do_delete {
+                self.config.personal_scripts.remove(index);
+                self.save_config_quietly("scripts");
+                self.log_info(format!("deleted script '{name}'"));
+            }
+            if do_delete || do_cancel || !window_open {
+                self.pending_script_delete = None;
+            }
+        }
+
+        /// Render the git-PAT prompt (launch, Scripts-menu edit, or after a
+        /// git auth failure).
+        fn render_pat_dialog(&mut self, ctx: &egui::Context) {
+            let Some(mut dlg) = self.pat_dialog.take() else {
+                return;
+            };
+            let os_user = ec2_manager::features::current_os_user();
+            let mut window_open = true;
+            let mut do_save = false;
+            let mut do_cancel = false;
+
+            egui::Window::new("Git Personal Access Token")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(460.0)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    if let Some(reason) = &dlg.reason {
+                        ui.label(reason.clone());
+                        ui.add_space(4.0);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("PAT:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dlg.pat)
+                                .password(!dlg.reveal)
+                                .desired_width(300.0),
+                        );
+                        let (icon, hint) = if dlg.reveal {
+                            ("🔒", "Hide")
+                        } else {
+                            ("👁", "Show")
+                        };
+                        if ui.small_button(icon).on_hover_text(hint).clicked() {
+                            dlg.reveal = !dlg.reveal;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(format!(
+                        "Prep Terminal exports GIT_USER={os_user} and GIT_PAT to the remote \
+                         shell for that session only. The token is cached in your local \
+                         config file — it is not encrypted."
+                    ));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            do_save = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+
+            if do_save {
+                let pat = dlg.pat.trim().to_string();
+                let cleared = pat.is_empty();
+                self.config.git_pat = (!cleared).then_some(pat);
+                self.save_config_quietly("git PAT");
+                self.log_info(if cleared {
+                    "cleared cached git PAT".to_string()
+                } else {
+                    "cached git PAT updated".to_string()
+                });
+            }
+            if !(do_save || do_cancel || !window_open) {
+                self.pat_dialog = Some(dlg);
+            }
+        }
+
         /// Render the "Scripts → create_new_user.sh" modal.
         fn render_create_user_dialog(&mut self, ctx: &egui::Context) {
             let Some(mut dlg) = self.create_user_dialog.take() else {
@@ -5572,7 +6594,9 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                         let ok = if is_prep {
                             // Send the prep-terminal sequence (it already
                             // ends in CR); no extra command line.
-                            w.write_all(PREP_TERMINAL_COMMAND).is_ok()
+                            // No git exports: the built-in user scripts run as
+                            // root and don't touch git.
+                            w.write_all(&prep_terminal_command(None)).is_ok()
                         } else {
                             let mut line = step.into_bytes();
                             line.push(b'\r');
@@ -5971,6 +6995,10 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
             // output arrives from the reader thread.
             self.poll_ui_events();
 
+            // Snapshot the git exports up front: the auto-prep below runs
+            // while `self.pty_sessions` is mutably borrowed.
+            let git_env = self.git_env();
+
             // Drain proc_rx with a per-frame cap so a flood of output
             // (e.g., sudo su - motd, terraform plan diff, awk over
             // /etc/passwd on large-NSS hosts) can't starve the UI thread
@@ -6229,7 +7257,11 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                         session.pending_reprep = false;
                         session.last_prepped_prompt = cursor_trimmed;
                         let (rows, cols) = session.last_size.unwrap_or((24, 120));
-                        let prep = prep_terminal_command_for_size(rows, cols);
+                        let prep = prep_terminal_command_for_size(
+                            rows,
+                            cols,
+                            git_env.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
+                        );
                         if let Ok(mut stdin) = session.writer.lock() {
                             let _ = stdin.write_all(&prep)
                                 .and_then(|()| stdin.flush());
@@ -6272,6 +7304,13 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 }
                 if let Some(msg) = connect_diag {
                     self.log_info(msg);
+                }
+                // git rejected the exported PAT (expired, revoked, typo'd) —
+                // offer to update it rather than leave the user to guess.
+                if self.personal_scripts_enabled
+                    && looks_like_git_auth_failure(&String::from_utf8_lossy(&bytes))
+                {
+                    self.prompt_pat_update_from_git_failure();
                 }
                 self.maybe_record_gui_smoke_success(tab_id, &bytes);
             }
@@ -7598,6 +8637,11 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         }
 
         fn forward_terminal_key_input(&mut self, ctx: &egui::Context, tab_id: u64) {
+            // A personal-script hotkey claimed this frame's keys — don't also
+            // type them into the terminal.
+            if self.hotkey_consumed_frame {
+                return;
+            }
             let events = ctx.input(|i| i.raw.events.clone());
             let current_modifiers = ctx.input(|i| i.modifiers);
             let has_text = events.iter().any(|e| matches!(e, egui::Event::Text(_)));
@@ -8847,12 +9891,7 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                         pty_bytes,
                     ));
                     if tab.running && ui.small_button("Prep Terminal").clicked() {
-                        let (rows, cols) = self
-                            .pty_sessions
-                            .get(&tab.id)
-                            .and_then(|s| s.last_size)
-                            .unwrap_or((24, 120));
-                        let prep = prep_terminal_command_for_size(rows, cols);
+                        let prep = self.prep_bytes_for_tab(tab.id);
                         self.send_raw_bytes_to_connection_tab(tab.id, &prep);
                         self.pending_terminal_focus = Some(tab.id);
                     }
@@ -10685,6 +11724,10 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 // monitor moves regardless of the active tab.
                 self.apply_auto_fit_zoom(ctx);
 
+                // Personal-script hotkeys. Runs before any panel so a match
+                // can suppress the key press for the focused terminal.
+                self.poll_script_hotkeys(ctx);
+
                 // Auto-focus the visible terminal when:
                 //   - the user just switched into the Connections tab
                 //   - the active connection tab changed (new tab opened
@@ -10898,9 +11941,14 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 self.render_settings_pem_dialog(ctx);
                 self.render_file_browser_defaults_dialog(ctx);
                 self.render_create_user_dialog(ctx);
+                self.render_script_editor(ctx);
+                self.render_script_delete_confirm(ctx);
+                self.render_pat_dialog(ctx);
                 self.render_script_result_popup(ctx);
+                self.render_alerts_window(ctx);
                 self.pump_script_runs();
                 self.poll_script_events();
+                self.poll_alerts_events();
 
                 if self.wsl_show_password_popup {
                     let mut open = true;
@@ -11344,8 +12392,15 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                             }
                         }
 
-                        let script_count = 1 + usize::from(self.allow_delete_user);
+                        let script_count = 1
+                            + usize::from(self.allow_delete_user)
+                            + self.config.personal_scripts.len();
                         let mut open_dialog: Option<bool> = None;
+                        let mut run_script: Option<usize> = None;
+                        let mut edit_script: Option<usize> = None;
+                        let mut delete_script: Option<usize> = None;
+                        let mut add_script = false;
+                        let mut edit_pat = false;
                         egui::ComboBox::from_id_salt("scripts_menu")
                             .selected_text(format!("Scripts ({script_count})"))
                             .show_ui(ui, |ui| {
@@ -11359,7 +12414,83 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                                     open_dialog = Some(true);
                                     ui.close();
                                 }
+
+                                // Personal scripts sit below the built-in
+                                // ones, each with edit / delete on the right.
+                                if !self.config.personal_scripts.is_empty() {
+                                    ui.separator();
+                                }
+                                for (i, script) in
+                                    self.config.personal_scripts.iter().enumerate()
+                                {
+                                    ui.horizontal(|ui| {
+                                        let label = if script.hotkey.is_empty() {
+                                            script.name.clone()
+                                        } else {
+                                            format!("{}  ({})", script.name, script.hotkey)
+                                        };
+                                        if ui
+                                            .selectable_label(false, label)
+                                            .on_hover_text("Run in the open connection tab")
+                                            .clicked()
+                                        {
+                                            run_script = Some(i);
+                                            ui.close();
+                                        }
+                                        if ui.small_button("✏").on_hover_text("Edit").clicked() {
+                                            edit_script = Some(i);
+                                            ui.close();
+                                        }
+                                        if ui.small_button("✖").on_hover_text("Delete").clicked() {
+                                            delete_script = Some(i);
+                                            ui.close();
+                                        }
+                                    });
+                                }
+
+                                if self.personal_scripts_enabled {
+                                    ui.separator();
+                                    if ui.selectable_label(false, "Add Script…").clicked() {
+                                        add_script = true;
+                                        ui.close();
+                                    }
+                                    ui.horizontal(|ui| {
+                                        let set = self
+                                            .config
+                                            .git_pat
+                                            .as_deref()
+                                            .is_some_and(|p| !p.is_empty());
+                                        ui.label(if set {
+                                            "Git PAT (saved)"
+                                        } else {
+                                            "Git PAT (not set)"
+                                        });
+                                        if ui
+                                            .small_button("✏")
+                                            .on_hover_text("Update the cached PAT")
+                                            .clicked()
+                                        {
+                                            edit_pat = true;
+                                            ui.close();
+                                        }
+                                    });
+                                }
                             });
+                        if let Some(i) = run_script {
+                            self.run_personal_script(i);
+                        }
+                        if let Some(i) = edit_script {
+                            self.open_script_editor(Some(i));
+                        }
+                        if let Some(i) = delete_script {
+                            self.pending_script_delete = Some(i);
+                        }
+                        if add_script {
+                            self.open_script_editor(None);
+                        }
+                        if edit_pat {
+                            self.open_pat_dialog(None);
+                        }
                         {
                             if let Some(delete) = open_dialog {
                                 let env = self.selected_profile.clone().unwrap_or_default();
@@ -11384,6 +12515,36 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                                     secondary_id,
                                     error: None,
                                 });
+                            }
+                        }
+
+                        // On-call alerts — only for users on the features.json
+                        // allow-list, on a build with a Jira site configured.
+                        if self.alerts_enabled {
+                            let open_count = self
+                                .alerts_window
+                                .as_ref()
+                                .map(|w| w.rows.len())
+                                .unwrap_or(0);
+                            let label = if open_count > 0 {
+                                format!("Alerts ({open_count})")
+                            } else {
+                                "Alerts".to_string()
+                            };
+                            if ui.button(label).clicked() {
+                                if self.alerts_window.is_some() {
+                                    self.alerts_window = None;
+                                } else if self.alerts_auth.is_complete() {
+                                    self.alerts_window = Some(AlertsWindow::new());
+                                    self.log_info("alerts: opening on-call alerts");
+                                    self.start_alerts_fetch();
+                                } else {
+                                    // Site is configured but no token — the
+                                    // usual case is JIRA_TOKEN not exported.
+                                    let msg = "Alerts: no API token. Set JIRA_TOKEN in your environment (or alerts.token in features.json) and restart.";
+                                    self.log_error(msg);
+                                    self.set_script_status(msg, ScriptState::Failed);
+                                }
                             }
                         }
                     });
@@ -14225,6 +15386,186 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
             assert!(GUI_DEFAULT_HEIGHT >= 900.0);
             assert!(GUI_MIN_WIDTH >= 1200.0);
             assert!(GUI_MIN_HEIGHT >= 700.0);
+        }
+
+        fn mods(ctrl: bool, alt: bool, shift: bool) -> egui::Modifiers {
+            egui::Modifiers {
+                ctrl,
+                alt,
+                shift,
+                command: ctrl,
+                mac_cmd: false,
+            }
+        }
+
+        #[test]
+        fn hotkey_round_trips_through_its_label() {
+            let hk = Hotkey::from_press(egui::Key::K, mods(true, false, true))
+                .expect("ctrl+shift+k is bindable");
+            assert_eq!(hk.label(), "Ctrl+Shift+K");
+            assert_eq!(Hotkey::parse("Ctrl+Shift+K"), Some(hk));
+            assert_eq!(Hotkey::parse(&hk.label()), Some(hk));
+        }
+
+        #[test]
+        fn hotkey_parse_rejects_garbage() {
+            assert_eq!(Hotkey::parse(""), None);
+            assert_eq!(Hotkey::parse("Ctrl+"), None);
+            assert_eq!(Hotkey::parse("Ctrl+Nonsense"), None);
+        }
+
+        /// A bare (or shift-only) letter would eat normal typing in the
+        /// terminal, so it must not be bindable. Function keys are fine.
+        #[test]
+        fn hotkey_requires_ctrl_alt_or_function_key() {
+            assert!(Hotkey::from_press(egui::Key::K, mods(false, false, false)).is_none());
+            assert!(Hotkey::from_press(egui::Key::K, mods(false, false, true)).is_none());
+            assert!(Hotkey::from_press(egui::Key::Escape, mods(true, false, false)).is_none());
+            assert!(Hotkey::from_press(egui::Key::F, mods(false, false, false)).is_none());
+            assert!(Hotkey::from_press(egui::Key::F5, mods(false, false, false)).is_some());
+            assert!(Hotkey::from_press(egui::Key::K, mods(true, false, false)).is_some());
+            assert!(Hotkey::from_press(egui::Key::K, mods(false, true, false)).is_some());
+        }
+
+        #[test]
+        fn hotkey_matches_only_its_exact_modifiers() {
+            let hk = Hotkey::parse("Ctrl+Alt+P").expect("parses");
+            assert!(hk.matches(egui::Key::P, mods(true, true, false)));
+            assert!(!hk.matches(egui::Key::P, mods(true, false, false)));
+            assert!(!hk.matches(egui::Key::P, mods(true, true, true)));
+            assert!(!hk.matches(egui::Key::O, mods(true, true, false)));
+        }
+
+        /// Each line is CR-terminated so the paste drip-feed treats it as its
+        /// own command; CRLF bodies (pasted from Notepad) must not double up.
+        #[test]
+        fn script_payload_sends_one_cr_per_line() {
+            assert_eq!(script_payload("echo hi\r\necho bye\n"), b"echo hi\recho bye\r");
+            assert_eq!(script_payload("echo hi"), b"echo hi\r");
+            assert_eq!(script_payload(""), b"");
+        }
+
+        #[test]
+        fn prep_terminal_exports_git_credentials_when_set() {
+            let bytes = prep_terminal_command(Some(("bconrad", "abc123")));
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains(" export GIT_USER='bconrad' GIT_PAT='abc123'\r"));
+            // Leading space + ignorespace keeps the token out of bash history.
+            assert!(text.contains("HISTCONTROL=ignorespace"));
+            // …and the exports land before the clear that hides them.
+            assert!(text.ends_with("clear\r"));
+            assert_eq!(text.matches("clear\r").count(), 1);
+        }
+
+        #[test]
+        fn prep_terminal_omits_exports_without_a_pat() {
+            for git_env in [None, Some(("bconrad", ""))] {
+                let bytes = prep_terminal_command(git_env);
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(!text.contains("GIT_PAT"), "unexpected export: {text}");
+                assert!(text.starts_with("exec bash\r"));
+                assert!(text.ends_with("clear\r"));
+            }
+        }
+
+        /// A quote in the token must not break out of the export.
+        #[test]
+        fn prep_terminal_quotes_a_pat_containing_a_quote() {
+            let bytes = prep_terminal_command(Some(("u", "a'b")));
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains(r"GIT_PAT='a'\''b'"), "{text}");
+        }
+
+        #[test]
+        fn git_auth_failures_are_recognised() {
+            assert!(looks_like_git_auth_failure(
+                "remote: Invalid username or password.\nfatal: Authentication failed for 'https://…'"
+            ));
+            assert!(looks_like_git_auth_failure(
+                "remote: HTTP Basic: Access denied"
+            ));
+            assert!(looks_like_git_auth_failure(
+                "fatal: could not read Username for 'https://github.com': No such device"
+            ));
+            assert!(!looks_like_git_auth_failure("Already up to date."));
+            assert!(!looks_like_git_auth_failure(""));
+        }
+
+        /// The API reports UTC; the table must show the machine's local clock.
+        #[test]
+        fn alert_time_is_rendered_in_local_zone() {
+            let utc = "2026-07-13T15:21:12.874Z";
+            let rendered = format_local_time(utc);
+            let expected = chrono::DateTime::parse_from_rfc3339(utc)
+                .expect("sample parses")
+                .with_timezone(&chrono::Local)
+                .format("%b %d %-I:%M:%S %p")
+                .to_string();
+            assert_eq!(rendered, expected);
+            // 12-hour clock with a meridiem, not the raw UTC string.
+            assert!(rendered.ends_with("AM") || rendered.ends_with("PM"));
+            assert!(!rendered.contains('Z'));
+        }
+
+        #[test]
+        fn unparseable_timestamp_falls_back_to_raw() {
+            assert_eq!(format_local_time("not-a-time"), "not-a-time");
+        }
+
+        #[test]
+        fn tz_label_is_a_utc_offset() {
+            let label = local_tz_label();
+            assert!(label.starts_with("UTC+") || label.starts_with("UTC-"), "{label}");
+            assert_eq!(label.len(), 9, "{label}"); // UTC-05:00
+        }
+
+        #[test]
+        fn priorities_are_color_coded_by_severity() {
+            assert_eq!(priority_color("P1"), priority_color("P2"));
+            assert_ne!(priority_color("P1"), priority_color("P3"));
+            assert_ne!(priority_color("P3"), priority_color("P4"));
+            assert_eq!(priority_color("p1"), priority_color("P1")); // case-insensitive
+        }
+
+        #[test]
+        fn copied_table_has_a_header_and_one_line_per_alert() {
+            let rows = vec![
+                alerts::Alert {
+                    tiny_id: "9945".into(),
+                    created_at: "2026-07-13T15:21:12.874Z".into(),
+                    priority: "P4".into(),
+                    status: "open".into(),
+                    acknowledged: false,
+                    account: "123456789012".into(),
+                    environment: "Dev".into(),
+                    message: "[Catalyst Gateway]: Warning".into(),
+                    ..Default::default()
+                },
+                alerts::Alert {
+                    tiny_id: "9946".into(),
+                    acknowledged: true,
+                    ..Default::default()
+                },
+            ];
+            let text = alerts_as_text(&rows);
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(lines.len(), 3); // header + 2 rows
+            assert!(lines[0].starts_with("Time (UTC"));
+            assert!(lines[1].contains("123456789012"));
+            assert!(lines[1].contains("Dev"));
+            assert!(lines[1].contains("unack"));
+            assert!(lines[2].contains("ack"));
+        }
+
+        #[test]
+        fn alerts_window_defaults_to_ten_minutes_auto_refreshing() {
+            let win = AlertsWindow::new();
+            assert_eq!(win.window_min, 10);
+            assert!(win.auto_refresh);
+            assert!(!win.loading);
+            assert!(win.rows.is_empty());
+            // Every offered window must be selectable back from the list.
+            assert!(ALERT_WINDOWS.iter().any(|(m, _)| *m == win.window_min));
         }
 
         #[test]

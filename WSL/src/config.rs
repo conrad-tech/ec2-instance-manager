@@ -4,7 +4,10 @@ use std::path::PathBuf;
 
 use crate::accounts;
 use crate::error::Result;
-use crate::models::{Mode, PortForwardPreset, ProfileConfig, RecentConnection, SavedFilter, TagMapping};
+use crate::models::{
+    Mode, PersonalScript, PortForwardPreset, ProfileConfig, RecentConnection, SavedFilter,
+    TagMapping,
+};
 use crate::util::{home_dir, split_csv};
 
 const APP_DIR: &str = "ec2-manager";
@@ -63,6 +66,13 @@ pub struct AppConfig {
     /// "primary_instance_id|secondary_instance_id" (either side may be
     /// empty). Used to pre-fill the dialog on the next run.
     pub bastion_selections: BTreeMap<String, String>,
+    /// User-authored scripts shown under the built-in entries in the
+    /// Scripts menu ("Add Script"). Order is the menu order.
+    pub personal_scripts: Vec<PersonalScript>,
+    /// Cached git personal access token, exported as `GIT_PAT` by Prep
+    /// Terminal. Stored base64-encoded in config.ini — that is obfuscation,
+    /// not encryption: anyone who can read the file can read the token.
+    pub git_pat: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -111,6 +121,8 @@ impl Default for AppConfig {
             ssh_pem_instance: BTreeMap::new(),
             vscode_pem_suppressed: BTreeMap::new(),
             bastion_selections: BTreeMap::new(),
+            personal_scripts: Vec::new(),
+            git_pat: None,
         }
     }
 }
@@ -519,6 +531,14 @@ impl AppConfig {
                         cfg.upsert_port_forward_preset(preset);
                     }
                 }
+                "personal_script" => {
+                    if let Some(script) = parse_personal_script(value) {
+                        cfg.personal_scripts.push(script);
+                    }
+                }
+                "git_pat" => {
+                    cfg.git_pat = decode_b64(value).filter(|t| !t.is_empty());
+                }
                 "theme" => {
                     cfg.theme = if value.is_empty() {
                         None
@@ -744,9 +764,51 @@ impl AppConfig {
             ));
         }
 
+        // Name and body are base64'd: config.ini is line-based and both may
+        // contain '|', '=' or newlines. The hotkey is a plain canonical
+        // string ("Ctrl+Shift+K") and stays readable.
+        for script in &self.personal_scripts {
+            lines.push(format!(
+                "personal_script={}|{}|{}",
+                encode_b64(&script.name),
+                script.hotkey,
+                encode_b64(&script.body)
+            ));
+        }
+
+        if let Some(pat) = self.git_pat.as_deref().filter(|p| !p.is_empty()) {
+            lines.push(format!("git_pat={}", encode_b64(pat)));
+        }
+
         lines.push(String::new());
         lines.join("\n")
     }
+}
+
+fn encode_b64(raw: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(raw)
+}
+
+fn decode_b64(raw: &str) -> Option<String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(raw.trim())
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// `<b64 name>|<hotkey>|<b64 body>`. A script with an unreadable name or
+/// body is dropped rather than surfaced half-decoded.
+fn parse_personal_script(raw: &str) -> Option<PersonalScript> {
+    let mut fields = raw.splitn(3, '|');
+    let name = decode_b64(fields.next()?)?;
+    let hotkey = fields.next().unwrap_or("").trim().to_string();
+    let body = decode_b64(fields.next().unwrap_or(""))?;
+    if name.trim().is_empty() {
+        return None;
+    }
+    Some(PersonalScript { name, hotkey, body })
 }
 
 fn parse_recent(raw: &str) -> Option<RecentConnection> {
@@ -843,6 +905,55 @@ fn parse_port_forward_preset(raw: &str) -> Option<PortForwardPreset> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Names and bodies are base64'd, so a script whose body contains the
+    /// field separator, an '=' or newlines survives a save/load cycle.
+    #[test]
+    fn personal_scripts_round_trip_through_config_text() {
+        let mut cfg = AppConfig::default();
+        cfg.personal_scripts = vec![
+            PersonalScript {
+                name: "Deploy | web".to_string(),
+                hotkey: "Ctrl+Shift+K".to_string(),
+                body: "cd /srv\nMSG='a=b|c'\ngit pull\n".to_string(),
+            },
+            PersonalScript {
+                name: "Tail logs".to_string(),
+                hotkey: String::new(),
+                body: "tail -f /var/log/messages".to_string(),
+            },
+        ];
+
+        let parsed = AppConfig::parse(&cfg.to_text());
+        assert_eq!(parsed.personal_scripts, cfg.personal_scripts);
+    }
+
+    #[test]
+    fn git_pat_round_trips_and_is_not_stored_in_the_clear() {
+        let mut cfg = AppConfig::default();
+        cfg.git_pat = Some("s3cr3t-token".to_string());
+
+        let text = cfg.to_text();
+        assert!(!text.contains("s3cr3t-token"));
+        assert_eq!(
+            AppConfig::parse(&text).git_pat.as_deref(),
+            Some("s3cr3t-token")
+        );
+    }
+
+    #[test]
+    fn missing_scripts_and_pat_default_to_empty() {
+        let cfg = AppConfig::parse("default_mode=live\n");
+        assert!(cfg.personal_scripts.is_empty());
+        assert_eq!(cfg.git_pat, None);
+    }
+
+    /// A corrupt entry is dropped, not surfaced half-decoded.
+    #[test]
+    fn undecodable_personal_script_is_skipped() {
+        let cfg = AppConfig::parse("personal_script=not-base64!!|Ctrl+K|also-bad\n");
+        assert!(cfg.personal_scripts.is_empty());
+    }
 
     #[test]
     fn parse_config() {

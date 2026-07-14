@@ -5,6 +5,21 @@ CLI_APP_NAME="ec2_manager"
 GUI_APP_NAME="ec2_manager_gui"
 APP_VERSION="1.1"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Cargo's build directory. The mingw toolchain's `dlltool` (invoked for crates
+# that use raw-dylib imports, e.g. chrono -> windows-link) does not quote the
+# paths it passes to the assembler, so it fails outright when the build
+# directory contains a space — as it does under "/mnt/d/Work Projects/...".
+# When ROOT_DIR has a space, build into a space-free scratch dir instead. The
+# artifacts are copied out to dist/ either way, so nothing else changes.
+if [[ "$ROOT_DIR" == *" "* ]]; then
+  TARGET_DIR="${TMPDIR:-/tmp}/ec2-manager-build/target"
+  export CARGO_TARGET_DIR="$TARGET_DIR"
+  echo "info: repo path contains a space; building into $TARGET_DIR"
+else
+  TARGET_DIR="${ROOT_DIR}/target"
+fi
+
 DIST_DIR="${ROOT_DIR}/dist"
 LINUX_DIST_DIR="${DIST_DIR}/linux"
 WINDOWS_DIST_DIR="${DIST_DIR}/windows"
@@ -110,9 +125,9 @@ copy_artifact() {
 
   local source_dir
   if [[ "$target" == "$HOST_TRIPLE" ]]; then
-    source_dir="$ROOT_DIR/target/release"
+    source_dir="$TARGET_DIR/release"
   else
-    source_dir="$ROOT_DIR/target/${target}/release"
+    source_dir="$TARGET_DIR/${target}/release"
   fi
 
   local out_dir
@@ -222,10 +237,12 @@ package_windows_zip() {
 }
 
 package_linux_zip() {
-  local zip_path="${LINUX_DIST_DIR}/ec2_manager_linux.zip"
+  local zip_path="${LINUX_DIST_DIR}/ec2_manager_linux_${APP_VERSION}.zip"
+  # Must match the versioned names copy_artifact actually writes (e.g.
+  # ec2_manager_gui_1.1) — otherwise nothing is ever found to package.
   local candidates=(
-    "${LINUX_DIST_DIR}/${CLI_APP_NAME}"
-    "${LINUX_DIST_DIR}/${GUI_APP_NAME}"
+    "${LINUX_DIST_DIR}/${CLI_APP_NAME}_${APP_VERSION}"
+    "${LINUX_DIST_DIR}/${GUI_APP_NAME}_${APP_VERSION}"
   )
   local files=()
 

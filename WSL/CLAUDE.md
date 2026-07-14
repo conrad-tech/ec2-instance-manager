@@ -32,11 +32,30 @@ cargo clippy --features gui
 
 ## Build status
 
-As of 2026-02-13, the full build pipeline passes cleanly:
+As of 2026-07-14, the full build pipeline passes cleanly:
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 83 tests pass (34 lib + 3 CLI + 46 GUI)
+- `cargo test --features gui` — 202 tests pass (88 lib + 3 CLI + 111 GUI)
 - `cargo clippy --features gui` — only pre-existing lib-level warnings (derivable_impls on Mode, too_many_arguments on sim::make_instance, collapsible_if in GUI)
 - `./scripts/build_binaries.sh` — zero warnings on both Linux (x86_64-unknown-linux-gnu) and Windows (x86_64-pc-windows-gnu) release targets
+- Packaging the release zips needs `zip`/`unzip` on PATH (`sudo apt install zip`); without them the binaries still build and only the zip step is skipped.
+
+### Windows cross-compile and spaces in the repo path
+
+The mingw `dlltool` does not quote the paths it passes to the assembler, so it
+fails outright when Cargo's build directory contains a space — as it does when
+the repo lives under `/mnt/d/Work Projects/...`. It is invoked for any crate
+using raw-dylib imports (e.g. `chrono` → `windows-link`), so this breaks the
+whole Windows target with an opaque "dlltool could not create import library"
+error.
+
+`build_binaries.sh` handles this: when `ROOT_DIR` contains a space it sets
+`CARGO_TARGET_DIR` to a space-free scratch dir (`/tmp/ec2-manager-build/target`)
+and copies artifacts out to `dist/` as usual. If you cross-compile by hand,
+do the same:
+
+```bash
+CARGO_TARGET_DIR=/tmp/ec2m cargo build --release --target x86_64-pc-windows-gnu --features gui
+```
 
 ## Architecture notes
 
@@ -49,6 +68,70 @@ Key functions:
 - `spawn_pty_session_blocking()` — spawns all sessions via `native_pty_system()` (ConPTY on Windows)
 - `pty_command_for_context()` — spawns `aws` directly with SSM args in live mode
 - `resize_pty_session()` — propagates resize to both vt100 parser and PTY master
+
+### On-call alerts (Alerts button)
+
+`src/alerts.rs` fetches the Jira Service Management Operations alert feed
+(`https://api.atlassian.com/jsm/ops/api/<cloud_id>/v1/alerts`). The GUI's
+**Alerts** button (right of Scripts, Connections toolbar) opens a window that
+polls it every 10s and renders the rows in the user's **local** timezone — the
+API reports UTC.
+
+Two things that are easy to get wrong:
+
+- **Account / Environment / App are not top-level fields.** They arrive as
+  `"Key: value"` strings inside each alert's `tags` array (`"Account: 1234…"`,
+  `"Environment: Dev"`). `Alert::from_raw` splits them out, matching the key
+  case-insensitively and splitting on the *first* colon only — otherwise a
+  sibling tag like `"Metric: Global-Request-Time-(seconds)"` gets misread.
+- **HTTP goes through `curl`,** not a linked HTTP stack (consistent with how the
+  app shells out to `aws`). Credentials are written to curl's **stdin**
+  (`-K -`), never argv, so the API token never appears in the process list.
+  `curl.exe` ships with Windows 10 1803+.
+
+Config lives in the `alerts` section of `assets/features.json` (compiled in):
+`cloud_id` + `email` identify the site, and `allowed_users` is the list of OS
+usernames that see the button (`["*"]` = everyone, `[]` = nobody; the shipped
+default is `[]`, so the button is hidden until an admin opts users in). The
+button also stays hidden when `cloud_id`/`email` are blank — it fails closed,
+like `allow_delete_user`.
+
+**Do not put a real token in features.json** — that file is committed. Leave
+`token` empty and have each user export `JIRA_TOKEN`, which always overrides it.
+
+`assets/scripts/alerts_10min.sh` is the standalone bash equivalent (curl + jq,
+same tag parsing, same local-time conversion) for terminal use.
+
+### Personal scripts + git PAT (Scripts → Add Script)
+
+Users on `personal_scripts.allowed_users` in `assets/features.json` get an
+**Add Script** entry in the Scripts menu. A personal script is a name, an
+optional hotkey, and a shell body; the entries render under the built-in
+`create_new_user.sh` / `delete_user.sh` ones, each with ✏ (edit) and ✖
+(delete). Picking one — or pressing its hotkey — pastes the body into the
+**focused connection tab** via the existing `paste_to_connection_tab`
+drip-feed. It does not open a bastion dialog and does not `sudo su`.
+
+- **Storage is `config.ini`, not features.json.** `personal_script=<b64
+  name>|<hotkey>|<b64 body>` and `git_pat=<b64>`. The name and body are
+  base64'd because the file is line-based and both may contain `|`, `=` or
+  newlines. The PAT is base64 — that is obfuscation, **not** encryption.
+- **Hotkeys need Ctrl or Alt** (or are a function key) — `Hotkey::is_bindable`
+  enforces this, because a bare letter binding would swallow ordinary typing
+  in the terminal. They only fire while the app owns OS focus
+  (`ctx.input(|i| i.focused)`), and `poll_script_hotkeys` runs before any
+  panel so `hotkey_consumed_frame` can suppress the key press for
+  `forward_terminal_key_input`.
+- **Prep Terminal exports the credentials.** `prep_terminal_command(git_env)`
+  splices `export GIT_USER=… GIT_PAT=…` in ahead of the trailing `clear`, so
+  `git clone`/`git pull` over HTTPS work for that session only. The leading
+  space plus `HISTCONTROL=ignorespace` keeps the token out of the remote
+  shell history, and the `clear` wipes it off the screen. The built-in user
+  scripts pass `None` — they run as root and don't touch git.
+- **git auth failures re-prompt.** `looks_like_git_auth_failure` scans PTY
+  output for the usual rejections ("fatal: Authentication failed", "HTTP
+  Basic: Access denied", …) and raises the PAT dialog, rate-limited to once
+  per 30s so a failing `git pull` doesn't reopen it per line.
 
 ### cfg gates for imports
 

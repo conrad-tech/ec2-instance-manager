@@ -13,5 +13,16 @@
     "admin",
     "sshd",
     "nobody"
-  ]
+  ],
+  "_alerts_comment": "On-call Alerts button (Jira Service Management Operations). cloud_id + email identify the JSM site to query. allowed_users lists the OS usernames (Windows USERNAME / Linux USER, matched case-insensitively) that may see the Alerts button; use [\"*\"] for everyone, [] to hide it from everyone. The button only appears when cloud_id AND email are set AND the user is on the list. DO NOT commit a real API token in 'token' — this file is in git. Leave it empty and have each user set JIRA_TOKEN in their environment; JIRA_TOKEN always overrides this value.",
+  "alerts": {
+    "cloud_id": "",
+    "email": "",
+    "token": "",
+    "allowed_users": []
+  },
+  "_personal_scripts_comment": "\"Add Script\" in the Scripts menu: users on allowed_users can save their own shell scripts (optionally bound to a hotkey) and are prompted once for a git personal access token, which Prep Terminal exports to the remote shell as GIT_USER/GIT_PAT for that session. Same matching rules as alerts.allowed_users: OS username, case-insensitive, [\"*\"] = everyone, [] = nobody (the shipped default). The PAT is cached in the user's local config.ini (base64, not encrypted) — never in this file.",
+  "personal_scripts": {
+    "allowed_users": []
+  }
 }
