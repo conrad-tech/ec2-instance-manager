@@ -34,7 +34,7 @@ cargo clippy --features gui
 
 As of 2026-07-14, the full build pipeline passes cleanly:
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 202 tests pass (88 lib + 3 CLI + 111 GUI)
+- `cargo test --features gui` — 208 tests pass (92 lib + 3 CLI + 113 GUI)
 - `cargo clippy --features gui` — only pre-existing lib-level warnings (derivable_impls on Mode, too_many_arguments on sim::make_instance, collapsible_if in GUI)
 - `./scripts/build_binaries.sh` — zero warnings on both Linux (x86_64-unknown-linux-gnu) and Windows (x86_64-pc-windows-gnu) release targets
 - Packaging the release zips needs `zip`/`unzip` on PATH (`sudo apt install zip`); without them the binaries still build and only the zip step is skipped.
@@ -102,36 +102,60 @@ like `allow_delete_user`.
 `assets/scripts/alerts_10min.sh` is the standalone bash equivalent (curl + jq,
 same tag parsing, same local-time conversion) for terminal use.
 
-### Personal scripts + git PAT (Scripts → Add Script)
+### Scripts menu: personal scripts, default scripts, git PAT
 
-Users on `personal_scripts.allowed_users` in `assets/features.json` get an
-**Add Script** entry in the Scripts menu. A personal script is a name, an
-optional hotkey, and a shell body; the entries render under the built-in
-`create_new_user.sh` / `delete_user.sh` ones, each with ✏ (edit) and ✖
-(delete). Picking one — or pressing its hotkey — pastes the body into the
-**focused connection tab** via the existing `paste_to_connection_tab`
-drip-feed. It does not open a bastion dialog and does not `sudo su`.
+**Add Script** in the Scripts menu is available to **everyone**. A personal
+script is a name, an optional hotkey, and a shell body; entries render below
+the built-in `create_new_user.sh` / `delete_user.sh` ones, each with ✏ (edit)
+and ✖ (delete, with an "Are you sure…" confirm). Picking one — or pressing its
+hotkey — pastes the body into the **focused connection tab** via the existing
+`paste_to_connection_tab` drip-feed. No bastion dialog, no `sudo su`.
 
-- **Storage is `config.ini`, not features.json.** `personal_script=<b64
-  name>|<hotkey>|<b64 body>` and `git_pat=<b64>`. The name and body are
-  base64'd because the file is line-based and both may contain `|`, `=` or
-  newlines. The PAT is base64 — that is obfuscation, **not** encryption.
-- **Hotkeys need Ctrl or Alt** (or are a function key) — `Hotkey::is_bindable`
-  enforces this, because a bare letter binding would swallow ordinary typing
-  in the terminal. They only fire while the app owns OS focus
-  (`ctx.input(|i| i.focused)`), and `poll_script_hotkeys` runs before any
-  panel so `hotkey_consumed_frame` can suppress the key press for
-  `forward_terminal_key_input`.
-- **Prep Terminal exports the credentials.** `prep_terminal_command(git_env)`
-  splices `export GIT_USER=… GIT_PAT=…` in ahead of the trailing `clear`, so
-  `git clone`/`git pull` over HTTPS work for that session only. The leading
-  space plus `HISTCONTROL=ignorespace` keeps the token out of the remote
-  shell history, and the `clear` wipes it off the screen. The built-in user
+`personal_scripts.allowed_users` in `assets/features.json` gates the **git
+integration only**, not Add Script:
+
+- **Default scripts.** `personal_scripts.default_scripts` (name, hotkey, body)
+  are hardcoded scripts handed to allow-listed users — e.g. a **Ctrl+1**
+  "re-clone the repo" script. They show above the personal scripts, are
+  read-only (no ✏/✖), and live in features.json, not config.ini. On a hotkey
+  collision they win over a personal binding (`poll_script_hotkeys` checks
+  them first; the editor's clash check refuses to bind their keys). Users off
+  the allow-list get none, and can bind Ctrl+1 to their own script instead.
+- **`{{user}}` placeholder.** `expand_script_placeholders` replaces `{{user}}`
+  (and `{{USER}}`) in a body with the local OS username before pasting —
+  applied to every script run, default or personal. Needed for per-user paths
+  like `/home/efs/{{user}}`: the remote `$USER` is the SSM/root account, not
+  the person at the keyboard, so the substitution must happen locally.
+- **Git PAT prompt.** Allow-listed users are prompted for a PAT on first
+  launch (and via the "Git PAT" ✏ row in the menu). Cached in config.ini.
+- **Prep Terminal populates git's credential store.**
+  `git_credential_store_command` enables `credential.helper store` and writes
+  `~/.git-credentials` with `https://USER:PAT@<git_host>` (chmod 600), so
+  `git clone`/`git pull` over HTTPS authenticate **without prompting** and it
+  persists across sessions. It is self-healing: each prep drops any stale line
+  for that host and re-adds the current PAT (a rotated token replaces the old
+  one), preserving other hosts' lines. `git_host` defaults to `github.com`.
+  Token hygiene: leading space + `HISTCONTROL=ignorespace` keeps it out of the
+  remote history, the trailing `clear` wipes it off screen. The built-in user
   scripts pass `None` — they run as root and don't touch git.
-- **git auth failures re-prompt.** `looks_like_git_auth_failure` scans PTY
-  output for the usual rejections ("fatal: Authentication failed", "HTTP
-  Basic: Access denied", …) and raises the PAT dialog, rate-limited to once
-  per 30s so a failing `git pull` doesn't reopen it per line.
+
+**Storage in `config.ini`:** `personal_script=<b64 name>|<hotkey>|<b64 body>`
+and `git_pat=<b64>`. Name/body are base64'd because the file is line-based and
+both may contain `|`, `=` or newlines; the PAT is base64 — obfuscation, **not**
+encryption.
+
+**Hotkeys** need Ctrl or Alt (or a function key) — `Hotkey::is_bindable`
+enforces this, since a bare letter binding would swallow ordinary typing in
+the terminal. They only fire while the app owns OS focus (`ctx.input(|i|
+i.focused)`), and `poll_script_hotkeys` runs before any panel so
+`hotkey_consumed_frame` can suppress the key press for
+`forward_terminal_key_input`.
+
+**git auth failures re-prompt.** `looks_like_git_auth_failure` scans PTY
+output for the usual rejections ("fatal: Authentication failed", "HTTP Basic:
+Access denied", …) and raises the PAT dialog, rate-limited to once per 30s so a
+failing `git pull` doesn't reopen it per line. After updating the PAT, click
+Prep Terminal to rewrite the stored credential.
 
 ### cfg gates for imports
 

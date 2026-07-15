@@ -1929,6 +1929,10 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         opened_at: Instant,
         /// Active path-input tab-completion dropdown, if any.
         path_completion: Option<PathCompletion>,
+        /// Path the user just typed into the path box (Enter/Go). When the
+        /// listing for it succeeds, it's persisted as this instance's
+        /// remembered browser path. Cleared on success or failure.
+        remember_path_on_success: Option<String>,
         /// Whether the in-editor find bar (Ctrl+F) is visible.
         editor_find_open: bool,
         /// Current find-in-file query text.
@@ -1961,6 +1965,7 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 selected_file: None,
                 opened_at: Instant::now(),
                 path_completion: None,
+                remember_path_on_success: None,
                 editor_find_open: false,
                 editor_find_query: String::new(),
                 editor_find_current: 0,
@@ -2053,10 +2058,10 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
     fn prep_terminal_command_for_size(
         rows: u16,
         cols: u16,
-        git_env: Option<(&str, &str)>,
+        git_cred: Option<GitCredential<'_>>,
     ) -> Vec<u8> {
         let mut buf = format!("stty rows {rows} cols {cols} 2>/dev/null\r").into_bytes();
-        buf.extend_from_slice(&prep_terminal_command(git_env));
+        buf.extend_from_slice(&prep_terminal_command(git_cred));
         buf
     }
 
@@ -2065,36 +2070,65 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         format!("'{}'", raw.replace('\'', "'\\''"))
     }
 
-    /// The prep-terminal sequence, with the git credential exports spliced
-    /// in ahead of the trailing `clear`.
+    /// The prep-terminal sequence, with the git credential-store setup
+    /// spliced in ahead of the trailing `clear`.
     ///
-    /// `git_env` is `(username, pat)` for users on the `personal_scripts`
-    /// allow-list who have cached a PAT — the remote shell gets `GIT_USER`
-    /// and `GIT_PAT` for that session only, so `git clone` / `git pull` over
-    /// HTTPS can use them. `HISTCONTROL=ignorespace` plus the leading space
-    /// on the export line keeps the token out of the remote shell history,
-    /// and the trailing `clear` wipes it from the visible screen.
-    fn prep_terminal_command(git_env: Option<(&str, &str)>) -> Vec<u8> {
+    /// `git_cred` is the (user, PAT, host) for a user on the allow-list who
+    /// has cached a token — the remote box gets git's credential store
+    /// populated (see `git_credential_store_command`), so `git clone` /
+    /// `git pull` over HTTPS authenticate without prompting, and it persists
+    /// across sessions. `None` (or an empty PAT) leaves git untouched.
+    fn prep_terminal_command(git_cred: Option<GitCredential<'_>>) -> Vec<u8> {
         const CLEAR: &[u8] = b"clear\r";
         let setup = PREP_TERMINAL_COMMAND
             .strip_suffix(CLEAR)
             .unwrap_or(PREP_TERMINAL_COMMAND);
         let mut buf = setup.to_vec();
-        if let Some((user, pat)) = git_env {
-            if !pat.is_empty() {
+        if let Some(cred) = git_cred {
+            if !cred.pat.is_empty() {
                 buf.extend_from_slice(b"export HISTCONTROL=ignorespace:ignoredups\r");
-                buf.extend_from_slice(
-                    format!(
-                        " export GIT_USER={} GIT_PAT={}\r",
-                        shell_single_quote(user),
-                        shell_single_quote(pat)
-                    )
-                    .as_bytes(),
-                );
+                buf.extend_from_slice(&git_credential_store_command(&cred));
             }
         }
         buf.extend_from_slice(CLEAR);
         buf
+    }
+
+    /// A git personal access token, scoped to one host, for the git
+    /// credential store on the remote box.
+    #[derive(Clone, Copy, Debug)]
+    struct GitCredential<'a> {
+        user: &'a str,
+        pat: &'a str,
+        host: &'a str,
+    }
+
+    /// One `\r`-terminated shell line that persists `cred` into git's
+    /// credential store on the remote box, so `git clone` / `git pull` over
+    /// HTTPS authenticate without prompting.
+    ///
+    /// It is idempotent and self-healing: it enables `credential.helper
+    /// store`, then rewrites `~/.git-credentials` so the line for this host
+    /// reflects the *current* user+PAT (dropping any stale one — a rotated
+    /// token replaces the old value rather than sitting behind it). The
+    /// leading space plus `HISTCONTROL=ignorespace` (set by the caller)
+    /// keeps the token out of the remote shell history; the caller's
+    /// trailing `clear` wipes it off the screen. Credentials for other
+    /// hosts are preserved.
+    fn git_credential_store_command(cred: &GitCredential<'_>) -> Vec<u8> {
+        let host_marker = shell_single_quote(&format!("@{}", cred.host));
+        let url = shell_single_quote(&format!(
+            "https://{}:{}@{}",
+            cred.user, cred.pat, cred.host
+        ));
+        // Leading space → kept out of history (ignorespace).
+        format!(
+            " git config --global credential.helper store >/dev/null 2>&1; \
+             f=~/.git-credentials; touch \"$f\"; chmod 600 \"$f\"; \
+             grep -vF {host_marker} \"$f\" > \"$f.tmp\" 2>/dev/null; \
+             printf '%s\\n' {url} >> \"$f.tmp\"; mv \"$f.tmp\" \"$f\"\r"
+        )
+        .into_bytes()
     }
 
     /// Output that means a git operation was rejected for bad/expired
@@ -2198,6 +2232,16 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 key: key?,
             })
         }
+    }
+
+    /// Substitute script placeholders before a body is pasted. Currently
+    /// `{{user}}` → the local OS username (the name in features.json's
+    /// `allowed_users`), so a shared default script can target a per-user
+    /// path like `/home/efs/{{user}}`. The token is remote-shell-agnostic:
+    /// the remote `$USER` is the SSM/root account, not the person running
+    /// the app, so the substitution has to happen locally.
+    fn expand_script_placeholders(body: &str, user: &str) -> String {
+        body.replace("{{user}}", user).replace("{{USER}}", user)
     }
 
     /// Turn a script body into terminal bytes: one CR-terminated line each,
@@ -2677,10 +2721,17 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         secondary_bastion_filter: String,
         /// Usernames delete_user must never remove (from features.json).
         protected_users: Vec<String>,
-        /// Build-time gate: whether the current OS user may add personal
-        /// scripts (features.json `personal_scripts.allowed_users`). Also
-        /// gates the git-PAT prompt and the GIT_USER/GIT_PAT exports.
-        personal_scripts_enabled: bool,
+        /// Build-time gate (features.json `personal_scripts.allowed_users`):
+        /// whether the current OS user gets the git integration — the PAT
+        /// prompt, git's credential store populated by Prep Terminal, and the
+        /// hardcoded `default_scripts`. The plain "Add Script" feature is
+        /// available regardless.
+        git_scripts_enabled: bool,
+        /// Host the git credential store is scoped to (features.json).
+        git_host: String,
+        /// Hardcoded scripts from features.json (e.g. the Ctrl+1 re-clone),
+        /// shown to allow-listed users. Read-only — not in config.ini.
+        default_scripts: Vec<PersonalScript>,
         /// Active "Add Script" / "Edit Script" modal, if any.
         script_editor: Option<ScriptEditor>,
         /// Personal script awaiting delete confirmation (index into
@@ -2793,21 +2844,34 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
             let terminals = filter_embedded_terminals(discover_terminals());
             let selected_terminal_id = initial_terminal_id(&config, &terminals);
             let gui_smoke = gui_smoke_config_from_env();
-            let personal_scripts_enabled =
-                features.personal_scripts_visible_for(&ec2_manager::features::current_os_user());
+            let os_user = ec2_manager::features::current_os_user();
+            let git_scripts_enabled = features.git_scripts_enabled_for(&os_user);
+            let git_host = features.git_host();
+            // Hardcoded default scripts (Ctrl+1 re-clone, …) for allow-listed
+            // users. Parsed once here; hotkeys are validated at dispatch.
+            let default_scripts: Vec<PersonalScript> = features
+                .default_scripts_for(&os_user)
+                .into_iter()
+                .filter(|s| !s.name.trim().is_empty() && !s.body.trim().is_empty())
+                .map(|s| PersonalScript {
+                    name: s.name,
+                    hotkey: s.hotkey,
+                    body: s.body,
+                })
+                .collect();
             // Allow-listed users are prompted for their git PAT on first
             // launch; afterwards it's cached in config.ini and updated from
             // the Scripts menu (or when git rejects it).
-            let pat_dialog = (personal_scripts_enabled
+            let pat_dialog = (git_scripts_enabled
                 && config.git_pat.as_deref().unwrap_or("").is_empty())
             .then(|| PatDialog {
                 pat: String::new(),
                 reveal: false,
-                reason: Some(
-                    "Prep Terminal exports this to the remote shell as GIT_PAT so git can \
-                     authenticate. Leave it blank to skip."
-                        .to_string(),
-                ),
+                reason: Some(format!(
+                    "Prep Terminal stores this in git's credential helper on the remote box \
+                     (scoped to {git_host}) so git clone / git pull authenticate without \
+                     prompting. Leave it blank to skip."
+                )),
             });
             let dark_mode = config.theme.as_deref() != Some("light");
             let scroll_sensitivity = config.scroll_sensitivity.unwrap_or(10.0);
@@ -2950,7 +3014,9 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 primary_bastion_filter: features.primary_bastion_filter.clone(),
                 secondary_bastion_filter: features.secondary_bastion_filter.clone(),
                 protected_users: features.protected_users.clone(),
-                personal_scripts_enabled,
+                git_scripts_enabled,
+                git_host,
+                default_scripts,
                 script_editor: None,
                 pending_script_delete: None,
                 pat_dialog,
@@ -4958,10 +5024,12 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
             ctx.request_repaint_after(Duration::from_millis(500));
         }
 
-        /// `(username, PAT)` to export to the remote shell on Prep Terminal,
-        /// when the user is allow-listed and has cached a token.
-        fn git_env(&self) -> Option<(String, String)> {
-            if !self.personal_scripts_enabled {
+        /// `(username, PAT, host)` for the git credential store, when the
+        /// user is allow-listed and has cached a token. The username is the
+        /// cached PAT-holder's OS name — the credential store only needs a
+        /// non-empty username field alongside the token.
+        fn git_credential_parts(&self) -> Option<(String, String, String)> {
+            if !self.git_scripts_enabled {
                 return None;
             }
             let pat = self
@@ -4969,30 +5037,57 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 .git_pat
                 .clone()
                 .filter(|pat| !pat.trim().is_empty())?;
-            Some((ec2_manager::features::current_os_user(), pat))
+            let user = {
+                let u = ec2_manager::features::current_os_user();
+                if u.is_empty() {
+                    "git".to_string()
+                } else {
+                    u
+                }
+            };
+            Some((user, pat, self.git_host.clone()))
         }
 
         /// Prep-terminal bytes for `tab_id`, sized to its PTY and carrying
-        /// the git exports when configured.
+        /// the git credential-store setup when configured.
         fn prep_bytes_for_tab(&self, tab_id: u64) -> Vec<u8> {
             let (rows, cols) = self
                 .pty_sessions
                 .get(&tab_id)
                 .and_then(|s| s.last_size)
                 .unwrap_or((24, 120));
-            let git = self.git_env();
+            let git = self.git_credential_parts();
             prep_terminal_command_for_size(
                 rows,
                 cols,
-                git.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
+                git.as_ref().map(|(u, p, h)| GitCredential {
+                    user: u,
+                    pat: p,
+                    host: h,
+                }),
             )
         }
 
-        /// Paste a personal script into the focused connection tab.
+        /// Run a personal (config.ini) script by index.
         fn run_personal_script(&mut self, index: usize) {
             let Some(script) = self.config.personal_scripts.get(index).cloned() else {
                 return;
             };
+            self.run_script_body(&script.name, &script.body);
+        }
+
+        /// Run a hardcoded default (features.json) script by index.
+        fn run_default_script(&mut self, index: usize) {
+            let Some(script) = self.default_scripts.get(index).cloned() else {
+                return;
+            };
+            self.run_script_body(&script.name, &script.body);
+        }
+
+        /// Paste a script body into the focused connection tab, exactly as a
+        /// multi-line clipboard paste. Fails with a status line if there is
+        /// no live tab.
+        fn run_script_body(&mut self, name: &str, body: &str) {
             let tab_id = self
                 .connections
                 .selected()
@@ -5005,23 +5100,23 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 .filter(|id| self.pty_sessions.contains_key(id));
             let Some(tab_id) = tab_id else {
                 let msg = format!(
-                    "Script '{}': no live connection tab — connect to an instance first.",
-                    script.name
+                    "Script '{name}': no live connection tab — connect to an instance first."
                 );
                 self.log_error(msg.clone());
                 self.set_script_status(msg, ScriptState::Failed);
                 return;
             };
-            let payload = script_payload(&script.body);
+            let expanded =
+                expand_script_placeholders(body, &ec2_manager::features::current_os_user());
+            let payload = script_payload(&expanded);
             if payload.is_empty() {
-                let msg = format!("Script '{}' is empty.", script.name);
+                let msg = format!("Script '{name}' is empty.");
                 self.log_error(msg.clone());
                 self.set_script_status(msg, ScriptState::Failed);
                 return;
             }
             self.log_info(format!(
-                "running script '{}' in tab {tab_id} ({} bytes)",
-                script.name,
+                "running script '{name}' in tab {tab_id} ({} bytes)",
                 payload.len()
             ));
             self.main_tab = MainTab::Connections;
@@ -5055,7 +5150,7 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         /// Raise the PAT prompt after git rejected the current token. Rate-
         /// limited: a failing `git pull` prints several matching lines.
         fn prompt_pat_update_from_git_failure(&mut self) {
-            if !self.personal_scripts_enabled || self.pat_dialog.is_some() {
+            if !self.git_scripts_enabled || self.pat_dialog.is_some() {
                 return;
             }
             if let Some(at) = self.last_git_failure_prompt {
@@ -5067,7 +5162,7 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
             self.log_info("git authentication failed — prompting for an updated PAT");
             self.open_pat_dialog(Some(
                 "git rejected these credentials. Enter a current PAT, then click Prep \
-                 Terminal on the tab to re-export it."
+                 Terminal on the tab to refresh the stored credential."
                     .to_string(),
             ));
         }
@@ -5080,26 +5175,37 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
             }
         }
 
-        /// Fire a personal script whose hotkey was pressed this frame. Only
-        /// while the app owns the OS focus and no modal is up.
+        /// Fire a script whose hotkey was pressed this frame. Only while the
+        /// app owns the OS focus and no modal is up. Hardcoded default
+        /// scripts are checked first, so a features.json Ctrl+1 wins over a
+        /// personal binding to the same keys.
         fn poll_script_hotkeys(&mut self, ctx: &egui::Context) {
             self.hotkey_consumed_frame = false;
             if self.script_editor.is_some()
                 || self.pat_dialog.is_some()
                 || self.pending_script_delete.is_some()
-                || self.config.personal_scripts.is_empty()
+                || (self.default_scripts.is_empty()
+                    && self.config.personal_scripts.is_empty())
             {
                 return;
             }
             if !ctx.input(|i| i.focused) {
                 return;
             }
-            let bindings: Vec<(usize, Hotkey)> = self
-                .config
-                .personal_scripts
+            // (is_default, index, hotkey) — defaults first so they take
+            // precedence on a collision.
+            let bindings: Vec<(bool, usize, Hotkey)> = self
+                .default_scripts
                 .iter()
                 .enumerate()
-                .filter_map(|(i, s)| Hotkey::parse(&s.hotkey).map(|hk| (i, hk)))
+                .filter_map(|(i, s)| Hotkey::parse(&s.hotkey).map(|hk| (true, i, hk)))
+                .chain(
+                    self.config
+                        .personal_scripts
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, s)| Hotkey::parse(&s.hotkey).map(|hk| (false, i, hk))),
+                )
                 .collect();
             if bindings.is_empty() {
                 return;
@@ -5113,16 +5219,20 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                         ..
                     } => bindings
                         .iter()
-                        .find(|(_, hk)| hk.matches(*key, *modifiers))
-                        .map(|(idx, _)| *idx),
+                        .find(|(_, _, hk)| hk.matches(*key, *modifiers))
+                        .map(|(is_default, idx, _)| (*is_default, *idx)),
                     _ => None,
                 })
             });
-            if let Some(index) = fired {
+            if let Some((is_default, index)) = fired {
                 // Swallow the key press for this frame so it isn't also typed
                 // into the terminal that has keyboard focus.
                 self.hotkey_consumed_frame = true;
-                self.run_personal_script(index);
+                if is_default {
+                    self.run_default_script(index);
+                } else {
+                    self.run_personal_script(index);
+                }
             }
         }
 
@@ -5258,17 +5368,24 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                     dlg.error = Some("Give the script a name.".to_string());
                 } else if dlg.body.trim().is_empty() {
                     dlg.error = Some("The script is empty.".to_string());
-                } else if let Some(clash) = self
-                    .config
-                    .personal_scripts
-                    .iter()
-                    .enumerate()
-                    .find(|(i, s)| {
-                        !hotkey.is_empty()
-                            && s.hotkey == hotkey
-                            && Some(*i) != dlg.index
+                } else if let Some(clash) = (!hotkey.is_empty())
+                    .then(|| {
+                        // A features.json default script owns its hotkey — a
+                        // personal binding can't override it.
+                        self.default_scripts
+                            .iter()
+                            .find(|s| s.hotkey == hotkey)
+                            .map(|s| s.name.clone())
+                            .or_else(|| {
+                                self.config
+                                    .personal_scripts
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(i, s)| s.hotkey == hotkey && Some(*i) != dlg.index)
+                                    .map(|(_, s)| s.name.clone())
+                            })
                     })
-                    .map(|(_, s)| s.name.clone())
+                    .flatten()
                 {
                     dlg.error = Some(format!("{hotkey} is already bound to '{clash}'."));
                 } else {
@@ -5318,10 +5435,10 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 .open(&mut window_open)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.label(format!("Delete the script '{name}'?"));
+                    ui.label(format!("Are you sure you want to delete '{name}'?"));
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Delete").clicked() {
+                        if ui.button("Confirm").clicked() {
                             do_delete = true;
                         }
                         if ui.button("Cancel").clicked() {
@@ -5345,7 +5462,6 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
             let Some(mut dlg) = self.pat_dialog.take() else {
                 return;
             };
-            let os_user = ec2_manager::features::current_os_user();
             let mut window_open = true;
             let mut do_save = false;
             let mut do_cancel = false;
@@ -5379,9 +5495,11 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                     });
                     ui.add_space(4.0);
                     ui.label(format!(
-                        "Prep Terminal exports GIT_USER={os_user} and GIT_PAT to the remote \
-                         shell for that session only. The token is cached in your local \
-                         config file — it is not encrypted."
+                        "Prep Terminal stores this in git's credential helper on the remote box \
+                         (scoped to {host}) so git clone / git pull over HTTPS authenticate \
+                         without prompting. The token is cached in your local config file — it \
+                         is not encrypted.",
+                        host = self.git_host,
                     ));
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -6845,9 +6963,11 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| "/".to_string())
             } else {
+                // Prefer the path the user last navigated to on this instance;
+                // fall back to the configured default, then /home/ec2-user.
                 self.config
-                    .default_remote_browser_path
-                    .clone()
+                    .file_browser_path(&instance_id)
+                    .or_else(|| self.config.default_remote_browser_path.clone())
                     .unwrap_or_else(|| "/home/ec2-user".to_string())
             };
             let mut fb_state = FileBrowserState {
@@ -6995,9 +7115,9 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
             // output arrives from the reader thread.
             self.poll_ui_events();
 
-            // Snapshot the git exports up front: the auto-prep below runs
+            // Snapshot the git credential up front: the auto-prep below runs
             // while `self.pty_sessions` is mutably borrowed.
-            let git_env = self.git_env();
+            let git_cred = self.git_credential_parts();
 
             // Drain proc_rx with a per-frame cap so a flood of output
             // (e.g., sudo su - motd, terraform plan diff, awk over
@@ -7260,7 +7380,11 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                         let prep = prep_terminal_command_for_size(
                             rows,
                             cols,
-                            git_env.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
+                            git_cred.as_ref().map(|(u, p, h)| GitCredential {
+                                user: u,
+                                pat: p,
+                                host: h,
+                            }),
                         );
                         if let Ok(mut stdin) = session.writer.lock() {
                             let _ = stdin.write_all(&prep)
@@ -7305,9 +7429,9 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 if let Some(msg) = connect_diag {
                     self.log_info(msg);
                 }
-                // git rejected the exported PAT (expired, revoked, typo'd) —
+                // git rejected the stored PAT (expired, revoked, typo'd) —
                 // offer to update it rather than leave the user to guess.
-                if self.personal_scripts_enabled
+                if self.git_scripts_enabled
                     && looks_like_git_auth_failure(&String::from_utf8_lossy(&bytes))
                 {
                     self.prompt_pat_update_from_git_failure();
@@ -8254,6 +8378,9 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                         // an expanded directory, so the user can drill in
                         // without waiting on each new level.
                         let mut subdirs_to_prefetch: Vec<String> = Vec::new();
+                        // A typed path whose listing just succeeded becomes
+                        // this instance's remembered browser path.
+                        let mut remember_path: Option<String> = None;
                         if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
                             fb.fetching_dirs.remove(&path);
                             fb.dir_cache.insert(path.clone(), entries.clone());
@@ -8262,6 +8389,10 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                                 fb.status = FileOpStatus::Idle;
                             }
                             fb.initialized = true;
+                            if fb.remember_path_on_success.as_deref() == Some(path.as_str()) {
+                                fb.remember_path_on_success = None;
+                                remember_path = Some(path.clone());
+                            }
 
                             let should_cascade =
                                 fb.current_path == path || fb.expanded_dirs.contains(&path);
@@ -8290,6 +8421,30 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                         }
                         for child in subdirs_to_prefetch {
                             self.request_bg_listing(tab_id, child);
+                        }
+                        if let Some(path) = remember_path {
+                            let instance_id = self
+                                .connections
+                                .tabs()
+                                .iter()
+                                .find(|t| t.id == tab_id)
+                                .map(|t| t.instance_id.clone())
+                                .unwrap_or_default();
+                            if !instance_id.is_empty()
+                                && self.config.file_browser_path(&instance_id).as_deref()
+                                    != Some(path.as_str())
+                            {
+                                self.config.set_file_browser_path(&instance_id, &path);
+                                if let Err(err) = self.config.save() {
+                                    self.log_error(format!(
+                                        "failed to save file-browser path: {err}"
+                                    ));
+                                } else {
+                                    self.log_info(format!(
+                                        "remembered file-browser path for {instance_id}: {path}"
+                                    ));
+                                }
+                            }
                         }
                     }
                     FileOpEvent::ListingFailed { tab_id, error } => {
@@ -10543,6 +10698,9 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
 
             // Path bar
             let mut navigate_to: Option<String> = None;
+            // True when the navigation came from the user typing into the
+            // path box (Enter / Go) — those are remembered per instance.
+            let mut remember_typed = false;
             let mut refresh_all = false;
             let busy = matches!(
                 status,
@@ -10661,11 +10819,13 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                         response.request_focus();
                     } else {
                         navigate_to = Some(path_input.clone());
+                        remember_typed = true;
                     }
                 }
 
                 if ui.small_button("Go").clicked() {
                     navigate_to = Some(path_input.clone());
+                    remember_typed = true;
                 }
                 if ui
                     .add_enabled(!busy, egui::Button::new("Refresh").small())
@@ -11048,6 +11208,11 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
 
             // Handle navigation
             if let Some(path) = navigate_to {
+                // A typed navigation is remembered for this instance once its
+                // listing succeeds (see the ListingCompleted handler).
+                if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                    fb.remember_path_on_success = remember_typed.then(|| path.clone());
+                }
                 if refresh_all {
                     // Invalidate entire cache and refresh expanded dirs
                     let expanded: Vec<String> = self.file_browsers.get(&tab_id)
@@ -12394,8 +12559,10 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
 
                         let script_count = 1
                             + usize::from(self.allow_delete_user)
+                            + self.default_scripts.len()
                             + self.config.personal_scripts.len();
                         let mut open_dialog: Option<bool> = None;
+                        let mut run_default: Option<usize> = None;
                         let mut run_script: Option<usize> = None;
                         let mut edit_script: Option<usize> = None;
                         let mut delete_script: Option<usize> = None;
@@ -12415,8 +12582,29 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                                     ui.close();
                                 }
 
-                                // Personal scripts sit below the built-in
-                                // ones, each with edit / delete on the right.
+                                // Hardcoded default scripts (features.json) —
+                                // runnable, with their hotkey, but read-only.
+                                if !self.default_scripts.is_empty() {
+                                    ui.separator();
+                                }
+                                for (i, script) in self.default_scripts.iter().enumerate() {
+                                    let label = if script.hotkey.is_empty() {
+                                        script.name.clone()
+                                    } else {
+                                        format!("{}  ({})", script.name, script.hotkey)
+                                    };
+                                    if ui
+                                        .selectable_label(false, label)
+                                        .on_hover_text("Run in the open connection tab")
+                                        .clicked()
+                                    {
+                                        run_default = Some(i);
+                                        ui.close();
+                                    }
+                                }
+
+                                // Personal scripts sit below, each with edit /
+                                // delete on the right.
                                 if !self.config.personal_scripts.is_empty() {
                                     ui.separator();
                                 }
@@ -12448,12 +12636,16 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                                     });
                                 }
 
-                                if self.personal_scripts_enabled {
-                                    ui.separator();
-                                    if ui.selectable_label(false, "Add Script…").clicked() {
-                                        add_script = true;
-                                        ui.close();
-                                    }
+                                // Add Script is available to everyone.
+                                ui.separator();
+                                if ui.selectable_label(false, "Add Script…").clicked() {
+                                    add_script = true;
+                                    ui.close();
+                                }
+
+                                // The git PAT row is only for allow-listed
+                                // users (features.json).
+                                if self.git_scripts_enabled {
                                     ui.horizontal(|ui| {
                                         let set = self
                                             .config
@@ -12476,6 +12668,9 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                                     });
                                 }
                             });
+                        if let Some(i) = run_default {
+                            self.run_default_script(i);
+                        }
                         if let Some(i) = run_script {
                             self.run_personal_script(i);
                         }
@@ -15439,41 +15634,70 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         /// Each line is CR-terminated so the paste drip-feed treats it as its
         /// own command; CRLF bodies (pasted from Notepad) must not double up.
         #[test]
+        fn user_placeholder_expands_to_the_os_username() {
+            let body = "rm -rf /home/efs/{{user}} && git clone $URL /home/efs/{{USER}}";
+            assert_eq!(
+                expand_script_placeholders(body, "conrad1861"),
+                "rm -rf /home/efs/conrad1861 && git clone $URL /home/efs/conrad1861"
+            );
+            // No placeholder → unchanged.
+            assert_eq!(expand_script_placeholders("echo hi", "conrad1861"), "echo hi");
+        }
+
+        #[test]
         fn script_payload_sends_one_cr_per_line() {
             assert_eq!(script_payload("echo hi\r\necho bye\n"), b"echo hi\recho bye\r");
             assert_eq!(script_payload("echo hi"), b"echo hi\r");
             assert_eq!(script_payload(""), b"");
         }
 
+        fn cred<'a>(user: &'a str, pat: &'a str, host: &'a str) -> GitCredential<'a> {
+            GitCredential { user, pat, host }
+        }
+
         #[test]
-        fn prep_terminal_exports_git_credentials_when_set() {
-            let bytes = prep_terminal_command(Some(("bconrad", "abc123")));
+        fn prep_terminal_populates_the_credential_store_when_set() {
+            let bytes = prep_terminal_command(Some(cred("bconrad", "abc123", "github.com")));
             let text = String::from_utf8_lossy(&bytes);
-            assert!(text.contains(" export GIT_USER='bconrad' GIT_PAT='abc123'\r"));
+            // Enables the store helper and writes the host's URL with the PAT.
+            assert!(text.contains("git config --global credential.helper store"));
+            assert!(text.contains("https://bconrad:abc123@github.com"));
+            // Drops any stale line for this host before re-adding it.
+            assert!(text.contains("grep -vF '@github.com'"));
             // Leading space + ignorespace keeps the token out of bash history.
             assert!(text.contains("HISTCONTROL=ignorespace"));
-            // …and the exports land before the clear that hides them.
+            // …and the setup lands before the clear that hides it.
             assert!(text.ends_with("clear\r"));
             assert_eq!(text.matches("clear\r").count(), 1);
         }
 
         #[test]
-        fn prep_terminal_omits_exports_without_a_pat() {
-            for git_env in [None, Some(("bconrad", ""))] {
-                let bytes = prep_terminal_command(git_env);
+        fn prep_terminal_scopes_to_the_configured_host() {
+            let bytes = prep_terminal_command(Some(cred("u", "t", "git.internal")));
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains("https://u:t@git.internal"));
+            assert!(!text.contains("github.com"));
+        }
+
+        #[test]
+        fn prep_terminal_omits_git_setup_without_a_pat() {
+            let none: Option<GitCredential<'_>> = None;
+            for git_cred in [none, Some(cred("bconrad", "", "github.com"))] {
+                let bytes = prep_terminal_command(git_cred);
                 let text = String::from_utf8_lossy(&bytes);
-                assert!(!text.contains("GIT_PAT"), "unexpected export: {text}");
+                assert!(!text.contains("git-credentials"), "unexpected setup: {text}");
+                assert!(!text.contains("credential.helper"), "unexpected setup: {text}");
                 assert!(text.starts_with("exec bash\r"));
                 assert!(text.ends_with("clear\r"));
             }
         }
 
-        /// A quote in the token must not break out of the export.
+        /// A quote in the token must not break out of the printf argument.
         #[test]
         fn prep_terminal_quotes_a_pat_containing_a_quote() {
-            let bytes = prep_terminal_command(Some(("u", "a'b")));
+            let bytes = prep_terminal_command(Some(cred("u", "a'b", "github.com")));
             let text = String::from_utf8_lossy(&bytes);
-            assert!(text.contains(r"GIT_PAT='a'\''b'"), "{text}");
+            assert!(text.contains(r"https://u:a'\''b@github.com"), "{text}");
         }
 
         #[test]

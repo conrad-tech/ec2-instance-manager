@@ -21,8 +21,16 @@
     "token": "",
     "allowed_users": []
   },
-  "_personal_scripts_comment": "\"Add Script\" in the Scripts menu: users on allowed_users can save their own shell scripts (optionally bound to a hotkey) and are prompted once for a git personal access token, which Prep Terminal exports to the remote shell as GIT_USER/GIT_PAT for that session. Same matching rules as alerts.allowed_users: OS username, case-insensitive, [\"*\"] = everyone, [] = nobody (the shipped default). The PAT is cached in the user's local config.ini (base64, not encrypted) — never in this file.",
+  "_personal_scripts_comment": "\"Add Script\" in the Scripts menu (save your own shell scripts, optionally bound to a hotkey, that paste into the focused connection tab) is available to everyone. This section instead gates the git integration: users on allowed_users are prompted once for a git personal access token, get git's credential store on the remote box populated by Prep Terminal (scoped to git_host, so git clone/pull over HTTPS just work), and receive the hardcoded default_scripts below (e.g. a Ctrl+1 're-clone the repo' script). Users NOT on the list can still create their own scripts and bind Ctrl+1 themselves. Matching: OS username, case-insensitive, [\"*\"] = everyone, [] = nobody (the shipped default). The PAT is cached in the user's local config.ini (base64, not encrypted) — never in this file. default_scripts fields: name, hotkey (e.g. \"Ctrl+1\"), body (the shell script; the credential store makes the clone auth automatically). In a body, {{user}} is replaced with the local OS username (the allowed_users name) before it runs — use it for per-user paths like /home/efs/{{user}}, since the remote $USER is the SSM/root account, not the person running the app.",
   "personal_scripts": {
-    "allowed_users": []
+    "allowed_users": [],
+    "git_host": "github.YOUR-ENTERPRISE.com",
+    "default_scripts": [
+      {
+        "name": "Re-clone repo",
+        "hotkey": "Ctrl+1",
+        "body": "rm -rf /home/efs/{{user}} && git clone https://github.YOUR-ENTERPRISE.com/YOUR-ORG/YOUR-REPO.git /home/efs/{{user}}"
+      }
+    ]
   }
 }

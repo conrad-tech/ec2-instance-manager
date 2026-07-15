@@ -73,6 +73,10 @@ pub struct AppConfig {
     /// Terminal. Stored base64-encoded in config.ini — that is obfuscation,
     /// not encryption: anyone who can read the file can read the token.
     pub git_pat: Option<String>,
+    /// Last file-browser path the user navigated to, keyed by instance id.
+    /// Re-opening that instance starts the browser here instead of the
+    /// default. Only set once the listing for the path succeeds.
+    pub file_browser_paths: BTreeMap<String, String>,
 }
 
 impl Default for AppConfig {
@@ -123,6 +127,7 @@ impl Default for AppConfig {
             bastion_selections: BTreeMap::new(),
             personal_scripts: Vec::new(),
             git_pat: None,
+            file_browser_paths: BTreeMap::new(),
         }
     }
 }
@@ -236,6 +241,27 @@ impl AppConfig {
     pub fn set_bastion_selection(&mut self, env: &str, primary: &str, secondary: &str) {
         self.bastion_selections
             .insert(env.to_string(), format!("{primary}|{secondary}"));
+    }
+
+    /// The remembered file-browser path for an instance, if the user has
+    /// navigated there before.
+    pub fn file_browser_path(&self, instance_id: &str) -> Option<String> {
+        self.file_browser_paths
+            .get(instance_id)
+            .filter(|p| !p.trim().is_empty())
+            .cloned()
+    }
+
+    /// Remember the file-browser path for an instance. A no-op when either
+    /// side is blank, so a stray empty value never displaces the default.
+    pub fn set_file_browser_path(&mut self, instance_id: &str, path: &str) {
+        let instance_id = instance_id.trim();
+        let path = path.trim();
+        if instance_id.is_empty() || path.is_empty() {
+            return;
+        }
+        self.file_browser_paths
+            .insert(instance_id.to_string(), path.to_string());
     }
 
     pub fn scope_key(account_id: &str, region: &str) -> String {
@@ -442,6 +468,14 @@ impl AppConfig {
             if let Some(rest) = key.strip_prefix("bastion_pair.") {
                 if !rest.is_empty() && !value.is_empty() {
                     cfg.bastion_selections
+                        .insert(rest.to_string(), value.to_string());
+                }
+                continue;
+            }
+
+            if let Some(rest) = key.strip_prefix("fb_path.") {
+                if !rest.is_empty() && !value.is_empty() {
+                    cfg.file_browser_paths
                         .insert(rest.to_string(), value.to_string());
                 }
                 continue;
@@ -780,6 +814,10 @@ impl AppConfig {
             lines.push(format!("git_pat={}", encode_b64(pat)));
         }
 
+        for (instance, path) in &self.file_browser_paths {
+            lines.push(format!("fb_path.{instance}={path}"));
+        }
+
         lines.push(String::new());
         lines.join("\n")
     }
@@ -939,6 +977,32 @@ mod tests {
             AppConfig::parse(&text).git_pat.as_deref(),
             Some("s3cr3t-token")
         );
+    }
+
+    #[test]
+    fn file_browser_paths_round_trip() {
+        let mut cfg = AppConfig::default();
+        cfg.set_file_browser_path("i-0abc123", "/home/efs/conrad1861");
+        // A path containing '=' survives (split_once keeps the value whole).
+        cfg.set_file_browser_path("i-0def456", "/opt/app?x=1");
+        let parsed = AppConfig::parse(&cfg.to_text());
+        assert_eq!(
+            parsed.file_browser_path("i-0abc123").as_deref(),
+            Some("/home/efs/conrad1861")
+        );
+        assert_eq!(
+            parsed.file_browser_path("i-0def456").as_deref(),
+            Some("/opt/app?x=1")
+        );
+        assert_eq!(parsed.file_browser_path("i-never"), None);
+    }
+
+    #[test]
+    fn set_file_browser_path_ignores_blanks() {
+        let mut cfg = AppConfig::default();
+        cfg.set_file_browser_path("", "/x");
+        cfg.set_file_browser_path("i-1", "  ");
+        assert!(cfg.file_browser_paths.is_empty());
     }
 
     #[test]

@@ -27,25 +27,59 @@ pub struct Features {
     pub protected_users: Vec<String>,
     /// On-call Alerts button: Jira site + who may see it.
     pub alerts: AlertsFeature,
-    /// "Add Script" (personal scripts + git PAT): who may use it.
+    /// Git PAT + credential setup + default hotkey scripts: who gets them.
     pub personal_scripts: PersonalScriptsFeature,
+}
+
+/// A hardcoded script (from `assets/features.json`) handed to allow-listed
+/// users — e.g. the Ctrl+1 "re-clone the repo" script. Not editable in the
+/// UI; users off the list bind their own instead.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct DefaultScript {
+    pub name: String,
+    /// Canonical hotkey string, e.g. "Ctrl+1". Empty for menu-only.
+    pub hotkey: String,
+    /// Shell body, pasted into the focused connection tab when run.
+    pub body: String,
 }
 
 /// The `personal_scripts` section of `assets/features.json`.
 ///
-/// Users on `allowed_users` get the "Add Script" entry in the Scripts menu
-/// and are prompted once for a git personal access token, which Prep
-/// Terminal then exports to the remote shell as `GIT_PAT`.
-#[derive(Clone, Debug, Default, Deserialize)]
+/// The *personal scripts* feature ("Add Script") is available to everyone;
+/// this section instead gates the git integration: users on `allowed_users`
+/// are prompted once for a git personal access token, get git's credential
+/// store populated by Prep Terminal (scoped to `git_host`), and receive the
+/// hardcoded `default_scripts` (e.g. bound to Ctrl+1).
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct PersonalScriptsFeature {
-    /// OS usernames allowed to add personal scripts (case-insensitive).
+    /// OS usernames allowed the git PAT + default scripts (case-insensitive).
     /// `["*"]` for everyone; an empty list (the shipped default) for nobody.
     pub allowed_users: Vec<String>,
+    /// Host the cached PAT authenticates to (git credential store scope).
+    pub git_host: String,
+    /// Hardcoded scripts (with hotkeys) handed to allow-listed users.
+    pub default_scripts: Vec<DefaultScript>,
+}
+
+impl Default for PersonalScriptsFeature {
+    fn default() -> Self {
+        Self {
+            allowed_users: Vec::new(),
+            git_host: default_git_host(),
+            default_scripts: Vec::new(),
+        }
+    }
+}
+
+/// Host used for the git credential store when features.json omits one.
+fn default_git_host() -> String {
+    "github.com".to_string()
 }
 
 impl PersonalScriptsFeature {
-    /// True when `user` may add personal scripts / is prompted for a PAT.
+    /// True when `user` gets the git PAT + credential setup + default scripts.
     pub fn is_allowed_user(&self, user: &str) -> bool {
         let u = user.trim().to_ascii_lowercase();
         if u.is_empty() {
@@ -55,6 +89,16 @@ impl PersonalScriptsFeature {
             let a = a.trim();
             a == "*" || a.eq_ignore_ascii_case(&u)
         })
+    }
+
+    /// Host the credential store is scoped to, never empty.
+    pub fn host(&self) -> String {
+        let h = self.git_host.trim();
+        if h.is_empty() {
+            default_git_host()
+        } else {
+            h.to_string()
+        }
     }
 }
 
@@ -165,10 +209,27 @@ impl Features {
             && self.alerts.is_allowed_user(user)
     }
 
-    /// True when `user` may add personal scripts (and so is prompted for a
-    /// git PAT on launch). Fails closed — the shipped allow-list is empty.
-    pub fn personal_scripts_visible_for(&self, user: &str) -> bool {
+    /// True when `user` gets the git integration — the PAT prompt on launch,
+    /// the credential store populated by Prep Terminal, and the hardcoded
+    /// default scripts. Fails closed — the shipped allow-list is empty.
+    /// (The plain "Add Script" feature is available to everyone regardless.)
+    pub fn git_scripts_enabled_for(&self, user: &str) -> bool {
         self.personal_scripts.is_allowed_user(user)
+    }
+
+    /// The hardcoded default scripts for `user` — empty unless they are on
+    /// the allow-list.
+    pub fn default_scripts_for(&self, user: &str) -> Vec<DefaultScript> {
+        if self.git_scripts_enabled_for(user) {
+            self.personal_scripts.default_scripts.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Host the git credential store is scoped to.
+    pub fn git_host(&self) -> String {
+        self.personal_scripts.host()
     }
 
     /// True when `name` is on the protected never-delete list (case- and
@@ -287,33 +348,62 @@ mod tests {
     }
 
     #[test]
-    fn personal_scripts_follow_the_allow_list() {
+    fn git_scripts_follow_the_allow_list() {
         let f: Features =
             serde_json::from_str(r#"{"personal_scripts":{"allowed_users":["bconrad"]}}"#)
                 .expect("should parse");
-        assert!(f.personal_scripts_visible_for("bconrad"));
-        assert!(f.personal_scripts_visible_for("BConrad")); // case-insensitive
-        assert!(!f.personal_scripts_visible_for("someone.else"));
-        assert!(!f.personal_scripts_visible_for("")); // unknown user → hidden
+        assert!(f.git_scripts_enabled_for("bconrad"));
+        assert!(f.git_scripts_enabled_for("BConrad")); // case-insensitive
+        assert!(!f.git_scripts_enabled_for("someone.else"));
+        assert!(!f.git_scripts_enabled_for("")); // unknown user → off
     }
 
     #[test]
-    fn personal_scripts_wildcard_and_empty_list() {
+    fn git_scripts_wildcard_and_empty_list() {
         let all: Features =
             serde_json::from_str(r#"{"personal_scripts":{"allowed_users":["*"]}}"#)
                 .expect("should parse");
-        assert!(all.personal_scripts_visible_for("anyone"));
+        assert!(all.git_scripts_enabled_for("anyone"));
 
         let none: Features = serde_json::from_str(r#"{"personal_scripts":{"allowed_users":[]}}"#)
             .expect("should parse");
-        assert!(!none.personal_scripts_visible_for("bconrad"));
+        assert!(!none.git_scripts_enabled_for("bconrad"));
     }
 
-    /// Fails closed: a build without the section shows nobody the feature.
+    /// Fails closed: a build without the section gives nobody the git setup.
     #[test]
-    fn personal_scripts_missing_section_defaults_off() {
+    fn git_scripts_missing_section_defaults_off() {
         let f: Features = serde_json::from_str("{}").expect("should parse");
-        assert!(!f.personal_scripts_visible_for("bconrad"));
+        assert!(!f.git_scripts_enabled_for("bconrad"));
+        assert_eq!(f.git_host(), "github.com");
+    }
+
+    #[test]
+    fn git_host_defaults_and_overrides() {
+        let f: Features = serde_json::from_str("{}").expect("should parse");
+        assert_eq!(f.git_host(), "github.com");
+        let f: Features =
+            serde_json::from_str(r#"{"personal_scripts":{"git_host":"git.internal"}}"#)
+                .expect("should parse");
+        assert_eq!(f.git_host(), "git.internal");
+        // Blank falls back rather than yielding an empty host.
+        let f: Features =
+            serde_json::from_str(r#"{"personal_scripts":{"git_host":"  "}}"#).expect("should parse");
+        assert_eq!(f.git_host(), "github.com");
+    }
+
+    /// Default scripts reach allow-listed users only.
+    #[test]
+    fn default_scripts_gated_on_the_allow_list() {
+        let f: Features = serde_json::from_str(
+            r#"{"personal_scripts":{"allowed_users":["bconrad"],
+                "default_scripts":[{"name":"Re-clone","hotkey":"Ctrl+1","body":"echo hi"}]}}"#,
+        )
+        .expect("should parse");
+        let scripts = f.default_scripts_for("bconrad");
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0].hotkey, "Ctrl+1");
+        assert!(f.default_scripts_for("someone.else").is_empty());
     }
 
     #[test]
