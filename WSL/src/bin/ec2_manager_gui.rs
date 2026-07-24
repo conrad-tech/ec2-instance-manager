@@ -2256,6 +2256,283 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         out.into_bytes()
     }
 
+    /// VSCode-ish colours for the shell-script editor, picked per theme so the
+    /// Add/Edit Script body reads like a code buffer in both light and dark.
+    struct BashPalette {
+        default: egui::Color32,
+        comment: egui::Color32,
+        string: egui::Color32,
+        keyword: egui::Color32,
+        builtin: egui::Color32,
+        variable: egui::Color32,
+        number: egui::Color32,
+        /// Bracket-pair colours, cycled by nesting depth (VSCode's
+        /// `editorBracketHighlight.foreground1..3`).
+        bracket: [egui::Color32; 3],
+    }
+
+    impl BashPalette {
+        fn for_theme(dark: bool) -> Self {
+            if dark {
+                // VSCode "Dark+"
+                Self {
+                    default: egui::Color32::from_rgb(212, 212, 212),
+                    comment: egui::Color32::from_rgb(106, 153, 85),
+                    string: egui::Color32::from_rgb(206, 145, 120),
+                    keyword: egui::Color32::from_rgb(86, 156, 214),
+                    builtin: egui::Color32::from_rgb(220, 220, 170),
+                    variable: egui::Color32::from_rgb(156, 220, 254),
+                    number: egui::Color32::from_rgb(181, 206, 168),
+                    bracket: [
+                        egui::Color32::from_rgb(255, 215, 0),   // gold
+                        egui::Color32::from_rgb(218, 112, 214), // orchid
+                        egui::Color32::from_rgb(23, 159, 255),  // blue
+                    ],
+                }
+            } else {
+                // VSCode "Light+"
+                Self {
+                    default: egui::Color32::from_rgb(0, 0, 0),
+                    comment: egui::Color32::from_rgb(0, 128, 0),
+                    string: egui::Color32::from_rgb(163, 21, 21),
+                    keyword: egui::Color32::from_rgb(0, 0, 255),
+                    builtin: egui::Color32::from_rgb(121, 94, 38),
+                    variable: egui::Color32::from_rgb(9, 134, 88),
+                    number: egui::Color32::from_rgb(9, 134, 88),
+                    bracket: [
+                        egui::Color32::from_rgb(4, 49, 250),  // blue
+                        egui::Color32::from_rgb(49, 147, 49), // green
+                        egui::Color32::from_rgb(123, 56, 20), // brown
+                    ],
+                }
+            }
+        }
+    }
+
+    /// Bash control keywords, coloured like VSCode's shell grammar.
+    const BASH_KEYWORDS: &[&str] = &[
+        "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+        "in", "function", "select", "time", "coproc",
+    ];
+
+    /// A small set of shell builtins we tint like commands.
+    const BASH_BUILTINS: &[&str] = &[
+        "echo", "printf", "read", "cd", "pushd", "popd", "export", "local", "declare", "readonly",
+        "unset", "set", "alias", "source", "eval", "exec", "trap", "return", "exit", "shift",
+        "test", "sudo",
+    ];
+
+    /// Build a coloured `LayoutJob` for a shell-script body — a lightweight,
+    /// dependency-free bash highlighter (comments, single/double-quoted
+    /// strings, `$variables`, keywords, builtins, numbers, bracket pairs) so
+    /// the Add/Edit Script editor reads like a VSCode buffer.
+    ///
+    /// Every byte of `text` is emitted into the job exactly once and slice
+    /// boundaries only land on ASCII delimiters, so the resulting galley stays
+    /// byte-for-byte in sync with the `TextEdit` buffer (cursor/selection map
+    /// correctly even with UTF-8 in the script).
+    fn highlight_bash(text: &str, font_id: egui::FontId, dark: bool) -> egui::text::LayoutJob {
+        use egui::text::{LayoutJob, TextFormat};
+        let pal = BashPalette::for_theme(dark);
+        let b = text.as_bytes();
+        let n = b.len();
+        let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let is_boundary = |c: u8| {
+            matches!(
+                c,
+                b' ' | b'\t'
+                    | b'\n'
+                    | b'\r'
+                    | b';'
+                    | b'|'
+                    | b'&'
+                    | b'('
+                    | b')'
+                    | b'{'
+                    | b'`'
+                    | b'='
+                    | b'<'
+                    | b'>'
+            )
+        };
+
+        let mut job = LayoutJob::default();
+        {
+            let mut emit = |slice: &str, color: egui::Color32| {
+                if !slice.is_empty() {
+                    job.append(slice, 0.0, TextFormat::simple(font_id.clone(), color));
+                }
+            };
+
+            let mut i = 0usize;
+            // Start of the pending run of default-coloured bytes; flushed just
+            // before any coloured token and once more at the very end.
+            let mut def_start = 0usize;
+            // Openers seen so far, for depth-coloured bracket pairs.
+            let mut open: Vec<u8> = Vec::new();
+
+            while i < n {
+                let c = b[i];
+
+                // `#` through end of line — but only when it opens a word
+                // (start of input or after a separator), so `foo#bar` is literal.
+                if c == b'#' && (i == 0 || is_boundary(b[i - 1])) {
+                    emit(&text[def_start..i], pal.default);
+                    let mut j = i + 1;
+                    while j < n && b[j] != b'\n' {
+                        j += 1;
+                    }
+                    emit(&text[i..j], pal.comment);
+                    i = j;
+                    def_start = j;
+                    continue;
+                }
+
+                // Single-quoted string (no escapes in bash); stop at a newline
+                // if unterminated so a stray quote can't recolour the rest.
+                if c == b'\'' {
+                    emit(&text[def_start..i], pal.default);
+                    let mut j = i + 1;
+                    while j < n && b[j] != b'\'' && b[j] != b'\n' {
+                        j += 1;
+                    }
+                    if j < n && b[j] == b'\'' {
+                        j += 1;
+                    }
+                    emit(&text[i..j], pal.string);
+                    i = j;
+                    def_start = j;
+                    continue;
+                }
+
+                // Double-quoted string, honouring the `\"` escape.
+                if c == b'"' {
+                    emit(&text[def_start..i], pal.default);
+                    let mut j = i + 1;
+                    while j < n && b[j] != b'\n' {
+                        if b[j] == b'\\' && j + 1 < n {
+                            j += 2;
+                            continue;
+                        }
+                        if b[j] == b'"' {
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if j < n && b[j] == b'"' {
+                        j += 1;
+                    }
+                    emit(&text[i..j], pal.string);
+                    i = j;
+                    def_start = j;
+                    continue;
+                }
+
+                // `$name`, `${...}`, and specials like `$1 $? $@ $#`.
+                if c == b'$' && i + 1 < n {
+                    let nx = b[i + 1];
+                    if nx == b'{' {
+                        emit(&text[def_start..i], pal.default);
+                        let mut j = i + 2;
+                        while j < n && b[j] != b'}' && b[j] != b'\n' {
+                            j += 1;
+                        }
+                        if j < n && b[j] == b'}' {
+                            j += 1;
+                        }
+                        emit(&text[i..j], pal.variable);
+                        i = j;
+                        def_start = j;
+                        continue;
+                    } else if is_word(nx) || matches!(nx, b'?' | b'@' | b'#' | b'*' | b'!' | b'$' | b'-')
+                    {
+                        emit(&text[def_start..i], pal.default);
+                        let mut j = i + 1;
+                        if is_word(nx) {
+                            while j < n && is_word(b[j]) {
+                                j += 1;
+                            }
+                        } else {
+                            j += 1; // one special char
+                        }
+                        emit(&text[i..j], pal.variable);
+                        i = j;
+                        def_start = j;
+                        continue;
+                    }
+                    // `$(`, bare `$`, etc. fall through to default.
+                }
+
+                // Bracket pairs, coloured by nesting depth like VSCode's
+                // bracket-pair colorization. Brackets inside comments, strings
+                // and `${…}` were consumed by the branches above, so the depth
+                // only ever tracks real code.
+                if matches!(c, b'(' | b'[' | b'{' | b')' | b']' | b'}') {
+                    let color = match c {
+                        b'(' | b'[' | b'{' => {
+                            let color = pal.bracket[open.len() % pal.bracket.len()];
+                            open.push(c);
+                            color
+                        }
+                        _ => {
+                            let opener = match c {
+                                b')' => b'(',
+                                b']' => b'[',
+                                _ => b'{',
+                            };
+                            if open.last() == Some(&opener) {
+                                open.pop();
+                                pal.bracket[open.len() % pal.bracket.len()]
+                            } else {
+                                // Unmatched closer. Left plain rather than
+                                // flagged red: a `case` pattern (`start)`) is
+                                // idiomatic bash, not an error.
+                                pal.default
+                            }
+                        }
+                    };
+                    if color != pal.default {
+                        emit(&text[def_start..i], pal.default);
+                        emit(&text[i..i + 1], color);
+                        def_start = i + 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+
+                // A word starting here: keyword / builtin / number get their own
+                // colour; anything else stays in the pending default run.
+                if is_word(c) && (i == 0 || !is_word(b[i - 1])) {
+                    let mut j = i;
+                    while j < n && is_word(b[j]) {
+                        j += 1;
+                    }
+                    let word = &text[i..j];
+                    let color = if word.bytes().all(|d| d.is_ascii_digit()) {
+                        pal.number
+                    } else if BASH_KEYWORDS.contains(&word) {
+                        pal.keyword
+                    } else if BASH_BUILTINS.contains(&word) {
+                        pal.builtin
+                    } else {
+                        pal.default
+                    };
+                    if color != pal.default {
+                        emit(&text[def_start..i], pal.default);
+                        emit(word, color);
+                        def_start = j;
+                    }
+                    i = j;
+                    continue;
+                }
+
+                i += 1;
+            }
+            emit(&text[def_start..n], pal.default);
+        }
+        job
+    }
+
     /// The "Add Script" / "Edit Script" modal.
     struct ScriptEditor {
         /// Index into `config.personal_scripts` when editing; `None` = new.
@@ -5333,11 +5610,24 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                         .id_salt("script_editor_body")
                         .max_height(280.0)
                         .show(ui, |ui| {
+                            let dark = ui.visuals().dark_mode;
+                            let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+                            let mut layouter =
+                                move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+                                    let mut job = highlight_bash(
+                                        egui::TextBuffer::as_str(buf),
+                                        font_id.clone(),
+                                        dark,
+                                    );
+                                    job.wrap.max_width = wrap_width;
+                                    ui.fonts_mut(|f| f.layout_job(job))
+                                };
                             ui.add(
                                 egui::TextEdit::multiline(&mut dlg.body)
                                     .code_editor()
                                     .desired_rows(14)
                                     .desired_width(f32::INFINITY)
+                                    .layouter(&mut layouter)
                                     .hint_text("Paste the shell script to run in the open session"),
                             );
                         });
@@ -15649,6 +15939,76 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
             assert_eq!(script_payload("echo hi\r\necho bye\n"), b"echo hi\recho bye\r");
             assert_eq!(script_payload("echo hi"), b"echo hi\r");
             assert_eq!(script_payload(""), b"");
+        }
+
+        #[test]
+        fn highlight_bash_round_trips_every_byte() {
+            // The galley must stay byte-for-byte identical to the buffer, or the
+            // TextEdit cursor/selection desync. `LayoutJob::text` is the exact
+            // concatenation of every appended slice.
+            let font = egui::FontId::monospace(12.0);
+            let samples = [
+                "",
+                "#!/bin/bash\n# a comment\necho \"hello $USER\" # trailing\n",
+                "for i in 1 2 3; do\n  echo ${i}\ndone\n",
+                "grep -vF '@github.com' file 2>&1 | sort\n",
+                "x='unterminated\nnext line\n",
+                "path=/home/efs/{{user}} && café ☕ = $HOME\n",
+                "foo#bar not-a-comment $? $@ $(date)\n",
+                "f() { echo $(( (1 + 2) * [3] )); }\n",
+                "case \"$x\" in\n  start) run ;;\nesac\n",
+                "unbalanced ) ] } ( [ {\n",
+            ];
+            for s in samples {
+                for dark in [true, false] {
+                    let job = highlight_bash(s, font.clone(), dark);
+                    assert_eq!(job.text, s, "round-trip failed (dark={dark}) for {s:?}");
+                }
+            }
+        }
+
+        #[test]
+        fn highlight_bash_colours_brackets_by_depth() {
+            let font = egui::FontId::monospace(12.0);
+            let pal = BashPalette::for_theme(true);
+            // Colour of the single byte at `at`, per the job's section list.
+            let color_at = |text: &str, at: usize| {
+                let job = highlight_bash(text, font.clone(), true);
+                job.sections
+                    .iter()
+                    .find(|s| s.byte_range.contains(&at))
+                    .map(|s| s.format.color)
+                    .expect("byte covered by exactly one section")
+            };
+
+            // `( [ { } ] )` — depth cycles 0,1,2 out and back on the way in.
+            let s = "([{}])";
+            assert_eq!(color_at(s, 0), pal.bracket[0]);
+            assert_eq!(color_at(s, 1), pal.bracket[1]);
+            assert_eq!(color_at(s, 2), pal.bracket[2]);
+            assert_eq!(color_at(s, 3), pal.bracket[2]);
+            assert_eq!(color_at(s, 4), pal.bracket[1]);
+            assert_eq!(color_at(s, 5), pal.bracket[0]);
+
+            // A fourth level wraps back to the first colour.
+            assert_eq!(color_at("(((( ", 3), pal.bracket[0]);
+
+            // `case` patterns and other stray closers stay plain.
+            assert_eq!(color_at("  start) run", 7), pal.default);
+            // A mismatched closer doesn't pop the stack, so the real `)` still
+            // closes at depth 0.
+            let s = "(a] b)";
+            assert_eq!(color_at(s, 2), pal.default);
+            assert_eq!(color_at(s, 5), pal.bracket[0]);
+
+            // Brackets inside comments and strings never affect the depth.
+            let s = "# ((\n'[[' ()";
+            assert_eq!(color_at(s, 2), pal.comment);
+            assert_eq!(color_at(s, 6), pal.string);
+            assert_eq!(color_at(s, 10), pal.bracket[0]);
+
+            // `${…}` keeps its variable colour rather than being split.
+            assert_eq!(color_at("${HOME}", 6), pal.variable);
         }
 
         fn cred<'a>(user: &'a str, pat: &'a str, host: &'a str) -> GitCredential<'a> {
