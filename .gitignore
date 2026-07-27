@@ -3,3 +3,8 @@ WSL/target/*
 dist/*
 WSL/dist/*
 
+# Claude Code settings are per-developer (machine-specific paths, usernames).
+# Keep them out of git — settings.local.json is already ignored by default.
+.claude/settings.json
+.claude/settings.local.json
+
