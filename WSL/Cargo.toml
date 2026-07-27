@@ -7,6 +7,22 @@ edition = "2021"
 default = []
 gui = ["dep:eframe", "dep:portable-pty", "dep:vt100", "dep:arboard", "dep:rfd"]
 
+[profile.release]
+# Ship as little about the build machine and the code's shape as possible.
+#
+# `strip` drops the symbol table — otherwise the binary carries ~20k mangled
+# Rust symbols that map out every module and function name.
+#
+# Absolute source paths are handled separately, by the --remap-path-prefix
+# flags that build_binaries.sh puts in RUSTFLAGS: they are compiled in as
+# string literals via panic!/#[track_caller] locations no matter what
+# debuginfo says, so stripping alone does not remove them. (The `trim-paths`
+# profile key would be tidier but is not stable as of cargo 1.94.)
+#
+# The GUI panic hook uses `Location::file()` rather than a backtrace, so
+# stripping costs us nothing in crash logs.
+strip = true
+
 [build-dependencies]
 serde_json = "1"
 

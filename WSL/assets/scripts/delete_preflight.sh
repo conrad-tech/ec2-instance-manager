@@ -1,0 +1,1 @@
+if id __USER__ >/dev/null 2>&1; then s="$(who 2>/dev/null | awk -v u=__USER__ '$1==u {print}')"; p="$(pgrep -u __USER__ 2>/dev/null | tr '\n' ' ')"; if [ -n "$s" ] || [ -n "$p" ]; then echo CNU_ACTIVE; [ -n "$s" ] && echo "sessions: $s"; [ -n "$p" ] && echo "procs: $p"; else echo CNU_IDLE; fi; else echo CNU_ABSENT; fi

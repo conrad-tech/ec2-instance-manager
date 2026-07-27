@@ -4,6 +4,9 @@ set -euo pipefail
 CLI_APP_NAME="ec2_manager"
 GUI_APP_NAME="ec2_manager_gui"
 APP_VERSION="1.1"
+# WALKTHROUGH.md is a full feature-by-feature spec of the GUI, so it is opt-in
+# rather than shipped by default. Set by --with-walkthrough (see usage()).
+INCLUDE_WALKTHROUGH=0
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Cargo's build directory. The mingw toolchain's `dlltool` (invoked for crates
@@ -20,6 +23,25 @@ else
   TARGET_DIR="${ROOT_DIR}/target"
 fi
 
+# Keep build-machine paths out of shipped binaries. Rust compiles source paths
+# in as string literals (panic!/#[track_caller] locations), so they ship
+# regardless of debuginfo or `strip` — which is how "/home/<user>/.cargo/..."
+# and the full repo path ended up readable in released .exe files. The
+# `trim-paths` profile key would be tidier but is not stable as of cargo 1.94.
+#
+# Uses CARGO_ENCODED_RUSTFLAGS (0x1f-separated) rather than RUSTFLAGS, which is
+# split on spaces — and ROOT_DIR contains one under "/mnt/d/Work Projects/...",
+# which silently mangles the flag into an invalid one.
+RUSTFLAGS_SEP=$'\x1f'
+REMAP_FLAGS="--remap-path-prefix=${CARGO_HOME:-${HOME}/.cargo}/registry=/deps"
+REMAP_FLAGS="${REMAP_FLAGS}${RUSTFLAGS_SEP}--remap-path-prefix=${ROOT_DIR}=/src"
+if [[ -n "${RUSTFLAGS:-}" ]]; then
+  # Preserve caller-supplied flags, then hand everything over in encoded form.
+  REMAP_FLAGS="${RUSTFLAGS// /${RUSTFLAGS_SEP}}${RUSTFLAGS_SEP}${REMAP_FLAGS}"
+  unset RUSTFLAGS
+fi
+export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS:+${CARGO_ENCODED_RUSTFLAGS}${RUSTFLAGS_SEP}}${REMAP_FLAGS}"
+
 DIST_DIR="${ROOT_DIR}/dist"
 LINUX_DIST_DIR="${DIST_DIR}/linux"
 WINDOWS_DIST_DIR="${DIST_DIR}/windows"
@@ -29,7 +51,7 @@ HOST_TRIPLE=""
 
 usage() {
   cat <<USAGE
-Usage: $0 [native|all|linux|windows]
+Usage: $0 [native|all|linux|windows] [--with-walkthrough]
 
 Build release binaries for Pop!_OS (linux) and Windows.
 
@@ -42,6 +64,13 @@ Modes:
   all      Build linux + windows binaries (best on Linux host)
   linux    Build Linux binaries
   windows  Build Windows binaries
+
+Options:
+  --with-walkthrough
+           Include WALKTHROUGH.md in the Windows zip and extracted folder.
+           Off by default: the walkthrough documents every feature, panel and
+           shortcut, so it doubles as a spec for anyone reimplementing the GUI.
+           Use it for internal builds; omit it for anything handed outside.
 USAGE
 }
 
@@ -51,6 +80,41 @@ require_cmd() {
     echo "error: required command not found: $cmd" >&2
     exit 1
   fi
+}
+
+# Write SHA-256 checksums for every file passed, into <dir>/SHA256SUMS.txt.
+# Lets whoever receives a release verify it is byte-for-byte the build you
+# published — a mismatched or extra copy is a tampered/unofficial one. Uses
+# whatever hashing tool is available (sha256sum, then shasum, then openssl,
+# then python3) so it works across Linux/macOS/Git-Bash build hosts. The
+# output format matches `sha256sum -c`, so users can verify with that.
+write_checksums() {
+  local dir="$1"; shift
+  local out="${dir}/SHA256SUMS.txt"
+  : > "$out"
+
+  local f name
+  for f in "$@"; do
+    [[ -f "$f" ]] || continue
+    name="$(basename "$f")"
+    if command -v sha256sum >/dev/null 2>&1; then
+      (cd "$dir" && sha256sum "$name")
+    elif command -v shasum >/dev/null 2>&1; then
+      (cd "$dir" && shasum -a 256 "$name")
+    elif command -v openssl >/dev/null 2>&1; then
+      printf '%s  %s\n' "$(openssl dgst -sha256 -r "$f" | awk '{print $1}')" "$name"
+    elif command -v python3 >/dev/null 2>&1; then
+      printf '%s  %s\n' \
+        "$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$f")" \
+        "$name"
+    else
+      echo "warning: no SHA-256 tool found; skipping checksums for $dir" >&2
+      rm -f "$out"
+      return 0
+    fi
+  done >> "$out"
+
+  echo "info: wrote checksums: $out"
 }
 
 # Ensure the Rust toolchain (rustc + cargo + rustup) is present. If Rust is
@@ -194,9 +258,13 @@ copy_windows_runtime_dlls() {
 
 package_windows_zip() {
   local zip_path="${WINDOWS_DIST_DIR}/ec2_manager_windows_${APP_VERSION}.zip"
-  # Copy walkthrough into dist dir for packaging
-  if [[ -f "${ROOT_DIR}/WALKTHROUGH.md" ]]; then
+  # Copy walkthrough into dist dir for packaging, only when opted in. Otherwise
+  # remove any copy staged by an earlier --with-walkthrough run, so the zip
+  # candidate below finds nothing and the doc stays out of the artifact.
+  if [[ "$INCLUDE_WALKTHROUGH" == "1" && -f "${ROOT_DIR}/WALKTHROUGH.md" ]]; then
     cp "${ROOT_DIR}/WALKTHROUGH.md" "${WINDOWS_DIST_DIR}/WALKTHROUGH.md"
+  else
+    rm -f "${WINDOWS_DIST_DIR}/WALKTHROUGH.md"
   fi
   local candidates=(
     "${WINDOWS_DIST_DIR}/${CLI_APP_NAME}_${APP_VERSION}.exe"
@@ -228,12 +296,18 @@ package_windows_zip() {
   unzip -qo "$zip_path" -d "$extract_dir"
   # User-facing README goes ONLY in the extracted folder (not the zip), so
   # someone opening the folder has a quick "what is this / how to run" guide.
-  # The WALKTHROUGH is in both (it's a zip candidate above).
+  # The WALKTHROUGH is in both, but only under --with-walkthrough.
   if [[ -f "${ROOT_DIR}/USER_README.md" ]]; then
     cp "${ROOT_DIR}/USER_README.md" "${extract_dir}/README.md"
   fi
   echo "info: packaged Windows zip: $zip_path"
   echo "info: extracted to: $extract_dir"
+
+  # Checksums for the zip and the loose binaries next to it.
+  write_checksums "$WINDOWS_DIST_DIR" \
+    "$zip_path" \
+    "${WINDOWS_DIST_DIR}/${CLI_APP_NAME}_${APP_VERSION}.exe" \
+    "${WINDOWS_DIST_DIR}/${GUI_APP_NAME}_${APP_VERSION}.exe"
 }
 
 package_linux_zip() {
@@ -261,6 +335,8 @@ package_linux_zip() {
   rm -f "$zip_path"
   zip -q -j "$zip_path" "${files[@]}"
   echo "info: packaged Linux zip: $zip_path"
+
+  write_checksums "$LINUX_DIST_DIR" "$zip_path" "${files[@]}"
 }
 
 build_for_target() {
@@ -350,13 +426,34 @@ resolve_targets() {
 }
 
 main() {
-  local mode="${1:-all}"
-  case "$mode" in
-    -h|--help)
-      usage
-      exit 0
-      ;;
-  esac
+  local mode=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --with-walkthrough)
+        INCLUDE_WALKTHROUGH=1
+        shift
+        ;;
+      -*)
+        echo "error: unknown option: $1" >&2
+        usage
+        exit 1
+        ;;
+      *)
+        if [[ -n "$mode" ]]; then
+          echo "error: unexpected argument: $1" >&2
+          usage
+          exit 1
+        fi
+        mode="$1"
+        shift
+        ;;
+    esac
+  done
+  mode="${mode:-all}"
 
   # Bootstrap the toolchain before anything that needs rustc (e.g. HOST_TRIPLE).
   ensure_rust

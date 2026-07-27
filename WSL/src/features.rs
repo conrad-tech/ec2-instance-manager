@@ -8,8 +8,17 @@
 
 use serde::Deserialize;
 
-/// Compiled-in feature flags from `assets/features.json`.
-const BUNDLED_FEATURES: &str = include_str!("../assets/features.json");
+/// Compiled-in feature flags from `assets/features.json`, obfuscated at build
+/// time (see [`crate::obf_core`]) so the gate config, bastion filters and Jira
+/// alert settings do not sit in the binary as readable JSON. `build.rs` writes
+/// the scrambled blob; [`bundled_features`] unscrambles it.
+const BUNDLED_FEATURES_OBF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/features.json.obf"));
+
+fn bundled_features() -> String {
+    let plain = crate::obf_core::obf_transform(BUNDLED_FEATURES_OBF);
+    String::from_utf8(plain).expect("bundled features.json is valid UTF-8")
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
@@ -245,7 +254,7 @@ impl Features {
 /// Parse the bundled feature flags, falling back to all-off if the JSON is
 /// malformed (fail closed — never enable a gated action by accident).
 pub fn load() -> Features {
-    serde_json::from_str(BUNDLED_FEATURES).unwrap_or_default()
+    serde_json::from_str(&bundled_features()).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -256,8 +265,9 @@ mod tests {
     fn bundled_features_parse() {
         // The shipped file must always parse; a typo there would silently
         // disable every gate.
+        // Also exercises the build-time obfuscation round-trip.
         let parsed: std::result::Result<Features, _> =
-            serde_json::from_str(BUNDLED_FEATURES);
+            serde_json::from_str(&bundled_features());
         assert!(parsed.is_ok(), "assets/features.json failed to parse");
     }
 

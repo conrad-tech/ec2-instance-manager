@@ -1,14 +1,22 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::config::AppConfig;
 use crate::models::ProfileConfig;
 
-/// Compiled-in default account list from `assets/accounts.json`.
-/// Edit that file and rebuild to change the defaults.
-const BUNDLED_ACCOUNTS: &str = include_str!("../assets/accounts.json");
+/// Compiled-in default account list from `assets/accounts.json`, obfuscated at
+/// build time (see [`crate::obf_core`]) so the account inventory does not sit
+/// in the binary as readable JSON. `build.rs` writes the scrambled blob; we
+/// unscramble it here. Edit `assets/accounts.json` and rebuild to change it.
+const BUNDLED_ACCOUNTS_OBF: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/accounts.json.obf"));
+
+fn bundled_accounts() -> String {
+    let plain = crate::obf_core::obf_transform(BUNDLED_ACCOUNTS_OBF);
+    String::from_utf8(plain).expect("bundled accounts.json is valid UTF-8")
+}
 
 #[derive(Deserialize)]
 struct AccountEntry {
@@ -19,8 +27,15 @@ struct AccountEntry {
     color: Option<String>,
 }
 
-pub fn accounts_path() -> Option<PathBuf> {
+fn accounts_path() -> Option<PathBuf> {
     AppConfig::config_path().map(|p| p.with_file_name("accounts.json"))
+}
+
+/// Delete the `accounts.json` reference copy that older builds wrote into the
+/// user's config dir. Silent and best-effort: a missing file is the expected
+/// case, and a permissions failure must not stop the app from loading.
+fn remove_stale_accounts_file(path: &Path) {
+    let _ = fs::remove_file(path);
 }
 
 fn parse_accounts(json: &str) -> Vec<ProfileConfig> {
@@ -42,22 +57,22 @@ fn parse_accounts(json: &str) -> Vec<ProfileConfig> {
 
 /// Load the ordered account list.
 ///
-/// Always uses the bundled `assets/accounts.json` compiled into the binary.
-/// On load, copies it to the user config dir so you can see/reference the file,
-/// but the bundled version is the source of truth — edit `assets/accounts.json`
-/// and rebuild to change accounts.
+/// Always uses the bundled `assets/accounts.json` compiled into the binary —
+/// edit that file and rebuild to change accounts.
+///
+/// This used to also write the bundled JSON to `<config_dir>/accounts.json` on
+/// every load, as a reference copy. Nothing ever read it back, and it put a
+/// plaintext inventory of our AWS accounts (labels, account IDs, regions) into
+/// every user's config directory, rewritten on each launch so deleting it did
+/// not help. That write is gone, and we now proactively delete any copy an
+/// older build left behind, so upgrading users stop having it on disk. The
+/// copy inside the binary is now obfuscated (see [`bundled_accounts`]) so it is
+/// no longer readable as plaintext JSON via `strings`.
 pub fn load_accounts() -> Vec<ProfileConfig> {
-    let profiles = parse_accounts(BUNDLED_ACCOUNTS);
-
-    // Write the bundled version to the config dir so the user has a reference copy
     if let Some(path) = accounts_path() {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = fs::write(&path, BUNDLED_ACCOUNTS);
+        remove_stale_accounts_file(&path);
     }
-
-    profiles
+    parse_accounts(&bundled_accounts())
 }
 
 #[cfg(test)]
@@ -99,6 +114,21 @@ mod tests {
     }
 
     #[test]
+    fn remove_stale_accounts_file_deletes_and_tolerates_absence() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("ec2mgr_accounts_test_{}.json", std::process::id()));
+        fs::write(&path, "[]").unwrap();
+        assert!(path.exists());
+
+        remove_stale_accounts_file(&path);
+        assert!(!path.exists(), "stale accounts file should be deleted");
+
+        // Second call on a now-missing file must not panic or error.
+        remove_stale_accounts_file(&path);
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn parse_empty_array() {
         let profiles = parse_accounts("[]");
         assert!(profiles.is_empty());
@@ -106,7 +136,9 @@ mod tests {
 
     #[test]
     fn bundled_accounts_parses_cleanly() {
-        let profiles = parse_accounts(BUNDLED_ACCOUNTS);
+        // Also exercises the build-time obfuscation round-trip: bundled_accounts()
+        // decrypts the OUT_DIR blob, and it must yield parseable JSON.
+        let profiles = parse_accounts(&bundled_accounts());
         assert!(!profiles.is_empty(), "bundled accounts.json should have at least one entry");
         for p in &profiles {
             assert!(!p.profile_id.is_empty(), "profile_id (account_id) must not be empty");

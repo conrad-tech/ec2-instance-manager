@@ -1,0 +1,46 @@
+EC2 Instance Manager - Windows Build Setup
+============================================
+
+Prerequisites
+-------------
+1. Install Cargo / Rust via rustup (installs both rustc and cargo):
+
+   From a terminal (Git Bash, PowerShell, etc.):
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+   Or download and run rustup-init.exe from https://rustup.rs
+
+   After install, restart your shell so cargo/rustc are in PATH.
+
+2. Install the MSVC Rust target and toolchain:
+   rustup target add x86_64-pc-windows-msvc
+   rustup toolchain install stable-x86_64-pc-windows-msvc
+
+3. Install zip (for final packaging step):
+   choco install zip
+   (Requires Chocolatey: https://chocolatey.org/install)
+
+Building
+--------
+Run from the project root in a bash shell (e.g. Git Bash):
+
+   ./scripts/build_binaries.sh windows
+
+Output artifacts will be in dist/windows/:
+   - ec2_manager.exe     (CLI)
+   - ec2_manager_gui.exe (GUI)
+
+Notes
+-----
+- The build script defaults to the x86_64-pc-windows-gnu target on Linux
+  and x86_64-pc-windows-msvc on Windows. Use the "windows" mode on a
+  Windows host to avoid needing the MinGW toolchain (dlltool, etc.).
+
+- The default toolchain installed by rustup on Windows may be
+  stable-x86_64-pc-windows-gnu, which requires MinGW's dlltool.exe.
+  Installing the MSVC toolchain and target avoids this dependency.
+
+- The README.md Build section documents cargo build commands but does not
+  mention installing Rust/Cargo as a prerequisite. The Windows setup
+  section in the README covers running pre-built binaries, not building
+  from source on Windows.

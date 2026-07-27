@@ -4,6 +4,13 @@
 
 use std::path::Path;
 
+// Shared, dependency-free keystream used to obfuscate the compiled-in assets.
+// The runtime compiles the same file as the `obf_core` module; pulling it in
+// here with `include!` guarantees build-time encrypt and run-time decrypt can
+// never use different logic. See src/obf_core.rs for the (obfuscation-not-
+// encryption) threat model.
+include!("src/obf_core.rs");
+
 fn main() {
     // Validate the file the binary actually embeds via
     // `include_str!("../assets/accounts.json")` from `src/`, i.e.
@@ -89,6 +96,48 @@ fn main() {
     }
 
     validate_features();
+    emit_obfuscated_assets();
+}
+
+/// Encrypt each compiled-in asset with the shared keystream and write the
+/// result to `OUT_DIR/<name>.obf`. The runtime `include_bytes!`s these blobs
+/// and calls `obf_core::obf_transform` to recover the plaintext, so the raw
+/// scripts and JSON never appear in the binary as readable strings.
+///
+/// Only the *shape* changes: the same bytes are still embedded, just scrambled.
+/// CR-stripping for the shell scripts stays at runtime (unchanged), so the
+/// blobs here are the files verbatim.
+fn emit_obfuscated_assets() {
+    let out_dir = std::env::var("OUT_DIR")
+        .expect("OUT_DIR is always set for build scripts");
+
+    // (output name, source path). Output names match the include_bytes! calls
+    // in accounts.rs / features.rs / ec2_manager_gui.rs.
+    let assets = [
+        ("accounts.json.obf", "assets/accounts.json"),
+        ("features.json.obf", "assets/features.json"),
+        ("create_new_user.sh.obf", "assets/scripts/create_new_user.sh"),
+        ("delete_user.sh.obf", "assets/scripts/delete_user.sh"),
+        // User-management shell that used to be inline string literals in the
+        // GUI (verify/diagnostics/preflight/secondary-mirror). Each is a
+        // template with a `__USER__` placeholder the runtime substitutes after
+        // decrypting; see the `deobf_*` call sites in ec2_manager_gui.rs.
+        ("create_diagnostics.sh.obf", "assets/scripts/create_diagnostics.sh"),
+        ("delete_preflight.sh.obf", "assets/scripts/delete_preflight.sh"),
+        ("delete_diagnostics.sh.obf", "assets/scripts/delete_diagnostics.sh"),
+        ("secondary_mirror.sh.obf", "assets/scripts/secondary_mirror.sh"),
+        ("sudoers_grant.sh.obf", "assets/scripts/sudoers_grant.sh"),
+    ];
+
+    for (out_name, src) in assets {
+        println!("cargo:rerun-if-changed={src}");
+        let plain = std::fs::read(src)
+            .unwrap_or_else(|err| panic!("Build failed: could not read {src}: {err}"));
+        let obfuscated = obf_transform(&plain);
+        let dest = Path::new(&out_dir).join(out_name);
+        std::fs::write(&dest, obfuscated)
+            .unwrap_or_else(|err| panic!("Build failed: could not write {}: {err}", dest.display()));
+    }
 }
 
 /// Validate `assets/features.json` at compile time. Every documented flag

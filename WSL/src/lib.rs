@@ -12,6 +12,7 @@ pub mod filter;
 pub mod gui_cli;
 pub mod inventory;
 pub mod models;
+pub mod obf_core;
 pub mod profile_choice;
 pub mod sim;
 pub mod ssh_config;

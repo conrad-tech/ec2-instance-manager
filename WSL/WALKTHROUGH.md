@@ -113,10 +113,10 @@ The app runs AWS CLI and the Session Manager Plugin inside **WSL** using
 
 ### Color Legend
 - The color legend appears on the **Connections** page, showing environment names from the `MMODAL_ENV` tag
-- Colors are derived from the account's base color in `accounts.json` — darker and lighter shades per environment
+- Each account has a base color; its environments are shown as darker and lighter shades of it
 - Each environment name always gets the same shade (deterministic, consistent across users)
-- Environments are ordered by account `sort_order`, then alphabetically within each account
-- Single environment per account uses the exact base color from `accounts.json`
+- Environments are grouped by account, then ordered alphabetically within each account
+- An account with a single environment uses its base color exactly
 
 ### Exclude Env
 - Use the **Exclude Env** dropdown (next to the Log tab) to hide specific environments from the legend and connection tab coloring
@@ -222,8 +222,8 @@ The file browser is the left sidebar in the Connections panel.
 
 On the **Connections** page there is a **`Scripts (N)`** dropdown (to the right of
 **Close All**), where `N` is the number of available scripts. It automates
-creating (and, for admin builds, deleting) a Linux user across a **primary +
-secondary bastion pair**, so you don't have to run the steps by hand.
+creating a Linux user across a **primary + secondary bastion pair**, so you
+don't have to run the steps by hand.
 
 ### The dialog
 Each script opens a small window with:
@@ -250,17 +250,6 @@ flashes **green**; on failure it turns solid **red**.
   folder** button that opens Explorer with the `.pem` highlighted.
 - If something fails, the popup shows a **diagnostics report** (the script's
   actual error plus account/home/keys checks) so you can see exactly what broke.
-
-### delete_user.sh (admin builds only)
-This entry only appears in builds where an administrator has enabled it.
-- A **confirmation checkbox** must be ticked before the **Delete** button works.
-- Removes the account, group, sudoers entry, generated key, **and** the shared
-  home directory on both bastions.
-- **Safety:** protected/system users (`root`, `ec2-user`, `ssm-user`, etc.) can
-  never be deleted, and it **refuses to delete a user who is currently logged in**
-  (it tells you which session/process is holding them) — no active session is
-  ever killed.
-- After it runs it confirms the account is actually gone from both bastions.
 
 ---
 

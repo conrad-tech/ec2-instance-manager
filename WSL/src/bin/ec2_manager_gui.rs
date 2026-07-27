@@ -63,6 +63,15 @@ mod gui {
     const GUI_SMOKE_EXIT_ON_MARKER_ENV: &str = "EC2_MANAGER_GUI_SMOKE_EXIT_ON_MARKER";
     const GUI_SMOKE_AUTO_CONNECT_ENV: &str = "EC2_MANAGER_GUI_SMOKE_AUTO_CONNECT";
 
+    /// Decrypt an asset that `build.rs` obfuscated (see `ec2_manager::obf_core`)
+    /// and embedded into `OUT_DIR`. Used for the compiled-in shell scripts and
+    /// script templates so they don't sit in the binary as readable strings.
+    /// Pass the blob via `include_bytes!(concat!(env!("OUT_DIR"), "/<name>.obf"))`.
+    fn deobf_asset(blob: &[u8]) -> String {
+        String::from_utf8(ec2_manager::obf_core::obf_transform(blob))
+            .expect("obfuscated asset is valid UTF-8")
+    }
+
     const COL_FAV_W: f32 = 55.0;
     const COL_INSTANCE_W: f32 = 80.0;
     const COL_NAME_W: f32 = 50.0;
@@ -1367,26 +1376,13 @@ mod gui {
         // so the key/authorized_keys checks are done AS THE USER via
         // `sudo -n -u` (inside that block $HD is the user's home dir and $1
         // is the username). account/group/rootpem/sudoers stay as root.
-        let script = format!(
-            r#"U="{u}"
-echo "account : $(getent passwd "$U" 2>/dev/null || echo MISSING)"
-echo "group   : $(getent group "$U" 2>/dev/null || echo MISSING)"
-sudo -n -u "$U" -H sh -c '
-HD="$HOME"
-D="$HD/.s""sh"
-if [ -d "$HD" ]; then echo "home    : $(ls -ld "$HD")"; else echo "home    : MISSING"; fi
-if [ -d "$D" ]; then echo "keydir  : $(ls -ld "$D")"; else echo "keydir  : MISSING"; fi
-AK="$D/authorized_keys"
-if [ -f "$AK" ]; then echo "authkeys: $(ls -l "$AK") [$(grep -c . "$AK" 2>/dev/null) key line(s)]"; else echo "authkeys: MISSING"; fi
-UP="$D/$1.pem"
-if [ -f "$UP" ]; then echo "userpem : $(ls -l "$UP")"; else echo "userpem : MISSING"; fi
-' _ "$U"
-if [ -f "/root/$U.pem" ]; then echo "rootpem : $(ls -l "/root/$U.pem")"; else echo "rootpem : MISSING (root copy; may be normal)"; fi
-SF="/etc/sudoers.d/zz-$(echo "$U" | tr '.' '-')-nopasswd"
-if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
-"#,
-            u = username,
-        );
+        // Obfuscated template (see build.rs / deobf_asset); `__USER__` is the
+        // only substitution, matching the old `format!(u = username)`.
+        let script = deobf_asset(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/create_diagnostics.sh.obf"
+        )))
+        .replace("__USER__", username);
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
         let cmd = format!("echo {b64} | base64 -d | bash");
@@ -1419,18 +1415,13 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         tx: Sender<PreflightOutcome>,
     ) {
         // base64-wrapped so quoting survives `aws ssm send-command`.
-        let script = format!(
-            "if id {u} >/dev/null 2>&1; then \
-               s=\"$(who 2>/dev/null | awk -v u={u} '$1==u {{print}}')\"; \
-               p=\"$(pgrep -u {u} 2>/dev/null | tr '\\n' ' ')\"; \
-               if [ -n \"$s\" ] || [ -n \"$p\" ]; then \
-                 echo CNU_ACTIVE; \
-                 [ -n \"$s\" ] && echo \"sessions: $s\"; \
-                 [ -n \"$p\" ] && echo \"procs: $p\"; \
-               else echo CNU_IDLE; fi; \
-             else echo CNU_ABSENT; fi",
-            u = username,
-        );
+        // Obfuscated template (see build.rs / deobf_asset); `__USER__` matches
+        // the old `format!(u = username)`.
+        let script = deobf_asset(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/delete_preflight.sh.obf"
+        )))
+        .replace("__USER__", &username);
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
         let cmd = format!("echo {b64} | base64 -d | bash");
@@ -1546,21 +1537,13 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         instance_id: &str,
         username: &str,
     ) -> String {
-        let script = format!(
-            "U=\"{u}\"\n\
-             echo \"account : $(getent passwd \"$U\" 2>/dev/null || echo GONE)\"\n\
-             echo \"group   : $(getent group \"$U\" 2>/dev/null || echo GONE)\"\n\
-             S=\"$(who 2>/dev/null | awk -v u=\"$U\" '$1==u {{print}}')\"\n\
-             if [ -n \"$S\" ]; then echo \"sessions: $(echo \"$S\" | tr '\\n' ';')\"; \
-             else echo \"sessions: none\"; fi\n\
-             P=\"$(pgrep -u \"$U\" 2>/dev/null | tr '\\n' ' ')\"\n\
-             if [ -n \"$P\" ]; then echo \"procs   : $P\"; else echo \"procs   : none\"; fi\n\
-             if [ -d \"/efs/home/$U\" ]; then echo \"home    : $(ls -ld \"/efs/home/$U\")\"; \
-             else echo \"home    : removed\"; fi\n\
-             SF=\"/etc/sudoers.d/zz-$(echo \"$U\" | tr '.' '-')-nopasswd\"\n\
-             if [ -f \"$SF\" ]; then echo \"sudoers : present ($SF)\"; else echo \"sudoers : removed\"; fi\n",
-            u = username,
-        );
+        // Obfuscated template (see build.rs / deobf_asset); `__USER__` matches
+        // the old `format!(u = username)`.
+        let script = deobf_asset(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/delete_diagnostics.sh.obf"
+        )))
+        .replace("__USER__", username);
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
         let cmd = format!("echo {b64} | base64 -d | bash");
@@ -6293,12 +6276,16 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
         ) {
             use base64::Engine;
             let (primary_steps, secondary_steps) = if delete {
-                const SCRIPT: &str =
-                    include_str!("../../assets/scripts/delete_user.sh");
+                // Obfuscated at build time (see obf_core) so the script body
+                // isn't readable in the binary; decrypt it here.
+                let script = String::from_utf8(ec2_manager::obf_core::obf_transform(
+                    include_bytes!(concat!(env!("OUT_DIR"), "/delete_user.sh.obf")),
+                ))
+                .expect("bundled delete_user.sh is valid UTF-8");
                 // Strip CR so a Windows (autocrlf) checkout doesn't ship a
                 // CRLF script that bash chokes on ($'\r': command not found).
                 let b64 = base64::engine::general_purpose::STANDARD
-                    .encode(SCRIPT.replace('\r', ""));
+                    .encode(script.replace('\r', ""));
                 let remote_path = "/root/delete_user.sh";
                 let write = format!("echo '{b64}' | base64 -d > {remote_path}");
                 // `cd ~` is folded into the next command: on its own it's a
@@ -6321,11 +6308,14 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 ];
                 (primary, secondary)
             } else {
-                const SCRIPT: &str =
-                    include_str!("../../assets/scripts/create_new_user.sh");
+                // Obfuscated at build time (see delete branch); decrypt here.
+                let script = String::from_utf8(ec2_manager::obf_core::obf_transform(
+                    include_bytes!(concat!(env!("OUT_DIR"), "/create_new_user.sh.obf")),
+                ))
+                .expect("bundled create_new_user.sh is valid UTF-8");
                 // Strip CR (see delete branch) — Windows autocrlf checkout.
                 let b64 = base64::engine::general_purpose::STANDARD
-                    .encode(SCRIPT.replace('\r', ""));
+                    .encode(script.replace('\r', ""));
                 let remote_path = "/root/create_new_user.sh";
 
                 // Primary: drop the script and run it as root from $HOME.
@@ -6357,35 +6347,35 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                 // the local account. Kept as a single step so the retry loop
                 // doesn't race the drip-feed. The `stat -c %u /efs/home`
                 // substring flags it for the longer worker timeout.
+                // Obfuscated template (see build.rs / deobf_asset); `__USER__`
+                // matches every `{username}` in the old inline command. The
+                // `stat -c %u`/`useradd`/`groupadd` body was the most
+                // recognizable user-management shell in `strings`.
+                let secondary_mirror = deobf_asset(include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/secondary_mirror.sh.obf"
+                )))
+                .replace("__USER__", username);
                 let mut secondary = vec![
                     "sudo su".to_string(),
                     PREP_STEP_SENTINEL.to_string(),
-                    format!(
-                        "cd ~ && H=/efs/home/{username}; \
-                         for i in $(seq 1 12); do ls /efs/home >/dev/null 2>&1; [ -e \"$H\" ] && break; sleep 2; done; \
-                         UID_NUM=$(stat -c %u \"$H\" 2>/dev/null); GID_NUM=$(stat -c %g \"$H\" 2>/dev/null); \
-                         if [ -z \"$UID_NUM\" ] || [ -z \"$GID_NUM\" ]; then \
-                           echo \"secondary: ERROR /efs/home/{username} not visible from this bastion (do both bastions mount the same EFS?)\"; \
-                         else \
-                           groupadd -g \"$GID_NUM\" {username} 2>/dev/null || true; \
-                           useradd -u \"$UID_NUM\" -g \"$GID_NUM\" -M -d \"$H\" {username} 2>/dev/null || true; \
-                         fi; \
-                         id {username} >/dev/null 2>&1 && echo \"secondary: {username} ready\" || echo \"secondary: FAILED to create {username}\""
-                    ),
+                    secondary_mirror,
                 ];
                 if grant_sudo {
-                    secondary.push(format!(
-                        "echo '{username} ALL=(ALL) NOPASSWD:ALL' | tee /etc/sudoers.d/zz-{suffix}-nopasswd > /dev/null"
-                    ));
-                    secondary.push(format!(
-                        "visudo -cf /etc/sudoers.d/zz-{suffix}-nopasswd"
-                    ));
-                    secondary.push(format!(
-                        "chmod 0440 /etc/sudoers.d/zz-{suffix}-nopasswd"
-                    ));
-                    secondary.push(format!(
-                        "chown root:root /etc/sudoers.d/zz-{suffix}-nopasswd"
-                    ));
+                    // Obfuscated template (see build.rs / deobf_asset): four
+                    // sudoers steps, one per line. Splitting on lines keeps
+                    // them as separate drip-feed steps, each byte-identical to
+                    // the old inline `format!`. `__USER__`/`__SUFFIX__` match
+                    // the old `{username}`/`{suffix}`.
+                    let sudoers = deobf_asset(include_bytes!(concat!(
+                        env!("OUT_DIR"),
+                        "/sudoers_grant.sh.obf"
+                    )))
+                    .replace("__USER__", username)
+                    .replace("__SUFFIX__", &suffix);
+                    for step in sudoers.lines() {
+                        secondary.push(step.to_string());
+                    }
                 }
                 (primary, secondary)
             };
@@ -11085,7 +11075,15 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
 
                 // Enter: apply the completion if the popup is open,
                 // otherwise navigate to the typed path.
-                let enter = focused
+                //
+                // A singleline TextEdit surrenders focus on Enter (egui ends
+                // input with it), so on the frame the key is pressed
+                // has_focus() is already false and only lost_focus() is set.
+                // Gating on `focused` alone silently dropped every Enter and
+                // left "Go" as the only way to navigate. The event itself is
+                // not drained by the TextEdit, so consume_key still fires and
+                // still keeps the press away from the terminal pane.
+                let enter = (focused || response.lost_focus())
                     && ui.input_mut(|i| {
                         i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
                     });
@@ -11954,12 +11952,12 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                     text.push_str(&format!("IAM Role: {}\n", self.detail_iam_role.as_deref().unwrap_or("-")));
                     text.push_str(&format!("ASG: {}\n", instance.asg.as_deref().unwrap_or("-")));
                     text.push_str(&format!("SSM Managed: {}\n", if instance.ssm_managed { "Yes" } else { "No" }));
-                    text.push_str(&format!("Launch Time: {}\n", instance.launch_time.as_deref().unwrap_or("-")));
+                    text.push_str(&format!("Launch Time: {}\n", instance.launch_time.as_deref().map(format_aws_time_local).unwrap_or_else(|| "-".to_string())));
                     if !self.detail_volumes.is_empty() {
                         text.push_str("\nVolumes:\n");
                         for vol in &self.detail_volumes {
                             text.push_str(&format!("  {} | {} | {} | {} | {} | {}\n",
-                                vol.volume_id, vol.size_gb, vol.volume_type, vol.device, vol.state, vol.attach_time));
+                                vol.volume_id, vol.size_gb, vol.volume_type, vol.device, vol.state, format_aws_time_local(&vol.attach_time)));
                         }
                     }
                     if !instance.tags.is_empty() {
@@ -12007,8 +12005,24 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                         row(ui, "Auto Scaling Group", instance.asg.as_deref().unwrap_or("-"));
                         row(ui, "SSM Managed", if instance.ssm_managed { "Yes" } else { "No" });
                         row(ui, "SSM Ping", instance.ssm_ping.as_deref().unwrap_or("-"));
-                        row(ui, "SSM Last Ping", instance.ssm_last_ping.as_deref().unwrap_or("-"));
-                        row(ui, "Launch Time", instance.launch_time.as_deref().unwrap_or("-"));
+                        row(
+                            ui,
+                            "SSM Last Ping",
+                            &instance
+                                .ssm_last_ping
+                                .as_deref()
+                                .map(format_aws_time_local)
+                                .unwrap_or_else(|| "-".to_string()),
+                        );
+                        row(
+                            ui,
+                            "Launch Time",
+                            &instance
+                                .launch_time
+                                .as_deref()
+                                .map(format_aws_time_local)
+                                .unwrap_or_else(|| "-".to_string()),
+                        );
                     });
 
                 // Volumes section
@@ -12043,7 +12057,7 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
                                 ui.label(&vol.volume_type);
                                 ui.label(&vol.device);
                                 ui.label(&vol.state);
-                                ui.label(&vol.attach_time);
+                                ui.label(format_aws_time_local(&vol.attach_time));
                                 ui.end_row();
                             }
                         });
@@ -14525,10 +14539,52 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
     }
 
     /// Current wall-clock time in the **local machine's** timezone, e.g.
-    /// `2026-07-02 16:20:33 CDT`. Uses `chrono::Local`, which reads the OS
-    /// timezone (and DST) — so it's correct wherever the app runs.
+    /// `2026-07-02 16:20:33 -05:00`. Uses `chrono::Local`, which reads the OS
+    /// timezone (and DST) — so it's correct wherever the app runs. Note `%Z`
+    /// renders the numeric offset, not an abbreviation like `CDT`; chrono only
+    /// produces zone names with the `chrono-tz` crate.
     fn local_timestamp_now() -> String {
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z").to_string()
+    }
+
+    /// `UTC-04:00` style label for a given offset from UTC.
+    ///
+    /// Takes the offset rather than reading "now" so a timestamp on the other
+    /// side of a DST boundary is labelled with the offset that was actually in
+    /// effect for it, not today's.
+    fn utc_offset_label(offset_seconds: i32) -> String {
+        let sign = if offset_seconds < 0 { '-' } else { '+' };
+        let secs = offset_seconds.abs();
+        format!("UTC{sign}{:02}:{:02}", secs / 3600, (secs % 3600) / 60)
+    }
+
+    /// Render an AWS timestamp in the **local machine's** timezone, with the
+    /// zone spelled out after it: `2026-03-11 12:03:45 UTC-04:00`.
+    ///
+    /// EC2 reports `LaunchTime`/`AttachTime`/`LastPingDateTime` as RFC 3339 in
+    /// UTC (e.g. `2026-03-11T16:03:45+00:00`). `chrono::Local` reads the OS
+    /// timezone and DST rules, so the displayed clock follows the machine —
+    /// EST, PST, IST, whatever the user is actually on.
+    ///
+    /// The zone is shown as a numeric offset rather than an abbreviation
+    /// because chrono's `%Z` yields the offset anyway for `Local`; real
+    /// abbreviations ("EDT") would need the `chrono-tz` crate.
+    ///
+    /// Anything unparseable — including the `-` placeholder used when a field
+    /// is absent — passes through untouched.
+    fn format_aws_time_local(raw: &str) -> String {
+        use chrono::Offset;
+        match chrono::DateTime::parse_from_rfc3339(raw) {
+            Ok(dt) => {
+                let local = dt.with_timezone(&chrono::Local);
+                format!(
+                    "{} {}",
+                    local.format("%Y-%m-%d %H:%M:%S"),
+                    utc_offset_label(local.offset().fix().local_minus_utc())
+                )
+            }
+            Err(_) => raw.to_string(),
+        }
     }
 
     fn profile_choice_mtime(path: Option<&std::path::Path>) -> Option<SystemTime> {
@@ -15864,6 +15920,112 @@ if [ -f "$SF" ]; then echo "sudoers : $(ls -l "$SF")"; fi
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn utc_offset_label_formats_hours_and_minutes() {
+            assert_eq!(utc_offset_label(0), "UTC+00:00");
+            assert_eq!(utc_offset_label(-4 * 3600), "UTC-04:00");
+            assert_eq!(utc_offset_label(-8 * 3600), "UTC-08:00");
+            // Half-hour zones (India) must not lose the :30.
+            assert_eq!(utc_offset_label(5 * 3600 + 1800), "UTC+05:30");
+        }
+
+        #[test]
+        fn format_aws_time_local_passes_through_unparseable() {
+            // "-" is the placeholder used when AWS omits the field.
+            assert_eq!(format_aws_time_local("-"), "-");
+            assert_eq!(format_aws_time_local(""), "");
+            assert_eq!(format_aws_time_local("not a time"), "not a time");
+        }
+
+        // --- Obfuscated user-management shell templates ------------------
+        // These used to be inline `format!` string literals; they now live in
+        // obfuscated asset blobs. Each test decrypts the blob, substitutes the
+        // username, and checks the reconstructed shell is intact — that the
+        // build-time obfuscation round-trips, the placeholder is fully
+        // replaced, and the recognizable command signature survived.
+
+        fn deobf_named(blob: &[u8], user: &str) -> String {
+            deobf_asset(blob).replace("__USER__", user)
+        }
+
+        #[test]
+        fn create_diagnostics_template_round_trips() {
+            let s = deobf_named(
+                include_bytes!(concat!(env!("OUT_DIR"), "/create_diagnostics.sh.obf")),
+                "jane.doe",
+            );
+            assert!(!s.contains("__USER__"), "placeholder not substituted");
+            assert!(s.starts_with("U=\"jane.doe\""), "got: {s}");
+            assert!(s.contains("authorized_keys") && s.contains("getent passwd"));
+        }
+
+        #[test]
+        fn delete_preflight_template_round_trips() {
+            let s = deobf_named(
+                include_bytes!(concat!(env!("OUT_DIR"), "/delete_preflight.sh.obf")),
+                "jane.doe",
+            );
+            assert!(!s.contains("__USER__"));
+            // Single line, no trailing newline (fed straight to `base64 -d`).
+            assert!(!s.contains('\n'), "preflight must stay one line");
+            assert!(s.contains("id jane.doe >/dev/null") && s.contains("CNU_ABSENT"));
+        }
+
+        #[test]
+        fn delete_diagnostics_template_round_trips() {
+            let s = deobf_named(
+                include_bytes!(concat!(env!("OUT_DIR"), "/delete_diagnostics.sh.obf")),
+                "jane.doe",
+            );
+            assert!(!s.contains("__USER__"));
+            assert!(s.starts_with("U=\"jane.doe\""));
+            assert!(s.contains("pgrep -u") && s.contains("/efs/home/"));
+        }
+
+        #[test]
+        fn secondary_mirror_template_round_trips() {
+            let s = deobf_named(
+                include_bytes!(concat!(env!("OUT_DIR"), "/secondary_mirror.sh.obf")),
+                "jane.doe",
+            );
+            assert!(!s.contains("__USER__"));
+            // One compound command, no trailing newline (one step in a vec).
+            assert!(!s.contains('\n'), "secondary must stay one line");
+            assert!(s.starts_with("cd ~ && H=/efs/home/jane.doe;"));
+            assert!(s.contains("useradd -u") && s.contains("groupadd -g"));
+            assert!(s.ends_with("|| echo \"secondary: FAILED to create jane.doe\""));
+        }
+
+        #[test]
+        fn sudoers_grant_template_splits_into_four_steps() {
+            let s = deobf_asset(include_bytes!(concat!(env!("OUT_DIR"), "/sudoers_grant.sh.obf")))
+                .replace("__USER__", "jane.doe")
+                .replace("__SUFFIX__", "jane-doe");
+            let steps: Vec<&str> = s.lines().collect();
+            assert_eq!(steps.len(), 4, "must yield exactly 4 sudoers steps");
+            assert_eq!(
+                steps[0],
+                "echo 'jane.doe ALL=(ALL) NOPASSWD:ALL' | tee /etc/sudoers.d/zz-jane-doe-nopasswd > /dev/null"
+            );
+            assert_eq!(steps[1], "visudo -cf /etc/sudoers.d/zz-jane-doe-nopasswd");
+            assert_eq!(steps[2], "chmod 0440 /etc/sudoers.d/zz-jane-doe-nopasswd");
+            assert_eq!(steps[3], "chown root:root /etc/sudoers.d/zz-jane-doe-nopasswd");
+        }
+
+        #[test]
+        fn format_aws_time_local_normalizes_to_one_instant() {
+            // Same moment, expressed two ways. Whatever the test machine's
+            // timezone is, both must render identically — that only holds if
+            // the value is genuinely converted rather than reformatted.
+            let utc = format_aws_time_local("2026-03-11T16:03:45+00:00");
+            let offset = format_aws_time_local("2026-03-11T11:03:45-05:00");
+            assert_eq!(utc, offset);
+            // And the zone is always spelled out for the user.
+            assert!(utc.contains("UTC+") || utc.contains("UTC-"), "got {utc}");
+            // Reformatted, not passed through raw.
+            assert_ne!(utc, "2026-03-11T16:03:45+00:00");
+        }
 
         #[test]
         fn default_window_size_is_large_enough() {
