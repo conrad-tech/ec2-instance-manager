@@ -1232,10 +1232,26 @@ mod gui {
         end: &str,
     ) -> Option<(String, i32)> {
         let text = String::from_utf8_lossy(raw);
-        let bpos = text.find(begin)?;
-        let after_begin = &text[bpos + begin.len()..];
-        let nl = after_begin.find('\n')?;
-        let out_start = bpos + begin.len() + nl + 1;
+        // Find the begin marker emitted by the *real* `printf` — it is
+        // immediately followed by a newline (`\n`, or `\r\n` through the PTY).
+        // When the remote shell echoes the command (some SSM shells don't
+        // honor `stty -echo`), the marker ALSO appears inside the echoed
+        // `printf 'CB_<id>_\n'`, where it is followed by a literal backslash,
+        // not a real newline. Taking the first match unconditionally would
+        // then treat the real marker as file data and the base64 decode fails
+        // on the marker's `_`. Skip to the newline-terminated occurrence — the
+        // same defense `channel_handshake_done` applies to CTRLRDY.
+        let mut from = 0;
+        let out_start = loop {
+            let rel = text[from..].find(begin)?;
+            let marker_end = from + rel + begin.len();
+            let after = &text[marker_end..];
+            let after = after.strip_prefix('\r').unwrap_or(after);
+            if let Some(rest) = after.strip_prefix('\n') {
+                break text.len() - rest.len();
+            }
+            from = marker_end;
+        };
         let tail = &text[out_start..];
         let epos = tail.find(end)?;
         let output = &tail[..epos];
@@ -11765,11 +11781,9 @@ mod gui {
                     };
                     ui.label(counter);
 
-                    if ui
-                        .small_button("✕")
-                        .on_hover_text("Close (Esc)")
-                        .clicked()
-                    {
+                    // Plain ASCII "X" — the ✕ (U+2715) glyph is missing from
+                    // egui's bundled fonts and renders as a tofu square.
+                    if ui.small_button("X").on_hover_text("Close (Esc)").clicked() {
                         find_open = false;
                     }
                 });
@@ -16802,6 +16816,31 @@ mod gui {
             // Begin + partial output but no end marker yet — must not match.
             let raw = b"CB_3_\r\npartial output\r\n";
             assert!(extract_channel_response(raw, "CB_3_", "CE_3_").is_none());
+        }
+
+        #[test]
+        fn control_channel_ignores_echoed_command_line() {
+            // Regression: when `stty -echo` isn't honored, the whole command
+            // is echoed first — so the markers appear TWICE. The echoed
+            // `printf 'CB_5_\n'` is followed by a literal backslash, the real
+            // printf output by a newline. Extraction must lock onto the real
+            // one; otherwise the begin marker leaks into the output and the
+            // file-read base64 decode fails on the `_` (symbol 95, offset 2).
+            let raw = b"printf 'CB_5_\\n'; { sudo -n base64 main.tf ; } 2>&1; \
+                        __rc=$?; printf 'CE_5_%d_\\n' \"$__rc\"\r\n\
+                        CB_5_\r\ndGVycmFmb3Jt\r\nCE_5_0_\r\n";
+            let (out, rc) =
+                extract_channel_response(raw, "CB_5_", "CE_5_").expect("response");
+            assert_eq!(rc, 0);
+            // The begin marker must NOT leak into the output (the bug).
+            assert!(!out.contains("CB_5_"), "marker leaked: {out:?}");
+            // After the file-read path strips whitespace it is clean base64.
+            let cleaned: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+            use base64::Engine;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(cleaned.as_bytes())
+                .expect("valid base64");
+            assert_eq!(decoded, b"terraform");
         }
 
         #[test]
