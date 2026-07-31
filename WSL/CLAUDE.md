@@ -34,7 +34,7 @@ cargo clippy --features gui
 
 As of 2026-07-31, the full build pipeline passes cleanly:
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 280 tests pass (150 lib + 3 CLI + 127 GUI)
+- `cargo test --features gui` — 294 tests pass (164 lib + 3 CLI + 127 GUI)
 - `cargo clippy --features gui` — only pre-existing lib-level warnings (derivable_impls on Mode, too_many_arguments on sim::make_instance, collapsible_if in GUI)
 - Release targets — zero warnings on both Linux (x86_64-unknown-linux-gnu, via
   `build_binaries.sh`) and Windows (x86_64-pc-windows-gnu, built directly since
@@ -233,6 +233,20 @@ double-quoted shell argument.
 `accounts::vault_addr_for`. `ProfileConfig` is deliberately not extended with
 it; it flows into config.ini persistence and the tab UI, neither of which needs
 Vault settings.
+
+**Vault IAM Delete** is the same modal with a `delete` flag (the ARN and
+policy-body boxes are hidden), driven by `VaultIamDeleteRequest`. It runs
+`vault delete auth/aws/role/<name>` + `vault policy delete <name>`, lists what's
+left, and its verdict test is the **negation**: OK means neither object reads
+back. Both requests share `connect_steps` and `verdict_step`, so the token
+hygiene and the marker mechanism cannot drift between them — keep it that way.
+
+Its gate is `vault_iam.delete_allowed_users`, which **ships empty and is ANDed
+with `allowed_users`** (`vault_iam_delete_enabled_for`): being able to create
+must not imply being able to delete. The delete always removes the policy too,
+so pointing it at a policy shared by another role takes that role's policy with
+it. Deleting something already absent is fine — the verdict checks end state,
+not the delete's exit code.
 
 ### cfg gates for imports
 

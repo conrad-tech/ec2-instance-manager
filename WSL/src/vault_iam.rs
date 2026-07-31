@@ -8,17 +8,18 @@
 
 use base64::Engine;
 
-/// Marker echoed by the final step when both reads succeed.
+/// Marker echoed by the final step when the run achieved its goal.
 pub const OK_MARKER: &str = "__VAULT_IAM_OK__";
-/// Marker echoed by the final step when either read fails.
+/// Marker echoed by the final step when it did not.
 pub const FAIL_MARKER: &str = "__VAULT_IAM_FAIL__";
 
 /// Outcome of a run, read from the terminal after the steps finish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// Policy and role both read back successfully.
-    Created,
-    /// The check ran and at least one read failed.
+    /// The run achieved its goal: for a create, both objects read back; for a
+    /// delete, neither does.
+    Ok,
+    /// The check ran and the goal was not met.
     Failed,
     /// Neither marker was found — the session died, scrolled away, or never
     /// reached the last step. Treated as a failure by the caller.
@@ -110,6 +111,86 @@ fn is_valid_vault_addr(addr: &str) -> bool {
         && !addr.chars().any(|c| c.is_whitespace() || c == '\'')
 }
 
+/// Export the address and token, then wipe them off the screen.
+///
+/// The token is base64-encoded rather than written literally, and the export
+/// carries a leading space so the preceding `HISTCONTROL=ignorespace` keeps it
+/// out of the remote shell history. `clear` runs immediately after, before any
+/// output worth reading, so the verification below stays visible.
+fn connect_steps(vault_addr: &str, vault_token: &str) -> Vec<String> {
+    let token_b64 = base64::engine::general_purpose::STANDARD.encode(vault_token.trim());
+    vec![
+        "export HISTCONTROL=ignorespace".to_string(),
+        format!(
+            " export VAULT_ADDR='{}'; \
+             export VAULT_TOKEN=\"$(echo '{token_b64}' | base64 -d)\"; clear",
+            vault_addr.trim()
+        ),
+    ]
+}
+
+/// Final step: run `ok_test` and echo the verdict marker.
+///
+/// The marker is assembled from `$v` at runtime. The shell echoes each command
+/// before running it, so a literal `__VAULT_IAM_OK__` in the command line would
+/// make [`parse_verdict`] match the echo instead of the output and report
+/// success regardless of what Vault did.
+fn verdict_step(ok_test: &str) -> String {
+    format!("if {ok_test}; then v=OK; else v=FAIL; fi; echo \"__VAULT_IAM_${{v}}__\"")
+}
+
+/// Everything the delete dialog collects. The mirror image of
+/// [`VaultIamRequest`]: no ARN and no policy body, because it removes the two
+/// objects a create made rather than describing them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VaultIamDeleteRequest {
+    pub role_name: String,
+    pub policy_name: String,
+    pub vault_addr: String,
+    /// Typed per run and never persisted anywhere.
+    pub vault_token: String,
+}
+
+impl VaultIamDeleteRequest {
+    /// Check every field, returning the message for the dialog's error line.
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_valid_name(self.role_name.trim()) {
+            return Err("AWS role name must be letters, digits, '_', '.' or '-'.".to_string());
+        }
+        if !is_valid_name(self.policy_name.trim()) {
+            return Err("Policy name must be letters, digits, '_', '.' or '-'.".to_string());
+        }
+        if !is_valid_vault_addr(&self.vault_addr) {
+            return Err("Enter a VAULT_ADDR starting with http:// or https://.".to_string());
+        }
+        if self.vault_token.trim().is_empty() {
+            return Err("Enter a VAULT_TOKEN.".to_string());
+        }
+        Ok(())
+    }
+
+    /// The shell commands to drip-feed to the bastion, in order.
+    ///
+    /// Call [`validate`](Self::validate) first. Deleting something that is
+    /// already gone is not an error here: Vault's delete is idempotent, and the
+    /// verdict checks the end state rather than the delete's exit code, so a
+    /// half-finished earlier run still converges on OK.
+    pub fn steps(&self) -> Vec<String> {
+        let role = self.role_name.trim();
+        let policy = self.policy_name.trim();
+        let mut steps = connect_steps(&self.vault_addr, &self.vault_token);
+        steps.push(format!("vault delete auth/aws/role/{role}"));
+        steps.push(format!("vault policy delete {policy}"));
+        // Shown to the user, so they can see the role is no longer listed.
+        steps.push("vault list auth/aws/role".to_string());
+        steps.push(verdict_step(&format!(
+            "! vault read auth/aws/role/{role} >/dev/null 2>&1 && \
+             ! vault policy read {policy} >/dev/null 2>&1"
+        )));
+        steps
+    }
+}
+
 impl VaultIamRequest {
     /// Check every field, returning the message to show on the dialog's error
     /// line. Ordered so the user fixes the top of the form first.
@@ -155,47 +236,36 @@ impl VaultIamRequest {
     ///   stays out of the remote shell history, and the `clear` that follows
     ///   moves it off the visible screen before the verification output.
     pub fn steps(&self) -> Vec<String> {
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let addr = self.vault_addr.trim();
         let role = self.role_name.trim();
         let policy = self.policy_name.trim();
         // Strip CR so a Windows (autocrlf) clipboard or file doesn't feed the
         // remote bash a CRLF policy body.
-        let policy_b64 = b64.encode(self.policy_body.replace('\r', ""));
-        let token_b64 = b64.encode(self.vault_token.trim());
+        let policy_b64 = base64::engine::general_purpose::STANDARD
+            .encode(self.policy_body.replace('\r', ""));
 
-        vec![
-            "export HISTCONTROL=ignorespace".to_string(),
-            // Leading space: kept out of history by the line above.
-            format!(
-                " export VAULT_ADDR='{addr}'; \
-                 export VAULT_TOKEN=\"$(echo '{token_b64}' | base64 -d)\"; clear"
-            ),
-            format!("echo '{policy_b64}' | base64 -d | vault policy write {policy} -"),
-            format!(
-                "vault write auth/aws/role/{role} \
-                 bound_iam_principal_arn=\"{}\" \
-                 resolve_aws_unique_id=true \
-                 policies=\"{policy}\" \
-                 token_ttl=0s \
-                 token_max_ttl=24h \
-                 max_ttl=24h",
-                self.iam_role_arn.trim()
-            ),
-            // Shown to the user — this is the "list it to make sure it got
-            // created" step.
-            format!("vault policy read {policy}"),
-            format!("vault read auth/aws/role/{role}"),
-            // Machine-readable verdict. The marker is assembled from $v so the
-            // echoed command line does not itself contain OK_MARKER or
-            // FAIL_MARKER — otherwise scanning the screen would match the
-            // command instead of its output.
-            format!(
-                "if vault policy read {policy} >/dev/null 2>&1 && \
-                 vault read auth/aws/role/{role} >/dev/null 2>&1; \
-                 then v=OK; else v=FAIL; fi; echo \"__VAULT_IAM_${{v}}__\"",
-            ),
-        ]
+        let mut steps = connect_steps(&self.vault_addr, &self.vault_token);
+        steps.push(format!(
+            "echo '{policy_b64}' | base64 -d | vault policy write {policy} -"
+        ));
+        steps.push(format!(
+            "vault write auth/aws/role/{role} \
+             bound_iam_principal_arn=\"{}\" \
+             resolve_aws_unique_id=true \
+             policies=\"{policy}\" \
+             token_ttl=0s \
+             token_max_ttl=24h \
+             max_ttl=24h",
+            self.iam_role_arn.trim()
+        ));
+        // Shown to the user — this is the "list it to make sure it got
+        // created" step.
+        steps.push(format!("vault policy read {policy}"));
+        steps.push(format!("vault read auth/aws/role/{role}"));
+        steps.push(verdict_step(&format!(
+            "vault policy read {policy} >/dev/null 2>&1 && \
+             vault read auth/aws/role/{role} >/dev/null 2>&1"
+        )));
+        steps
     }
 }
 
@@ -207,7 +277,7 @@ pub fn parse_verdict(screen: &str) -> Verdict {
     if screen.contains(FAIL_MARKER) {
         Verdict::Failed
     } else if screen.contains(OK_MARKER) {
-        Verdict::Created
+        Verdict::Ok
     } else {
         Verdict::Unknown
     }
@@ -428,11 +498,117 @@ mod tests {
         assert!(!request().steps().iter().any(|s| s.contains("sudo")));
     }
 
+    fn delete_request() -> VaultIamDeleteRequest {
+        VaultIamDeleteRequest {
+            role_name: "my-role".to_string(),
+            policy_name: "my-role".to_string(),
+            vault_addr: "https://vault.example.com:8200".to_string(),
+            vault_token: "hvs.exampletoken".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_complete_delete_request_validates() {
+        assert_eq!(delete_request().validate(), Ok(()));
+    }
+
+    #[test]
+    fn delete_validation_rejects_each_missing_field() {
+        let cases: Vec<(&str, VaultIamDeleteRequest)> = vec![
+            ("role name", VaultIamDeleteRequest { role_name: String::new(), ..delete_request() }),
+            ("policy name", VaultIamDeleteRequest { policy_name: "  ".into(), ..delete_request() }),
+            ("vault addr", VaultIamDeleteRequest { vault_addr: String::new(), ..delete_request() }),
+            ("token", VaultIamDeleteRequest { vault_token: "  ".into(), ..delete_request() }),
+        ];
+        for (field, req) in cases {
+            assert!(req.validate().is_err(), "{field} should be required");
+        }
+    }
+
+    #[test]
+    fn delete_validation_rejects_unsafe_names() {
+        let bad = VaultIamDeleteRequest {
+            role_name: "my-role; vault delete secret/prod".into(),
+            ..delete_request()
+        };
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn delete_removes_both_the_role_and_the_policy() {
+        let steps = delete_request().steps();
+        assert!(steps.iter().any(|s| s == "vault delete auth/aws/role/my-role"));
+        assert!(steps.iter().any(|s| s == "vault policy delete my-role"));
+    }
+
+    #[test]
+    fn delete_lists_the_remaining_roles() {
+        assert!(delete_request()
+            .steps()
+            .iter()
+            .any(|s| s == "vault list auth/aws/role"));
+    }
+
+    #[test]
+    fn delete_shares_the_connect_prelude_with_create() {
+        // Same token hygiene on both paths — history-suppressed, encoded,
+        // cleared off screen.
+        let delete = delete_request().steps();
+        let create = request().steps();
+        assert_eq!(delete[0], create[0]);
+        assert_eq!(delete[1], create[1]);
+        assert!(!delete[1].contains("hvs.exampletoken"));
+    }
+
+    #[test]
+    fn delete_succeeds_only_when_both_objects_are_gone() {
+        let check = delete_request().steps().last().unwrap().clone();
+        // Negated reads: OK means neither object can be read back.
+        assert!(check.contains("! vault read auth/aws/role/my-role"));
+        assert!(check.contains("! vault policy read my-role"));
+        assert!(check.contains("&&"), "both must be absent, not either");
+    }
+
+    #[test]
+    fn the_delete_verdict_step_does_not_contain_the_literal_markers() {
+        let check = delete_request().steps().last().unwrap().clone();
+        assert!(!check.contains(OK_MARKER), "would self-match: {check}");
+        assert!(!check.contains(FAIL_MARKER), "would self-match: {check}");
+    }
+
+    #[test]
+    fn delete_never_elevates() {
+        assert!(!delete_request().steps().iter().any(|s| s.contains("sudo")));
+    }
+
+    #[test]
+    fn delete_undoes_exactly_what_create_made() {
+        // The two paths must agree on the object names, or a delete would
+        // leave the role behind and a re-create would collide with it.
+        let create = request();
+        let delete = VaultIamDeleteRequest {
+            role_name: create.role_name.clone(),
+            policy_name: create.policy_name.clone(),
+            vault_addr: create.vault_addr.clone(),
+            vault_token: create.vault_token.clone(),
+        };
+        let created_role = format!("vault write auth/aws/role/{}", create.role_name);
+        assert!(create.steps().iter().any(|s| s.starts_with(&created_role)));
+        assert!(delete
+            .steps()
+            .iter()
+            .any(|s| *s == format!("vault delete auth/aws/role/{}", create.role_name)));
+        assert!(delete
+            .steps()
+            .iter()
+            .any(|s| *s == format!("vault policy delete {}", create.policy_name)));
+    }
+
     #[test]
     fn verdict_is_read_from_the_marker() {
         assert_eq!(
             parse_verdict("Success! Data written\n__VAULT_IAM_OK__\n$ "),
-            Verdict::Created
+            Verdict::Ok
         );
         assert_eq!(parse_verdict("no such policy\n__VAULT_IAM_FAIL__\n"), Verdict::Failed);
     }

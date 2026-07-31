@@ -20,8 +20,9 @@ Rust-only EC2 + SSM instance explorer with:
 - **Scripts menu** (GUI, Connections page) — run bastion helper scripts against a
   primary/secondary bastion pair: `create_new_user.sh` (create a user, verify
   cross-bastion SSH, pull the PEM to your local Downloads), an admin-gated
-  `delete_user.sh`, and **Vault IAM Access** (write a Vault policy + AWS auth role
-  bound to an IAM role, then read both back to verify).
+  `delete_user.sh`, **Vault IAM Access** (write a Vault policy + AWS auth role
+  bound to an IAM role, then read both back to verify), and an admin-gated
+  **Vault IAM Delete** that undoes it.
   See [Scripts menu (bastion user management)](#scripts-menu-bastion-user-management).
 
 ## Prerequisites
@@ -603,6 +604,32 @@ reports the verdict with the captured terminal output under **Details**.
 > tab's scrollback. The `vault` binary must be on the bastion's PATH for the SSM
 > user, otherwise you get "command not found" and a failure popup.
 
+### Vault IAM Delete (admin-gated)
+
+The flip of Vault IAM Access, for tearing down a test role before re-running the
+create. **Hidden unless enabled at build time** — it needs a username on *both*
+`vault_iam.allowed_users` and `vault_iam.delete_allowed_users` (see
+[Feature flags](#feature-flags-featuresjson)); the delete list ships empty, so
+being able to create never implies being able to delete.
+
+Same dialog minus the **IAM Role** and **Policy** boxes — it removes objects
+rather than describing them. You supply the AWS role name, the policy name, the
+environment, the bastions, and the Vault address and token, then tick the
+confirmation before the **Delete** button enables.
+
+On the primary bastion it runs `vault delete auth/aws/role/<name>` and
+`vault policy delete <name>`, lists the remaining roles so you can see it gone,
+and confirms that **neither** object reads back before reporting success. Token
+handling is identical to the create — the two paths share the same export
+prelude.
+
+> Deleting something already absent is not an error: Vault's delete is
+> idempotent and the verdict checks the end state rather than the delete's exit
+> code, so a half-finished earlier run still converges on success.
+>
+> The policy is always removed alongside the role. If you point this at a policy
+> shared by another role, that role loses its policy too.
+
 The script sources live in `assets/scripts/` (`create_new_user.sh`,
 `delete_user.sh`) and are compiled into the binary; edit them and rebuild to
 change behavior. The Vault commands are built in-app, not from a script file.
@@ -620,7 +647,8 @@ actions.
   "primary_bastion_filter": "bastion",
   "secondary_bastion_filter": "bastion",
   "vault_iam": {
-    "allowed_users": ["*"]
+    "allowed_users": ["*"],
+    "delete_allowed_users": []
   }
 }
 ```
@@ -631,6 +659,7 @@ actions.
 | `primary_bastion_filter`   | `"bastion"` | Substring that narrows the **Primary Bastion** dropdown (matches instance name or id, case-insensitive). Empty shows all. |
 | `secondary_bastion_filter` | `"bastion"` | Same, for the **Secondary Bastion** dropdown. |
 | `vault_iam.allowed_users`  | `["*"]`     | OS usernames that see the **Vault IAM Access** entry. `["*"]` = everyone, `[]` = nobody, or list specific usernames (case-insensitive). |
+| `vault_iam.delete_allowed_users` | `[]`  | OS usernames that additionally see the destructive **Vault IAM Delete** entry. Requires membership of `allowed_users` too. Ships empty — nobody. |
 
 Parsing **fails closed**: if the file is malformed, every gate defaults to off.
 To ship a build for admins who need user deletion, set `"allow_delete_user": true`
@@ -648,4 +677,17 @@ but it needs one thing to be useful:
 
 To restrict it instead, replace `["*"]` with the usernames who should have it
 (or `[]` to hide it from everyone) and rebuild.
+
+### Enabling Vault IAM Delete
+
+This one is off for everyone in the shipped default, deliberately:
+
+1. Add the usernames to `vault_iam.delete_allowed_users` in
+   `assets/features.json`. They must also be covered by `allowed_users` — the
+   gate requires both, so nobody gets a destructive Vault action without the
+   create it undoes.
+2. Rebuild.
+
+`["*"]` works here too, but think before using it: the entry deletes a Vault
+role *and* its policy.
 

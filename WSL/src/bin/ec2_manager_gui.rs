@@ -29,7 +29,7 @@ mod gui {
     use ec2_manager::config::AppConfig;
     use ec2_manager::credentials;
     use ec2_manager::script_env::ScriptEnv;
-    use ec2_manager::vault_iam::{self, VaultIamRequest};
+    use ec2_manager::vault_iam::{self, VaultIamDeleteRequest, VaultIamRequest};
     use ec2_manager::connection_tabs::ConnectionTabs;
     use ec2_manager::diagnostics::run_diagnostics;
     use ec2_manager::error::{AppError, Result};
@@ -573,6 +573,11 @@ mod gui {
     /// name, and VAULT_ADDR tracks the selected environment — each stopping as
     /// soon as the user types in that box.
     struct VaultIamDialog {
+        /// Delete mode (Vault IAM Delete) rather than create. The ARN and
+        /// policy-body boxes are hidden; everything else is shared.
+        delete: bool,
+        /// Delete mode: confirmation checkbox — Delete stays disabled until set.
+        confirm_delete: bool,
         iam_role_arn: String,
         policy_body: String,
         role_name: String,
@@ -600,6 +605,8 @@ mod gui {
     struct VaultIamRun {
         /// Connection tab the commands were sent to.
         tab_id: u64,
+        /// Whether this run was a delete, for the result wording.
+        delete: bool,
         role_name: String,
         policy_name: String,
     }
@@ -3039,6 +3046,10 @@ mod gui {
         /// Build-time gate: whether the Vault IAM Access entry is shown to the
         /// current OS user (features.json `vault_iam.allowed_users`).
         vault_iam_enabled: bool,
+        /// Build-time gate for the destructive Vault IAM Delete entry
+        /// (features.json `vault_iam.delete_allowed_users`); needs the create
+        /// gate too.
+        vault_iam_delete_enabled: bool,
         /// Queued script runs waiting for their PTY session to come up.
         pending_script_runs: Vec<PendingScriptRun>,
         /// Build-time gate: whether the destructive "delete_user.sh" entry
@@ -3342,6 +3353,9 @@ mod gui {
                 vault_iam_run: None,
                 vault_iam_enabled: features
                     .vault_iam_enabled_for(&ec2_manager::features::current_os_user()),
+                vault_iam_delete_enabled: features.vault_iam_delete_enabled_for(
+                    &ec2_manager::features::current_os_user(),
+                ),
                 pending_script_runs: Vec::new(),
                 allow_delete_user: features.allow_delete_user,
                 primary_bastion_filter: features.primary_bastion_filter.clone(),
@@ -6274,9 +6288,9 @@ mod gui {
                 });
         }
 
-        /// Open the "Vault IAM Access" dialog, pre-filled from the current
-        /// environment and its cached bastion pair.
-        fn open_vault_iam_dialog(&mut self) {
+        /// Open the "Vault IAM Access" dialog (or its delete twin), pre-filled
+        /// from the current environment and its cached bastion pair.
+        fn open_vault_iam_dialog(&mut self, delete: bool) {
             let (env, env_name) = self.default_script_environment();
             let mut primary_id = String::new();
             let mut primary_query = String::new();
@@ -6293,6 +6307,8 @@ mod gui {
             let vault_addr =
                 ec2_manager::accounts::vault_addr_for(&env, &env_name).unwrap_or_default();
             self.vault_iam_dialog = Some(VaultIamDialog {
+                delete,
+                confirm_delete: false,
                 iam_role_arn: String::new(),
                 policy_body: String::new(),
                 role_name: String::new(),
@@ -6328,7 +6344,12 @@ mod gui {
             let mut do_cancel = false;
             let mut env_changed = false;
 
-            egui::Window::new("Scripts — Vault IAM Access")
+            let title = if dlg.delete {
+                "Scripts — Vault IAM Delete"
+            } else {
+                "Scripts — Vault IAM Access"
+            };
+            egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut window_open)
@@ -6338,37 +6359,46 @@ mod gui {
                         .num_columns(2)
                         .spacing([10.0, 8.0])
                         .show(ui, |ui| {
-                            ui.label("IAM Role:");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut dlg.iam_role_arn)
-                                    .hint_text("arn:aws:iam::123456789012:role/my-role")
-                                    .desired_width(360.0),
-                            );
-                            ui.end_row();
+                            // Delete takes only the names — there is no ARN to
+                            // bind and no policy body to write.
+                            if !dlg.delete {
+                                ui.label("IAM Role:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut dlg.iam_role_arn)
+                                        .hint_text("arn:aws:iam::123456789012:role/my-role")
+                                        .desired_width(360.0),
+                                );
+                                ui.end_row();
 
-                            ui.label("Policy:");
-                            ui.add(
-                                egui::TextEdit::multiline(&mut dlg.policy_body)
-                                    .hint_text(
-                                        "path \"ctt/*\" {\n  capabilities = [\"read\", \"write\", \"list\"]\n}",
-                                    )
-                                    .desired_width(360.0)
-                                    .desired_rows(5),
-                            );
-                            ui.end_row();
+                                ui.label("Policy:");
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut dlg.policy_body)
+                                        .hint_text(
+                                            "path \"ctt/*\" {\n  capabilities = [\"read\", \"write\", \"list\"]\n}",
+                                        )
+                                        .desired_width(360.0)
+                                        .desired_rows(5),
+                                );
+                                ui.end_row();
 
-                            // Defaults to the role name in the ARN until the
-                            // user types something of their own.
-                            if !dlg.role_name_edited {
-                                dlg.role_name =
-                                    vault_iam::role_name_from_arn(&dlg.iam_role_arn)
-                                        .unwrap_or_default();
+                                // Defaults to the role name in the ARN until
+                                // the user types something of their own.
+                                if !dlg.role_name_edited {
+                                    dlg.role_name =
+                                        vault_iam::role_name_from_arn(&dlg.iam_role_arn)
+                                            .unwrap_or_default();
+                                }
                             }
                             ui.label("AWS Role Name:");
+                            let role_hint = if dlg.delete {
+                                "the role to delete"
+                            } else {
+                                "defaults to the IAM role"
+                            };
                             if ui
                                 .add(
                                     egui::TextEdit::singleline(&mut dlg.role_name)
-                                        .hint_text("defaults to the IAM role")
+                                        .hint_text(role_hint)
                                         .desired_width(360.0),
                                 )
                                 .changed()
@@ -6477,19 +6507,46 @@ mod gui {
                         });
 
                     ui.add_space(4.0);
-                    ui.label(
-                        "Runs on the primary bastion: writes the policy and the AWS auth \
-                         role, then reads both back.",
-                    );
+                    if dlg.delete {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 150, 60),
+                            "⚠ Removes the AWS auth role and the policy from Vault.",
+                        );
+                        ui.label(
+                            "Runs on the primary bastion, then confirms both are gone.",
+                        );
+                    } else {
+                        ui.label(
+                            "Runs on the primary bastion: writes the policy and the AWS auth \
+                             role, then reads both back.",
+                        );
+                    }
 
                     if let Some(err) = &dlg.error {
                         ui.add_space(6.0);
                         ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
                     }
 
+                    if dlg.delete {
+                        ui.add_space(6.0);
+                        let confirm_text = if dlg.role_name.trim().is_empty() {
+                            "Yes, delete this role and its policy".to_string()
+                        } else {
+                            format!("Yes, delete '{}' and its policy", dlg.role_name.trim())
+                        };
+                        ui.checkbox(&mut dlg.confirm_delete, confirm_text);
+                    }
+
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Run").clicked() {
+                        let run_label = if dlg.delete { "Delete" } else { "Run" };
+                        // In delete mode the button stays disabled until the
+                        // confirmation is ticked.
+                        let run_enabled = !dlg.delete || dlg.confirm_delete;
+                        if ui
+                            .add_enabled(run_enabled, egui::Button::new(run_label))
+                            .clicked()
+                        {
                             do_run = true;
                         }
                         if ui.button("Cancel").clicked() {
@@ -6521,19 +6578,41 @@ mod gui {
             }
 
             if do_run {
-                let request = VaultIamRequest {
-                    iam_role_arn: dlg.iam_role_arn.trim().to_string(),
-                    policy_body: dlg.policy_body.clone(),
-                    role_name: dlg.role_name.trim().to_string(),
-                    policy_name: dlg.policy_name.trim().to_string(),
-                    vault_addr: dlg.vault_addr.trim().to_string(),
-                    vault_token: dlg.vault_token.clone(),
+                // Each mode validates its own fields and builds its own steps;
+                // everything downstream is shared.
+                let steps = if dlg.delete {
+                    let request = VaultIamDeleteRequest {
+                        role_name: dlg.role_name.trim().to_string(),
+                        policy_name: dlg.policy_name.trim().to_string(),
+                        vault_addr: dlg.vault_addr.trim().to_string(),
+                        vault_token: dlg.vault_token.clone(),
+                    };
+                    match request.validate() {
+                        Ok(()) => request.steps(),
+                        Err(err) => {
+                            dlg.error = Some(err);
+                            self.vault_iam_dialog = Some(dlg);
+                            return;
+                        }
+                    }
+                } else {
+                    let request = VaultIamRequest {
+                        iam_role_arn: dlg.iam_role_arn.trim().to_string(),
+                        policy_body: dlg.policy_body.clone(),
+                        role_name: dlg.role_name.trim().to_string(),
+                        policy_name: dlg.policy_name.trim().to_string(),
+                        vault_addr: dlg.vault_addr.trim().to_string(),
+                        vault_token: dlg.vault_token.clone(),
+                    };
+                    match request.validate() {
+                        Ok(()) => request.steps(),
+                        Err(err) => {
+                            dlg.error = Some(err);
+                            self.vault_iam_dialog = Some(dlg);
+                            return;
+                        }
+                    }
                 };
-                if let Err(err) = request.validate() {
-                    dlg.error = Some(err);
-                    self.vault_iam_dialog = Some(dlg);
-                    return;
-                }
                 if dlg.env_profile_id.is_empty() {
                     dlg.error = Some("Choose an environment.".to_string());
                     self.vault_iam_dialog = Some(dlg);
@@ -6559,7 +6638,10 @@ mod gui {
                 );
                 let _ = self.config.save();
                 self.enqueue_vault_iam_run(
-                    request,
+                    steps,
+                    dlg.delete,
+                    dlg.role_name.trim(),
+                    dlg.policy_name.trim(),
                     &dlg.env_profile_id,
                     &dlg.primary_id,
                     &dlg.secondary_id,
@@ -6577,9 +6659,13 @@ mod gui {
         /// server, so writing the same policy and role from the secondary would
         /// be a redundant repeat. The secondary is used only when the primary
         /// session cannot be opened.
+        #[allow(clippy::too_many_arguments)]
         fn enqueue_vault_iam_run(
             &mut self,
-            request: VaultIamRequest,
+            steps: Vec<String>,
+            delete: bool,
+            role_name: &str,
+            policy_name: &str,
             env: &str,
             primary_id: &str,
             secondary_id: &str,
@@ -6604,24 +6690,25 @@ mod gui {
                 return;
             };
 
-            let role_name = request.role_name.trim().to_string();
-            let policy_name = request.policy_name.trim().to_string();
+            let action = if delete { "vault_iam_delete" } else { "vault_iam" };
             self.pending_script_runs.push(PendingScriptRun {
                 tab_id,
-                steps: request.steps(),
+                steps,
                 wait_for_login,
                 spawned: false,
-                label: format!("vault_iam {instance_id}"),
+                label: format!("{action} {instance_id}"),
             });
             self.vault_iam_run = Some(VaultIamRun {
                 tab_id,
-                role_name: role_name.clone(),
-                policy_name,
+                delete,
+                role_name: role_name.to_string(),
+                policy_name: policy_name.to_string(),
             });
             self.script_status_tabs = vec![tab_id];
             self.main_tab = MainTab::Connections;
+            let verb = if delete { "Deleting" } else { "Creating" };
             self.set_script_status(
-                format!("Creating Vault role '{role_name}' on {instance_id}…"),
+                format!("{verb} Vault role '{role_name}' on {instance_id}…"),
                 ScriptState::Running,
             );
         }
@@ -6635,14 +6722,36 @@ mod gui {
             let run = self.vault_iam_run.take().expect("checked above");
             let screen = output.unwrap_or_default();
             let details = (!screen.trim().is_empty()).then(|| screen.to_string());
+            let failed_title = if run.delete {
+                "Vault IAM Delete Failed"
+            } else {
+                "Vault IAM Access Failed"
+            };
             match vault_iam::parse_verdict(screen) {
-                vault_iam::Verdict::Created => {
+                vault_iam::Verdict::Ok if run.delete => {
+                    let msg = format!(
+                        "Vault role '{}' and policy '{}' deleted (confirmed gone).",
+                        run.role_name, run.policy_name
+                    );
+                    self.log_info(msg.clone());
+                    self.show_script_result("Vault Role Deleted", msg, true, None, details);
+                }
+                vault_iam::Verdict::Ok => {
                     let msg = format!(
                         "Vault role '{}' created and verified (policy '{}').",
                         run.role_name, run.policy_name
                     );
                     self.log_info(msg.clone());
                     self.show_script_result("Vault Role Created", msg, true, None, details);
+                }
+                vault_iam::Verdict::Failed if run.delete => {
+                    let msg = format!(
+                        "Vault role '{}' or policy '{}' is still present after the \
+                         delete. See the details and the terminal tab.",
+                        run.role_name, run.policy_name
+                    );
+                    self.log_error(msg.clone());
+                    self.show_script_result(failed_title, msg, false, None, details);
                 }
                 vault_iam::Verdict::Failed => {
                     let msg = format!(
@@ -6651,7 +6760,7 @@ mod gui {
                         run.role_name, run.policy_name
                     );
                     self.log_error(msg.clone());
-                    self.show_script_result("Vault IAM Access Failed", msg, false, None, details);
+                    self.show_script_result(failed_title, msg, false, None, details);
                 }
                 vault_iam::Verdict::Unknown => {
                     // No marker: the session died, or the steps never reached
@@ -6662,7 +6771,7 @@ mod gui {
                         run.role_name
                     );
                     self.log_error(msg.clone());
-                    self.show_script_result("Vault IAM Access Failed", msg, false, None, details);
+                    self.show_script_result(failed_title, msg, false, None, details);
                 }
             }
         }
@@ -13457,6 +13566,7 @@ mod gui {
                         let script_count = 1
                             + usize::from(self.allow_delete_user)
                             + usize::from(self.vault_iam_enabled)
+                            + usize::from(self.vault_iam_delete_enabled)
                             + self.default_scripts.len()
                             + self.config.personal_scripts.len();
                         let mut open_dialog: Option<bool> = None;
@@ -13466,7 +13576,7 @@ mod gui {
                         let mut delete_script: Option<usize> = None;
                         let mut add_script = false;
                         let mut edit_pat = false;
-                        let mut open_vault_iam = false;
+                        let mut open_vault_iam: Option<bool> = None;
                         egui::ComboBox::from_id_salt("scripts_menu")
                             .selected_text(format!("Scripts ({script_count})"))
                             .show_ui(ui, |ui| {
@@ -13483,7 +13593,13 @@ mod gui {
                                 if self.vault_iam_enabled
                                     && ui.selectable_label(false, "Vault IAM Access…").clicked()
                                 {
-                                    open_vault_iam = true;
+                                    open_vault_iam = Some(false);
+                                    ui.close();
+                                }
+                                if self.vault_iam_delete_enabled
+                                    && ui.selectable_label(false, "Vault IAM Delete…").clicked()
+                                {
+                                    open_vault_iam = Some(true);
                                     ui.close();
                                 }
 
@@ -13591,8 +13707,8 @@ mod gui {
                         if edit_pat {
                             self.open_pat_dialog(None);
                         }
-                        if open_vault_iam {
-                            self.open_vault_iam_dialog();
+                        if let Some(delete) = open_vault_iam {
+                            self.open_vault_iam_dialog(delete);
                         }
                         {
                             if let Some(delete) = open_dialog {

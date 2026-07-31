@@ -68,12 +68,23 @@ pub struct VaultIamFeature {
     /// OS usernames allowed to see the entry (case-insensitive).
     /// `["*"]` for everyone, an empty list for nobody.
     pub allowed_users: Vec<String>,
+    /// OS usernames additionally allowed to see the destructive **Vault IAM
+    /// Delete** entry, which removes a role and its policy. Separate from
+    /// `allowed_users` and empty by default, so creating does not imply
+    /// deleting — the same stance `allow_delete_user` takes.
+    pub delete_allowed_users: Vec<String>,
 }
 
 impl VaultIamFeature {
     /// True when `user` may see the Vault IAM Access entry.
     pub fn is_allowed_user(&self, user: &str) -> bool {
         user_in_list(&self.allowed_users, user)
+    }
+
+    /// True when `user` may see the Vault IAM Delete entry. Being on the
+    /// create list is not enough — delete has its own list.
+    pub fn is_delete_allowed_user(&self, user: &str) -> bool {
+        user_in_list(&self.delete_allowed_users, user)
     }
 }
 
@@ -266,6 +277,14 @@ impl Features {
         self.vault_iam.is_allowed_user(user)
     }
 
+    /// True when the destructive **Vault IAM Delete** entry should be shown to
+    /// `user`. Requires both lists: you cannot be handed the delete without the
+    /// create it undoes. Fails closed; the shipped delete list is empty.
+    pub fn vault_iam_delete_enabled_for(&self, user: &str) -> bool {
+        self.vault_iam.is_allowed_user(user)
+            && self.vault_iam.is_delete_allowed_user(user)
+    }
+
     /// Host the git credential store is scoped to.
     pub fn git_host(&self) -> String {
         self.personal_scripts.host()
@@ -434,6 +453,48 @@ mod tests {
             f.vault_iam_enabled_for("any.user"),
             "assets/features.json should ship vault_iam.allowed_users = [\"*\"]"
         );
+    }
+
+    #[test]
+    fn vault_iam_delete_is_hidden_by_default() {
+        // Everyone sees create in the shipped file; nobody sees delete.
+        let f = load();
+        assert!(f.vault_iam_enabled_for("any.user"));
+        assert!(
+            !f.vault_iam_delete_enabled_for("any.user"),
+            "assets/features.json must ship an empty delete_allowed_users"
+        );
+    }
+
+    #[test]
+    fn vault_iam_delete_follows_its_own_list() {
+        let f: Features = serde_json::from_str(
+            r#"{"vault_iam":{"allowed_users":["*"],"delete_allowed_users":["bconrad"]}}"#,
+        )
+        .expect("should parse");
+        assert!(f.vault_iam_delete_enabled_for("bconrad"));
+        assert!(f.vault_iam_delete_enabled_for("BConrad"));
+        assert!(
+            !f.vault_iam_delete_enabled_for("someone.else"),
+            "the create wildcard must not grant delete"
+        );
+    }
+
+    #[test]
+    fn vault_iam_delete_requires_create_access_too() {
+        // On the delete list but not the create list: nothing to delete from.
+        let f: Features = serde_json::from_str(
+            r#"{"vault_iam":{"allowed_users":[],"delete_allowed_users":["bconrad"]}}"#,
+        )
+        .expect("should parse");
+        assert!(!f.vault_iam_delete_enabled_for("bconrad"));
+    }
+
+    #[test]
+    fn vault_iam_delete_fails_closed() {
+        assert!(!Features::default().vault_iam_delete_enabled_for("bconrad"));
+        let f: Features = serde_json::from_str("{}").expect("should parse");
+        assert!(!f.vault_iam_delete_enabled_for("bconrad"));
     }
 
     #[test]
