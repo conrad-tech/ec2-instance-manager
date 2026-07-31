@@ -391,49 +391,92 @@ The file is an array of account objects:
     "region":     "us-east-1",
     "sort_order": 1,
     "color":      "#2ea043",
-    "vault_addr": "https://vault.dev.example.com:8200"
+    "environments": [
+      { "name": "DEV1", "vault_addr": "https://vault.dev1.example.com:8200" },
+      { "name": "DEV2", "vault_addr": "https://vault.dev2.example.com:8200" }
+    ]
   },
   {
     "label":      "QA",
     "account_id": "234567890123",
     "region":     "us-east-1",
     "sort_order": 2,
-    "color":      "#c8b41e"
+    "color":      "#c8b41e",
+    "vault_addr": "https://vault.qa.example.com:8200",
+    "environments": [
+      { "name": "QA1" },
+      { "name": "QA2" }
+    ]
   },
   {
     "label":      "Staging",
     "account_id": "345678901234",
     "region":     "us-east-1",
     "sort_order": 3,
-    "color":      "#e69600"
+    "color":      "#e69600",
+    "vault_addr": "https://vault.staging.example.com:8200"
   },
   {
-    "label":      "Prod-A",
+    "label":      "Prod",
     "account_id": "456789012345",
     "region":     "us-east-1",
     "sort_order": 4,
-    "color":      "#c82828"
-  },
-  {
-    "label":      "Prod-B",
-    "account_id": "567890123456",
-    "region":     "us-west-2",
-    "sort_order": 5,
-    "color":      "#aa1e46"
+    "color":      "#c82828",
+    "vault_addr": "https://vault.prod.example.com:8200"
   }
 ]
 ```
 
+Above: **Dev** declares two environments with their own Vault servers, **QA**
+declares two that share one account-level Vault server, and **Staging** /
+**Prod** are single-environment accounts that declare none — see
+[Accounts with one environment](#accounts-with-one-environment).
+
 ### Fields
 
-| Field        | Required | Description |
-|-------------|----------|-------------|
-| `label`      | Yes      | Display name shown in the UI |
-| `account_id` | Yes      | AWS account ID (used as profile identifier) |
-| `region`     | No       | Default AWS region for this account |
-| `sort_order` | No       | Display order in legend and dropdowns (lower = first). Omit for alphabetical. |
-| `color`      | No       | Hex color code for tab coloring (e.g. `"#2ea043"`). Omit for auto-assignment. |
-| `vault_addr` | No       | Vault server URL for this account. Pre-fills **VAULT_ADDR** in the [Vault IAM Access](#vault-iam-access) dialog when this environment is selected. Omit to leave the box blank. |
+| Field          | Required | Description |
+|----------------|----------|-------------|
+| `label`        | Yes      | Display name shown in the UI |
+| `account_id`   | Yes      | AWS account ID (used as profile identifier) |
+| `region`       | No       | Default AWS region for this account |
+| `sort_order`   | No       | Display order in legend and dropdowns (lower = first). Omit for alphabetical. |
+| `color`        | No       | Hex color code for tab coloring (e.g. `"#2ea043"`). Omit for auto-assignment. |
+| `vault_addr`   | No       | Account-level Vault server URL. Used by every environment in the account that doesn't set its own. |
+| `environments` | No       | Environments hosted in this account, as `{ "name": …, "vault_addr": … }` objects. `name` must match the instances' **`MMODAL_ENV`** tag (case-insensitive). Omit for single-environment accounts. |
+
+`vault_addr` resolves in this order: the selected environment's own value, then
+the account-level value, then blank. It only pre-fills the
+[Vault IAM Access](#vault-iam-access) dialog and is always editable there.
+
+### Environments within an account
+
+Several accounts host more than one environment, distinguished by the
+**`MMODAL_ENV`** tag on each instance. The Scripts dialogs therefore select an
+**environment**, not an account, and narrow both bastion dropdowns to instances
+carrying that tag value.
+
+The dropdown shows the union of:
+
+- every environment declared in `environments` for that account, and
+- every distinct `MMODAL_ENV` value found in that account's loaded inventory.
+
+So a new environment appears as soon as its instances do — declaring it in
+`accounts.json` is only needed to give it a `vault_addr`.
+
+### Accounts with one environment
+
+Nothing extra to configure. An account with a single environment shows a single
+row, labelled with just the account name rather than `Account — ENV`, and behaves
+exactly as it did before this change. Two cases:
+
+- **The instances are tagged** (one `MMODAL_ENV` value across the account) — the
+  environment is discovered automatically. Declare it in `environments` only if
+  it needs its own `vault_addr`; otherwise set `vault_addr` at the account level,
+  as **Staging** does above.
+- **The instances are untagged** — there is nothing to discover, so the account
+  itself is the single entry, no environment filter is applied to the bastion
+  dropdowns, and the account-level `vault_addr` is used. This is the pre-existing
+  behavior, unchanged.
 
 ### Available color codes
 
@@ -465,14 +508,26 @@ scripts against a **primary + secondary bastion pair** in a chosen environment.
 Each script opens a dialog. The two user-management scripts share these fields:
 
 - **User** — the username to act on.
-- **Environment** — which account/profile's bastions to target.
-- **Primary Bastion** / **Secondary Bastion** — dropdowns (`choose ▾`) whose
-  contents are narrowed by the `primary_bastion_filter` / `secondary_bastion_filter`
-  values in `features.json` (substring match on instance **name or id**). Items
-  display as `Name  i-0abc…`.
+- **Environment** — which environment's bastions to target, listed as
+  `Account — ENV` (or just `Account` where the account has a single environment).
+  See [Environments within an account](#environments-within-an-account).
+- **Primary Bastion** / **Secondary Bastion** — dropdowns (`choose ▾`) narrowed
+  to instances whose `MMODAL_ENV` tag matches the selected environment, and then
+  by the `primary_bastion_filter` / `secondary_bastion_filter` values in
+  `features.json` (substring match on instance **name or id**). Items display as
+  `Name  i-0abc…`.
+
+The environment filter is never relaxed — if an environment has no matching
+bastion the dropdown stays empty rather than falling back to another
+environment's boxes, so a script can't be aimed at the wrong environment by
+accident.
 
 The selected bastion pair is cached per environment in `config.ini`
-(`bastion_pair.<env>=<primary>|<secondary>`) and pre-filled on the next run.
+(`bastion_pair.<account_id>.<env>=<primary>|<secondary>`) and pre-filled on the
+next run — for all three scripts, which share the cache. Accounts with a single
+untagged environment keep using the older `bastion_pair.<account_id>` key; that
+key is also read as the starting value the first time you open a dialog for a
+newly-split account, so no existing selection is lost.
 
 For each bastion the app reuses an already-connected tab if one exists, otherwise
 opens a new SSM session; for the user-management scripts it then elevates with
@@ -525,9 +580,9 @@ The dialog has:
 | **Policy** | The policy HCL. Hint shows `path "ctt/*" { capabilities = ["read", "write", "list"] }`. |
 | **AWS Role Name** | The `auth/aws/role/<name>` path. Defaults to the role name parsed off the ARN; stops tracking once you edit it. |
 | **Policy Name** | Defaults to the AWS Role Name; edit it when the policy is shared across roles. |
-| **Environment** | Selects the bastions **and** the pre-filled VAULT_ADDR. |
-| **Primary / Secondary Bastion** | Same filtered dropdowns and same `config.ini` caching as above. |
-| **VAULT_ADDR** | Pre-filled from the environment's `vault_addr` in `accounts.json`; editable, and required if the account has none. |
+| **Environment** | `Account — ENV`. Selects the bastions **and** the pre-filled VAULT_ADDR. |
+| **Primary / Secondary Bastion** | Same env-filtered dropdowns and same `config.ini` caching as above. |
+| **VAULT_ADDR** | Pre-filled from the environment's `vault_addr`, falling back to the account-level one; editable, and required if neither is set. |
 | **VAULT_TOKEN** | Masked, typed per run, **never stored** — not in `config.ini`, not in `features.json`. |
 
 Unlike the user scripts this runs on the **primary bastion only** (Vault is a

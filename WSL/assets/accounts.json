@@ -5,7 +5,16 @@
     "region": "us-east-1",
     "sort_order": 2,
     "color": "#2ea043",
-    "vault_addr": "https://vault.dev.YOUR-COMPANY.com:8200"
+    "environments": [
+      {
+        "name": "DEV1",
+        "vault_addr": "https://vault.dev1.YOUR-COMPANY.com:8200"
+      },
+      {
+        "name": "DEV2",
+        "vault_addr": "https://vault.dev2.YOUR-COMPANY.com:8200"
+      }
+    ]
   },
   {
     "label": "Staging",
@@ -13,6 +22,22 @@
     "region": "us-east-1",
     "sort_order": 1,
     "color": "#c8b41e",
-    "vault_addr": "https://vault.staging.YOUR-COMPANY.com:8200"
+    "vault_addr": "https://vault.staging.YOUR-COMPANY.com:8200",
+    "environments": [
+      {
+        "name": "STG1"
+      },
+      {
+        "name": "STG2"
+      }
+    ]
+  },
+  {
+    "label": "Prod",
+    "account_id": "345678901234",
+    "region": "us-east-1",
+    "sort_order": 3,
+    "color": "#c82828",
+    "vault_addr": "https://vault.prod.YOUR-COMPANY.com:8200"
   }
 ]
