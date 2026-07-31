@@ -13545,29 +13545,6 @@ mod gui {
                                 });
                         }
 
-                        let tab_count = self.connections.tabs().len();
-                        let close_all_label = if tab_count > 0 {
-                            format!("Close All ({tab_count})")
-                        } else {
-                            "Close All".to_string()
-                        };
-                        let close_all = ui.add_enabled(
-                            tab_count > 0,
-                            egui::Button::new(close_all_label),
-                        );
-                        if close_all.clicked() {
-                            let ids: Vec<u64> = self
-                                .connections
-                                .tabs()
-                                .iter()
-                                .map(|t| t.id)
-                                .collect();
-                            self.log_info(format!("closing all {} connection tab(s)", ids.len()));
-                            for id in ids {
-                                self.close_connection_tab(id);
-                            }
-                        }
-
                         let script_count = 1
                             + usize::from(self.allow_delete_user)
                             + usize::from(self.vault_iam_enabled)
@@ -13743,6 +13720,29 @@ mod gui {
                                     secondary_id,
                                     error: None,
                                 });
+                            }
+                        }
+
+                        let tab_count = self.connections.tabs().len();
+                        let close_all_label = if tab_count > 0 {
+                            format!("Close All ({tab_count})")
+                        } else {
+                            "Close All".to_string()
+                        };
+                        let close_all = ui.add_enabled(
+                            tab_count > 0,
+                            egui::Button::new(close_all_label),
+                        );
+                        if close_all.clicked() {
+                            let ids: Vec<u64> = self
+                                .connections
+                                .tabs()
+                                .iter()
+                                .map(|t| t.id)
+                                .collect();
+                            self.log_info(format!("closing all {} connection tab(s)", ids.len()));
+                            for id in ids {
+                                self.close_connection_tab(id);
                             }
                         }
 

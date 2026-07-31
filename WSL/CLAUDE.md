@@ -81,7 +81,7 @@ Key functions:
 
 `src/alerts.rs` fetches the Jira Service Management Operations alert feed
 (`https://api.atlassian.com/jsm/ops/api/<cloud_id>/v1/alerts`). The GUI's
-**Alerts** button (right of Scripts, Connections toolbar) opens a window that
+**Alerts** button (right of Close All, Connections toolbar) opens a window that
 polls it every 10s and renders the rows in the user's **local** timezone — the
 API reports UTC.
 

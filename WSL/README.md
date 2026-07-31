@@ -514,7 +514,7 @@ Colors can also be customized at runtime via **right-click on a legend item** or
 
 ## Scripts menu (bastion user management)
 
-On the **Connections** page there is a **`Scripts (N)`** dropdown (to the right of
+On the **Connections** page there is a **`Scripts (N)`** dropdown (left of
 **Close All**), where `N` is the number of available scripts. It runs helper
 scripts against a **primary + secondary bastion pair** in a chosen environment.
 
