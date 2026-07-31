@@ -6375,7 +6375,7 @@ mod gui {
                                 );
                                 ui.end_row();
 
-                                ui.label("Policy:");
+                                ui.label("Vault Policy:");
                                 ui.add(
                                     egui::TextEdit::multiline(&mut dlg.policy_body)
                                         .hint_text(
@@ -6394,7 +6394,7 @@ mod gui {
                                             .unwrap_or_default();
                                 }
                             }
-                            ui.label("AWS Role Name:");
+                            ui.label("Vault Role Name:");
                             let role_hint = if dlg.delete {
                                 "the role to delete"
                             } else {
@@ -6416,11 +6416,11 @@ mod gui {
                             if !dlg.policy_name_edited {
                                 dlg.policy_name = dlg.role_name.clone();
                             }
-                            ui.label("Policy Name:");
+                            ui.label("Vault Policy Name:");
                             if ui
                                 .add(
                                     egui::TextEdit::singleline(&mut dlg.policy_name)
-                                        .hint_text("defaults to the AWS role name")
+                                        .hint_text("defaults to the Vault role name")
                                         .desired_width(360.0),
                                 )
                                 .changed()

@@ -590,9 +590,9 @@ The dialog has:
 | Field | Notes |
 |-------|-------|
 | **IAM Role** | The full ARN, used verbatim as `bound_iam_principal_arn`. Hint shows `arn:aws:iam::123456789012:role/my-role`. |
-| **Policy** | The policy HCL. Hint shows `path "ctt/*" { capabilities = ["read", "write", "list"] }`. |
-| **AWS Role Name** | The `auth/aws/role/<name>` path. Defaults to the role name parsed off the ARN; stops tracking once you edit it. |
-| **Policy Name** | Defaults to the AWS Role Name; edit it when the policy is shared across roles. |
+| **Vault Policy** | The policy HCL. Hint shows `path "ctt/*" { capabilities = ["read", "write", "list"] }`. |
+| **Vault Role Name** | The `auth/aws/role/<name>` path. Defaults to the role name parsed off the ARN; stops tracking once you edit it. |
+| **Vault Policy Name** | Defaults to the Vault Role Name; edit it when the policy is shared across roles. |
 | **Environment** | Selects the bastions **and** the pre-filled VAULT_ADDR. |
 | **Primary / Secondary Bastion** | Same env-filtered dropdowns and same `config.ini` caching as above. |
 | **VAULT_ADDR** | Pre-filled from the environment's `vault_addr`, falling back to the account-level one; editable, and required if neither is set. |
@@ -625,7 +625,7 @@ create. **Hidden unless enabled at build time** — it needs a username on *both
 being able to create never implies being able to delete.
 
 Same dialog minus the **IAM Role** and **Policy** boxes — it removes objects
-rather than describing them. You supply the AWS role name, the policy name, the
+rather than describing them. You supply the Vault role name, the Vault policy name, the
 environment, the bastions, and the Vault address and token, then tick the
 confirmation before the **Delete** button enables.
 

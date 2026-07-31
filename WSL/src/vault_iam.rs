@@ -155,7 +155,9 @@ impl VaultIamDeleteRequest {
     /// Check every field, returning the message for the dialog's error line.
     pub fn validate(&self) -> Result<(), String> {
         if !is_valid_name(self.role_name.trim()) {
-            return Err("AWS role name must be letters, digits, '_', '.' or '-'.".to_string());
+            return Err(
+                "Vault role name must be letters, digits, '_', '.' or '-'.".to_string(),
+            );
         }
         if !is_valid_name(self.policy_name.trim()) {
             return Err("Policy name must be letters, digits, '_', '.' or '-'.".to_string());
@@ -206,7 +208,7 @@ impl VaultIamRequest {
         }
         if !is_valid_name(self.role_name.trim()) {
             return Err(
-                "AWS role name must be letters, digits, '_', '.' or '-'.".to_string()
+                "Vault role name must be letters, digits, '_', '.' or '-'.".to_string()
             );
         }
         if !is_valid_name(self.policy_name.trim()) {
