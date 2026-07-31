@@ -514,8 +514,9 @@ Colors can also be customized at runtime via **right-click on a legend item** or
 
 ## Scripts menu (bastion user management)
 
-On the **Connections** page there is a **`Scripts (N)`** dropdown (left of
-**Close All**), where `N` is the number of available scripts. It runs helper
+On the **Connections** page there is a **`Scripts (N)`** dropdown, where `N` is
+the number of available scripts (toolbar order: Exclude Env, Scripts, Alerts,
+Close All). It runs helper
 scripts against a **primary + secondary bastion pair** in a chosen environment.
 
 Each script opens a dialog. The two user-management scripts share these fields:
@@ -593,7 +594,7 @@ The dialog has:
 | **Vault Policy** | The policy HCL. Hint shows `path "ctt/*" { capabilities = ["read", "write", "list"] }`. |
 | **Vault Role Name** | The `auth/aws/role/<name>` path. Defaults to the role name parsed off the ARN; stops tracking once you edit it. |
 | **Vault Policy Name** | Defaults to the Vault Role Name; edit it when the policy is shared across roles. |
-| **Environment** | Selects the bastions **and** the pre-filled VAULT_ADDR. |
+| **Environment** | Selects the bastions **and** the pre-filled VAULT_ADDR. Always shown uppercase. |
 | **Primary / Secondary Bastion** | Same env-filtered dropdowns and same `config.ini` caching as above. |
 | **VAULT_ADDR** | Pre-filled from the environment's `vault_addr`, falling back to the account-level one; editable, and required if neither is set. |
 | **VAULT_TOKEN** | Masked, typed per run, **never stored** — not in `config.ini`, not in `features.json`. |

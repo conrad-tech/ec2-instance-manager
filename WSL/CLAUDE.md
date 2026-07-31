@@ -81,7 +81,7 @@ Key functions:
 
 `src/alerts.rs` fetches the Jira Service Management Operations alert feed
 (`https://api.atlassian.com/jsm/ops/api/<cloud_id>/v1/alerts`). The GUI's
-**Alerts** button (right of Close All, Connections toolbar) opens a window that
+**Alerts** button (left of Close All, Connections toolbar) opens a window that
 polls it every 10s and renders the rows in the user's **local** timezone — the
 API reports UTC.
 
@@ -181,7 +181,10 @@ are easy to break:
   accounts.json and a `dev1` tag are one row, labelled as the admin wrote it.
 - **Rows are labelled with the environment name alone**, not `Account — ENV`.
   Two accounts sharing an `MMODAL_ENV` value therefore render identically;
-  `account_id` still distinguishes them internally.
+  `account_id` still distinguishes them internally. The two Vault dialogs
+  uppercase the label via `vault_env_label` (display only — matching and
+  `vault_addr` lookup are already case-insensitive); the whole-account row is
+  exempt, since it names an account rather than an environment.
 - **An account with nothing declared and nothing tagged** yields one row with
   `env: ""` labelled with the *account* name, which applies **no** environment
   filter — the pre-existing whole-account behavior. Do not "fix" that empty

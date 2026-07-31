@@ -6436,7 +6436,7 @@ mod gui {
                                     e.account_id == dlg.env_profile_id
                                         && e.env == dlg.env_name
                                 })
-                                .map(|e| e.label.clone())
+                                .map(vault_env_label)
                                 .unwrap_or_else(|| "Select…".to_string());
                             let prev = (dlg.env_profile_id.clone(), dlg.env_name.clone());
                             egui::ComboBox::from_id_salt("vault_iam_env")
@@ -6447,7 +6447,7 @@ mod gui {
                                         let selected = row.account_id == dlg.env_profile_id
                                             && row.env == dlg.env_name;
                                         if ui
-                                            .selectable_label(selected, row.label.clone())
+                                            .selectable_label(selected, vault_env_label(row))
                                             .clicked()
                                         {
                                             dlg.env_profile_id = row.account_id.clone();
@@ -13723,29 +13723,6 @@ mod gui {
                             }
                         }
 
-                        let tab_count = self.connections.tabs().len();
-                        let close_all_label = if tab_count > 0 {
-                            format!("Close All ({tab_count})")
-                        } else {
-                            "Close All".to_string()
-                        };
-                        let close_all = ui.add_enabled(
-                            tab_count > 0,
-                            egui::Button::new(close_all_label),
-                        );
-                        if close_all.clicked() {
-                            let ids: Vec<u64> = self
-                                .connections
-                                .tabs()
-                                .iter()
-                                .map(|t| t.id)
-                                .collect();
-                            self.log_info(format!("closing all {} connection tab(s)", ids.len()));
-                            for id in ids {
-                                self.close_connection_tab(id);
-                            }
-                        }
-
                         // On-call alerts — only for users on the features.json
                         // allow-list, on a build with a Jira site configured.
                         if self.alerts_enabled {
@@ -13773,6 +13750,29 @@ mod gui {
                                     self.log_error(msg);
                                     self.set_script_status(msg, ScriptState::Failed);
                                 }
+                            }
+                        }
+
+                        let tab_count = self.connections.tabs().len();
+                        let close_all_label = if tab_count > 0 {
+                            format!("Close All ({tab_count})")
+                        } else {
+                            "Close All".to_string()
+                        };
+                        let close_all = ui.add_enabled(
+                            tab_count > 0,
+                            egui::Button::new(close_all_label),
+                        );
+                        if close_all.clicked() {
+                            let ids: Vec<u64> = self
+                                .connections
+                                .tabs()
+                                .iter()
+                                .map(|t| t.id)
+                                .collect();
+                            self.log_info(format!("closing all {} connection tab(s)", ids.len()));
+                            for id in ids {
+                                self.close_connection_tab(id);
                             }
                         }
                     });
@@ -15476,6 +15476,23 @@ mod gui {
         }
     }
 
+    /// Environment label as the Vault dialogs show it: always uppercase.
+    ///
+    /// `MMODAL_ENV` values are uppercase by convention, but the tag is free
+    /// text and `accounts.json` is typed by hand, so a stray `dev1` would
+    /// otherwise render as typed. Display only — matching an instance to an
+    /// environment and looking up its `vault_addr` are both case-insensitive.
+    ///
+    /// An account with no environment dimension keeps its account label as
+    /// written: that row names an account, not an environment.
+    fn vault_env_label(row: &ScriptEnv) -> String {
+        if row.env.is_empty() {
+            row.label.clone()
+        } else {
+            row.label.to_uppercase()
+        }
+    }
+
     /// Keep a cached bastion id only if that instance is still offered in the
     /// selected environment, otherwise clear it.
     ///
@@ -16664,6 +16681,33 @@ mod gui {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn env_row(env: &str, label: &str) -> ScriptEnv {
+            ScriptEnv {
+                account_id: "111".to_string(),
+                account_label: "Dev".to_string(),
+                env: env.to_string(),
+                label: label.to_string(),
+            }
+        }
+
+        #[test]
+        fn vault_env_labels_are_uppercased() {
+            assert_eq!(vault_env_label(&env_row("dev1", "dev1")), "DEV1");
+            assert_eq!(vault_env_label(&env_row("Stg-2", "Stg-2")), "STG-2");
+        }
+
+        #[test]
+        fn an_already_uppercase_env_label_is_unchanged() {
+            assert_eq!(vault_env_label(&env_row("DEV1", "DEV1")), "DEV1");
+        }
+
+        #[test]
+        fn an_account_row_keeps_its_own_casing() {
+            // No environment dimension: this row names an account, not an
+            // environment, so "Prod" must not become "PROD".
+            assert_eq!(vault_env_label(&env_row("", "Prod")), "Prod");
+        }
 
         fn bastions() -> Vec<(String, String)> {
             vec![
