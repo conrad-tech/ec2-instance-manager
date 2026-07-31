@@ -38,6 +38,43 @@ pub struct Features {
     pub alerts: AlertsFeature,
     /// Git PAT + credential setup + default hotkey scripts: who gets them.
     pub personal_scripts: PersonalScriptsFeature,
+    /// "Vault IAM Access" entry in the Scripts menu: who may see it.
+    pub vault_iam: VaultIamFeature,
+}
+
+/// Shared allow-list match used by every `allowed_users` gate: OS username,
+/// trimmed and case-insensitive, with `"*"` meaning everyone. An empty user
+/// never matches, so a missing `USER`/`USERNAME` fails closed.
+fn user_in_list(allowed: &[String], user: &str) -> bool {
+    let u = user.trim();
+    if u.is_empty() {
+        return false;
+    }
+    allowed.iter().any(|a| {
+        let a = a.trim();
+        a == "*" || a.eq_ignore_ascii_case(u)
+    })
+}
+
+/// The `vault_iam` section of `assets/features.json`.
+///
+/// Gates the **Vault IAM Access** entry in the Scripts menu, which writes a
+/// Vault policy and an AWS-auth role from a bastion. The shipped file sets
+/// `["*"]` (everyone); the `Default` below is empty so a malformed features.json
+/// hides the entry rather than exposing it.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct VaultIamFeature {
+    /// OS usernames allowed to see the entry (case-insensitive).
+    /// `["*"]` for everyone, an empty list for nobody.
+    pub allowed_users: Vec<String>,
+}
+
+impl VaultIamFeature {
+    /// True when `user` may see the Vault IAM Access entry.
+    pub fn is_allowed_user(&self, user: &str) -> bool {
+        user_in_list(&self.allowed_users, user)
+    }
 }
 
 /// A hardcoded script (from `assets/features.json`) handed to allow-listed
@@ -90,14 +127,7 @@ fn default_git_host() -> String {
 impl PersonalScriptsFeature {
     /// True when `user` gets the git PAT + credential setup + default scripts.
     pub fn is_allowed_user(&self, user: &str) -> bool {
-        let u = user.trim().to_ascii_lowercase();
-        if u.is_empty() {
-            return false;
-        }
-        self.allowed_users.iter().any(|a| {
-            let a = a.trim();
-            a == "*" || a.eq_ignore_ascii_case(&u)
-        })
+        user_in_list(&self.allowed_users, user)
     }
 
     /// Host the credential store is scoped to, never empty.
@@ -136,14 +166,7 @@ pub struct AlertsFeature {
 impl AlertsFeature {
     /// True when `user` may see the Alerts button.
     pub fn is_allowed_user(&self, user: &str) -> bool {
-        let u = user.trim().to_ascii_lowercase();
-        if u.is_empty() {
-            return false;
-        }
-        self.allowed_users.iter().any(|a| {
-            let a = a.trim();
-            a == "*" || a.eq_ignore_ascii_case(&u)
-        })
+        user_in_list(&self.allowed_users, user)
     }
 
     /// The API token actually used: `JIRA_TOKEN` wins over features.json so a
@@ -195,6 +218,7 @@ impl Default for Features {
             protected_users: default_protected_users(),
             alerts: AlertsFeature::default(),
             personal_scripts: PersonalScriptsFeature::default(),
+            vault_iam: VaultIamFeature::default(),
         }
     }
 }
@@ -234,6 +258,12 @@ impl Features {
         } else {
             Vec::new()
         }
+    }
+
+    /// True when the **Vault IAM Access** entry should be shown to `user`.
+    /// Fails closed: a malformed features.json yields an empty allow-list.
+    pub fn vault_iam_enabled_for(&self, user: &str) -> bool {
+        self.vault_iam.is_allowed_user(user)
     }
 
     /// Host the git credential store is scoped to.
@@ -355,6 +385,55 @@ mod tests {
         let f: Features =
             serde_json::from_str(r#"{"alerts":{"allowed_users":["*"]}}"#).expect("should parse");
         assert!(!f.alerts_visible_for("bconrad"));
+    }
+
+    fn vault_iam_features(allowed: &str) -> Features {
+        serde_json::from_str(&format!(
+            r#"{{"vault_iam":{{"allowed_users":{allowed}}}}}"#
+        ))
+        .expect("should parse")
+    }
+
+    #[test]
+    fn vault_iam_wildcard_shows_to_everyone() {
+        // The shipped features.json setting.
+        let f = vault_iam_features(r#"["*"]"#);
+        assert!(f.vault_iam_enabled_for("anyone"));
+    }
+
+    #[test]
+    fn vault_iam_follows_a_named_allow_list() {
+        let f = vault_iam_features(r#"["bconrad"]"#);
+        assert!(f.vault_iam_enabled_for("bconrad"));
+        assert!(f.vault_iam_enabled_for(" BConrad ")); // trimmed, case-insensitive
+        assert!(!f.vault_iam_enabled_for("someone.else"));
+    }
+
+    #[test]
+    fn vault_iam_empty_allow_list_hides_from_everyone() {
+        assert!(!vault_iam_features("[]").vault_iam_enabled_for("bconrad"));
+    }
+
+    #[test]
+    fn vault_iam_fails_closed_when_absent_or_user_unknown() {
+        // A features.json with no vault_iam section at all, and the case where
+        // neither USER nor USERNAME is set.
+        let f: Features = serde_json::from_str("{}").expect("should parse");
+        assert!(!f.vault_iam_enabled_for("bconrad"));
+        assert!(!vault_iam_features(r#"["*"]"#).vault_iam_enabled_for(""));
+        // A malformed file falls back to Default, which must also be closed.
+        assert!(!Features::default().vault_iam_enabled_for("bconrad"));
+    }
+
+    #[test]
+    fn shipped_features_show_vault_iam_to_everyone() {
+        // Guards the shipped assets/features.json against an accidental edit
+        // that would hide the entry from all users.
+        let f = load();
+        assert!(
+            f.vault_iam_enabled_for("any.user"),
+            "assets/features.json should ship vault_iam.allowed_users = [\"*\"]"
+        );
     }
 
     #[test]

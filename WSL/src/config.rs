@@ -227,20 +227,51 @@ impl AppConfig {
             .unwrap_or_else(|| "ec2-user".to_string())
     }
 
-    /// Last (primary, secondary) bastion instance ids selected for the
-    /// create-user script in the given environment/profile.
-    pub fn bastion_selection(&self, env: &str) -> Option<(String, String)> {
-        let raw = self.bastion_selections.get(env)?;
+    /// Key under which a bastion pair is cached.
+    ///
+    /// One account may host several environments (`MMODAL_ENV`), each with its
+    /// own bastions, so the key carries both. An empty `env` — an account with
+    /// no environment dimension — collapses to the bare account id, which is
+    /// also the key older builds wrote, so those accounts keep exactly one
+    /// entry across the upgrade.
+    fn bastion_key(account_id: &str, env: &str) -> String {
+        let env = env.trim();
+        if env.is_empty() {
+            account_id.to_string()
+        } else {
+            format!("{account_id}.{env}")
+        }
+    }
+
+    /// Last (primary, secondary) bastion instance ids selected for the Scripts
+    /// dialogs in the given account/environment. All three scripts share this.
+    ///
+    /// Falls back to the account-level entry written by builds that predate
+    /// per-environment selection, so an existing saved pair is offered as the
+    /// starting value the first time a newly-split account is opened.
+    pub fn bastion_selection(&self, account_id: &str, env: &str) -> Option<(String, String)> {
+        let raw = self
+            .bastion_selections
+            .get(&Self::bastion_key(account_id, env))
+            .or_else(|| self.bastion_selections.get(account_id))?;
         let mut parts = raw.splitn(2, '|');
         let primary = parts.next().unwrap_or("").to_string();
         let secondary = parts.next().unwrap_or("").to_string();
         Some((primary, secondary))
     }
 
-    /// Remember the primary/secondary bastion pair for an environment.
-    pub fn set_bastion_selection(&mut self, env: &str, primary: &str, secondary: &str) {
-        self.bastion_selections
-            .insert(env.to_string(), format!("{primary}|{secondary}"));
+    /// Remember the primary/secondary bastion pair for an account/environment.
+    pub fn set_bastion_selection(
+        &mut self,
+        account_id: &str,
+        env: &str,
+        primary: &str,
+        secondary: &str,
+    ) {
+        self.bastion_selections.insert(
+            Self::bastion_key(account_id, env),
+            format!("{primary}|{secondary}"),
+        );
     }
 
     /// The remembered file-browser path for an instance, if the user has
@@ -964,6 +995,72 @@ mod tests {
 
         let parsed = AppConfig::parse(&cfg.to_text());
         assert_eq!(parsed.personal_scripts, cfg.personal_scripts);
+    }
+
+    #[test]
+    fn bastion_pair_round_trips_per_environment() {
+        let mut cfg = AppConfig::default();
+        cfg.set_bastion_selection("111", "DEV1", "i-aaa", "i-bbb");
+        cfg.set_bastion_selection("111", "DEV2", "i-ccc", "i-ddd");
+
+        let parsed = AppConfig::parse(&cfg.to_text());
+        assert_eq!(
+            parsed.bastion_selection("111", "DEV1"),
+            Some(("i-aaa".to_string(), "i-bbb".to_string()))
+        );
+        assert_eq!(
+            parsed.bastion_selection("111", "DEV2"),
+            Some(("i-ccc".to_string(), "i-ddd".to_string())),
+            "two environments in one account must not share a slot"
+        );
+    }
+
+    #[test]
+    fn bastion_pair_for_an_untagged_account_uses_the_legacy_key() {
+        let mut cfg = AppConfig::default();
+        cfg.set_bastion_selection("222", "", "i-aaa", "i-bbb");
+
+        assert!(
+            cfg.to_text().contains("bastion_pair.222=i-aaa|i-bbb"),
+            "an account with no environment keeps the pre-existing key"
+        );
+        assert_eq!(
+            cfg.bastion_selection("222", ""),
+            Some(("i-aaa".to_string(), "i-bbb".to_string()))
+        );
+    }
+
+    #[test]
+    fn legacy_account_level_pair_is_offered_to_every_environment() {
+        // Written by a build that predated per-environment selection.
+        let cfg = AppConfig::parse("bastion_pair.111=i-old1|i-old2\n");
+        assert_eq!(
+            cfg.bastion_selection("111", "DEV1"),
+            Some(("i-old1".to_string(), "i-old2".to_string())),
+            "an existing saved pair must not be lost on upgrade"
+        );
+    }
+
+    #[test]
+    fn per_environment_pair_wins_over_the_legacy_key() {
+        let mut cfg = AppConfig::parse("bastion_pair.111=i-old1|i-old2\n");
+        cfg.set_bastion_selection("111", "DEV1", "i-new1", "i-new2");
+
+        assert_eq!(
+            cfg.bastion_selection("111", "DEV1"),
+            Some(("i-new1".to_string(), "i-new2".to_string()))
+        );
+        assert_eq!(
+            cfg.bastion_selection("111", "DEV2"),
+            Some(("i-old1".to_string(), "i-old2".to_string())),
+            "an environment with no entry of its own still sees the legacy pair"
+        );
+    }
+
+    #[test]
+    fn bastion_pair_is_absent_for_an_unknown_account() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.bastion_selection("999", "DEV1"), None);
     }
 
     #[test]
