@@ -32,12 +32,20 @@ cargo clippy --features gui
 
 ## Build status
 
-As of 2026-07-14, the full build pipeline passes cleanly:
+As of 2026-07-31, the full build pipeline passes cleanly:
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 208 tests pass (92 lib + 3 CLI + 113 GUI)
+- `cargo test --features gui` — 280 tests pass (150 lib + 3 CLI + 127 GUI)
 - `cargo clippy --features gui` — only pre-existing lib-level warnings (derivable_impls on Mode, too_many_arguments on sim::make_instance, collapsible_if in GUI)
-- `./scripts/build_binaries.sh` — zero warnings on both Linux (x86_64-unknown-linux-gnu) and Windows (x86_64-pc-windows-gnu) release targets
-- Packaging the release zips needs `zip`/`unzip` on PATH (`sudo apt install zip`); without them the binaries still build and only the zip step is skipped.
+- Release targets — zero warnings on both Linux (x86_64-unknown-linux-gnu, via
+  `build_binaries.sh`) and Windows (x86_64-pc-windows-gnu, built directly since
+  the script aborts without `zip` — see below)
+- Packaging the release zips needs `zip`/`unzip` on PATH (`sudo apt install zip`).
+  **Without them `build_binaries.sh` aborts, it does not skip the step:**
+  `package_linux_zip` calls `require_cmd zip`, which `exit 1`s — so the Linux
+  binaries land in `dist/linux/` and the run dies there, *before* the Windows
+  target is ever built. If you only need to check that both targets compile,
+  build them directly (see the cross-compile note below) rather than running the
+  packaging script.
 
 ### Windows cross-compile and spaces in the repo path
 
@@ -156,6 +164,75 @@ output for the usual rejections ("fatal: Authentication failed", "HTTP Basic:
 Access denied", …) and raises the PAT dialog, rate-limited to once per 30s so a
 failing `git pull` doesn't reopen it per line. After updating the PAT, click
 Prep Terminal to rewrite the stored credential.
+
+### Scripts dialogs select an environment, not an account
+
+Several AWS accounts host **two environments**, told apart by each instance's
+`MMODAL_ENV` tag. All three Scripts entries (create_new_user, delete_user,
+Vault IAM Access) therefore select an *environment*, and narrow their bastion
+dropdowns to instances carrying that tag value.
+
+`src/script_env.rs` builds the dropdown rows as the **union** of the
+environments declared in `accounts.json` (`environments: [{name, vault_addr}]`)
+and those discovered from the tags in the account's inventory. Three cases that
+are easy to break:
+
+- **Declared spelling wins** on a case-insensitive collision, so a `DEV1` in
+  accounts.json and a `dev1` tag are one row, labelled as the admin wrote it.
+- **A single-environment account renders as just the account name**, not
+  `Account — ENV`. The suffix adds nothing when there is one choice.
+- **An account with nothing declared and nothing tagged** yields one row with
+  `env: ""`, which applies **no** environment filter — the pre-existing
+  whole-account behavior. Do not "fix" that empty string away.
+
+The environment filter is never relaxed: `bastion_combo_ui`'s fallback to the
+`"bastion"` substring applies *within* the selected environment, so an
+environment with no matching bastion shows an empty dropdown rather than
+another environment's boxes.
+
+**Cache.** `bastion_pair.<account_id>.<env>` in config.ini, shared by all three
+scripts. Reads fall back to the legacy `bastion_pair.<account_id>` key so
+existing selections survive; an empty `env` normalizes back to that key.
+Because an inherited pair can name a box from elsewhere,
+`retain_available_bastion` clears any id not present in the selected
+environment — otherwise the dialog opens pre-aimed at the wrong hosts.
+
+### Vault IAM Access (Scripts menu)
+
+`src/vault_iam.rs` builds the commands that create a Vault policy and an AWS
+auth role bound to an IAM role; the GUI file holds only the dialog and the
+run/verify wiring. Gated by `vault_iam.allowed_users` in features.json
+(`["*"]` shipped; the `Default` is empty so a malformed file fails closed).
+
+Unlike the user scripts it runs on the **primary bastion only** — Vault is a
+shared server, so a second identical write is redundant — and as the
+**logged-in SSM user**, with no `sudo su`, since Vault authenticates by token.
+The secondary is used only if the primary session won't open.
+
+Three things that will silently break if changed:
+
+- **The verdict sentinel is assembled at runtime** (`then v=OK; else v=FAIL;
+  fi; echo "__VAULT_IAM_${v}__"`). The shell echoes every command before
+  running it, so a literal `__VAULT_IAM_OK__` in the command line would make
+  the screen scan match the echo and report success no matter what Vault did.
+  `parse_verdict` checks FAIL first, and a missing marker is `Unknown` —
+  never treated as success.
+- **The policy body ships base64-encoded**, like create_new_user.sh, so
+  multi-line HCL survives the line-at-a-time drip-feed.
+- **The token ships base64-encoded too**, with the export sent under a leading
+  space + `HISTCONTROL=ignorespace` and a `clear` immediately after — before
+  the read-back output, so the verification stays readable. `clear` only wipes
+  the visible screen; the encoded value can remain in that tab's scrollback,
+  the same tradeoff the git PAT flow accepts.
+
+ARNs are validated rather than escaped: anything containing quotes, `$`,
+backticks or whitespace is rejected, since it is interpolated into a
+double-quoted shell argument.
+
+`vault_addr` resolves environment-level → account-level → blank, via
+`accounts::vault_addr_for`. `ProfileConfig` is deliberately not extended with
+it; it flows into config.ini persistence and the tab UI, neither of which needs
+Vault settings.
 
 ### cfg gates for imports
 
