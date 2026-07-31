@@ -28,6 +28,8 @@ mod gui {
     use ec2_manager::aws_context::build_context_with_profile;
     use ec2_manager::config::AppConfig;
     use ec2_manager::credentials;
+    use ec2_manager::script_env::ScriptEnv;
+    use ec2_manager::vault_iam::{self, VaultIamRequest};
     use ec2_manager::connection_tabs::ConnectionTabs;
     use ec2_manager::diagnostics::run_diagnostics;
     use ec2_manager::error::{AppError, Result};
@@ -542,8 +544,11 @@ mod gui {
         delete: bool,
         /// New username to create (or the user to delete).
         username: String,
-        /// Environment (config profile_id) whose bastions we target.
+        /// Account (config profile_id) whose bastions we target.
         env_profile_id: String,
+        /// `MMODAL_ENV` value selected within that account. Empty for accounts
+        /// with no environment dimension — then no environment filter applies.
+        env_name: String,
         /// Create mode: whether to pass `--sudo` (grant NOPASSWD:ALL).
         grant_sudo: bool,
         /// Delete mode: confirmation checkbox — Delete is disabled until set.
@@ -558,6 +563,45 @@ mod gui {
         secondary_id: String,
         /// Inline validation error, shown in red.
         error: Option<String>,
+    }
+
+    /// Modal state for "Scripts → Vault IAM Access".
+    ///
+    /// Collects everything [`VaultIamRequest`] needs. The three `*_edited`
+    /// flags implement the "defaults to, until you touch it" behavior: the AWS
+    /// role name tracks the IAM role ARN, the policy name tracks the AWS role
+    /// name, and VAULT_ADDR tracks the selected environment — each stopping as
+    /// soon as the user types in that box.
+    struct VaultIamDialog {
+        iam_role_arn: String,
+        policy_body: String,
+        role_name: String,
+        role_name_edited: bool,
+        policy_name: String,
+        policy_name_edited: bool,
+        /// Account (config profile_id) whose bastions we target.
+        env_profile_id: String,
+        /// `MMODAL_ENV` selected within that account; empty when untagged.
+        env_name: String,
+        primary_query: String,
+        primary_id: String,
+        secondary_query: String,
+        secondary_id: String,
+        vault_addr: String,
+        vault_addr_edited: bool,
+        /// Typed per run; never written to config.ini or anywhere else.
+        vault_token: String,
+        /// Inline validation error, shown in red.
+        error: Option<String>,
+    }
+
+    /// Tracks an in-flight Vault IAM Access run so the verdict marker can be
+    /// read off the terminal once its steps finish.
+    struct VaultIamRun {
+        /// Connection tab the commands were sent to.
+        tab_id: u64,
+        role_name: String,
+        policy_name: String,
     }
 
     /// Tracks an in-flight create_new_user.sh run so that once both the
@@ -603,6 +647,8 @@ mod gui {
     struct PendingDelete {
         username: String,
         env: String,
+        /// `MMODAL_ENV` selected in the dialog; empty for untagged accounts.
+        env_name: String,
         primary_id: String,
         secondary_id: String,
     }
@@ -2986,6 +3032,13 @@ mod gui {
         edit_menu_flash_start: Option<Instant>,
         /// Active "Scripts → create_new_user.sh" dialog, if any.
         create_user_dialog: Option<CreateUserDialog>,
+        /// Active "Scripts → Vault IAM Access" dialog, if any.
+        vault_iam_dialog: Option<VaultIamDialog>,
+        /// In-flight Vault IAM Access run, awaiting its verdict marker.
+        vault_iam_run: Option<VaultIamRun>,
+        /// Build-time gate: whether the Vault IAM Access entry is shown to the
+        /// current OS user (features.json `vault_iam.allowed_users`).
+        vault_iam_enabled: bool,
         /// Queued script runs waiting for their PTY session to come up.
         pending_script_runs: Vec<PendingScriptRun>,
         /// Build-time gate: whether the destructive "delete_user.sh" entry
@@ -3285,6 +3338,10 @@ mod gui {
                 show_file_browser_defaults: false,
                 edit_menu_flash_start: None,
                 create_user_dialog: None,
+                vault_iam_dialog: None,
+                vault_iam_run: None,
+                vault_iam_enabled: features
+                    .vault_iam_enabled_for(&ec2_manager::features::current_os_user()),
                 pending_script_runs: Vec::new(),
                 allow_delete_user: features.allow_delete_user,
                 primary_bastion_filter: features.primary_bastion_filter.clone(),
@@ -5072,6 +5129,122 @@ mod gui {
             }
         }
 
+        /// Rows for the Scripts dialogs' Environment dropdown, across every
+        /// configured account.
+        ///
+        /// An account may host several environments (`MMODAL_ENV`), each with
+        /// its own bastions, so the dialogs select an environment rather than
+        /// an account. Each account contributes the union of the environments
+        /// declared for it in accounts.json and those discovered in its
+        /// inventory — see [`ec2_manager::script_env`].
+        ///
+        /// Priming each account's disk cache is what makes the discovered half
+        /// available; it returns immediately once an account is cached, so
+        /// calling this per frame while the dialog is open is cheap.
+        fn script_environments(&mut self) -> Vec<ScriptEnv> {
+            let profiles: Vec<(String, String, String)> = self
+                .config
+                .profiles
+                .iter()
+                .map(|p| {
+                    (
+                        p.profile_id.clone(),
+                        p.account_id.clone(),
+                        p.display_name.clone(),
+                    )
+                })
+                .collect();
+            let mut rows = Vec::new();
+            for (profile_id, account_id, display_name) in profiles {
+                self.prime_cache_from_disk(&profile_id);
+                let discovered: Vec<String> = self
+                    .profile_inventory_cache
+                    .get(&profile_id)
+                    .map(|(inv, _)| {
+                        inv.instances.iter().filter_map(instance_env).collect()
+                    })
+                    .unwrap_or_default();
+                let declared = ec2_manager::accounts::environments_for(&account_id);
+                rows.extend(ec2_manager::script_env::build(
+                    &profile_id,
+                    &display_name,
+                    &declared,
+                    &discovered,
+                ));
+            }
+            rows
+        }
+
+        /// Environment a Scripts dialog opens on: the first environment of the
+        /// account currently selected on the Inventory page, so the common case
+        /// of one environment per account needs no picking at all. Falls back
+        /// to the first environment of any account.
+        fn default_script_environment(&mut self) -> (String, String) {
+            let selected = self.selected_profile.clone().unwrap_or_default();
+            let rows = self.script_environments();
+            rows.iter()
+                .find(|e| e.account_id == selected)
+                .or_else(|| rows.first())
+                .map(|e| (e.account_id.clone(), e.env.clone()))
+                .unwrap_or_default()
+        }
+
+        /// Instances in an account that belong to `env`, as `(id, name)` pairs
+        /// sorted for a stable dropdown. An empty `env` applies no environment
+        /// filter, which is the untagged-account case.
+        fn env_instances(&self, profile_id: &str, env: &str) -> Vec<(String, String)> {
+            let mut instances: Vec<(String, String)> = self
+                .profile_inventory_cache
+                .get(profile_id)
+                .map(|(inv, _)| {
+                    inv.instances
+                        .iter()
+                        .filter(|i| i.state.eq_ignore_ascii_case("running"))
+                        .filter(|i| {
+                            ec2_manager::script_env::env_matches(
+                                instance_env(i).as_deref(),
+                                env,
+                            )
+                        })
+                        .map(|i| (i.instance_id.clone(), i.name.clone().unwrap_or_default()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Alphabetical by name (case-insensitive), then instance id, so
+            // the bastion dropdowns list in a stable, readable order.
+            instances.sort_by(|(a_id, a_name), (b_id, b_name)| {
+                a_name
+                    .to_ascii_lowercase()
+                    .cmp(&b_name.to_ascii_lowercase())
+                    .then_with(|| a_id.cmp(b_id))
+            });
+            instances
+        }
+
+        /// Load the cached bastion pair for an account/environment into a
+        /// dialog's fields, clearing them when nothing is cached.
+        fn load_bastion_pair(
+            &self,
+            profile_id: &str,
+            env: &str,
+            primary_id: &mut String,
+            primary_query: &mut String,
+            secondary_id: &mut String,
+            secondary_query: &mut String,
+        ) {
+            let (primary, secondary) = self
+                .config
+                .bastion_selection(profile_id, env)
+                .unwrap_or_default();
+            // A pair cached for another environment may name instances that
+            // aren't in this one; drop those rather than show a stale pick.
+            let available = self.env_instances(profile_id, env);
+            *primary_id = retain_available_bastion(primary, &available);
+            *secondary_id = retain_available_bastion(secondary, &available);
+            *primary_query = self.bastion_label(profile_id, primary_id);
+            *secondary_query = self.bastion_label(profile_id, secondary_id);
+        }
+
         /// Kick off a background alerts fetch for the window's current
         /// lookback. No-op while one is already in flight.
         fn start_alerts_fetch(&mut self) {
@@ -5822,45 +5995,17 @@ mod gui {
             let Some(mut dlg) = self.create_user_dialog.take() else {
                 return;
             };
-            // Make sure the chosen environment's inventory is loaded so the
-            // bastion pickers have something to filter.
-            if !dlg.env_profile_id.is_empty() {
-                self.prime_cache_from_disk(&dlg.env_profile_id);
-            }
-            // (id, name) for running instances in the chosen environment.
-            let mut instances: Vec<(String, String)> = self
-                .profile_inventory_cache
-                .get(&dlg.env_profile_id)
-                .map(|(inv, _)| {
-                    inv.instances
-                        .iter()
-                        .filter(|i| i.state.eq_ignore_ascii_case("running"))
-                        .map(|i| {
-                            (i.instance_id.clone(), i.name.clone().unwrap_or_default())
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            // Alphabetical by name (case-insensitive), then instance id, so
-            // the bastion dropdowns list in a stable, readable order.
-            instances.sort_by(|(a_id, a_name), (b_id, b_name)| {
-                a_name
-                    .to_ascii_lowercase()
-                    .cmp(&b_name.to_ascii_lowercase())
-                    .then_with(|| a_id.cmp(b_id))
-            });
-            let profiles: Vec<(String, String)> = self
-                .config
-                .profiles
-                .iter()
-                .map(|p| (p.profile_id.clone(), p.display_name.clone()))
-                .collect();
+            // Environment rows across every account, and the running instances
+            // belonging to the selected one.
+            let environments = self.script_environments();
+            let instances = self.env_instances(&dlg.env_profile_id, &dlg.env_name);
             let primary_filter = self.primary_bastion_filter.clone();
             let secondary_filter = self.secondary_bastion_filter.clone();
 
             let mut window_open = true;
             let mut do_run = false;
             let mut do_cancel = false;
+            let mut env_changed = false;
 
             let title = if dlg.delete {
                 "Scripts — delete_user.sh"
@@ -5886,30 +6031,36 @@ mod gui {
                             ui.end_row();
 
                             ui.label("Environment:");
-                            let env_label = profiles
+                            let env_label = environments
                                 .iter()
-                                .find(|(id, _)| *id == dlg.env_profile_id)
-                                .map(|(_, name)| name.clone())
+                                .find(|e| {
+                                    e.account_id == dlg.env_profile_id
+                                        && e.env == dlg.env_name
+                                })
+                                .map(|e| e.label.clone())
                                 .unwrap_or_else(|| "Select…".to_string());
-                            let prev_env = dlg.env_profile_id.clone();
+                            let prev = (dlg.env_profile_id.clone(), dlg.env_name.clone());
                             egui::ComboBox::from_id_salt("cnu_env")
                                 .selected_text(env_label)
                                 .width(320.0)
                                 .show_ui(ui, |ui| {
-                                    for (id, name) in &profiles {
-                                        ui.selectable_value(
-                                            &mut dlg.env_profile_id,
-                                            id.clone(),
-                                            name.clone(),
-                                        );
+                                    for row in &environments {
+                                        let selected = row.account_id == dlg.env_profile_id
+                                            && row.env == dlg.env_name;
+                                        if ui
+                                            .selectable_label(selected, row.label.clone())
+                                            .clicked()
+                                        {
+                                            dlg.env_profile_id = row.account_id.clone();
+                                            dlg.env_name = row.env.clone();
+                                            ui.close();
+                                        }
                                     }
                                 });
-                            if dlg.env_profile_id != prev_env {
-                                // Chosen bastions belong to the old env — reset.
-                                dlg.primary_id.clear();
-                                dlg.primary_query.clear();
-                                dlg.secondary_id.clear();
-                                dlg.secondary_query.clear();
+                            if (dlg.env_profile_id.clone(), dlg.env_name.clone()) != prev {
+                                // Offer whatever pair was last used here; the
+                                // old environment's bastions don't apply.
+                                env_changed = true;
                             }
                             ui.end_row();
                         });
@@ -5988,6 +6139,18 @@ mod gui {
                 return;
             }
 
+            if env_changed {
+                let (account, env) = (dlg.env_profile_id.clone(), dlg.env_name.clone());
+                self.load_bastion_pair(
+                    &account,
+                    &env,
+                    &mut dlg.primary_id,
+                    &mut dlg.primary_query,
+                    &mut dlg.secondary_id,
+                    &mut dlg.secondary_query,
+                );
+            }
+
             if do_run {
                 let username = dlg.username.trim().to_string();
                 let valid_user = !username.is_empty()
@@ -6026,9 +6189,10 @@ mod gui {
                     self.create_user_dialog = Some(dlg);
                     return;
                 }
-                // Remember the selection for next time.
+                // Remember the selection for next time, per environment.
                 self.config.set_bastion_selection(
                     &dlg.env_profile_id,
+                    &dlg.env_name,
                     &dlg.primary_id,
                     &dlg.secondary_id,
                 );
@@ -6037,6 +6201,7 @@ mod gui {
                     dlg.delete,
                     &username,
                     &dlg.env_profile_id,
+                    &dlg.env_name,
                     dlg.grant_sudo,
                     &dlg.primary_id,
                     &dlg.secondary_id,
@@ -6107,6 +6272,399 @@ mod gui {
                         }
                     }
                 });
+        }
+
+        /// Open the "Vault IAM Access" dialog, pre-filled from the current
+        /// environment and its cached bastion pair.
+        fn open_vault_iam_dialog(&mut self) {
+            let (env, env_name) = self.default_script_environment();
+            let mut primary_id = String::new();
+            let mut primary_query = String::new();
+            let mut secondary_id = String::new();
+            let mut secondary_query = String::new();
+            self.load_bastion_pair(
+                &env,
+                &env_name,
+                &mut primary_id,
+                &mut primary_query,
+                &mut secondary_id,
+                &mut secondary_query,
+            );
+            let vault_addr =
+                ec2_manager::accounts::vault_addr_for(&env, &env_name).unwrap_or_default();
+            self.vault_iam_dialog = Some(VaultIamDialog {
+                iam_role_arn: String::new(),
+                policy_body: String::new(),
+                role_name: String::new(),
+                role_name_edited: false,
+                policy_name: String::new(),
+                policy_name_edited: false,
+                env_profile_id: env,
+                env_name,
+                primary_query,
+                primary_id,
+                secondary_query,
+                secondary_id,
+                vault_addr,
+                vault_addr_edited: false,
+                // Never pre-filled: the token is not stored anywhere.
+                vault_token: String::new(),
+                error: None,
+            });
+        }
+
+        /// Render the "Scripts → Vault IAM Access" modal.
+        fn render_vault_iam_dialog(&mut self, ctx: &egui::Context) {
+            let Some(mut dlg) = self.vault_iam_dialog.take() else {
+                return;
+            };
+            let environments = self.script_environments();
+            let instances = self.env_instances(&dlg.env_profile_id, &dlg.env_name);
+            let primary_filter = self.primary_bastion_filter.clone();
+            let secondary_filter = self.secondary_bastion_filter.clone();
+
+            let mut window_open = true;
+            let mut do_run = false;
+            let mut do_cancel = false;
+            let mut env_changed = false;
+
+            egui::Window::new("Scripts — Vault IAM Access")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    egui::Grid::new("vault_iam_grid")
+                        .num_columns(2)
+                        .spacing([10.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("IAM Role:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut dlg.iam_role_arn)
+                                    .hint_text("arn:aws:iam::123456789012:role/my-role")
+                                    .desired_width(360.0),
+                            );
+                            ui.end_row();
+
+                            ui.label("Policy:");
+                            ui.add(
+                                egui::TextEdit::multiline(&mut dlg.policy_body)
+                                    .hint_text(
+                                        "path \"ctt/*\" {\n  capabilities = [\"read\", \"write\", \"list\"]\n}",
+                                    )
+                                    .desired_width(360.0)
+                                    .desired_rows(5),
+                            );
+                            ui.end_row();
+
+                            // Defaults to the role name in the ARN until the
+                            // user types something of their own.
+                            if !dlg.role_name_edited {
+                                dlg.role_name =
+                                    vault_iam::role_name_from_arn(&dlg.iam_role_arn)
+                                        .unwrap_or_default();
+                            }
+                            ui.label("AWS Role Name:");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut dlg.role_name)
+                                        .hint_text("defaults to the IAM role")
+                                        .desired_width(360.0),
+                                )
+                                .changed()
+                            {
+                                dlg.role_name_edited = true;
+                            }
+                            ui.end_row();
+
+                            // Likewise, the policy name follows the role name.
+                            if !dlg.policy_name_edited {
+                                dlg.policy_name = dlg.role_name.clone();
+                            }
+                            ui.label("Policy Name:");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut dlg.policy_name)
+                                        .hint_text("defaults to the AWS role name")
+                                        .desired_width(360.0),
+                                )
+                                .changed()
+                            {
+                                dlg.policy_name_edited = true;
+                            }
+                            ui.end_row();
+
+                            ui.label("Environment:");
+                            let env_label = environments
+                                .iter()
+                                .find(|e| {
+                                    e.account_id == dlg.env_profile_id
+                                        && e.env == dlg.env_name
+                                })
+                                .map(|e| e.label.clone())
+                                .unwrap_or_else(|| "Select…".to_string());
+                            let prev = (dlg.env_profile_id.clone(), dlg.env_name.clone());
+                            egui::ComboBox::from_id_salt("vault_iam_env")
+                                .selected_text(env_label)
+                                .width(360.0)
+                                .show_ui(ui, |ui| {
+                                    for row in &environments {
+                                        let selected = row.account_id == dlg.env_profile_id
+                                            && row.env == dlg.env_name;
+                                        if ui
+                                            .selectable_label(selected, row.label.clone())
+                                            .clicked()
+                                        {
+                                            dlg.env_profile_id = row.account_id.clone();
+                                            dlg.env_name = row.env.clone();
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            if (dlg.env_profile_id.clone(), dlg.env_name.clone()) != prev {
+                                env_changed = true;
+                            }
+                            ui.end_row();
+                        });
+
+                    ui.add_space(6.0);
+                    Self::bastion_combo_ui(
+                        ui,
+                        "vault_iam_primary",
+                        "Primary Bastion:",
+                        &primary_filter,
+                        &mut dlg.primary_id,
+                        &mut dlg.primary_query,
+                        &instances,
+                    );
+                    ui.add_space(6.0);
+                    Self::bastion_combo_ui(
+                        ui,
+                        "vault_iam_secondary",
+                        "Secondary Bastion:",
+                        &secondary_filter,
+                        &mut dlg.secondary_id,
+                        &mut dlg.secondary_query,
+                        &instances,
+                    );
+
+                    ui.add_space(6.0);
+                    egui::Grid::new("vault_iam_conn_grid")
+                        .num_columns(2)
+                        .spacing([10.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("VAULT_ADDR:");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut dlg.vault_addr)
+                                        .hint_text("https://vault.example.com:8200")
+                                        .desired_width(360.0),
+                                )
+                                .changed()
+                            {
+                                dlg.vault_addr_edited = true;
+                            }
+                            ui.end_row();
+
+                            ui.label("VAULT_TOKEN:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut dlg.vault_token)
+                                    .password(true)
+                                    .hint_text("not saved — enter it each run")
+                                    .desired_width(360.0),
+                            );
+                            ui.end_row();
+                        });
+
+                    ui.add_space(4.0);
+                    ui.label(
+                        "Runs on the primary bastion: writes the policy and the AWS auth \
+                         role, then reads both back.",
+                    );
+
+                    if let Some(err) = &dlg.error {
+                        ui.add_space(6.0);
+                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+                    }
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Run").clicked() {
+                            do_run = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+
+            if do_cancel || !window_open {
+                self.vault_iam_dialog = None;
+                return;
+            }
+
+            if env_changed {
+                let (account, env) = (dlg.env_profile_id.clone(), dlg.env_name.clone());
+                self.load_bastion_pair(
+                    &account,
+                    &env,
+                    &mut dlg.primary_id,
+                    &mut dlg.primary_query,
+                    &mut dlg.secondary_id,
+                    &mut dlg.secondary_query,
+                );
+                if !dlg.vault_addr_edited {
+                    dlg.vault_addr =
+                        ec2_manager::accounts::vault_addr_for(&account, &env)
+                            .unwrap_or_default();
+                }
+            }
+
+            if do_run {
+                let request = VaultIamRequest {
+                    iam_role_arn: dlg.iam_role_arn.trim().to_string(),
+                    policy_body: dlg.policy_body.clone(),
+                    role_name: dlg.role_name.trim().to_string(),
+                    policy_name: dlg.policy_name.trim().to_string(),
+                    vault_addr: dlg.vault_addr.trim().to_string(),
+                    vault_token: dlg.vault_token.clone(),
+                };
+                if let Err(err) = request.validate() {
+                    dlg.error = Some(err);
+                    self.vault_iam_dialog = Some(dlg);
+                    return;
+                }
+                if dlg.env_profile_id.is_empty() {
+                    dlg.error = Some("Choose an environment.".to_string());
+                    self.vault_iam_dialog = Some(dlg);
+                    return;
+                }
+                if dlg.primary_id.is_empty() {
+                    dlg.error = Some("Choose a primary bastion.".to_string());
+                    self.vault_iam_dialog = Some(dlg);
+                    return;
+                }
+                if dlg.secondary_id.is_empty() {
+                    dlg.error = Some("Choose a secondary bastion.".to_string());
+                    self.vault_iam_dialog = Some(dlg);
+                    return;
+                }
+                // Shared with the user scripts, so a pair picked here is
+                // offered there too.
+                self.config.set_bastion_selection(
+                    &dlg.env_profile_id,
+                    &dlg.env_name,
+                    &dlg.primary_id,
+                    &dlg.secondary_id,
+                );
+                let _ = self.config.save();
+                self.enqueue_vault_iam_run(
+                    request,
+                    &dlg.env_profile_id,
+                    &dlg.primary_id,
+                    &dlg.secondary_id,
+                );
+                self.vault_iam_dialog = None;
+                return;
+            }
+
+            self.vault_iam_dialog = Some(dlg);
+        }
+
+        /// Send the Vault commands to the primary bastion.
+        ///
+        /// Unlike the user scripts this touches **one** host: Vault is a shared
+        /// server, so writing the same policy and role from the secondary would
+        /// be a redundant repeat. The secondary is used only when the primary
+        /// session cannot be opened.
+        fn enqueue_vault_iam_run(
+            &mut self,
+            request: VaultIamRequest,
+            env: &str,
+            primary_id: &str,
+            secondary_id: &str,
+        ) {
+            let target = self
+                .ensure_bastion_session(primary_id, env)
+                .map(|s| (primary_id.to_string(), s))
+                .or_else(|| {
+                    self.log_error(format!(
+                        "vault_iam: could not open primary bastion {primary_id}; \
+                         falling back to the secondary"
+                    ));
+                    self.ensure_bastion_session(secondary_id, env)
+                        .map(|s| (secondary_id.to_string(), s))
+                });
+            let Some((instance_id, (tab_id, wait_for_login))) = target else {
+                let msg = format!(
+                    "vault_iam: could not open a session to {primary_id} or {secondary_id}"
+                );
+                self.log_error(msg.clone());
+                self.set_script_status(msg, ScriptState::Failed);
+                return;
+            };
+
+            let role_name = request.role_name.trim().to_string();
+            let policy_name = request.policy_name.trim().to_string();
+            self.pending_script_runs.push(PendingScriptRun {
+                tab_id,
+                steps: request.steps(),
+                wait_for_login,
+                spawned: false,
+                label: format!("vault_iam {instance_id}"),
+            });
+            self.vault_iam_run = Some(VaultIamRun {
+                tab_id,
+                role_name: role_name.clone(),
+                policy_name,
+            });
+            self.script_status_tabs = vec![tab_id];
+            self.main_tab = MainTab::Connections;
+            self.set_script_status(
+                format!("Creating Vault role '{role_name}' on {instance_id}…"),
+                ScriptState::Running,
+            );
+        }
+
+        /// Read the verdict marker once a Vault IAM Access run's steps finish.
+        /// A no-op for any other tab.
+        fn finish_vault_iam_run(&mut self, tab_id: u64, output: Option<&str>) {
+            if self.vault_iam_run.as_ref().map(|r| r.tab_id) != Some(tab_id) {
+                return;
+            }
+            let run = self.vault_iam_run.take().expect("checked above");
+            let screen = output.unwrap_or_default();
+            let details = (!screen.trim().is_empty()).then(|| screen.to_string());
+            match vault_iam::parse_verdict(screen) {
+                vault_iam::Verdict::Created => {
+                    let msg = format!(
+                        "Vault role '{}' created and verified (policy '{}').",
+                        run.role_name, run.policy_name
+                    );
+                    self.log_info(msg.clone());
+                    self.show_script_result("Vault Role Created", msg, true, None, details);
+                }
+                vault_iam::Verdict::Failed => {
+                    let msg = format!(
+                        "Vault role '{}' could not be verified — reading back the role \
+                         or policy '{}' failed. See the details and the terminal tab.",
+                        run.role_name, run.policy_name
+                    );
+                    self.log_error(msg.clone());
+                    self.show_script_result("Vault IAM Access Failed", msg, false, None, details);
+                }
+                vault_iam::Verdict::Unknown => {
+                    // No marker: the session died, or the steps never reached
+                    // the check. Never report this as success.
+                    let msg = format!(
+                        "Vault role '{}': the run did not report a result. Check the \
+                         terminal tab — the session may have ended early.",
+                        run.role_name
+                    );
+                    self.log_error(msg.clone());
+                    self.show_script_result("Vault IAM Access Failed", msg, false, None, details);
+                }
+            }
         }
 
         /// Find a logged-in tab for `instance_id`, or open a new session to
@@ -6180,22 +6738,31 @@ mod gui {
         /// runs a pre-flight active-session check across both bastions and
         /// only proceeds once it clears (see `poll_script_events`).
         #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::too_many_arguments)]
         fn start_user_script_run(
             &mut self,
             delete: bool,
             username: &str,
             env: &str,
+            env_name: &str,
             grant_sudo: bool,
             primary_id: &str,
             secondary_id: &str,
         ) {
             if delete {
-                self.begin_delete_preflight(username, env, primary_id, secondary_id);
+                self.begin_delete_preflight(
+                    username,
+                    env,
+                    env_name,
+                    primary_id,
+                    secondary_id,
+                );
             } else {
                 self.enqueue_user_script(
                     false,
                     username,
                     env,
+                    env_name,
                     grant_sudo,
                     primary_id,
                     secondary_id,
@@ -6220,6 +6787,7 @@ mod gui {
             &mut self,
             username: &str,
             env: &str,
+            env_name: &str,
             primary_id: &str,
             secondary_id: &str,
         ) {
@@ -6246,6 +6814,7 @@ mod gui {
             self.pending_delete = Some(PendingDelete {
                 username: username.to_string(),
                 env: env.to_string(),
+                env_name: env_name.to_string(),
                 primary_id: primary_id.to_string(),
                 secondary_id: secondary_id.to_string(),
             });
@@ -6286,6 +6855,7 @@ mod gui {
             delete: bool,
             username: &str,
             env: &str,
+            env_name: &str,
             grant_sudo: bool,
             primary_id: &str,
             secondary_id: &str,
@@ -6440,14 +7010,20 @@ mod gui {
                 };
                 let primary_ip = ip_of(primary_id);
                 let secondary_ip = ip_of(secondary_id);
-                let mmodal_env = self
-                    .profile_inventory_cache
-                    .get(env)
-                    .and_then(|(inv, _)| {
-                        inv.instances.iter().find(|i| i.instance_id == primary_id)
-                    })
-                    .and_then(instance_env)
-                    .unwrap_or_default();
+                // Used in the PEM filename. The dialog's environment is
+                // authoritative; fall back to the primary bastion's tag for
+                // accounts with no environment dimension.
+                let mmodal_env = if env_name.trim().is_empty() {
+                    self.profile_inventory_cache
+                        .get(env)
+                        .and_then(|(inv, _)| {
+                            inv.instances.iter().find(|i| i.instance_id == primary_id)
+                        })
+                        .and_then(instance_env)
+                        .unwrap_or_default()
+                } else {
+                    env_name.trim().to_string()
+                };
                 if let Some(ctx) = ctx {
                     self.create_user_run = Some(CreateUserRun {
                         delete,
@@ -6603,6 +7179,7 @@ mod gui {
                             true,
                             &pd.username,
                             &pd.env,
+                            &pd.env_name,
                             false,
                             &pd.primary_id,
                             &pd.secondary_id,
@@ -6627,6 +7204,7 @@ mod gui {
                     .pty_sessions
                     .get(&tab_id)
                     .map(|s| s.parser.screen().contents());
+                self.finish_vault_iam_run(tab_id, output.as_deref());
                 if let Some(run) = self.create_user_run.as_mut() {
                     if tab_id == run.primary_tab {
                         run.primary_done = true;
@@ -12424,6 +13002,7 @@ mod gui {
                 self.render_settings_pem_dialog(ctx);
                 self.render_file_browser_defaults_dialog(ctx);
                 self.render_create_user_dialog(ctx);
+                self.render_vault_iam_dialog(ctx);
                 self.render_script_editor(ctx);
                 self.render_script_delete_confirm(ctx);
                 self.render_pat_dialog(ctx);
@@ -12877,6 +13456,7 @@ mod gui {
 
                         let script_count = 1
                             + usize::from(self.allow_delete_user)
+                            + usize::from(self.vault_iam_enabled)
                             + self.default_scripts.len()
                             + self.config.personal_scripts.len();
                         let mut open_dialog: Option<bool> = None;
@@ -12886,6 +13466,7 @@ mod gui {
                         let mut delete_script: Option<usize> = None;
                         let mut add_script = false;
                         let mut edit_pat = false;
+                        let mut open_vault_iam = false;
                         egui::ComboBox::from_id_salt("scripts_menu")
                             .selected_text(format!("Scripts ({script_count})"))
                             .show_ui(ui, |ui| {
@@ -12897,6 +13478,12 @@ mod gui {
                                     && ui.selectable_label(false, "delete_user.sh…").clicked()
                                 {
                                     open_dialog = Some(true);
+                                    ui.close();
+                                }
+                                if self.vault_iam_enabled
+                                    && ui.selectable_label(false, "Vault IAM Access…").clicked()
+                                {
+                                    open_vault_iam = true;
                                     ui.close();
                                 }
 
@@ -13004,22 +13591,29 @@ mod gui {
                         if edit_pat {
                             self.open_pat_dialog(None);
                         }
+                        if open_vault_iam {
+                            self.open_vault_iam_dialog();
+                        }
                         {
                             if let Some(delete) = open_dialog {
-                                let env = self.selected_profile.clone().unwrap_or_default();
-                                if !env.is_empty() {
-                                    self.prime_cache_from_disk(&env);
-                                }
-                                let (primary_id, secondary_id) = self
-                                    .config
-                                    .bastion_selection(&env)
-                                    .unwrap_or_default();
-                                let primary_query = self.bastion_label(&env, &primary_id);
-                                let secondary_query = self.bastion_label(&env, &secondary_id);
+                                let (env, env_name) = self.default_script_environment();
+                                let mut primary_id = String::new();
+                                let mut primary_query = String::new();
+                                let mut secondary_id = String::new();
+                                let mut secondary_query = String::new();
+                                self.load_bastion_pair(
+                                    &env,
+                                    &env_name,
+                                    &mut primary_id,
+                                    &mut primary_query,
+                                    &mut secondary_id,
+                                    &mut secondary_query,
+                                );
                                 self.create_user_dialog = Some(CreateUserDialog {
                                     delete,
                                     username: String::new(),
                                     env_profile_id: env,
+                                    env_name,
                                     grant_sudo: false,
                                     confirm_delete: false,
                                     primary_query,
@@ -14761,6 +15355,21 @@ mod gui {
         }
     }
 
+    /// Keep a cached bastion id only if that instance is still offered in the
+    /// selected environment, otherwise clear it.
+    ///
+    /// The bastion pair falls back to the account-level cache and to the pair
+    /// last used in a sibling environment, either of which can name a box that
+    /// belongs elsewhere. Showing it pre-selected would invite running a script
+    /// against the wrong environment.
+    fn retain_available_bastion(id: String, available: &[(String, String)]) -> String {
+        if available.iter().any(|(instance_id, _)| *instance_id == id) {
+            id
+        } else {
+            String::new()
+        }
+    }
+
     /// Extract the MMODAL_ENV tag value from an instance.
     fn instance_env(instance: &Instance) -> Option<String> {
         instance.tags.get("MMODAL_ENV")
@@ -15934,6 +16543,36 @@ mod gui {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn bastions() -> Vec<(String, String)> {
+            vec![
+                ("i-dev1a".to_string(), "dev1-bastion-a".to_string()),
+                ("i-dev1b".to_string(), "dev1-bastion-b".to_string()),
+            ]
+        }
+
+        #[test]
+        fn a_cached_bastion_still_in_the_environment_is_kept() {
+            assert_eq!(
+                retain_available_bastion("i-dev1a".to_string(), &bastions()),
+                "i-dev1a"
+            );
+        }
+
+        #[test]
+        fn a_bastion_from_another_environment_is_dropped() {
+            // Came from the account-level cache or a sibling environment.
+            assert_eq!(
+                retain_available_bastion("i-dev2a".to_string(), &bastions()),
+                ""
+            );
+        }
+
+        #[test]
+        fn an_empty_cached_bastion_stays_empty() {
+            assert_eq!(retain_available_bastion(String::new(), &bastions()), "");
+            assert_eq!(retain_available_bastion("i-dev1a".to_string(), &[]), "");
+        }
 
         #[test]
         fn utc_offset_label_formats_hours_and_minutes() {
