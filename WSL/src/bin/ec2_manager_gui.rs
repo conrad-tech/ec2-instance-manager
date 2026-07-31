@@ -6027,9 +6027,9 @@ mod gui {
             let mut env_changed = false;
 
             let title = if dlg.delete {
-                "Scripts — delete_user.sh"
+                "Scripts — Bastion User Delete"
             } else {
-                "Scripts — create_new_user.sh"
+                "Scripts — Bastion New User"
             };
             egui::Window::new(title)
                 .collapsible(false)
@@ -13562,12 +13562,14 @@ mod gui {
                         egui::ComboBox::from_id_salt("scripts_menu")
                             .selected_text(format!("Scripts ({script_count})"))
                             .show_ui(ui, |ui| {
-                                if ui.selectable_label(false, "create_new_user.sh…").clicked() {
+                                if ui.selectable_label(false, "Bastion New User…").clicked() {
                                     open_dialog = Some(false);
                                     ui.close();
                                 }
                                 if self.allow_delete_user
-                                    && ui.selectable_label(false, "delete_user.sh…").clicked()
+                                    && ui
+                                        .selectable_label(false, "Bastion User Delete…")
+                                        .clicked()
                                 {
                                     open_dialog = Some(true);
                                     ui.close();

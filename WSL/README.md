@@ -548,7 +548,7 @@ opens a new SSM session; for the user-management scripts it then elevates with
 `sudo su`, `cd ~`, and runs the script. Commands are drip-fed one line at a time,
 waiting for the shell prompt between lines.
 
-### create_new_user.sh
+### Bastion New User (`create_new_user.sh`)
 
 - **Grant sudo (NOPASSWD:ALL)** checkbox (off by default) passes `--sudo`.
 - Runs `create_new_user.sh` on the **primary** (creates the user and generates a
@@ -560,10 +560,11 @@ waiting for the shell prompt between lines.
   `MMODAL_ENV` tag is read from the primary bastion).
 - On success the status line reports all tests passed and the saved PEM path.
 
-### delete_user.sh (admin-gated)
+### Bastion User Delete (`delete_user.sh`, admin-gated)
 
 This entry is **hidden unless enabled at build time** (see
-[Feature flags (features.json)](#feature-flags-featuresjson)).
+[Feature flags (features.json)](#feature-flags-featuresjson)). The menu shows it
+as **Bastion User Delete**; the script it runs is `delete_user.sh`.
 
 - Runs `delete_user.sh` on both bastions: the primary removes the account, group,
   sudoers entry, generated PEM, **and the shared EFS home** (`/efs/home/<user>`);

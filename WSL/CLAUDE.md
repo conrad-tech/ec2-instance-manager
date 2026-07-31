@@ -114,7 +114,8 @@ same tag parsing, same local-time conversion) for terminal use.
 
 **Add Script** in the Scripts menu is available to **everyone**. A personal
 script is a name, an optional hotkey, and a shell body; entries render below
-the built-in `create_new_user.sh` / `delete_user.sh` ones, each with ✏ (edit)
+the built-in Bastion New User / Bastion User Delete ones (which run
+`create_new_user.sh` / `delete_user.sh`), each with ✏ (edit)
 and ✖ (delete, with an "Are you sure…" confirm). Picking one — or pressing its
 hotkey — pastes the body into the **focused connection tab** via the existing
 `paste_to_connection_tab` drip-feed. No bastion dialog, no `sudo su`.
