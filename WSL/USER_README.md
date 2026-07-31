@@ -81,6 +81,9 @@ app:
   primary/secondary bastion pair, generate and install its SSH key, verify it,
   and pull the private key (PEM) to your **Downloads** folder automatically. Some
   builds also allow guarded user deletion.
+- **Vault IAM Access (Scripts menu)** — create a Vault policy and an AWS auth
+  role bound to an IAM role from a bastion, then read both back to confirm it
+  took. You supply the Vault token each time; it is never saved.
 
 ## Learn more
 

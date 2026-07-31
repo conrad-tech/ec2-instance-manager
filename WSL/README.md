@@ -19,8 +19,10 @@ Rust-only EC2 + SSM instance explorer with:
 - Interactive Rust shell mode (`--interactive`) for local operation without JS/HTML.
 - **Scripts menu** (GUI, Connections page) — run bastion helper scripts against a
   primary/secondary bastion pair: `create_new_user.sh` (create a user, verify
-  cross-bastion SSH, pull the PEM to your local Downloads) and an admin-gated
-  `delete_user.sh`. See [Scripts menu (bastion user management)](#scripts-menu-bastion-user-management).
+  cross-bastion SSH, pull the PEM to your local Downloads), an admin-gated
+  `delete_user.sh`, and **Vault IAM Access** (write a Vault policy + AWS auth role
+  bound to an IAM role, then read both back to verify).
+  See [Scripts menu (bastion user management)](#scripts-menu-bastion-user-management).
 
 ## Prerequisites
 
@@ -388,7 +390,8 @@ The file is an array of account objects:
     "account_id": "123456789012",
     "region":     "us-east-1",
     "sort_order": 1,
-    "color":      "#2ea043"
+    "color":      "#2ea043",
+    "vault_addr": "https://vault.dev.example.com:8200"
   },
   {
     "label":      "QA",
@@ -430,6 +433,7 @@ The file is an array of account objects:
 | `region`     | No       | Default AWS region for this account |
 | `sort_order` | No       | Display order in legend and dropdowns (lower = first). Omit for alphabetical. |
 | `color`      | No       | Hex color code for tab coloring (e.g. `"#2ea043"`). Omit for auto-assignment. |
+| `vault_addr` | No       | Vault server URL for this account. Pre-fills **VAULT_ADDR** in the [Vault IAM Access](#vault-iam-access) dialog when this environment is selected. Omit to leave the box blank. |
 
 ### Available color codes
 
@@ -458,7 +462,7 @@ On the **Connections** page there is a **`Scripts (N)`** dropdown (to the right 
 **Close All**), where `N` is the number of available scripts. It runs helper
 scripts against a **primary + secondary bastion pair** in a chosen environment.
 
-Each script opens a dialog with:
+Each script opens a dialog. The two user-management scripts share these fields:
 
 - **User** — the username to act on.
 - **Environment** — which account/profile's bastions to target.
@@ -471,9 +475,9 @@ The selected bastion pair is cached per environment in `config.ini`
 (`bastion_pair.<env>=<primary>|<secondary>`) and pre-filled on the next run.
 
 For each bastion the app reuses an already-connected tab if one exists, otherwise
-opens a new SSM session; it then elevates with `sudo su`, `cd ~`, and runs the
-script. Commands are drip-fed one line at a time, waiting for the shell prompt
-between lines.
+opens a new SSM session; for the user-management scripts it then elevates with
+`sudo su`, `cd ~`, and runs the script. Commands are drip-fed one line at a time,
+waiting for the shell prompt between lines.
 
 ### create_new_user.sh
 
@@ -506,9 +510,47 @@ This entry is **hidden unless enabled at build time** (see
 > real `userdel` error if one occurs. No sessions are ever killed; ask the user
 > to log out and re-run.
 
+### Vault IAM Access
+
+Creates a Vault policy and an AWS-auth role bound to an IAM role, from a bastion
+that can reach the Vault server. Visible to everyone by default — see
+`vault_iam.allowed_users` under
+[Feature flags (features.json)](#feature-flags-featuresjson) to restrict it.
+
+The dialog has:
+
+| Field | Notes |
+|-------|-------|
+| **IAM Role** | The full ARN, used verbatim as `bound_iam_principal_arn`. Hint shows `arn:aws:iam::123456789012:role/my-role`. |
+| **Policy** | The policy HCL. Hint shows `path "ctt/*" { capabilities = ["read", "write", "list"] }`. |
+| **AWS Role Name** | The `auth/aws/role/<name>` path. Defaults to the role name parsed off the ARN; stops tracking once you edit it. |
+| **Policy Name** | Defaults to the AWS Role Name; edit it when the policy is shared across roles. |
+| **Environment** | Selects the bastions **and** the pre-filled VAULT_ADDR. |
+| **Primary / Secondary Bastion** | Same filtered dropdowns and same `config.ini` caching as above. |
+| **VAULT_ADDR** | Pre-filled from the environment's `vault_addr` in `accounts.json`; editable, and required if the account has none. |
+| **VAULT_TOKEN** | Masked, typed per run, **never stored** — not in `config.ini`, not in `features.json`. |
+
+Unlike the user scripts this runs on the **primary bastion only** (Vault is a
+shared server, so a second write would be redundant); the secondary is used only
+if the primary session won't open. It also runs as the **logged-in SSM user** —
+no `sudo su` — since Vault authenticates by token, not by OS user.
+
+On the bastion it exports `VAULT_ADDR`/`VAULT_TOKEN`, writes the policy, writes
+the role with `resolve_aws_unique_id=true`, `token_ttl=0s`, `token_max_ttl=24h`,
+`max_ttl=24h`, then reads the policy and the role back. A success/failure popup
+reports the verdict with the captured terminal output under **Details**.
+
+> **Token handling.** The export line is sent with a leading space under
+> `HISTCONTROL=ignorespace` so it stays out of the remote shell history, the
+> token is passed base64-encoded rather than as a literal, and the screen is
+> cleared immediately after — the same hygiene the git PAT flow uses. Note that
+> `clear` only wipes the visible screen; the encoded value can still sit in that
+> tab's scrollback. The `vault` binary must be on the bastion's PATH for the SSM
+> user, otherwise you get "command not found" and a failure popup.
+
 The script sources live in `assets/scripts/` (`create_new_user.sh`,
 `delete_user.sh`) and are compiled into the binary; edit them and rebuild to
-change behavior.
+change behavior. The Vault commands are built in-app, not from a script file.
 
 ## Feature flags (features.json)
 
@@ -521,7 +563,10 @@ actions.
 {
   "allow_delete_user": false,
   "primary_bastion_filter": "bastion",
-  "secondary_bastion_filter": "bastion"
+  "secondary_bastion_filter": "bastion",
+  "vault_iam": {
+    "allowed_users": ["*"]
+  }
 }
 ```
 
@@ -530,8 +575,22 @@ actions.
 | `allow_delete_user`        | `false`     | Exposes the destructive `delete_user.sh` entry in the Scripts menu. |
 | `primary_bastion_filter`   | `"bastion"` | Substring that narrows the **Primary Bastion** dropdown (matches instance name or id, case-insensitive). Empty shows all. |
 | `secondary_bastion_filter` | `"bastion"` | Same, for the **Secondary Bastion** dropdown. |
+| `vault_iam.allowed_users`  | `["*"]`     | OS usernames that see the **Vault IAM Access** entry. `["*"]` = everyone, `[]` = nobody, or list specific usernames (case-insensitive). |
 
 Parsing **fails closed**: if the file is malformed, every gate defaults to off.
 To ship a build for admins who need user deletion, set `"allow_delete_user": true`
 and rebuild.
+
+### Enabling Vault IAM Access
+
+It is on for everyone in the shipped default, so there is nothing to switch on —
+but it needs one thing to be useful:
+
+1. Set `vault_addr` on each account in `assets/accounts.json` that has a Vault
+   server (see [Account configuration](#account-configuration-accountsjson)).
+   Without it the VAULT_ADDR box opens blank and has to be typed each run.
+2. Rebuild — both files are compiled into the binary.
+
+To restrict it instead, replace `["*"]` with the usernames who should have it
+(or `[]` to hide it from everyone) and rebuild.
 

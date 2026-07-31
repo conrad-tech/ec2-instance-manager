@@ -4,13 +4,15 @@
     "account_id": "123456789012",
     "region": "us-east-1",
     "sort_order": 2,
-    "color": "#2ea043"
+    "color": "#2ea043",
+    "vault_addr": "https://vault.dev.YOUR-COMPANY.com:8200"
   },
   {
     "label": "Staging",
     "account_id": "234567890123",
     "region": "us-east-1",
     "sort_order": 1,
-    "color": "#c8b41e"
+    "color": "#c8b41e",
+    "vault_addr": "https://vault.staging.YOUR-COMPANY.com:8200"
   }
 ]

@@ -1,5 +1,5 @@
 {
-  "_comment": "Build-time feature gates. Edit and rebuild to change. allow_delete_user exposes the destructive 'delete_user.sh' entry in the Scripts menu; keep it false unless the build is intended for admins who need it. primary_bastion_filter / secondary_bastion_filter narrow the Scripts dialog bastion dropdowns to instances whose name or id contains the given text (case-insensitive); empty shows all. protected_users are never deleted by delete_user (case-insensitive); the script also hardcodes system-account protection as a backstop.",
+  "_comment": "Build-time feature gates. Edit and rebuild to change. allow_delete_user exposes the destructive 'delete_user.sh' entry in the Scripts menu; keep it false unless the build is intended for admins who need it. primary_bastion_filter / secondary_bastion_filter narrow the bastion dropdowns in every Scripts dialog (create_new_user, delete_user, and Vault IAM Access) to instances whose name or id contains the given text (case-insensitive); empty shows all. protected_users are never deleted by delete_user (case-insensitive); the script also hardcodes system-account protection as a backstop.",
   "allow_delete_user": false,
   "primary_bastion_filter": "bastion",
   "secondary_bastion_filter": "bastion",
@@ -14,6 +14,10 @@
     "sshd",
     "nobody"
   ],
+  "_vault_iam_comment": "\"Vault IAM Access\" entry in the Scripts menu. It opens a dialog (IAM role ARN, policy HCL, AWS role name, policy name, environment, primary/secondary bastion, VAULT_ADDR, VAULT_TOKEN), then on the PRIMARY bastion writes the policy, writes auth/aws/role/<name> bound to the IAM role, and reads both back to verify. It reuses primary_bastion_filter / secondary_bastion_filter above for the bastion dropdowns. allowed_users lists the OS usernames that see the entry: [\"*\"] = everyone (the shipped default), [] = nobody, or name specific users to restrict it. VAULT_ADDR is pre-filled from the selected environment's \"vault_addr\" in accounts.json and is editable; accounts without one open with a blank box that must be filled in by hand. The VAULT_TOKEN is typed per run and is NEVER stored — not in this file, not in config.ini.",
+  "vault_iam": {
+    "allowed_users": ["*"]
+  },
   "_alerts_comment": "On-call Alerts button (Jira Service Management Operations). cloud_id + email identify the JSM site to query. allowed_users lists the OS usernames (Windows USERNAME / Linux USER, matched case-insensitively) that may see the Alerts button; use [\"*\"] for everyone, [] to hide it from everyone. The button only appears when cloud_id AND email are set AND the user is on the list. DO NOT commit a real API token in 'token' — this file is in git. Leave it empty and have each user set JIRA_TOKEN in their environment; JIRA_TOKEN always overrides this value.",
   "alerts": {
     "cloud_id": "",
