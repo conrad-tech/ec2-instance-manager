@@ -16705,6 +16705,26 @@ mod gui {
         }
 
         #[test]
+        fn a_lowercase_discovered_env_shows_uppercase_in_the_vault_dialogs() {
+            // The Prod account declares no `environments`, so its single
+            // environment is discovered from the MMODAL_ENV tag — which is
+            // lowercase on those instances.
+            let rows = ec2_manager::script_env::build(
+                "345678901234",
+                "Prod",
+                &[],
+                &["prod".to_string()],
+                &[],
+            );
+            assert_eq!(rows.len(), 1);
+            assert_eq!(vault_env_label(&rows[0]), "PROD", "dropdown reads uppercase");
+            assert_eq!(
+                rows[0].env, "prod",
+                "the tag value itself is untouched — only the label is uppercased"
+            );
+        }
+
+        #[test]
         fn an_account_row_keeps_its_own_casing() {
             // No environment dimension: this row names an account, not an
             // environment, so "Prod" must not become "PROD".
