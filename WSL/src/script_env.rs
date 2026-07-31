@@ -26,8 +26,9 @@ pub struct ScriptEnv {
     /// has no environment dimension at all (nothing declared, no tagged
     /// instances) — the pre-existing whole-account behavior.
     pub env: String,
-    /// Text shown in the dropdown: `Account — ENV`, or just `Account` when the
-    /// account has a single environment (the suffix would add nothing).
+    /// Text shown in the dropdown: the environment name on its own. Accounts
+    /// with no environment dimension show their account label instead, since
+    /// there is nothing else to name them by.
     pub label: String,
 }
 
@@ -62,11 +63,19 @@ pub fn env_matches(tag: Option<&str>, env: &str) -> bool {
 /// tags in that account's inventory (duplicates are fine — they are collapsed
 /// here). Declared environments keep their declaration order and their declared
 /// spelling; extra discovered ones follow, sorted alphabetically.
+///
+/// `hidden` is the toolbar's **Exclude Env** selection: those environments are
+/// dropped from the list, so the Scripts dialogs offer the same environments
+/// the Inventory page is showing. An account whose environments are *all*
+/// excluded contributes no rows at all — it does **not** fall back to the
+/// unfiltered whole-account row, which would quietly re-expose every bastion
+/// the user just hid.
 pub fn build(
     account_id: &str,
     account_label: &str,
     declared: &[AccountEnvironment],
     discovered: &[String],
+    hidden: &[String],
 ) -> Vec<ScriptEnv> {
     let mut names: Vec<String> = Vec::new();
     let push_unique = |name: &str, names: &mut Vec<String>| {
@@ -90,7 +99,8 @@ pub fn build(
     }
 
     // No environment dimension: one row for the account itself. Bastion
-    // dropdowns then apply no environment filter, exactly as before.
+    // dropdowns then apply no environment filter, exactly as before. There is
+    // no environment name here, so Exclude Env has nothing to act on.
     if names.is_empty() {
         return vec![ScriptEnv {
             account_id: account_id.to_string(),
@@ -100,17 +110,13 @@ pub fn build(
         }];
     }
 
-    let single = names.len() == 1;
     names
         .into_iter()
+        .filter(|env| !hidden.iter().any(|h| env_eq(h, env)))
         .map(|env| ScriptEnv {
             account_id: account_id.to_string(),
             account_label: account_label.to_string(),
-            label: if single {
-                account_label.to_string()
-            } else {
-                format!("{account_label} — {env}")
-            },
+            label: env.clone(),
             env,
         })
         .collect()
@@ -134,34 +140,41 @@ mod tests {
         names.iter().map(|n| (*n).to_string()).collect()
     }
 
+    /// Nothing excluded — the common case.
+    fn rows(
+        account_id: &str,
+        label: &str,
+        decl: &[AccountEnvironment],
+        disc: &[String],
+    ) -> Vec<ScriptEnv> {
+        build(account_id, label, decl, disc, &[])
+    }
+
     #[test]
     fn declared_and_discovered_are_unioned() {
-        let rows = build("111", "Dev", &declared(&["DEV1"]), &owned(&["DEV2"]));
-        assert_eq!(
-            rows.iter().map(|r| r.env.as_str()).collect::<Vec<_>>(),
-            ["DEV1", "DEV2"]
-        );
+        let r = rows("111", "Dev", &declared(&["DEV1"]), &owned(&["DEV2"]));
+        assert_eq!(r.iter().map(|r| r.env.as_str()).collect::<Vec<_>>(), ["DEV1", "DEV2"]);
     }
 
     #[test]
     fn declared_spelling_wins_over_discovered() {
         // accounts.json says "DEV1"; the tag says "dev1". One row, declared
         // casing, so the label matches what the admin wrote.
-        let rows = build("111", "Dev", &declared(&["DEV1"]), &owned(&["dev1"]));
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].env, "DEV1");
+        let r = rows("111", "Dev", &declared(&["DEV1"]), &owned(&["dev1"]));
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].env, "DEV1");
     }
 
     #[test]
     fn declared_order_is_preserved_and_discovered_are_sorted() {
-        let rows = build(
+        let r = rows(
             "111",
             "Dev",
             &declared(&["ZONE-B", "ZONE-A"]),
             &owned(&["zeta", "alpha"]),
         );
         assert_eq!(
-            rows.iter().map(|r| r.env.as_str()).collect::<Vec<_>>(),
+            r.iter().map(|r| r.env.as_str()).collect::<Vec<_>>(),
             ["ZONE-B", "ZONE-A", "alpha", "zeta"]
         );
     }
@@ -169,63 +182,96 @@ mod tests {
     #[test]
     fn duplicate_discovered_values_collapse() {
         // Every instance carries the tag, so the raw list is full of repeats.
-        let rows = build(
-            "111",
-            "Dev",
-            &[],
-            &owned(&["DEV1", "DEV1", "DEV2", "DEV1"]),
-        );
-        assert_eq!(
-            rows.iter().map(|r| r.env.as_str()).collect::<Vec<_>>(),
-            ["DEV1", "DEV2"]
-        );
+        let r = rows("111", "Dev", &[], &owned(&["DEV1", "DEV1", "DEV2", "DEV1"]));
+        assert_eq!(r.iter().map(|r| r.env.as_str()).collect::<Vec<_>>(), ["DEV1", "DEV2"]);
     }
 
     #[test]
-    fn multi_environment_rows_are_labelled_with_the_environment() {
-        let rows = build("111", "Dev", &declared(&["DEV1", "DEV2"]), &[]);
-        assert_eq!(rows[0].label, "Dev — DEV1");
-        assert_eq!(rows[1].label, "Dev — DEV2");
+    fn rows_are_labelled_with_the_environment_alone() {
+        // No "Account — ENV" prefix: the environment name is the label.
+        let r = rows("111", "Dev", &declared(&["DEV1", "DEV2"]), &[]);
+        assert_eq!(r[0].label, "DEV1");
+        assert_eq!(r[1].label, "DEV2");
+        assert_eq!(r[0].account_label, "Dev", "the account is still tracked");
     }
 
     #[test]
-    fn single_environment_row_is_labelled_with_just_the_account() {
-        // The suffix adds no information when there is only one choice.
-        let rows = build("222", "Prod", &declared(&["PROD"]), &[]);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].label, "Prod");
-        assert_eq!(rows[0].env, "PROD", "the filter still uses the tag value");
+    fn a_single_environment_is_labelled_with_its_own_name() {
+        let r = rows("222", "Prod", &declared(&["PROD"]), &[]);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].label, "PROD");
+        assert_eq!(r[0].env, "PROD");
     }
 
     #[test]
-    fn single_discovered_environment_also_drops_the_suffix() {
-        let rows = build("222", "Prod", &[], &owned(&["PROD"]));
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].label, "Prod");
-    }
-
-    #[test]
-    fn untagged_account_yields_one_whole_account_row() {
-        let rows = build("333", "Legacy", &[], &[]);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].label, "Legacy");
-        assert_eq!(
-            rows[0].env, "",
-            "an empty env means no environment filter is applied"
-        );
+    fn untagged_account_falls_back_to_the_account_label() {
+        // Nothing declared, nothing tagged: there is no environment name to
+        // show, so the account name is the only thing left to call it.
+        let r = rows("333", "Legacy", &[], &[]);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].label, "Legacy");
+        assert_eq!(r[0].env, "", "an empty env means no environment filter");
     }
 
     #[test]
     fn blank_names_are_ignored_on_both_sides() {
-        let rows = build("111", "Dev", &declared(&["  ", ""]), &owned(&["", "   "]));
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].env, "", "all names were blank — treat as untagged");
+        let r = rows("111", "Dev", &declared(&["  ", ""]), &owned(&["", "   "]));
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].env, "", "all names were blank — treat as untagged");
     }
 
     #[test]
     fn names_are_trimmed() {
-        let rows = build("111", "Dev", &[], &owned(&["  DEV1  "]));
-        assert_eq!(rows[0].env, "DEV1");
+        let r = rows("111", "Dev", &[], &owned(&["  DEV1  "]));
+        assert_eq!(r[0].env, "DEV1");
+    }
+
+    #[test]
+    fn excluded_environments_are_dropped() {
+        // "Exclude Env" in the toolbar hid DEV2.
+        let r = build(
+            "111",
+            "Dev",
+            &declared(&["DEV1", "DEV2"]),
+            &[],
+            &owned(&["dev2"]),
+        );
+        assert_eq!(r.iter().map(|r| r.env.as_str()).collect::<Vec<_>>(), ["DEV1"]);
+    }
+
+    #[test]
+    fn exclusion_matches_case_insensitively() {
+        // hidden_envs stores lowercase; accounts.json declares upper.
+        let r = build("111", "Dev", &declared(&["DEV1"]), &[], &owned(&["  dev1 "]));
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn an_account_with_every_environment_excluded_contributes_nothing() {
+        // It must NOT collapse to an unfiltered whole-account row, which would
+        // re-expose the bastions the user just hid.
+        let r = build(
+            "111",
+            "Dev",
+            &declared(&["DEV1", "DEV2"]),
+            &[],
+            &owned(&["DEV1", "DEV2"]),
+        );
+        assert!(r.is_empty(), "the account drops out of the dropdown entirely");
+    }
+
+    #[test]
+    fn exclusion_applies_to_discovered_environments_too() {
+        let r = build("111", "Dev", &[], &owned(&["DEV1", "DEV2"]), &owned(&["dev1"]));
+        assert_eq!(r.iter().map(|r| r.env.as_str()).collect::<Vec<_>>(), ["DEV2"]);
+    }
+
+    #[test]
+    fn an_untagged_account_is_unaffected_by_exclusions() {
+        // It has no environment name for Exclude Env to match against.
+        let r = build("333", "Legacy", &[], &[], &owned(&["dev1", "legacy"]));
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].label, "Legacy");
     }
 
     #[test]
@@ -251,8 +297,8 @@ mod tests {
 
     #[test]
     fn key_pairs_account_and_environment() {
-        let rows = build("111", "Dev", &declared(&["DEV1", "DEV2"]), &[]);
-        assert_eq!(rows[0].key(), ("111".to_string(), "DEV1".to_string()));
-        assert_ne!(rows[0].key(), rows[1].key());
+        let r = rows("111", "Dev", &declared(&["DEV1", "DEV2"]), &[]);
+        assert_eq!(r[0].key(), ("111".to_string(), "DEV1".to_string()));
+        assert_ne!(r[0].key(), r[1].key());
     }
 }

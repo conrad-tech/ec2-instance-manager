@@ -5152,10 +5152,14 @@ mod gui {
         /// declared for it in accounts.json and those discovered in its
         /// inventory — see [`ec2_manager::script_env`].
         ///
+        /// Environments excluded via the toolbar's **Exclude Env** dropdown are
+        /// left out, so the dialogs offer what the Inventory page is showing.
+        ///
         /// Priming each account's disk cache is what makes the discovered half
         /// available; it returns immediately once an account is cached, so
         /// calling this per frame while the dialog is open is cheap.
         fn script_environments(&mut self) -> Vec<ScriptEnv> {
+            let hidden: Vec<String> = self.hidden_envs.iter().cloned().collect();
             let profiles: Vec<(String, String, String)> = self
                 .config
                 .profiles
@@ -5184,6 +5188,7 @@ mod gui {
                     &display_name,
                     &declared,
                     &discovered,
+                    &hidden,
                 ));
             }
             rows

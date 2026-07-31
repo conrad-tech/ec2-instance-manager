@@ -34,7 +34,7 @@ cargo clippy --features gui
 
 As of 2026-07-31, the full build pipeline passes cleanly:
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 294 tests pass (164 lib + 3 CLI + 127 GUI)
+- `cargo test --features gui` — 298 tests pass (168 lib + 3 CLI + 127 GUI)
 - `cargo clippy --features gui` — only pre-existing lib-level warnings (derivable_impls on Mode, too_many_arguments on sim::make_instance, collapsible_if in GUI)
 - Release targets — zero warnings on both Linux (x86_64-unknown-linux-gnu, via
   `build_binaries.sh`) and Windows (x86_64-pc-windows-gnu, built directly since
@@ -179,11 +179,17 @@ are easy to break:
 
 - **Declared spelling wins** on a case-insensitive collision, so a `DEV1` in
   accounts.json and a `dev1` tag are one row, labelled as the admin wrote it.
-- **A single-environment account renders as just the account name**, not
-  `Account — ENV`. The suffix adds nothing when there is one choice.
+- **Rows are labelled with the environment name alone**, not `Account — ENV`.
+  Two accounts sharing an `MMODAL_ENV` value therefore render identically;
+  `account_id` still distinguishes them internally.
 - **An account with nothing declared and nothing tagged** yields one row with
-  `env: ""`, which applies **no** environment filter — the pre-existing
-  whole-account behavior. Do not "fix" that empty string away.
+  `env: ""` labelled with the *account* name, which applies **no** environment
+  filter — the pre-existing whole-account behavior. Do not "fix" that empty
+  string away.
+- **Exclude Env (`hidden_envs`) filters the list.** An account whose
+  environments are *all* excluded contributes **no rows**; it must not collapse
+  back to the `env: ""` whole-account row, which would re-expose every bastion
+  the user just hid. The untagged row is exempt — it has no name to match.
 
 The environment filter is never relaxed: `bastion_combo_ui`'s fallback to the
 `"bastion"` substring applies *within* the selected environment, so an

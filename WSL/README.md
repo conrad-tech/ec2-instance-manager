@@ -456,7 +456,8 @@ Several accounts host more than one environment, distinguished by the
 **environment**, not an account, and narrow both bastion dropdowns to instances
 carrying that tag value.
 
-The dropdown shows the union of:
+The dropdown lists environments **by name** (`DEV1`, `DEV2`, …), not
+`Account — ENV`. It shows the union of:
 
 - every environment declared in `environments` for that account, and
 - every distinct `MMODAL_ENV` value found in that account's loaded inventory.
@@ -464,20 +465,31 @@ The dropdown shows the union of:
 So a new environment appears as soon as its instances do — declaring it in
 `accounts.json` is only needed to give it a `vault_addr`.
 
+Environments hidden with the toolbar's **Exclude Env** dropdown are left out, so
+the Scripts dialogs offer the same environments the Inventory page is showing.
+If every environment in an account is excluded, that account disappears from the
+list entirely — it does **not** fall back to an unfiltered whole-account entry,
+which would re-expose the bastions you just hid.
+
+> Because rows are named by environment alone, two accounts that use the *same*
+> `MMODAL_ENV` value produce two identically-labelled rows. Keep environment
+> names unique across accounts if you rely on this dropdown.
+
 ### Accounts with one environment
 
 Nothing extra to configure. An account with a single environment shows a single
-row, labelled with just the account name rather than `Account — ENV`, and behaves
-exactly as it did before this change. Two cases:
+row and behaves exactly as it did before this change. Two cases:
 
 - **The instances are tagged** (one `MMODAL_ENV` value across the account) — the
   environment is discovered automatically. Declare it in `environments` only if
   it needs its own `vault_addr`; otherwise set `vault_addr` at the account level,
   as **Staging** does above.
 - **The instances are untagged** — there is nothing to discover, so the account
-  itself is the single entry, no environment filter is applied to the bastion
-  dropdowns, and the account-level `vault_addr` is used. This is the pre-existing
-  behavior, unchanged.
+  itself is the single entry, **labelled with the account name** (there is no
+  environment name to show), no environment filter is applied to the bastion
+  dropdowns, and the account-level `vault_addr` is used. **Exclude Env** cannot
+  hide such an entry, since it has no environment name to match. This is the
+  pre-existing behavior, unchanged.
 
 ### Available color codes
 
@@ -509,9 +521,9 @@ scripts against a **primary + secondary bastion pair** in a chosen environment.
 Each script opens a dialog. The two user-management scripts share these fields:
 
 - **User** — the username to act on.
-- **Environment** — which environment's bastions to target, listed as
-  `Account — ENV` (or just `Account` where the account has a single environment).
-  See [Environments within an account](#environments-within-an-account).
+- **Environment** — which environment's bastions to target, listed by
+  environment name. See
+  [Environments within an account](#environments-within-an-account).
 - **Primary Bastion** / **Secondary Bastion** — dropdowns (`choose ▾`) narrowed
   to instances whose `MMODAL_ENV` tag matches the selected environment, and then
   by the `primary_bastion_filter` / `secondary_bastion_filter` values in
@@ -581,7 +593,7 @@ The dialog has:
 | **Policy** | The policy HCL. Hint shows `path "ctt/*" { capabilities = ["read", "write", "list"] }`. |
 | **AWS Role Name** | The `auth/aws/role/<name>` path. Defaults to the role name parsed off the ARN; stops tracking once you edit it. |
 | **Policy Name** | Defaults to the AWS Role Name; edit it when the policy is shared across roles. |
-| **Environment** | `Account — ENV`. Selects the bastions **and** the pre-filled VAULT_ADDR. |
+| **Environment** | Selects the bastions **and** the pre-filled VAULT_ADDR. |
 | **Primary / Secondary Bastion** | Same env-filtered dropdowns and same `config.ini` caching as above. |
 | **VAULT_ADDR** | Pre-filled from the environment's `vault_addr`, falling back to the account-level one; editable, and required if neither is set. |
 | **VAULT_TOKEN** | Masked, typed per run, **never stored** — not in `config.ini`, not in `features.json`. |
