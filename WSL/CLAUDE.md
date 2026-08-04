@@ -32,10 +32,10 @@ cargo clippy --features gui
 
 ## Build status
 
-As of 2026-08-04 (commit `58a9b9a`, rustc 1.94.0), the full build pipeline
-passes cleanly:
+As of 2026-08-04 (rustc 1.94.0), with the access-email integration restored, the
+full build pipeline passes cleanly:
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 302 tests pass, 0 fail (168 lib + 3 CLI + 131 GUI)
+- `cargo test --features gui` — 305 tests pass, 0 fail (168 lib + 3 CLI + 134 GUI)
 - `cargo clippy --features gui` — no errors; 21 pre-existing style warnings
   (derivable_impls on Mode, too_many_arguments on sim::make_instance,
   collapsible_if / let_and_return / manual_is_multiple_of in the GUI)
@@ -59,9 +59,10 @@ passes cleanly:
 ### Known-good rollback point: `pre-email-readd-58a9b9a`
 
 Tag `pre-email-readd-58a9b9a` (annotated) marks the last state verified working
-**before** the Outlook access-email integration is re-added. It sits on the
-commit that added this note; the code is identical to `58a9b9a`, which is where
-the verification below was actually run. Roll back with:
+**before** the Outlook access-email integration was re-added — i.e. the state to
+return to if the email code turns out to be the CrowdStrike trigger after all.
+It sits on the commit that added this note; the code is identical to `58a9b9a`,
+which is where the verification below was run. Roll back with:
 
 ```bash
 git reset --hard pre-email-readd-58a9b9a
@@ -74,31 +75,56 @@ with a clean working tree, plus the Windows release cross-compile
 `send_access_email` / `outlook` / `access_email` / `smtp` / `MailItem` outside
 `target/`.
 
-**Re-adding email = reverting `0360342` ("Removed email code.").** That restores
-`ACCESS_EMAIL_WALKTHROUGH.md`, four PowerShell assets
+**The email code came back via `git revert 0360342` ("Removed email code.").**
+That restored `ACCESS_EMAIL_WALKTHROUGH.md`, four PowerShell assets
 (`send_access_email.ps1`, `outlook_verification.ps1`, `test_access_email.ps1`,
 `test_headless_encrypt.ps1`), the `access_email` block in `features.json`, the
 `AccessEmailConfig` struct in `features.rs`, the GUI wiring, and the
-`build_binaries.sh` hunk that copies `send_access_email.ps1` next to the GUI exe
-(deliberately *not* embedded, to avoid EDR false positives).
+`build_binaries.sh` hunk that copies `send_access_email.ps1` next to the GUI exe.
 
-`git revert --no-commit 0360342` does **not** apply cleanly — three conflicts,
-all because the files moved on under the alerts / Vault IAM / personal-scripts
-work:
+It conflicted in three files — `assets/features.json`, `src/features.rs`,
+`src/bin/ec2_manager_gui.rs` — purely because each had grown new sections under
+the alerts / Vault IAM / personal-scripts work. Every conflict was additive
+(keep both sides); nothing from either side was dropped. The PowerShell assets,
+the walkthrough, and the `build_binaries.sh` hunk applied clean.
 
-- `WSL/assets/features.json`
-- `WSL/src/features.rs`
-- `WSL/src/bin/ec2_manager_gui.rs`
-
-The PowerShell assets, the walkthrough, and the `build_binaries.sh` hunk apply
-clean. Earlier email history, if the revert gets messy: `5e03e93` (initial),
-`3dc603d` (logic), `050a4b9` (manual button), `ccb3104` (the last commit that
+Earlier email history, if it ever needs untangling again: `5e03e93` (initial),
+`3dc603d` (logic), `050a4b9` (switched to the manual copy-a-command button —
+this is the version that came back), `ccb3104` (the last pre-removal commit that
 *has* the code).
 
 **Why it was removed:** CrowdStrike quarantined the app, so `2c9a8e6` stripped
 email as a test. It still quarantined afterward, so email was ruled out as the
 cause; `2c31e8c` then reset the branch to the pre-email baseline `c51a397` for a
 clean test target. Tag `pre-rollback-2c9a8e6` preserves the old tip.
+
+### Access email (post-create) — copy a command, never auto-send
+
+Restored on 2026-08-04 by reverting `0360342`. **It does not send anything
+itself, and that is the whole design.** After a successful Bastion New User run
+*where the PEM was saved*, the result popup grows a **✉ Send Email Command**
+menu with one entry per terminal (WSL / Git Bash / PowerShell).
+`build_email_command` assembles a ready-to-run command line; clicking an entry
+only copies it to the clipboard, and the user runs it in their own shell.
+
+Running the Outlook automation from the user's shell — rather than spawning it
+from the unsigned GUI process — is what keeps EDR/CrowdStrike off it. Do not
+"improve" this into an auto-send or a `Command::spawn`.
+
+- The command invokes `send_access_email.ps1` **from the GUI exe's own
+  directory**, not from an embedded asset. `build_binaries.sh`'s
+  `package_windows_zip` copies it next to the exe and lists it in the zip
+  candidates. Keeping the PowerShell out of the `.exe` is deliberate, same
+  reason as above.
+- Values are interpolated into single-quoted arguments, and the two shells
+  escape an embedded quote differently (`'a'\''b'` for bash, `'a''b'` for
+  PowerShell). `build_email_command_quotes_apostrophes_per_shell` covers it.
+- `access_email.enabled: false` in features.json makes `build_email_command`
+  return `None`, so the menu never appears.
+- The `encrypt_*` values are tenant-specific and discovered with
+  `outlook_verification.ps1` / `test_headless_encrypt.ps1`; the shipped
+  `encrypt_template_guid` is an all-zeros placeholder that must be replaced.
+  See `ACCESS_EMAIL_WALKTHROUGH.md`.
 
 ### Windows cross-compile and spaces in the repo path
 

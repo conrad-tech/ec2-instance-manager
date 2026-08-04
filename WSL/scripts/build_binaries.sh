@@ -266,9 +266,17 @@ package_windows_zip() {
   else
     rm -f "${WINDOWS_DIST_DIR}/WALKTHROUGH.md"
   fi
+  # The access-email helper ships as a plain file next to the GUI exe (the GUI
+  # runs it from its own directory). It is intentionally NOT embedded in the
+  # binary - keeping the PowerShell out of the .exe avoids EDR false positives.
+  if [[ -f "${ROOT_DIR}/assets/scripts/send_access_email.ps1" ]]; then
+    cp "${ROOT_DIR}/assets/scripts/send_access_email.ps1" \
+       "${WINDOWS_DIST_DIR}/send_access_email.ps1"
+  fi
   local candidates=(
     "${WINDOWS_DIST_DIR}/${CLI_APP_NAME}_${APP_VERSION}.exe"
     "${WINDOWS_DIST_DIR}/${GUI_APP_NAME}_${APP_VERSION}.exe"
+    "${WINDOWS_DIST_DIR}/send_access_email.ps1"
     "${WINDOWS_DIST_DIR}/WALKTHROUGH.md"
     "${WINDOWS_DIST_DIR}/libgcc_s_seh-1.dll"
     "${WINDOWS_DIST_DIR}/libstdc++-6.dll"

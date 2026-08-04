@@ -40,6 +40,9 @@ pub struct Features {
     pub personal_scripts: PersonalScriptsFeature,
     /// "Vault IAM Access" entry in the Scripts menu: who may see it.
     pub vault_iam: VaultIamFeature,
+    /// Outlook "access email" automation config (Windows only). Controls
+    /// how the post-create email is encrypted and whether it may auto-send.
+    pub access_email: AccessEmailConfig,
 }
 
 /// Shared allow-list match used by every `allowed_users` gate: OS username,
@@ -202,6 +205,44 @@ pub fn current_os_user() -> String {
     std::env::var(key).unwrap_or_default().trim().to_string()
 }
 
+/// Config for the post-create Outlook access email (see
+/// `assets/scripts/send_access_email.ps1`). The encryption values are
+/// discovered per-tenant with `outlook_verification.ps1` and pasted here.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct AccessEmailConfig {
+    /// Master switch. When false the GUI never launches the email.
+    pub enabled: bool,
+    /// RMS/IRM template GUID to apply for encryption (tenant-specific).
+    /// Empty disables the template path.
+    pub encrypt_template_guid: String,
+    /// `MailItem.Permission` value to set (e.g. 3 for the discovered
+    /// template, 2 = Do Not Forward). 0 = don't set via Permission.
+    pub encrypt_permission: i64,
+    /// `MailItem.PermissionService` value (1 = olWindows). Required
+    /// alongside a template GUID for headless encryption. 0 = don't set.
+    pub encrypt_permission_service: i64,
+    /// S/MIME security flag (MAPI 0x6E010003): 1 = encrypt contents.
+    /// 0 = not used. Only relevant when there's no template GUID.
+    pub encrypt_smime_flag: i64,
+    /// Quick Access Toolbar Encrypt shortcut for the visible fallback
+    /// path (SendKeys syntax; Alt+6 = "%6").
+    pub encrypt_sendkeys: String,
+}
+
+impl Default for AccessEmailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            encrypt_template_guid: String::new(),
+            encrypt_permission: 0,
+            encrypt_permission_service: 0,
+            encrypt_smime_flag: 0,
+            encrypt_sendkeys: "%6".to_string(),
+        }
+    }
+}
+
 /// Built-in never-delete list (system / critical accounts).
 fn default_protected_users() -> Vec<String> {
     [
@@ -230,6 +271,7 @@ impl Default for Features {
             alerts: AlertsFeature::default(),
             personal_scripts: PersonalScriptsFeature::default(),
             vault_iam: VaultIamFeature::default(),
+            access_email: AccessEmailConfig::default(),
         }
     }
 }
