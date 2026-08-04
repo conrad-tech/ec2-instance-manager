@@ -1,14 +1,17 @@
 # Access Email Setup - Walkthrough
 
-After a user is created, the app hands you a ready-to-run command that composes
-the "bastion access" email in Outlook, encrypts it, and - when the recipient is
-unambiguous - sends it. **You run that command yourself**; the app only copies
-it to your clipboard. This is **Windows only** and relies on Outlook being
-installed and signed in.
+After a user is created, the app composes the "bastion access" email in Outlook,
+encrypts it, and - when the recipient resolves to exactly one person in your
+mail domain - sends it in the background. Otherwise Outlook opens with the
+email ready and the To field empty. This is **Windows only** and relies on
+Outlook being installed and signed in.
 
-> Why the extra step: running the Outlook automation from your own shell keeps
-> it out of the unsigned GUI process, which is what stops EDR (CrowdStrike) from
-> quarantining the app. It is not a limitation to be engineered away.
+The result popup reports which of those happened, so a silent send is still
+visible. A **✉ Send Email Command** menu is also there as a manual fallback: it
+copies a ready-to-run command for WSL, Git Bash or PowerShell.
+
+> Set `access_email.auto_run` to `false` in features.json to turn the automatic
+> run off and leave the ✉ menu as the only route.
 
 The one thing that must be set up per organization is **encryption**: the app
 applies the same encryption your **Options > Encrypt** button applies, via the
@@ -118,6 +121,8 @@ Edit `assets/features.json`, fill in the `access_email` block, then rebuild:
 ```json
 "access_email": {
   "enabled": true,
+  "auto_run": true,
+  "email_domain": "xyz.com",
   "encrypt_template_guid": "{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}",
   "encrypt_permission": 3,
   "encrypt_permission_service": 1,
@@ -129,6 +134,11 @@ Edit `assets/features.json`, fill in the `access_email` block, then rebuild:
 - All three of `encrypt_permission`, `encrypt_permission_service` (1), and
   `encrypt_template_guid` are needed for headless encryption.
 - `enabled` - set `false` to turn the whole feature off.
+- `auto_run` - set `false` to stop the app running the script itself, leaving
+  the ✉ Send Email Command menu as the only route.
+- `email_domain` - your organization's mail domain. A recipient that resolves
+  to an address outside it is never mailed unattended, which is what stops a
+  stale local Contacts entry from receiving the PEM. Leave empty to skip.
 - `encrypt_sendkeys` - your QAT Encrypt shortcut, used only on the visible
   fallback path (Alt+6 = `"%6"`).
 
@@ -145,21 +155,18 @@ cargo build --features gui        # or the release build script
 ## What happens after a user is created
 
 Once a create finishes and passes verification (user created on both bastions,
-SSH cross-login OK, PEM pulled to `~/Downloads`), the result popup grows an
-**✉ Send Email Command** menu. Pick your terminal (WSL / Git Bash / PowerShell)
-and the command is copied to your clipboard - the popup confirms with "Command
-copied. Now run it in your terminal." Paste it into that terminal and run it.
+SSH cross-login OK, PEM pulled to `~/Downloads`), the app runs
+`send_access_email.ps1` itself. This only happens when the PEM was saved (the
+email body promises it as an attachment) and both `access_email.enabled` and
+`access_email.auto_run` are `true`.
 
-The menu only appears when the PEM was saved (the email body promises it as an
-attachment) and `access_email.enabled` is `true`.
-
-Running the command:
+The script:
 
 1. Composes the email:
    - **To:** `firstname.lastname` -> `Firstname Lastname`, resolved against the
      Global Address List (like typing in the To field).
-   - **Subject:** `Access for <ENV> Bastion EC2s` (ENV = primary bastion's
-     MMODAL_ENV tag).
+   - **Subject:** `Bastion Access for <ENV>` (ENV = the primary bastion's
+     MMODAL_ENV tag, uppercased).
    - **Body:** greeting with the first name, the username, both bastion instance
      IDs, and a signature using your Outlook profile's first name.
    - **Attachment:** the generated PEM.
@@ -167,12 +174,18 @@ Running the command:
 
 | Case | What happens |
 |---|---|
-| **Exactly one match** | Encrypts headless and **sends silently** - no compose window. The script pops up "Email sent successfully" and prints `SENT recipient='...'`. |
-| **Two or more people share the name (or none match)** | **Opens the Outlook window, presses Alt+6 to encrypt, and leaves it open** so you pick the correct recipient and click Send. A popup explains why. |
-| **One match but headless encryption can't be confirmed** | Opens the window, presses Alt+6, and leaves it for you to verify and Send. |
+| **One match, address in your `email_domain`** | Encrypts headless and **sends silently** - no compose window. Prints `SENT recipient='...' address='...'`. |
+| **One match, address outside `email_domain`** | Opens the draft with the **To field empty** and names the address it found. Guards against a stale Contacts entry receiving the PEM. |
+| **Two or more people share the name, or nobody matches** | Opens the draft with the **To field empty** so nobody is pre-selected. One message covers both - Outlook cannot tell them apart without a full directory scan. |
+| **Encryption could not be confirmed** | Opens the draft and presses your Alt+6 shortcut. Only ever pressed when headless encryption failed, since Alt+6 is a toggle. |
 
-The private key is only sent automatically when the recipient is unambiguous
-**and** encryption is confirmed on the item. Alt+6 is only ever pressed on a
+The result popup in the app shows which of these happened. On the automatic run
+the script is passed `-Quiet`, so it does not also raise its own message boxes;
+run it by hand from the ✉ menu and the boxes come back.
+
+The private key is only sent automatically when the recipient resolves to one
+person, that person's address is in your configured `email_domain`, **and**
+encryption is confirmed on the item. Alt+6 is only ever pressed on a
 not-yet-encrypted draft (it's a toggle), so it never accidentally un-encrypts.
 
 ---

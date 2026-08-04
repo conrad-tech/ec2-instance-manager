@@ -670,6 +670,8 @@ actions.
   },
   "access_email": {
     "enabled": true,
+    "auto_run": true,
+    "email_domain": "xyz.com",
     "encrypt_template_guid": "{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}",
     "encrypt_permission": 3,
     "encrypt_permission_service": 1,
@@ -686,7 +688,9 @@ actions.
 | `secondary_bastion_filter` | `"bastion"` | Same, for the **Secondary Bastion** dropdown. |
 | `vault_iam.allowed_users`  | `["*"]`     | OS usernames that see the **Vault IAM Access** entry. `["*"]` = everyone, `[]` = nobody, or list specific usernames (case-insensitive). |
 | `vault_iam.delete_allowed_users` | `[]`  | OS usernames that additionally see the destructive **Vault IAM Delete** entry. Requires membership of `allowed_users` too. Ships empty — nobody. |
-| `access_email.enabled`     | `true`      | Shows the **✉ Send Email Command** menu on the create-user result popup. `false` hides it entirely. See [Access email](#access-email-post-create). |
+| `access_email.enabled`     | `true`      | Master switch for the whole access-email feature. `false` disables the automatic send and hides the **✉ Send Email Command** menu. See [Access email](#access-email-post-create). |
+| `access_email.auto_run`    | `true`      | Run `send_access_email.ps1` automatically once a create finishes with a saved PEM. `false` leaves the ✉ menu as the only route. |
+| `access_email.email_domain` | `""`       | Your organization's mail domain, e.g. `xyz.com`. A recipient that resolves outside it is never mailed unattended — this is what stops a stale local Contacts entry or autocomplete hit from receiving the PEM. Empty skips the check. |
 | `access_email.encrypt_template_guid` | *(placeholder)* | Your **Microsoft 365 tenant's** RMS/IRM template GUID, braces included. Ships as an all-zeros placeholder that must be replaced — see [Finding your template GUID](#finding-your-template-guid). |
 | `access_email.encrypt_permission` | `3`    | The `MailItem.Permission` value your Encrypt button applies (`2` = Do Not Forward). `0` skips it. |
 | `access_email.encrypt_permission_service` | `1` | `MailItem.PermissionService` (`1` = olWindows). Needed alongside the template GUID. |
@@ -727,21 +731,32 @@ role *and* its policy.
 
 **Windows only**, and it needs Outlook installed and signed in.
 
-After a Bastion New User run finishes *and the PEM was saved*, the result popup
-grows a **✉ Send Email Command** menu with one entry per terminal (WSL, Git
-Bash, PowerShell). Picking one **copies a command to your clipboard** — the app
-does not run it. You paste it into your own terminal and run it; that command
-invokes `send_access_email.ps1`, which composes the access email in Outlook,
-attaches the PEM, encrypts it, and sends it when the recipient resolves
-unambiguously (otherwise it leaves the draft open for you).
+After a Bastion New User run finishes *and the PEM was saved*, the app runs
+`send_access_email.ps1` for you (`access_email.auto_run`, on by default). That
+script composes the email in Outlook, attaches the PEM, encrypts it, and:
 
-> The app deliberately never spawns the Outlook automation itself. Running it
-> from your own shell — a human-initiated action in a trusted process — is what
-> keeps EDR (CrowdStrike) from quarantining the unsigned GUI binary. Please do
-> not "improve" this into an auto-send.
+| Outcome | What happens |
+|---|---|
+| The name resolves to exactly one person **in `email_domain`** | Encrypted and **sent in the background** — no window |
+| Resolves, but the address is outside `email_domain` | Opens the draft, **To field empty**, naming the address it found |
+| Does not resolve — nobody matches, or two people share the name | Opens the draft, **To field empty** |
+| Encryption could not be confirmed | Opens the draft and applies your `Alt+6` shortcut |
 
-`send_access_email.ps1` is copied next to the GUI `.exe` by
-`scripts/build_binaries.sh` and is **not** embedded in the binary — same reason.
+The result popup shows which of these happened, so a silent send is still
+visible. Nothing is ever sent unattended without a confirmed single in-domain
+recipient **and** confirmed encryption — the attachment is a private key.
+
+The **✉ Send Email Command** menu remains as a manual fallback: it copies a
+ready-to-run command for WSL, Git Bash or PowerShell, useful for re-sending or
+when the automatic attempt fails.
+
+> Two things in the spawn are deliberate EDR hygiene and should not be
+> "tidied": the script is run **from the file next to the exe** (never written
+> to `%TEMP%` and run from there), and `-WindowStyle Hidden` is **not** used. A
+> brief console window is the accepted cost. `scripts/build_binaries.sh` copies
+> the script next to the `.exe` rather than embedding it, for the same reason.
+
+Set `access_email.auto_run` to `false` to leave the ✉ menu as the only route.
 
 ### Finding your template GUID
 

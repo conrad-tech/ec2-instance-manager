@@ -32,10 +32,10 @@ cargo clippy --features gui
 
 ## Build status
 
-As of 2026-08-04 (rustc 1.94.0), with the access-email integration restored, the
-full build pipeline passes cleanly:
+As of 2026-08-04 (rustc 1.94.0), with the access-email integration restored and
+made automatic, the full build pipeline passes cleanly:
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 305 tests pass, 0 fail (168 lib + 3 CLI + 134 GUI)
+- `cargo test --features gui` — 315 tests pass, 0 fail (171 lib + 3 CLI + 141 GUI)
 - `cargo clippy --features gui` — no errors; 21 pre-existing style warnings
   (derivable_impls on Mode, too_many_arguments on sim::make_instance,
   collapsible_if / let_and_return / manual_is_multiple_of in the GUI)
@@ -98,29 +98,54 @@ email as a test. It still quarantined afterward, so email was ruled out as the
 cause; `2c31e8c` then reset the branch to the pre-email baseline `c51a397` for a
 clean test target. Tag `pre-rollback-2c9a8e6` preserves the old tip.
 
-### Access email (post-create) — copy a command, never auto-send
+### Access email (post-create)
 
-Restored on 2026-08-04 by reverting `0360342`. **It does not send anything
-itself, and that is the whole design.** After a successful Bastion New User run
-*where the PEM was saved*, the result popup grows a **✉ Send Email Command**
-menu with one entry per terminal (WSL / Git Bash / PowerShell).
-`build_email_command` assembles a ready-to-run command line; clicking an entry
-only copies it to the clipboard, and the user runs it in their own shell.
+Restored on 2026-08-04 by reverting `0360342`, then made automatic again. After
+a Bastion New User run *where the PEM was saved*, the GUI spawns
+`send_access_email.ps1` itself (`start_access_email`, Windows only), and the
+result popup shows a status line fed by the script's stdout marker. The **✉ Send
+Email Command** menu remains as a manual fallback that copies a ready-to-run
+command per terminal.
 
-Running the Outlook automation from the user's shell — rather than spawning it
-from the unsigned GUI process — is what keeps EDR/CrowdStrike off it. Do not
-"improve" this into an auto-send or a `Command::spawn`.
-
-- The command invokes `send_access_email.ps1` **from the GUI exe's own
-  directory**, not from an embedded asset. `build_binaries.sh`'s
-  `package_windows_zip` copies it next to the exe and lists it in the zip
-  candidates. Keeping the PowerShell out of the `.exe` is deliberate, same
-  reason as above.
+- **The send path has three conditions, all required:** the recipient resolves
+  to exactly one person, that address is in `access_email.email_domain`, and
+  encryption reads back confirmed. Anything else opens the draft. The
+  attachment is a private key — do not relax this.
+- **The domain check is a safety control, not a filter.** Outlook's `Resolve()`
+  matches the local Contacts folder and the autocomplete cache as well as the
+  GAL, so a stale personal entry for the same name would otherwise be mailed
+  the PEM. Blank `email_domain` skips the check (preserving older behavior);
+  that is deliberate, not an oversight.
+- **0 matches and 2+ matches share one message on purpose.** `Resolve()` returns
+  false for both and cannot distinguish them; telling them apart needs a full
+  GAL enumeration or an LDAP query, and the user does the same thing either way
+  (pick a recipient in an empty To field). Do not add a directory scan to
+  produce a nicer error string.
+- **Two EDR constraints in the spawn are load-bearing.** The script is run from
+  the file **next to the exe** — never written to `%TEMP%` and run from there —
+  and `-WindowStyle Hidden` is not used. Both are patterns EDRs quarantine on
+  sight. `build_binaries.sh`'s `package_windows_zip` copies the script beside
+  the exe rather than embedding it, for the same reason.
+  (History worth knowing: `050a4b9` removed auto-run believing it triggered
+  CrowdStrike; `2c31e8c` later found the app was still quarantined with *all*
+  email code gone, so email was never the trigger.)
+- **`-Quiet` is only for the auto-run path.** It suppresses the script's own
+  message boxes because the GUI renders the outcome; the copied manual command
+  omits it, since nothing is watching a command pasted into a terminal.
+  `the_copied_command_never_carries_quiet` guards this.
+- **`access_email_args` is shared** by `build_email_command` and
+  `launch_access_email` so the copied command and the spawned one cannot drift.
 - Values are interpolated into single-quoted arguments, and the two shells
   escape an embedded quote differently (`'a'\''b'` for bash, `'a''b'` for
   PowerShell). `build_email_command_quotes_apostrophes_per_shell` covers it.
-- `access_email.enabled: false` in features.json makes `build_email_command`
-  return `None`, so the menu never appears.
+- `EmailStatus` and `parse_email_marker` carry
+  `#[cfg_attr(not(target_os = "windows"), allow(dead_code))]` — only the
+  Windows build constructs the non-`Sending` variants, and the Linux dev build
+  must stay warning-free without weakening the check where it ships.
+- `launch_access_email` returns `std::result::Result` spelled out, because the
+  crate's own `Result<T>` alias (`src/error.rs`) takes one parameter and is in
+  scope. This only fails on the Windows target, so **cross-compile before
+  trusting a change here.**
 - The `encrypt_*` values are tenant-specific and discovered with
   `outlook_verification.ps1` / `test_headless_encrypt.ps1`; the shipped
   `encrypt_template_guid` is an all-zeros placeholder that must be replaced.
