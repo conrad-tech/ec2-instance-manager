@@ -286,10 +286,13 @@ are easy to break:
   accounts.json and a `dev1` tag are one row, labelled as the admin wrote it.
 - **Rows are labelled with the environment name alone**, not `Account — ENV`.
   Two accounts sharing an `MMODAL_ENV` value therefore render identically;
-  `account_id` still distinguishes them internally. The two Vault dialogs
-  uppercase the label via `vault_env_label` (display only — matching and
-  `vault_addr` lookup are already case-insensitive); the whole-account row is
-  exempt, since it names an account rather than an environment.
+  `account_id` still distinguishes them internally. **All** the Scripts dialogs
+  uppercase the label via `script_env_label` — the shared Bastion New User /
+  Bastion User Delete dropdown (`cnu_env`) and both Vault dialogs — so one
+  environment reads the same everywhere. Display only: matching an instance to
+  an environment and looking up its `vault_addr` are already case-insensitive,
+  and `row.env` keeps the tag's real casing. The whole-account row is exempt,
+  since it names an account rather than an environment.
 - **An account with nothing declared and nothing tagged** yields one row with
   `env: ""` labelled with the *account* name, which applies **no** environment
   filter — the pre-existing whole-account behavior. Do not "fix" that empty

@@ -6364,7 +6364,7 @@ mod gui {
                                     e.account_id == dlg.env_profile_id
                                         && e.env == dlg.env_name
                                 })
-                                .map(|e| e.label.clone())
+                                .map(script_env_label)
                                 .unwrap_or_else(|| "Select…".to_string());
                             let prev = (dlg.env_profile_id.clone(), dlg.env_name.clone());
                             egui::ComboBox::from_id_salt("cnu_env")
@@ -6375,7 +6375,7 @@ mod gui {
                                         let selected = row.account_id == dlg.env_profile_id
                                             && row.env == dlg.env_name;
                                         if ui
-                                            .selectable_label(selected, row.label.clone())
+                                            .selectable_label(selected, script_env_label(row))
                                             .clicked()
                                         {
                                             dlg.env_profile_id = row.account_id.clone();
@@ -6744,7 +6744,7 @@ mod gui {
                                     e.account_id == dlg.env_profile_id
                                         && e.env == dlg.env_name
                                 })
-                                .map(vault_env_label)
+                                .map(script_env_label)
                                 .unwrap_or_else(|| "Select…".to_string());
                             let prev = (dlg.env_profile_id.clone(), dlg.env_name.clone());
                             egui::ComboBox::from_id_salt("vault_iam_env")
@@ -6755,7 +6755,7 @@ mod gui {
                                         let selected = row.account_id == dlg.env_profile_id
                                             && row.env == dlg.env_name;
                                         if ui
-                                            .selectable_label(selected, vault_env_label(row))
+                                            .selectable_label(selected, script_env_label(row))
                                             .clicked()
                                         {
                                             dlg.env_profile_id = row.account_id.clone();
@@ -15906,7 +15906,10 @@ mod gui {
         }
     }
 
-    /// Environment label as the Vault dialogs show it: always uppercase.
+    /// Environment label as every Scripts dialog shows it: always uppercase.
+    ///
+    /// Shared by the Bastion New User / Bastion User Delete dropdown and both
+    /// Vault dialogs, so one environment reads the same everywhere.
     ///
     /// `MMODAL_ENV` values are uppercase by convention, but the tag is free
     /// text and `accounts.json` is typed by hand, so a stray `dev1` would
@@ -15915,7 +15918,7 @@ mod gui {
     ///
     /// An account with no environment dimension keeps its account label as
     /// written: that row names an account, not an environment.
-    fn vault_env_label(row: &ScriptEnv) -> String {
+    fn script_env_label(row: &ScriptEnv) -> String {
         if row.env.is_empty() {
             row.label.clone()
         } else {
@@ -17278,18 +17281,18 @@ mod gui {
         }
 
         #[test]
-        fn vault_env_labels_are_uppercased() {
-            assert_eq!(vault_env_label(&env_row("dev1", "dev1")), "DEV1");
-            assert_eq!(vault_env_label(&env_row("Stg-2", "Stg-2")), "STG-2");
+        fn script_env_labels_are_uppercased() {
+            assert_eq!(script_env_label(&env_row("dev1", "dev1")), "DEV1");
+            assert_eq!(script_env_label(&env_row("Stg-2", "Stg-2")), "STG-2");
         }
 
         #[test]
         fn an_already_uppercase_env_label_is_unchanged() {
-            assert_eq!(vault_env_label(&env_row("DEV1", "DEV1")), "DEV1");
+            assert_eq!(script_env_label(&env_row("DEV1", "DEV1")), "DEV1");
         }
 
         #[test]
-        fn a_lowercase_discovered_env_shows_uppercase_in_the_vault_dialogs() {
+        fn a_lowercase_discovered_env_shows_uppercase_in_every_scripts_dialog() {
             // The Prod account declares no `environments`, so its single
             // environment is discovered from the MMODAL_ENV tag — which is
             // lowercase on those instances.
@@ -17301,7 +17304,7 @@ mod gui {
                 &[],
             );
             assert_eq!(rows.len(), 1);
-            assert_eq!(vault_env_label(&rows[0]), "PROD", "dropdown reads uppercase");
+            assert_eq!(script_env_label(&rows[0]), "PROD", "dropdown reads uppercase");
             assert_eq!(
                 rows[0].env, "prod",
                 "the tag value itself is untouched — only the label is uppercased"
@@ -17312,7 +17315,7 @@ mod gui {
         fn an_account_row_keeps_its_own_casing() {
             // No environment dimension: this row names an account, not an
             // environment, so "Prod" must not become "PROD".
-            assert_eq!(vault_env_label(&env_row("", "Prod")), "Prod");
+            assert_eq!(script_env_label(&env_row("", "Prod")), "Prod");
         }
 
         fn bastions() -> Vec<(String, String)> {
