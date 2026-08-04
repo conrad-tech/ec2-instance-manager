@@ -42,6 +42,12 @@ passes cleanly:
 - Release targets — zero warnings on both Linux (x86_64-unknown-linux-gnu, via
   `build_binaries.sh`) and Windows (x86_64-pc-windows-gnu, built directly since
   the script aborts without `zip` — see below)
+- **Disk space on `D:`.** A full `D:` surfaces as an opaque Cargo failure, not a
+  "no space" message: `error: failed to build archive at .../libec2_manager-*.rlib:
+  Input/output error (os error 5)`. Check with `df -h /mnt/d` — `WSL/target/`
+  alone is ~10 GB. Either `cargo clean`, or build to the Linux filesystem with
+  `CARGO_TARGET_DIR=/tmp/ec2m-test cargo test --features gui` (same trick the
+  Windows cross-compile already uses for the spaces-in-path problem).
 - Packaging the release zips needs `zip`/`unzip` on PATH (`sudo apt install zip`).
   **Without them `build_binaries.sh` aborts, it does not skip the step:**
   `package_linux_zip` calls `require_cmd zip`, which `exit 1`s — so the Linux
