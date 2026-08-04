@@ -750,21 +750,17 @@ applies the same encryption your Outlook **Options > Encrypt** button applies,
 which means it needs your tenant's RMS/IRM template GUID.
 
 1. In Outlook, open **New Email** and click **Options > Encrypt** (or your
-   `Alt+6` shortcut). **Leave that compose window open — do not send it.**
-2. In PowerShell, run:
-
-   ```powershell
-   $i = (New-Object -ComObject Outlook.Application).ActiveInspector().CurrentItem
-   "Permission             : {0}" -f $i.Permission
-   "PermissionTemplateGuid : '{0}'" -f $i.PermissionTemplateGuid
-   ```
-
-   Or, from a source checkout, the same thing with friendlier error handling:
+   `Alt+6` shortcut). **Leave that draft open — do not send it.**
+2. From a source checkout, in PowerShell:
 
    ```powershell
    powershell -NoProfile -ExecutionPolicy Bypass -File assets\scripts\outlook_verification.ps1
    ```
 
+   It finds the draft whether you composed in a pop-out window or inline in the
+   reading pane, prints what the Encrypt button set, and ends with a
+   **WHAT THIS MEANS** block naming the exact `features.json` values for your
+   case.
 3. Copy the GUID **with its braces** into `access_email.encrypt_template_guid`
    in `assets/features.json`, set `encrypt_permission` to the `Permission`
    number it printed, and **rebuild** — features.json is compiled in.
@@ -773,13 +769,38 @@ Reading the output:
 
 | What you see | Meaning | What to set |
 |---|---|---|
-| A `Permission` number **and** a GUID | Tenant RMS/IRM template (most common) | `encrypt_permission` = that number, `encrypt_permission_service` = `1`, `encrypt_template_guid` = the GUID |
+| A `Permission` number **and** a GUID | Tenant RMS/IRM template | `encrypt_permission` = that number, `encrypt_permission_service` = `1`, `encrypt_template_guid` = the GUID |
 | `Permission = 2`, no GUID | Do Not Forward | `encrypt_permission: 2` |
 | `Permission = 0`, no GUID, S/MIME flag `1` | S/MIME | `encrypt_smime_flag: 1` |
-| `Permission = 0`, no GUID, S/MIME `0` | Sensitivity-label only | Headless encryption may not work — set `encrypt_template_guid: ""` and `encrypt_permission: 0` to always take the visible `Alt+6` path |
+| No GUID, but **Sensitivity label: set** | Purview label / OME "Encrypt-Only" | No GUID exists — use the visible path: `encrypt_template_guid: ""`, `encrypt_permission: 0` |
 
 The GUID belongs to your **Microsoft 365 tenant**, not your machine — it is the
 same for everyone in your org and only changes if IT rebuilds the template.
+
+#### If the GUID comes back blank
+
+Blank is a real answer, not always a failure. Work down this list:
+
+- **Everything blank, including `Permission`** — the script found no draft, or
+  you ran the older one-liner that only sees a *pop-out* compose window. Composing
+  inline in the reading pane leaves `ActiveInspector()` empty. The current script
+  handles all three locations (pop-out, inline, newest item in Drafts); rerun it.
+- **`Sensitivity label: set`, no GUID** — your Encrypt button applies a Purview
+  sensitivity label or OME "Encrypt-Only". **These do not expose a template GUID
+  at all**, so there is nothing to find and headless encryption cannot be set
+  through the object model. This is the expected modern-tenant result. Set
+  `encrypt_template_guid: ""` and `encrypt_permission: 0`; every access email
+  then opens in Outlook with your `encrypt_sendkeys` shortcut applied, ready for
+  a one-click Send.
+- **Everything blank and no label either** — the Encrypt may not have applied,
+  or your tenant only stamps it on save. Click into the body, type a character,
+  press `Ctrl+S`, and rerun.
+- **`Could not attach to Outlook`** — the **new Outlook for Windows has no COM
+  object model**. Toggle "New Outlook" off (top-right of the Outlook window) to
+  get classic Outlook, then rerun.
+
+Blank in the label case costs you nothing but the extra click: the email is still
+composed, attached and encrypted, it just isn't sent unattended.
 
 To verify the value end-to-end before you rebuild (it re-reads the GUID from the
 open draft, echoes it untruncated, then encrypts and sends a test to yourself

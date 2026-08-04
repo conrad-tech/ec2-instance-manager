@@ -53,10 +53,26 @@ All commands run in **PowerShell** (no admin needed). The helper scripts live in
 
 | What you see | Meaning | Config to use |
 |---|---|---|
-| `Permission` + a GUID | Tenant RMS/IRM template (most common) | `encrypt_permission` = that number, `encrypt_permission_service` = 1, `encrypt_template_guid` = the GUID |
+| `Permission` + a GUID | Tenant RMS/IRM template | `encrypt_permission` = that number, `encrypt_permission_service` = 1, `encrypt_template_guid` = the GUID |
 | `Permission = 2`, no GUID | Do Not Forward | `encrypt_permission: 2` |
 | `Permission = 0`, no GUID, `S/MIME = 1` | S/MIME | `encrypt_smime_flag: 1` |
-| `Permission = 0`, no GUID, `S/MIME = 0` | Sensitivity-label only | headless may not work - see Step 4 |
+| No GUID, `Sensitivity label: set` | Purview label / OME "Encrypt-Only" | No GUID exists - see Step 4 |
+
+The script ends with a **WHAT THIS MEANS** block that names your case and the
+exact values to use, so you do not have to read the table.
+
+**If it prints a blank GUID:**
+
+- **Everything blank, `Permission` included** - no draft was found. The script
+  checks the pop-out compose window, the inline reading-pane compose, and the
+  newest item in Drafts, so make sure a draft actually exists and rerun.
+- **`Sensitivity label: set` with no GUID** - normal for modern tenants. Purview
+  sensitivity labels and OME "Encrypt-Only" **never expose a template GUID**;
+  there is nothing to discover. Go to Step 4 and use the visible path.
+- **Blank with no label at all** - the Encrypt may not have stuck. Type a
+  character in the body, press `Ctrl+S`, rerun.
+- **`Could not attach to Outlook`** - the *new* Outlook for Windows has no COM
+  object model. Toggle "New Outlook" off to get classic Outlook, then rerun.
 
 > The `PermissionTemplateGuid` is tied to your **Microsoft 365 tenant**, not your
 > machine - it's the same for everyone in your org, and only changes if IT
