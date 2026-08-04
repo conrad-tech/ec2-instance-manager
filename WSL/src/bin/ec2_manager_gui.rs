@@ -692,6 +692,8 @@ mod gui {
         email_cmd: Option<EmailCommand>,
         /// Set once the user has copied a command, to show the confirmation.
         email_copied: bool,
+        /// Progress/result of the automatic send, when `auto_run` is on.
+        email_status: Option<EmailStatus>,
     }
 
     /// Visual state of the Scripts status line in the Connections toolbar.
@@ -1880,6 +1882,76 @@ mod gui {
         }
     }
 
+    /// Outcome of the automatic access-email run, shown as a status line in
+    /// the create-result popup. Without this the auto-run is invisible: a
+    /// create finishes, nothing appears to happen, and the feature reads as
+    /// broken even when it sent successfully.
+    ///
+    /// Only the Windows build constructs the non-`Sending` variants (the
+    /// worker that parses the script's output is Windows-gated), so the
+    /// allow keeps the Linux dev build warning-free without loosening
+    /// dead-code checking on the target that ships them.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[derive(Clone, Debug)]
+    enum EmailStatus {
+        /// PowerShell has been spawned and has not exited yet.
+        Sending,
+        /// Sent unattended. Carries the address it actually went to.
+        Sent { address: String },
+        /// Outlook was opened for the user, with the reason why.
+        Opened { reason: String },
+        /// The script could not be started, died, or produced no marker.
+        Failed { error: String },
+    }
+
+    /// Read one line of `send_access_email.ps1` output and turn a marker into a
+    /// status. Returns `None` for any other line, so the reader keeps the last
+    /// real marker it saw. The marker format is fixed by the script:
+    ///
+    /// ```text
+    /// SENT recipient='John Smith' address='jsmith@xyz.com'
+    /// OPEN recipient='John Smith' resolved=False domain_ok=False encrypted=True
+    /// ```
+    ///
+    /// PowerShell renders booleans as `True`/`False`.
+    ///
+    /// Called from the Windows-gated worker (and from the tests), hence the
+    /// conditional allow on non-Windows builds.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn parse_email_marker(line: &str) -> Option<EmailStatus> {
+        let line = line.trim();
+
+        if let Some(rest) = line.strip_prefix("SENT ") {
+            let address = single_quoted_value(rest, "address=").unwrap_or_default();
+            return Some(EmailStatus::Sent { address });
+        }
+
+        let rest = line.strip_prefix("OPEN ")?;
+        let flag = |name: &str| rest.contains(&format!("{name}=True"));
+        // Ordered by specificity: an unresolved recipient makes the domain
+        // result meaningless, and a wrong domain is a more useful thing to say
+        // than "encryption unconfirmed" when both are false.
+        let reason = if !flag("resolved") {
+            "Outlook opened - pick the recipient".to_string()
+        } else if !flag("domain_ok") {
+            "Outlook opened - that address is not in your mail domain".to_string()
+        } else if !flag("encrypted") {
+            "Outlook opened - encryption could not be confirmed".to_string()
+        } else {
+            "Outlook opened - send it manually".to_string()
+        };
+        Some(EmailStatus::Opened { reason })
+    }
+
+    /// Pull `key='value'` out of a marker line.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn single_quoted_value(haystack: &str, key: &str) -> Option<String> {
+        let after = haystack.split_once(key)?.1;
+        let inner = after.strip_prefix('\'')?;
+        let end = inner.find('\'')?;
+        Some(inner[..end].to_string())
+    }
+
     /// Absolute path to the `send_access_email.ps1` that ships **next to the
     /// executable**. It is deliberately not embedded in the binary and never
     /// written to `%TEMP%` — dropping a script into temp and running it is a
@@ -1916,6 +1988,121 @@ mod gui {
             ("-SmimeFlag", cfg.encrypt_smime_flag.to_string()),
             ("-EncryptSendKeys", cfg.encrypt_sendkeys.clone()),
         ]
+    }
+
+    /// Spawn `send_access_email.ps1` for the automatic path (Windows only).
+    ///
+    /// Two EDR constraints are load-bearing here and must not be "tidied":
+    ///
+    /// * The script is run **from the file next to the exe**. It is never
+    ///   written to `%TEMP%` and run from there — dropping a script into temp
+    ///   and executing it is a pattern EDRs quarantine on sight. A missing file
+    ///   is an error, not a reason to fall back to temp.
+    /// * **No `-WindowStyle Hidden`.** Hidden PowerShell is itself a detection
+    ///   heuristic. A brief console window is the accepted cost.
+    ///
+    /// `-Quiet` is appended so the script suppresses its own message boxes; the
+    /// GUI shows the outcome instead, from the marker on stdout.
+    #[cfg(target_os = "windows")]
+    fn launch_access_email(
+        cfg: &ec2_manager::features::AccessEmailConfig,
+        username: &str,
+        env: &str,
+        primary_id: &str,
+        secondary_id: &str,
+        pem_path: &str,
+    ) -> std::result::Result<std::process::Child, String> {
+        // `std::result::Result` is spelled out because the crate's own
+        // `Result<T>` alias (src/error.rs) is in scope and takes one parameter.
+        let path = access_email_script_path();
+        if !path.exists() {
+            return Err(format!(
+                "send_access_email.ps1 was not found next to the executable ({})",
+                path.display()
+            ));
+        }
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&path);
+        for (flag, value) in
+            access_email_args(cfg, username, env, primary_id, secondary_id, pem_path)
+        {
+            cmd.arg(flag).arg(value);
+        }
+        cmd.arg("-Quiet")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        cmd.spawn()
+            .map_err(|e| format!("could not start PowerShell: {e}"))
+    }
+
+    /// Kick off the automatic access email and report the outcome over `tx`.
+    ///
+    /// Best-effort by design: any failure becomes an `EmailStatus::Failed` on
+    /// the status line and leaves the "Send Email Command" menu as the manual
+    /// fallback. It never blocks the UI thread and never aborts the create.
+    ///
+    /// Returns whether a result will arrive on `tx`. False on non-Windows, so
+    /// the caller does not leave the popup showing "Sending..." forever.
+    fn start_access_email(
+        cfg: &ec2_manager::features::AccessEmailConfig,
+        username: &str,
+        env: &str,
+        primary_id: &str,
+        secondary_id: &str,
+        pem_path: &str,
+        tx: Sender<EmailStatus>,
+    ) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            match launch_access_email(cfg, username, env, primary_id, secondary_id, pem_path) {
+                Ok(mut child) => {
+                    std::thread::spawn(move || {
+                        use std::io::BufRead;
+                        // Keep the LAST marker seen: the script prints other
+                        // lines, and only the final verdict matters.
+                        let mut last: Option<EmailStatus> = None;
+                        if let Some(out) = child.stdout.take() {
+                            for line in std::io::BufReader::new(out)
+                                .lines()
+                                .map_while(std::result::Result::ok)
+                            {
+                                if let Some(status) = parse_email_marker(&line) {
+                                    last = Some(status);
+                                }
+                            }
+                        }
+                        let waited = child.wait();
+                        let final_status = match (last, waited) {
+                            (Some(status), _) => status,
+                            (None, Ok(code)) => EmailStatus::Failed {
+                                error: format!(
+                                    "the email script exited ({code}) without reporting a result"
+                                ),
+                            },
+                            (None, Err(e)) => EmailStatus::Failed {
+                                error: format!("could not wait for the email script: {e}"),
+                            },
+                        };
+                        let _ = tx.send(final_status);
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(EmailStatus::Failed { error: e });
+                }
+            }
+            true
+        }
+        // Outlook is Windows-only. On Linux (dev/sim) say so in the log and
+        // leave the popup without a status line rather than showing a failure.
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (cfg, env, primary_id, secondary_id, pem_path, tx);
+            eprintln!(
+                "start_access_email: skipped for {username} (the Outlook automation is Windows only)"
+            );
+            false
+        }
     }
 
     /// Build the ready-to-run "send access email" command for each terminal
@@ -3209,6 +3396,9 @@ mod gui {
         alerts_rx: Receiver<AlertsFetch>,
         /// Outlook access-email automation config (from features.json).
         access_email: ec2_manager::features::AccessEmailConfig,
+        /// Access-email worker → UI: the outcome of the automatic send.
+        email_tx: Sender<EmailStatus>,
+        email_rx: Receiver<EmailStatus>,
         /// In-flight create-user run (post-create SSH verification + PEM
         /// pull), if any.
         create_user_run: Option<CreateUserRun>,
@@ -3290,6 +3480,7 @@ mod gui {
             let (verify_tx, verify_rx) = mpsc::channel();
             let (preflight_tx, preflight_rx) = mpsc::channel();
             let (alerts_tx, alerts_rx) = mpsc::channel();
+            let (email_tx, email_rx) = mpsc::channel();
             let features = ec2_manager::features::load();
             #[cfg(target_os = "windows")]
             let (ui_tx, ui_rx) = mpsc::channel();
@@ -3490,6 +3681,8 @@ mod gui {
                 alerts_tx,
                 alerts_rx,
                 access_email: features.access_email.clone(),
+                email_tx,
+                email_rx,
                 create_user_run: None,
                 pending_delete: None,
                 script_status: None,
@@ -7323,6 +7516,7 @@ mod gui {
                 details,
                 email_cmd: None,
                 email_copied: false,
+                email_status: None,
             });
         }
 
@@ -7351,6 +7545,32 @@ mod gui {
                         ui.add_space(8.0);
                         ui.label("PEM saved to:");
                         ui.monospace(path);
+                        // Access-email progress/outcome. Without this the
+                        // automatic send is invisible and reads as a no-op.
+                        if let Some(status) = &popup.email_status {
+                            ui.add_space(8.0);
+                            let (text, tint) = match status {
+                                EmailStatus::Sending => (
+                                    "Sending access email...".to_string(),
+                                    egui::Color32::from_rgb(220, 200, 90),
+                                ),
+                                EmailStatus::Sent { address } => (
+                                    format!("Access email sent to {address}"),
+                                    egui::Color32::from_rgb(90, 200, 90),
+                                ),
+                                EmailStatus::Opened { reason } => (
+                                    reason.clone(),
+                                    egui::Color32::from_rgb(220, 200, 90),
+                                ),
+                                EmailStatus::Failed { error } => (
+                                    format!(
+                                        "Access email failed: {error}. Use Send Email Command below."
+                                    ),
+                                    egui::Color32::from_rgb(220, 60, 60),
+                                ),
+                            };
+                            ui.colored_label(tint, text);
+                        }
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if ui.button("📂 Open Downloads folder").clicked() {
@@ -7606,6 +7826,25 @@ mod gui {
                 }
             }
 
+            // Access-email results from the auto-run worker. The popup may
+            // already be closed (the user does not have to wait for it), in
+            // which case the outcome only reaches the log.
+            while let Ok(status) = self.email_rx.try_recv() {
+                match &status {
+                    EmailStatus::Sent { address } => {
+                        self.log_info(format!("access email sent to {address}"))
+                    }
+                    EmailStatus::Opened { reason } => self.log_info(format!("access email: {reason}")),
+                    EmailStatus::Failed { error } => {
+                        self.log_error(format!("access email failed: {error}"))
+                    }
+                    EmailStatus::Sending => {}
+                }
+                if let Some(popup) = &mut self.script_result_popup {
+                    popup.email_status = Some(status);
+                }
+            }
+
             // Verification results.
             while let Ok(outcome) = self.verify_rx.try_recv() {
                 let finished = self.create_user_run.take();
@@ -7653,13 +7892,11 @@ mod gui {
                                 }
                             }
                             self.log_info(format!("{msg}{pem_note}"));
-                            // Build (but do NOT run) the per-terminal send-email
-                            // command. Only when the PEM was saved — the email
-                            // body promises it as an attachment. The user copies
-                            // it from the "Send Email Command" menu and runs it
-                            // in their own shell (keeps the Outlook automation
-                            // out of the unsigned GUI process, so EDR leaves it
-                            // alone).
+                            // Build the per-terminal send-email command for the
+                            // manual "Send Email Command" menu, and — when
+                            // auto_run is on — run the script ourselves. Only
+                            // when the PEM was saved: the email body promises it
+                            // as an attachment.
                             let email_cmd = match (&pem_path, &finished) {
                                 (Some(pem), Some(run)) => build_email_command(
                                     &self.access_email,
@@ -7671,6 +7908,20 @@ mod gui {
                                 ),
                                 _ => None,
                             };
+                            let mut auto_email = false;
+                            if self.access_email.enabled && self.access_email.auto_run {
+                                if let (Some(pem), Some(run)) = (&pem_path, &finished) {
+                                    auto_email = start_access_email(
+                                        &self.access_email,
+                                        &username,
+                                        &run.mmodal_env,
+                                        &run.primary_id,
+                                        &run.secondary_id,
+                                        pem,
+                                        self.email_tx.clone(),
+                                    );
+                                }
+                            }
                             self.show_script_result(
                                 "User Created",
                                 msg,
@@ -7680,6 +7931,9 @@ mod gui {
                             );
                             if let Some(popup) = &mut self.script_result_popup {
                                 popup.email_cmd = email_cmd;
+                                if auto_email {
+                                    popup.email_status = Some(EmailStatus::Sending);
+                                }
                             }
                         } else {
                             let dir = |ok: bool| if ok { "OK" } else { "FAILED" };
@@ -16878,6 +17132,69 @@ mod gui {
                 encrypt_smime_flag: 0,
                 encrypt_sendkeys: "%6".to_string(),
             }
+        }
+
+        #[test]
+        fn a_sent_marker_reports_the_address() {
+            let s = parse_email_marker("SENT recipient='John Smith' address='jsmith@xyz.com'")
+                .expect("SENT parses");
+            match s {
+                EmailStatus::Sent { address } => assert_eq!(address, "jsmith@xyz.com"),
+                other => panic!("expected Sent, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn an_unresolved_marker_asks_the_user_to_pick() {
+            let s = parse_email_marker(
+                "OPEN recipient='John Smith' resolved=False domain_ok=False encrypted=True",
+            )
+            .expect("OPEN parses");
+            match s {
+                EmailStatus::Opened { reason } => {
+                    assert!(reason.contains("pick the recipient"), "{reason}")
+                }
+                other => panic!("expected Opened, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_wrong_domain_marker_takes_priority_over_encryption() {
+            // resolved=True means the recipient was found; domain_ok=False is
+            // the specific reason and must not be masked by encryption.
+            let s = parse_email_marker(
+                "OPEN recipient='John Smith' resolved=True domain_ok=False encrypted=True",
+            )
+            .expect("OPEN parses");
+            match s {
+                EmailStatus::Opened { reason } => {
+                    assert!(reason.contains("not in your mail domain"), "{reason}")
+                }
+                other => panic!("expected Opened, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn an_unencrypted_marker_says_encryption_was_not_confirmed() {
+            let s = parse_email_marker(
+                "OPEN recipient='John Smith' resolved=True domain_ok=True encrypted=False",
+            )
+            .expect("OPEN parses");
+            match s {
+                EmailStatus::Opened { reason } => {
+                    assert!(reason.contains("encryption"), "{reason}")
+                }
+                other => panic!("expected Opened, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_line_that_is_not_a_marker_is_ignored() {
+            // The script writes other output; only the markers count. Returning
+            // None lets the reader keep the last real marker it saw.
+            assert!(parse_email_marker("Recipient resolved: True").is_none());
+            assert!(parse_email_marker("").is_none());
+            assert!(parse_email_marker("SENTINEL something").is_none());
         }
 
         #[test]
