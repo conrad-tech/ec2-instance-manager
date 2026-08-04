@@ -144,6 +144,20 @@ if ($resolved) {
     }
 }
 
+# The shipped placeholder GUID is all zeros. Treat it as NOT configured:
+# otherwise Permission reads back non-zero and the placeholder reads back
+# non-empty, encConfirmed goes true, and a private key is sent believing it
+# is encrypted. Strips braces, dashes and zeros - nothing left means zeros.
+$encConfigured = $true
+if ($TemplateGuid -and (($TemplateGuid -replace '[{}\-0]', '') -eq '')) {
+    Write-Output "WARN encrypt_template_guid is the unconfigured all-zeros placeholder"
+    $TemplateGuid  = ""
+    $encConfigured = $false
+}
+# Note: a deliberate Permission-only setup (e.g. encrypt_permission = 2, Do Not
+# Forward, with no template GUID) keeps $encConfigured true and still confirms.
+# Only a cleared placeholder disqualifies the bare-Permission path below.
+
 # --- Apply encryption headless -------------------------------------------
 # Applied whether or not the recipient resolved, so a draft that opens is
 # already encrypted rather than depending on the Alt+6 keystroke landing.
@@ -169,7 +183,10 @@ if ($TemplateGuid) {
 } elseif ($Permission -ne 0) {
     try {
         $mail.Permission = $Permission
-        if ([int]$mail.Permission -ne 0) { $encConfirmed = $true }
+        # Only counts when the admin chose a Permission-only scheme (e.g. 2 =
+        # Do Not Forward) rather than falling here because the template GUID
+        # was never configured.
+        if ([int]$mail.Permission -ne 0 -and $encConfigured) { $encConfirmed = $true }
     } catch {}
 }
 
@@ -199,6 +216,10 @@ $reason =
     } elseif (-not $domainOk) {
         "'$displayName' resolved to $smtp, which is not in $Domain.`n`n" +
         "The email is ready below with the To field empty. Enter the correct recipient, confirm it still shows encrypted, then click Send."
+    } elseif (-not $encConfigured) {
+        "Encryption is not configured: encrypt_template_guid is still the all-zeros placeholder.`n`n" +
+        "Nothing was sent. Discover your tenant's template GUID with outlook_verification.ps1, put it in features.json and rebuild.`n`n" +
+        "Applying your Encrypt shortcut now - verify the email shows as encrypted before sending it by hand."
     } elseif (-not $encConfirmed) {
         "The email is ready but encryption could not be confirmed automatically.`n`n" +
         "Applying your Encrypt shortcut now - verify the email shows as encrypted, then enter the recipient and click Send.`n`n" +
@@ -220,4 +241,4 @@ if (-not $encConfirmed -and $EncryptSendKeys) {
 }
 
 Show-Box $reason "Warning"
-Write-Output "OPEN recipient='$displayName' resolved=$resolved domain_ok=$domainOk encrypted=$encConfirmed"
+Write-Output "OPEN recipient='$displayName' resolved=$resolved domain_ok=$domainOk encrypted=$encConfirmed enc_config=$encConfigured"

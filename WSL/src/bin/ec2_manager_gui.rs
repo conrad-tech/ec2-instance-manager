@@ -1931,10 +1931,17 @@ mod gui {
         // Ordered by specificity: an unresolved recipient makes the domain
         // result meaningless, and a wrong domain is a more useful thing to say
         // than "encryption unconfirmed" when both are false.
+        // `enc_config=False` is the misconfiguration case (the shipped all-zeros
+        // template GUID). Absent on output from an older script beside the exe,
+        // so absence must read as "configured" rather than as a problem.
+        let enc_unconfigured = rest.contains("enc_config=False");
         let reason = if !flag("resolved") {
             "Outlook opened - pick the recipient".to_string()
         } else if !flag("domain_ok") {
             "Outlook opened - that address is not in your mail domain".to_string()
+        } else if enc_unconfigured {
+            "Not sent - encryption is not configured (encrypt_template_guid is still the placeholder)"
+                .to_string()
         } else if !flag("encrypted") {
             "Outlook opened - encryption could not be confirmed".to_string()
         } else {
@@ -17172,6 +17179,39 @@ mod gui {
             match s {
                 EmailStatus::Opened { reason } => {
                     assert!(reason.contains("not in your mail domain"), "{reason}")
+                }
+                other => panic!("expected Opened, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn an_unconfigured_encryption_marker_names_the_placeholder() {
+            // The shipped all-zeros template GUID configures nothing. Saying
+            // "could not be confirmed" would send the admin hunting a
+            // transient Outlook problem instead of features.json.
+            let s = parse_email_marker(
+                "OPEN recipient='John Smith' resolved=True domain_ok=True encrypted=False enc_config=False",
+            )
+            .expect("OPEN parses");
+            match s {
+                EmailStatus::Opened { reason } => {
+                    assert!(reason.contains("not configured"), "{reason}")
+                }
+                other => panic!("expected Opened, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn an_older_marker_without_enc_config_still_parses() {
+            // enc_config was added later; a stale script beside the exe must
+            // not make every run read as an encryption misconfiguration.
+            let s = parse_email_marker(
+                "OPEN recipient='John Smith' resolved=True domain_ok=True encrypted=False",
+            )
+            .expect("OPEN parses");
+            match s {
+                EmailStatus::Opened { reason } => {
+                    assert!(reason.contains("could not be confirmed"), "{reason}")
                 }
                 other => panic!("expected Opened, got {other:?}"),
             }
