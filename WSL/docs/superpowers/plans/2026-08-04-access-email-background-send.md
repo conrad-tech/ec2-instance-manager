@@ -2,16 +2,19 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make the post-create access email send unattended only when the recipient resolves to one person in the organization's own mail domain, and correct the subject, body, and failure behavior.
+**Goal:** Run the access email automatically after a create, send it unattended only when the recipient resolves to one person in the organization's own mail domain, report the outcome in the GUI, and correct the subject, body, and failure behavior.
 
-**Architecture:** Three layers, in order. `AccessEmailConfig` (Rust lib) gains `email_domain`; `build_email_command` (Rust GUI) passes it through as `-Domain`; `send_access_email.ps1` (PowerShell) does the actual domain check, clears the To field on every failure, encrypts before deciding, and emits the new subject and body. The Rust layers are unit-tested; the PowerShell is verified by hand on Windows because it drives live Outlook COM.
+**Architecture:** Four layers, in order. `AccessEmailConfig` (Rust lib) gains `email_domain` and `auto_run`; `build_email_command` (Rust GUI) passes the domain through as `-Domain`; `send_access_email.ps1` (PowerShell) does the domain check, clears the To field on every failure, encrypts before deciding, emits the new subject and body, and gains a `-Quiet` switch; the GUI spawns that script itself on Windows and renders the outcome as a status line in the result popup. The Rust layers are unit-tested; the PowerShell is verified by hand on Windows because it drives live Outlook COM.
+
+**Revision note:** Tasks 4 and 5 (auto-run and status reporting) were added after live testing showed the copy-a-command-only flow read as a broken feature. The ✉ Send Email Command menu is retained as a manual fallback.
 
 **Tech Stack:** Rust (serde `Deserialize` with `#[serde(default)]`), Windows PowerShell 5.1 + Outlook COM object model, `cargo test --features gui`.
 
 ## Global Constraints
 
 - **Design spec:** `docs/superpowers/plans/../specs/2026-08-04-access-email-background-send-design.md`. Read it before starting.
-- **The app must never run the automation itself.** The GUI builds a command string; the user copies it and runs it. Do not add `Command::spawn`, auto-run, or any direct Outlook call from Rust. This boundary is what keeps EDR off the unsigned GUI binary.
+- **EDR hygiene when spawning (Task 4).** Run the `send_access_email.ps1` that sits **next to the exe**; never write a script to `%TEMP%` and run that. Never pass `-WindowStyle Hidden`. Both are patterns EDRs quarantine on sight. If the file is missing, log and skip — do not fall back to temp.
+- **The GUI still must not talk to Outlook directly.** No COM, no MAPI, no mail library in Rust. The only Outlook contact is the spawned PowerShell.
 - **`.ps1` files must be pure ASCII.** Windows PowerShell reads scripts as ANSI; a curly quote or em dash breaks parsing with "string is missing the terminator". No `—`, `’`, `“`, `”` anywhere in a `.ps1`.
 - **`Alt+6` is a toggle.** `$EncryptSendKeys` must only ever be sent when headless encryption was **not** confirmed. Sending it on an already-encrypted item strips the encryption.
 - **Never send without confirmed encryption.** The PEM is a private key. The send path requires resolved AND domain-matched AND encryption-confirmed — all three.
@@ -25,7 +28,7 @@
 
 ---
 
-### Task 1: Add `email_domain` to the features config
+### Task 1: Add `email_domain` and `auto_run` to the features config
 
 **Files:**
 - Modify: `src/features.rs:213-243` (`AccessEmailConfig` struct and its `Default` impl)
@@ -54,6 +57,14 @@ Append to the `mod tests` block at the end of `src/features.rs`:
         assert_eq!(cfg.email_domain, "xyz.com");
         // Unlisted fields still fall back to the Default impl.
         assert!(cfg.enabled);
+    }
+
+    #[test]
+    fn access_email_auto_run_defaults_on_and_can_be_disabled() {
+        assert!(AccessEmailConfig::default().auto_run);
+        let cfg: AccessEmailConfig =
+            serde_json::from_str(r#"{"auto_run":false}"#).expect("parses");
+        assert!(!cfg.auto_run);
     }
 ```
 
@@ -457,7 +468,43 @@ git commit -m "Send the access email unattended only to a single in-domain recip
 
 ---
 
-### Task 4: Update the documentation
+### Task 4: Run the script automatically after a create (Windows)
+
+**Files:**
+- Modify: `src/bin/ec2_manager_gui.rs` — add `access_email_args()` next to `build_email_command`, add `launch_access_email()`, call it where `popup.email_cmd` is assigned
+- Test: `src/bin/ec2_manager_gui.rs` — `gui::tests`
+
+**Interfaces:**
+- Consumes: `AccessEmailConfig.auto_run` and `.email_domain` (Task 1), `-Quiet` (Task 3).
+- Produces: `access_email_args(cfg, username, env, primary, secondary, pem) -> Vec<(&'static str, String)>` — the shared ordered flag/value list, consumed by both `build_email_command` and `launch_access_email`. `launch_access_email` returns `Result<std::process::Child, String>` on Windows.
+
+- [ ] **Step 1:** Extract the `args` vector from `build_email_command` into `access_email_args`, returning `Vec<(&'static str, String)>`. `build_email_command` calls it. Test that both still contain every flag (existing tests cover this).
+- [ ] **Step 2:** Add `launch_access_email`, gated `#[cfg(target_os = "windows")]`, resolving `send_access_email.ps1` beside `current_exe()`, erroring if absent (no `%TEMP%` fallback), spawning `powershell.exe -NoProfile -ExecutionPolicy Bypass -File <path> <args> -Quiet` with `.stdout(Stdio::piped())` and no `-WindowStyle Hidden`. Non-Windows arm logs and returns `Err`.
+- [ ] **Step 3:** Call it where `popup.email_cmd` is set, only when `cfg.enabled && cfg.auto_run`.
+- [ ] **Step 4:** `cargo test --features gui`, `cargo build --features gui` (0 warnings), commit.
+
+---
+
+### Task 5: Report the outcome in the result popup
+
+**Files:**
+- Modify: `src/bin/ec2_manager_gui.rs` — `EmailStatus` enum, `ScriptResultPopup.email_status`, an `email_tx`/`email_rx` channel pair on the app, the popup rendering, and a `parse_email_marker` helper
+- Test: `src/bin/ec2_manager_gui.rs` — `gui::tests`
+
+**Interfaces:**
+- Consumes: `launch_access_email` (Task 4) and the script's stdout markers (Task 3).
+- Produces: `parse_email_marker(line: &str) -> Option<EmailStatus>`.
+
+- [ ] **Step 1: Write the failing tests** for `parse_email_marker`, one per row of the spec's Part 6 table plus a malformed line returning `None`.
+- [ ] **Step 2:** Run them; expect FAIL (function not defined).
+- [ ] **Step 3:** Add `enum EmailStatus { Sending, Sent { address: String }, Opened { reason: String }, Failed { error: String } }` and `parse_email_marker`, reading `SENT ... address='...'` and `OPEN ... resolved=/domain_ok=/encrypted=` (PowerShell prints `True`/`False`).
+- [ ] **Step 4:** Run them; expect PASS.
+- [ ] **Step 5:** Wire it up — worker thread reads the child's stdout to EOF, waits, sends the parsed status (or `Failed`) over `email_tx`; the update loop drains `email_rx` into `popup.email_status`; the popup renders it coloured (green sent, yellow opened/sending, red failed) above the button row.
+- [ ] **Step 6:** `cargo test --features gui`, `cargo build --features gui` (0 warnings), commit.
+
+---
+
+### Task 6: Update the documentation
 
 **Files:**
 - Modify: `README.md` — the `access_email` JSON sample and the feature-flag table in the "Feature flags (features.json)" section, and the "Access email (post-create)" section
@@ -568,7 +615,7 @@ git commit -m "Document the mail-domain check and the new send/open outcomes"
 
 ---
 
-### Task 5: Full verification pass
+### Task 7: Full verification pass
 
 **Files:**
 - Modify: `CLAUDE.md` — the "Build status" bullet list only

@@ -1880,16 +1880,53 @@ mod gui {
         }
     }
 
+    /// Absolute path to the `send_access_email.ps1` that ships **next to the
+    /// executable**. It is deliberately not embedded in the binary and never
+    /// written to `%TEMP%` — dropping a script into temp and running it is a
+    /// pattern EDRs quarantine on sight.
+    fn access_email_script_path() -> std::path::PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|d| d.join("send_access_email.ps1")))
+            .unwrap_or_else(|| std::path::PathBuf::from("send_access_email.ps1"))
+    }
+
+    /// The ordered (flag, value) pairs handed to `send_access_email.ps1`.
+    /// Shared by `build_email_command` (which quotes them into a shell string
+    /// for the user to copy) and `launch_access_email` (which passes them to
+    /// `Command::args` directly), so the two can never drift apart.
+    fn access_email_args(
+        cfg: &ec2_manager::features::AccessEmailConfig,
+        username: &str,
+        env: &str,
+        primary_id: &str,
+        secondary_id: &str,
+        pem_path: &str,
+    ) -> Vec<(&'static str, String)> {
+        vec![
+            ("-Username", username.to_string()),
+            ("-EnvTag", env.to_string()),
+            ("-Primary", primary_id.to_string()),
+            ("-Secondary", secondary_id.to_string()),
+            ("-Pem", pem_path.to_string()),
+            ("-Domain", cfg.email_domain.clone()),
+            ("-TemplateGuid", cfg.encrypt_template_guid.clone()),
+            ("-Permission", cfg.encrypt_permission.to_string()),
+            ("-PermissionService", cfg.encrypt_permission_service.to_string()),
+            ("-SmimeFlag", cfg.encrypt_smime_flag.to_string()),
+            ("-EncryptSendKeys", cfg.encrypt_sendkeys.clone()),
+        ]
+    }
+
     /// Build the ready-to-run "send access email" command for each terminal
-    /// (PowerShell, WSL, Git Bash). The app deliberately does NOT run these —
-    /// the user copies one and runs it in their own shell, so the Outlook
-    /// automation runs under the user (a trusted, human-initiated action)
-    /// rather than being spawned by the unsigned GUI process (which EDRs like
-    /// CrowdStrike quarantine). Returns None if the feature is disabled.
+    /// (PowerShell, WSL, Git Bash), for the **manual** "Send Email Command"
+    /// menu. Returns None if the feature is disabled.
     ///
-    /// Each command invokes the `send_access_email.ps1` that ships next to the
-    /// executable, passing the same args the automation used to. The script
-    /// still encrypts, resolves the recipient, and opens Outlook ready to send.
+    /// This is the fallback path: the app also runs the script itself when
+    /// `auto_run` is set (see `launch_access_email`). The copied command
+    /// deliberately omits `-Quiet`, so a hand-run still shows the script's own
+    /// message boxes — there is no GUI status line watching a command the user
+    /// pasted into a terminal.
     fn build_email_command(
         cfg: &ec2_manager::features::AccessEmailConfig,
         username: &str,
@@ -1901,26 +1938,8 @@ mod gui {
         if !cfg.enabled {
             return None;
         }
-        // Windows path to the helper script shipped beside the exe.
-        let script = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|d| d.join("send_access_email.ps1")))
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "send_access_email.ps1".to_string());
-
-        // Ordered (flag, value) pairs passed to the script.
-        let args: Vec<(&str, String)> = vec![
-            ("-Username", username.to_string()),
-            ("-EnvTag", env.to_string()),
-            ("-Primary", primary_id.to_string()),
-            ("-Secondary", secondary_id.to_string()),
-            ("-Pem", pem_path.to_string()),
-            ("-TemplateGuid", cfg.encrypt_template_guid.clone()),
-            ("-Permission", cfg.encrypt_permission.to_string()),
-            ("-PermissionService", cfg.encrypt_permission_service.to_string()),
-            ("-SmimeFlag", cfg.encrypt_smime_flag.to_string()),
-            ("-EncryptSendKeys", cfg.encrypt_sendkeys.clone()),
-        ];
+        let script = access_email_script_path().to_string_lossy().into_owned();
+        let args = access_email_args(cfg, username, env, primary_id, secondary_id, pem_path);
 
         // bash single-quote (escape embedded single quotes): 'a'\''b'.
         let bash_q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
@@ -16851,6 +16870,8 @@ mod gui {
         fn access_email_cfg(enabled: bool) -> ec2_manager::features::AccessEmailConfig {
             ec2_manager::features::AccessEmailConfig {
                 enabled,
+                auto_run: true,
+                email_domain: "xyz.com".to_string(),
                 encrypt_template_guid: "{abc}".to_string(),
                 encrypt_permission: 3,
                 encrypt_permission_service: 1,
@@ -16882,6 +16903,7 @@ mod gui {
                 "-Primary 'i-1'",
                 "-Secondary 'i-2'",
                 "-Pem '/p.pem'",
+                "-Domain 'xyz.com'",
                 "-TemplateGuid '{abc}'",
                 "-Permission '3'",
                 "-PermissionService '1'",
@@ -16895,6 +16917,29 @@ mod gui {
                     cmd.powershell
                 );
             }
+        }
+
+        #[test]
+        fn build_email_command_still_passes_domain_when_blank() {
+            // A blank domain must still emit the flag, so argument positions
+            // never shift and the script's default stays a plain empty string.
+            let mut cfg = access_email_cfg(true);
+            cfg.email_domain = String::new();
+            let cmd = build_email_command(&cfg, "jdoe", "DEV1", "i-1", "i-2", "/p.pem")
+                .expect("enabled config builds a command");
+            assert!(cmd.wsl.contains("-Domain ''"), "{}", cmd.wsl);
+            assert!(cmd.powershell.contains("-Domain ''"), "{}", cmd.powershell);
+        }
+
+        #[test]
+        fn the_copied_command_never_carries_quiet() {
+            // -Quiet suppresses the script's own message boxes. That is right
+            // for the auto-run path, where the GUI shows the outcome, but wrong
+            // for a command the user runs by hand in a terminal.
+            let cmd = build_email_command(&access_email_cfg(true), "jdoe", "DEV1", "i-1", "i-2", "/p.pem")
+                .expect("enabled config builds a command");
+            assert!(!cmd.wsl.contains("-Quiet"), "{}", cmd.wsl);
+            assert!(!cmd.powershell.contains("-Quiet"), "{}", cmd.powershell);
         }
 
         #[test]

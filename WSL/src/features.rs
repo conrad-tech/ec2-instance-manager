@@ -213,6 +213,18 @@ pub fn current_os_user() -> String {
 pub struct AccessEmailConfig {
     /// Master switch. When false the GUI never launches the email.
     pub enabled: bool,
+    /// Run `send_access_email.ps1` automatically once a create finishes with a
+    /// saved PEM, instead of only offering the "Send Email Command" menu.
+    /// Defaults to true — this is a convenience, not a privilege gate, so it
+    /// does not follow the fail-closed pattern the `allowed_users` lists use.
+    /// Set false to leave the menu as the only route.
+    pub auto_run: bool,
+    /// The organization's own mail domain, e.g. "xyz.com". A resolved
+    /// recipient's address must sit in this domain before anything is sent
+    /// unattended: Outlook's `Resolve()` also matches the local Contacts folder
+    /// and the autocomplete cache, so a stale personal entry for the same name
+    /// would otherwise be mailed a private key. Blank disables the check.
+    pub email_domain: String,
     /// RMS/IRM template GUID to apply for encryption (tenant-specific).
     /// Empty disables the template path.
     pub encrypt_template_guid: String,
@@ -234,6 +246,8 @@ impl Default for AccessEmailConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            auto_run: true,
+            email_domain: String::new(),
             encrypt_template_guid: String::new(),
             encrypt_permission: 0,
             encrypt_permission_service: 0,
@@ -360,6 +374,28 @@ mod tests {
         let parsed: std::result::Result<Features, _> =
             serde_json::from_str(&bundled_features());
         assert!(parsed.is_ok(), "assets/features.json failed to parse");
+    }
+
+    #[test]
+    fn access_email_domain_defaults_to_blank() {
+        assert_eq!(AccessEmailConfig::default().email_domain, "");
+    }
+
+    #[test]
+    fn access_email_domain_is_read_from_json() {
+        let cfg: AccessEmailConfig =
+            serde_json::from_str(r#"{"email_domain":"xyz.com"}"#).expect("parses");
+        assert_eq!(cfg.email_domain, "xyz.com");
+        // Unlisted fields still fall back to the Default impl.
+        assert!(cfg.enabled);
+    }
+
+    #[test]
+    fn access_email_auto_run_defaults_on_and_can_be_disabled() {
+        assert!(AccessEmailConfig::default().auto_run);
+        let cfg: AccessEmailConfig =
+            serde_json::from_str(r#"{"auto_run":false}"#).expect("parses");
+        assert!(!cfg.auto_run);
     }
 
     #[test]

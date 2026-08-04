@@ -22,12 +22,15 @@ Four substantive changes:
    that opens is already encrypted instead of depending on `Alt+6` landing.
 4. **New subject and body,** with the environment uppercased.
 
-Plus one new config value, the mail domain, in `features.json`.
+Plus two new config values in `features.json`: the mail domain and an auto-run
+switch.
 
-Out of scope: the app still does **not** run the automation itself. The GUI
-builds a command, the user copies it from the **✉ Send Email Command** menu and
-runs it in their own terminal. That boundary is what keeps EDR off the unsigned
-GUI process and is not revisited here.
+**Revised 2026-08-04, after live testing.** The first draft kept the
+copy-a-command boundary — the app built a command string and the user pasted it
+into a terminal. Testing showed that is not what was wanted: a create finished,
+no Outlook window appeared, nothing reached Sent Items, and the feature looked
+broken. Parts 5 and 6 below restore automatic execution and report the outcome
+in the GUI. The **✉ Send Email Command** menu stays as a manual fallback.
 
 ## Part 1 — Recipient resolution
 
@@ -134,6 +137,7 @@ Brandon
 ```json
 "access_email": {
   "enabled": true,
+  "auto_run": true,
   "email_domain": "xyz.com",
   "encrypt_template_guid": "{...}",
   "encrypt_permission": 3,
@@ -143,15 +147,96 @@ Brandon
 }
 ```
 
-- `AccessEmailConfig` (`src/features.rs`) gains `pub email_domain: String`,
-  defaulting to `""`.
+- `AccessEmailConfig` (`src/features.rs`) gains `pub email_domain: String`
+  (default `""`) and `pub auto_run: bool` (default `true`).
 - `build_email_command` (`src/bin/ec2_manager_gui.rs`) appends
   `-Domain <email_domain>` to the argument list, quoted per shell like every
   other value.
-- `send_access_email.ps1` gains `[string]$Domain = ""`.
+- `send_access_email.ps1` gains `[string]$Domain = ""` and `[switch]$Quiet`.
 
-Blank is the fail-open case here, deliberately: an admin who has not set a
-domain gets today's behavior rather than a feature that silently stops sending.
+Blank domain is the fail-open case here, deliberately: an admin who has not set
+a domain gets today's behavior rather than a feature that silently stops
+sending.
+
+`auto_run` defaults to **true**, matching `enabled: true` — the feature is a
+convenience, not a privilege gate, so it does not follow the fail-closed pattern
+used by `allow_delete_user` and the `allowed_users` lists. Setting it false
+leaves the ✉ menu as the only route.
+
+## Part 5 — Run it automatically
+
+Reinstates what `050a4b9` removed. On a create that finishes with a saved PEM,
+with `enabled` and `auto_run` both true, the GUI spawns:
+
+```
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File <exe dir>\send_access_email.ps1 <args> -Quiet
+```
+
+Windows only, behind `#[cfg(target_os = "windows")]`; on Linux the spawn is
+skipped and logged, so dev builds stay usable.
+
+Two constraints carried forward from the deleted implementation, both still
+correct EDR hygiene and both to be preserved:
+
+- **The script is run from the file next to the exe, never written to `%TEMP%`.**
+  Dropping a script into temp and executing it is a pattern EDRs quarantine on
+  sight. If the file is missing, log and skip — do not fall back to temp.
+- **No `-WindowStyle Hidden`.** Hidden PowerShell is itself a detection
+  heuristic. A brief console window is the acceptable cost.
+
+The spawn is best-effort and never fatal: a failure updates the status line and
+leaves the ✉ menu available.
+
+The ✉ **Send Email Command** menu is unchanged and still present. Its copied
+command omits `-Quiet`, so a hand-run keeps the script's own message boxes.
+
+### Note on the EDR justification
+
+`050a4b9` removed auto-run on the theory that it triggered CrowdStrike. `2c31e8c`
+later recorded that the app was *still* quarantined after all email code was
+removed, so email was never the trigger. The theory that motivated the manual
+button was disproven by the caller's own investigation. Spawning PowerShell from
+an unsigned binary remains a common heuristic in general, which is why the two
+constraints above stay — but it is not evidenced by this app's incident.
+
+## Part 6 — Report the outcome in the GUI
+
+Automatic execution is invisible without feedback — the failure that prompted
+this revision was a user watching a popup that said nothing while the feature
+did nothing. The result popup therefore carries a status line.
+
+`ScriptResultPopup` gains `email_status: Option<EmailStatus>`:
+
+```rust
+enum EmailStatus {
+    Sending,
+    Sent { address: String },
+    Opened { reason: String },
+    Failed { error: String },
+}
+```
+
+Flow, following the existing `script_done_tx` / `verify_tx` convention in the
+GUI: the spawn happens on a worker thread with stdout piped; the thread waits,
+parses the script's last marker line, and sends an `EmailStatus` over a channel;
+the UI drains it each frame and updates the popup.
+
+Marker lines the script already emits are the contract:
+
+| stdout | Status shown |
+|---|---|
+| `SENT recipient='John Smith' address='jsmith@xyz.com'` | `Email sent to jsmith@xyz.com` (green) |
+| `OPEN ... resolved=False ...` | `Outlook opened - pick the recipient` (yellow) |
+| `OPEN ... domain_ok=False ...` | `Outlook opened - <address> is not in <domain>` (yellow) |
+| `OPEN ... encrypted=False ...` | `Outlook opened - encryption not confirmed` (yellow) |
+| no marker, or non-zero exit | `Email script failed - use Send Email Command` (red) |
+| spawn itself failed | `Could not start PowerShell: <error>` (red) |
+
+While the thread runs, the popup shows `Sending email...` in yellow.
+
+`-Quiet` suppresses the script's own `Show-Box` dialogs on this path so the
+user gets one message, in the GUI, rather than a modal from a process they did
+not knowingly start. The script still writes every marker to stdout.
 
 ## Error messages
 
@@ -179,19 +264,28 @@ Rust side, in the existing `gui::tests` module:
   positions never shift.
 - Existing `build_email_command` tests extended rather than duplicated.
 
+- `-Quiet` and `-Domain` both appear in the generated command; `-Quiet` is
+  absent from the copied (manual) form.
+- `EmailStatus` parsing: each marker line in the Part 6 table maps to the right
+  variant, including a malformed line falling through to `Failed`.
+
 PowerShell side there is no automated coverage and none is proposed — the script
 drives a live Outlook COM object. It cannot run in this repo's Linux CI, and a
 mock would test the mock. **The behavior must be confirmed by hand on a Windows
-box with Outlook**, in four runs:
+box with Outlook**, in five runs:
 
-1. A name that resolves to one person in the domain → sends with no window.
-2. A name shared by two people → opens, To empty, combined message.
-3. A name that matches nobody → opens, To empty, combined message.
+1. A name that resolves to one person in the domain → sends with no window, GUI
+   shows `Email sent to ...`.
+2. A name shared by two people → opens, To empty, GUI shows
+   `Outlook opened - pick the recipient`.
+3. A name that matches nobody → same as 2.
 4. `email_domain` set to something the resolved address is not in → opens, To
-   empty, domain message.
+   empty, GUI names the address.
+5. `send_access_email.ps1` deleted from beside the exe → GUI shows the failure
+   status and the ✉ menu still works.
 
-The first run must be checked in the recipient's mailbox for the encryption
-banner, not just for arrival.
+Run 1 must be checked in the recipient's mailbox for the encryption banner, not
+just for arrival.
 
 ## Rollback
 

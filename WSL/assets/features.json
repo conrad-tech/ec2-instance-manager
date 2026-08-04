@@ -39,9 +39,11 @@
       }
     ]
   },
-  "_access_email_comment": "Post-create Outlook access email (Windows only). Discover the encrypt_* values with scripts/outlook_verification.ps1 (or test_headless_encrypt.ps1), then paste them here. Headless encryption needs all three: encrypt_permission (the MailItem.Permission value it reported, e.g. 3), encrypt_permission_service (1 = olWindows), and encrypt_template_guid (the tenant RMS/IRM template GUID, same for everyone in your org - keep the braces). encrypt_smime_flag is only used when there is no template GUID (1 = S/MIME encrypt). encrypt_sendkeys is the QAT Encrypt shortcut for the visible fallback path (Alt+6 = '%6'). Set enabled=false to turn the feature off.",
+  "_access_email_comment": "Post-create Outlook access email (Windows only). Discover the encrypt_* values with scripts/outlook_verification.ps1 (or test_headless_encrypt.ps1), then paste them here. Headless encryption needs all three: encrypt_permission (the MailItem.Permission value it reported, e.g. 3), encrypt_permission_service (1 = olWindows), and encrypt_template_guid (the tenant RMS/IRM template GUID, same for everyone in your org - keep the braces). encrypt_smime_flag is only used when there is no template GUID (1 = S/MIME encrypt). encrypt_sendkeys is the QAT Encrypt shortcut for the visible fallback path (Alt+6 = '%6'). Set enabled=false to turn the feature off. auto_run makes the app run the script itself as soon as a create finishes with a saved PEM; set it to false to leave the 'Send Email Command' menu as the only route. email_domain is your organization's mail domain (e.g. xyz.com): a recipient that resolves outside it is never mailed unattended, which stops a stale local Contacts entry or autocomplete cache hit from receiving the PEM. Leave email_domain empty to skip that check.",
   "access_email": {
     "enabled": true,
+    "auto_run": true,
+    "email_domain": "",
     "encrypt_template_guid": "{00000000-0000-0000-0000-000000000000}",
     "encrypt_permission": 3,
     "encrypt_permission_service": 1,
