@@ -52,9 +52,10 @@ passes cleanly:
 
 ### Known-good rollback point: `pre-email-readd-58a9b9a`
 
-Tag `pre-email-readd-58a9b9a` (annotated, on `58a9b9a`) marks the last state
-verified working **before** the Outlook access-email integration is re-added.
-Roll back with:
+Tag `pre-email-readd-58a9b9a` (annotated) marks the last state verified working
+**before** the Outlook access-email integration is re-added. It sits on the
+commit that added this note; the code is identical to `58a9b9a`, which is where
+the verification below was actually run. Roll back with:
 
 ```bash
 git reset --hard pre-email-readd-58a9b9a
