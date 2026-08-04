@@ -20,6 +20,8 @@ template. This walkthrough discovers those values and verifies the path.
 
 All commands run in **PowerShell** (no admin needed). The helper scripts live in
 `assets/scripts/`:
+- `test_resolve_recipient.ps1` - dry run: who would a username be mailed, and
+  is the name really ambiguous? Sends nothing, creates no draft.
 - `outlook_verification.ps1` - read what your Encrypt button sets
 - `test_headless_encrypt.ps1` - confirm headless encryption works, auto-grab the GUID
 - `test_access_email.ps1` - send a full test email to yourself
@@ -182,6 +184,22 @@ The script:
 The result popup in the app shows which of these happened. On the automatic run
 the script is passed `-Quiet`, so it does not also raise its own message boxes;
 run it by hand from the ✉ menu and the boxes come back.
+
+> **Autocomplete is not the ambiguity test.** Typing a name in Outlook's To
+> field lists *substring* matches, so seeing several entries does not mean the
+> name is ambiguous - "Test User2" and "Tester Userson" both appear while you
+> type "test user". What matters is whether more than one person has that
+> **exact** display name. To check a specific username without sending
+> anything:
+>
+> ```powershell
+> powershell -NoProfile -ExecutionPolicy Bypass -File assets\scripts\test_resolve_recipient.ps1 -Username first.last -Domain xyz.com
+> ```
+>
+> It prints what `Resolve()` does, the address it would use, whether that entry
+> is a real directory user or a local Contact, and counts exact display-name
+> matches - then tells you whether the behavior is correct or a bug worth
+> reporting.
 
 The private key is only sent automatically when the recipient resolves to one
 person, that person's address is in your configured `email_domain`, **and**
