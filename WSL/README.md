@@ -24,6 +24,10 @@ Rust-only EC2 + SSM instance explorer with:
   bound to an IAM role, then read both back to verify), and an admin-gated
   **Vault IAM Delete** that undoes it.
   See [Scripts menu (bastion user management)](#scripts-menu-bastion-user-management).
+- **Access email** (Windows) — after a create, copy a ready-to-run command that
+  composes, encrypts and sends the bastion-access email with the PEM attached.
+  You run it in your own terminal; the app never sends anything itself.
+  See [Access email (post-create)](#access-email-post-create).
 
 ## Prerequisites
 
@@ -663,6 +667,14 @@ actions.
   "vault_iam": {
     "allowed_users": ["*"],
     "delete_allowed_users": []
+  },
+  "access_email": {
+    "enabled": true,
+    "encrypt_template_guid": "{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}",
+    "encrypt_permission": 3,
+    "encrypt_permission_service": 1,
+    "encrypt_smime_flag": 0,
+    "encrypt_sendkeys": "%6"
   }
 }
 ```
@@ -674,6 +686,12 @@ actions.
 | `secondary_bastion_filter` | `"bastion"` | Same, for the **Secondary Bastion** dropdown. |
 | `vault_iam.allowed_users`  | `["*"]`     | OS usernames that see the **Vault IAM Access** entry. `["*"]` = everyone, `[]` = nobody, or list specific usernames (case-insensitive). |
 | `vault_iam.delete_allowed_users` | `[]`  | OS usernames that additionally see the destructive **Vault IAM Delete** entry. Requires membership of `allowed_users` too. Ships empty — nobody. |
+| `access_email.enabled`     | `true`      | Shows the **✉ Send Email Command** menu on the create-user result popup. `false` hides it entirely. See [Access email](#access-email-post-create). |
+| `access_email.encrypt_template_guid` | *(placeholder)* | Your **Microsoft 365 tenant's** RMS/IRM template GUID, braces included. Ships as an all-zeros placeholder that must be replaced — see [Finding your template GUID](#finding-your-template-guid). |
+| `access_email.encrypt_permission` | `3`    | The `MailItem.Permission` value your Encrypt button applies (`2` = Do Not Forward). `0` skips it. |
+| `access_email.encrypt_permission_service` | `1` | `MailItem.PermissionService` (`1` = olWindows). Needed alongside the template GUID. |
+| `access_email.encrypt_smime_flag` | `0`    | S/MIME encrypt flag, used only when there is no template GUID (`1` = encrypt). |
+| `access_email.encrypt_sendkeys` | `"%6"`   | Your Outlook QAT Encrypt shortcut, for the visible fallback path (`Alt+6` = `%6`). |
 
 Parsing **fails closed**: if the file is malformed, every gate defaults to off.
 To ship a build for admins who need user deletion, set `"allow_delete_user": true`
@@ -704,4 +722,77 @@ This one is off for everyone in the shipped default, deliberately:
 
 `["*"]` works here too, but think before using it: the entry deletes a Vault
 role *and* its policy.
+
+## Access email (post-create)
+
+**Windows only**, and it needs Outlook installed and signed in.
+
+After a Bastion New User run finishes *and the PEM was saved*, the result popup
+grows a **✉ Send Email Command** menu with one entry per terminal (WSL, Git
+Bash, PowerShell). Picking one **copies a command to your clipboard** — the app
+does not run it. You paste it into your own terminal and run it; that command
+invokes `send_access_email.ps1`, which composes the access email in Outlook,
+attaches the PEM, encrypts it, and sends it when the recipient resolves
+unambiguously (otherwise it leaves the draft open for you).
+
+> The app deliberately never spawns the Outlook automation itself. Running it
+> from your own shell — a human-initiated action in a trusted process — is what
+> keeps EDR (CrowdStrike) from quarantining the unsigned GUI binary. Please do
+> not "improve" this into an auto-send.
+
+`send_access_email.ps1` is copied next to the GUI `.exe` by
+`scripts/build_binaries.sh` and is **not** embedded in the binary — same reason.
+
+### Finding your template GUID
+
+Encryption is the one thing that must be configured per organization: the script
+applies the same encryption your Outlook **Options > Encrypt** button applies,
+which means it needs your tenant's RMS/IRM template GUID.
+
+1. In Outlook, open **New Email** and click **Options > Encrypt** (or your
+   `Alt+6` shortcut). **Leave that compose window open — do not send it.**
+2. In PowerShell, run:
+
+   ```powershell
+   $i = (New-Object -ComObject Outlook.Application).ActiveInspector().CurrentItem
+   "Permission             : {0}" -f $i.Permission
+   "PermissionTemplateGuid : '{0}'" -f $i.PermissionTemplateGuid
+   ```
+
+   Or, from a source checkout, the same thing with friendlier error handling:
+
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File assets\scripts\outlook_verification.ps1
+   ```
+
+3. Copy the GUID **with its braces** into `access_email.encrypt_template_guid`
+   in `assets/features.json`, set `encrypt_permission` to the `Permission`
+   number it printed, and **rebuild** — features.json is compiled in.
+
+Reading the output:
+
+| What you see | Meaning | What to set |
+|---|---|---|
+| A `Permission` number **and** a GUID | Tenant RMS/IRM template (most common) | `encrypt_permission` = that number, `encrypt_permission_service` = `1`, `encrypt_template_guid` = the GUID |
+| `Permission = 2`, no GUID | Do Not Forward | `encrypt_permission: 2` |
+| `Permission = 0`, no GUID, S/MIME flag `1` | S/MIME | `encrypt_smime_flag: 1` |
+| `Permission = 0`, no GUID, S/MIME `0` | Sensitivity-label only | Headless encryption may not work — set `encrypt_template_guid: ""` and `encrypt_permission: 0` to always take the visible `Alt+6` path |
+
+The GUID belongs to your **Microsoft 365 tenant**, not your machine — it is the
+same for everyone in your org and only changes if IT rebuilds the template.
+
+To verify the value end-to-end before you rebuild (it re-reads the GUID from the
+open draft, echoes it untruncated, then encrypts and sends a test to yourself
+with no window and no `Alt+6`):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File assets\scripts\test_headless_encrypt.ps1 -Username first.last
+```
+
+> Setting `PermissionTemplateGuid` prints `The operation failed` even when it
+> works — the value still sticks and applies at send time. That is why the
+> scripts confirm by **reading the GUID back**, never by the setter's error.
+
+Full procedure, including what to do when headless encryption won't confirm:
+[`ACCESS_EMAIL_WALKTHROUGH.md`](ACCESS_EMAIL_WALKTHROUGH.md).
 

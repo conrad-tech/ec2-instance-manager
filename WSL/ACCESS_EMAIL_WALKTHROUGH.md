@@ -1,9 +1,14 @@
 # Access Email Setup - Walkthrough
 
-After a user is created, the app automatically composes the "bastion access"
-email in Outlook, encrypts it, and - when the recipient is unambiguous - sends
-it for you. This is **Windows only** and relies on Outlook being installed and
-signed in.
+After a user is created, the app hands you a ready-to-run command that composes
+the "bastion access" email in Outlook, encrypts it, and - when the recipient is
+unambiguous - sends it. **You run that command yourself**; the app only copies
+it to your clipboard. This is **Windows only** and relies on Outlook being
+installed and signed in.
+
+> Why the extra step: running the Outlook automation from your own shell keeps
+> it out of the unsigned GUI process, which is what stops EDR (CrowdStrike) from
+> quarantining the app. It is not a limitation to be engineered away.
 
 The one thing that must be set up per organization is **encryption**: the app
 applies the same encryption your **Options > Encrypt** button applies, via the
@@ -121,10 +126,18 @@ cargo build --features gui        # or the release build script
 
 ---
 
-## What the app does after a user is created
+## What happens after a user is created
 
 Once a create finishes and passes verification (user created on both bastions,
-SSH cross-login OK, PEM pulled to `~/Downloads`), the app automatically:
+SSH cross-login OK, PEM pulled to `~/Downloads`), the result popup grows an
+**✉ Send Email Command** menu. Pick your terminal (WSL / Git Bash / PowerShell)
+and the command is copied to your clipboard - the popup confirms with "Command
+copied. Now run it in your terminal." Paste it into that terminal and run it.
+
+The menu only appears when the PEM was saved (the email body promises it as an
+attachment) and `access_email.enabled` is `true`.
+
+Running the command:
 
 1. Composes the email:
    - **To:** `firstname.lastname` -> `Firstname Lastname`, resolved against the
@@ -138,13 +151,13 @@ SSH cross-login OK, PEM pulled to `~/Downloads`), the app automatically:
 
 | Case | What happens |
 |---|---|
-| **Exactly one match** | Encrypts headless and **sends silently** - no window. A popup confirms "Email sent successfully." |
+| **Exactly one match** | Encrypts headless and **sends silently** - no compose window. The script pops up "Email sent successfully" and prints `SENT recipient='...'`. |
 | **Two or more people share the name (or none match)** | **Opens the Outlook window, presses Alt+6 to encrypt, and leaves it open** so you pick the correct recipient and click Send. A popup explains why. |
 | **One match but headless encryption can't be confirmed** | Opens the window, presses Alt+6, and leaves it for you to verify and Send. |
 
-The private key is only auto-sent when the recipient is unambiguous **and**
-encryption is confirmed on the item. Alt+6 is only ever pressed on a not-yet-
-encrypted draft (it's a toggle), so it never accidentally un-encrypts.
+The private key is only sent automatically when the recipient is unambiguous
+**and** encryption is confirmed on the item. Alt+6 is only ever pressed on a
+not-yet-encrypted draft (it's a toggle), so it never accidentally un-encrypts.
 
 ---
 
