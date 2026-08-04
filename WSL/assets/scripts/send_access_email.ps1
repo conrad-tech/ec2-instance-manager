@@ -7,10 +7,11 @@
 #
 # Flow:
 #   * Compose headless (To/Subject/Body/PEM) - nothing is shown yet.
-#   * Resolve the recipient. Resolve() is TRUE only for a single unambiguous
-#     match; FALSE for 2+ same-named people AND for no match at all. We do not
-#     try to tell those two apart - the user does the same thing either way,
-#     and counting would need a full GAL enumeration or an LDAP query.
+#   * Count how many people the directory matches for the name, the same way
+#     Outlook's suggestion list does (LDAP Ambiguous Name Resolution). Exactly
+#     one is required; 0 or 2+ opens Outlook instead. Recipient.Resolve() is
+#     NOT the ambiguity test - it returns TRUE for a shared name by quietly
+#     taking the nickname-cache entry.
 #   * Verify the resolved address is in -Domain. Resolve() also matches the
 #     local Contacts folder and the autocomplete cache, so this is what stops a
 #     stale personal entry from being mailed a private key. Blank -Domain
@@ -19,14 +20,19 @@
 #     (discovered with outlook_verification.ps1). Done whether or not the
 #     recipient resolved, so a draft that opens is already encrypted rather
 #     than depending on the Alt+6 keystroke landing.
-#   * Send headless ONLY when resolved AND in-domain AND encryption confirmed.
+#   * Check the address SHAPE against the username (-LocalFormat /
+#     -ExpectedLocal). The domain check cannot catch an in-domain address that
+#     belongs to a different person with a similar name; this can.
+#   * Send headless ONLY when resolved AND in-domain AND name-shaped AND
+#     encryption confirmed.
 #   * Otherwise clear the To field, open the draft, apply the QAT Encrypt
 #     shortcut if encryption did not confirm, and explain why.
 #
 # Every run ends with one machine-readable marker on stdout, which the GUI
 # parses to show a status line:
 #   SENT recipient='<name>' address='<smtp>'
-#   OPEN recipient='<name>' resolved=<bool> domain_ok=<bool> encrypted=<bool>
+#   OPEN recipient='<name>' resolved=<bool> domain_ok=<bool> local_ok=<bool>
+#        encrypted=<bool> enc_config=<bool>
 
 param(
     [string]$Username        = "",   # firstname.lastname, as typed in the app
@@ -35,6 +41,8 @@ param(
     [string]$Secondary       = "",   # secondary bastion instance id
     [string]$Pem             = "",   # local path to the PEM to attach
     [string]$Domain          = "",   # org mail domain; resolved address must match
+    [string]$LocalFormat     = "",   # non-empty turns the name-shape check on
+    [string]$ExpectedLocal   = "",   # stem the address must be, e.g. "jsmith"
     [switch]$Quiet,                  # suppress message boxes (GUI shows status)
     [string]$TemplateGuid      = "",   # RMS/IRM template GUID (tenant-specific)
     [int]   $Permission        = 0,    # MailItem.Permission value to set (0=skip)
@@ -117,30 +125,87 @@ if ($Pem -and (Test-Path -LiteralPath $Pem)) {
     try { $mail.Attachments.Add($Pem) | Out-Null } catch {}
 }
 
-# To: add the display name and resolve. Resolve() is TRUE only for ONE
-# unambiguous match; FALSE for 2+ same-named people AND for no match at all.
-# We deliberately do not tell those two failures apart: the user does the same
-# thing either way (pick the right person in an empty To field), and counting
-# would need a full GAL enumeration or an LDAP query.
-$recip = $mail.Recipients.Add($displayName)
-$resolved = $false
-try { $resolved = [bool]$recip.Resolve() } catch { $resolved = $false }
+# --- How many people would Outlook suggest for this name? ----------------
+# This is the ambiguity gate, and it deliberately does NOT use
+# Recipient.Resolve(). Resolve() can return TRUE for a name several people
+# share - it will quietly take the nickname/autocomplete cache entry - so it is
+# not a safe test for "exactly one person". Outlook's suggestion list is
+# Ambiguous Name Resolution against the directory, which is what LDAP's `anr`
+# filter does, so we ask the directory the same question and count.
+#
+#   0 matches  -> nobody to send to        -> open Outlook
+#   2+ matches -> the ambiguity we care about -> open Outlook
+#   1 match    -> send to that address
+#
+# A directory that cannot be queried (not domain-joined, LDAP blocked) counts
+# as -1 and FAILS CLOSED. Falling back to Resolve() would restore exactly the
+# hole this replaces, and the attachment is a private key.
+$anrCount = -1
+$anrMail  = ""
+$anrList  = @()
+try {
+    # Escape the LDAP filter metacharacters; a name is user-supplied text.
+    $esc = $displayName -replace '([\\()\*])', '\$1'
+    $ds  = New-Object DirectoryServices.DirectorySearcher
+    $ds.Filter    = "(&(objectCategory=person)(objectClass=user)(mail=*)(anr=$esc))"
+    $ds.SizeLimit = 25
+    [void]$ds.PropertiesToLoad.Add("mail")
+    [void]$ds.PropertiesToLoad.Add("displayname")
+    $hits = @($ds.FindAll())
+    $anrCount = $hits.Count
+    foreach ($h in $hits) {
+        $m = ""; $n = ""
+        try { $m = "$($h.Properties['mail'][0])" } catch {}
+        try { $n = "$($h.Properties['displayname'][0])" } catch {}
+        $anrList += "    $n <$m>"
+    }
+    if ($anrCount -eq 1) { $anrMail = "$($hits[0].Properties['mail'][0])" }
+} catch {
+    $anrCount = -1
+    Write-Output "WARN directory lookup failed: $($_.Exception.Message)"
+}
 
-# Resolve() also matches the local Contacts folder and the autocomplete cache,
-# not just the GAL. A stale personal entry for the same name would otherwise be
-# mailed a private key, so a resolved address must sit in the configured domain.
+Write-Output "MATCHES name='$displayName' count=$anrCount"
+if ($anrList.Count -gt 0) { $anrList | ForEach-Object { Write-Output $_ } }
+
+# Address the mail by SMTP, never by display name: adding the name back would
+# hand the ambiguity straight to Outlook again.
+$resolved = $false
 $smtp     = ""
+$recip    = $null
+if ($anrCount -eq 1 -and $anrMail) {
+    $smtp  = $anrMail
+    $recip = $mail.Recipients.Add($smtp)
+    try { $resolved = [bool]$recip.Resolve() } catch { $resolved = $false }
+}
+
+# The one match must still be in our own domain.
 $domainOk = $false
 if ($resolved) {
-    try { $smtp = "$($recip.AddressEntry.GetExchangeUser().PrimarySmtpAddress)" } catch { $smtp = "" }
-    if (-not $smtp) { try { $smtp = "$($recip.Address)" } catch { $smtp = "" } }
-
     if (-not $Domain) {
         # No domain configured - check disabled, preserving older behavior.
         $domainOk = $true
     } elseif ($smtp -like "*@*") {
         $addrDomain = ($smtp -split '@')[-1]
         $domainOk = $addrDomain.Trim().ToLower() -eq $Domain.Trim().ToLower()
+    }
+}
+
+# The address must also LOOK like this person. The domain check cannot catch an
+# in-domain address belonging to someone else with a similar name - resolving
+# "Test User" to testuser@ when the username is test.user (so tuser@) is exactly
+# that. The app derives $ExpectedLocal; an optional numeric suffix is allowed,
+# since organizations disambiguate duplicates that way (jsmith, jsmith2).
+$localOk = $true
+if ($LocalFormat) {
+    $localOk = $false
+    if (-not $ExpectedLocal) {
+        # The format is configured but no stem could be derived (an unknown
+        # format name, or a username with no surname). Fail closed.
+        Write-Output "WARN could not derive an expected address for '$Username' (LocalFormat='$LocalFormat')"
+    } elseif ($smtp -like "*@*") {
+        $localPart = ($smtp -split '@')[0]
+        $localOk = $localPart.Trim().ToLower() -match ('^' + [regex]::Escape($ExpectedLocal.Trim().ToLower()) + '\d*$')
     }
 }
 
@@ -195,7 +260,7 @@ if ($TemplateGuid) {
 # unattended without a confirmed single recipient in our own domain and
 # confirmed encryption.
 $sent = $false
-if ($resolved -and $domainOk -and $encConfirmed) {
+if ($resolved -and $domainOk -and $localOk -and $encConfirmed) {
     try { $mail.Send(); $sent = $true } catch { $sent = $false }
 }
 
@@ -210,11 +275,26 @@ if ($sent) {
 try { while ($mail.Recipients.Count -gt 0) { $mail.Recipients.Remove(1) } } catch {}
 
 $reason =
-    if (-not $resolved) {
-        "Could not identify a single recipient for '$displayName' - either nobody matches or more than one person does.`n`n" +
+    if ($anrCount -lt 0) {
+        "Could not search the directory to check how many people match '$displayName', so nothing was sent.`n`n" +
+        "This machine may not be joined to the domain, or LDAP may be blocked.`n`n" +
+        "The email is ready below with the To field empty. Enter the correct recipient, confirm it still shows encrypted, then click Send."
+    } elseif ($anrCount -eq 0) {
+        "Nobody in the directory matches '$displayName', so nothing was sent.`n`n" +
+        "The email is ready below with the To field empty. Enter the correct recipient, confirm it still shows encrypted, then click Send."
+    } elseif ($anrCount -gt 1) {
+        "$anrCount people match '$displayName', so nothing was sent:`n`n" +
+        (($anrList -join "`n").Trim()) + "`n`n" +
+        "The email is ready below with the To field empty. Pick the correct person, confirm it still shows encrypted, then click Send."
+    } elseif (-not $resolved) {
+        "Outlook could not resolve $smtp, so nothing was sent.`n`n" +
         "The email is ready below with the To field empty. Enter the correct recipient, confirm it still shows encrypted, then click Send."
     } elseif (-not $domainOk) {
         "'$displayName' resolved to $smtp, which is not in $Domain.`n`n" +
+        "The email is ready below with the To field empty. Enter the correct recipient, confirm it still shows encrypted, then click Send."
+    } elseif (-not $localOk) {
+        "'$displayName' resolved to $smtp, but the username '$Username' expects an address like '$ExpectedLocal@$Domain' (an optional number is allowed).`n`n" +
+        "That usually means Outlook matched a different person with a similar name. Nothing was sent.`n`n" +
         "The email is ready below with the To field empty. Enter the correct recipient, confirm it still shows encrypted, then click Send."
     } elseif (-not $encConfigured) {
         "Encryption is not configured: encrypt_template_guid is still the all-zeros placeholder.`n`n" +
@@ -241,4 +321,4 @@ if (-not $encConfirmed -and $EncryptSendKeys) {
 }
 
 Show-Box $reason "Warning"
-Write-Output "OPEN recipient='$displayName' resolved=$resolved domain_ok=$domainOk encrypted=$encConfirmed enc_config=$encConfigured"
+Write-Output "OPEN recipient='$displayName' matches=$anrCount resolved=$resolved domain_ok=$domainOk local_ok=$localOk encrypted=$encConfirmed enc_config=$encConfigured"

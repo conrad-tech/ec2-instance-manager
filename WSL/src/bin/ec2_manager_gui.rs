@@ -1935,10 +1935,23 @@ mod gui {
         // template GUID). Absent on output from an older script beside the exe,
         // so absence must read as "configured" rather than as a problem.
         let enc_unconfigured = rest.contains("enc_config=False");
-        let reason = if !flag("resolved") {
+        // `matches` is the directory match count: -1 could not be queried, 0
+        // nobody, 2+ ambiguous. Absent on output from an older script.
+        let matches: Option<i64> = single_unquoted_value(rest, "matches=")
+            .and_then(|v| v.parse().ok());
+        let reason = if matches == Some(-1) {
+            "Not sent - could not search the directory to check for duplicate names".to_string()
+        } else if matches == Some(0) {
+            "Not sent - nobody in the directory matches that name".to_string()
+        } else if matches.is_some_and(|n| n > 1) {
+            let n = matches.unwrap_or_default();
+            format!("Not sent - {n} people match that name; pick one in Outlook")
+        } else if !flag("resolved") {
             "Outlook opened - pick the recipient".to_string()
         } else if !flag("domain_ok") {
             "Outlook opened - that address is not in your mail domain".to_string()
+        } else if rest.contains("local_ok=False") {
+            "Outlook opened - that address does not match the expected name format".to_string()
         } else if enc_unconfigured {
             "Not sent - encryption is not configured (encrypt_template_guid is still the placeholder)"
                 .to_string()
@@ -1950,6 +1963,19 @@ mod gui {
         Some(EmailStatus::Opened { reason })
     }
 
+    /// Pull a bare `key=value` (no quotes, space-terminated) out of a marker.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn single_unquoted_value(haystack: &str, key: &str) -> Option<String> {
+        let after = haystack.split_once(key)?.1;
+        Some(
+            after
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+        )
+    }
+
     /// Pull `key='value'` out of a marker line.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn single_quoted_value(haystack: &str, key: &str) -> Option<String> {
@@ -1957,6 +1983,31 @@ mod gui {
         let inner = after.strip_prefix('\'')?;
         let end = inner.find('\'')?;
         Some(inner[..end].to_string())
+    }
+
+    /// The local part an access-email recipient's address must start with,
+    /// derived from the username, or `None` when it cannot be derived.
+    ///
+    /// Formats (`access_email.email_local_format`):
+    /// * `"flast"` — first initial + surname, e.g. `john.smith` → `jsmith`.
+    ///   The script then accepts an optional numeric suffix (`jsmith`,
+    ///   `jsmith2`), since organizations disambiguate that way.
+    ///
+    /// `None` for a blank format (gate off), an unrecognized format, or a
+    /// username with no surname to build from. The caller treats "format set
+    /// but nothing derived" as a failed check rather than a skipped one, so an
+    /// admin typo cannot silently disable the gate.
+    fn expected_email_local(username: &str, format: &str) -> Option<String> {
+        if !format.trim().eq_ignore_ascii_case("flast") {
+            return None;
+        }
+        let parts: Vec<&str> = username.split('.').filter(|p| !p.is_empty()).collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        let first_initial = parts[0].chars().next()?;
+        let surname = parts[parts.len() - 1];
+        Some(format!("{first_initial}{surname}").to_lowercase())
     }
 
     /// Absolute path to the `send_access_email.ps1` that ships **next to the
@@ -1989,6 +2040,15 @@ mod gui {
             ("-Secondary", secondary_id.to_string()),
             ("-Pem", pem_path.to_string()),
             ("-Domain", cfg.email_domain.clone()),
+            // The format name doubles as the on/off switch; the stem is
+            // derived here so the rule stays unit-testable. A configured
+            // format with an underivable stem leaves the stem empty, which
+            // the script treats as a failed check, not a skipped one.
+            ("-LocalFormat", cfg.email_local_format.clone()),
+            (
+                "-ExpectedLocal",
+                expected_email_local(username, &cfg.email_local_format).unwrap_or_default(),
+            ),
             ("-TemplateGuid", cfg.encrypt_template_guid.clone()),
             ("-Permission", cfg.encrypt_permission.to_string()),
             ("-PermissionService", cfg.encrypt_permission_service.to_string()),
@@ -17136,11 +17196,68 @@ mod gui {
                 enabled,
                 auto_run: true,
                 email_domain: "xyz.com".to_string(),
+                email_local_format: "flast".to_string(),
                 encrypt_template_guid: "{abc}".to_string(),
                 encrypt_permission: 3,
                 encrypt_permission_service: 1,
                 encrypt_smime_flag: 0,
                 encrypt_sendkeys: "%6".to_string(),
+            }
+        }
+
+        #[test]
+        fn flast_takes_the_first_initial_and_the_last_name() {
+            assert_eq!(
+                expected_email_local("john.smith", "flast").as_deref(),
+                Some("jsmith")
+            );
+            // Casing in the username must not leak into the comparison.
+            assert_eq!(
+                expected_email_local("John.SMITH", "flast").as_deref(),
+                Some("jsmith")
+            );
+        }
+
+        #[test]
+        fn flast_uses_the_last_part_when_there_is_a_middle_name() {
+            assert_eq!(
+                expected_email_local("mary.jane.watson", "flast").as_deref(),
+                Some("mwatson")
+            );
+        }
+
+        #[test]
+        fn flast_cannot_be_derived_without_a_surname() {
+            // No dot means no surname to build from. Returning None makes the
+            // caller fail closed rather than send against a guessed address.
+            assert!(expected_email_local("jsmith", "flast").is_none());
+            assert!(expected_email_local("", "flast").is_none());
+            assert!(expected_email_local(".smith", "flast").is_none());
+        }
+
+        #[test]
+        fn an_unknown_local_format_derives_nothing() {
+            // An admin typo in features.json must not silently disable the
+            // gate; None makes the run open Outlook instead of sending.
+            assert!(expected_email_local("john.smith", "lastf").is_none());
+        }
+
+        #[test]
+        fn no_local_format_means_no_expected_local_part() {
+            assert!(expected_email_local("john.smith", "").is_none());
+        }
+
+        #[test]
+        fn a_bad_local_part_marker_says_the_address_does_not_match() {
+            let s = parse_email_marker(
+                "OPEN recipient='Test User' resolved=True domain_ok=True local_ok=False encrypted=True",
+            )
+            .expect("OPEN parses");
+            match s {
+                EmailStatus::Opened { reason } => {
+                    assert!(reason.contains("does not match"), "{reason}")
+                }
+                other => panic!("expected Opened, got {other:?}"),
             }
         }
 
@@ -17163,6 +17280,53 @@ mod gui {
             match s {
                 EmailStatus::Opened { reason } => {
                     assert!(reason.contains("pick the recipient"), "{reason}")
+                }
+                other => panic!("expected Opened, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn several_directory_matches_are_counted_in_the_status() {
+            // The whole point of the gate: say how many people matched, so the
+            // user knows why it stopped rather than guessing.
+            let s = parse_email_marker(
+                "OPEN recipient='Test User' matches=4 resolved=False domain_ok=False local_ok=False encrypted=True",
+            )
+            .expect("OPEN parses");
+            match s {
+                EmailStatus::Opened { reason } => {
+                    assert!(reason.contains('4'), "{reason}");
+                    assert!(reason.contains("match"), "{reason}");
+                }
+                other => panic!("expected Opened, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn no_directory_match_says_nobody_matched() {
+            let s = parse_email_marker(
+                "OPEN recipient='Test User' matches=0 resolved=False domain_ok=False encrypted=True",
+            )
+            .expect("OPEN parses");
+            match s {
+                EmailStatus::Opened { reason } => {
+                    assert!(reason.to_lowercase().contains("nobody"), "{reason}")
+                }
+                other => panic!("expected Opened, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn an_unqueryable_directory_is_reported_as_such() {
+            // -1 means the LDAP lookup itself failed. That is a different
+            // problem from "nobody matched" and needs a different fix.
+            let s = parse_email_marker(
+                "OPEN recipient='Test User' matches=-1 resolved=False domain_ok=False encrypted=True",
+            )
+            .expect("OPEN parses");
+            match s {
+                EmailStatus::Opened { reason } => {
+                    assert!(reason.contains("directory"), "{reason}")
                 }
                 other => panic!("expected Opened, got {other:?}"),
             }

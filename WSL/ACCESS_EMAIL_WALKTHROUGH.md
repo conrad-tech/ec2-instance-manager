@@ -176,10 +176,20 @@ The script:
 
 | Case | What happens |
 |---|---|
-| **One match, address in your `email_domain`** | Encrypts headless and **sends silently** - no compose window. Prints `SENT recipient='...' address='...'`. |
-| **One match, address outside `email_domain`** | Opens the draft with the **To field empty** and names the address it found. Guards against a stale Contacts entry receiving the PEM. |
-| **Two or more people share the name, or nobody matches** | Opens the draft with the **To field empty** so nobody is pre-selected. One message covers both - Outlook cannot tell them apart without a full directory scan. |
+| **Exactly one directory match, in `email_domain`, address fits `email_local_format`** | Encrypts headless and **sends silently** - no compose window. Prints `SENT recipient='...' address='...'`. |
+| **Two or more people match the name** | Opens the draft with the **To field empty** and lists who matched. This is the case Outlook's suggestion dropdown shows you. |
+| **Nobody matches** | Opens the draft with the **To field empty**. |
+| **The directory could not be searched** | Opens the draft and says so - the machine may not be domain-joined, or LDAP may be blocked. It never falls back to a weaker check. |
+| **One match, address outside `email_domain`** | Opens the draft, **To empty**, naming the address it found. Guards against a stale Contacts entry receiving the PEM. |
+| **One match, but the address does not fit the name** | Opens the draft, **To empty**. `test.user` expects `tuser@` or `tuser2@`; `testuser@` is a different person. |
 | **Encryption could not be confirmed** | Opens the draft and presses your Alt+6 shortcut. Only ever pressed when headless encryption failed, since Alt+6 is a toggle. |
+
+> **How the count is done.** Not `Recipient.Resolve()` - that returns "resolved"
+> even when several people share a name, quietly taking whichever entry is in
+> your autocomplete cache. The script asks the directory the same question
+> Outlook's suggestion list asks (LDAP Ambiguous Name Resolution) and requires
+> the answer to be exactly one. The mail is then addressed **by SMTP address**,
+> so Outlook is never given the chance to pick again.
 
 The result popup in the app shows which of these happened. On the automatic run
 the script is passed `-Quiet`, so it does not also raise its own message boxes;

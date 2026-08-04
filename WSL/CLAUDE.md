@@ -107,20 +107,26 @@ result popup shows a status line fed by the script's stdout marker. The **✉ Se
 Email Command** menu remains as a manual fallback that copies a ready-to-run
 command per terminal.
 
-- **The send path has three conditions, all required:** the recipient resolves
-  to exactly one person, that address is in `access_email.email_domain`, and
-  encryption reads back confirmed. Anything else opens the draft. The
-  attachment is a private key — do not relax this.
-- **The domain check is a safety control, not a filter.** Outlook's `Resolve()`
-  matches the local Contacts folder and the autocomplete cache as well as the
-  GAL, so a stale personal entry for the same name would otherwise be mailed
-  the PEM. Blank `email_domain` skips the check (preserving older behavior);
-  that is deliberate, not an oversight.
-- **0 matches and 2+ matches share one message on purpose.** `Resolve()` returns
-  false for both and cannot distinguish them; telling them apart needs a full
-  GAL enumeration or an LDAP query, and the user does the same thing either way
-  (pick a recipient in an empty To field). Do not add a directory scan to
-  produce a nicer error string.
+- **The send path has four conditions, all required:** the directory matches
+  **exactly one** person, that address is in `access_email.email_domain`, the
+  address matches `email_local_format`, and encryption reads back confirmed.
+  Anything else opens the draft. The attachment is a private key — do not relax
+  this.
+- **`Recipient.Resolve()` is NOT the ambiguity test, and must not be used as
+  one.** It returns `True` for a name several people share, quietly taking the
+  nickname/autocomplete-cache entry — this shipped once and mailed a PEM to a
+  silently-chosen entry. The gate is an LDAP **ANR** query (`(anr=<name>)`),
+  the same resolution Outlook's suggestion list uses, and the count must be 1.
+  The mail is then addressed **by SMTP**, never by display name, so Outlook is
+  never handed the ambiguity again.
+- **A directory that cannot be queried fails closed** (`matches=-1` → open the
+  draft). Falling back to `Resolve()` would restore the exact hole the ANR
+  query replaces.
+- **`email_domain` and `email_local_format` are layered, not redundant.** The
+  domain check catches an out-of-org address (a stale local Contact); the local
+  format catches an *in-domain* address belonging to a different person with a
+  similar name — `test.user` must resolve to `tuser@`/`tuser2@`, not
+  `testuser@`. Blank disables either check.
 - **Two EDR constraints in the spawn are load-bearing.** The script is run from
   the file **next to the exe** — never written to `%TEMP%` and run from there —
   and `-WindowStyle Hidden` is not used. Both are patterns EDRs quarantine on

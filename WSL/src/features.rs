@@ -225,6 +225,14 @@ pub struct AccessEmailConfig {
     /// and the autocomplete cache, so a stale personal entry for the same name
     /// would otherwise be mailed a private key. Blank disables the check.
     pub email_domain: String,
+    /// Shape the recipient's address must have, checked against the username
+    /// before anything is sent unattended. `"flast"` means first initial +
+    /// surname with an optional numeric suffix, so `john.smith` accepts
+    /// `jsmith@` or `jsmith2@` but not `johnsmith@`. Blank disables the check.
+    ///
+    /// This catches what the domain check cannot: an in-domain address that
+    /// simply belongs to a different person with a similar name.
+    pub email_local_format: String,
     /// RMS/IRM template GUID to apply for encryption (tenant-specific).
     /// Empty disables the template path.
     pub encrypt_template_guid: String,
@@ -248,6 +256,7 @@ impl Default for AccessEmailConfig {
             enabled: true,
             auto_run: true,
             email_domain: String::new(),
+            email_local_format: String::new(),
             encrypt_template_guid: String::new(),
             encrypt_permission: 0,
             encrypt_permission_service: 0,

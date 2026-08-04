@@ -76,30 +76,34 @@ if ($resolved) {
 }
 ""
 
-# --- How many people REALLY share that exact display name? ---------------
-# Autocomplete matches substrings, so seeing several entries while typing does
-# not mean the name is ambiguous. This counts EXACT display-name matches only.
-# Stops at 5 so a large directory does not take forever.
-"Exact display-name matches in the Global Address List:"
+# --- The gate that actually decides: how many people does the directory
+# --- suggest for this name? This is LDAP Ambiguous Name Resolution, the same
+# --- resolution behind Outlook's suggestion dropdown.
+"Directory matches (LDAP ANR - what Outlook's suggestion list shows):"
 $found = @()
+$anrCount = -1
 try {
-    $gal = $ns.GetGlobalAddressList().AddressEntries
-    $total = $gal.Count
-    "  (scanning $total entries - this can take a while on a big directory)"
-    for ($i = 1; $i -le $total; $i++) {
-        $e = $gal.Item($i)
-        if ("$($e.Name)".Trim() -eq $displayName) {
-            $addr = ""
-            try { $addr = "$($e.GetExchangeUser().PrimarySmtpAddress)" } catch { $addr = "$($e.Address)" }
-            $found += "  - $($e.Name)  <$addr>"
-            if ($found.Count -ge 5) { break }
-        }
+    $esc = $displayName -replace '([\\()\*])', '\$1'
+    $ds  = New-Object DirectoryServices.DirectorySearcher
+    $ds.Filter    = "(&(objectCategory=person)(objectClass=user)(mail=*)(anr=$esc))"
+    $ds.SizeLimit = 25
+    [void]$ds.PropertiesToLoad.Add("mail")
+    [void]$ds.PropertiesToLoad.Add("displayname")
+    $hits = @($ds.FindAll())
+    $anrCount = $hits.Count
+    foreach ($h in $hits) {
+        $m = ""; $n = ""
+        try { $m = "$($h.Properties['mail'][0])" } catch {}
+        try { $n = "$($h.Properties['displayname'][0])" } catch {}
+        $found += "  - $n  <$m>"
     }
 } catch {
-    "  Could not scan the address list: $($_.Exception.Message)"
+    "  Could not search the directory: $($_.Exception.Message)"
 }
 
-if ($found.Count -eq 0) {
+if ($anrCount -lt 0) {
+    "  (lookup failed)"
+} elseif ($anrCount -eq 0) {
     "  none"
 } else {
     $found | ForEach-Object { $_ }
@@ -107,26 +111,23 @@ if ($found.Count -eq 0) {
 ""
 
 "VERDICT"
-if ($found.Count -gt 1) {
-    "  $($found.Count)+ people share the exact name '$displayName'."
+if ($anrCount -lt 0) {
+    "  The directory could not be searched - this machine may not be joined to"
+    "  the domain, or LDAP may be blocked. The access email FAILS CLOSED here:"
+    "  it opens Outlook rather than falling back to a weaker check."
+} elseif ($anrCount -gt 1) {
+    "  $anrCount people match '$displayName', so the access email will NOT send."
+    "  Outlook opens with an empty To field for you to pick. Working as intended."
     if ($resolved) {
-        "  Resolve() still returned TRUE, so the access email WOULD send to"
-        "  $smtp without asking. That is a real ambiguity the guard misses -"
-        "  report this, it needs fixing."
-    } else {
-        "  Resolve() returned FALSE, so the access email would open Outlook"
-        "  with an empty To field. Working as intended."
+        "  (Note Resolve() still returned TRUE here - that is exactly why the"
+        "  ambiguity gate uses this directory count instead of Resolve().)"
     }
-} elseif ($found.Count -eq 1) {
-    "  Exactly one person has that name. The entries you see while typing are"
-    "  substring matches from autocomplete, not duplicates. Sending to $smtp"
-    "  is correct."
+} elseif ($anrCount -eq 1) {
+    "  Exactly one person matches. The extra entries you see while typing in"
+    "  Outlook are autocomplete substring matches, not duplicates."
+    "  The access email would send to the address listed above, provided it is"
+    "  in your email_domain, fits email_local_format, and encryption confirms."
 } else {
-    "  Nobody in the directory has that exact display name."
-    if ($resolved) {
-        "  Resolve() still returned TRUE, so it matched a local Contact or the"
-        "  autocomplete cache rather than the directory - see 'Entry type' above."
-    } else {
-        "  The access email would open Outlook with an empty To field."
-    }
+    "  Nobody in the directory matches '$displayName', so nothing would be sent;"
+    "  Outlook opens with an empty To field."
 }
