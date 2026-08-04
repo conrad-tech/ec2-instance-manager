@@ -32,10 +32,13 @@ cargo clippy --features gui
 
 ## Build status
 
-As of 2026-07-31, the full build pipeline passes cleanly:
+As of 2026-08-04 (commit `58a9b9a`, rustc 1.94.0), the full build pipeline
+passes cleanly:
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 298 tests pass (168 lib + 3 CLI + 127 GUI)
-- `cargo clippy --features gui` — only pre-existing lib-level warnings (derivable_impls on Mode, too_many_arguments on sim::make_instance, collapsible_if in GUI)
+- `cargo test --features gui` — 302 tests pass, 0 fail (168 lib + 3 CLI + 131 GUI)
+- `cargo clippy --features gui` — no errors; 21 pre-existing style warnings
+  (derivable_impls on Mode, too_many_arguments on sim::make_instance,
+  collapsible_if / let_and_return / manual_is_multiple_of in the GUI)
 - Release targets — zero warnings on both Linux (x86_64-unknown-linux-gnu, via
   `build_binaries.sh`) and Windows (x86_64-pc-windows-gnu, built directly since
   the script aborts without `zip` — see below)
@@ -46,6 +49,49 @@ As of 2026-07-31, the full build pipeline passes cleanly:
   target is ever built. If you only need to check that both targets compile,
   build them directly (see the cross-compile note below) rather than running the
   packaging script.
+
+### Known-good rollback point: `pre-email-readd-58a9b9a`
+
+Tag `pre-email-readd-58a9b9a` (annotated, on `58a9b9a`) marks the last state
+verified working **before** the Outlook access-email integration is re-added.
+Roll back with:
+
+```bash
+git reset --hard pre-email-readd-58a9b9a
+```
+
+Everything in the Build status section above was run against that exact commit
+with a clean working tree, plus the Windows release cross-compile
+(`CARGO_TARGET_DIR=/tmp/ec2m cargo build --release --target x86_64-pc-windows-gnu
+--features gui`, exit 0). The tree is confirmed email-free — no hits for
+`send_access_email` / `outlook` / `access_email` / `smtp` / `MailItem` outside
+`target/`.
+
+**Re-adding email = reverting `0360342` ("Removed email code.").** That restores
+`ACCESS_EMAIL_WALKTHROUGH.md`, four PowerShell assets
+(`send_access_email.ps1`, `outlook_verification.ps1`, `test_access_email.ps1`,
+`test_headless_encrypt.ps1`), the `access_email` block in `features.json`, the
+`AccessEmailConfig` struct in `features.rs`, the GUI wiring, and the
+`build_binaries.sh` hunk that copies `send_access_email.ps1` next to the GUI exe
+(deliberately *not* embedded, to avoid EDR false positives).
+
+`git revert --no-commit 0360342` does **not** apply cleanly — three conflicts,
+all because the files moved on under the alerts / Vault IAM / personal-scripts
+work:
+
+- `WSL/assets/features.json`
+- `WSL/src/features.rs`
+- `WSL/src/bin/ec2_manager_gui.rs`
+
+The PowerShell assets, the walkthrough, and the `build_binaries.sh` hunk apply
+clean. Earlier email history, if the revert gets messy: `5e03e93` (initial),
+`3dc603d` (logic), `050a4b9` (manual button), `ccb3104` (the last commit that
+*has* the code).
+
+**Why it was removed:** CrowdStrike quarantined the app, so `2c9a8e6` stripped
+email as a test. It still quarantined afterward, so email was ruled out as the
+cause; `2c31e8c` then reset the branch to the pre-email baseline `c51a397` for a
+clean test target. Tag `pre-rollback-2c9a8e6` preserves the old tip.
 
 ### Windows cross-compile and spaces in the repo path
 
