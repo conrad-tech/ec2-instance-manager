@@ -1939,15 +1939,18 @@ mod gui {
         // nobody, 2+ ambiguous. Absent on output from an older script.
         let matches: Option<i64> = single_unquoted_value(rest, "matches=")
             .and_then(|v| v.parse().ok());
-        let reason = if matches == Some(-1) {
-            "Not sent - could not search the directory to check for duplicate names".to_string()
-        } else if matches == Some(0) {
+        // matches == -1 means the directory could not be queried (normal on an
+        // Entra-joined machine). That is not itself a failure: the script falls
+        // back to Outlook's resolution, and the checks below still apply.
+        let reason = if matches == Some(0) {
             "Not sent - nobody in the directory matches that name".to_string()
         } else if matches.is_some_and(|n| n > 1) {
             let n = matches.unwrap_or_default();
             format!("Not sent - {n} people match that name; pick one in Outlook")
         } else if !flag("resolved") {
             "Outlook opened - pick the recipient".to_string()
+        } else if rest.contains("dir_user=False") {
+            "Not sent - that address is not in the company directory (a local Contact?)".to_string()
         } else if !flag("domain_ok") {
             "Outlook opened - that address is not in your mail domain".to_string()
         } else if rest.contains("local_ok=False") {
@@ -17317,16 +17320,35 @@ mod gui {
         }
 
         #[test]
-        fn an_unqueryable_directory_is_reported_as_such() {
-            // -1 means the LDAP lookup itself failed. That is a different
-            // problem from "nobody matched" and needs a different fix.
+        fn an_unqueryable_directory_is_not_itself_a_failure() {
+            // matches=-1 is normal on an Entra-joined machine with no on-prem
+            // AD. The script falls back to Outlook's resolution, so the status
+            // must report the real blocker - here the name format - and not
+            // the LDAP lookup.
             let s = parse_email_marker(
-                "OPEN recipient='Test User' matches=-1 resolved=False domain_ok=False encrypted=True",
+                "OPEN recipient='Test User' matches=-1 resolved=True dir_user=True domain_ok=True local_ok=False encrypted=True",
             )
             .expect("OPEN parses");
             match s {
                 EmailStatus::Opened { reason } => {
-                    assert!(reason.contains("directory"), "{reason}")
+                    assert!(reason.contains("does not match"), "{reason}");
+                    assert!(!reason.contains("directory"), "{reason}");
+                }
+                other => panic!("expected Opened, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_non_directory_entry_is_named_as_the_blocker() {
+            // A local Contact or saved one-off address resolving for the name
+            // is exactly how a private key reaches the wrong mailbox.
+            let s = parse_email_marker(
+                "OPEN recipient='Test User' matches=-1 resolved=True dir_user=False domain_ok=True local_ok=True encrypted=True",
+            )
+            .expect("OPEN parses");
+            match s {
+                EmailStatus::Opened { reason } => {
+                    assert!(reason.contains("not in the company directory"), "{reason}")
                 }
                 other => panic!("expected Opened, got {other:?}"),
             }

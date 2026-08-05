@@ -137,9 +137,11 @@ if ($Pem -and (Test-Path -LiteralPath $Pem)) {
 #   2+ matches -> the ambiguity we care about -> open Outlook
 #   1 match    -> send to that address
 #
-# A directory that cannot be queried (not domain-joined, LDAP blocked) counts
-# as -1 and FAILS CLOSED. Falling back to Resolve() would restore exactly the
-# hole this replaces, and the attachment is a private key.
+# A directory that cannot be queried counts as -1. That is the normal case on
+# an Entra-ID-joined machine with no on-prem AD reachable, so it does NOT
+# disable the feature; it falls back to Outlook's own resolution, which is a
+# weaker ambiguity check made safe by the three gates that follow (must be a
+# real directory user, in -Domain, matching -ExpectedLocal).
 $anrCount = -1
 $anrMail  = ""
 $anrList  = @()
@@ -173,10 +175,41 @@ if ($anrList.Count -gt 0) { $anrList | ForEach-Object { Write-Output $_ } }
 $resolved = $false
 $smtp     = ""
 $recip    = $null
+$dirUser  = $false
+
 if ($anrCount -eq 1 -and $anrMail) {
     $smtp  = $anrMail
     $recip = $mail.Recipients.Add($smtp)
     try { $resolved = [bool]$recip.Resolve() } catch { $resolved = $false }
+    $dirUser = $true   # it came out of the directory by definition
+} elseif ($anrCount -lt 0) {
+    # No directory to query - an Entra-ID-joined machine with no on-prem AD
+    # reachable, which is normal for a cloud-first tenant. Fall back to
+    # Outlook's own resolution rather than disabling the feature outright.
+    #
+    # This is a WEAKER ambiguity check: Recipient.Resolve() reports success for
+    # a name several people share. What keeps it safe is that the resolved
+    # entry must ALSO be a real Exchange directory user (not a local Contact or
+    # a one-off address), be in -Domain, and match -ExpectedLocal. A wrong
+    # person clearing all three would have to have the requested user's own
+    # name shape, in the org's own directory.
+    $recip = $mail.Recipients.Add($displayName)
+    try { $resolved = [bool]$recip.Resolve() } catch { $resolved = $false }
+    if ($resolved) {
+        try {
+            $eu = $recip.AddressEntry.GetExchangeUser()
+            if ($null -ne $eu) {
+                $smtp    = "$($eu.PrimarySmtpAddress)"
+                $dirUser = $true
+            }
+        } catch {}
+        if (-not $dirUser) {
+            # A local Contact or a one-off address. Never send to one of these:
+            # a stale personal entry for the same name is precisely the way a
+            # private key reaches the wrong mailbox.
+            try { $smtp = "$($recip.Address)" } catch { $smtp = "" }
+        }
+    }
 }
 
 # The one match must still be in our own domain.
@@ -260,7 +293,7 @@ if ($TemplateGuid) {
 # unattended without a confirmed single recipient in our own domain and
 # confirmed encryption.
 $sent = $false
-if ($resolved -and $domainOk -and $localOk -and $encConfirmed) {
+if ($resolved -and $dirUser -and $domainOk -and $localOk -and $encConfirmed) {
     try { $mail.Send(); $sent = $true } catch { $sent = $false }
 }
 
@@ -275,11 +308,7 @@ if ($sent) {
 try { while ($mail.Recipients.Count -gt 0) { $mail.Recipients.Remove(1) } } catch {}
 
 $reason =
-    if ($anrCount -lt 0) {
-        "Could not search the directory to check how many people match '$displayName', so nothing was sent.`n`n" +
-        "This machine may not be joined to the domain, or LDAP may be blocked.`n`n" +
-        "The email is ready below with the To field empty. Enter the correct recipient, confirm it still shows encrypted, then click Send."
-    } elseif ($anrCount -eq 0) {
+    if ($anrCount -eq 0) {
         "Nobody in the directory matches '$displayName', so nothing was sent.`n`n" +
         "The email is ready below with the To field empty. Enter the correct recipient, confirm it still shows encrypted, then click Send."
     } elseif ($anrCount -gt 1) {
@@ -287,7 +316,11 @@ $reason =
         (($anrList -join "`n").Trim()) + "`n`n" +
         "The email is ready below with the To field empty. Pick the correct person, confirm it still shows encrypted, then click Send."
     } elseif (-not $resolved) {
-        "Outlook could not resolve $smtp, so nothing was sent.`n`n" +
+        "Outlook could not identify a single recipient for '$displayName', so nothing was sent.`n`n" +
+        "The email is ready below with the To field empty. Enter the correct recipient, confirm it still shows encrypted, then click Send."
+    } elseif (-not $dirUser) {
+        "'$displayName' matched $smtp, which is not an entry in the company directory - it looks like a local Contact or a saved address.`n`n" +
+        "Nothing was sent: that is how a private key reaches the wrong mailbox.`n`n" +
         "The email is ready below with the To field empty. Enter the correct recipient, confirm it still shows encrypted, then click Send."
     } elseif (-not $domainOk) {
         "'$displayName' resolved to $smtp, which is not in $Domain.`n`n" +
@@ -321,4 +354,4 @@ if (-not $encConfirmed -and $EncryptSendKeys) {
 }
 
 Show-Box $reason "Warning"
-Write-Output "OPEN recipient='$displayName' matches=$anrCount resolved=$resolved domain_ok=$domainOk local_ok=$localOk encrypted=$encConfirmed enc_config=$encConfigured"
+Write-Output "OPEN recipient='$displayName' matches=$anrCount resolved=$resolved dir_user=$dirUser domain_ok=$domainOk local_ok=$localOk encrypted=$encConfirmed enc_config=$encConfigured"
