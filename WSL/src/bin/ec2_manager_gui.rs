@@ -2018,6 +2018,19 @@ mod gui {
         Some(format!("{first_initial}{surname}").to_lowercase())
     }
 
+    /// True when the configured template GUID is the shipped all-zeros
+    /// placeholder (or blank) rather than a real tenant template.
+    ///
+    /// Mirrors the same test in `send_access_email.ps1`, so the GUI can say
+    /// "this build cannot send" in the log instead of leaving the user to
+    /// infer it from a run that always opens Outlook.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn template_guid_is_placeholder(guid: &str) -> bool {
+        !guid
+            .chars()
+            .any(|c| !matches!(c, '{' | '}' | '-' | '0') && !c.is_whitespace())
+    }
+
     /// Every local part worth probing for this user: the bare stem first, then
     /// the numbered variants up to `max_suffix`.
     ///
@@ -2166,6 +2179,28 @@ mod gui {
         tx: Sender<EmailStatus>,
         log_tx: Sender<String>,
     ) -> bool {
+        // What actually reached the binary. features.json is compiled in at
+        // build time, so an edit that was never rebuilt — or a pull that
+        // overwrote it — is invisible without this. Logged before the OS gate
+        // so it appears on dev builds too.
+        let _ = log_tx.send(format!(
+            "access email config: domains=[{}] local_format='{}' max_suffix={} template_guid={}",
+            cfg.email_domains.join(", "),
+            cfg.email_local_format,
+            cfg.email_local_max_suffix,
+            if template_guid_is_placeholder(&cfg.encrypt_template_guid) {
+                "PLACEHOLDER - this build will never send"
+            } else {
+                "configured"
+            }
+        ));
+        if cfg.email_domains.is_empty() {
+            let _ = log_tx.send(
+                "access email config: email_domains is empty, so the address probe cannot run \
+                 (it builds addresses from those domains)"
+                    .to_string(),
+            );
+        }
         #[cfg(target_os = "windows")]
         {
             match launch_access_email(cfg, username, env, primary_id, secondary_id, pem_path) {
@@ -17459,6 +17494,26 @@ mod gui {
         }
 
         #[test]
+        fn the_shipped_all_zeros_guid_is_recognised_as_a_placeholder() {
+            assert!(template_guid_is_placeholder(
+                "{00000000-0000-0000-0000-000000000000}"
+            ));
+            assert!(template_guid_is_placeholder(
+                "00000000-0000-0000-0000-000000000000"
+            ));
+            // Nothing configured at all is equally "not a real template".
+            assert!(template_guid_is_placeholder(""));
+            assert!(template_guid_is_placeholder("   "));
+        }
+
+        #[test]
+        fn a_real_guid_is_not_a_placeholder() {
+            assert!(!template_guid_is_placeholder(
+                "{c1a2b3d4-0000-0000-0000-000000000000}"
+            ));
+        }
+
+        #[test]
         fn candidates_are_the_stem_then_the_numbered_variants() {
             // Most people are jsmith; a minority carry a number because someone
             // shared the surname. Probing the range finds them without needing
@@ -17783,6 +17838,31 @@ mod gui {
                 .expect("enabled config builds a command");
             assert!(cmd.wsl.contains("-Domain ''"), "{}", cmd.wsl);
             assert!(cmd.powershell.contains("-Domain ''"), "{}", cmd.powershell);
+        }
+
+        #[test]
+        fn the_shipped_config_reaches_the_generated_command() {
+            // End-to-end over the real pipeline: assets/features.json ->
+            // build.rs obfuscation -> include_bytes! -> deserialize -> command
+            // argument. Asserts against whatever the shipped file holds rather
+            // than fixed values, so it catches the embedding silently dropping
+            // a field without breaking when an admin edits the config.
+            let features = ec2_manager::features::load();
+            let cfg = &features.access_email;
+            if !cfg.enabled {
+                return; // disabled builds legitimately produce no command
+            }
+            let cmd = build_email_command(cfg, "john.smith", "DEV1", "i-1", "i-2", "/p.pem")
+                .expect("an enabled config builds a command");
+            let expected_domains = format!("-Domain '{}'", cfg.email_domains.join(","));
+            assert!(
+                cmd.wsl.contains(&expected_domains),
+                "shipped domains {:?} did not reach the command: {}",
+                cfg.email_domains,
+                cmd.wsl
+            );
+            let expected_format = format!("-LocalFormat '{}'", cfg.email_local_format);
+            assert!(cmd.wsl.contains(&expected_format), "{}", cmd.wsl);
         }
 
         #[test]

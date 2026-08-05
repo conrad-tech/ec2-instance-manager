@@ -43,7 +43,7 @@
   "access_email": {
     "enabled": true,
     "auto_run": true,
-    "email_domains": [],
+    "email_domains": ["test.com", "test2.com"],
     "email_local_format": "flast",
     "email_local_max_suffix": 5,
     "encrypt_template_guid": "{00000000-0000-0000-0000-000000000000}",

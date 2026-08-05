@@ -35,7 +35,7 @@ cargo clippy --features gui
 As of 2026-08-04 (rustc 1.94.0), with the access-email integration restored and
 made automatic, the full build pipeline passes cleanly:
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 336 tests pass, 0 fail (174 lib + 3 CLI + 159 GUI)
+- `cargo test --features gui` — 353 tests pass, 0 fail (174 lib + 3 CLI + 176 GUI)
 - `cargo clippy --features gui` — no errors; 21 pre-existing style warnings
   (derivable_impls on Mode, too_many_arguments on sim::make_instance,
   collapsible_if / let_and_return / manual_is_multiple_of in the GUI)
