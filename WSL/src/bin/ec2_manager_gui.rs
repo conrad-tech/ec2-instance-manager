@@ -2018,6 +2018,48 @@ mod gui {
         Some(format!("{first_initial}{surname}").to_lowercase())
     }
 
+    /// Whether a rendered log line matches the panel's Ctrl+F filter.
+    ///
+    /// Case-insensitive substring, matched against the whole rendered line
+    /// (timestamp, level and message) so `ERROR` or a time both work as
+    /// searches. An empty or whitespace-only query matches everything, so
+    /// clearing the box restores the full log rather than blanking it.
+    fn log_line_matches(line: &str, query: &str) -> bool {
+        let q = query.trim();
+        if q.is_empty() {
+            return true;
+        }
+        line.to_lowercase().contains(&q.to_lowercase())
+    }
+
+    /// One-line summary of the access-email config as it reached the binary.
+    ///
+    /// `features.json` is compiled in at build time, so an edit that was never
+    /// rebuilt — or one a pull overwrote — is otherwise invisible. Logged at
+    /// startup so it can be checked without creating a user, and again when a
+    /// run begins.
+    fn access_email_config_summary(cfg: &ec2_manager::features::AccessEmailConfig) -> String {
+        let domains = if cfg.email_domains.is_empty() {
+            "NONE - the address probe cannot run".to_string()
+        } else {
+            cfg.email_domains.join(", ")
+        };
+        format!(
+            "access email config: enabled={} auto_run={} domains=[{}] local_format='{}' \
+             max_suffix={} template_guid={}",
+            cfg.enabled,
+            cfg.auto_run,
+            domains,
+            cfg.email_local_format,
+            cfg.email_local_max_suffix,
+            if template_guid_is_placeholder(&cfg.encrypt_template_guid) {
+                "PLACEHOLDER - this build will never send"
+            } else {
+                "configured"
+            }
+        )
+    }
+
     /// True when the configured template GUID is the shipped all-zeros
     /// placeholder (or blank) rather than a real tenant template.
     ///
@@ -2161,7 +2203,15 @@ mod gui {
             .map_err(|e| format!("could not start PowerShell: {e}"))
     }
 
-    /// Kick off the automatic access email and report the outcome over `tx`.
+    /// Where an access-email run reports back to: the outcome for the popup
+    /// status line, and the script's own output for the app log.
+    struct EmailRunChannels {
+        status: Sender<EmailStatus>,
+        log: Sender<String>,
+    }
+
+    /// Kick off the automatic access email and report the outcome over
+    /// `channels.status`, with the script's output going to `channels.log`.
     ///
     /// Best-effort by design: any failure becomes an `EmailStatus::Failed` on
     /// the status line and leaves the "Send Email Command" menu as the manual
@@ -2176,31 +2226,14 @@ mod gui {
         primary_id: &str,
         secondary_id: &str,
         pem_path: &str,
-        tx: Sender<EmailStatus>,
-        log_tx: Sender<String>,
+        channels: EmailRunChannels,
     ) -> bool {
+        let EmailRunChannels { status: tx, log: log_tx } = channels;
         // What actually reached the binary. features.json is compiled in at
         // build time, so an edit that was never rebuilt — or a pull that
         // overwrote it — is invisible without this. Logged before the OS gate
         // so it appears on dev builds too.
-        let _ = log_tx.send(format!(
-            "access email config: domains=[{}] local_format='{}' max_suffix={} template_guid={}",
-            cfg.email_domains.join(", "),
-            cfg.email_local_format,
-            cfg.email_local_max_suffix,
-            if template_guid_is_placeholder(&cfg.encrypt_template_guid) {
-                "PLACEHOLDER - this build will never send"
-            } else {
-                "configured"
-            }
-        ));
-        if cfg.email_domains.is_empty() {
-            let _ = log_tx.send(
-                "access email config: email_domains is empty, so the address probe cannot run \
-                 (it builds addresses from those domains)"
-                    .to_string(),
-            );
-        }
+        let _ = log_tx.send(access_email_config_summary(cfg));
         #[cfg(target_os = "windows")]
         {
             match launch_access_email(cfg, username, env, primary_id, secondary_id, pem_path) {
@@ -3500,6 +3533,11 @@ mod gui {
         main_tab: MainTab,
         logs: VecDeque<LogEntry>,
         log_filters: LogFilters,
+        /// Free-text filter for the log panel (Ctrl+F). Applies on top of the
+        /// level checkboxes and narrows Copy All to what is on screen.
+        log_search: String,
+        /// Set for one frame by Ctrl+F so the search box takes focus.
+        log_search_focus: bool,
         terminals: Vec<TerminalOption>,
         selected_terminal_id: String,
         profile_choice_path: Option<PathBuf>,
@@ -3862,6 +3900,8 @@ mod gui {
                 } else {
                     LogFilters::default()
                 },
+                log_search: String::new(),
+                log_search_focus: false,
                 terminals,
                 selected_terminal_id,
                 profile_choice_path,
@@ -3992,6 +4032,11 @@ mod gui {
                 });
             }
             app.log_info("application started");
+            // Report the compiled-in access-email config immediately, so a
+            // config that did not survive a rebuild or a pull is visible
+            // without having to create a user first.
+            let email_summary = access_email_config_summary(&app.access_email);
+            app.log_info(email_summary);
             if let Some(smoke) = &app.gui_smoke {
                 app.log_info(format!(
                     "GUI smoke mode enabled marker={} expected='{}'",
@@ -8197,8 +8242,10 @@ mod gui {
                                         &run.primary_id,
                                         &run.secondary_id,
                                         pem,
-                                        self.email_tx.clone(),
-                                        self.script_log_tx.clone(),
+                                        EmailRunChannels {
+                                            status: self.email_tx.clone(),
+                                            log: self.script_log_tx.clone(),
+                                        },
                                     );
                                 }
                             }
@@ -13601,44 +13648,72 @@ mod gui {
             });
             ui.separator();
 
-            let matching_count = self
+            // Ctrl+F focuses the search box. Only bound while the Log tab is
+            // showing, so it cannot swallow Ctrl+F (0x06) meant for a terminal.
+            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+                self.log_search_focus = true;
+            }
+            ui.horizontal(|ui| {
+                ui.label("🔍 Find:");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.log_search)
+                        .hint_text("Ctrl+F - filter log lines")
+                        .desired_width(320.0),
+                );
+                if std::mem::take(&mut self.log_search_focus) {
+                    resp.request_focus();
+                }
+                // Escape clears while the box has focus.
+                if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.log_search.clear();
+                }
+                if !self.log_search.is_empty() && ui.button("✖").clicked() {
+                    self.log_search.clear();
+                }
+            });
+            ui.separator();
+
+            // One predicate for the count, the view and Copy All, so what you
+            // see is exactly what gets copied.
+            let rendered = |e: &LogEntry| format!("[{}] [{}] {}", e.time, e.level.as_str(), e.message);
+            let search = self.log_search.clone();
+            let visible: Vec<String> = self
                 .logs
                 .iter()
-                .filter(|entry| self.log_filters.includes(entry.level))
-                .count();
-            ui.label(format!(
-                "Showing {matching_count} / {} log lines",
-                self.logs.len()
-            ));
+                .filter(|e| self.log_filters.includes(e.level))
+                .map(&rendered)
+                .filter(|line| log_line_matches(line, &search))
+                .collect();
+
+            if search.trim().is_empty() {
+                ui.label(format!(
+                    "Showing {} / {} log lines",
+                    visible.len(),
+                    self.logs.len()
+                ));
+            } else {
+                ui.label(format!(
+                    "Showing {} / {} log lines matching \"{}\"",
+                    visible.len(),
+                    self.logs.len(),
+                    search.trim()
+                ));
+            }
             ui.separator();
 
             ui.horizontal(|ui| {
                 if ui.button("Copy All").clicked() {
-                    let text: String = self.logs.iter()
-                        .filter(|e| self.log_filters.includes(e.level))
-                        .map(|e| format!("[{}] [{}] {}", e.time, e.level.as_str(), e.message))
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    let text: String = visible.join("\n");
                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
                         let _ = clipboard.set_text(&text);
                     }
                 }
             });
 
-            // Build colored log text as a LayoutJob for selectable display
-            let mut log_text = String::new();
-            for entry in self.logs.iter()
-                .filter(|e| self.log_filters.includes(e.level))
-            {
-                if !log_text.is_empty() {
-                    log_text.push('\n');
-                }
-                log_text.push_str(&format!(
-                    "[{}] [{}] {}",
-                    entry.time,
-                    entry.level.as_str(),
-                    entry.message
-                ));
+            // Selectable display of exactly the lines counted above.
+            let mut log_text = visible.join("\n");
+            if visible.is_empty() && !search.trim().is_empty() {
+                log_text = format!("(no log lines match \"{}\")", search.trim());
             }
 
             egui::ScrollArea::vertical()
@@ -17491,6 +17566,30 @@ mod gui {
                 encrypt_smime_flag: 0,
                 encrypt_sendkeys: "%6".to_string(),
             }
+        }
+
+        #[test]
+        fn an_empty_log_search_keeps_every_line() {
+            // Clearing the box must restore the log, not blank it.
+            assert!(log_line_matches("[12:00:00] [INFO] anything", ""));
+            assert!(log_line_matches("[12:00:00] [INFO] anything", "   "));
+        }
+
+        #[test]
+        fn log_search_is_case_insensitive_and_spans_the_whole_line() {
+            let line = "[12:00:00] [ERROR] access email: PROBE try tuser3@test.com -> no such mailbox";
+            assert!(log_line_matches(line, "probe"));
+            assert!(log_line_matches(line, "TUSER3"));
+            // The level and timestamp are part of the line, so they search too.
+            assert!(log_line_matches(line, "error"));
+            assert!(log_line_matches(line, "12:00"));
+            assert!(!log_line_matches(line, "vault"));
+        }
+
+        #[test]
+        fn a_padded_log_search_still_matches() {
+            // Pasting a term often brings whitespace with it.
+            assert!(log_line_matches("[12:00:00] [INFO] access email", "  email  "));
         }
 
         #[test]
