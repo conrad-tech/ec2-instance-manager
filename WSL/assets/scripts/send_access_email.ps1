@@ -196,6 +196,14 @@ $probeList = @($Candidates -split ',' | ForEach-Object { $_.Trim().ToLower() } |
 $probeHits = @()
 $localOkOverride = $false
 
+Write-Output "PROBE plan candidates=[$($probeList -join ', ')] domains=[$($domainList -join ', ')]"
+if ($probeList.Count -eq 0) {
+    Write-Output "PROBE skipped: no candidate local parts (email_local_format / email_local_max_suffix)"
+}
+if ($domainList.Count -eq 0) {
+    Write-Output "PROBE skipped: no mail domains configured (access_email.email_domains is empty)"
+}
+
 if ($probeList.Count -gt 0 -and $domainList.Count -gt 0) {
     # The name parts to look for, e.g. test.user -> @('test','user').
     $wantParts = @($parts | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
@@ -204,15 +212,24 @@ if ($probeList.Count -gt 0 -and $domainList.Count -gt 0) {
         foreach ($c in $probeList) {
             $addr = "$c@$d"
             $r = $null
-            try { $r = $ns.CreateRecipient($addr) } catch { continue }
+            try { $r = $ns.CreateRecipient($addr) } catch {
+                Write-Output "PROBE try  $addr -> could not create recipient: $($_.Exception.Message)"
+                continue
+            }
             $ok = $false
             try { $ok = [bool]$r.Resolve() } catch { $ok = $false }
-            if (-not $ok) { continue }
+            if (-not $ok) {
+                Write-Output "PROBE try  $addr -> no such mailbox"
+                continue
+            }
 
             # Must be a real directory user, not a Contact or a one-off.
             $eu = $null
             try { $eu = $r.AddressEntry.GetExchangeUser() } catch {}
-            if ($null -eq $eu) { continue }
+            if ($null -eq $eu) {
+                Write-Output "PROBE try  $addr -> resolved but not a directory user (Contact or one-off)"
+                continue
+            }
 
             $foundAddr = "$($eu.PrimarySmtpAddress)"
             $foundName = "$($eu.Name)"
@@ -225,14 +242,16 @@ if ($probeList.Count -gt 0 -and $domainList.Count -gt 0) {
                 if ($nameWords -notcontains $w) { $nameMatches = $false; break }
             }
             if (-not $nameMatches) {
-                Write-Output "PROBE skip $addr -> '$foundName' (name does not match '$Username')"
+                Write-Output "PROBE try  $addr -> '$foundName' REJECTED: display name does not contain all of [$($wantParts -join ', ')]"
                 continue
             }
 
             # Aliases across domains collapse to one primary address.
             if (($probeHits | ForEach-Object { $_.Address.ToLower() }) -notcontains $foundAddr.ToLower()) {
                 $probeHits += [pscustomobject]@{ Address = $foundAddr; Name = $foundName }
-                Write-Output "PROBE hit  $addr -> '$foundName' <$foundAddr>"
+                Write-Output "PROBE try  $addr -> '$foundName' <$foundAddr> ACCEPTED"
+            } else {
+                Write-Output "PROBE try  $addr -> '$foundName' <$foundAddr> (alias of one already found)"
             }
         }
     }

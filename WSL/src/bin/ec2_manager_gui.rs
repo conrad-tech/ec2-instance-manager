@@ -2164,6 +2164,7 @@ mod gui {
         secondary_id: &str,
         pem_path: &str,
         tx: Sender<EmailStatus>,
+        log_tx: Sender<String>,
     ) -> bool {
         #[cfg(target_os = "windows")]
         {
@@ -2179,6 +2180,15 @@ mod gui {
                                 .lines()
                                 .map_while(std::result::Result::ok)
                             {
+                                // Everything the script says goes to the app
+                                // log. Without this the run is a black box:
+                                // the status line says it opened Outlook but
+                                // not which addresses were tried or why each
+                                // was rejected.
+                                let trimmed = line.trim();
+                                if !trimmed.is_empty() {
+                                    let _ = log_tx.send(format!("access email: {trimmed}"));
+                                }
                                 if let Some(status) = parse_email_marker(&line) {
                                     last = Some(status);
                                 }
@@ -2209,7 +2219,7 @@ mod gui {
         // leave the popup without a status line rather than showing a failure.
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (cfg, env, primary_id, secondary_id, pem_path, tx);
+            let _ = (cfg, env, primary_id, secondary_id, pem_path, tx, log_tx);
             eprintln!(
                 "start_access_email: skipped for {username} (the Outlook automation is Windows only)"
             );
@@ -8153,6 +8163,7 @@ mod gui {
                                         &run.secondary_id,
                                         pem,
                                         self.email_tx.clone(),
+                                        self.script_log_tx.clone(),
                                     );
                                 }
                             }
