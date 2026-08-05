@@ -110,13 +110,17 @@ $mail.Subject = "Bastion Access for $envUpper"
 $mail.Body = @"
 Hello $firstName,
 
-See below for your login credentials and attached is your PEM file.
+Your access to the $envUpper bastion servers is ready. Connect with the username
+below, using the attached PEM file as your private key.
 
 Username: $Username
 
 Primary Bastion: $Primary
 
 Secondary Bastion: $Secondary
+
+Please keep the PEM file somewhere safe and do not share it - it is the only key
+to your account.
 
 Thanks,
 $senderFirst
