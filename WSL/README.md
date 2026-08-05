@@ -671,7 +671,7 @@ actions.
   "access_email": {
     "enabled": true,
     "auto_run": true,
-    "email_domain": "xyz.com",
+    "email_domains": ["xyz.com", "old-xyz.com"],
     "encrypt_template_guid": "{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}",
     "encrypt_permission": 3,
     "encrypt_permission_service": 1,
@@ -690,7 +690,7 @@ actions.
 | `vault_iam.delete_allowed_users` | `[]`  | OS usernames that additionally see the destructive **Vault IAM Delete** entry. Requires membership of `allowed_users` too. Ships empty — nobody. |
 | `access_email.enabled`     | `true`      | Master switch for the whole access-email feature. `false` disables the automatic send and hides the **✉ Send Email Command** menu. See [Access email](#access-email-post-create). |
 | `access_email.auto_run`    | `true`      | Run `send_access_email.ps1` automatically once a create finishes with a saved PEM. `false` leaves the ✉ menu as the only route. |
-| `access_email.email_domain` | `""`       | Your organization's mail domain, e.g. `xyz.com`. A recipient that resolves outside it is never mailed unattended — this is what stops a stale local Contacts entry or autocomplete hit from receiving the PEM. Empty skips the check. |
+| `access_email.email_domains` | `[]`      | Your organization's **mail** domains, e.g. `["xyz.com", "old-xyz.com"]`. A recipient resolving outside all of them is never mailed unattended — this is what stops a stale local Contacts entry or autocomplete hit from receiving the PEM. Staff often have mail on several domains; this is unrelated to the Windows/AD domain the machine is joined to. A single string or a comma-separated string also works, as does the older `email_domain` key. Empty skips the check. |
 | `access_email.email_local_format` | `"flast"` | Shape the address must have for the username. `flast` = first initial + surname with an optional number, so `john.smith` accepts `jsmith@` or `jsmith2@` but not `johnsmith@`. Catches an in-domain address belonging to a different person — which the domain check cannot. Empty skips it. |
 | `access_email.encrypt_template_guid` | *(placeholder)* | Your **Microsoft 365 tenant's** RMS/IRM template GUID, braces included. Ships as an all-zeros placeholder that must be replaced — see [Finding your template GUID](#finding-your-template-guid). |
 | `access_email.encrypt_permission` | `3`    | The `MailItem.Permission` value your Encrypt button applies (`2` = Do Not Forward). `0` skips it. |
@@ -738,11 +738,11 @@ script composes the email in Outlook, attaches the PEM, encrypts it, and:
 
 | Outcome | What happens |
 |---|---|
-| Exactly one directory match, in `email_domain`, address fits `email_local_format` | Encrypted and **sent in the background** — no window |
+| Exactly one directory match, in an `email_domains` entry, address fits `email_local_format` | Encrypted and **sent in the background** — no window |
 | Two or more people match the name | Opens the draft, **To field empty**, listing who matched |
 | Nobody matches | Opens the draft, **To field empty** |
 | The directory could not be searched | Opens the draft and says so — never falls back to a weaker check |
-| One match, address outside `email_domain` | Opens the draft, **To empty**, naming the address it found |
+| One match, address outside every `email_domains` entry | Opens the draft, **To empty**, naming the address it found |
 | One match, but the address does not fit the username | Opens the draft, **To empty** — `test.user` expects `tuser@`, not `testuser@` |
 | Encryption could not be confirmed | Opens the draft and applies your `Alt+6` shortcut |
 

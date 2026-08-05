@@ -6,7 +6,36 @@
 //! at runtime. This is intentional for destructive actions such as
 //! deleting a user.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
+/// Accept a JSON array, a single string, or a comma-separated string, and
+/// return the trimmed non-empty entries.
+///
+/// Config that started as one value and grew into a list is a common source of
+/// churn; taking both spellings means an admin's existing file keeps working
+/// and `"a.com, b.com"` does the obvious thing instead of silently becoming one
+/// domain nothing can match.
+fn string_or_list<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    let raw = match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(s) => s.split(',').map(str::to_string).collect(),
+        OneOrMany::Many(v) => v,
+    };
+    Ok(raw
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
+}
 
 /// Compiled-in feature flags from `assets/features.json`, obfuscated at build
 /// time (see [`crate::obf_core`]) so the gate config, bastion filters and Jira
@@ -219,12 +248,20 @@ pub struct AccessEmailConfig {
     /// does not follow the fail-closed pattern the `allowed_users` lists use.
     /// Set false to leave the menu as the only route.
     pub auto_run: bool,
-    /// The organization's own mail domain, e.g. "xyz.com". A resolved
-    /// recipient's address must sit in this domain before anything is sent
-    /// unattended: Outlook's `Resolve()` also matches the local Contacts folder
-    /// and the autocomplete cache, so a stale personal entry for the same name
-    /// would otherwise be mailed a private key. Blank disables the check.
-    pub email_domain: String,
+    /// The organization's own mail domains, e.g. `["xyz.com", "old-xyz.com"]`.
+    /// A resolved recipient's address must sit in one of them before anything
+    /// is sent unattended: Outlook's `Resolve()` also matches the local
+    /// Contacts folder and the autocomplete cache, so a stale personal entry
+    /// for the same name would otherwise be mailed a private key.
+    ///
+    /// Staff routinely have mail on more than one domain (after a merger or a
+    /// rebrand), and the Windows/AD domain is often a third, unrelated name —
+    /// so this is a list, not the machine's domain.
+    ///
+    /// Accepts a JSON array, a single string, or a comma-separated string, and
+    /// the older `email_domain` spelling. Empty disables the check.
+    #[serde(alias = "email_domain", deserialize_with = "string_or_list")]
+    pub email_domains: Vec<String>,
     /// Shape the recipient's address must have, checked against the username
     /// before anything is sent unattended. `"flast"` means first initial +
     /// surname with an optional numeric suffix, so `john.smith` accepts
@@ -233,6 +270,12 @@ pub struct AccessEmailConfig {
     /// This catches what the domain check cannot: an in-domain address that
     /// simply belongs to a different person with a similar name.
     pub email_local_format: String,
+    /// Highest numeric suffix to probe when looking for the mailbox, e.g. 5
+    /// tries `jsmith`, `jsmith2` … `jsmith5`. People who share a surname get a
+    /// number, and there is no way to know in advance which one — so the script
+    /// resolves each candidate address and requires exactly one real match.
+    /// Below 2 probes only the bare stem.
+    pub email_local_max_suffix: u32,
     /// RMS/IRM template GUID to apply for encryption (tenant-specific).
     /// Empty disables the template path.
     pub encrypt_template_guid: String,
@@ -255,8 +298,9 @@ impl Default for AccessEmailConfig {
         Self {
             enabled: true,
             auto_run: true,
-            email_domain: String::new(),
+            email_domains: Vec::new(),
             email_local_format: String::new(),
+            email_local_max_suffix: 5,
             encrypt_template_guid: String::new(),
             encrypt_permission: 0,
             encrypt_permission_service: 0,
@@ -386,17 +430,47 @@ mod tests {
     }
 
     #[test]
-    fn access_email_domain_defaults_to_blank() {
-        assert_eq!(AccessEmailConfig::default().email_domain, "");
+    fn access_email_domains_default_to_empty() {
+        assert!(AccessEmailConfig::default().email_domains.is_empty());
     }
 
     #[test]
-    fn access_email_domain_is_read_from_json() {
+    fn access_email_domains_accept_a_list() {
+        // Staff can receive mail on more than one domain, so any of them is a
+        // valid destination.
         let cfg: AccessEmailConfig =
-            serde_json::from_str(r#"{"email_domain":"xyz.com"}"#).expect("parses");
-        assert_eq!(cfg.email_domain, "xyz.com");
+            serde_json::from_str(r#"{"email_domains":["a.com","b.com"]}"#).expect("parses");
+        assert_eq!(cfg.email_domains, vec!["a.com", "b.com"]);
         // Unlisted fields still fall back to the Default impl.
         assert!(cfg.enabled);
+    }
+
+    #[test]
+    fn a_single_domain_string_is_still_accepted() {
+        // The field started life as a plain string; existing files must keep
+        // working, and one domain is the common case.
+        let cfg: AccessEmailConfig =
+            serde_json::from_str(r#"{"email_domain":"xyz.com"}"#).expect("parses");
+        assert_eq!(cfg.email_domains, vec!["xyz.com"]);
+    }
+
+    #[test]
+    fn a_comma_separated_domain_string_is_split() {
+        let cfg: AccessEmailConfig =
+            serde_json::from_str(r#"{"email_domains":"a.com, b.com"}"#).expect("parses");
+        assert_eq!(cfg.email_domains, vec!["a.com", "b.com"]);
+    }
+
+    #[test]
+    fn blank_and_empty_domain_entries_are_dropped() {
+        // A blank value means "no check"; it must not become a domain named ""
+        // that nothing can ever match.
+        let cfg: AccessEmailConfig =
+            serde_json::from_str(r#"{"email_domains":["a.com","","  "]}"#).expect("parses");
+        assert_eq!(cfg.email_domains, vec!["a.com"]);
+        let blank: AccessEmailConfig =
+            serde_json::from_str(r#"{"email_domains":""}"#).expect("parses");
+        assert!(blank.email_domains.is_empty());
     }
 
     #[test]

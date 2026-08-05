@@ -40,9 +40,10 @@ param(
     [string]$Primary         = "",   # primary bastion instance id
     [string]$Secondary       = "",   # secondary bastion instance id
     [string]$Pem             = "",   # local path to the PEM to attach
-    [string]$Domain          = "",   # org mail domain; resolved address must match
+    [string]$Domain          = "",   # org MAIL domain(s), comma-separated; any one matches
     [string]$LocalFormat     = "",   # non-empty turns the name-shape check on
     [string]$ExpectedLocal   = "",   # stem the address must be, e.g. "jsmith"
+    [string]$Candidates      = "",   # comma-separated locals to probe: jsmith,jsmith2,...
     [switch]$Quiet,                  # suppress message boxes (GUI shows status)
     [string]$TemplateGuid      = "",   # RMS/IRM template GUID (tenant-specific)
     [int]   $Permission        = 0,    # MailItem.Permission value to set (0=skip)
@@ -177,7 +178,73 @@ $smtp     = ""
 $recip    = $null
 $dirUser  = $false
 
-if ($anrCount -eq 1 -and $anrMail) {
+# --- Probe the addresses this username should have -----------------------
+# Resolving an ADDRESS is unambiguous; resolving a display name is not. Given
+# the org's naming convention we can therefore look the mailbox up directly:
+# try jsmith@, jsmith2@ ... across every configured mail domain and keep the
+# ones that are real directory users.
+#
+# Where two candidates both exist (jsmith is Jane Smith, jsmith3 is John
+# Smith), the address alone cannot say which is ours - so each hit's display
+# name must also contain the username's own name parts. If exactly one survives
+# both tests it is the recipient; anything else opens Outlook.
+$probeList = @($Candidates -split ',' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
+$probeHits = @()
+$localOkOverride = $false
+
+if ($probeList.Count -gt 0 -and $domainList.Count -gt 0) {
+    # The name parts to look for, e.g. test.user -> @('test','user').
+    $wantParts = @($parts | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
+
+    foreach ($d in $domainList) {
+        foreach ($c in $probeList) {
+            $addr = "$c@$d"
+            $r = $null
+            try { $r = $ns.CreateRecipient($addr) } catch { continue }
+            $ok = $false
+            try { $ok = [bool]$r.Resolve() } catch { $ok = $false }
+            if (-not $ok) { continue }
+
+            # Must be a real directory user, not a Contact or a one-off.
+            $eu = $null
+            try { $eu = $r.AddressEntry.GetExchangeUser() } catch {}
+            if ($null -eq $eu) { continue }
+
+            $foundAddr = "$($eu.PrimarySmtpAddress)"
+            $foundName = "$($eu.Name)"
+
+            # Display name must account for the username. Compared as a set of
+            # words so "User, Test" and "Test A User" both match test.user.
+            $nameWords = @(($foundName.ToLower() -replace '[^a-z0-9]+', ' ') -split '\s+' | Where-Object { $_ })
+            $nameMatches = $true
+            foreach ($w in $wantParts) {
+                if ($nameWords -notcontains $w) { $nameMatches = $false; break }
+            }
+            if (-not $nameMatches) {
+                Write-Output "PROBE skip $addr -> '$foundName' (name does not match '$Username')"
+                continue
+            }
+
+            # Aliases across domains collapse to one primary address.
+            if (($probeHits | ForEach-Object { $_.Address.ToLower() }) -notcontains $foundAddr.ToLower()) {
+                $probeHits += [pscustomobject]@{ Address = $foundAddr; Name = $foundName }
+                Write-Output "PROBE hit  $addr -> '$foundName' <$foundAddr>"
+            }
+        }
+    }
+}
+
+if ($probeHits.Count -eq 1) {
+    $smtp    = $probeHits[0].Address
+    $recip   = $mail.Recipients.Add($smtp)
+    try { $resolved = [bool]$recip.Resolve() } catch { $resolved = $false }
+    $dirUser = $true
+    $localOkOverride = $true
+} elseif ($probeHits.Count -gt 1) {
+    # Several real people fit this username's address shape and name. Which one
+    # is the new account cannot be decided from here.
+    Write-Output "PROBE ambiguous: $($probeHits.Count) mailboxes fit '$Username'"
+} elseif ($anrCount -eq 1 -and $anrMail) {
     $smtp  = $anrMail
     $recip = $mail.Recipients.Add($smtp)
     try { $resolved = [bool]$recip.Resolve() } catch { $resolved = $false }
@@ -212,15 +279,23 @@ if ($anrCount -eq 1 -and $anrMail) {
     }
 }
 
-# The one match must still be in our own domain.
+# The match must still be in one of our own mail domains. -Domain is a
+# comma-separated list: staff often have mail on more than one (after a merger
+# or rebrand), and any of them is a legitimate destination. Note this is the
+# MAIL domain, unrelated to the Windows/AD domain the machine is joined to.
+$domainList = @()
+if ($Domain) {
+    $domainList = @($Domain -split ',' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
+}
+
 $domainOk = $false
 if ($resolved) {
-    if (-not $Domain) {
-        # No domain configured - check disabled, preserving older behavior.
+    if ($domainList.Count -eq 0) {
+        # None configured - check disabled, preserving older behavior.
         $domainOk = $true
     } elseif ($smtp -like "*@*") {
-        $addrDomain = ($smtp -split '@')[-1]
-        $domainOk = $addrDomain.Trim().ToLower() -eq $Domain.Trim().ToLower()
+        $addrDomain = (($smtp -split '@')[-1]).Trim().ToLower()
+        $domainOk = $domainList -contains $addrDomain
     }
 }
 
@@ -229,8 +304,14 @@ if ($resolved) {
 # "Test User" to testuser@ when the username is test.user (so tuser@) is exactly
 # that. The app derives $ExpectedLocal; an optional numeric suffix is allowed,
 # since organizations disambiguate duplicates that way (jsmith, jsmith2).
+#
+# Skipped when the probe found the mailbox: it was located BY one of these
+# addresses, so the shape is satisfied by construction. Re-checking would then
+# compare against the account's PRIMARY address, which can legitimately differ
+# from the alias we resolved (tuser3@ resolving to test.user@), and reject a
+# correct recipient.
 $localOk = $true
-if ($LocalFormat) {
+if ($LocalFormat -and -not $localOkOverride) {
     $localOk = $false
     if (-not $ExpectedLocal) {
         # The format is configured but no stem could be derived (an unknown
@@ -308,7 +389,11 @@ if ($sent) {
 try { while ($mail.Recipients.Count -gt 0) { $mail.Recipients.Remove(1) } } catch {}
 
 $reason =
-    if ($anrCount -eq 0) {
+    if ($probeHits.Count -gt 1) {
+        "$($probeHits.Count) mailboxes fit the username '$Username', so nothing was sent:`n`n" +
+        (($probeHits | ForEach-Object { "    $($_.Name) <$($_.Address)>" }) -join "`n") + "`n`n" +
+        "The email is ready below with the To field empty. Pick the correct person, confirm it still shows encrypted, then click Send."
+    } elseif ($anrCount -eq 0) {
         "Nobody in the directory matches '$displayName', so nothing was sent.`n`n" +
         "The email is ready below with the To field empty. Enter the correct recipient, confirm it still shows encrypted, then click Send."
     } elseif ($anrCount -gt 1) {
@@ -323,10 +408,10 @@ $reason =
         "Nothing was sent: that is how a private key reaches the wrong mailbox.`n`n" +
         "The email is ready below with the To field empty. Enter the correct recipient, confirm it still shows encrypted, then click Send."
     } elseif (-not $domainOk) {
-        "'$displayName' resolved to $smtp, which is not in $Domain.`n`n" +
+        "'$displayName' resolved to $smtp, which is not in any of your mail domains ($($domainList -join ', ')).`n`n" +
         "The email is ready below with the To field empty. Enter the correct recipient, confirm it still shows encrypted, then click Send."
     } elseif (-not $localOk) {
-        "'$displayName' resolved to $smtp, but the username '$Username' expects an address like '$ExpectedLocal@$Domain' (an optional number is allowed).`n`n" +
+        "'$displayName' resolved to $smtp, but the username '$Username' expects an address starting '$ExpectedLocal' (an optional number is allowed).`n`n" +
         "That usually means Outlook matched a different person with a similar name. Nothing was sent.`n`n" +
         "The email is ready below with the To field empty. Enter the correct recipient, confirm it still shows encrypted, then click Send."
     } elseif (-not $encConfigured) {
@@ -354,4 +439,4 @@ if (-not $encConfirmed -and $EncryptSendKeys) {
 }
 
 Show-Box $reason "Warning"
-Write-Output "OPEN recipient='$displayName' matches=$anrCount resolved=$resolved dir_user=$dirUser domain_ok=$domainOk local_ok=$localOk encrypted=$encConfirmed enc_config=$encConfigured"
+Write-Output "OPEN recipient='$displayName' probe=$($probeHits.Count) matches=$anrCount resolved=$resolved dir_user=$dirUser domain_ok=$domainOk local_ok=$localOk encrypted=$encConfirmed enc_config=$encConfigured"

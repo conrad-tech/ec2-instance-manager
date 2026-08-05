@@ -1,8 +1,9 @@
 # Access Email Setup - Walkthrough
 
 After a user is created, the app composes the "bastion access" email in Outlook,
-encrypts it, and - when the recipient resolves to exactly one person in your
-mail domain - sends it in the background. Otherwise Outlook opens with the
+encrypts it, and - when it can identify exactly one directory user whose
+address matches the username and sits in one of your mail domains - sends it in
+the background. Otherwise Outlook opens with the
 email ready and the To field empty. This is **Windows only** and relies on
 Outlook being installed and signed in.
 
@@ -22,6 +23,9 @@ All commands run in **PowerShell** (no admin needed). The helper scripts live in
 `assets/scripts/`:
 - `test_resolve_recipient.ps1` - dry run: who would a username be mailed, and
   is the name really ambiguous? Sends nothing, creates no draft.
+- `test_directory_access.ps1` - can this machine query an on-prem AD at all?
+  Answers whether the duplicate-name count is available here. Takes no
+  arguments.
 - `outlook_verification.ps1` - read what your Encrypt button sets
 - `test_headless_encrypt.ps1` - confirm headless encryption works, auto-grab the GUID
 - `test_access_email.ps1` - send a full test email to yourself
@@ -124,7 +128,7 @@ Edit `assets/features.json`, fill in the `access_email` block, then rebuild:
 "access_email": {
   "enabled": true,
   "auto_run": true,
-  "email_domain": "xyz.com",
+  "email_domains": ["xyz.com", "old-xyz.com"],
   "encrypt_template_guid": "{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}",
   "encrypt_permission": 3,
   "encrypt_permission_service": 1,
@@ -138,7 +142,8 @@ Edit `assets/features.json`, fill in the `access_email` block, then rebuild:
 - `enabled` - set `false` to turn the whole feature off.
 - `auto_run` - set `false` to stop the app running the script itself, leaving
   the ✉ Send Email Command menu as the only route.
-- `email_domain` - your organization's mail domain. A recipient that resolves
+- `email_domains` - your organization's MAIL domains (a list; staff often have
+  more than one, and it is unrelated to the Windows/AD domain). A recipient that resolves
   to an address outside it is never mailed unattended, which is what stops a
   stale local Contacts entry from receiving the PEM. Leave empty to skip.
 - `encrypt_sendkeys` - your QAT Encrypt shortcut, used only on the visible
@@ -176,11 +181,11 @@ The script:
 
 | Case | What happens |
 |---|---|
-| **Exactly one directory match, in `email_domain`, address fits `email_local_format`** | Encrypts headless and **sends silently** - no compose window. Prints `SENT recipient='...' address='...'`. |
+| **Exactly one directory match, in an `email_domains` entry, address fits `email_local_format`** | Encrypts headless and **sends silently** - no compose window. Prints `SENT recipient='...' address='...'`. |
 | **Two or more people match the name** | Opens the draft with the **To field empty** and lists who matched. This is the case Outlook's suggestion dropdown shows you. |
 | **Nobody matches** | Opens the draft with the **To field empty**. |
 | **The directory could not be searched** | Opens the draft and says so - the machine may not be domain-joined, or LDAP may be blocked. It never falls back to a weaker check. |
-| **One match, address outside `email_domain`** | Opens the draft, **To empty**, naming the address it found. Guards against a stale Contacts entry receiving the PEM. |
+| **One match, address outside every `email_domains` entry** | Opens the draft, **To empty**, naming the address it found. Guards against a stale Contacts entry receiving the PEM. |
 | **One match, but the address does not fit the name** | Opens the draft, **To empty**. `test.user` expects `tuser@` or `tuser2@`; `testuser@` is a different person. |
 | **Encryption could not be confirmed** | Opens the draft and presses your Alt+6 shortcut. Only ever pressed when headless encryption failed, since Alt+6 is a toggle. |
 
@@ -212,7 +217,7 @@ run it by hand from the ✉ menu and the boxes come back.
 > reporting.
 
 The private key is only sent automatically when the recipient resolves to one
-person, that person's address is in your configured `email_domain`, **and**
+person, that person's address is in one of your configured `email_domains`, **and**
 encryption is confirmed on the item. Alt+6 is only ever pressed on a
 not-yet-encrypted draft (it's a toggle), so it never accidentally un-encrypts.
 

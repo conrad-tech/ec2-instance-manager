@@ -74,11 +74,13 @@ if ($resolved) {
     try { "Entry name   : $($recip.AddressEntry.Name)" } catch {}
 
     if ($Domain) {
+        # -Domain accepts a comma-separated list, like the real script.
+        $dl = @($Domain -split ',' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
         $ok = $false
         if ($smtp -like "*@*") {
-            $ok = (($smtp -split '@')[-1]).Trim().ToLower() -eq $Domain.Trim().ToLower()
+            $ok = $dl -contains (($smtp -split '@')[-1]).Trim().ToLower()
         }
-        "In '$Domain' : $ok"
+        "In domains   : $ok   ($($dl -join ', '))"
     }
 } elseif ($null -ne $ns) {
     "Resolved to  : (nothing - Outlook treated the name as ambiguous or unknown)"

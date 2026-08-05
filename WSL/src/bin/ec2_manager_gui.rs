@@ -1942,7 +1942,12 @@ mod gui {
         // matches == -1 means the directory could not be queried (normal on an
         // Entra-joined machine). That is not itself a failure: the script falls
         // back to Outlook's resolution, and the checks below still apply.
-        let reason = if matches == Some(0) {
+        let probe: Option<i64> =
+            single_unquoted_value(rest, "probe=").and_then(|v| v.parse().ok());
+        let reason = if probe.is_some_and(|n| n > 1) {
+            let n = probe.unwrap_or_default();
+            format!("Not sent - {n} mailboxes fit that username; pick one in Outlook")
+        } else if matches == Some(0) {
             "Not sent - nobody in the directory matches that name".to_string()
         } else if matches.is_some_and(|n| n > 1) {
             let n = matches.unwrap_or_default();
@@ -2013,6 +2018,29 @@ mod gui {
         Some(format!("{first_initial}{surname}").to_lowercase())
     }
 
+    /// Every local part worth probing for this user: the bare stem first, then
+    /// the numbered variants up to `max_suffix`.
+    ///
+    /// Most people are `jsmith`; a minority carry a number because someone
+    /// already had the surname. Probing `jsmith`, `jsmith2`… lets the script
+    /// find the mailbox by *address* — which resolves unambiguously — instead
+    /// of by display name, which does not. That matters because an Entra-only
+    /// machine has no directory to search for duplicates.
+    ///
+    /// Empty when no stem can be derived, so the caller falls back rather than
+    /// probing nonsense.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn expected_email_locals(username: &str, format: &str, max_suffix: u32) -> Vec<String> {
+        let Some(stem) = expected_email_local(username, format) else {
+            return Vec::new();
+        };
+        let mut out = vec![stem.clone()];
+        for n in 2..=max_suffix {
+            out.push(format!("{stem}{n}"));
+        }
+        out
+    }
+
     /// Absolute path to the `send_access_email.ps1` that ships **next to the
     /// executable**. It is deliberately not embedded in the binary and never
     /// written to `%TEMP%` — dropping a script into temp and running it is a
@@ -2042,7 +2070,9 @@ mod gui {
             ("-Primary", primary_id.to_string()),
             ("-Secondary", secondary_id.to_string()),
             ("-Pem", pem_path.to_string()),
-            ("-Domain", cfg.email_domain.clone()),
+            // Comma-separated: staff can have mail on more than one domain,
+            // and the script accepts any of them.
+            ("-Domain", cfg.email_domains.join(",")),
             // The format name doubles as the on/off switch; the stem is
             // derived here so the rule stays unit-testable. A configured
             // format with an underivable stem leaves the stem empty, which
@@ -2051,6 +2081,18 @@ mod gui {
             (
                 "-ExpectedLocal",
                 expected_email_local(username, &cfg.email_local_format).unwrap_or_default(),
+            ),
+            // Addresses to probe. Resolving an address is unambiguous where
+            // resolving a display name is not, so this is the primary way the
+            // mailbox is found on a machine with no directory to search.
+            (
+                "-Candidates",
+                expected_email_locals(
+                    username,
+                    &cfg.email_local_format,
+                    cfg.email_local_max_suffix,
+                )
+                .join(","),
             ),
             ("-TemplateGuid", cfg.encrypt_template_guid.clone()),
             ("-Permission", cfg.encrypt_permission.to_string()),
@@ -3103,6 +3145,120 @@ mod gui {
             STATE_FILTER_RUNNING | STATE_FILTER_STOPPED | STATE_FILTER_TERMINATED => normalized,
             _ => STATE_FILTER_NONE.to_string(),
         }
+    }
+
+    /// The pinned ids a filter keeps when it is (re)saved under `name`.
+    ///
+    /// Pins come from "Add to filter" on the row context menu and from nowhere
+    /// else. Favorites are deliberately **not** captured here: the dropdown
+    /// already has its own "Show Favorites" entry, and capturing them made a
+    /// freshly saved filter apply as "favorites narrowed by the search rules".
+    fn preserved_pinned_ids(existing: &[SavedFilter], name: &str) -> Vec<String> {
+        existing
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(name.trim()))
+            .map(|f| f.pinned_ids.clone())
+            .unwrap_or_default()
+    }
+
+    /// Pinned instances are a **union** with the search rules, never an
+    /// intersection — the point of "Add to filter" is to show a box the rules
+    /// miss. Ids not present in `pool` are skipped (another account/region).
+    fn merge_pinned_instances(filtered: &mut Vec<Instance>, pool: &[Instance], pinned_ids: &[String]) {
+        for id in pinned_ids {
+            if filtered
+                .iter()
+                .any(|i| i.instance_id.eq_ignore_ascii_case(id))
+            {
+                continue;
+            }
+            if let Some(instance) = pool
+                .iter()
+                .find(|i| i.instance_id.eq_ignore_ascii_case(id))
+            {
+                filtered.push(instance.clone());
+            }
+        }
+    }
+
+    /// Adds `instance_id` to a saved filter's pins. Returns false if already
+    /// pinned. Pins are used instead of an include term because include terms
+    /// are AND'd (`filter::apply_filters`), so pushing a name there would
+    /// narrow the filter to nothing rather than add the instance to it.
+    fn pin_instance_to_filter(saved: &mut SavedFilter, instance_id: &str) -> bool {
+        if saved
+            .pinned_ids
+            .iter()
+            .any(|id| id.eq_ignore_ascii_case(instance_id))
+        {
+            return false;
+        }
+        saved.pinned_ids.push(instance_id.to_string());
+        true
+    }
+
+    /// Whether a saved filter's own rules (ignoring pins) would show `instance`.
+    fn saved_filter_rules_match(saved: &SavedFilter, instance: &Instance) -> bool {
+        let filters = Filters {
+            includes: saved.include_terms.clone(),
+            excludes: saved.exclude_terms.clone(),
+            states: saved.states.clone(),
+            only_ssm_managed: saved.only_ssm_managed,
+        };
+        !apply_filters(std::slice::from_ref(instance), &filters).is_empty()
+    }
+
+    /// Whether `instance` shows up under a saved filter, by either route.
+    fn saved_filter_contains(saved: &SavedFilter, instance: &Instance) -> bool {
+        saved
+            .pinned_ids
+            .iter()
+            .any(|id| id.eq_ignore_ascii_case(&instance.instance_id))
+            || saved_filter_rules_match(saved, instance)
+    }
+
+    /// The saved filters a row's context menu offers, sorted by name.
+    /// `containing = true` gives the ones the instance already shows up under
+    /// ("Remove from filter"); `false` gives the ones it is missing from
+    /// ("Add to filter"). Driving both menus from here keeps them exactly
+    /// complementary — a filter is never in both lists, nor in neither.
+    fn menu_filters_for_instance(
+        filters: Vec<SavedFilter>,
+        instance: &Instance,
+        containing: bool,
+    ) -> Vec<SavedFilter> {
+        let mut out: Vec<SavedFilter> = filters
+            .into_iter()
+            .filter(|f| saved_filter_contains(f, instance) == containing)
+            .collect();
+        out.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+        out
+    }
+
+    /// Takes `instance` back out of a saved filter, whichever way it got in:
+    /// the pin is dropped, and if the rules would still pull it back, its
+    /// instance id is added as an exclude term. The id is used rather than the
+    /// name so removing one box never hides a similarly-named sibling.
+    ///
+    /// Returns false when nothing changed (it was not in the filter).
+    fn remove_instance_from_filter(saved: &mut SavedFilter, instance: &Instance) -> bool {
+        let id = &instance.instance_id;
+
+        let before = saved.pinned_ids.len();
+        saved.pinned_ids.retain(|p| !p.eq_ignore_ascii_case(id));
+        let unpinned = saved.pinned_ids.len() != before;
+
+        // Only exclude when the rules would otherwise bring it back — an
+        // exclude term for a hand-added box would be noise in the rule list.
+        let mut excluded = false;
+        if saved_filter_rules_match(saved, instance)
+            && !saved.exclude_terms.iter().any(|t| t.eq_ignore_ascii_case(id))
+        {
+            saved.exclude_terms.push(id.clone());
+            excluded = true;
+        }
+
+        unpinned || excluded
     }
 
     fn selected_region_label(selected_region: Option<&str>, context_region: Option<&str>) -> String {
@@ -4596,15 +4752,9 @@ mod gui {
             }
         }
 
-        fn apply_filters(&mut self) {
-            let (includes, excludes) = search_terms_from_rules(&self.search_rules);
-            let filters = Filters {
-                includes,
-                excludes,
-                states: states_from_state_filter(&self.selected_state_filter),
-                only_ssm_managed: self.only_ssm,
-            };
-
+        /// Every instance the filters can draw from: the current account's
+        /// inventory plus any checked multi-account profiles.
+        fn instance_pool(&mut self) -> Vec<Instance> {
             // Start with the current account's instances
             let mut all_instances = self.inventory.instances.clone();
 
@@ -4629,6 +4779,20 @@ mod gui {
                     ));
                 }
             }
+
+            all_instances
+        }
+
+        fn apply_filters(&mut self) {
+            let (includes, excludes) = search_terms_from_rules(&self.search_rules);
+            let filters = Filters {
+                includes,
+                excludes,
+                states: states_from_state_filter(&self.selected_state_filter),
+                only_ssm_managed: self.only_ssm,
+            };
+
+            let all_instances = self.instance_pool();
 
             self.filtered = apply_filters(&all_instances, &filters);
 
@@ -10452,13 +10616,12 @@ mod gui {
             let states = states_from_state_filter(&self.selected_state_filter);
             let (include_terms, exclude_terms) = search_terms_from_rules(&self.search_rules);
 
-            // Capture favorited instance IDs from the current filtered list
-            let account = self.account_scope();
-            let region = self.region_scope();
-            let pinned_ids: Vec<String> = self.filtered.iter()
-                .filter(|i| self.config.is_favorite(&account, &region, &i.instance_id))
-                .map(|i| i.instance_id.clone())
-                .collect();
+            // Keep whatever the user pinned via "Add to filter"; never capture
+            // favorites here — see `preserved_pinned_ids`.
+            let pinned_ids = preserved_pinned_ids(
+                &self.config.saved_filters_for_scope("global", "global"),
+                name,
+            );
 
             self.config.upsert_saved_filter(
                 "global",
@@ -10503,12 +10666,11 @@ mod gui {
             self.only_ssm = saved.only_ssm_managed;
             self.apply_filters();
 
-            // If the saved filter has pinned instance IDs (favorites at save time),
-            // further restrict to only those instances.
+            // Instances added by hand via "Add to filter" show up alongside the
+            // rule matches, whether or not the rules would have caught them.
             if !saved.pinned_ids.is_empty() {
-                self.filtered.retain(|i| {
-                    saved.pinned_ids.iter().any(|pid| pid.eq_ignore_ascii_case(&i.instance_id))
-                });
+                let pool = self.instance_pool();
+                merge_pinned_instances(&mut self.filtered, &pool, &saved.pinned_ids);
             }
 
             self.message = format!("Applied saved filter: {name}");
@@ -10684,7 +10846,9 @@ mod gui {
                         let mut pending_connect: Option<String> = None;
                         let mut pending_open_vscode: Option<Instance> = None;
                         let mut pending_fav_toggle: Option<String> = None;
-                        let mut pending_add_to_saved_filter: Option<(String, String)> = None;
+                        let mut pending_add_to_saved_filter: Option<(String, String, String)> = None;
+                        let mut pending_remove_from_saved_filter: Option<(String, Instance, String)> =
+                            None;
                         let (include_terms, _) = search_terms_from_rules(&self.search_rules);
 
                         // Sort filtered instances if a sort column is selected.
@@ -10952,7 +11116,9 @@ mod gui {
 
                             let detail_instance_clone = instance.clone();
                             let filter_instance_clone = instance.clone();
-                            let mut add_to_saved_filter: Option<(String, String)> = None;
+                            let mut add_to_saved_filter: Option<(String, String, String)> = None;
+                            let mut remove_from_saved_filter: Option<(String, Instance, String)> =
+                                None;
                             let vscode_instance_clone = instance.clone();
                             row_response.context_menu(|ui| {
                                 if ui.button("Quick Connect").clicked() {
@@ -10964,16 +11130,23 @@ mod gui {
                                     ui.close();
                                 }
                                 ui.menu_button("Add to filter", |ui| {
-                                    let mut scope_filters = self
-                                        .config
-                                        .saved_filters_for_scope("global", "global");
-                                    scope_filters.sort_by(|a, b| {
-                                        a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())
-                                    });
+                                    // Filters it is already in live under
+                                    // "Remove from filter" instead.
+                                    let all = self.config.saved_filters_for_scope("global", "global");
+                                    let none_saved = all.is_empty();
+                                    let scope_filters = menu_filters_for_instance(
+                                        all,
+                                        &filter_instance_clone,
+                                        false,
+                                    );
                                     if scope_filters.is_empty() {
-                                        ui.label("No saved filters");
+                                        ui.label(if none_saved {
+                                            "No saved filters"
+                                        } else {
+                                            "Already in every filter"
+                                        });
                                     } else {
-                                        let term = filter_instance_clone
+                                        let label = filter_instance_clone
                                             .name
                                             .as_deref()
                                             .filter(|n| !n.is_empty())
@@ -10983,7 +11156,37 @@ mod gui {
                                             if ui.button(&saved.name).clicked() {
                                                 add_to_saved_filter = Some((
                                                     saved.name.clone(),
-                                                    term.clone(),
+                                                    filter_instance_clone.instance_id.clone(),
+                                                    label.clone(),
+                                                ));
+                                                ui.close();
+                                            }
+                                        }
+                                    }
+                                });
+                                ui.menu_button("Remove from filter", |ui| {
+                                    // Only the filters this instance actually
+                                    // shows up under — by pin or by rule.
+                                    let scope_filters = menu_filters_for_instance(
+                                        self.config.saved_filters_for_scope("global", "global"),
+                                        &filter_instance_clone,
+                                        true,
+                                    );
+                                    if scope_filters.is_empty() {
+                                        ui.label("Not in any filter");
+                                    } else {
+                                        let label = filter_instance_clone
+                                            .name
+                                            .as_deref()
+                                            .filter(|n| !n.is_empty())
+                                            .unwrap_or(&filter_instance_clone.instance_id)
+                                            .to_string();
+                                        for saved in &scope_filters {
+                                            if ui.button(&saved.name).clicked() {
+                                                remove_from_saved_filter = Some((
+                                                    saved.name.clone(),
+                                                    filter_instance_clone.clone(),
+                                                    label.clone(),
                                                 ));
                                                 ui.close();
                                             }
@@ -11017,6 +11220,10 @@ mod gui {
 
                             if let Some(entry) = add_to_saved_filter {
                                 pending_add_to_saved_filter = Some(entry);
+                            }
+
+                            if let Some(entry) = remove_from_saved_filter {
+                                pending_remove_from_saved_filter = Some(entry);
                             }
 
                             if row_hovered {
@@ -11089,24 +11296,55 @@ mod gui {
                             }
                         }
 
-                        if let Some((filter_name, term)) = pending_add_to_saved_filter {
+                        if let Some((filter_name, instance_id, label)) = pending_add_to_saved_filter {
                             let mut filters = self
                                 .config
                                 .saved_filters_for_scope("global", "global");
                             if let Some(saved) = filters.iter_mut().find(|f| f.name == filter_name) {
-                                if !saved.include_terms.iter().any(|t| t == &term) {
-                                    saved.include_terms.push(term.clone());
+                                if pin_instance_to_filter(saved, &instance_id) {
                                     let updated = saved.clone();
                                     self.config.upsert_saved_filter("global", "global", updated);
                                     if let Err(err) = self.config.save() {
                                         self.message = format!("error: {err}");
                                         self.log_error(self.message.clone());
                                     } else {
-                                        self.message = format!("Added '{term}' to filter '{filter_name}'");
+                                        self.message = format!("Added '{label}' to filter '{filter_name}'");
                                         self.log_info(self.message.clone());
+                                        // Show it right away if that filter is on screen.
+                                        if self.selected_saved_filter == filter_name {
+                                            let _ = self.apply_saved_filter();
+                                        }
                                     }
                                 } else {
-                                    self.message = format!("'{term}' already in filter '{filter_name}'");
+                                    self.message = format!("'{label}' already in filter '{filter_name}'");
+                                }
+                            }
+                        }
+
+                        if let Some((filter_name, instance, label)) = pending_remove_from_saved_filter {
+                            let mut filters = self
+                                .config
+                                .saved_filters_for_scope("global", "global");
+                            if let Some(saved) = filters.iter_mut().find(|f| f.name == filter_name) {
+                                if remove_instance_from_filter(saved, &instance) {
+                                    let updated = saved.clone();
+                                    self.config.upsert_saved_filter("global", "global", updated);
+                                    if let Err(err) = self.config.save() {
+                                        self.message = format!("error: {err}");
+                                        self.log_error(self.message.clone());
+                                    } else {
+                                        self.message =
+                                            format!("Removed '{label}' from filter '{filter_name}'");
+                                        self.log_info(self.message.clone());
+                                        // Drop it from view right away if that
+                                        // filter is the one on screen.
+                                        if self.selected_saved_filter == filter_name {
+                                            let _ = self.apply_saved_filter();
+                                        }
+                                    }
+                                } else {
+                                    self.message =
+                                        format!("'{label}' is not in filter '{filter_name}'");
                                 }
                             }
                         }
@@ -17198,14 +17436,40 @@ mod gui {
             ec2_manager::features::AccessEmailConfig {
                 enabled,
                 auto_run: true,
-                email_domain: "xyz.com".to_string(),
+                email_domains: vec!["xyz.com".to_string()],
                 email_local_format: "flast".to_string(),
+                email_local_max_suffix: 5,
                 encrypt_template_guid: "{abc}".to_string(),
                 encrypt_permission: 3,
                 encrypt_permission_service: 1,
                 encrypt_smime_flag: 0,
                 encrypt_sendkeys: "%6".to_string(),
             }
+        }
+
+        #[test]
+        fn candidates_are_the_stem_then_the_numbered_variants() {
+            // Most people are jsmith; a minority carry a number because someone
+            // shared the surname. Probing the range finds them without needing
+            // a directory to search.
+            assert_eq!(
+                expected_email_locals("test.user", "flast", 5),
+                vec!["tuser", "tuser2", "tuser3", "tuser4", "tuser5"]
+            );
+        }
+
+        #[test]
+        fn a_max_suffix_below_two_probes_only_the_bare_stem() {
+            assert_eq!(expected_email_locals("test.user", "flast", 0), vec!["tuser"]);
+            assert_eq!(expected_email_locals("test.user", "flast", 1), vec!["tuser"]);
+        }
+
+        #[test]
+        fn no_derivable_stem_means_nothing_to_probe() {
+            // Without a stem there is no address to guess, so the caller must
+            // fall back rather than probe garbage.
+            assert!(expected_email_locals("jsmith", "flast", 5).is_empty());
+            assert!(expected_email_locals("test.user", "", 5).is_empty());
         }
 
         #[test]
@@ -17283,6 +17547,39 @@ mod gui {
             match s {
                 EmailStatus::Opened { reason } => {
                     assert!(reason.contains("pick the recipient"), "{reason}")
+                }
+                other => panic!("expected Opened, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn several_probe_hits_are_reported_before_anything_else() {
+            // Two real mailboxes fitting the username is the case the probe
+            // exists to catch, and it must be named rather than surfacing as a
+            // vaguer downstream failure.
+            let s = parse_email_marker(
+                "OPEN recipient='Test User' probe=2 matches=-1 resolved=False dir_user=False domain_ok=False local_ok=False encrypted=True",
+            )
+            .expect("OPEN parses");
+            match s {
+                EmailStatus::Opened { reason } => {
+                    assert!(reason.contains('2'), "{reason}");
+                    assert!(reason.contains("mailboxes fit"), "{reason}");
+                }
+                other => panic!("expected Opened, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_single_probe_hit_does_not_trigger_the_ambiguity_message() {
+            let s = parse_email_marker(
+                "OPEN recipient='Test User' probe=1 matches=-1 resolved=True dir_user=True domain_ok=True local_ok=True encrypted=False",
+            )
+            .expect("OPEN parses");
+            match s {
+                EmailStatus::Opened { reason } => {
+                    assert!(!reason.contains("mailboxes fit"), "{reason}");
+                    assert!(reason.contains("encryption"), "{reason}");
                 }
                 other => panic!("expected Opened, got {other:?}"),
             }
@@ -17470,11 +17767,25 @@ mod gui {
             // A blank domain must still emit the flag, so argument positions
             // never shift and the script's default stays a plain empty string.
             let mut cfg = access_email_cfg(true);
-            cfg.email_domain = String::new();
+            cfg.email_domains.clear();
             let cmd = build_email_command(&cfg, "jdoe", "DEV1", "i-1", "i-2", "/p.pem")
                 .expect("enabled config builds a command");
             assert!(cmd.wsl.contains("-Domain ''"), "{}", cmd.wsl);
             assert!(cmd.powershell.contains("-Domain ''"), "{}", cmd.powershell);
+        }
+
+        #[test]
+        fn several_domains_are_passed_as_one_comma_separated_argument() {
+            let mut cfg = access_email_cfg(true);
+            cfg.email_domains = vec!["a.com".to_string(), "b.com".to_string()];
+            let cmd = build_email_command(&cfg, "jdoe", "DEV1", "i-1", "i-2", "/p.pem")
+                .expect("enabled config builds a command");
+            assert!(cmd.wsl.contains("-Domain 'a.com,b.com'"), "{}", cmd.wsl);
+            assert!(
+                cmd.powershell.contains("-Domain 'a.com,b.com'"),
+                "{}",
+                cmd.powershell
+            );
         }
 
         #[test]
@@ -18400,6 +18711,187 @@ mod gui {
                 state_filter_from_saved_states(&["unknown".to_string()]),
                 "".to_string()
             );
+        }
+
+        fn saved_filter(name: &str, includes: &[&str], pinned: &[&str]) -> SavedFilter {
+            SavedFilter {
+                name: name.to_string(),
+                include_terms: includes.iter().map(|s| s.to_string()).collect(),
+                exclude_terms: Vec::new(),
+                states: Vec::new(),
+                only_ssm_managed: false,
+                pinned_ids: pinned.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+
+        #[test]
+        fn saving_a_new_filter_pins_nothing() {
+            // Regression: saving "Dev" while any Dev box was favorited used to
+            // capture those favorites as pinned ids, so applying the filter
+            // collapsed it to "Show Favorites narrowed to Dev".
+            let existing = vec![saved_filter("prod", &["prod"], &["i-fav"])];
+            assert!(preserved_pinned_ids(&existing, "dev").is_empty());
+        }
+
+        #[test]
+        fn resaving_a_filter_keeps_its_pinned_instances() {
+            let existing = vec![saved_filter("dev", &["dev"], &["i-added"])];
+            assert_eq!(
+                preserved_pinned_ids(&existing, "DEV"),
+                vec!["i-added".to_string()]
+            );
+        }
+
+        #[test]
+        fn pinned_instances_are_added_to_rule_matches_not_intersected() {
+            let pool = vec![
+                Instance::new("i-dev1".to_string(), "running".to_string()),
+                Instance::new("i-other".to_string(), "running".to_string()),
+            ];
+            // The rules matched only i-dev1; the user pinned i-other by hand.
+            let mut filtered = vec![pool[0].clone()];
+            merge_pinned_instances(&mut filtered, &pool, &["i-other".to_string()]);
+            let ids: Vec<&str> = filtered.iter().map(|i| i.instance_id.as_str()).collect();
+            assert_eq!(ids, vec!["i-dev1", "i-other"]);
+        }
+
+        #[test]
+        fn merge_pinned_instances_does_not_duplicate_or_invent_rows() {
+            let pool = vec![Instance::new("i-dev1".to_string(), "running".to_string())];
+            let mut filtered = vec![pool[0].clone()];
+            merge_pinned_instances(
+                &mut filtered,
+                &pool,
+                &["I-DEV1".to_string(), "i-gone".to_string()],
+            );
+            let ids: Vec<&str> = filtered.iter().map(|i| i.instance_id.as_str()).collect();
+            assert_eq!(ids, vec!["i-dev1"]);
+        }
+
+        fn named_instance(id: &str, name: &str) -> Instance {
+            let mut inst = Instance::new(id.to_string(), "running".to_string());
+            inst.name = Some(name.to_string());
+            inst
+        }
+
+        #[test]
+        fn saved_filter_contains_pins_and_rule_matches() {
+            let dev = named_instance("i-dev1", "dev-web-1");
+            let prod = named_instance("i-prod1", "prod-web-1");
+            let by_rule = saved_filter("dev", &["dev"], &[]);
+            assert!(saved_filter_contains(&by_rule, &dev));
+            assert!(!saved_filter_contains(&by_rule, &prod));
+
+            let by_pin = saved_filter("dev", &["dev"], &["i-prod1"]);
+            assert!(saved_filter_contains(&by_pin, &prod));
+        }
+
+        #[test]
+        fn add_menu_hides_filters_the_instance_is_already_in() {
+            let dev = named_instance("i-dev1", "dev-web-1");
+            let all = vec![
+                saved_filter("dev", &["dev"], &[]),        // matched by rule
+                saved_filter("pinned", &["nope"], &["i-dev1"]), // matched by pin
+                saved_filter("prod", &["prod"], &[]),      // not in it
+            ];
+
+            let addable = menu_filters_for_instance(all.clone(), &dev, false);
+            assert_eq!(names(&addable), vec!["prod"]);
+
+            let removable = menu_filters_for_instance(all.clone(), &dev, true);
+            assert_eq!(names(&removable), vec!["dev", "pinned"]);
+        }
+
+        #[test]
+        fn the_two_row_menus_are_complementary_and_sorted() {
+            let dev = named_instance("i-dev1", "dev-web-1");
+            let all = vec![
+                saved_filter("zulu", &["dev"], &[]),
+                saved_filter("alpha", &["prod"], &[]),
+                saved_filter("mike", &["dev"], &[]),
+            ];
+            let addable = names(&menu_filters_for_instance(all.clone(), &dev, false));
+            let removable = names(&menu_filters_for_instance(all.clone(), &dev, true));
+
+            assert_eq!(addable, vec!["alpha"]);
+            assert_eq!(removable, vec!["mike", "zulu"]);
+            assert_eq!(addable.len() + removable.len(), all.len());
+        }
+
+        #[test]
+        fn a_removed_instance_becomes_addable_again() {
+            let dev = named_instance("i-dev1", "dev-web-1");
+            let mut saved = saved_filter("dev", &["dev"], &[]);
+            remove_instance_from_filter(&mut saved, &dev);
+            let all = vec![saved];
+            assert_eq!(names(&menu_filters_for_instance(all.clone(), &dev, false)), vec!["dev"]);
+            assert!(menu_filters_for_instance(all, &dev, true).is_empty());
+        }
+
+        fn names(filters: &[SavedFilter]) -> Vec<String> {
+            filters.iter().map(|f| f.name.clone()).collect()
+        }
+
+        #[test]
+        fn removing_a_hand_added_instance_just_drops_the_pin() {
+            // Rules don't match it, so no exclude term is needed — and adding
+            // one would clutter the rule list the user sees when they apply it.
+            let prod = named_instance("i-prod1", "prod-web-1");
+            let mut saved = saved_filter("dev", &["dev"], &["i-prod1"]);
+            assert!(remove_instance_from_filter(&mut saved, &prod));
+            assert!(saved.pinned_ids.is_empty());
+            assert!(saved.exclude_terms.is_empty());
+        }
+
+        #[test]
+        fn removing_a_rule_matched_instance_excludes_it_by_id() {
+            let dev = named_instance("i-dev1", "dev-web-1");
+            let mut saved = saved_filter("dev", &["dev"], &[]);
+            assert!(remove_instance_from_filter(&mut saved, &dev));
+            assert_eq!(saved.exclude_terms, vec!["i-dev1".to_string()]);
+            assert!(!saved_filter_contains(&saved, &dev));
+            // Its neighbours must survive.
+            assert!(saved_filter_contains(&saved, &named_instance("i-dev2", "dev-web-2")));
+        }
+
+        #[test]
+        fn removing_an_instance_that_is_both_pinned_and_matched_takes_both_paths() {
+            let dev = named_instance("i-dev1", "dev-web-1");
+            let mut saved = saved_filter("dev", &["dev"], &["i-dev1"]);
+            assert!(remove_instance_from_filter(&mut saved, &dev));
+            assert!(saved.pinned_ids.is_empty());
+            assert_eq!(saved.exclude_terms, vec!["i-dev1".to_string()]);
+            assert!(!saved_filter_contains(&saved, &dev));
+        }
+
+        #[test]
+        fn removing_an_instance_twice_reports_no_change() {
+            let dev = named_instance("i-dev1", "dev-web-1");
+            let mut saved = saved_filter("dev", &["dev"], &["i-dev1"]);
+            assert!(remove_instance_from_filter(&mut saved, &dev));
+            assert!(!remove_instance_from_filter(&mut saved, &dev));
+        }
+
+        #[test]
+        fn re_adding_a_removed_instance_wins_over_the_exclude_term() {
+            // Pins are merged after the rules run, so an explicit re-add beats
+            // the exclude term left behind by the removal.
+            let dev = named_instance("i-dev1", "dev-web-1");
+            let mut saved = saved_filter("dev", &["dev"], &[]);
+            remove_instance_from_filter(&mut saved, &dev);
+            assert!(pin_instance_to_filter(&mut saved, &dev.instance_id));
+            assert!(saved_filter_contains(&saved, &dev));
+        }
+
+        #[test]
+        fn pin_instance_to_filter_is_idempotent() {
+            let mut saved = saved_filter("dev", &["dev"], &[]);
+            assert!(pin_instance_to_filter(&mut saved, "i-abc"));
+            assert!(!pin_instance_to_filter(&mut saved, "I-ABC"));
+            assert_eq!(saved.pinned_ids, vec!["i-abc".to_string()]);
+            // Pinning must not touch the search rules — they are OR'd with the
+            // pins, and include terms are AND'd with each other.
+            assert_eq!(saved.include_terms, vec!["dev".to_string()]);
         }
 
         #[test]

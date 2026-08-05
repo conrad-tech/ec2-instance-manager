@@ -35,7 +35,7 @@ cargo clippy --features gui
 As of 2026-08-04 (rustc 1.94.0), with the access-email integration restored and
 made automatic, the full build pipeline passes cleanly:
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 315 tests pass, 0 fail (171 lib + 3 CLI + 141 GUI)
+- `cargo test --features gui` — 336 tests pass, 0 fail (174 lib + 3 CLI + 159 GUI)
 - `cargo clippy --features gui` — no errors; 21 pre-existing style warnings
   (derivable_impls on Mode, too_many_arguments on sim::make_instance,
   collapsible_if / let_and_return / manual_is_multiple_of in the GUI)
@@ -107,22 +107,28 @@ result popup shows a status line fed by the script's stdout marker. The **✉ Se
 Email Command** menu remains as a manual fallback that copies a ready-to-run
 command per terminal.
 
-- **The send path has four conditions, all required:** the directory matches
-  **exactly one** person, that address is in `access_email.email_domain`, the
-  address matches `email_local_format`, and encryption reads back confirmed.
-  Anything else opens the draft. The attachment is a private key — do not relax
-  this.
-- **`Recipient.Resolve()` is NOT the ambiguity test, and must not be used as
-  one.** It returns `True` for a name several people share, quietly taking the
-  nickname/autocomplete-cache entry — this shipped once and mailed a PEM to a
-  silently-chosen entry. The gate is an LDAP **ANR** query (`(anr=<name>)`),
-  the same resolution Outlook's suggestion list uses, and the count must be 1.
-  The mail is then addressed **by SMTP**, never by display name, so Outlook is
-  never handed the ambiguity again.
-- **A directory that cannot be queried fails closed** (`matches=-1` → open the
-  draft). Falling back to `Resolve()` would restore the exact hole the ANR
-  query replaces.
-- **`email_domain` and `email_local_format` are layered, not redundant.** The
+- **The send path requires all of:** one identified recipient, that entry being
+  a real Exchange **directory user**, its address in an
+  `access_email.email_domains` entry, the address matching
+  `email_local_format`, and encryption reading back confirmed. Anything else
+  opens the draft. The attachment is a private key — do not relax this.
+- **`Recipient.Resolve()` is not a reliable ambiguity test.** It returns `True`
+  for a name several people share, quietly taking the nickname/autocomplete
+  entry. Preferred gate is an LDAP **ANR** query (`(anr=<name>)`) — the same
+  resolution behind Outlook's suggestion list — requiring exactly one match,
+  after which the mail is addressed **by SMTP**, never by display name.
+- **But LDAP is unavailable on an Entra-ID-only machine, and that is normal.**
+  `DirectorySearcher` cannot even bind with no on-prem AD (`dsregcmd` shows
+  `DomainJoined : NO`); Outlook still works because it reaches Exchange Online
+  over HTTPS, which says nothing about LDAP. So `matches=-1` **falls back** to
+  Outlook resolution rather than disabling the feature — an earlier version
+  failed closed here and would have sent nothing at all on such a machine.
+  What keeps the fallback safe is `dir_user`: a local Contact or saved one-off
+  address is refused outright, which is the specific path by which a stale
+  personal entry receives a private key.
+- **The Outlook GAL is not a substitute counter.** Measured at ~152,000 entries
+  on a real tenant — scanning it per send is not viable.
+- **`email_domains` and `email_local_format` are layered, not redundant.** The
   domain check catches an out-of-org address (a stale local Contact); the local
   format catches an *in-domain* address belonging to a different person with a
   similar name — `test.user` must resolve to `tuser@`/`tuser2@`, not
