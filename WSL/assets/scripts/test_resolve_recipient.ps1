@@ -31,23 +31,32 @@ $displayName = ($parts | ForEach-Object { Title $_ }) -join ' '
 "Display name : '$displayName'   <-- this is what Outlook is asked to resolve"
 ""
 
+# Outlook is only needed for the Resolve() comparison below. The directory
+# count - the part that actually decides whether the access email sends - uses
+# LDAP and does not need Outlook at all, so a failure here must not stop the
+# script.
+$ns = $null
 try {
     $ol = New-Object -ComObject Outlook.Application
     $ns = $ol.GetNamespace("MAPI")
 } catch {
     "Could not attach to Outlook: $($_.Exception.Message)"
-    "Classic Outlook must be running (the new Outlook has no COM object model)."
-    return
+    "Classic Outlook must be installed and signed in (the new Outlook has no"
+    "COM object model). Skipping the Resolve() comparison - the directory"
+    "count below is the part that matters and does not need Outlook."
+    ""
 }
 
-# --- What send_access_email.ps1 would do ---------------------------------
-$recip = $ns.CreateRecipient($displayName)
+# --- What Recipient.Resolve() does, for comparison only ------------------
 $resolved = $false
-try { $resolved = [bool]$recip.Resolve() } catch { $resolved = $false }
-"Resolve()    : $resolved"
-
 $smtp = ""
 $kind = "(none)"
+if ($null -ne $ns) {
+    $recip = $ns.CreateRecipient($displayName)
+    try { $resolved = [bool]$recip.Resolve() } catch { $resolved = $false }
+    "Resolve()    : $resolved"
+}
+
 if ($resolved) {
     try {
         $eu = $recip.AddressEntry.GetExchangeUser()
@@ -71,7 +80,7 @@ if ($resolved) {
         }
         "In '$Domain' : $ok"
     }
-} else {
+} elseif ($null -ne $ns) {
     "Resolved to  : (nothing - Outlook treated the name as ambiguous or unknown)"
 }
 ""
