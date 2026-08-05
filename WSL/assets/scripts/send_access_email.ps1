@@ -169,7 +169,10 @@ try {
     if ($anrCount -eq 1) { $anrMail = "$($hits[0].Properties['mail'][0])" }
 } catch {
     $anrCount = -1
-    Write-Output "WARN directory lookup failed: $($_.Exception.Message)"
+    # Collapse the message: COM exception text carries embedded newlines, which
+    # would otherwise split into extra half-empty lines in the app log.
+    $why = ("$($_.Exception.Message)" -replace '\s+', ' ').Trim()
+    Write-Output "WARN directory lookup failed (expected on an Entra-only machine): $why"
 }
 
 Write-Output "MATCHES name='$displayName' count=$anrCount"
@@ -192,6 +195,20 @@ $dirUser  = $false
 # Smith), the address alone cannot say which is ours - so each hit's display
 # name must also contain the username's own name parts. If exactly one survives
 # both tests it is the recipient; anything else opens Outlook.
+# Our own mail domains. -Domain is a comma-separated list: staff often have
+# mail on more than one (after a merger or rebrand), and any of them is a
+# legitimate destination. This is the MAIL domain, unrelated to the Windows/AD
+# domain the machine is joined to.
+#
+# Built HERE, not next to the domain check further down: the probe below needs
+# it to construct addresses. PowerShell leaves an unassigned variable as $null
+# rather than erroring, so having it defined later silently gave the probe an
+# empty list and skipped it on a correctly configured build.
+$domainList = @()
+if ($Domain) {
+    $domainList = @($Domain -split ',' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
+}
+
 $probeList = @($Candidates -split ',' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
 $probeHits = @()
 $localOkOverride = $false
@@ -302,15 +319,8 @@ if ($probeHits.Count -eq 1) {
     }
 }
 
-# The match must still be in one of our own mail domains. -Domain is a
-# comma-separated list: staff often have mail on more than one (after a merger
-# or rebrand), and any of them is a legitimate destination. Note this is the
-# MAIL domain, unrelated to the Windows/AD domain the machine is joined to.
-$domainList = @()
-if ($Domain) {
-    $domainList = @($Domain -split ',' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
-}
-
+# The match must still be in one of our own mail domains ($domainList is built
+# near the top - it is needed by the address probe, which runs before this).
 $domainOk = $false
 if ($resolved) {
     if ($domainList.Count -eq 0) {
