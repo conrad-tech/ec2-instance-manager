@@ -9,6 +9,7 @@ pub mod diagnostics;
 pub mod error;
 pub mod features;
 pub mod filter;
+pub mod forwards;
 pub mod gui_cli;
 pub mod inventory;
 pub mod models;

@@ -386,27 +386,60 @@ pub fn managed_alias(name: &str, user: &str, instance_id: &str) -> String {
     }
 }
 
+/// Everything that goes into one managed `Host` block. A struct rather than
+/// a parameter list because the two are easy to transpose — `profile` and
+/// `region` are both bare strings, and swapping them yields a block that
+/// looks right and cannot connect.
+pub struct ManagedHost<'a> {
+    pub instance_id: &'a str,
+    /// EC2 Name tag; may be empty.
+    pub name: &'a str,
+    /// SSH login.
+    pub user: &'a str,
+    /// Path to the private key.
+    pub pem: &'a str,
+    /// AWS profile for the SSM ProxyCommand.
+    pub profile: &'a str,
+    pub region: &'a str,
+    /// Ready-made `LocalForward` directives, in order. Built by
+    /// `crate::forwards` — this module formats, it does not resolve.
+    pub forwards: &'a [String],
+}
+
 /// Build a single managed `Host` block for VS Code Remote-SSH. The
 /// ProxyCommand tunnels SSH through SSM Session Manager so no inbound
 /// port 22 is required. `%h`/`%p` are filled in by ssh at connect time.
-pub fn vscode_host_block(
-    instance_id: &str,
-    name: &str,
-    user: &str,
-    pem: &str,
-    profile: &str,
-    region: &str,
-) -> String {
+///
+/// `ServerAliveInterval` is not optional: an SSM tunnel with a port forward
+/// on it goes quiet between requests and gets dropped without keepalives.
+pub fn vscode_host_block(host: &ManagedHost<'_>) -> String {
+    let ManagedHost {
+        instance_id,
+        name,
+        user,
+        pem,
+        profile,
+        region,
+        forwards,
+    } = *host;
     let alias = managed_alias(name, user, instance_id);
-    format!(
+    let mut block = format!(
         "Host {alias}\n  \
          HostName {instance_id}\n  \
          User {user}\n  \
          IdentityFile \"{pem}\"\n  \
+         ServerAliveInterval 30\n  \
          ProxyCommand aws ssm start-session --profile {profile} --region {region} \
          --target %h --document-name AWS-StartSSHSession \
          --parameters portNumber=%p\n"
-    )
+    );
+    for directive in forwards {
+        let directive = directive.trim();
+        if !directive.is_empty() {
+            block.push_str(&format!("  {directive}\n"));
+        }
+    }
+    block
 }
 
 /// Build the `vscode-remote://` URI for a folder on a managed host.
@@ -464,14 +497,7 @@ fn split_blocks(text: &str) -> Vec<(String, String)> {
 /// Write (or replace) the managed Host block for an instance in the
 /// quarantined `~/.ssh/config.d/ec2-manager` file. Other blocks are
 /// preserved. Returns the Host alias on success.
-pub fn write_managed_block(
-    instance_id: &str,
-    name: &str,
-    user: &str,
-    pem: &str,
-    profile: &str,
-    region: &str,
-) -> Result<String, String> {
+pub fn write_managed_block(host: &ManagedHost<'_>) -> Result<String, String> {
     let path = managed_config_path()
         .ok_or_else(|| "could not resolve home directory".to_string())?;
     if let Some(parent) = path.parent() {
@@ -480,15 +506,7 @@ pub fn write_managed_block(
     }
 
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let (alias, body) = compose_managed_file(
-        &existing,
-        instance_id,
-        name,
-        user,
-        pem,
-        profile,
-        region,
-    );
+    let (alias, body) = compose_managed_file(&existing, host);
     std::fs::write(&path, body)
         .map_err(|e| format!("could not write {}: {e}", path.display()))?;
     Ok(alias)
@@ -511,15 +529,8 @@ fn block_field(block: &str, keyword: &str) -> Option<String> {
 /// Returns `(alias, file_text)`. Split out from `write_managed_block` so
 /// the replacement rules can be tested without touching the real home
 /// directory.
-fn compose_managed_file(
-    existing: &str,
-    instance_id: &str,
-    name: &str,
-    user: &str,
-    pem: &str,
-    profile: &str,
-    region: &str,
-) -> (String, String) {
+fn compose_managed_file(existing: &str, host: &ManagedHost<'_>) -> (String, String) {
+    let (instance_id, name, user) = (host.instance_id, host.name, host.user);
     let alias = managed_alias(name, user, instance_id);
     let id_suffix = format!("-{instance_id}");
     let mut kept: Vec<String> = Vec::new();
@@ -548,11 +559,7 @@ fn compose_managed_file(
         }
         kept.push(block_text.trim_end().to_string());
     }
-    kept.push(
-        vscode_host_block(instance_id, name, user, pem, profile, region)
-            .trim_end()
-            .to_string(),
-    );
+    kept.push(vscode_host_block(host).trim_end().to_string());
 
     let header = "# Managed by ec2-manager — do not edit by hand.\n\n";
     (alias, format!("{header}{}\n", kept.join("\n\n")))
@@ -716,16 +723,34 @@ mod tests {
         assert!(pems_for_profile(&hosts, "zz").is_empty());
     }
 
+    /// A host with the fields the other tests do not care about filled in.
+    fn host<'a>(
+        instance_id: &'a str,
+        name: &'a str,
+        user: &'a str,
+        pem: &'a str,
+        forwards: &'a [String],
+    ) -> ManagedHost<'a> {
+        ManagedHost {
+            instance_id,
+            name,
+            user,
+            pem,
+            profile: "pa",
+            region: "us-east-1",
+            forwards,
+        }
+    }
+
     #[test]
     fn vscode_host_block_has_required_directives() {
-        let block = vscode_host_block(
+        let block = vscode_host_block(&host(
             "i-0c7b5d62a1a086476",
             "web server 01",
             "ec2-user",
             "C:\\keys\\pa.pem",
-            "pa",
-            "us-east-1",
-        );
+            &[],
+        ));
         // Name is sanitized, then the login user, then the instance id.
         assert!(block.starts_with("Host web-server-01-ec2-user-i-0c7b5d62a1a086476"));
         assert!(block.contains("HostName i-0c7b5d62a1a086476"));
@@ -734,6 +759,28 @@ mod tests {
         assert!(block.contains("--profile pa"));
         assert!(block.contains("--region us-east-1"));
         assert!(block.contains("AWS-StartSSHSession"));
+        // A tunnel carrying an idle port forward dies without keepalives.
+        assert!(block.contains("ServerAliveInterval 30"));
+        // No forwards means no stray blank directive lines.
+        assert!(!block.contains("LocalForward"));
+    }
+
+    #[test]
+    fn vscode_host_block_carries_forwards_in_order() {
+        let forwards = vec![
+            "LocalForward 127.200.20.1:443 uweb.example.net:443".to_string(),
+            "  LocalForward 127.200.20.2:5432 pg.example.net:5432  ".to_string(),
+            "   ".to_string(),
+        ];
+        let block = vscode_host_block(&host("i-1", "web", "jdoe", "/k/a.pem", &forwards));
+        let lines: Vec<&str> = block
+            .lines()
+            .filter(|l| l.trim_start().starts_with("LocalForward"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{block}");
+        assert_eq!(lines[0], "  LocalForward 127.200.20.1:443 uweb.example.net:443");
+        // Indentation is normalized and the blank entry is dropped.
+        assert_eq!(lines[1], "  LocalForward 127.200.20.2:5432 pg.example.net:5432");
     }
 
     #[test]
@@ -762,9 +809,8 @@ mod tests {
     fn compose_managed_file_drops_legacy_block_for_same_instance() {
         let legacy = "Host web-i-123\n  HostName i-123\n  User ec2-user\n  \
                       IdentityFile \"/keys/old.pem\"\n";
-        let (alias, text) = compose_managed_file(
-            legacy, "i-123", "web", "jdoe", "/keys/new.pem", "pa", "us-east-1",
-        );
+        let (alias, text) =
+            compose_managed_file(legacy, &host("i-123", "web", "jdoe", "/keys/new.pem", &[]));
         assert_eq!(alias, "web-jdoe-i-123");
         assert!(!text.contains("Host web-i-123\n"), "legacy block survived:\n{text}");
         assert!(text.contains("Host web-jdoe-i-123"));
@@ -777,7 +823,8 @@ mod tests {
         let old = "Host oldname-jdoe-i-123\n  HostName i-123\n  User jdoe\n  \
                    IdentityFile \"/keys/a.pem\"\n";
         let (alias, text) = compose_managed_file(
-            old, "i-123", "newname", "jdoe", "/keys/b.pem", "pa", "us-east-1",
+            old,
+            &host("i-123", "newname", "jdoe", "/keys/b.pem", &[]),
         );
         assert_eq!(alias, "newname-jdoe-i-123");
         assert!(!text.contains("oldname"));
@@ -790,7 +837,8 @@ mod tests {
         let existing = "Host other-jdoe-i-999\n  HostName i-999\n  User jdoe\n\n\
                         Host web-ec2-user-i-123\n  HostName i-123\n  User ec2-user\n";
         let (_, text) = compose_managed_file(
-            &existing, "i-123", "web", "jdoe", "/keys/n.pem", "pa", "us-east-1",
+            &existing,
+            &host("i-123", "web", "jdoe", "/keys/n.pem", &[]),
         );
         // A different box is untouched, and so is the same box under the
         // other login — that entry is still valid, just a different host.

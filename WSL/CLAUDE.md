@@ -300,7 +300,10 @@ an older session's login would otherwise keep re-suggesting itself.
 The pem dropdowns render `config.sorted_pem_library()` (alphabetical by
 filename, path as tiebreak; storage order untouched) through
 `pem_library_combo_items()`, shared by the launch dialog and Settings so the
-two cannot drift. **`ScrollBarVisibility::AlwaysVisible` on its own shows
+two cannot drift. Rows are labelled by `pem_row_labels()`: the filename
+alone, or the **full path** when another key in the library shares that
+filename (compared case-insensitively) — two rows reading `bastion.pem`
+identify neither, and a hover tooltip is not an answer. **`ScrollBarVisibility::AlwaysVisible` on its own shows
 nothing** — two egui details defeat it, and both are load-bearing:
 
 - `ComboBox::show_ui` wraps its contents in a `ScrollArea` of its own, capped
@@ -313,6 +316,42 @@ nothing** — two egui details defeat it, and both are load-bearing:
   fully transparent until hovered. `ScrollStyle::solid()` is opaque
   (`handle_opacity` is hard-coded to 1.0 for non-floating bars) and reserves
   its own width.
+
+### Port forwards (Open in VS Code)
+
+`src/forwards.rs` turns the compiled-in `assets/forwards.json` plus the
+machine's hosts file into the `LocalForward` lines in the managed Host block.
+Environments key on the `MMODAL_ENV` tag, like everything else.
+
+- **The hosts file is read, never written.** Verified 2026-08-06: an
+  unelevated process is denied write access to
+  `C:\Windows\System32\drivers\etc\hosts`, most corporate users are not local
+  admins, and programmatic writes to that path are EDR-flagged behaviour —
+  expensive for an app with a CrowdStrike quarantine in its history. The path
+  is configurable (`forwards_hosts_file` in config.ini) so a user can point at
+  whatever copy they keep.
+- **Where the user's hosts file resolves a name, the forward binds that IP**
+  (`ForwardSource::HostsIp`), not the one in forwards.json. That is what lets
+  an existing setup work untouched, and it closes a hazard: if forwards.json
+  names an IP the user already points a *different* name at, binding it would
+  silently hijack theirs.
+- **A missing hosts entry is not a failure.** The tunnel resolves its remote
+  name on the bastion, so it works addressed by IP; the hosts entry only lets
+  the user type the name in a browser. Those rows are flagged and
+  `hosts_snippet` offers the lines to paste.
+- **`port_rules` are first-match-wins** — documented, not incidental. A name
+  like `kafka-postgres-proxy` takes the port of whichever rule is listed
+  first. Do not sort that list.
+- **A malformed forwards.json yields no forwards, never an error.** Forwards
+  are a convenience; a bad config must not block a VS Code launch.
+- Section headers in a hosts file are comments whose text is a **single
+  word** (`# AUCT`). Real hosts files are full of prose comments and none of
+  them should become a phantom environment.
+- Unticked forwards persist per environment as the set of **disabled** names
+  (`forwards_disabled.<id>.<ENV>`), so a forward added to forwards.json later
+  arrives switched on rather than silently absent.
+- `ServerAliveInterval 30` is in every managed block: an SSM tunnel carrying
+  an idle forward gets dropped without keepalives.
 
 ### Instance search
 
@@ -377,6 +416,38 @@ output for the usual rejections ("fatal: Authentication failed", "HTTP Basic:
 Access denied", …) and raises the PAT dialog, rate-limited to once per 30s so a
 failing `git pull` doesn't reopen it per line. After updating the PAT, click
 Prep Terminal to rewrite the stored credential.
+
+### Bastion User Restore (Scripts menu)
+
+Restore issues a new key to a user who **already exists** — someone who lost
+their PEM. It is a variant of create, not a third pipeline: `UserScriptMode`
+picks between the three at the dialog/`enqueue_user_script` boundary, and
+everything downstream (drip-feed, secondary mirror, SSH verification, PEM
+pull, access email) is the create path unchanged. Only the run line and the
+wording differ. Delete is the genuinely separate path, and the code below
+`enqueue_user_script` still keys on `delete: bool` for that reason.
+
+`create_new_user.sh --restore` differs from a plain run in exactly four ways:
+
+- **Refuses a user who does not exist**, before writing anything. Without it a
+  typo'd username would quietly create a half-configured account instead of
+  saying the name was wrong.
+- **Replaces `authorized_keys`** rather than appending. The point of a restore
+  is that the previous key is unaccounted for, so leaving it authorized
+  defeats the exercise.
+- **Implies `--force`**, since the original run left a PEM at the default path
+  and refusing it would fail every restore.
+- **Never passes `--sudo`**, so sudoers is untouched and an existing grant
+  survives.
+
+**Restore refuses the `protected_users` list**, which previously only gated
+delete. Restore replaces `authorized_keys`, so pointed at a shared account
+like `ec2-user` it would revoke the key everyone uses.
+
+Every Scripts menu row carries hover text saying what it does; the personal
+and default script rows show a trimmed preview of the body itself
+(`script_hover_text`), since a name like "prep" says nothing about what is
+about to be pasted into a live shell.
 
 ### Scripts dialogs select an environment, not an account
 

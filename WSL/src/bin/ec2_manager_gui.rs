@@ -12,6 +12,8 @@ mod gui {
     use std::collections::{HashMap, VecDeque};
     use std::fs;
     use std::io::{Read, Write};
+
+    use ec2_manager::forwards::ForwardSource;
     use std::panic::{self, AssertUnwindSafe};
     use std::path::PathBuf;
     #[cfg(test)]
@@ -524,8 +526,16 @@ mod gui {
         remote_path: String,
         /// Currently selected pem path (the field the user edits/picks).
         pem_path: String,
-        /// "Don't ask again for this account" — unchecked by default.
+        /// "Don't ask again" — unchecked by default.
         dont_ask_again: bool,
+        /// Port forwards resolved for this environment, each with whether
+        /// it is ticked. Unticked ones are remembered per environment.
+        forwards: Vec<(ec2_manager::forwards::ResolvedForward, bool)>,
+        /// Hosts file the forwards were resolved against, shown so the user
+        /// knows which file to paste missing entries into.
+        hosts_path: String,
+        /// Whether the port-forward section is expanded.
+        forwards_open: bool,
         /// Set once VS Code has been launched: the dialog switches to an
         /// "Opening…" spinner and auto-closes shortly after.
         opening_since: Option<Instant>,
@@ -546,11 +556,62 @@ mod gui {
         ask_again: bool,
     }
 
-    /// Modal state for the "Scripts → create_new_user.sh / delete_user.sh"
-    /// dialog. The same modal serves both actions; `delete` selects which.
+    /// Which of the three bastion user actions a dialog is running.
+    ///
+    /// Restore is a variant of create, not a third pipeline: it runs the same
+    /// script with `--restore`, and everything downstream — the drip-feed, the
+    /// secondary mirror, the SSH verification, the PEM pull, the access email
+    /// — is identical. Only the run line and the wording differ. Delete is the
+    /// genuinely separate path.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum UserScriptMode {
+        Create,
+        Restore,
+        Delete,
+    }
+
+    impl UserScriptMode {
+        fn is_delete(self) -> bool {
+            self == Self::Delete
+        }
+
+        fn is_restore(self) -> bool {
+            self == Self::Restore
+        }
+
+        /// Window title for the dialog.
+        fn title(self) -> &'static str {
+            match self {
+                Self::Create => "Scripts — Bastion New User",
+                Self::Restore => "Scripts — Bastion User Restore",
+                Self::Delete => "Scripts — Bastion User Delete",
+            }
+        }
+
+        /// Label on the confirm button.
+        fn run_label(self) -> &'static str {
+            match self {
+                Self::Create => "Run",
+                Self::Restore => "Restore",
+                Self::Delete => "Delete",
+            }
+        }
+
+        /// Prefix used in log lines for this action.
+        fn log_action(self) -> &'static str {
+            match self {
+                Self::Create => "create_new_user",
+                Self::Restore => "restore_user",
+                Self::Delete => "delete_user",
+            }
+        }
+    }
+
+    /// Modal state for the "Scripts → Bastion New User / User Restore /
+    /// User Delete" dialog. The same modal serves all three; `mode` selects.
     struct CreateUserDialog {
-        /// Delete mode (delete_user.sh) rather than create.
-        delete: bool,
+        /// Which action this dialog runs.
+        mode: UserScriptMode,
         /// New username to create (or the user to delete).
         username: String,
         /// Account (config profile_id) whose bastions we target.
@@ -559,6 +620,8 @@ mod gui {
         /// with no environment dimension — then no environment filter applies.
         env_name: String,
         /// Create mode: whether to pass `--sudo` (grant NOPASSWD:ALL).
+        /// Not offered when restoring — that leaves sudoers alone, so an
+        /// existing grant survives.
         grant_sudo: bool,
         /// Delete mode: confirmation checkbox — Delete is disabled until set.
         confirm_delete: bool,
@@ -636,6 +699,9 @@ mod gui {
     struct CreateUserRun {
         /// Delete run (confirm removal) rather than create (SSH + PEM pull).
         delete: bool,
+        /// Restore run. Takes the same path as a create — only the wording
+        /// in the log and the result popup differs.
+        restore: bool,
         username: String,
         /// Environment/profile_id (used to open the secondary session).
         env: String,
@@ -1111,6 +1177,34 @@ mod gui {
             .unwrap_or_else(|| p.to_string())
     }
 
+    /// Tooltip for a script row: what it will actually run, trimmed to a
+    /// few lines. A name like "prep" says nothing about what lands in the
+    /// terminal, and these paste straight into a live session.
+    fn script_hover_text(body: &str) -> String {
+        const MAX_LINES: usize = 6;
+        const MAX_CHARS: usize = 80;
+        let lines: Vec<&str> = body
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        if lines.is_empty() {
+            return "Pastes into the focused connection tab. (empty script)".to_string();
+        }
+        let mut out = String::from("Pastes into the focused connection tab:\n");
+        for line in lines.iter().take(MAX_LINES) {
+            let mut line = (*line).to_string();
+            if line.chars().count() > MAX_CHARS {
+                line = line.chars().take(MAX_CHARS).collect::<String>() + "…";
+            }
+            out.push_str(&format!("\n  {line}"));
+        }
+        if lines.len() > MAX_LINES {
+            out.push_str(&format!("\n  … {} more lines", lines.len() - MAX_LINES));
+        }
+        out
+    }
+
     /// Login whose home lives locally on the box rather than on the shared
     /// EFS mount. Every account created by the Bastion New User script gets
     /// an EFS home instead.
@@ -1140,6 +1234,33 @@ mod gui {
             return None;
         }
         Some(owner)
+    }
+
+    /// Row labels for the pem dropdown, one per entry in `library`.
+    ///
+    /// The filename alone, except where another key in the library carries
+    /// the same filename — then the full path, since two rows reading
+    /// `bastion.pem` are indistinguishable and picking the wrong one is a
+    /// failed connection. Compared case-insensitively: the sort is, and on
+    /// Windows two names differing only in case are the same file anyway.
+    fn pem_row_labels(library: &[String]) -> Vec<String> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for pem in library {
+            *counts
+                .entry(pem_basename(pem).to_lowercase())
+                .or_insert(0) += 1;
+        }
+        library
+            .iter()
+            .map(|pem| {
+                let name = pem_basename(pem);
+                if counts.get(&name.to_lowercase()).copied().unwrap_or(0) > 1 {
+                    pem.clone()
+                } else {
+                    name
+                }
+            })
+            .collect()
     }
 
     /// Tallest the pem list gets before it scrolls. Must stay below
@@ -1187,8 +1308,8 @@ mod gui {
             )
             .show(ui, |ui| {
                 ui.set_min_width(230.0);
-                for pem in library {
-                    let resp = ui.selectable_label(selected == pem, pem_basename(pem));
+                for (pem, label) in library.iter().zip(pem_row_labels(library)) {
+                    let resp = ui.selectable_label(selected == pem, label);
                     if resp.on_hover_text(pem).clicked() {
                         picked = Some(pem.clone());
                     }
@@ -3859,6 +3980,9 @@ mod gui {
         secondary_bastion_filter: String,
         /// Usernames delete_user must never remove (from features.json).
         protected_users: Vec<String>,
+        /// Compiled-in port-forward definitions (assets/forwards.json), used
+        /// to build the LocalForward lines in the managed VS Code ssh block.
+        forwards_config: ec2_manager::forwards::ForwardsConfig,
         /// Build-time gate (features.json `personal_scripts.allowed_users`):
         /// whether the current OS user gets the git integration — the PAT
         /// prompt, git's credential store populated by Prep Terminal, and the
@@ -4167,6 +4291,7 @@ mod gui {
                 primary_bastion_filter: features.primary_bastion_filter.clone(),
                 secondary_bastion_filter: features.secondary_bastion_filter.clone(),
                 protected_users: features.protected_users.clone(),
+                forwards_config: ec2_manager::forwards::ForwardsConfig::bundled(),
                 git_scripts_enabled,
                 git_host,
                 default_scripts,
@@ -5392,10 +5517,33 @@ mod gui {
                 self.config
                     .resolve_pem(&profile_id, &env, &instance.instance_id);
 
+            // Port forwards for this environment. The hosts file is read
+            // only — where it already resolves a name, the forward binds
+            // that IP, so an existing setup needs no change.
+            let hosts_path = self.config.hosts_file_path();
+            let hosts = ec2_manager::forwards::load_hosts(&hosts_path);
+            for warning in
+                ec2_manager::forwards::drift_warnings(&self.forwards_config, &hosts)
+            {
+                self.log_warn(warning);
+            }
+            let resolved_forwards = ec2_manager::forwards::resolve_forwards(
+                &self.forwards_config,
+                &hosts,
+                &env,
+            );
+
             // Fast path: user opted out of the prompt and a pem is known.
             if suppressed {
                 if let Some(pem) = resolved_pem.clone() {
                     let remote = default_remote_dir(&ssh_user);
+                    let directives: Vec<String> = resolved_forwards
+                        .iter()
+                        .filter(|f| {
+                            !self.config.forward_disabled(&profile_id, &env, &f.host)
+                        })
+                        .map(|f| f.directive())
+                        .collect();
                     if let Err(err) = self.launch_vscode(
                         &instance.instance_id,
                         &instance_name,
@@ -5404,6 +5552,7 @@ mod gui {
                         &ssh_user,
                         &pem,
                         &remote,
+                        &directives,
                     ) {
                         self.message = format!("VS Code launch failed: {err}");
                         self.log_error(self.message.clone());
@@ -5442,17 +5591,33 @@ mod gui {
                         .and_then(|h| h.user.clone())
                 })
                 .unwrap_or(ssh_user);
+            let needs_attention =
+                resolved_forwards.iter().any(|f| f.needs_hosts_entry());
+            let profile_id_for_forwards = profile_id.clone();
             self.pem_dialog = Some(PemDialog {
                 instance_id: instance.instance_id.clone(),
                 instance_name,
                 profile_id,
-                env,
+                env: env.clone(),
                 aws_profile: context.profile.clone(),
                 region: context.region.clone(),
                 remote_path: default_remote_dir(&user_prefill),
                 ssh_user: user_prefill,
                 pem_path: pem_prefill,
                 dont_ask_again: false,
+                forwards: resolved_forwards
+                    .into_iter()
+                    .map(|f| {
+                        let on =
+                            !self.config.forward_disabled(&profile_id_for_forwards, &env, &f.host);
+                        (f, on)
+                    })
+                    .collect(),
+                hosts_path,
+                // Expanded when something needs attention, collapsed when
+                // every name already resolves — the common case is "these
+                // are fine, get on with it".
+                forwards_open: needs_attention,
                 opening_since: None,
             });
         }
@@ -5468,17 +5633,22 @@ mod gui {
             ssh_user: &str,
             pem: &str,
             remote_path: &str,
+            forwards: &[String],
         ) -> std::result::Result<(), String> {
             ec2_manager::ssh_config::ensure_include_directive()?;
             // The managed block is rewritten in full on every launch, so a
-            // changed SSH user or pem always takes effect on the next open.
+            // changed SSH user, pem or forward set always takes effect on
+            // the next open.
             let alias = ec2_manager::ssh_config::write_managed_block(
-                instance_id,
-                instance_name,
-                ssh_user,
-                pem,
-                aws_profile,
-                region,
+                &ec2_manager::ssh_config::ManagedHost {
+                    instance_id,
+                    name: instance_name,
+                    user: ssh_user,
+                    pem,
+                    profile: aws_profile,
+                    region,
+                    forwards,
+                },
             )?;
 
             // --folder-uri, not `--remote <alias> <path>`: the positional
@@ -5512,7 +5682,8 @@ mod gui {
                 format!("Opening {instance_id} in VS Code as {ssh_user}...");
             self.log_info(format!(
                 "launched VS Code Remote-SSH host={alias} user={ssh_user} \
-                 pem={pem} uri={folder_uri}"
+                 pem={pem} forwards={} uri={folder_uri}",
+                forwards.len()
             ));
             Ok(())
         }
@@ -5554,6 +5725,9 @@ mod gui {
             let mut window_open = true;
             let mut do_launch = false;
             let mut do_cancel = false;
+            // Set when the user picks a different hosts file, so the
+            // forwards can be re-resolved against it outside the closure.
+            let mut rehosted: Option<String> = None;
 
             egui::Window::new("Open in VS Code")
                 .collapsible(false)
@@ -5659,6 +5833,116 @@ mod gui {
                         }
                     }
 
+                    // Port forwards for this environment, if any are defined.
+                    if !dlg.forwards.is_empty() {
+                        ui.add_space(6.0);
+                        ui.separator();
+                        let on = dlg.forwards.iter().filter(|(_, on)| *on).count();
+                        let header = if dlg.env.is_empty() {
+                            format!("Port forwards ({on})")
+                        } else {
+                            format!(
+                                "Port forwards — {} ({on})",
+                                dlg.env.to_uppercase()
+                            )
+                        };
+                        let missing_any =
+                            dlg.forwards.iter().any(|(f, _)| f.needs_hosts_entry());
+                        egui::CollapsingHeader::new(header)
+                            .default_open(dlg.forwards_open)
+                            .show(ui, |ui| {
+                                for (fwd, enabled) in dlg.forwards.iter_mut() {
+                                    ui.horizontal(|ui| {
+                                        ui.checkbox(
+                                            enabled,
+                                            format!(
+                                                "{}:{} → {}:{}",
+                                                fwd.ip, fwd.port, fwd.host, fwd.port
+                                            ),
+                                        );
+                                        // Where the local IP came from, so a
+                                        // surprising address is traceable.
+                                        let (note, color) = match fwd.source {
+                                            ForwardSource::HostsSection => (
+                                                "hosts file",
+                                                egui::Color32::from_rgb(120, 170, 120),
+                                            ),
+                                            ForwardSource::HostsIp => (
+                                                "hosts file IP",
+                                                egui::Color32::from_rgb(120, 170, 120),
+                                            ),
+                                            ForwardSource::ConfigOnly => (
+                                                "not in hosts file",
+                                                egui::Color32::from_rgb(220, 160, 40),
+                                            ),
+                                        };
+                                        ui.colored_label(
+                                            color,
+                                            egui::RichText::new(note).small(),
+                                        );
+                                    });
+                                }
+                                if missing_any {
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Tunnels work by IP either way. Add \
+                                             these lines to use the names in a \
+                                             browser — that file needs an admin \
+                                             editor; this app only reads it.",
+                                        )
+                                        .small(),
+                                    );
+                                    if ui.button("Copy hosts entries").clicked() {
+                                        let resolved: Vec<_> = dlg
+                                            .forwards
+                                            .iter()
+                                            .map(|(f, _)| f.clone())
+                                            .collect();
+                                        let snippet =
+                                            ec2_manager::forwards::hosts_snippet(
+                                                &dlg.env, &resolved,
+                                            );
+                                        ui.ctx().copy_text(snippet);
+                                    }
+                                }
+
+                                // Which hosts file these were resolved
+                                // against, and a way to point elsewhere —
+                                // users who keep their own copy get their
+                                // existing setup honoured.
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Hosts file:").small(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(&dlg.hosts_path)
+                                            .small()
+                                            .weak(),
+                                    );
+                                    if ui.small_button("Browse...").clicked() {
+                                        let mut picker = rfd::FileDialog::new();
+                                        if let Some(dir) =
+                                            std::path::Path::new(&dlg.hosts_path)
+                                                .parent()
+                                                .filter(|p| p.is_dir())
+                                        {
+                                            picker = picker.set_directory(dir);
+                                        }
+                                        if let Some(picked) = picker.pick_file() {
+                                            let path =
+                                                picked.to_string_lossy().to_string();
+                                            self.config.forwards_hosts_file =
+                                                Some(path.clone());
+                                            let _ = self.config.save();
+                                            rehosted = Some(path);
+                                        }
+                                    }
+                                });
+                            });
+                    }
+
                     ui.add_space(4.0);
                     let was_checked = dlg.dont_ask_again;
                     // Scoped to the environment, since that is what the pem
@@ -5695,6 +5979,33 @@ mod gui {
                     });
                 });
 
+            // A newly picked hosts file re-resolves the forwards, keeping
+            // whatever the user had already unticked.
+            if let Some(path) = rehosted {
+                let hosts = ec2_manager::forwards::load_hosts(&path);
+                let resolved = ec2_manager::forwards::resolve_forwards(
+                    &self.forwards_config,
+                    &hosts,
+                    &dlg.env,
+                );
+                let was_off: Vec<String> = dlg
+                    .forwards
+                    .iter()
+                    .filter(|(_, on)| !*on)
+                    .map(|(f, _)| f.host.to_ascii_lowercase())
+                    .collect();
+                dlg.forwards = resolved
+                    .into_iter()
+                    .map(|f| {
+                        let on = !was_off.contains(&f.host.to_ascii_lowercase());
+                        (f, on)
+                    })
+                    .collect();
+                dlg.hosts_path = path;
+                self.pem_dialog = Some(dlg);
+                return;
+            }
+
             if do_launch {
                 self.config.set_vscode_defaults(
                     &dlg.profile_id,
@@ -5707,6 +6018,21 @@ mod gui {
                     self.config
                         .suppress_vscode_prompt(&dlg.profile_id, &dlg.env);
                 }
+                // Remember which forwards were unticked for this environment.
+                for (fwd, enabled) in &dlg.forwards {
+                    self.config.set_forward_disabled(
+                        &dlg.profile_id,
+                        &dlg.env,
+                        &fwd.host,
+                        !*enabled,
+                    );
+                }
+                let directives: Vec<String> = dlg
+                    .forwards
+                    .iter()
+                    .filter(|(_, on)| *on)
+                    .map(|(f, _)| f.directive())
+                    .collect();
                 if let Err(err) = self.config.save() {
                     self.log_warn(format!("failed to save pem config: {err}"));
                 }
@@ -5718,6 +6044,7 @@ mod gui {
                     &dlg.ssh_user,
                     &dlg.pem_path,
                     &dlg.remote_path,
+                    &directives,
                 ) {
                     Ok(()) => {
                         // Switch the dialog to the "Opening…" state; it
@@ -6986,11 +7313,7 @@ mod gui {
             let mut do_cancel = false;
             let mut env_changed = false;
 
-            let title = if dlg.delete {
-                "Scripts — Bastion User Delete"
-            } else {
-                "Scripts — Bastion New User"
-            };
+            let title = dlg.mode.title();
             egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
@@ -7062,13 +7385,26 @@ mod gui {
                         });
 
                     ui.add_space(4.0);
-                    if dlg.delete {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(220, 150, 60),
-                            "⚠ Removes the account, keys, and home directory (/efs/home/<user>).",
-                        );
-                    } else {
-                        ui.checkbox(&mut dlg.grant_sudo, "Grant sudo (NOPASSWD:ALL)");
+                    match dlg.mode {
+                        UserScriptMode::Delete => {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 150, 60),
+                                "⚠ Removes the account, keys, and home directory (/efs/home/<user>).",
+                            );
+                        }
+                        UserScriptMode::Restore => {
+                            // Say plainly what a restore destroys: the old
+                            // key stops working the moment this runs.
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 150, 60),
+                                "⚠ Issues a new key for an existing user and \
+                                 revokes their old one. Sudo and home are left \
+                                 alone; fails if the user does not exist.",
+                            );
+                        }
+                        UserScriptMode::Create => {
+                            ui.checkbox(&mut dlg.grant_sudo, "Grant sudo (NOPASSWD:ALL)");
+                        }
                     }
                     ui.add_space(6.0);
 
@@ -7107,7 +7443,7 @@ mod gui {
                         ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
                     }
 
-                    if dlg.delete {
+                    if dlg.mode.is_delete() {
                         ui.add_space(6.0);
                         let confirm_text = if dlg.username.trim().is_empty() {
                             "Yes, permanently delete this user".to_string()
@@ -7122,11 +7458,11 @@ mod gui {
 
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        let run_label = if dlg.delete { "Delete" } else { "Run" };
+                        let run_label = dlg.mode.run_label();
                         // In delete mode the button is disabled until the
-                        // confirmation checkbox is ticked, and in either mode
+                        // confirmation checkbox is ticked, and in every mode
                         // while the account isn't authenticated.
-                        let run_enabled = (!dlg.delete || dlg.confirm_delete)
+                        let run_enabled = (!dlg.mode.is_delete() || dlg.confirm_delete)
                             && auth_warning.is_none();
                         if ui
                             .add_enabled(run_enabled, egui::Button::new(run_label))
@@ -7178,9 +7514,20 @@ mod gui {
                     self.create_user_dialog = Some(dlg);
                     return;
                 }
-                if dlg.delete && self.is_protected_user(&username) {
+                // Restore replaces authorized_keys, so pointed at a shared
+                // account like ec2-user it would revoke the key everyone
+                // uses. Both destructive modes refuse the protected list.
+                if dlg.mode.is_delete() && self.is_protected_user(&username) {
                     dlg.error = Some(format!(
                         "'{username}' is a protected user and cannot be deleted."
+                    ));
+                    self.create_user_dialog = Some(dlg);
+                    return;
+                }
+                if dlg.mode.is_restore() && self.is_protected_user(&username) {
+                    dlg.error = Some(format!(
+                        "'{username}' is a protected user — restoring would \
+                         revoke the key everyone shares."
                     ));
                     self.create_user_dialog = Some(dlg);
                     return;
@@ -7209,7 +7556,7 @@ mod gui {
                 );
                 let _ = self.config.save();
                 self.start_user_script_run(
-                    dlg.delete,
+                    dlg.mode,
                     &username,
                     &dlg.env_profile_id,
                     &dlg.env_name,
@@ -7892,7 +8239,7 @@ mod gui {
         #[allow(clippy::too_many_arguments)]
         fn start_user_script_run(
             &mut self,
-            delete: bool,
+            mode: UserScriptMode,
             username: &str,
             env: &str,
             env_name: &str,
@@ -7900,7 +8247,7 @@ mod gui {
             primary_id: &str,
             secondary_id: &str,
         ) {
-            if delete {
+            if mode.is_delete() {
                 self.begin_delete_preflight(
                     username,
                     env,
@@ -7910,7 +8257,7 @@ mod gui {
                 );
             } else {
                 self.enqueue_user_script(
-                    false,
+                    mode,
                     username,
                     env,
                     env_name,
@@ -8003,7 +8350,7 @@ mod gui {
         #[allow(clippy::too_many_arguments)]
         fn enqueue_user_script(
             &mut self,
-            delete: bool,
+            mode: UserScriptMode,
             username: &str,
             env: &str,
             env_name: &str,
@@ -8012,6 +8359,7 @@ mod gui {
             secondary_id: &str,
         ) {
             use base64::Engine;
+            let delete = mode.is_delete();
             let (primary_steps, secondary_steps) = if delete {
                 // Obfuscated at build time (see obf_core) so the script body
                 // isn't readable in the binary; decrypt it here.
@@ -8056,7 +8404,13 @@ mod gui {
                 let remote_path = "/root/create_new_user.sh";
 
                 // Primary: drop the script and run it as root from $HOME.
-                let run_line = if grant_sudo {
+                // --restore makes the script require an existing account,
+                // replace authorized_keys and overwrite the old PEM; --sudo
+                // is never combined with it, so an existing grant survives
+                // untouched rather than being re-applied.
+                let run_line = if mode.is_restore() {
+                    format!("bash {remote_path} --user {username} --restore")
+                } else if grant_sudo {
                     format!("bash {remote_path} --user {username} --sudo")
                 } else {
                     format!("bash {remote_path} --user {username}")
@@ -8117,7 +8471,7 @@ mod gui {
                 (primary, secondary)
             };
 
-            let action = if delete { "delete_user" } else { "create_new_user" };
+            let action = mode.log_action();
 
             // Open the PRIMARY now and queue its steps. The SECONDARY is
             // deferred until the primary finishes — it reads the UID/GID
@@ -8179,6 +8533,7 @@ mod gui {
                 if let Some(ctx) = ctx {
                     self.create_user_run = Some(CreateUserRun {
                         delete,
+                        restore: mode.is_restore(),
                         username: username.to_string(),
                         env: env.to_string(),
                         mmodal_env,
@@ -8441,7 +8796,7 @@ mod gui {
                             pd.username
                         ));
                         self.enqueue_user_script(
-                            true,
+                            UserScriptMode::Delete,
                             &pd.username,
                             &pd.env,
                             &pd.env_name,
@@ -8543,6 +8898,7 @@ mod gui {
                 if let Some(run) = self.create_user_run.as_ref() {
                     let tx = self.verify_tx.clone();
                     let delete = run.delete;
+                    let restore_run = run.restore;
                     let username = run.username.clone();
                     let mmodal_env = run.mmodal_env.clone();
                     let primary_id = run.primary_id.clone();
@@ -8580,7 +8936,8 @@ mod gui {
                         });
                     } else {
                         self.log_info(format!(
-                            "create_new_user: create finished, verifying SSH for '{username}'…"
+                            "{}: finished, verifying SSH for '{username}'…",
+                            if restore_run { "restore_user" } else { "create_new_user" }
                         ));
                         self.set_script_status(
                             format!("Verifying SSH login for '{username}'…"),
@@ -8661,9 +9018,13 @@ mod gui {
                             .as_ref()
                             .map(|p| format!(" PEM saved to {p}"))
                             .unwrap_or_default();
+                        // A restore takes the create path end to end, so only
+                        // the wording distinguishes them here.
+                        let restored = finished.as_ref().is_some_and(|r| r.restore);
+                        let did = if restored { "restored" } else { "created" };
                         if p2s && s2p {
                             let mut msg = format!(
-                                "User '{username}' created. All tests passed (primary↔secondary SSH OK)."
+                                "User '{username}' {did}. All tests passed (primary↔secondary SSH OK)."
                             );
                             if pem_path.is_none() {
                                 if let Some(err) = &error {
@@ -8705,7 +9066,7 @@ mod gui {
                                 }
                             }
                             self.show_script_result(
-                                "User Created",
+                                if restored { "Access Restored" } else { "User Created" },
                                 msg,
                                 true,
                                 pem_path,
@@ -8720,7 +9081,7 @@ mod gui {
                         } else {
                             let dir = |ok: bool| if ok { "OK" } else { "FAILED" };
                             let mut msg = format!(
-                                "User '{username}' created, but SSH test failed \
+                                "User '{username}' {did}, but SSH test failed \
                                  (primary→secondary: {}, secondary→primary: {}). \
                                  See diagnostics below.",
                                 dir(p2s),
@@ -8740,7 +9101,7 @@ mod gui {
                             let details =
                                 if details.trim().is_empty() { None } else { Some(details) };
                             self.show_script_result(
-                                "Create Failed",
+                                if restored { "Restore Failed" } else { "Create Failed" },
                                 msg,
                                 false,
                                 pem_path,
@@ -14917,13 +15278,13 @@ mod gui {
                                 });
                         }
 
-                        let script_count = 1
+                        let script_count = 2
                             + usize::from(self.allow_delete_user)
                             + usize::from(self.vault_iam_enabled)
                             + usize::from(self.vault_iam_delete_enabled)
                             + self.default_scripts.len()
                             + self.config.personal_scripts.len();
-                        let mut open_dialog: Option<bool> = None;
+                        let mut open_dialog: Option<UserScriptMode> = None;
                         let mut run_default: Option<usize> = None;
                         let mut run_script: Option<usize> = None;
                         let mut edit_script: Option<usize> = None;
@@ -14934,26 +15295,75 @@ mod gui {
                         egui::ComboBox::from_id_salt("scripts_menu")
                             .selected_text(format!("Scripts ({script_count})"))
                             .show_ui(ui, |ui| {
-                                if ui.selectable_label(false, "Bastion New User…").clicked() {
-                                    open_dialog = Some(false);
+                                if ui
+                                    .selectable_label(false, "Bastion New User…")
+                                    .on_hover_text(
+                                        "Create a user on both bastions: makes the \
+                                         account and its /efs/home directory, \
+                                         generates a key, and saves the PEM. \
+                                         Optionally grants passwordless sudo.",
+                                    )
+                                    .clicked()
+                                {
+                                    open_dialog = Some(UserScriptMode::Create);
+                                    ui.close();
+                                }
+                                if ui
+                                    .selectable_label(false, "Bastion User Restore…")
+                                    .on_hover_text(
+                                        "Issue a new key to a user who already \
+                                         exists — for someone who lost their PEM. \
+                                         Replaces their authorized_keys, so the \
+                                         old key stops working. Leaves sudo, the \
+                                         account and the home directory alone, \
+                                         and fails if the user does not exist.",
+                                    )
+                                    .clicked()
+                                {
+                                    open_dialog = Some(UserScriptMode::Restore);
                                     ui.close();
                                 }
                                 if self.allow_delete_user
                                     && ui
                                         .selectable_label(false, "Bastion User Delete…")
+                                        .on_hover_text(
+                                            "Permanently remove a user from both \
+                                             bastions — the account, its keys and \
+                                             its /efs/home directory. Refuses the \
+                                             protected accounts, and aborts if the \
+                                             user has a session open.",
+                                        )
                                         .clicked()
                                 {
-                                    open_dialog = Some(true);
+                                    open_dialog = Some(UserScriptMode::Delete);
                                     ui.close();
                                 }
                                 if self.vault_iam_enabled
-                                    && ui.selectable_label(false, "Vault IAM Access…").clicked()
+                                    && ui
+                                        .selectable_label(false, "Vault IAM Access…")
+                                        .on_hover_text(
+                                            "Create a Vault policy and an AWS auth \
+                                             role bound to an IAM role, then read \
+                                             both back to confirm. Runs on the \
+                                             primary bastion only, as your own \
+                                             login.",
+                                        )
+                                        .clicked()
                                 {
                                     open_vault_iam = Some(false);
                                     ui.close();
                                 }
                                 if self.vault_iam_delete_enabled
-                                    && ui.selectable_label(false, "Vault IAM Delete…").clicked()
+                                    && ui
+                                        .selectable_label(false, "Vault IAM Delete…")
+                                        .on_hover_text(
+                                            "Remove a Vault auth role and its \
+                                             policy, then confirm neither reads \
+                                             back. The policy goes too, so a \
+                                             policy shared with another role takes \
+                                             that role's access with it.",
+                                        )
+                                        .clicked()
                                 {
                                     open_vault_iam = Some(true);
                                     ui.close();
@@ -14972,7 +15382,7 @@ mod gui {
                                     };
                                     if ui
                                         .selectable_label(false, label)
-                                        .on_hover_text("Run in the open connection tab")
+                                        .on_hover_text(script_hover_text(&script.body))
                                         .clicked()
                                     {
                                         run_default = Some(i);
@@ -14996,7 +15406,7 @@ mod gui {
                                         };
                                         if ui
                                             .selectable_label(false, label)
-                                            .on_hover_text("Run in the open connection tab")
+                                            .on_hover_text(script_hover_text(&script.body))
                                             .clicked()
                                         {
                                             run_script = Some(i);
@@ -15015,7 +15425,16 @@ mod gui {
 
                                 // Add Script is available to everyone.
                                 ui.separator();
-                                if ui.selectable_label(false, "Add Script…").clicked() {
+                                if ui
+                                    .selectable_label(false, "Add Script…")
+                                    .on_hover_text(
+                                        "Save your own shell snippet with an \
+                                         optional hotkey. It pastes into the \
+                                         focused connection tab — no bastion \
+                                         dialog, no sudo.",
+                                    )
+                                    .clicked()
+                                {
                                     add_script = true;
                                     ui.close();
                                 }
@@ -15067,7 +15486,7 @@ mod gui {
                             self.open_vault_iam_dialog(delete);
                         }
                         {
-                            if let Some(delete) = open_dialog {
+                            if let Some(mode) = open_dialog {
                                 let (env, env_name) = self.default_script_environment();
                                 let mut primary_id = String::new();
                                 let mut primary_query = String::new();
@@ -15082,7 +15501,7 @@ mod gui {
                                     &mut secondary_query,
                                 );
                                 self.create_user_dialog = Some(CreateUserDialog {
-                                    delete,
+                                    mode,
                                     username: String::new(),
                                     env_profile_id: env,
                                     env_name,
@@ -18074,6 +18493,95 @@ mod gui {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// A filename shared by two keys identifies neither, so those rows
+        /// carry their full path — without it the only way to tell them
+        /// apart is to hover and wait for the tooltip.
+        #[test]
+        fn pem_row_labels_expand_only_ambiguous_names() {
+            let library = vec![
+                "/keys/dev/bastion.pem".to_string(),
+                "/keys/prod/bastion.pem".to_string(),
+                "/keys/only-one.pem".to_string(),
+            ];
+            assert_eq!(
+                pem_row_labels(&library),
+                vec![
+                    "/keys/dev/bastion.pem".to_string(),
+                    "/keys/prod/bastion.pem".to_string(),
+                    "only-one.pem".to_string(),
+                ]
+            );
+        }
+
+        /// Filenames differing only in case read as the same name at a
+        /// glance (and are the same file on Windows), and the sort is
+        /// case-insensitive too — so the clash check has to be.
+        ///
+        /// Uses forward slashes deliberately: `Path::file_name` treats `\`
+        /// as an ordinary character on Linux, so a Windows-style path would
+        /// make this pass without exercising the clash check at all.
+        #[test]
+        fn pem_row_labels_clash_check_ignores_case() {
+            let library = vec![
+                "/keys/dev/Bastion.pem".to_string(),
+                "/keys/prod/bastion.pem".to_string(),
+            ];
+            assert_eq!(
+                pem_row_labels(&library),
+                vec![
+                    "/keys/dev/Bastion.pem".to_string(),
+                    "/keys/prod/bastion.pem".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn pem_row_labels_handles_empty_library() {
+            assert!(pem_row_labels(&[]).is_empty());
+        }
+
+        /// Restore is a variant of create, not a third pipeline — only the
+        /// wording and the run line differ. Delete is the separate path.
+        #[test]
+        fn user_script_mode_labels_each_action() {
+            assert!(UserScriptMode::Delete.is_delete());
+            assert!(!UserScriptMode::Restore.is_delete());
+            assert!(!UserScriptMode::Create.is_delete());
+            assert!(UserScriptMode::Restore.is_restore());
+            assert!(!UserScriptMode::Create.is_restore());
+
+            assert_eq!(UserScriptMode::Restore.title(), "Scripts — Bastion User Restore");
+            assert_eq!(UserScriptMode::Restore.run_label(), "Restore");
+            assert_eq!(UserScriptMode::Restore.log_action(), "restore_user");
+            assert_eq!(UserScriptMode::Create.log_action(), "create_new_user");
+            assert_eq!(UserScriptMode::Delete.log_action(), "delete_user");
+        }
+
+        /// The tooltip has to show what actually lands in the terminal: a
+        /// name like "prep" says nothing, and these paste into a live shell.
+        #[test]
+        fn script_hover_text_previews_the_body() {
+            let hover = script_hover_text("cd /srv\n\nsudo systemctl restart api\n");
+            assert!(hover.contains("cd /srv"), "{hover}");
+            assert!(hover.contains("sudo systemctl restart api"), "{hover}");
+
+            // Long bodies are trimmed, and say how much was left out.
+            let long: String =
+                (1..=10).map(|i| format!("line{i}\n")).collect();
+            let hover = script_hover_text(&long);
+            assert!(hover.contains("line6"), "{hover}");
+            assert!(!hover.contains("line7"), "{hover}");
+            assert!(hover.contains("… 4 more lines"), "{hover}");
+
+            // A very long single line is truncated rather than blowing the
+            // tooltip across the screen.
+            let hover = script_hover_text(&"x".repeat(200));
+            assert!(hover.contains('…'), "{hover}");
+            assert!(hover.lines().all(|l| l.chars().count() < 100), "{hover}");
+
+            assert!(script_hover_text("  \n \n").contains("empty script"));
+        }
 
         /// Created users' homes live on the shared EFS mount; only the
         /// built-in ec2-user has a local one.

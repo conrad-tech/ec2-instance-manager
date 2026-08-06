@@ -61,6 +61,18 @@ pub struct AppConfig {
     pub ssh_pem_instance: BTreeMap<String, String>,
     /// Per-profile "don't ask for pem again" flag (profile_id -> true).
     pub vscode_pem_suppressed: BTreeMap<String, bool>,
+    /// Hosts file the port-forward resolver reads, if the user pointed it
+    /// somewhere other than the machine's own. Read-only, always — see
+    /// `crate::forwards`.
+    pub forwards_hosts_file: Option<String>,
+    /// Port forwards the user unticked, keyed like the other VS Code
+    /// settings (`vscode_key`) with the DNS names as the value.
+    ///
+    /// Stores the *disabled* names rather than the enabled ones, so a
+    /// forward added to forwards.json later shows up switched on instead of
+    /// being silently absent because it was missing from a list saved
+    /// months ago.
+    pub disabled_forwards: BTreeMap<String, Vec<String>>,
     /// Last primary/secondary bastion pair selected in the create-user
     /// script dialog, keyed by environment/profile_id. Value is
     /// "primary_instance_id|secondary_instance_id" (either side may be
@@ -124,6 +136,8 @@ impl Default for AppConfig {
             ssh_user_default: BTreeMap::new(),
             ssh_pem_instance: BTreeMap::new(),
             vscode_pem_suppressed: BTreeMap::new(),
+            forwards_hosts_file: None,
+            disabled_forwards: BTreeMap::new(),
             bastion_selections: BTreeMap::new(),
             personal_scripts: Vec::new(),
             git_pat: None,
@@ -305,6 +319,51 @@ impl AppConfig {
     pub fn suppress_vscode_prompt(&mut self, profile_id: &str, env: &str) {
         self.vscode_pem_suppressed
             .insert(Self::vscode_key(profile_id, env), true);
+    }
+
+    /// Hosts file the port-forward resolver reads: the user's override, or
+    /// the machine's own. Only ever read — see `crate::forwards`.
+    pub fn hosts_file_path(&self) -> String {
+        self.forwards_hosts_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(crate::forwards::default_hosts_path)
+    }
+
+    /// Whether the user unticked this forward for this environment.
+    pub fn forward_disabled(&self, profile_id: &str, env: &str, host: &str) -> bool {
+        self.disabled_forwards
+            .get(&Self::vscode_key(profile_id, env))
+            .map(|names| names.iter().any(|n| n.eq_ignore_ascii_case(host.trim())))
+            .unwrap_or(false)
+    }
+
+    /// Tick or untick a forward for an environment.
+    pub fn set_forward_disabled(
+        &mut self,
+        profile_id: &str,
+        env: &str,
+        host: &str,
+        disabled: bool,
+    ) {
+        let key = Self::vscode_key(profile_id, env);
+        let host = host.trim();
+        if host.is_empty() {
+            return;
+        }
+        let names = self.disabled_forwards.entry(key.clone()).or_default();
+        if disabled {
+            if !names.iter().any(|n| n.eq_ignore_ascii_case(host)) {
+                names.push(host.to_string());
+            }
+        } else {
+            names.retain(|n| !n.eq_ignore_ascii_case(host));
+        }
+        if names.is_empty() {
+            self.disabled_forwards.remove(&key);
+        }
     }
 
     /// Drop the opt-out for an account and every environment under it, so
@@ -602,6 +661,20 @@ impl AppConfig {
                 continue;
             }
 
+            if let Some(rest) = key.strip_prefix("forwards_disabled.") {
+                if !rest.is_empty() {
+                    let names: Vec<String> = value
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if !names.is_empty() {
+                        cfg.disabled_forwards.insert(rest.to_string(), names);
+                    }
+                }
+                continue;
+            }
+
             if let Some(rest) = key.strip_prefix("vscode_pem_suppress.") {
                 if !rest.is_empty() {
                     cfg.vscode_pem_suppressed.insert(
@@ -754,6 +827,13 @@ impl AppConfig {
                         Some(value.to_string())
                     };
                 }
+                "forwards_hosts_file" => {
+                    cfg.forwards_hosts_file = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
                 _ => {}
             }
         }
@@ -829,6 +909,14 @@ impl AppConfig {
         }
         for (env, pair) in &self.bastion_selections {
             lines.push(format!("bastion_pair.{env}={pair}"));
+        }
+        if let Some(ref p) = self.forwards_hosts_file {
+            lines.push(format!("forwards_hosts_file={p}"));
+        }
+        for (key, names) in &self.disabled_forwards {
+            if !names.is_empty() {
+                lines.push(format!("forwards_disabled.{key}={}", names.join(",")));
+            }
         }
         for (profile, suppressed) in &self.vscode_pem_suppressed {
             if *suppressed {
@@ -1152,6 +1240,40 @@ mod tests {
         assert!(!cfg.vscode_prompt_suppressed("acct", "DEV1"));
         assert!(!cfg.vscode_prompt_suppressed("acct", ""));
         assert!(!cfg.clear_vscode_prompt_suppression("acct"));
+    }
+
+    /// Unticking a forward is remembered per environment, and storing the
+    /// disabled names means a forward added to forwards.json later arrives
+    /// switched on rather than silently missing.
+    #[test]
+    fn disabled_forwards_are_per_environment_and_round_trip() {
+        let mut cfg = AppConfig::default();
+        assert!(!cfg.forward_disabled("acct", "DEV1", "solr.example.net"));
+
+        cfg.set_forward_disabled("acct", "DEV1", "solr.example.net", true);
+        assert!(cfg.forward_disabled("acct", "DEV1", "solr.example.net"));
+        // Case-insensitive, and scoped to the one environment.
+        assert!(cfg.forward_disabled("acct", "dev1", "SOLR.example.net"));
+        assert!(!cfg.forward_disabled("acct", "DEV2", "solr.example.net"));
+        assert!(!cfg.forward_disabled("other", "DEV1", "solr.example.net"));
+        // A forward nobody has ticked off is enabled.
+        assert!(!cfg.forward_disabled("acct", "DEV1", "new.example.net"));
+
+        // Re-ticking clears it, and empties drop out of the map entirely so
+        // config.ini does not accumulate blank keys.
+        cfg.set_forward_disabled("acct", "DEV1", "solr.example.net", false);
+        assert!(!cfg.forward_disabled("acct", "DEV1", "solr.example.net"));
+        assert!(cfg.disabled_forwards.is_empty());
+    }
+
+    #[test]
+    fn hosts_file_path_falls_back_to_the_machine_default() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(cfg.hosts_file_path(), crate::forwards::default_hosts_path());
+        cfg.forwards_hosts_file = Some("  ".to_string());
+        assert_eq!(cfg.hosts_file_path(), crate::forwards::default_hosts_path());
+        cfg.forwards_hosts_file = Some("/tmp/my-hosts".to_string());
+        assert_eq!(cfg.hosts_file_path(), "/tmp/my-hosts");
     }
 
     /// Names and bodies are base64'd, so a script whose body contains the

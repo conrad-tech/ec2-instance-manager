@@ -1,0 +1,30 @@
+{
+  "_comment": [
+    "Port forwards added to the managed Host block by Open in VS Code.",
+    "Compiled into the binary at build time — edit and rebuild to change.",
+    "",
+    "environments: keyed by the instance's MMODAL_ENV tag (case-insensitive).",
+    "  ip   loopback address bound locally. Used only when the machine's",
+    "       hosts file has no entry for `host` — where it does, that IP wins,",
+    "       so an existing hosts setup needs no change.",
+    "  host remote DNS name, resolved on the bastion.",
+    "  port optional; omit to infer from the name via port_rules.",
+    "",
+    "port_rules are checked in order and the FIRST match wins, so a name like",
+    "kafka-postgres-proxy takes the port of whichever rule is listed first.",
+    "",
+    "The hosts file is only ever read. Where a name has no hosts entry the",
+    "tunnel still works, addressed by its IP; the dialog offers the line to",
+    "paste in so the name resolves in a browser too."
+  ],
+
+  "default_port": 443,
+
+  "port_rules": [
+    { "match": "postgres", "port": 5432 },
+    { "match": "solr", "port": 8984 },
+    { "match": "kafka", "port": 9094 }
+  ],
+
+  "environments": {}
+}

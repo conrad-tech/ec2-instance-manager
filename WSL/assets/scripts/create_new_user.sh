@@ -1,15 +1,20 @@
 #!/bin/bash
 # Run as root on the PRIMARY bastion
 # Creates a brand-new user, generates a PEM private key, and installs the derived public key
+# With --restore: regenerates the key for a user who already exists, replacing
+# their authorized_keys so the key they lost stops working.
 
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 --user <username> [--pem <pem_path>] [--force] [--sudo] [--help]"
+  echo "Usage: $0 --user <username> [--pem <pem_path>] [--force] [--sudo] [--restore] [--help]"
   echo " --user <username> Required. New username to create"
   echo " --pem <pem_path> Optional. PEM output path (default: /root/<username>.pem)"
   echo " --force Optional. Overwrite existing PEM file"
   echo " --sudo Optional. Configure sudo access (NOPASSWD:ALL)"
+  echo " --restore Optional. Restore access for an EXISTING user: require the"
+  echo "                    account to exist, replace authorized_keys (revoking"
+  echo "                    the lost key) and overwrite any existing PEM."
   echo " --help Show this help message"
 }
 
@@ -22,6 +27,7 @@ USERNAME=""
 PEM_PATH=""
 FORCE=0
 SUDO=0
+RESTORE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -39,6 +45,13 @@ while [[ $# -gt 0 ]]; do
       ;;
     --sudo)
       SUDO=1
+      shift
+      ;;
+    --restore)
+      # Restoring implies overwriting the PEM: the original run left one at
+      # the default path, and refusing it would fail every restore.
+      RESTORE=1
+      FORCE=1
       shift
       ;;
     --help|-h)
@@ -70,6 +83,15 @@ fi
 
 DEFAULT_HOME_DIR="/efs/home/${USERNAME}"
 USER_CREATED=0
+
+# A restore never creates anything. Without this a typo'd username would
+# quietly produce a new half-configured account instead of telling the
+# operator the name was wrong.
+if [[ $RESTORE -eq 1 ]] && ! id "$USERNAME" >/dev/null 2>&1; then
+  echo "ERROR: User '$USERNAME' does not exist on this bastion."
+  echo "Use Bastion New User to create them; --restore only regenerates a key."
+  exit 1
+fi
 
 if id "$USERNAME" >/dev/null 2>&1; then
   HOME_DIR="$(getent passwd "$USERNAME" | cut -d: -f6)"
@@ -136,7 +158,12 @@ chmod 700 "$SSH_DIR"
 touch "$AUTH_KEYS"
 chmod 600 "$AUTH_KEYS"
 
-if ! grep -qxF "$PUB_KEY" "$AUTH_KEYS" 2>/dev/null; then
+if [[ $RESTORE -eq 1 ]]; then
+  # Replace rather than append: the point of a restore is that the previous
+  # key is unaccounted for, so leaving it authorized defeats the exercise.
+  echo "Replacing authorized_keys for $USERNAME (previous keys revoked)."
+  printf '%s\n' "$PUB_KEY" > "$AUTH_KEYS"
+elif ! grep -qxF "$PUB_KEY" "$AUTH_KEYS" 2>/dev/null; then
   echo "$PUB_KEY" >> "$AUTH_KEYS"
 fi
 
@@ -182,6 +209,8 @@ fi
 echo ""
 if [[ $USER_CREATED -eq 1 ]]; then
   echo "Created user: $USERNAME"
+elif [[ $RESTORE -eq 1 ]]; then
+  echo "Restored access for: $USERNAME"
 else
   echo "Updated existing user: $USERNAME"
 fi

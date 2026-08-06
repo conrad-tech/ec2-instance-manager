@@ -116,6 +116,7 @@ fn emit_obfuscated_assets() {
     let assets = [
         ("accounts.json.obf", "assets/accounts.json"),
         ("features.json.obf", "assets/features.json"),
+        ("forwards.json.obf", "assets/forwards.json"),
         ("create_new_user.sh.obf", "assets/scripts/create_new_user.sh"),
         ("delete_user.sh.obf", "assets/scripts/delete_user.sh"),
         // User-management shell that used to be inline string literals in the
