@@ -31,7 +31,7 @@ impl Default for Mode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthStatus {
     Ok,
     Expired,

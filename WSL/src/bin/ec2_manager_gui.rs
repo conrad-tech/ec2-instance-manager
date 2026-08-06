@@ -563,6 +563,10 @@ mod gui {
         secondary_id: String,
         /// Inline validation error, shown in red.
         error: Option<String>,
+        /// Give the top text box keyboard focus on the dialog's first frame,
+        /// so picking the script from the menu leaves the user able to type
+        /// straight away. Cleared once requested.
+        focus_top: bool,
     }
 
     /// Modal state for "Scripts → Vault IAM Access".
@@ -598,6 +602,11 @@ mod gui {
         vault_token: String,
         /// Inline validation error, shown in red.
         error: Option<String>,
+        /// Give the top text box keyboard focus on the dialog's first frame
+        /// (the IAM Role ARN when creating, the Vault Role Name when
+        /// deleting, since the ARN box is hidden then). Cleared once
+        /// requested.
+        focus_top: bool,
     }
 
     /// Tracks an in-flight Vault IAM Access run so the verdict marker can be
@@ -816,7 +825,22 @@ mod gui {
         spawned: bool,
         /// Human-readable label for logging (e.g. "primary i-0abc…").
         label: String,
+        /// When this run was queued. A session that never registers within
+        /// `SESSION_START_WAIT` aborts the run rather than sitting here
+        /// forever — see `pump_script_runs`.
+        queued_at: Instant,
     }
+
+    /// How long a queued script run waits for its PTY session to appear
+    /// before giving up.
+    ///
+    /// `aws ssm start-session` reaches a prompt in a few seconds when it
+    /// works; when it fails on credentials or permissions it writes an error
+    /// and exits, so the session never registers at all. Without this the
+    /// pending run sits un-spawned and the status line flashes yellow with
+    /// nothing ever clearing it. Kept below the worker's own 45s `LOGIN_WAIT`
+    /// so the two timeouts can't stack.
+    const SESSION_START_WAIT: Duration = Duration::from_secs(30);
 
     /// Comment prefixes for a file extension, used by the editor's
     /// lightweight syntax highlighter.
@@ -2692,6 +2716,77 @@ mod gui {
         GIT_AUTH_FAILURE_MARKERS
             .iter()
             .any(|marker| lower.contains(marker))
+    }
+
+    /// Output from `aws ssm start-session` (or the session-manager-plugin)
+    /// that means the session will never come up, paired with the reason to
+    /// show the user. Markers are lowercase — the text is lowercased before
+    /// matching.
+    ///
+    /// Ordered most-specific first: an AccessDenied body usually also carries
+    /// the "is not authorized to perform" sentence, and that one names the
+    /// actual problem, so it must be tested before the bare code.
+    const SSM_SESSION_FAILURE_MARKERS: &[(&str, &str)] = &[
+        (
+            "is not authorized to perform",
+            "Your credentials are valid, but they are not authorized to start a \
+             session on this instance. Re-authenticate with a role that has \
+             ssm:StartSession, then retry.",
+        ),
+        (
+            "accessdenied",
+            "Access was denied starting the session — your credentials may not \
+             cover this account. Re-authenticate and retry.",
+        ),
+        (
+            "expiredtoken",
+            "Your credentials for this account have expired. Re-authenticate and \
+             retry.",
+        ),
+        (
+            "security token included in the request is expired",
+            "Your credentials for this account have expired. Re-authenticate and \
+             retry.",
+        ),
+        (
+            "unable to locate credentials",
+            "No credentials were found for this account's profile. \
+             Re-authenticate and retry.",
+        ),
+        (
+            "config profile",
+            "This account's profile is missing from ~/.aws/credentials. \
+             Re-authenticate and retry.",
+        ),
+        (
+            "invalidclienttokenid",
+            "This account's credentials were rejected as invalid. \
+             Re-authenticate and retry.",
+        ),
+        (
+            "unrecognizedclientexception",
+            "This account's credentials were rejected as invalid. \
+             Re-authenticate and retry.",
+        ),
+        (
+            "targetnotconnected",
+            "The instance is not connected to SSM, so a session cannot be \
+             started. Check that the box is running and its SSM agent is up.",
+        ),
+    ];
+
+    /// The reason a Scripts run's session failed to start, or `None` when the
+    /// output shows nothing fatal.
+    ///
+    /// Only ever applied to a tab a script run is waiting on — an ordinary
+    /// session printing "AccessDenied" from some unrelated command must not
+    /// tear a run down.
+    fn ssm_session_failure(text: &str) -> Option<&'static str> {
+        let lower = text.to_ascii_lowercase();
+        SSM_SESSION_FAILURE_MARKERS
+            .iter()
+            .find(|(marker, _)| lower.contains(marker))
+            .map(|(_, reason)| *reason)
     }
 
     /// A key combination bound to a personal script. Fires only while the
@@ -5826,6 +5921,59 @@ mod gui {
             rows
         }
 
+        /// Auth status of the profile behind a Scripts-dialog environment row.
+        ///
+        /// Sim mode always reports `Ok` so the smoke tests and offline demos
+        /// aren't gated. A profile with **no** entry in `profile_auth_infos`
+        /// is `Missing`, not `Ok` — the gate fails closed, like
+        /// `allow_delete_user`.
+        fn script_env_auth(&self, profile_id: &str) -> AuthStatus {
+            if self.options.mode == Mode::Sim {
+                return AuthStatus::Ok;
+            }
+            self.profile_auth_infos
+                .iter()
+                .find(|a| a.profile_id == profile_id)
+                .map(|a| a.auth_status)
+                .unwrap_or(AuthStatus::Missing)
+        }
+
+        /// The account name to show for a profile, falling back to the
+        /// profile id when it isn't configured.
+        fn profile_display_name(&self, profile_id: &str) -> String {
+            self.config
+                .profiles
+                .iter()
+                .find(|p| p.profile_id == profile_id)
+                .map(|p| p.display_name.clone())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| profile_id.to_string())
+        }
+
+        /// The warning a Scripts dialog shows when the selected environment's
+        /// account has no usable credentials, or `None` when it's good to run.
+        ///
+        /// This is what keeps a run from ever starting against an account the
+        /// user isn't authenticated to: the dialogs disable their Run button
+        /// while it returns `Some`. An empty `profile_id` is *not* a warning —
+        /// "choose an environment" is already handled by each dialog's own
+        /// validation on Run.
+        fn script_env_auth_warning(&self, profile_id: &str) -> Option<String> {
+            if profile_id.trim().is_empty() {
+                return None;
+            }
+            let name = self.profile_display_name(profile_id);
+            match self.script_env_auth(profile_id) {
+                AuthStatus::Ok => None,
+                AuthStatus::Expired => Some(format!(
+                    "⚠ Auth has expired for {name}. Refresh credentials and retry."
+                )),
+                AuthStatus::Missing => Some(format!(
+                    "⚠ Auth is not OK for {name}. Refresh credentials and retry."
+                )),
+            }
+        }
+
         /// Environment a Scripts dialog opens on: the first environment of the
         /// account currently selected on the Inventory page, so the common case
         /// of one environment per account needs no picking at all. Falls back
@@ -6652,6 +6800,13 @@ mod gui {
             let instances = self.env_instances(&dlg.env_profile_id, &dlg.env_name);
             let primary_filter = self.primary_bastion_filter.clone();
             let secondary_filter = self.secondary_bastion_filter.clone();
+            // Auth per row, and for the current selection. Precomputed here
+            // because the window closure below borrows `dlg`, not `self`.
+            let env_auth: Vec<AuthStatus> = environments
+                .iter()
+                .map(|e| self.script_env_auth(&e.account_id))
+                .collect();
+            let auth_warning = self.script_env_auth_warning(&dlg.env_profile_id);
 
             let mut window_open = true;
             let mut do_run = false;
@@ -6674,32 +6829,49 @@ mod gui {
                         .spacing([10.0, 8.0])
                         .show(ui, |ui| {
                             ui.label("User:");
-                            ui.add(
+                            let user_box = ui.add(
                                 egui::TextEdit::singleline(&mut dlg.username)
                                     .hint_text("firstname.lastname")
                                     .desired_width(320.0),
                             );
+                            // First frame only: the user picked this off the
+                            // Scripts menu to type a username, so put the
+                            // caret there rather than making them click.
+                            if dlg.focus_top {
+                                dlg.focus_top = false;
+                                user_box.request_focus();
+                            }
                             ui.end_row();
 
                             ui.label("Environment:");
                             let env_label = environments
                                 .iter()
-                                .find(|e| {
+                                .position(|e| {
                                     e.account_id == dlg.env_profile_id
                                         && e.env == dlg.env_name
                                 })
-                                .map(script_env_label)
+                                .map(|i| {
+                                    script_env_label_with_auth(
+                                        &environments[i],
+                                        env_auth[i],
+                                    )
+                                })
                                 .unwrap_or_else(|| "Select…".to_string());
                             let prev = (dlg.env_profile_id.clone(), dlg.env_name.clone());
                             egui::ComboBox::from_id_salt("cnu_env")
                                 .selected_text(env_label)
                                 .width(320.0)
                                 .show_ui(ui, |ui| {
-                                    for row in &environments {
+                                    for (row, auth) in
+                                        environments.iter().zip(env_auth.iter())
+                                    {
                                         let selected = row.account_id == dlg.env_profile_id
                                             && row.env == dlg.env_name;
                                         if ui
-                                            .selectable_label(selected, script_env_label(row))
+                                            .selectable_label(
+                                                selected,
+                                                script_env_label_with_auth(row, *auth),
+                                            )
                                             .clicked()
                                         {
                                             dlg.env_profile_id = row.account_id.clone();
@@ -6749,6 +6921,14 @@ mod gui {
                         &instances,
                     );
 
+                    // Selected environment's account has no usable credentials
+                    // — say so here rather than opening a session that can
+                    // only fail.
+                    if let Some(warn) = &auth_warning {
+                        ui.add_space(6.0);
+                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), warn);
+                    }
+
                     if let Some(err) = &dlg.error {
                         ui.add_space(6.0);
                         ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
@@ -6771,10 +6951,17 @@ mod gui {
                     ui.horizontal(|ui| {
                         let run_label = if dlg.delete { "Delete" } else { "Run" };
                         // In delete mode the button is disabled until the
-                        // confirmation checkbox is ticked.
-                        let run_enabled = !dlg.delete || dlg.confirm_delete;
+                        // confirmation checkbox is ticked, and in either mode
+                        // while the account isn't authenticated.
+                        let run_enabled = (!dlg.delete || dlg.confirm_delete)
+                            && auth_warning.is_none();
                         if ui
                             .add_enabled(run_enabled, egui::Button::new(run_label))
+                            .on_disabled_hover_text(
+                                auth_warning.clone().unwrap_or_else(|| {
+                                    "Tick the confirmation to enable.".to_string()
+                                }),
+                            )
                             .clicked()
                         {
                             do_run = true;
@@ -6963,6 +7150,7 @@ mod gui {
                 // Never pre-filled: the token is not stored anywhere.
                 vault_token: String::new(),
                 error: None,
+                focus_top: true,
             });
         }
 
@@ -6975,6 +7163,13 @@ mod gui {
             let instances = self.env_instances(&dlg.env_profile_id, &dlg.env_name);
             let primary_filter = self.primary_bastion_filter.clone();
             let secondary_filter = self.secondary_bastion_filter.clone();
+            // Auth per row, and for the current selection — see the matching
+            // block in `render_create_user_dialog`.
+            let env_auth: Vec<AuthStatus> = environments
+                .iter()
+                .map(|e| self.script_env_auth(&e.account_id))
+                .collect();
+            let auth_warning = self.script_env_auth_warning(&dlg.env_profile_id);
 
             let mut window_open = true;
             let mut do_run = false;
@@ -7000,11 +7195,19 @@ mod gui {
                             // bind and no policy body to write.
                             if !dlg.delete {
                                 ui.label("IAM Role:");
-                                ui.add(
+                                let arn_box = ui.add(
                                     egui::TextEdit::singleline(&mut dlg.iam_role_arn)
                                         .hint_text("arn:aws:iam::123456789012:role/my-role")
                                         .desired_width(360.0),
                                 );
+                                // First frame only — see the matching block in
+                                // `render_create_user_dialog`. In delete mode
+                                // this box is hidden, so the focus request
+                                // moves to Vault Role Name below.
+                                if dlg.focus_top {
+                                    dlg.focus_top = false;
+                                    arn_box.request_focus();
+                                }
                                 ui.end_row();
 
                                 ui.label("Vault Policy:");
@@ -7032,15 +7235,19 @@ mod gui {
                             } else {
                                 "defaults to the IAM role"
                             };
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut dlg.role_name)
-                                        .hint_text(role_hint)
-                                        .desired_width(360.0),
-                                )
-                                .changed()
-                            {
+                            let role_box = ui.add(
+                                egui::TextEdit::singleline(&mut dlg.role_name)
+                                    .hint_text(role_hint)
+                                    .desired_width(360.0),
+                            );
+                            if role_box.changed() {
                                 dlg.role_name_edited = true;
+                            }
+                            // Delete mode hides the ARN box, so this is the
+                            // top field and takes the first-frame focus.
+                            if dlg.focus_top {
+                                dlg.focus_top = false;
+                                role_box.request_focus();
                             }
                             ui.end_row();
 
@@ -7064,22 +7271,32 @@ mod gui {
                             ui.label("Environment:");
                             let env_label = environments
                                 .iter()
-                                .find(|e| {
+                                .position(|e| {
                                     e.account_id == dlg.env_profile_id
                                         && e.env == dlg.env_name
                                 })
-                                .map(script_env_label)
+                                .map(|i| {
+                                    script_env_label_with_auth(
+                                        &environments[i],
+                                        env_auth[i],
+                                    )
+                                })
                                 .unwrap_or_else(|| "Select…".to_string());
                             let prev = (dlg.env_profile_id.clone(), dlg.env_name.clone());
                             egui::ComboBox::from_id_salt("vault_iam_env")
                                 .selected_text(env_label)
                                 .width(360.0)
                                 .show_ui(ui, |ui| {
-                                    for row in &environments {
+                                    for (row, auth) in
+                                        environments.iter().zip(env_auth.iter())
+                                    {
                                         let selected = row.account_id == dlg.env_profile_id
                                             && row.env == dlg.env_name;
                                         if ui
-                                            .selectable_label(selected, script_env_label(row))
+                                            .selectable_label(
+                                                selected,
+                                                script_env_label_with_auth(row, *auth),
+                                            )
                                             .clicked()
                                         {
                                             dlg.env_profile_id = row.account_id.clone();
@@ -7159,6 +7376,13 @@ mod gui {
                         );
                     }
 
+                    // Selected environment's account has no usable credentials
+                    // — see the matching block in `render_create_user_dialog`.
+                    if let Some(warn) = &auth_warning {
+                        ui.add_space(6.0);
+                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), warn);
+                    }
+
                     if let Some(err) = &dlg.error {
                         ui.add_space(6.0);
                         ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
@@ -7178,10 +7402,17 @@ mod gui {
                     ui.horizontal(|ui| {
                         let run_label = if dlg.delete { "Delete" } else { "Run" };
                         // In delete mode the button stays disabled until the
-                        // confirmation is ticked.
-                        let run_enabled = !dlg.delete || dlg.confirm_delete;
+                        // confirmation is ticked, and in either mode while the
+                        // account isn't authenticated.
+                        let run_enabled = (!dlg.delete || dlg.confirm_delete)
+                            && auth_warning.is_none();
                         if ui
                             .add_enabled(run_enabled, egui::Button::new(run_label))
+                            .on_disabled_hover_text(
+                                auth_warning.clone().unwrap_or_else(|| {
+                                    "Tick the confirmation to enable.".to_string()
+                                }),
+                            )
                             .clicked()
                         {
                             do_run = true;
@@ -7334,6 +7565,7 @@ mod gui {
                 wait_for_login,
                 spawned: false,
                 label: format!("{action} {instance_id}"),
+                queued_at: Instant::now(),
             });
             self.vault_iam_run = Some(VaultIamRun {
                 tab_id,
@@ -7726,6 +7958,7 @@ mod gui {
                         wait_for_login,
                         spawned: false,
                         label: format!("primary {primary_id}"),
+                        queued_at: Instant::now(),
                     });
                     Some(tab_id)
                 }
@@ -7816,6 +8049,54 @@ mod gui {
             self.script_status = Some((text.into(), state));
             self.script_status_highlight = None;
             self.message = String::new();
+        }
+
+        /// Tear down the in-flight Scripts run and report why, replacing the
+        /// flashing-yellow status line with the standard red result popup.
+        ///
+        /// Only one Scripts run is ever in flight (there is a single
+        /// `script_status`), so every queued step is dropped, not just the
+        /// ones for `tab_id`: a create's secondary is queued off the back of
+        /// its primary and must not proceed once the primary is dead.
+        ///
+        /// The terminal tab is deliberately **left open** — the `aws` error
+        /// that killed the session is the most useful thing on screen. A
+        /// snapshot of it goes into the popup's details pane too, for the case
+        /// where the process has already exited and taken the PTY with it.
+        fn abort_script_run(&mut self, tab_id: u64, message: String) {
+            // A create's SECONDARY dying is not fatal to the whole run: the
+            // primary has already made the user and produced the PEM, and the
+            // verify/report flow knows how to describe a half-done run.
+            // Marking it done is exactly what the "couldn't open the
+            // secondary" arm of `poll_script_events` does — reuse that path
+            // rather than nuking a run whose PEM the user still needs.
+            let is_secondary = self
+                .create_user_run
+                .as_ref()
+                .is_some_and(|r| r.primary_done && r.secondary_tab == Some(tab_id));
+            if is_secondary {
+                self.log_error(format!("secondary bastion session failed: {message}"));
+                self.pending_script_runs.retain(|r| r.tab_id != tab_id);
+                if let Some(r) = self.create_user_run.as_mut() {
+                    r.secondary_started = true;
+                    r.secondary_done = true;
+                }
+                return;
+            }
+
+            let details = self
+                .pty_sessions
+                .get(&tab_id)
+                .map(|s| s.parser.screen().contents())
+                .filter(|s| !s.trim().is_empty());
+
+            self.pending_script_runs.clear();
+            self.create_user_run = None;
+            self.vault_iam_run = None;
+            self.pending_delete = None;
+
+            self.log_error(message.clone());
+            self.show_script_result("Session Failed", message, false, None, details);
         }
 
         /// Show the final result of a create/delete run in a modal popup and
@@ -8047,6 +8328,7 @@ mod gui {
                             wait_for_login,
                             spawned: false,
                             label: format!("secondary {secondary_id}"),
+                            queued_at: Instant::now(),
                         });
                         if let Some(r) = self.create_user_run.as_mut() {
                             r.secondary_tab = Some(tab_id);
@@ -8361,6 +8643,33 @@ mod gui {
         /// waiting for the shell prompt between them.
         fn pump_script_runs(&mut self) {
             if self.pending_script_runs.is_empty() {
+                return;
+            }
+
+            // A run whose PTY session never showed up: `aws ssm start-session`
+            // wrote an error and exited, so the loop below would skip this
+            // entry every frame forever and the status line would flash yellow
+            // with nothing to clear it. Fail the run instead.
+            let stalled = self
+                .pending_script_runs
+                .iter()
+                .find(|r| {
+                    !r.spawned
+                        && !self.pty_sessions.contains_key(&r.tab_id)
+                        && r.queued_at.elapsed() >= SESSION_START_WAIT
+                })
+                .map(|r| (r.tab_id, r.label.clone()));
+            if let Some((tab_id, label)) = stalled {
+                self.abort_script_run(
+                    tab_id,
+                    format!(
+                        "The session for {label} never came up after {}s. Your \
+                         credentials for this account may have expired, or they may \
+                         not permit an SSM session to that instance. Refresh \
+                         credentials and retry.",
+                        SESSION_START_WAIT.as_secs(),
+                    ),
+                );
                 return;
             }
 
@@ -9178,6 +9487,35 @@ mod gui {
                     && looks_like_git_auth_failure(&String::from_utf8_lossy(&bytes))
                 {
                     self.prompt_pat_update_from_git_failure();
+                }
+                // A Scripts run's session failing to come up — expired or
+                // missing credentials, or no permission on this account.
+                //
+                // The window is deliberately narrow: a run must be in flight,
+                // the tab must be one of its own, and that tab must not have
+                // reached a shell prompt yet. `aws ssm start-session` writes
+                // its error and exits before any prompt appears, so that last
+                // condition is what separates a session that never came up
+                // from a live one. Without it the scan would stay armed for
+                // the whole run and a script echoing "AccessDenied" from some
+                // unrelated command would tear down a healthy create.
+                let run_in_flight = !self.pending_script_runs.is_empty()
+                    || self.create_user_run.is_some()
+                    || self.vault_iam_run.is_some()
+                    || self.pending_delete.is_some();
+                let never_prompted = self
+                    .pty_sessions
+                    .get(&tab_id)
+                    .is_none_or(|s| s.last_prompt_abs_row.is_none());
+                if run_in_flight
+                    && never_prompted
+                    && self.script_status_tabs.contains(&tab_id)
+                {
+                    if let Some(reason) =
+                        ssm_session_failure(&String::from_utf8_lossy(&bytes))
+                    {
+                        self.abort_script_run(tab_id, reason.to_string());
+                    }
                 }
                 self.maybe_record_gui_smoke_success(tab_id, &bytes);
             }
@@ -14309,9 +14647,9 @@ mod gui {
                                         self.profile_auth_infos
                                             .iter()
                                             .find(|a| a.profile_id == pid)
-                                            .map(|a| a.auth_status.clone())
+                                            .map(|a| a.auth_status)
                                     })
-                                    .unwrap_or_else(|| c.auth_status.clone())
+                                    .unwrap_or(c.auth_status)
                             };
                             ui.label(format!("Auth: {}", live_auth));
                         }
@@ -14578,6 +14916,7 @@ mod gui {
                                     primary_id,
                                     secondary_id,
                                     error: None,
+                                    focus_top: true,
                                 });
                             }
                         }
@@ -14924,7 +15263,7 @@ mod gui {
                                     .unwrap_or_else(|| "us-east-1".to_string());
                                 let ctx_auth = self.profile_auth_infos.iter()
                                     .find(|a| a.profile_id == pcfg.profile_id)
-                                    .map(|a| a.auth_status.clone())
+                                    .map(|a| a.auth_status)
                                     .unwrap_or(AuthStatus::Expired);
                                 self.context = Some(AwsContext {
                                     mode: self.options.mode.clone(),
@@ -16352,6 +16691,21 @@ mod gui {
             row.label.clone()
         } else {
             row.label.to_uppercase()
+        }
+    }
+
+    /// The same label with a suffix naming the account's auth problem, so an
+    /// environment the user cannot currently run against says so in the
+    /// dropdown rather than only once they've clicked Run.
+    ///
+    /// Wraps [`script_env_label`] rather than duplicating it, so the casing
+    /// rule stays in one place.
+    fn script_env_label_with_auth(row: &ScriptEnv, auth: AuthStatus) -> String {
+        let label = script_env_label(row);
+        match auth {
+            AuthStatus::Ok => label,
+            AuthStatus::Expired => format!("{label} — auth expired"),
+            AuthStatus::Missing => format!("{label} — not authenticated"),
         }
     }
 
@@ -18012,6 +18366,110 @@ mod gui {
         fn script_env_labels_are_uppercased() {
             assert_eq!(script_env_label(&env_row("dev1", "dev1")), "DEV1");
             assert_eq!(script_env_label(&env_row("Stg-2", "Stg-2")), "STG-2");
+        }
+
+        #[test]
+        fn an_unauthenticated_env_says_so_in_the_dropdown() {
+            // The account behind a row can have no usable credentials, and the
+            // dropdown is the first place the user should learn that — not
+            // after a session has been opened and failed.
+            assert_eq!(
+                script_env_label_with_auth(&env_row("dev1", "dev1"), AuthStatus::Missing),
+                "DEV1 — not authenticated"
+            );
+            assert_eq!(
+                script_env_label_with_auth(&env_row("dev1", "dev1"), AuthStatus::Expired),
+                "DEV1 — auth expired"
+            );
+        }
+
+        #[test]
+        fn an_authenticated_env_label_is_left_alone() {
+            // The common case must render exactly as `script_env_label` does,
+            // including the uppercasing rule and the account-row exemption.
+            assert_eq!(
+                script_env_label_with_auth(&env_row("dev1", "dev1"), AuthStatus::Ok),
+                "DEV1"
+            );
+            assert_eq!(
+                script_env_label_with_auth(&env_row("", "Prod"), AuthStatus::Ok),
+                "Prod"
+            );
+        }
+
+        #[test]
+        fn an_unauthenticated_account_row_keeps_its_own_casing() {
+            // A row with no environment dimension names an *account*, so the
+            // suffix must not drag the uppercasing rule in with it.
+            assert_eq!(
+                script_env_label_with_auth(&env_row("", "Prod"), AuthStatus::Missing),
+                "Prod — not authenticated"
+            );
+        }
+
+        #[test]
+        fn ssm_access_denied_is_reported_as_a_permissions_problem() {
+            // The full AccessDenied body carries both markers; the sentence
+            // that names the problem must win over the bare code.
+            let out = "An error occurred (AccessDeniedException) when calling the \
+                       StartSession operation: User: arn:aws:sts::1234:assumed-role/dev \
+                       is not authorized to perform: ssm:StartSession on resource: \
+                       arn:aws:ec2:us-east-1:1234:instance/i-0abc";
+            let reason = ssm_session_failure(out).expect("AccessDenied is fatal");
+            assert!(reason.contains("not authorized"), "{reason}");
+        }
+
+        #[test]
+        fn ssm_expired_credentials_are_reported_as_expiry() {
+            for out in [
+                "An error occurred (ExpiredTokenException) when calling the \
+                 StartSession operation: The security token included in the request \
+                 is expired",
+                "An error occurred (ExpiredToken) when calling the StartSession operation",
+            ] {
+                let reason = ssm_session_failure(out).expect("expiry is fatal");
+                assert!(reason.contains("expired"), "{out} → {reason}");
+            }
+        }
+
+        #[test]
+        fn ssm_missing_credentials_are_fatal() {
+            assert!(ssm_session_failure("Unable to locate credentials. You can \
+                                         configure credentials by running \"aws configure\".")
+                .is_some());
+            assert!(ssm_session_failure(
+                "The config profile (dev-account) could not be found"
+            )
+            .is_some());
+            assert!(ssm_session_failure(
+                "An error occurred (InvalidClientTokenId) when calling the \
+                 StartSession operation: The security token included in the request \
+                 is invalid"
+            )
+            .is_some());
+        }
+
+        #[test]
+        fn ssm_target_not_connected_is_fatal() {
+            let reason = ssm_session_failure(
+                "An error occurred (TargetNotConnected) when calling the \
+                 StartSession operation: i-0abc is not connected.",
+            )
+            .expect("an unreachable target is fatal");
+            assert!(reason.contains("not connected to SSM"), "{reason}");
+        }
+
+        #[test]
+        fn ordinary_session_output_is_not_a_failure() {
+            // A false positive here tears down a healthy run, so the happy
+            // path matters as much as the failures.
+            assert!(ssm_session_failure("").is_none());
+            assert!(ssm_session_failure(
+                "Starting session with SessionId: dev-user-0123456789abcdef"
+            )
+            .is_none());
+            assert!(ssm_session_failure("[ec2-user@ip-10-0-0-1 ~]$ ").is_none());
+            assert!(ssm_session_failure("Last login: Tue Aug  4 09:12:31 2026").is_none());
         }
 
         #[test]
