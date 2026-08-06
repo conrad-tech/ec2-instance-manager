@@ -270,11 +270,16 @@ pub struct AccessEmailConfig {
     /// This catches what the domain check cannot: an in-domain address that
     /// simply belongs to a different person with a similar name.
     pub email_local_format: String,
-    /// Highest numeric suffix to probe when looking for the mailbox, e.g. 5
-    /// tries `jsmith`, `jsmith2` … `jsmith5`. People who share a surname get a
+    /// Highest numeric suffix to probe when looking for the mailbox, e.g. 20
+    /// tries `jsmith`, `jsmith2` … `jsmith20`. People who share a surname get a
     /// number, and there is no way to know in advance which one — so the script
     /// resolves each candidate address and requires exactly one real match.
     /// Below 2 probes only the bare stem.
+    ///
+    /// Set high enough to cover the real range: a `dli15@` turned up in
+    /// practice, and a suffix beyond this silently falls back to resolving the
+    /// display name, which cannot detect duplicates. The cost is one address
+    /// lookup per candidate per domain, all local MAPI calls.
     pub email_local_max_suffix: u32,
     /// RMS/IRM template GUID to apply for encryption (tenant-specific).
     /// Empty disables the template path.
@@ -300,7 +305,7 @@ impl Default for AccessEmailConfig {
             auto_run: true,
             email_domains: Vec::new(),
             email_local_format: String::new(),
-            email_local_max_suffix: 5,
+            email_local_max_suffix: 20,
             encrypt_template_guid: String::new(),
             encrypt_permission: 0,
             encrypt_permission_service: 0,
