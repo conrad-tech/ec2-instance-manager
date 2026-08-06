@@ -409,6 +409,32 @@ pub fn vscode_host_block(
     )
 }
 
+/// Build the `vscode-remote://` URI for a folder on a managed host.
+///
+/// Passing the path as a bare positional argument
+/// (`code --remote ssh-remote+alias /efs/home/x`) leaves VS Code to guess
+/// whether it names a file or a folder, and it cannot stat a remote path to
+/// find out — a wrong guess opens a connected-but-empty window with the
+/// "Open Folder / Clone Repository" buttons instead of the tree. A
+/// `--folder-uri` says folder outright, so there is nothing to guess.
+///
+/// Everything outside the unreserved URI set is percent-encoded, since the
+/// folder is a free-text field the user can type a space into.
+pub fn remote_folder_uri(alias: &str, path: &str) -> String {
+    let mut encoded = String::new();
+    for byte in path.trim().bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'
+            | b'/' => encoded.push(byte as char),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    if !encoded.starts_with('/') {
+        encoded.insert(0, '/');
+    }
+    format!("vscode-remote://ssh-remote+{alias}{encoded}")
+}
+
 /// Split managed-file text into (alias, block_text) pairs.
 fn split_blocks(text: &str) -> Vec<(String, String)> {
     let mut blocks: Vec<(String, String)> = Vec::new();
@@ -801,6 +827,27 @@ mod tests {
         let updated = compose_config_with_include("").expect("should rewrite");
         assert!(updated.contains("Include config.d/ec2-manager"));
         assert!(updated.starts_with(INCLUDE_BEGIN));
+    }
+
+    /// The URI has to say "folder" outright — the positional form left VS
+    /// Code guessing and it opened an empty connected window.
+    #[test]
+    fn remote_folder_uri_is_explicit_and_encoded() {
+        assert_eq!(
+            remote_folder_uri("web-jdoe-i-123", "/efs/home/jdoe"),
+            "vscode-remote://ssh-remote+web-jdoe-i-123/efs/home/jdoe"
+        );
+        // A typed path with a space (or any reserved byte) is encoded.
+        assert_eq!(
+            remote_folder_uri("h", "/efs/home/j doe/my repo"),
+            "vscode-remote://ssh-remote+h/efs/home/j%20doe/my%20repo"
+        );
+        // Relative or untrimmed input still yields an absolute path.
+        assert_eq!(
+            remote_folder_uri("h", "  efs/home/x "),
+            "vscode-remote://ssh-remote+h/efs/home/x"
+        );
+        assert!(remote_folder_uri("h", "/home/ec2-user").ends_with("/home/ec2-user"));
     }
 
     #[test]

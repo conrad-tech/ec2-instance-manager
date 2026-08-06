@@ -274,11 +274,24 @@ key to use again" checkbox is the only in-app way to undo one —
 `clear_vscode_prompt_suppression` drops the account key and every `<id>.<ENV>`
 key under it.
 
-The path passed to `code --remote ssh-remote+<alias> <path>` **is** the
-workspace root — VS Code opens with the Explorer rooted there, it does not
-open a bare remote window. A path that does not exist (or that the login
-cannot read) still opens the window, just with an error instead of a tree,
-which is why the wrong-owner warning is worth having.
+**Launch with `code --folder-uri vscode-remote://ssh-remote+<alias><path>`,
+never `code --remote ssh-remote+<alias> <path>`.** The positional form leaves
+VS Code to guess whether the path is a file or a folder, and it cannot stat a
+remote path to find out; the guess lands on "file", the window comes up
+connected but empty — the "Open Folder / Clone Repository" buttons — and the
+folder is silently dropped. `remote_folder_uri` builds the explicit form and
+percent-encodes the path, since Open folder is a free-text field.
+
+The folder in that URI **is** the workspace root: VS Code opens with the
+Explorer rooted there. A path that does not exist (or that the login cannot
+read) still opens the window, just with an error instead of a tree, which is
+why the wrong-owner warning is worth having.
+
+Unrelated but easy to misread as a failure: Remote-SSH asks "Select the
+platform of the remote host" once per alias it has never seen, and stores the
+answer in the user's `remote.SSH.remotePlatform` setting. Since the alias now
+carries the login, that prompt appears once per (instance, user) rather than
+once per instance. It does not affect which folder opens.
 
 Prefill precedence also matters: a user saved for the account wins over one
 scraped from the ssh config, because `scan()` sees our own managed blocks and

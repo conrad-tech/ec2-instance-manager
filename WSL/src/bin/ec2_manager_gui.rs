@@ -5458,7 +5458,12 @@ mod gui {
                 region,
             )?;
 
-            let remote_arg = format!("ssh-remote+{alias}");
+            // --folder-uri, not `--remote <alias> <path>`: the positional
+            // form leaves VS Code guessing file-vs-folder for a path it
+            // cannot stat, and a wrong guess opens a connected-but-empty
+            // window instead of the folder.
+            let folder_uri =
+                ec2_manager::ssh_config::remote_folder_uri(&alias, remote_path);
             #[cfg(windows)]
             let spawn_result = {
                 use std::os::windows::process::CommandExt;
@@ -5466,13 +5471,13 @@ mod gui {
                 // otherwise flash on screen while launching `code`.
                 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
                 std::process::Command::new("cmd")
-                    .args(["/c", "code", "--remote", &remote_arg, remote_path])
+                    .args(["/c", "code", "--folder-uri", &folder_uri])
                     .creation_flags(CREATE_NO_WINDOW)
                     .spawn()
             };
             #[cfg(not(windows))]
             let spawn_result = std::process::Command::new("code")
-                .args(["--remote", &remote_arg, remote_path])
+                .args(["--folder-uri", &folder_uri])
                 .spawn();
             spawn_result.map_err(|e| format!("could not start VS Code: {e}"))?;
 
@@ -5484,7 +5489,7 @@ mod gui {
                 format!("Opening {instance_id} in VS Code as {ssh_user}...");
             self.log_info(format!(
                 "launched VS Code Remote-SSH host={alias} user={ssh_user} \
-                 pem={pem} path={remote_path}"
+                 pem={pem} uri={folder_uri}"
             ));
             Ok(())
         }
