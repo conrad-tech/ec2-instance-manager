@@ -210,21 +210,111 @@ impl AppConfig {
         }
     }
 
+    /// The pem library ordered for display: alphabetical by filename
+    /// (case-insensitive), with the full path as a tiebreak so two keys of
+    /// the same name in different directories keep a stable order. Storage
+    /// order is left alone; only the dropdowns care.
+    pub fn sorted_pem_library(&self) -> Vec<String> {
+        let mut pems = self.ssh_pem_library.clone();
+        pems.sort_by_cached_key(|p| {
+            let name = std::path::Path::new(p)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| p.clone());
+            (name.to_lowercase(), p.to_lowercase())
+        });
+        pems
+    }
+
+    /// Key under which the VS Code pem, SSH login and prompt-suppression
+    /// settings are cached.
+    ///
+    /// One account may host several environments (`MMODAL_ENV`), each with
+    /// its own keys and its own logins, so the key carries both — the same
+    /// shape as `bastion_key`. An empty `env` (an instance with no
+    /// `MMODAL_ENV` tag) collapses to the bare profile id, which is also
+    /// the key older builds wrote.
+    ///
+    /// The tag is free text, so the environment is upper-cased: `dev1` and
+    /// `DEV1` are one environment everywhere else in the app and must not
+    /// become two cache entries here.
+    pub fn vscode_key(profile_id: &str, env: &str) -> String {
+        let env = env.trim();
+        if env.is_empty() {
+            profile_id.to_string()
+        } else {
+            format!("{profile_id}.{}", env.to_uppercase())
+        }
+    }
+
     /// Resolve the pem to use for a given instance: per-instance override
-    /// first, then the profile default. Returns None if neither is set.
-    pub fn resolve_pem(&self, profile_id: &str, instance_id: &str) -> Option<String> {
+    /// first, then the environment default, then the account-wide one.
+    /// Returns None if none is set.
+    pub fn resolve_pem(
+        &self,
+        profile_id: &str,
+        env: &str,
+        instance_id: &str,
+    ) -> Option<String> {
         self.ssh_pem_instance
             .get(instance_id)
+            .or_else(|| self.ssh_pem_default.get(&Self::vscode_key(profile_id, env)))
             .or_else(|| self.ssh_pem_default.get(profile_id))
             .cloned()
     }
 
-    /// Resolve the SSH login user for a profile, defaulting to "ec2-user".
-    pub fn resolve_ssh_user(&self, profile_id: &str) -> String {
+    /// Resolve the SSH login user for an environment, falling back to the
+    /// account-wide value and then to "ec2-user".
+    pub fn resolve_ssh_user(&self, profile_id: &str, env: &str) -> String {
         self.ssh_user_default
-            .get(profile_id)
-            .cloned()
+            .get(&Self::vscode_key(profile_id, env))
+            .or_else(|| self.ssh_user_default.get(profile_id))
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
             .unwrap_or_else(|| "ec2-user".to_string())
+    }
+
+    /// Whether "don't ask again" was ticked for this environment.
+    ///
+    /// Deliberately does *not* fall back to the account-wide entry when the
+    /// instance carries an environment: opting out for one environment must
+    /// not silently opt out of every other one, whose key and login are
+    /// usually different. An untagged instance keys on the bare profile id,
+    /// so an opt-out saved by an older build still applies there.
+    pub fn vscode_prompt_suppressed(&self, profile_id: &str, env: &str) -> bool {
+        self.vscode_pem_suppressed
+            .get(&Self::vscode_key(profile_id, env))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Remember the pem and login chosen for an environment.
+    pub fn set_vscode_defaults(
+        &mut self,
+        profile_id: &str,
+        env: &str,
+        pem: &str,
+        user: &str,
+    ) {
+        let key = Self::vscode_key(profile_id, env);
+        self.ssh_pem_default.insert(key.clone(), pem.to_string());
+        self.ssh_user_default.insert(key, user.to_string());
+    }
+
+    /// Record the "don't ask again" opt-out for one environment.
+    pub fn suppress_vscode_prompt(&mut self, profile_id: &str, env: &str) {
+        self.vscode_pem_suppressed
+            .insert(Self::vscode_key(profile_id, env), true);
+    }
+
+    /// Drop the opt-out for an account and every environment under it, so
+    /// the pem prompt comes back. Returns true if anything was cleared.
+    pub fn clear_vscode_prompt_suppression(&mut self, profile_id: &str) -> bool {
+        let prefix = format!("{profile_id}.");
+        let before = self.vscode_pem_suppressed.len();
+        self.vscode_pem_suppressed
+            .retain(|key, _| key != profile_id && !key.starts_with(&prefix));
+        before != self.vscode_pem_suppressed.len()
     }
 
     /// Key under which a bastion pair is cached.
@@ -974,6 +1064,95 @@ fn parse_port_forward_preset(raw: &str) -> Option<PortForwardPreset> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dropdowns list keys by filename, so that — not the directory or
+    /// the order they were discovered in — is what has to sort.
+    #[test]
+    fn sorted_pem_library_orders_by_filename() {
+        let mut cfg = AppConfig::default();
+        cfg.ssh_pem_library = vec![
+            "/keys/zulu.pem".to_string(),
+            "/other/Alpha.pem".to_string(),
+            "/keys/mike.pem".to_string(),
+            "/aaa/zulu.pem".to_string(),
+        ];
+        assert_eq!(
+            cfg.sorted_pem_library(),
+            vec![
+                "/other/Alpha.pem".to_string(),
+                "/keys/mike.pem".to_string(),
+                "/aaa/zulu.pem".to_string(),
+                "/keys/zulu.pem".to_string(),
+            ]
+        );
+        // Storage order is untouched.
+        assert_eq!(cfg.ssh_pem_library[0], "/keys/zulu.pem");
+    }
+
+    /// The pem, login and prompt opt-out are cached per environment, since
+    /// one account can host several, each with its own key.
+    #[test]
+    fn vscode_settings_are_scoped_per_environment() {
+        let mut cfg = AppConfig::default();
+        // Account-wide values written by an older build.
+        cfg.ssh_pem_default
+            .insert("acct".to_string(), "/keys/acct.pem".to_string());
+        cfg.ssh_user_default
+            .insert("acct".to_string(), "ec2-user".to_string());
+
+        // An environment with nothing of its own inherits the account's.
+        assert_eq!(
+            cfg.resolve_pem("acct", "DEV1", "i-1").as_deref(),
+            Some("/keys/acct.pem")
+        );
+        assert_eq!(cfg.resolve_ssh_user("acct", "DEV1"), "ec2-user");
+
+        cfg.set_vscode_defaults("acct", "DEV1", "/keys/dev1.pem", "jdoe");
+        assert_eq!(
+            cfg.resolve_pem("acct", "DEV1", "i-1").as_deref(),
+            Some("/keys/dev1.pem")
+        );
+        assert_eq!(cfg.resolve_ssh_user("acct", "DEV1"), "jdoe");
+        // A sibling environment is untouched.
+        assert_eq!(
+            cfg.resolve_pem("acct", "DEV2", "i-2").as_deref(),
+            Some("/keys/acct.pem")
+        );
+        assert_eq!(cfg.resolve_ssh_user("acct", "DEV2"), "ec2-user");
+        // The tag is free text: dev1 and DEV1 are one environment.
+        assert_eq!(cfg.resolve_ssh_user("acct", "dev1"), "jdoe");
+        // A per-instance override still beats both.
+        cfg.ssh_pem_instance
+            .insert("i-1".to_string(), "/keys/one.pem".to_string());
+        assert_eq!(
+            cfg.resolve_pem("acct", "DEV1", "i-1").as_deref(),
+            Some("/keys/one.pem")
+        );
+    }
+
+    /// Opting out of the prompt in one environment must not opt out of the
+    /// others, whose key and login are usually different.
+    #[test]
+    fn vscode_prompt_opt_out_does_not_leak_across_environments() {
+        let mut cfg = AppConfig::default();
+        cfg.suppress_vscode_prompt("acct", "DEV1");
+        assert!(cfg.vscode_prompt_suppressed("acct", "DEV1"));
+        assert!(cfg.vscode_prompt_suppressed("acct", "dev1"));
+        assert!(!cfg.vscode_prompt_suppressed("acct", "DEV2"));
+        assert!(!cfg.vscode_prompt_suppressed("acct", ""));
+        assert!(!cfg.vscode_prompt_suppressed("other", "DEV1"));
+
+        // An untagged instance keys on the account, which is also what an
+        // older build wrote — that opt-out keeps working.
+        cfg.suppress_vscode_prompt("acct", "");
+        assert!(cfg.vscode_prompt_suppressed("acct", ""));
+
+        // Clearing takes the account and every environment under it.
+        assert!(cfg.clear_vscode_prompt_suppression("acct"));
+        assert!(!cfg.vscode_prompt_suppressed("acct", "DEV1"));
+        assert!(!cfg.vscode_prompt_suppressed("acct", ""));
+        assert!(!cfg.clear_vscode_prompt_suppression("acct"));
+    }
 
     /// Names and bodies are base64'd, so a script whose body contains the
     /// field separator, an '=' or newlines survives a save/load cycle.

@@ -367,14 +367,22 @@ pub fn sanitize_alias_part(raw: &str) -> String {
 }
 
 /// Stable Host alias used for our managed VS Code Remote-SSH entries:
-/// `<ec2-name>-<instance-id>`, falling back to `ec2-<instance-id>` when
-/// the instance has no usable Name tag.
-pub fn managed_alias(name: &str, instance_id: &str) -> String {
+/// `<ec2-name>-<ssh-user>-<instance-id>`, falling back to `ec2-…` when the
+/// instance has no usable Name tag.
+///
+/// The login user is part of the alias on purpose. VS Code keys a remote
+/// window — its recent-hosts entry, its `~/.vscode-server` install, its
+/// cached connection details — on the host alias alone, so reusing one
+/// alias for two logins lets a previous session's user resurface. One
+/// alias per (instance, user) keeps them apart.
+pub fn managed_alias(name: &str, user: &str, instance_id: &str) -> String {
     let prefix = sanitize_alias_part(name);
-    if prefix.is_empty() {
-        format!("ec2-{instance_id}")
+    let user_part = sanitize_alias_part(user);
+    let head = if prefix.is_empty() { "ec2" } else { &prefix };
+    if user_part.is_empty() {
+        format!("{head}-{instance_id}")
     } else {
-        format!("{prefix}-{instance_id}")
+        format!("{head}-{user_part}-{instance_id}")
     }
 }
 
@@ -389,7 +397,7 @@ pub fn vscode_host_block(
     profile: &str,
     region: &str,
 ) -> String {
-    let alias = managed_alias(name, instance_id);
+    let alias = managed_alias(name, user, instance_id);
     format!(
         "Host {alias}\n  \
          HostName {instance_id}\n  \
@@ -445,17 +453,74 @@ pub fn write_managed_block(
             .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
     }
 
-    let alias = managed_alias(name, instance_id);
-    // Drop any prior block for this alias *or* an older block for the
-    // same instance under a different name, so a renamed instance does
-    // not leave a stale duplicate entry behind.
-    let suffix = format!("-{instance_id}");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut kept: Vec<String> = Vec::new();
-    for (block_alias, block_text) in split_blocks(&existing) {
-        if block_alias != alias && !block_alias.ends_with(&suffix) {
-            kept.push(block_text.trim_end().to_string());
+    let (alias, body) = compose_managed_file(
+        &existing,
+        instance_id,
+        name,
+        user,
+        pem,
+        profile,
+        region,
+    );
+    std::fs::write(&path, body)
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    Ok(alias)
+}
+
+/// Read a directive's value out of one Host block's text.
+fn block_field(block: &str, keyword: &str) -> Option<String> {
+    for line in block.lines() {
+        if let Some((kw, rest)) = split_directive(line) {
+            if kw == keyword {
+                return Some(rest.trim_matches('"').to_string());
+            }
         }
+    }
+    None
+}
+
+/// Build the new contents of the managed file: `existing` with this
+/// instance's block for this user replaced, every other block preserved.
+/// Returns `(alias, file_text)`. Split out from `write_managed_block` so
+/// the replacement rules can be tested without touching the real home
+/// directory.
+fn compose_managed_file(
+    existing: &str,
+    instance_id: &str,
+    name: &str,
+    user: &str,
+    pem: &str,
+    profile: &str,
+    region: &str,
+) -> (String, String) {
+    let alias = managed_alias(name, user, instance_id);
+    let id_suffix = format!("-{instance_id}");
+    let mut kept: Vec<String> = Vec::new();
+    for (block_alias, block_text) in split_blocks(existing) {
+        if block_alias == alias {
+            continue;
+        }
+        let same_instance = block_alias.ends_with(&id_suffix)
+            || block_field(&block_text, "hostname").as_deref() == Some(instance_id);
+        if same_instance {
+            let block_user = block_field(&block_text, "user").unwrap_or_default();
+            // Same instance, same login: this is the block being rewritten,
+            // under an older alias (the instance was renamed).
+            if block_user == user {
+                continue;
+            }
+            // Same instance, written before the alias carried the user.
+            // Left in place it lingers as a second entry for this box
+            // pointing at a different login — the stale entry that makes
+            // VS Code come back up as the previous user.
+            let user_suffix =
+                format!("-{}-{instance_id}", sanitize_alias_part(&block_user));
+            if !block_alias.ends_with(&user_suffix) {
+                continue;
+            }
+        }
+        kept.push(block_text.trim_end().to_string());
     }
     kept.push(
         vscode_host_block(instance_id, name, user, pem, profile, region)
@@ -464,14 +529,53 @@ pub fn write_managed_block(
     );
 
     let header = "# Managed by ec2-manager — do not edit by hand.\n\n";
-    let body = format!("{header}{}\n", kept.join("\n\n"));
-    std::fs::write(&path, body)
-        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
-    Ok(alias)
+    (alias, format!("{header}{}\n", kept.join("\n\n")))
 }
 
 const INCLUDE_BEGIN: &str = "# >>> ec2-manager managed include >>>";
 const INCLUDE_END: &str = "# <<< ec2-manager managed include <<<";
+
+/// Return the rewritten config text when the managed `Include` needs to be
+/// added or hoisted, or `None` when it is already in the right place.
+///
+/// ssh keeps the *first* value it obtains for each keyword, so an Include
+/// sitting below a matching block — a `Host *` carrying a `User`, say —
+/// never gets to set the login for our managed hosts, and every VS Code
+/// session silently connects as whatever that earlier block named. The
+/// directive therefore has to come before any Host/Match block, not
+/// merely exist somewhere in the file.
+fn compose_config_with_include(existing: &str) -> Option<String> {
+    let is_include = |l: &&str| {
+        let lower = l.trim().to_ascii_lowercase();
+        lower.starts_with("include") && lower.contains("config.d/ec2-manager")
+    };
+    let is_block_start = |l: &&str| {
+        matches!(split_directive(l), Some((kw, _)) if kw == "host" || kw == "match")
+    };
+
+    let lines: Vec<&str> = existing.lines().collect();
+    let first_include = lines.iter().position(is_include);
+    let first_block = lines.iter().position(is_block_start);
+    match (first_include, first_block) {
+        (Some(_), None) => return None,
+        (Some(i), Some(b)) if i < b => return None,
+        _ => {}
+    }
+
+    // Drop any existing include (and our own markers around it) wherever it
+    // sits, then re-add it at the top. Everything else is left untouched.
+    let remaining: Vec<&str> = lines
+        .into_iter()
+        .filter(|l| {
+            let trimmed = l.trim();
+            !is_include(l) && trimmed != INCLUDE_BEGIN && trimmed != INCLUDE_END
+        })
+        .collect();
+    let body = remaining.join("\n");
+    let snippet =
+        format!("{INCLUDE_BEGIN}\nInclude config.d/ec2-manager\n{INCLUDE_END}\n\n");
+    Some(format!("{snippet}{}", body.trim_start_matches('\n')))
+}
 
 /// Ensure `~/.ssh/config` contains an `Include config.d/ec2-manager`
 /// directive so VS Code's Remote-SSH picks up our managed blocks. The
@@ -485,19 +589,9 @@ pub fn ensure_include_directive() -> Result<(), String> {
             .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
     }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    // Already present (either our marked block or a hand-written Include).
-    let already = existing.lines().any(|l| {
-        let lower = l.trim().to_ascii_lowercase();
-        lower.starts_with("include") && lower.contains("config.d/ec2-manager")
-    });
-    if already {
+    let Some(updated) = compose_config_with_include(&existing) else {
         return Ok(());
-    }
-    // Include must precede Host blocks to apply globally — prepend it.
-    let snippet = format!(
-        "{INCLUDE_BEGIN}\nInclude config.d/ec2-manager\n{INCLUDE_END}\n\n"
-    );
-    let updated = format!("{snippet}{existing}");
+    };
     std::fs::write(&path, updated)
         .map_err(|e| format!("could not update {}: {e}", path.display()))?;
     Ok(())
@@ -606,8 +700,8 @@ mod tests {
             "pa",
             "us-east-1",
         );
-        // Name is sanitized and prefixed onto the instance id.
-        assert!(block.starts_with("Host web-server-01-i-0c7b5d62a1a086476"));
+        // Name is sanitized, then the login user, then the instance id.
+        assert!(block.starts_with("Host web-server-01-ec2-user-i-0c7b5d62a1a086476"));
         assert!(block.contains("HostName i-0c7b5d62a1a086476"));
         assert!(block.contains("User ec2-user"));
         assert!(block.contains("IdentityFile \"C:\\keys\\pa.pem\""));
@@ -617,17 +711,96 @@ mod tests {
     }
 
     #[test]
-    fn managed_alias_uses_name_and_falls_back() {
+    fn managed_alias_uses_name_user_and_falls_back() {
         assert_eq!(
-            managed_alias("Web Server", "i-123"),
-            "Web-Server-i-123"
+            managed_alias("Web Server", "jdoe", "i-123"),
+            "Web-Server-jdoe-i-123"
         );
-        assert_eq!(managed_alias("", "i-123"), "ec2-i-123");
-        assert_eq!(managed_alias("  ", "i-123"), "ec2-i-123");
+        assert_eq!(managed_alias("", "jdoe", "i-123"), "ec2-jdoe-i-123");
+        assert_eq!(managed_alias("  ", "jdoe", "i-123"), "ec2-jdoe-i-123");
+        assert_eq!(managed_alias("Web Server", "", "i-123"), "Web-Server-i-123");
+        // Two logins on one box are two distinct VS Code hosts.
+        assert_ne!(
+            managed_alias("Web", "ec2-user", "i-123"),
+            managed_alias("Web", "jdoe", "i-123")
+        );
         assert_eq!(
             sanitize_alias_part("prod/app (east)"),
             "prod-app-east"
         );
+    }
+
+    /// Opening the same box as a second user must not leave the previous
+    /// user's entry behind under an alias VS Code might still reconnect to.
+    #[test]
+    fn compose_managed_file_drops_legacy_block_for_same_instance() {
+        let legacy = "Host web-i-123\n  HostName i-123\n  User ec2-user\n  \
+                      IdentityFile \"/keys/old.pem\"\n";
+        let (alias, text) = compose_managed_file(
+            legacy, "i-123", "web", "jdoe", "/keys/new.pem", "pa", "us-east-1",
+        );
+        assert_eq!(alias, "web-jdoe-i-123");
+        assert!(!text.contains("Host web-i-123\n"), "legacy block survived:\n{text}");
+        assert!(text.contains("Host web-jdoe-i-123"));
+        assert!(text.contains("User jdoe"));
+        assert!(!text.contains("User ec2-user"));
+    }
+
+    #[test]
+    fn compose_managed_file_replaces_renamed_block_for_same_user() {
+        let old = "Host oldname-jdoe-i-123\n  HostName i-123\n  User jdoe\n  \
+                   IdentityFile \"/keys/a.pem\"\n";
+        let (alias, text) = compose_managed_file(
+            old, "i-123", "newname", "jdoe", "/keys/b.pem", "pa", "us-east-1",
+        );
+        assert_eq!(alias, "newname-jdoe-i-123");
+        assert!(!text.contains("oldname"));
+        assert!(text.contains("/keys/b.pem"));
+        assert_eq!(text.matches("HostName i-123").count(), 1);
+    }
+
+    #[test]
+    fn compose_managed_file_keeps_other_instances_and_other_users() {
+        let existing = "Host other-jdoe-i-999\n  HostName i-999\n  User jdoe\n\n\
+                        Host web-ec2-user-i-123\n  HostName i-123\n  User ec2-user\n";
+        let (_, text) = compose_managed_file(
+            &existing, "i-123", "web", "jdoe", "/keys/n.pem", "pa", "us-east-1",
+        );
+        // A different box is untouched, and so is the same box under the
+        // other login — that entry is still valid, just a different host.
+        assert!(text.contains("Host other-jdoe-i-999"));
+        assert!(text.contains("Host web-ec2-user-i-123"));
+        assert!(text.contains("Host web-jdoe-i-123"));
+    }
+
+    #[test]
+    fn include_is_hoisted_above_earlier_host_blocks() {
+        // `Host *` with a User ahead of the include wins under ssh's
+        // first-value-wins rule, which is how a stale ec2-user login
+        // survives a correctly written managed block.
+        let existing = "Host *\n  User ec2-user\n\nInclude config.d/ec2-manager\n";
+        let updated = compose_config_with_include(existing).expect("should rewrite");
+        let inc = updated.find("Include config.d/ec2-manager").unwrap();
+        let host = updated.find("Host *").unwrap();
+        assert!(inc < host, "include not hoisted:\n{updated}");
+        assert_eq!(updated.matches("Include config.d/ec2-manager").count(), 1);
+        assert!(updated.contains("User ec2-user"));
+    }
+
+    #[test]
+    fn include_left_alone_when_already_first() {
+        let existing = "Include config.d/ec2-manager\n\nHost *\n  User ec2-user\n";
+        assert_eq!(compose_config_with_include(existing), None);
+        // Idempotent: hoisting once produces a file that needs no rewrite.
+        let once = compose_config_with_include("Host *\n  User ec2-user\n").unwrap();
+        assert_eq!(compose_config_with_include(&once), None);
+    }
+
+    #[test]
+    fn include_added_to_empty_config() {
+        let updated = compose_config_with_include("").expect("should rewrite");
+        assert!(updated.contains("Include config.d/ec2-manager"));
+        assert!(updated.starts_with(INCLUDE_BEGIN));
     }
 
     #[test]

@@ -340,6 +340,10 @@ fn searchable_text(instance: &Instance) -> String {
     append(&mut out, &instance.instance_id);
     append_opt(&mut out, instance.name.as_deref());
     append_opt(&mut out, instance.private_ip.as_deref());
+    // The table shows a Private DNS column, so it has to be searchable too;
+    // without it `ip-10-1-2-3` only ever matched the handful of boxes with
+    // that string in a Name tag.
+    append_opt(&mut out, instance.private_dns.as_deref());
     append_opt(&mut out, instance.image_id.as_deref());
 
     for (k, v) in &instance.tags {
@@ -390,6 +394,42 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].instance_id, "i-a");
+    }
+
+    /// Searching the private DNS name — the short host part, the fully
+    /// qualified form, or a prefix — has to find the box even when nothing
+    /// in its name or tags mentions it.
+    #[test]
+    fn search_matches_private_dns() {
+        let mut a = Instance::new("i-a".to_string(), "running".to_string());
+        a.name = Some("orders-api".to_string());
+        a.private_ip = Some("10.20.30.40".to_string());
+        a.private_dns = Some("ip-10-20-30-40.ec2.internal".to_string());
+
+        let mut b = Instance::new("i-b".to_string(), "running".to_string());
+        b.name = Some("billing-worker".to_string());
+        b.private_dns = Some("ip-10-20-31-99.ec2.internal".to_string());
+
+        let all = vec![a, b];
+        let hits = |term: &str| {
+            apply_filters(
+                &all,
+                &Filters {
+                    includes: vec![term.to_string()],
+                    ..Filters::default()
+                },
+            )
+        };
+
+        assert_eq!(hits("ip-10-20-30-40")[0].instance_id, "i-a");
+        assert_eq!(
+            hits("ip-10-20-30-40.ec2.internal")[0].instance_id,
+            "i-a"
+        );
+        assert_eq!(hits("IP-10-20-30-40")[0].instance_id, "i-a");
+        // A prefix common to both still returns both.
+        assert_eq!(hits("ip-10-20-3").len(), 2);
+        assert!(hits("ip-10-99-0-1").is_empty());
     }
 
     #[test]

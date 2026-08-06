@@ -510,6 +510,10 @@ mod gui {
         instance_name: String,
         /// Config profile_id this instance belongs to (config lookup key).
         profile_id: String,
+        /// `MMODAL_ENV` tag of this instance. Empty when untagged. The pem,
+        /// login and "don't ask again" opt-out are all cached per (account,
+        /// environment), since one account can host several.
+        env: String,
         /// AWS profile name passed to `aws --profile` (SSM transport).
         aws_profile: String,
         /// AWS region for the SSM ProxyCommand.
@@ -527,7 +531,9 @@ mod gui {
         opening_since: Option<Instant>,
     }
 
-    /// Modal state for the Settings "Update VS Code Pem" dialog.
+    /// Modal state for the Settings "Update VS Code Pem" dialog. Edits the
+    /// account-wide fallback that every environment inherits; a single
+    /// environment's override is set from the launch dialog itself.
     struct SettingsPemDialog {
         /// profile_id whose default pem is being edited.
         profile_id: String,
@@ -535,6 +541,9 @@ mod gui {
         pem_path: String,
         /// SSH login user being edited.
         ssh_user: String,
+        /// Bring the pem prompt back for this account and every environment
+        /// under it — the only way to undo a "don't ask again".
+        ask_again: bool,
     }
 
     /// Modal state for the "Scripts → create_new_user.sh / delete_user.sh"
@@ -1100,6 +1109,69 @@ mod gui {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| p.to_string())
+    }
+
+    /// Login whose home lives locally on the box rather than on the shared
+    /// EFS mount. Every account created by the Bastion New User script gets
+    /// an EFS home instead.
+    const LOCAL_HOME_USER: &str = "ec2-user";
+
+    /// Folder VS Code should open for an SSH login: the built-in
+    /// `ec2-user` has a local home, everyone else lives under EFS. Only a
+    /// default — the dialog's Open folder box stays editable.
+    fn default_remote_dir(user: &str) -> String {
+        let user = user.trim();
+        if user == LOCAL_HOME_USER {
+            format!("/home/{user}")
+        } else {
+            format!("/efs/home/{user}")
+        }
+    }
+
+    /// If a remote path is exactly some login's default home — local or
+    /// EFS — that login. Used to warn when the folder belongs to a
+    /// different user than the one connecting.
+    fn remote_dir_owner(path: &str) -> Option<&str> {
+        let path = path.trim().trim_end_matches('/');
+        let owner = path
+            .strip_prefix("/efs/home/")
+            .or_else(|| path.strip_prefix("/home/"))?;
+        if owner.is_empty() || owner.contains('/') {
+            return None;
+        }
+        Some(owner)
+    }
+
+    /// Populate an open pem ComboBox: the library sorted by filename, in a
+    /// scroll area whose bar stays visible so a list longer than the popup
+    /// is obviously scrollable rather than looking truncated. Returns the
+    /// pem the user clicked, if any.
+    fn pem_library_combo_items(
+        ui: &mut egui::Ui,
+        library: &[String],
+        selected: &str,
+    ) -> Option<String> {
+        if library.is_empty() {
+            ui.label(egui::RichText::new("(library empty — use Add)").weak());
+            return None;
+        }
+        let mut picked = None;
+        egui::ScrollArea::vertical()
+            .max_height(240.0)
+            .auto_shrink([false, true])
+            .scroll_bar_visibility(
+                egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+            )
+            .show(ui, |ui| {
+                ui.set_min_width(240.0);
+                for pem in library {
+                    let resp = ui.selectable_label(selected == pem, pem_basename(pem));
+                    if resp.on_hover_text(pem).clicked() {
+                        picked = Some(pem.clone());
+                    }
+                }
+            });
+        picked
     }
 
     /// Render the validation feedback (and a "did you mean" suggestion
@@ -5286,22 +5358,21 @@ mod gui {
                 return;
             }
 
-            let ssh_user = self.config.resolve_ssh_user(&profile_id);
+            // One account can host several environments, each with its own
+            // key and its own logins, so everything below is cached per
+            // (account, MMODAL_ENV) rather than per account.
+            let env = instance_env(instance).unwrap_or_default();
+            let ssh_user = self.config.resolve_ssh_user(&profile_id, &env);
             let instance_name = instance.name.clone().unwrap_or_default();
-            let suppressed = self
-                .config
-                .vscode_pem_suppressed
-                .get(&profile_id)
-                .copied()
-                .unwrap_or(false);
-            let resolved_pem = self
-                .config
-                .resolve_pem(&profile_id, &instance.instance_id);
+            let suppressed = self.config.vscode_prompt_suppressed(&profile_id, &env);
+            let resolved_pem =
+                self.config
+                    .resolve_pem(&profile_id, &env, &instance.instance_id);
 
             // Fast path: user opted out of the prompt and a pem is known.
             if suppressed {
                 if let Some(pem) = resolved_pem.clone() {
-                    let remote = format!("/home/{ssh_user}");
+                    let remote = default_remote_dir(&ssh_user);
                     if let Err(err) = self.launch_vscode(
                         &instance.instance_id,
                         &instance_name,
@@ -5327,18 +5398,35 @@ mod gui {
                         .next()
                 })
                 .unwrap_or_default();
-            let user_prefill = discovered
-                .iter()
-                .find(|h| h.aws_profile.as_deref() == Some(context.profile.as_str()))
-                .and_then(|h| h.user.clone())
+            // A user saved for this environment (or, failing that, the
+            // account) wins over one scraped out of the ssh config: the scan
+            // sees our own managed blocks, so an older session's login would
+            // otherwise keep re-suggesting itself even after the user picked
+            // a different one here.
+            let user_prefill = self
+                .config
+                .ssh_user_default
+                .get(&ec2_manager::config::AppConfig::vscode_key(&profile_id, &env))
+                .or_else(|| self.config.ssh_user_default.get(&profile_id))
+                .cloned()
+                .filter(|u| !u.trim().is_empty())
+                .or_else(|| {
+                    discovered
+                        .iter()
+                        .find(|h| {
+                            h.aws_profile.as_deref() == Some(context.profile.as_str())
+                        })
+                        .and_then(|h| h.user.clone())
+                })
                 .unwrap_or(ssh_user);
             self.pem_dialog = Some(PemDialog {
                 instance_id: instance.instance_id.clone(),
                 instance_name,
                 profile_id,
+                env,
                 aws_profile: context.profile.clone(),
                 region: context.region.clone(),
-                remote_path: format!("/home/{user_prefill}"),
+                remote_path: default_remote_dir(&user_prefill),
                 ssh_user: user_prefill,
                 pem_path: pem_prefill,
                 dont_ask_again: false,
@@ -5392,9 +5480,11 @@ mod gui {
             if let Err(err) = self.config.save() {
                 self.log_warn(format!("failed to save config after VS Code launch: {err}"));
             }
-            self.message = format!("Opening {instance_id} in VS Code...");
+            self.message =
+                format!("Opening {instance_id} in VS Code as {ssh_user}...");
             self.log_info(format!(
-                "launched VS Code Remote-SSH host={alias} path={remote_path}"
+                "launched VS Code Remote-SSH host={alias} user={ssh_user} \
+                 pem={pem} path={remote_path}"
             ));
             Ok(())
         }
@@ -5457,24 +5547,17 @@ mod gui {
                         } else {
                             pem_basename(&dlg.pem_path)
                         };
+                        let library = self.config.sorted_pem_library();
                         egui::ComboBox::from_id_salt("pem_library_combo")
                             .selected_text(selected_text)
                             .width(260.0)
                             .show_ui(ui, |ui| {
-                                if self.config.ssh_pem_library.is_empty() {
-                                    ui.label(
-                                        egui::RichText::new("(library empty — use Add)")
-                                            .weak(),
-                                    );
-                                }
-                                for pem in &self.config.ssh_pem_library {
-                                    let resp = ui.selectable_label(
-                                        dlg.pem_path == *pem,
-                                        pem_basename(pem),
-                                    );
-                                    if resp.on_hover_text(pem).clicked() {
-                                        dlg.pem_path = pem.clone();
-                                    }
+                                if let Some(picked) = pem_library_combo_items(
+                                    ui,
+                                    &library,
+                                    &dlg.pem_path,
+                                ) {
+                                    dlg.pem_path = picked;
                                 }
                             });
                         if ui.button("+ Add pem...").clicked() {
@@ -5503,10 +5586,21 @@ mod gui {
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.label("SSH user:");
-                        ui.add(
+                        let prev_user = dlg.ssh_user.clone();
+                        let resp = ui.add(
                             egui::TextEdit::singleline(&mut dlg.ssh_user)
                                 .desired_width(140.0),
                         );
+                        // Keep the folder pointed at the login's own home
+                        // while it hasn't been edited by hand — otherwise
+                        // switching user opens the previous user's home and
+                        // VS Code reports permission denied. A hand-typed
+                        // path stops matching and is left alone from then on.
+                        if resp.changed()
+                            && dlg.remote_path == default_remote_dir(&prev_user)
+                        {
+                            dlg.remote_path = default_remote_dir(&dlg.ssh_user);
+                        }
                     });
                     ui.horizontal(|ui| {
                         ui.label("Open folder:");
@@ -5515,14 +5609,45 @@ mod gui {
                                 .desired_width(240.0),
                         );
                     });
+                    ui.label(
+                        egui::RichText::new(
+                            "VS Code opens with this folder as the workspace \
+                             root — it is what the Explorer shows.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                    if let Some(owner) = remote_dir_owner(&dlg.remote_path) {
+                        if owner != dlg.ssh_user.trim() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 160, 40),
+                                format!(
+                                    "Folder is {owner}'s home but the login is \
+                                     {}. Expect permission denied.",
+                                    dlg.ssh_user.trim()
+                                ),
+                            );
+                        }
+                    }
 
                     ui.add_space(4.0);
                     let was_checked = dlg.dont_ask_again;
-                    ui.checkbox(
-                        &mut dlg.dont_ask_again,
+                    // Scoped to the environment, since that is what the pem
+                    // and login belong to. An instance with no MMODAL_ENV
+                    // tag has no environment to name, so it stays per
+                    // account — which is also the key it is cached under.
+                    let scope_label = if dlg.env.is_empty() {
                         "Don't ask again for this account (change later in \
-                         Edit menu > Update VS Code Pem)",
-                    );
+                         Edit menu > Update VS Code Pem)"
+                            .to_string()
+                    } else {
+                        format!(
+                            "Don't ask again for this environment ({}) \
+                             (change later in Edit menu > Update VS Code Pem)",
+                            dlg.env.to_uppercase()
+                        )
+                    };
+                    ui.checkbox(&mut dlg.dont_ask_again, scope_label);
                     if dlg.dont_ask_again && !was_checked {
                         self.edit_menu_flash_start = Some(Instant::now());
                     }
@@ -5542,17 +5667,16 @@ mod gui {
                 });
 
             if do_launch {
-                self.config
-                    .ssh_pem_default
-                    .insert(dlg.profile_id.clone(), dlg.pem_path.clone());
-                self.config
-                    .ssh_user_default
-                    .insert(dlg.profile_id.clone(), dlg.ssh_user.clone());
+                self.config.set_vscode_defaults(
+                    &dlg.profile_id,
+                    &dlg.env,
+                    &dlg.pem_path,
+                    &dlg.ssh_user,
+                );
                 self.config.add_pem_to_library(&dlg.pem_path);
                 if dlg.dont_ask_again {
                     self.config
-                        .vscode_pem_suppressed
-                        .insert(dlg.profile_id.clone(), true);
+                        .suppress_vscode_prompt(&dlg.profile_id, &dlg.env);
                 }
                 if let Err(err) = self.config.save() {
                     self.log_warn(format!("failed to save pem config: {err}"));
@@ -5636,7 +5760,8 @@ mod gui {
                                         .get(&pid)
                                         .cloned()
                                         .unwrap_or_default();
-                                    dlg.ssh_user = self.config.resolve_ssh_user(&pid);
+                                    dlg.ssh_user =
+                                        self.config.resolve_ssh_user(&pid, "");
                                 }
                             }
                         });
@@ -5649,24 +5774,17 @@ mod gui {
                         } else {
                             pem_basename(&dlg.pem_path)
                         };
+                        let library = self.config.sorted_pem_library();
                         egui::ComboBox::from_id_salt("settings_pem_library")
                             .selected_text(selected_text)
                             .width(260.0)
                             .show_ui(ui, |ui| {
-                                if self.config.ssh_pem_library.is_empty() {
-                                    ui.label(
-                                        egui::RichText::new("(library empty — use Add)")
-                                            .weak(),
-                                    );
-                                }
-                                for pem in &self.config.ssh_pem_library {
-                                    let resp = ui.selectable_label(
-                                        dlg.pem_path == *pem,
-                                        pem_basename(pem),
-                                    );
-                                    if resp.on_hover_text(pem).clicked() {
-                                        dlg.pem_path = pem.clone();
-                                    }
+                                if let Some(picked) = pem_library_combo_items(
+                                    ui,
+                                    &library,
+                                    &dlg.pem_path,
+                                ) {
+                                    dlg.pem_path = picked;
                                 }
                             });
                         if ui.button("+ Add pem...").clicked() {
@@ -5720,6 +5838,21 @@ mod gui {
                                 .desired_width(140.0),
                         );
                     });
+                    ui.label(
+                        egui::RichText::new(
+                            "Account-wide default. An environment that was \
+                             opened with its own key keeps that key.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+
+                    ui.add_space(4.0);
+                    ui.checkbox(
+                        &mut dlg.ask_again,
+                        "Ask which key to use again (undoes \"Don't ask \
+                         again\" for this account and its environments)",
+                    );
 
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -5737,16 +5870,26 @@ mod gui {
                 });
 
             if do_save {
-                self.config
-                    .ssh_pem_default
-                    .insert(dlg.profile_id.clone(), dlg.pem_path.clone());
-                self.config
-                    .ssh_user_default
-                    .insert(dlg.profile_id.clone(), dlg.ssh_user.clone());
+                // Empty env: the account-wide entry every environment falls
+                // back to when it has no override of its own.
+                self.config.set_vscode_defaults(
+                    &dlg.profile_id,
+                    "",
+                    &dlg.pem_path,
+                    &dlg.ssh_user,
+                );
                 self.config.add_pem_to_library(&dlg.pem_path);
+                let restored = dlg.ask_again
+                    && self
+                        .config
+                        .clear_vscode_prompt_suppression(&dlg.profile_id);
                 if let Err(err) = self.config.save() {
                     self.message = format!("error: {err}");
                     self.log_error(self.message.clone());
+                } else if restored {
+                    self.message =
+                        "VS Code pem updated; the key prompt is back on."
+                            .to_string();
                 } else {
                     self.message = "VS Code pem updated.".to_string();
                 }
@@ -14489,12 +14632,16 @@ mod gui {
                                     .get(&profile_id)
                                     .cloned()
                                     .unwrap_or_default();
+                                // Account-level values: this dialog edits the
+                                // fallback every environment inherits, not one
+                                // environment's override.
                                 let ssh_user =
-                                    self.config.resolve_ssh_user(&profile_id);
+                                    self.config.resolve_ssh_user(&profile_id, "");
                                 self.settings_pem_dialog = Some(SettingsPemDialog {
                                     profile_id,
                                     pem_path,
                                     ssh_user,
+                                    ask_again: false,
                                 });
                                 ui.close();
                             }
@@ -17897,6 +18044,29 @@ mod gui {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Created users' homes live on the shared EFS mount; only the
+        /// built-in ec2-user has a local one.
+        #[test]
+        fn default_remote_dir_sends_created_users_to_efs() {
+            assert_eq!(default_remote_dir("ec2-user"), "/home/ec2-user");
+            assert_eq!(default_remote_dir("jdoe"), "/efs/home/jdoe");
+            assert_eq!(default_remote_dir("  jdoe "), "/efs/home/jdoe");
+        }
+
+        /// The Open-folder field follows the SSH user only while it is
+        /// still that user's default home; a hand-typed path is left alone.
+        #[test]
+        fn remote_dir_owner_identifies_both_home_layouts() {
+            assert_eq!(remote_dir_owner("/efs/home/jdoe"), Some("jdoe"));
+            assert_eq!(remote_dir_owner("/efs/home/jdoe/"), Some("jdoe"));
+            assert_eq!(remote_dir_owner("/home/ec2-user"), Some("ec2-user"));
+            // Anything deeper, or elsewhere, is the user's own choice.
+            assert_eq!(remote_dir_owner("/efs/home/jdoe/src"), None);
+            assert_eq!(remote_dir_owner("/opt/app"), None);
+            assert_eq!(remote_dir_owner("/efs/home/"), None);
+            assert_eq!(remote_dir_owner("/home/"), None);
+        }
 
         fn env_row(env: &str, label: &str) -> ScriptEnv {
             ScriptEnv {

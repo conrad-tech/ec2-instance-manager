@@ -226,6 +226,77 @@ like `allow_delete_user`.
 `assets/scripts/alerts_10min.sh` is the standalone bash equivalent (curl + jq,
 same tag parsing, same local-time conversion) for terminal use.
 
+### Open in VS Code (right-click) — how the wrong login sneaks back in
+
+`src/ssh_config.rs` writes a managed Host block into the quarantined
+`config.d/ec2-manager` include and launches `code --remote ssh-remote+<alias>`.
+Four things keep the connection on the login the user actually picked; each
+was a real "it connects as ec2-user and gets permission denied" bug:
+
+- **The alias carries the login** — `<name>-<user>-<instance-id>`, built by
+  `managed_alias`. VS Code keys a remote window on the alias alone (recent
+  hosts, its server install, cached connection details), so one alias reused
+  for two logins lets the earlier session's user resurface. One alias per
+  (instance, user).
+- **`compose_managed_file` replaces by (HostName, User), not by alias**, so a
+  renamed instance collapses into one entry, a *different* login on the same
+  box keeps its own entry, and a block written before the alias carried the
+  user is dropped. That last rule is what clears the stale entry left by
+  earlier versions — without it the old alias lingers and stays clickable.
+- **The `Include` must precede every Host/Match block.** ssh keeps the *first*
+  value it obtains for each keyword, so an include sitting under a `Host *`
+  that sets `User` never gets to set the login, no matter how correct the
+  managed block is. `compose_config_with_include` hoists an existing include
+  rather than assuming that "present somewhere" is good enough. It returns
+  `None` when nothing needs moving, and is idempotent.
+- **The dialog's "Open folder" follows the SSH user** while it is still that
+  login's default home (`default_remote_dir`/`remote_dir_owner` in the GUI),
+  and warns when it names someone else's. Editing only the user field and
+  launching into `/home/ec2-user` is its own permission-denied, distinct from
+  the ssh one. Only `ec2-user` has a local `/home/ec2-user`; every account the
+  Bastion New User script creates lives at `/efs/home/<user>` on the shared
+  mount, so that is the default for any other login. The box stays editable
+  and a hand-typed path stops tracking the user field.
+
+**The pem, the login and the "don't ask again" opt-out are cached per
+(account, `MMODAL_ENV`)**, not per account — `AppConfig::vscode_key`, the same
+`<id>.<ENV>` shape as `bastion_key`, upper-cased because the tag is free text.
+Resolution layers instance → environment → account, so an environment with no
+override still inherits the account-wide value the Settings dialog writes
+(that dialog is deliberately account-level and passes an empty env).
+
+The opt-out is the one thing that does **not** fall back to the account entry
+when the instance carries an environment: opting out of the prompt for DEV1
+must not silently opt out of DEV2, whose key and login differ. An untagged
+instance keys on the bare profile id, which is also what older builds wrote,
+so an existing opt-out keeps working there. The Settings dialog's "Ask which
+key to use again" checkbox is the only in-app way to undo one —
+`clear_vscode_prompt_suppression` drops the account key and every `<id>.<ENV>`
+key under it.
+
+The path passed to `code --remote ssh-remote+<alias> <path>` **is** the
+workspace root — VS Code opens with the Explorer rooted there, it does not
+open a bare remote window. A path that does not exist (or that the login
+cannot read) still opens the window, just with an error instead of a tree,
+which is why the wrong-owner warning is worth having.
+
+Prefill precedence also matters: a user saved for the account wins over one
+scraped from the ssh config, because `scan()` sees our own managed blocks and
+an older session's login would otherwise keep re-suggesting itself.
+
+The pem dropdowns render `config.sorted_pem_library()` (alphabetical by
+filename, path as tiebreak; storage order untouched) inside a scroll area
+pinned to `ScrollBarVisibility::AlwaysVisible` — `pem_library_combo_items()`,
+shared by the launch dialog and Settings so the two cannot drift.
+
+### Instance search
+
+`filter::searchable_text` is the *whole* haystack for the search box —
+instance id, Name, private IP, **private DNS**, AMI id, and every tag key and
+value. A column visible in the table but missing here reads as "search is
+broken": private DNS was absent, so `ip-10-1-2-3` only ever matched the few
+boxes with that string in a Name tag. Add the field here when adding a column.
+
 ### Scripts menu: personal scripts, default scripts, git PAT
 
 **Add Script** in the Scripts menu is available to **everyone**. A personal
