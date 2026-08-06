@@ -1953,7 +1953,7 @@ mod gui {
             let n = matches.unwrap_or_default();
             format!("Not sent - {n} people match that name; pick one in Outlook")
         } else if !flag("resolved") {
-            "Outlook opened - pick the recipient".to_string()
+            "Unable to auto send email. Outlook opened - choose the recipient".to_string()
         } else if rest.contains("dir_user=False") {
             "Not sent - that address is not in the company directory (a local Contact?)".to_string()
         } else if !flag("domain_ok") {
@@ -17711,7 +17711,8 @@ mod gui {
             .expect("OPEN parses");
             match s {
                 EmailStatus::Opened { reason } => {
-                    assert!(reason.contains("pick the recipient"), "{reason}")
+                    assert!(reason.contains("Unable to auto send email"), "{reason}");
+                    assert!(reason.contains("choose the recipient"), "{reason}")
                 }
                 other => panic!("expected Opened, got {other:?}"),
             }
