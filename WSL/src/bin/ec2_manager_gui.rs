@@ -1142,10 +1142,32 @@ mod gui {
         Some(owner)
     }
 
+    /// Tallest the pem list gets before it scrolls. Must stay below
+    /// [`PEM_COMBO_POPUP_H`] so the ComboBox's own scroll area never kicks
+    /// in on top of this one — see [`pem_library_combo_items`].
+    const PEM_LIST_H: f32 = 240.0;
+    /// Height handed to `ComboBox::height`, i.e. the popup's own scroll
+    /// limit. Deliberately larger than the list so it is never reached.
+    const PEM_COMBO_POPUP_H: f32 = 400.0;
+
     /// Populate an open pem ComboBox: the library sorted by filename, in a
     /// scroll area whose bar stays visible so a list longer than the popup
     /// is obviously scrollable rather than looking truncated. Returns the
     /// pem the user clicked, if any.
+    ///
+    /// Two egui details this depends on, both of which made the bar
+    /// invisible before:
+    ///
+    /// - `ComboBox::show_ui` wraps its contents in a `ScrollArea` of its
+    ///   own, capped at `spacing.combo_height` (200 by default). Nesting a
+    ///   taller one inside means the outer clips ours and *its* bar is what
+    ///   responds — ours ends up drawn past the bottom edge, reachable only
+    ///   by scrolling. The callers pass [`PEM_COMBO_POPUP_H`] so the outer
+    ///   never has anything to scroll.
+    /// - The default `ScrollStyle` is `floating`, whose dormant handle and
+    ///   background opacities are both `0.0` — the bar is fully transparent
+    ///   until hovered, so `AlwaysVisible` alone still shows nothing.
+    ///   `solid()` is opaque and reserves its own width.
     fn pem_library_combo_items(
         ui: &mut egui::Ui,
         library: &[String],
@@ -1155,15 +1177,16 @@ mod gui {
             ui.label(egui::RichText::new("(library empty — use Add)").weak());
             return None;
         }
+        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
         let mut picked = None;
         egui::ScrollArea::vertical()
-            .max_height(240.0)
+            .max_height(PEM_LIST_H)
             .auto_shrink([false, true])
             .scroll_bar_visibility(
                 egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
             )
             .show(ui, |ui| {
-                ui.set_min_width(240.0);
+                ui.set_min_width(230.0);
                 for pem in library {
                     let resp = ui.selectable_label(selected == pem, pem_basename(pem));
                     if resp.on_hover_text(pem).clicked() {
@@ -5556,6 +5579,7 @@ mod gui {
                         egui::ComboBox::from_id_salt("pem_library_combo")
                             .selected_text(selected_text)
                             .width(260.0)
+                            .height(PEM_COMBO_POPUP_H)
                             .show_ui(ui, |ui| {
                                 if let Some(picked) = pem_library_combo_items(
                                     ui,
@@ -5783,6 +5807,7 @@ mod gui {
                         egui::ComboBox::from_id_salt("settings_pem_library")
                             .selected_text(selected_text)
                             .width(260.0)
+                            .height(PEM_COMBO_POPUP_H)
                             .show_ui(ui, |ui| {
                                 if let Some(picked) = pem_library_combo_items(
                                     ui,

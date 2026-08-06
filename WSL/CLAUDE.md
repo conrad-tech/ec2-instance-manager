@@ -298,9 +298,21 @@ scraped from the ssh config, because `scan()` sees our own managed blocks and
 an older session's login would otherwise keep re-suggesting itself.
 
 The pem dropdowns render `config.sorted_pem_library()` (alphabetical by
-filename, path as tiebreak; storage order untouched) inside a scroll area
-pinned to `ScrollBarVisibility::AlwaysVisible` — `pem_library_combo_items()`,
-shared by the launch dialog and Settings so the two cannot drift.
+filename, path as tiebreak; storage order untouched) through
+`pem_library_combo_items()`, shared by the launch dialog and Settings so the
+two cannot drift. **`ScrollBarVisibility::AlwaysVisible` on its own shows
+nothing** — two egui details defeat it, and both are load-bearing:
+
+- `ComboBox::show_ui` wraps its contents in a `ScrollArea` of its own, capped
+  at `spacing.combo_height` (200). A taller scroll area nested inside gets
+  clipped by it, and the inner bar is drawn past the bottom edge where you
+  have to scroll to find it. Callers pass `.height(PEM_COMBO_POPUP_H)`, kept
+  well above `PEM_LIST_H`, so the outer one never has anything to scroll.
+- The default `ScrollStyle` is `floating()`, whose `dormant_handle_opacity`
+  and `dormant_background_opacity` are both `0.0` — the bar exists but is
+  fully transparent until hovered. `ScrollStyle::solid()` is opaque
+  (`handle_opacity` is hard-coded to 1.0 for non-floating bars) and reserves
+  its own width.
 
 ### Instance search
 
