@@ -1,22 +1,59 @@
 {
   "_comment": [
-    "Port forwards added to the managed Host block by Open in VS Code.",
-    "Compiled into the binary at build time — edit and rebuild to change.",
+    "Port forwards carried by the background tunnels (Port Forwards window).",
+    "Compiled into the binary at build time — edit this file and rebuild.",
+    "After editing, run `cargo test --lib forwards`: a malformed file yields",
+    "NO forwards rather than an error (so a bad config can never block a VS",
+    "Code launch), which means a stray comma silently disables everything.",
     "",
-    "environments: keyed by the instance's MMODAL_ENV tag (case-insensitive).",
-    "  ip   loopback address bound locally. Used only when the machine's",
-    "       hosts file has no entry for `host` — where it does, that IP wins,",
-    "       so an existing hosts setup needs no change.",
-    "  host remote DNS name, resolved on the bastion.",
-    "  port optional; omit to infer from the name via port_rules.",
+    "FILLING IT IN — copy a block out of _example_environments below into",
+    "environments, rename the key, and edit the entries.",
     "",
-    "port_rules are checked in order and the FIRST match wins, so a name like",
-    "kafka-postgres-proxy takes the port of whichever rule is listed first.",
+    "  key   the instance's MMODAL_ENV tag, matched case-insensitively.",
+    "  ip    loopback address bound on THIS machine. Used only when your",
+    "        hosts file has no entry for `host`; where it does, that IP wins",
+    "        and this is ignored, so an existing hosts setup keeps working.",
+    "  host  the remote DNS name. Resolved on the bastion, not locally.",
+    "  port  optional. Omit it and the port comes from port_rules below.",
     "",
-    "The hosts file is only ever read. Where a name has no hosts entry the",
-    "tunnel still works, addressed by its IP; the dialog offers the line to",
-    "paste in so the name resolves in a browser too."
+    "EVERY ENVIRONMENT'S TUNNEL RUNS AT ONCE, so no two environments may",
+    "share an ip:port. The second ssh cannot bind it, and tunnels run with",
+    "ExitOnForwardFailure=yes, so that whole environment goes down. The app",
+    "detects this at startup and drops the clashing forward from the",
+    "alphabetically later environment, but the fix is distinct addresses:",
+    "give each environment its own /24, e.g. 127.200.10.x, 127.200.20.x.",
+    "Anything in 127.0.0.0/8 is loopback on Windows and needs no setup.",
+    "",
+    "port_rules are checked IN ORDER and the FIRST match wins, so a name",
+    "like kafka-postgres-proxy takes the port of whichever rule is listed",
+    "first. Add a service type here rather than porting every entry.",
+    "",
+    "The hosts file is optional and is only ever read. With no entry a",
+    "forward still works, reached at its IP (https://127.200.20.1) instead",
+    "of by name; the app offers the lines to paste in when any are missing."
   ],
+
+  "_example_environments": {
+    "_note": "Examples only — this key is ignored. Copy into environments.",
+    "AUCT": [
+      { "ip": "127.200.20.1", "host": "uweb01.auct.example.net" },
+      { "ip": "127.200.20.2", "host": "uapi01.auct.example.net" },
+      { "ip": "127.200.20.3", "host": "pg-postgres01.auct.example.net" }
+    ],
+    "DEV1": [
+      { "ip": "127.200.10.1", "host": "uweb01.dev1.example.net" },
+      { "ip": "127.200.10.2", "host": "solr01.dev1.example.net" },
+      { "ip": "127.200.10.3", "host": "admin01.dev1.example.net", "port": 8443 }
+    ],
+    "_what_those_produce": [
+      "LocalForward 127.200.20.1:443  uweb01.auct.example.net:443",
+      "LocalForward 127.200.20.2:443  uapi01.auct.example.net:443",
+      "LocalForward 127.200.20.3:5432 pg-postgres01.auct.example.net:5432",
+      "LocalForward 127.200.10.1:443  uweb01.dev1.example.net:443",
+      "LocalForward 127.200.10.2:8984 solr01.dev1.example.net:8984",
+      "LocalForward 127.200.10.3:8443 admin01.dev1.example.net:8443"
+    ]
+  },
 
   "default_port": 443,
 
