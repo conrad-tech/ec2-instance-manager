@@ -106,21 +106,37 @@ to no environment but are still available for name lookup.
 
 ## Resolution per environment
 
-Given the environment of the instance being opened:
+**Matching is by endpoint, not by comment.** Which endpoints belong to an
+environment comes from forwards.json; the hosts file is searched by DNS name
+wherever that name appears in it. Many hosts files are a bare list of
+`IP name` lines with no section comments at all, and those users get the same
+result as the ones who annotate.
 
-1. **The hosts file has a section for it** — those entries define the forward
-   set. IP and name come from the user's file. Hosts files carry no port, so
-   the port comes from a forwards.json entry for that same name if one exists
-   (honouring its explicit `"port"`), otherwise from the rules above.
-2. **No section, but the DNS name appears anywhere in the hosts file** — use
-   the forwards.json entry, but bind the IP the hosts file gives.
-3. **Name absent from the hosts file** — use the forwards.json entry as
-   written, and mark it as needing a hosts entry.
+Per declared entry:
 
-Case 2 is what makes an existing setup work untouched, and it closes a hazard:
-if forwards.json names an IP the user's hosts file already points at a
-*different* name, binding it would silently hijack theirs. Taking the IP from
-their file makes that impossible.
+- **The name is in the hosts file** — bind the IP the hosts file gives. This
+  is what makes an existing setup work untouched, and it closes a hazard: if
+  forwards.json names an IP the user's file already points a *different* name
+  at, binding it would silently hijack theirs.
+- **The name is absent** — use forwards.json's IP and mark it as needing a
+  hosts entry. The tunnel still works, addressed by IP.
+
+A section comment naming the environment is not required. Where one exists it
+is purely additive: an entry under it that forwards.json does not declare is
+offered as a forward too, since that user has said those endpoints belong to
+this environment.
+
+A name mapped to two different addresses uses the first, matching how the file
+itself resolves, and logs a warning.
+
+## Ports
+
+Hosts entries carry an IP and a name, so the port comes from the rules above.
+`parse_hosts` additionally tolerates `IP:port name:port` and honours such a
+port over the rules, for a user keeping a private endpoint list — the system
+hosts file cannot carry a port, since Windows' DNS client rejects the line.
+The two ends may differ (`127.0.0.1:8443 svc.example.net:443`); a port on one
+end mirrors to the other.
 
 ## Generated block
 
@@ -150,8 +166,9 @@ listing the resolved forwards, each with a checkbox, ticked by default. Each
 row shows `127.200.20.1:443 -> uxxx.net:443` and where the IP came from (hosts
 file or forwards.json).
 
-Rows in case 3 are flagged, with a **Copy hosts entries** button that puts the
-section text on the clipboard, and the hosts file path shown for pasting:
+Rows whose name is absent from the hosts file are flagged, with a **Copy hosts
+entries** button that puts the text on the clipboard, and the hosts file path
+shown for pasting:
 
 ```
 #####
@@ -168,9 +185,11 @@ absent.
 
 ## Validation
 
-On load, an entry in forwards.json whose IP has no matching hosts line in that
-environment's section is logged as a warning naming both. This is the drift the
-two-file split invites; it is surfaced, not silently merged.
+Where forwards.json and the hosts file both name an endpoint but disagree about
+its address, the disagreement is logged naming both, and the hosts file wins.
+This is the drift the two-file split invites; it is surfaced, not silently
+merged. A name the hosts file does not mention at all is not drift — that is a
+user who has not added it, which the dialog already flags per forward.
 
 ## Not building
 

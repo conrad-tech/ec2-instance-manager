@@ -134,9 +134,39 @@ impl ForwardsConfig {
 pub struct HostsEntry {
     pub ip: String,
     pub host: String,
+    /// Port written on the address, as in `127.0.0.1:8080`.
+    ///
+    /// The system hosts file cannot carry a port — Windows' DNS client
+    /// rejects such a line — but a user keeping their own endpoint list and
+    /// pointing us at it can, and it is more specific than anything we would
+    /// infer, so it wins.
+    pub local_port: Option<u16>,
+    /// Port written on the name, as in `test.example.com:8080`.
+    pub remote_port: Option<u16>,
     /// Section this line sits under, i.e. the environment named by the
     /// nearest preceding single-word comment. Empty for lines above any.
+    /// Only ever additive — resolution matches on the endpoint.
     pub section: String,
+}
+
+/// Split `host:port` into its parts, tolerating a bare host, a bracketed
+/// IPv6 literal (`[::1]:8080`) and a bare IPv6 literal (`::1`, no port —
+/// the colons are the address, not a separator).
+fn split_endpoint(token: &str) -> (String, Option<u16>) {
+    if let Some(rest) = token.strip_prefix('[') {
+        if let Some((addr, tail)) = rest.split_once(']') {
+            let port = tail.strip_prefix(':').and_then(|p| p.parse().ok());
+            return (addr.to_string(), port);
+        }
+    }
+    if token.matches(':').count() == 1 {
+        if let Some((host, port)) = token.split_once(':') {
+            if let Ok(port) = port.parse::<u16>() {
+                return (host.to_string(), Some(port));
+            }
+        }
+    }
+    (token.to_string(), None)
 }
 
 /// Parse a hosts-format file.
@@ -163,16 +193,21 @@ pub fn parse_hosts(text: &str) -> Vec<HostsEntry> {
             }
             continue;
         }
-        // `IP name [alias...]` — every name on the line maps to that IP.
+        // `IP[:port] name[:port] [alias...]` — every name on the line maps
+        // to that address.
         let mut parts = trimmed.split_whitespace();
-        let Some(ip) = parts.next() else { continue };
-        for host in parts {
-            if host.starts_with('#') {
+        let Some(ip_token) = parts.next() else { continue };
+        let (ip, local_port) = split_endpoint(ip_token);
+        for host_token in parts {
+            if host_token.starts_with('#') {
                 break;
             }
+            let (host, remote_port) = split_endpoint(host_token);
             entries.push(HostsEntry {
-                ip: ip.to_string(),
-                host: host.to_string(),
+                ip: ip.clone(),
+                host,
+                local_port,
+                remote_port,
                 section: section.clone(),
             });
         }
@@ -202,8 +237,11 @@ pub struct ResolvedForward {
     pub ip: String,
     /// Remote DNS name, resolved on the bastion.
     pub host: String,
-    /// Port, used on both ends.
-    pub port: u16,
+    /// Port bound locally. Usually the same as `remote_port`, but a hosts
+    /// entry may name them separately (`127.0.0.1:8443 svc.example.net:443`).
+    pub local_port: u16,
+    /// Port connected to on the far side.
+    pub remote_port: u16,
     pub source: ForwardSource,
 }
 
@@ -212,7 +250,7 @@ impl ResolvedForward {
     pub fn directive(&self) -> String {
         format!(
             "LocalForward {}:{} {}:{}",
-            self.ip, self.port, self.host, self.port
+            self.ip, self.local_port, self.host, self.remote_port
         )
     }
 
@@ -225,17 +263,27 @@ impl ResolvedForward {
 
 /// Resolve the forwards for one environment.
 ///
-/// 1. The hosts file has a section for the environment — those entries are
-///    the forward set. Hosts files carry no port, so it comes from a
-///    forwards.json entry for the same name if there is one (honouring its
-///    explicit port), otherwise from the rules.
-/// 2. No section, but the name appears anywhere in the hosts file — take the
-///    forwards.json entry and bind the IP the hosts file gives. This is what
-///    lets an existing setup work untouched, and it closes a hazard: if
-///    forwards.json names an IP the user already points a *different* name
-///    at, binding it would silently hijack theirs.
-/// 3. Name absent from the hosts file — use the entry as written and mark it
-///    [`ForwardSource::ConfigOnly`].
+/// **Matching is by endpoint, not by comment.** Which endpoints belong to an
+/// environment comes from forwards.json; the hosts file is searched by DNS
+/// name wherever that name appears in it. Plenty of hosts files are a bare
+/// list of `IP name` lines with no section comments at all, and those users
+/// must get the same result as the ones who annotate.
+///
+/// Per declared entry:
+///
+/// - **The name is in the hosts file** — bind the IP the hosts file gives
+///   ([`ForwardSource::HostsIp`]). This is what lets an existing setup work
+///   untouched, and it closes a hazard: if forwards.json names an IP the
+///   user already points a *different* name at, binding it would silently
+///   hijack theirs.
+/// - **The name is absent** — use the entry as written and mark it
+///   [`ForwardSource::ConfigOnly`]. The tunnel still works, addressed by IP.
+///
+/// A section comment naming the environment is not required, but where one
+/// exists any entry under it that forwards.json does not declare is added
+/// too ([`ForwardSource::HostsSection`]) — that user has told us those
+/// endpoints belong to this environment, and dropping them would lose a
+/// forward they had before.
 pub fn resolve_forwards(
     config: &ForwardsConfig,
     hosts: &[HostsEntry],
@@ -244,53 +292,90 @@ pub fn resolve_forwards(
     let env = env.trim();
     let declared = config.entries_for(env);
 
-    let section: Vec<&HostsEntry> = if env.is_empty() {
-        Vec::new()
-    } else {
-        hosts
-            .iter()
-            .filter(|e| e.section.eq_ignore_ascii_case(env))
-            .collect()
-    };
-
-    if !section.is_empty() {
-        return section
-            .into_iter()
-            .map(|entry| {
-                let declared_entry = declared
-                    .iter()
-                    .find(|d| d.host.eq_ignore_ascii_case(&entry.host));
-                let explicit = declared_entry.and_then(|d| d.port);
-                ResolvedForward {
-                    ip: entry.ip.clone(),
-                    host: entry.host.clone(),
-                    port: config.port_for(&entry.host, explicit),
-                    source: ForwardSource::HostsSection,
-                }
-            })
-            .collect();
-    }
-
-    declared
+    let mut out: Vec<ResolvedForward> = declared
         .iter()
         .filter(|entry| !entry.host.trim().is_empty())
         .map(|entry| {
-            let matching = hosts
-                .iter()
-                .find(|h| h.host.eq_ignore_ascii_case(entry.host.trim()));
+            let host = entry.host.trim();
+            // First match wins, matching how a hosts file resolves.
+            let matching = hosts.iter().find(|h| h.host.eq_ignore_ascii_case(host));
             let (ip, source) = match matching {
                 Some(h) => (h.ip.clone(), ForwardSource::HostsIp),
                 None => (entry.ip.trim().to_string(), ForwardSource::ConfigOnly),
             };
+            // A port the user wrote in their own endpoint list is the most
+            // specific thing available, so it beats the declared port and
+            // the name rules alike.
+            let remote_port = matching
+                .and_then(|h| h.remote_port)
+                .unwrap_or_else(|| config.port_for(host, entry.port));
+            let local_port = matching
+                .and_then(|h| h.local_port)
+                .unwrap_or(remote_port);
             ResolvedForward {
                 ip,
-                host: entry.host.trim().to_string(),
-                port: config.port_for(entry.host.trim(), entry.port),
+                host: host.to_string(),
+                local_port,
+                remote_port,
                 source,
             }
         })
         .filter(|f| !f.ip.is_empty())
-        .collect()
+        .collect();
+
+    // Extras the user put under a section comment for this environment.
+    if !env.is_empty() {
+        for entry in hosts
+            .iter()
+            .filter(|h| h.section.eq_ignore_ascii_case(env))
+        {
+            if out
+                .iter()
+                .any(|f| f.host.eq_ignore_ascii_case(&entry.host))
+            {
+                continue;
+            }
+            let remote_port = entry
+                .remote_port
+                .unwrap_or_else(|| config.port_for(&entry.host, None));
+            out.push(ResolvedForward {
+                ip: entry.ip.clone(),
+                host: entry.host.clone(),
+                local_port: entry.local_port.unwrap_or(remote_port),
+                remote_port,
+                source: ForwardSource::HostsSection,
+            });
+        }
+    }
+
+    out
+}
+
+/// Names the hosts file maps to more than one address.
+///
+/// Only the first is used, matching how the file itself resolves — but a
+/// duplicate usually means a stale line left above the live one, and
+/// binding a forward to an address the machine does not resolve the name to
+/// fails in a way that looks like the tunnel is broken.
+pub fn duplicate_host_warnings(hosts: &[HostsEntry], used: &[ResolvedForward]) -> Vec<String> {
+    let mut out = Vec::new();
+    for forward in used {
+        let addresses: Vec<&str> = hosts
+            .iter()
+            .filter(|h| h.host.eq_ignore_ascii_case(&forward.host))
+            .map(|h| h.ip.as_str())
+            .collect();
+        if addresses.len() > 1 && addresses.iter().any(|ip| *ip != addresses[0]) {
+            out.push(format!(
+                "forwards: {} appears {} times in the hosts file ({}) — using {}",
+                forward.host,
+                addresses.len(),
+                addresses.join(", "),
+                addresses[0]
+            ));
+        }
+    }
+    out
 }
 
 /// The hosts-file text for the forwards that have no entry yet, in the
@@ -315,6 +400,126 @@ pub fn hosts_snippet(env: &str, forwards: &[ResolvedForward]) -> String {
     out
 }
 
+/// `ssh` arguments for a background tunnel carrying these forwards.
+///
+/// The forwards go on the command line rather than into the managed Host
+/// block, because VS Code connects to that same alias: if both carried them,
+/// whichever connected second would fail to bind every port and the forwards
+/// would exist on only one of the two connections, decided by timing.
+///
+/// `ExitOnForwardFailure=yes` is deliberate. The window is hidden, so a
+/// half-forwarded session that keeps running is invisible and looks exactly
+/// like a working one until something fails to connect much later. Better to
+/// die and say so in the log.
+pub fn tunnel_args(alias: &str, forwards: &[ResolvedForward]) -> Vec<String> {
+    let mut args = vec![
+        "-o".to_string(),
+        "ExitOnForwardFailure=yes".to_string(),
+        // The block sets this too, but a user editing their own config
+        // should not be able to silently disable the keepalive.
+        "-o".to_string(),
+        "ServerAliveInterval=30".to_string(),
+    ];
+    for f in forwards {
+        args.push("-L".to_string());
+        args.push(format!(
+            "{}:{}:{}:{}",
+            f.ip, f.local_port, f.host, f.remote_port
+        ));
+    }
+    args.push(alias.to_string());
+    args
+}
+
+/// Signature of a tunnel's forward set, used to notice that the resolved
+/// forwards changed and the running tunnel is now stale.
+pub fn tunnel_signature(forwards: &[ResolvedForward]) -> String {
+    let mut parts: Vec<String> = forwards.iter().map(|f| f.directive()).collect();
+    parts.sort();
+    parts.join("|")
+}
+
+/// A local `ip:port` claimed by two different environments.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Collision {
+    pub bind: String,
+    /// Environment that claims it first, in declaration order — the one
+    /// allowed to keep it.
+    pub kept_env: String,
+    pub kept_host: String,
+    /// Environment whose forward has to be dropped.
+    pub dropped_env: String,
+    pub dropped_host: String,
+}
+
+impl Collision {
+    pub fn message(&self) -> String {
+        format!(
+            "forwards: {} is claimed by both {} ({}) and {} ({}) — keeping {}, \
+             dropping the other. Give each environment its own address.",
+            self.bind,
+            self.kept_env,
+            self.kept_host,
+            self.dropped_env,
+            self.dropped_host,
+            self.kept_env
+        )
+    }
+}
+
+/// Local binds claimed by more than one environment.
+///
+/// Every environment's tunnel runs at once, so two of them binding the same
+/// `ip:port` cannot both work: the second `ssh` fails to bind and, because
+/// tunnels run with `ExitOnForwardFailure=yes`, that kills the whole
+/// environment's tunnel rather than the one forward. Since the window is
+/// hidden the user would just see an environment quietly not working, so the
+/// clash is found before anything is spawned.
+pub fn collisions(config: &ForwardsConfig) -> Vec<Collision> {
+    let mut seen: Vec<(String, String, String)> = Vec::new(); // bind, env, host
+    let mut out = Vec::new();
+    for (env, entries) in &config.environments {
+        for entry in entries {
+            let host = entry.host.trim();
+            let ip = entry.ip.trim();
+            if host.is_empty() || ip.is_empty() {
+                continue;
+            }
+            let bind = format!("{ip}:{}", config.port_for(host, entry.port));
+            match seen.iter().find(|(b, _, _)| *b == bind) {
+                Some((_, kept_env, kept_host)) => out.push(Collision {
+                    bind,
+                    kept_env: kept_env.clone(),
+                    kept_host: kept_host.clone(),
+                    dropped_env: env.clone(),
+                    dropped_host: host.to_string(),
+                }),
+                None => seen.push((bind, env.clone(), host.to_string())),
+            }
+        }
+    }
+    out
+}
+
+/// Drop forwards whose local bind another environment already claimed, so
+/// one bad entry costs a single forward instead of the whole tunnel.
+pub fn without_collisions(
+    forwards: &[ResolvedForward],
+    env: &str,
+    collisions: &[Collision],
+) -> Vec<ResolvedForward> {
+    forwards
+        .iter()
+        .filter(|f| {
+            !collisions.iter().any(|c| {
+                c.dropped_env.eq_ignore_ascii_case(env.trim())
+                    && c.dropped_host.eq_ignore_ascii_case(&f.host)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// Default path of the machine's hosts file.
 pub fn default_hosts_path() -> String {
     if cfg!(windows) {
@@ -335,38 +540,31 @@ pub fn load_hosts(path: &str) -> Vec<HostsEntry> {
         .unwrap_or_default()
 }
 
-/// Warnings for forwards.json entries whose IP has no matching line in that
-/// environment's hosts section. This is the drift the two-file split
-/// invites; it gets surfaced in the log rather than silently merged.
+/// Warnings where forwards.json and the hosts file disagree about an
+/// endpoint's address. Matched by DNS name anywhere in the file, so a hosts
+/// file with no section comments is checked the same as an annotated one.
+///
+/// This is the drift the two-file split invites; it gets surfaced in the log
+/// rather than silently merged. A name the hosts file does not mention at
+/// all is *not* drift — that is a user who has not added it, which the
+/// dialog already flags per forward.
 pub fn drift_warnings(config: &ForwardsConfig, hosts: &[HostsEntry]) -> Vec<String> {
     let mut out = Vec::new();
     for (env, entries) in &config.environments {
-        let section: Vec<&HostsEntry> = hosts
-            .iter()
-            .filter(|h| h.section.eq_ignore_ascii_case(env.trim()))
-            .collect();
-        if section.is_empty() {
-            continue;
-        }
         for entry in entries {
             let host = entry.host.trim();
-            if host.is_empty() {
+            let declared_ip = entry.ip.trim();
+            if host.is_empty() || declared_ip.is_empty() {
                 continue;
             }
-            match section.iter().find(|h| h.host.eq_ignore_ascii_case(host)) {
-                Some(h) if h.ip != entry.ip.trim() && !entry.ip.trim().is_empty() => {
+            if let Some(h) = hosts.iter().find(|h| h.host.eq_ignore_ascii_case(host)) {
+                if h.ip != declared_ip {
                     out.push(format!(
-                        "forwards: {env} {host} is {} in forwards.json but {} in \
-                         the hosts file — using the hosts file",
-                        entry.ip.trim(),
+                        "forwards: {env} {host} is {declared_ip} in forwards.json \
+                         but {} in the hosts file — using the hosts file",
                         h.ip
                     ));
                 }
-                None => out.push(format!(
-                    "forwards: {env} {host} has no line in the hosts file's \
-                     {env} section"
-                )),
-                _ => {}
             }
         }
     }
@@ -461,21 +659,134 @@ mod tests {
         assert_eq!(entries[5].section, "DEV1");
     }
 
+    /// The case that matters most: plenty of hosts files are a bare list of
+    /// `IP name` lines with no section comments anywhere. Matching on the
+    /// endpoint has to give those users the same result.
     #[test]
-    fn hosts_section_defines_the_forward_set() {
+    fn endpoints_match_without_any_section_comments() {
         let hosts = parse_hosts(
-            "# AUCT\n\
+            "127.0.0.1  localhost\n\
              127.9.9.1  uweb.example.net\n\
-             127.9.9.2  solr-search.example.net\n",
+             127.9.9.2  pg-postgres.example.net\n",
         );
         let out = resolve_forwards(&config(), &hosts, "AUCT");
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].ip, "127.9.9.1");
-        assert_eq!(out[0].port, 443);
-        assert_eq!(out[0].source, ForwardSource::HostsSection);
-        // A name only the hosts file knows still gets its port inferred.
-        assert_eq!(out[1].port, 8984);
+        assert_eq!(out[0].source, ForwardSource::HostsIp);
+        assert_eq!(out[1].ip, "127.9.9.2");
+        assert_eq!(out[1].remote_port, 5432);
         assert!(out.iter().all(|f| !f.needs_hosts_entry()));
+    }
+
+    /// A port written in the user's own endpoint list is the most specific
+    /// thing available, so it beats both the declared port and the rules.
+    #[test]
+    fn a_port_in_the_hosts_entry_wins() {
+        let hosts = parse_hosts(
+            "172.0.0.1:8080  uweb.example.net:8080\n\
+             127.9.9.2:9999  pg-postgres.example.net:9999\n",
+        );
+        let out = resolve_forwards(&config(), &hosts, "AUCT");
+        assert_eq!(
+            out[0].directive(),
+            "LocalForward 172.0.0.1:8080 uweb.example.net:8080"
+        );
+        // Beats the postgres rule, which would otherwise say 5432.
+        assert_eq!(
+            out[1].directive(),
+            "LocalForward 127.9.9.2:9999 pg-postgres.example.net:9999"
+        );
+    }
+
+    /// The two ends need not agree, and a port on only one end mirrors.
+    #[test]
+    fn local_and_remote_ports_can_differ() {
+        let hosts = parse_hosts("127.0.0.1:8443  uweb.example.net:443\n");
+        let out = resolve_forwards(&config(), &hosts, "AUCT");
+        assert_eq!(out[0].local_port, 8443);
+        assert_eq!(out[0].remote_port, 443);
+        assert_eq!(
+            out[0].directive(),
+            "LocalForward 127.0.0.1:8443 uweb.example.net:443"
+        );
+
+        // Port on the name only: the local end mirrors it.
+        let hosts = parse_hosts("127.0.0.1  uweb.example.net:8080\n");
+        let out = resolve_forwards(&config(), &hosts, "AUCT");
+        assert_eq!(out[0].local_port, 8080);
+        assert_eq!(out[0].remote_port, 8080);
+    }
+
+    /// An IPv6 literal is colons all the way down; only a bracketed form
+    /// carries a port.
+    #[test]
+    fn split_endpoint_handles_ipv6_and_bare_hosts() {
+        assert_eq!(split_endpoint("127.0.0.1"), ("127.0.0.1".into(), None));
+        assert_eq!(
+            split_endpoint("127.0.0.1:8080"),
+            ("127.0.0.1".into(), Some(8080))
+        );
+        assert_eq!(split_endpoint("::1"), ("::1".into(), None));
+        assert_eq!(split_endpoint("[::1]:8080"), ("::1".into(), Some(8080)));
+        // Not a port — left alone rather than mangled.
+        assert_eq!(
+            split_endpoint("host:notaport"),
+            ("host:notaport".into(), None)
+        );
+    }
+
+    /// A name under some *other* environment's comment still matches: the
+    /// comment is a hint, never a filter.
+    #[test]
+    fn a_misfiled_section_comment_does_not_hide_an_endpoint() {
+        let hosts = parse_hosts(
+            "# SOMETHINGELSE\n\
+             127.9.9.1  uweb.example.net\n",
+        );
+        let out = resolve_forwards(&config(), &hosts, "AUCT");
+        assert_eq!(out[0].ip, "127.9.9.1");
+        assert_eq!(out[0].source, ForwardSource::HostsIp);
+    }
+
+    /// Where a user *has* annotated, an endpoint under that environment's
+    /// comment that forwards.json does not declare is still offered — they
+    /// have said it belongs here, and dropping it loses a forward.
+    #[test]
+    fn section_adds_endpoints_forwards_json_does_not_declare() {
+        let hosts = parse_hosts(
+            "# AUCT\n\
+             127.9.9.1  uweb.example.net\n\
+             127.9.9.9  solr-search.example.net\n",
+        );
+        let out = resolve_forwards(&config(), &hosts, "AUCT");
+        assert_eq!(out.len(), 3, "{out:?}");
+        // Declared entries keep their order, extras follow.
+        assert_eq!(out[0].host, "uweb.example.net");
+        assert_eq!(out[1].host, "pg-postgres.example.net");
+        assert_eq!(out[2].host, "solr-search.example.net");
+        assert_eq!(out[2].source, ForwardSource::HostsSection);
+        // The extra still gets its port inferred from the name.
+        assert_eq!(out[2].remote_port, 8984);
+    }
+
+    /// Only the first address is used, as the file itself resolves — but a
+    /// stale duplicate above the live line is worth saying out loud.
+    #[test]
+    fn duplicate_names_use_the_first_and_warn() {
+        let hosts = parse_hosts(
+            "127.9.9.1  uweb.example.net\n\
+             127.9.9.7  uweb.example.net\n",
+        );
+        let out = resolve_forwards(&config(), &hosts, "AUCT");
+        assert_eq!(out[0].ip, "127.9.9.1");
+        let warnings = duplicate_host_warnings(&hosts, &out);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("127.9.9.1"), "{warnings:?}");
+        assert!(warnings[0].contains("127.9.9.7"), "{warnings:?}");
+        // A name repeated with the same address is just noise, not a clash.
+        let same = parse_hosts("127.9.9.1  uweb.example.net\n127.9.9.1  uweb.example.net\n");
+        let out = resolve_forwards(&config(), &same, "AUCT");
+        assert!(duplicate_host_warnings(&same, &out).is_empty());
     }
 
     /// The case that makes an existing setup work untouched: the name is in
@@ -532,20 +843,110 @@ mod tests {
         assert!(hosts_snippet("x", &[]).is_empty());
     }
 
+    /// Drift is a *disagreement* about an address, found by name with no
+    /// help from comments. A name the file does not mention is not drift —
+    /// that is a user who has not added it, flagged per forward instead.
     #[test]
-    fn drift_warnings_flag_a_mismatched_or_missing_line() {
-        let hosts = parse_hosts(
-            "# AUCT\n\
-             127.9.9.1  uweb.example.net\n",
-        );
+    fn drift_warnings_flag_only_a_disagreement() {
+        let hosts = parse_hosts("127.9.9.1  uweb.example.net\n");
         let warnings = drift_warnings(&config(), &hosts);
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("127.200.20.1"), "{warnings:?}");
         assert!(warnings[0].contains("127.9.9.1"), "{warnings:?}");
-        assert!(warnings[1].contains("no line"), "{warnings:?}");
-        // No section for the environment at all is not drift — that is just
-        // a user who has not set the hosts file up.
+
+        // Agreement is silent, and so is an empty hosts file.
+        let agreed = parse_hosts("127.200.20.1  uweb.example.net\n");
+        assert!(drift_warnings(&config(), &agreed).is_empty());
         assert!(drift_warnings(&config(), &[]).is_empty());
+    }
+
+    #[test]
+    fn tunnel_args_carry_every_forward_and_fail_loudly() {
+        let hosts = parse_hosts("127.9.9.1  uweb.example.net\n");
+        let out = resolve_forwards(&config(), &hosts, "AUCT");
+        let args = tunnel_args("web-jane-i-1", &out);
+        // Fails rather than half-forwarding: the window is hidden, so a
+        // partly working tunnel would be invisible.
+        assert!(args.windows(2).any(|w| w
+            == ["-o".to_string(), "ExitOnForwardFailure=yes".to_string()]));
+        assert!(args.contains(&"-L".to_string()));
+        assert!(args.contains(&"127.9.9.1:443:uweb.example.net:443".to_string()));
+        assert!(args.contains(&"127.200.20.2:5432:pg-postgres.example.net:5432".to_string()));
+        // The alias is last, as ssh expects.
+        assert_eq!(args.last().unwrap(), "web-jane-i-1");
+    }
+
+    /// The signature has to change when the forward set does, so a stale
+    /// tunnel gets replaced, and stay put when only the order differs.
+    #[test]
+    fn tunnel_signature_tracks_the_forward_set() {
+        let a = resolve_forwards(&config(), &[], "AUCT");
+        let same = resolve_forwards(&config(), &[], "auct");
+        assert_eq!(tunnel_signature(&a), tunnel_signature(&same));
+
+        let mut reordered = a.clone();
+        reordered.reverse();
+        assert_eq!(tunnel_signature(&a), tunnel_signature(&reordered));
+
+        let hosts = parse_hosts("127.9.9.1  uweb.example.net\n");
+        let moved = resolve_forwards(&config(), &hosts, "AUCT");
+        assert_ne!(tunnel_signature(&a), tunnel_signature(&moved));
+
+        assert_ne!(tunnel_signature(&a), tunnel_signature(&a[..1]));
+    }
+
+    /// Every environment's tunnel runs at once, so a shared bind is not a
+    /// style problem — with ExitOnForwardFailure it kills a whole tunnel.
+    #[test]
+    fn collisions_across_environments_are_found_before_spawning() {
+        let cfg = ForwardsConfig::parse(
+            r#"{
+                "environments": {
+                    "AUCT": [{ "ip": "127.200.20.1", "host": "a.example.net" }],
+                    "DEV1": [
+                        { "ip": "127.200.20.1", "host": "b.example.net" },
+                        { "ip": "127.200.10.1", "host": "c.example.net" }
+                    ]
+                }
+            }"#,
+        );
+        let clashes = collisions(&cfg);
+        assert_eq!(clashes.len(), 1, "{clashes:?}");
+        assert_eq!(clashes[0].bind, "127.200.20.1:443");
+        // Declaration order decides who keeps it; BTreeMap orders AUCT first.
+        assert_eq!(clashes[0].kept_env, "AUCT");
+        assert_eq!(clashes[0].dropped_env, "DEV1");
+        assert!(clashes[0].message().contains("127.200.20.1:443"));
+
+        // The clashing forward is dropped; the environment's others survive,
+        // so one bad entry costs a forward and not the whole tunnel.
+        let dev1 = resolve_forwards(&cfg, &[], "DEV1");
+        assert_eq!(dev1.len(), 2);
+        let kept = without_collisions(&dev1, "DEV1", &clashes);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].host, "c.example.net");
+        // AUCT keeps its claim.
+        let auct = resolve_forwards(&cfg, &[], "AUCT");
+        assert_eq!(without_collisions(&auct, "AUCT", &clashes).len(), 1);
+    }
+
+    /// The same address on a different port is not a clash, and neither is
+    /// the same port on a different address.
+    #[test]
+    fn collisions_compare_the_whole_bind() {
+        let cfg = ForwardsConfig::parse(
+            r#"{
+                "port_rules": [{ "match": "postgres", "port": 5432 }],
+                "environments": {
+                    "A": [{ "ip": "127.0.0.1", "host": "pg-postgres.net" }],
+                    "B": [
+                        { "ip": "127.0.0.1", "host": "web.net" },
+                        { "ip": "127.0.0.2", "host": "other-postgres.net" }
+                    ]
+                }
+            }"#,
+        );
+        assert!(collisions(&cfg).is_empty());
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod script_env;
 pub mod sim;
 pub mod ssh_config;
 pub mod terminal;
+pub mod tunnel;
 pub mod util;
 pub mod vault_iam;
 pub mod workflow;

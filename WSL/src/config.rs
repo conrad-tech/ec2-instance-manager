@@ -73,6 +73,18 @@ pub struct AppConfig {
     /// being silently absent because it was missing from a list saved
     /// months ago.
     pub disabled_forwards: BTreeMap<String, Vec<String>>,
+    /// Environments where the background port-forward tunnel was switched
+    /// off, keyed like the other VS Code settings. Stores the *off* set
+    /// because the option ships on.
+    pub tunnel_off: BTreeMap<String, bool>,
+    /// Tunnel failures the user has cleared, keyed the same way, with the
+    /// exact reason that was cleared as the value.
+    ///
+    /// Storing the *reason* rather than a flag is what makes this safe: an
+    /// account someone has permanently lost stops shouting, but a different
+    /// failure later still does. Clearing never stops the retry, so access
+    /// coming back still brings the tunnel up on its own.
+    pub tunnel_dismissed: BTreeMap<String, String>,
     /// Last primary/secondary bastion pair selected in the create-user
     /// script dialog, keyed by environment/profile_id. Value is
     /// "primary_instance_id|secondary_instance_id" (either side may be
@@ -138,6 +150,8 @@ impl Default for AppConfig {
             vscode_pem_suppressed: BTreeMap::new(),
             forwards_hosts_file: None,
             disabled_forwards: BTreeMap::new(),
+            tunnel_off: BTreeMap::new(),
+            tunnel_dismissed: BTreeMap::new(),
             bastion_selections: BTreeMap::new(),
             personal_scripts: Vec::new(),
             git_pat: None,
@@ -330,6 +344,59 @@ impl AppConfig {
             .filter(|p| !p.is_empty())
             .map(str::to_string)
             .unwrap_or_else(crate::forwards::default_hosts_path)
+    }
+
+    /// Whether the background port-forward tunnel runs for this
+    /// environment. On unless the user switched it off.
+    pub fn tunnel_enabled(&self, profile_id: &str, env: &str) -> bool {
+        !self
+            .tunnel_off
+            .get(&Self::vscode_key(profile_id, env))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Switch the background tunnel on or off for an environment.
+    pub fn set_tunnel_enabled(&mut self, profile_id: &str, env: &str, enabled: bool) {
+        let key = Self::vscode_key(profile_id, env);
+        if enabled {
+            self.tunnel_off.remove(&key);
+        } else {
+            self.tunnel_off.insert(key, true);
+        }
+    }
+
+    /// Whether `reason` is the failure the user already cleared for this
+    /// environment. A *different* failure is never silenced.
+    pub fn tunnel_error_dismissed(
+        &self,
+        profile_id: &str,
+        env: &str,
+        reason: &str,
+    ) -> bool {
+        self.tunnel_dismissed
+            .get(&Self::vscode_key(profile_id, env))
+            .map(|d| d == reason.trim())
+            .unwrap_or(false)
+    }
+
+    /// Silence this exact failure for this environment. Retries continue —
+    /// clearing hides the noise, it does not switch the tunnel off.
+    pub fn dismiss_tunnel_error(&mut self, profile_id: &str, env: &str, reason: &str) {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return;
+        }
+        self.tunnel_dismissed
+            .insert(Self::vscode_key(profile_id, env), reason.to_string());
+    }
+
+    /// Forget any cleared failure, so the next one speaks up. Called when a
+    /// tunnel comes up.
+    pub fn clear_tunnel_dismissal(&mut self, profile_id: &str, env: &str) -> bool {
+        self.tunnel_dismissed
+            .remove(&Self::vscode_key(profile_id, env))
+            .is_some()
     }
 
     /// Whether the user unticked this forward for this environment.
@@ -661,6 +728,21 @@ impl AppConfig {
                 continue;
             }
 
+            if let Some(rest) = key.strip_prefix("forward_dismissed.") {
+                if !rest.is_empty() && !value.is_empty() {
+                    cfg.tunnel_dismissed
+                        .insert(rest.to_string(), value.to_string());
+                }
+                continue;
+            }
+
+            if let Some(rest) = key.strip_prefix("forward_ports_off.") {
+                if !rest.is_empty() && value == "1" {
+                    cfg.tunnel_off.insert(rest.to_string(), true);
+                }
+                continue;
+            }
+
             if let Some(rest) = key.strip_prefix("forwards_disabled.") {
                 if !rest.is_empty() {
                     let names: Vec<String> = value
@@ -912,6 +994,16 @@ impl AppConfig {
         }
         if let Some(ref p) = self.forwards_hosts_file {
             lines.push(format!("forwards_hosts_file={p}"));
+        }
+        for (key, reason) in &self.tunnel_dismissed {
+            if !reason.is_empty() {
+                lines.push(format!("forward_dismissed.{key}={reason}"));
+            }
+        }
+        for (key, off) in &self.tunnel_off {
+            if *off {
+                lines.push(format!("forward_ports_off.{key}=1"));
+            }
         }
         for (key, names) in &self.disabled_forwards {
             if !names.is_empty() {
@@ -1216,6 +1308,35 @@ mod tests {
             cfg.resolve_pem("acct", "DEV1", "i-1").as_deref(),
             Some("/keys/one.pem")
         );
+    }
+
+    /// Someone can lose access to an account for good, and a red banner that
+    /// can never be satisfied is worse than no banner. Clearing silences that
+    /// one failure without stopping the retry, so access coming back still
+    /// brings the tunnel up by itself.
+    #[test]
+    fn clearing_a_tunnel_failure_silences_only_that_failure() {
+        let mut cfg = AppConfig::default();
+        let auth = "Prod needs authorizing — forwards start once it is";
+        assert!(!cfg.tunnel_error_dismissed("acct", "DEV1", auth));
+
+        cfg.dismiss_tunnel_error("acct", "DEV1", auth);
+        assert!(cfg.tunnel_error_dismissed("acct", "DEV1", auth));
+        // A different failure is never silenced by an old dismissal.
+        assert!(!cfg.tunnel_error_dismissed("acct", "DEV1", "no pem saved"));
+        // Nor is the same failure in another environment or account.
+        assert!(!cfg.tunnel_error_dismissed("acct", "DEV2", auth));
+        assert!(!cfg.tunnel_error_dismissed("other", "DEV1", auth));
+
+        // Coming up clears it, so the next failure speaks up again.
+        assert!(cfg.clear_tunnel_dismissal("acct", "DEV1"));
+        assert!(!cfg.tunnel_error_dismissed("acct", "DEV1", auth));
+        assert!(!cfg.clear_tunnel_dismissal("acct", "DEV1"));
+
+        // Clearing is not the same as switching the tunnel off — it must
+        // keep retrying, or access returning would go unnoticed.
+        cfg.dismiss_tunnel_error("acct", "DEV1", auth);
+        assert!(cfg.tunnel_enabled("acct", "DEV1"));
     }
 
     /// Opting out of the prompt in one environment must not opt out of the

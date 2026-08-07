@@ -504,6 +504,24 @@ mod gui {
         }
     }
 
+    /// One environment in the Port Forwards window.
+    #[derive(Clone)]
+    struct PortForwardRow {
+        /// Environment name as every dialog shows it (uppercased).
+        label: String,
+        /// Account this environment lives in — the same environment name can
+        /// appear in more than one, and each is its own tunnel.
+        account_id: String,
+        env: String,
+        /// `vscode_key(account_id, env)`, the key everything else uses.
+        key: String,
+        /// Forwards after removing the user's unticked ones and any whose
+        /// bind another environment already claimed.
+        forwards: Vec<ec2_manager::forwards::ResolvedForward>,
+        /// Primary bastion from the shared `bastion_pair` cache.
+        bastion: Option<String>,
+    }
+
     /// Modal state for the "Open in VS Code" pem-selection prompt.
     struct PemDialog {
         /// Instance being opened.
@@ -3981,8 +3999,31 @@ mod gui {
         /// Usernames delete_user must never remove (from features.json).
         protected_users: Vec<String>,
         /// Compiled-in port-forward definitions (assets/forwards.json), used
-        /// to build the LocalForward lines in the managed VS Code ssh block.
+        /// to build the LocalForward lines the background tunnels carry.
         forwards_config: ec2_manager::forwards::ForwardsConfig,
+        /// Running background tunnels, keyed by `vscode_key(account, env)`.
+        /// One per environment: they all run at once, which is why two
+        /// environments must never claim the same local bind.
+        port_tunnels: HashMap<String, ec2_manager::tunnel::Tunnel>,
+        /// Why a tunnel is not running, keyed the same way. Kept separate
+        /// from `port_tunnels` so a failure survives the process being gone.
+        tunnel_errors: HashMap<String, String>,
+        /// Whether the Port Forwards window is open.
+        show_port_forwards: bool,
+        /// Throttle for `poll_port_tunnels`.
+        last_tunnel_poll_at: Instant,
+        /// Tunnel status line, rendered like the Scripts one (yellow while
+        /// working, red on failure). Kept separate from `script_status` so a
+        /// tunnel cannot stomp an in-flight Scripts run.
+        tunnel_status: Option<(String, ScriptState)>,
+        /// Hosts entries missing last time forwarding was attempted. Used to
+        /// raise the copy-paste prompt when the set *changes*, rather than
+        /// every poll.
+        tunnel_hosts_missing: Vec<String>,
+        /// Active "add these hosts entries" prompt: (snippet, path).
+        hosts_prompt: Option<(String, String)>,
+        /// Local binds claimed by two environments, found once at startup.
+        forward_collisions: Vec<ec2_manager::forwards::Collision>,
         /// Build-time gate (features.json `personal_scripts.allowed_users`):
         /// whether the current OS user gets the git integration — the PAT
         /// prompt, git's credential store populated by Prep Terminal, and the
@@ -4292,6 +4333,14 @@ mod gui {
                 secondary_bastion_filter: features.secondary_bastion_filter.clone(),
                 protected_users: features.protected_users.clone(),
                 forwards_config: ec2_manager::forwards::ForwardsConfig::bundled(),
+                port_tunnels: HashMap::new(),
+                tunnel_errors: HashMap::new(),
+                show_port_forwards: false,
+                last_tunnel_poll_at: Instant::now(),
+                tunnel_status: None,
+                tunnel_hosts_missing: Vec::new(),
+                hosts_prompt: None,
+                forward_collisions: Vec::new(),
                 git_scripts_enabled,
                 git_host,
                 default_scripts,
@@ -4335,6 +4384,15 @@ mod gui {
 
             app.rebuild_account_colors();
             app.scan_ssh_hosts();
+            // Local binds claimed by two environments. Every tunnel runs at
+            // once, so this is a hard conflict, not a style note: with
+            // ExitOnForwardFailure the second bind kills that whole tunnel.
+            app.forward_collisions =
+                ec2_manager::forwards::collisions(&app.forwards_config);
+            for collision in app.forward_collisions.clone() {
+                app.log_error(collision.message());
+            }
+
             // Probe for the VS Code `code` CLI in the background so the
             // "Open in VS Code" button never blocks on a subprocess spawn.
             {
@@ -5470,6 +5528,841 @@ mod gui {
             }
         }
 
+        /// One row of the Port Forwards window: an environment that has
+        /// forwards declared, and what is known about reaching it.
+        fn port_forward_rows(&mut self) -> Vec<PortForwardRow> {
+            let hosts_path = self.config.hosts_file_path();
+            let hosts = ec2_manager::forwards::load_hosts(&hosts_path);
+            let environments = self.script_environments();
+            let mut rows: Vec<PortForwardRow> = Vec::new();
+
+            for env_name in self
+                .forwards_config
+                .environments
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                // An environment in forwards.json may exist in more than one
+                // account; each is its own tunnel, since each has its own
+                // bastion and its own login.
+                let matches: Vec<ScriptEnv> = environments
+                    .iter()
+                    .filter(|e| e.env.trim().eq_ignore_ascii_case(env_name.trim()))
+                    .cloned()
+                    .collect();
+                for row in matches {
+                    let key = ec2_manager::config::AppConfig::vscode_key(
+                        &row.account_id,
+                        &row.env,
+                    );
+                    let forwards = ec2_manager::forwards::without_collisions(
+                        &ec2_manager::forwards::resolve_forwards(
+                            &self.forwards_config,
+                            &hosts,
+                            &row.env,
+                        ),
+                        &row.env,
+                        &self.forward_collisions,
+                    );
+                    let forwards: Vec<_> = forwards
+                        .into_iter()
+                        .filter(|f| {
+                            !self.config.forward_disabled(
+                                &row.account_id,
+                                &row.env,
+                                &f.host,
+                            )
+                        })
+                        .collect();
+                    let bastion = self
+                        .config
+                        .bastion_selection(&row.account_id, &row.env)
+                        .map(|(primary, _)| primary)
+                        .filter(|p| !p.is_empty());
+                    rows.push(PortForwardRow {
+                        label: script_env_label(&row),
+                        account_id: row.account_id.clone(),
+                        env: row.env.clone(),
+                        key,
+                        forwards,
+                        bastion,
+                    });
+                }
+            }
+            rows.sort_by(|a, b| a.label.cmp(&b.label));
+            rows
+        }
+
+        /// Start the tunnel for one environment, replacing any running one
+        /// whose forward set no longer matches.
+        fn start_port_tunnel(&mut self, row: &PortForwardRow) {
+            if row.forwards.is_empty() {
+                self.tunnel_errors
+                    .insert(row.key.clone(), "no forwards for this environment".into());
+                return;
+            }
+            // An unauthenticated account cannot open a session, and trying
+            // produces a hidden process that dies with a credentials error
+            // nobody sees. Wait for the account to be authorized instead —
+            // `poll_port_tunnels` starts it the moment it is.
+            if self.script_env_auth(&row.account_id) != AuthStatus::Ok {
+                let name = self.profile_display_name(&row.account_id);
+                self.tunnel_errors.insert(
+                    row.key.clone(),
+                    format!("{name} needs authorizing — forwards start once it is"),
+                );
+                return;
+            }
+
+            let signature = ec2_manager::forwards::tunnel_signature(&row.forwards);
+            if let Some(existing) = self.port_tunnels.get_mut(&row.key) {
+                if existing.signature == signature && existing.is_running() {
+                    return;
+                }
+                self.port_tunnels.remove(&row.key);
+            }
+
+            let Some(bastion) = row.bastion.clone() else {
+                self.tunnel_errors.insert(
+                    row.key.clone(),
+                    "no bastion saved for this environment — pick one in a \
+                     Scripts dialog first"
+                        .into(),
+                );
+                return;
+            };
+            let Some((instance_name, profile, region)) =
+                self.bastion_connection_details(&row.account_id, &bastion)
+            else {
+                self.tunnel_errors.insert(
+                    row.key.clone(),
+                    format!("{bastion} is not in the loaded inventory — refresh"),
+                );
+                return;
+            };
+            let user = self.config.resolve_ssh_user(&row.account_id, &row.env);
+            let Some(pem) = self.config.resolve_pem(&row.account_id, &row.env, &bastion)
+            else {
+                self.tunnel_errors.insert(
+                    row.key.clone(),
+                    "no pem saved for this environment — open a box in VS Code \
+                     once to choose one"
+                        .into(),
+                );
+                return;
+            };
+
+            // The block carries no LocalForward: the tunnel owns the
+            // forwards, so VS Code connecting to the same alias cannot
+            // fight it for the ports.
+            if let Err(err) = ec2_manager::ssh_config::ensure_include_directive() {
+                self.tunnel_errors.insert(row.key.clone(), err);
+                return;
+            }
+            let alias = match ec2_manager::ssh_config::write_managed_block(
+                &ec2_manager::ssh_config::ManagedHost {
+                    instance_id: &bastion,
+                    name: &instance_name,
+                    user: &user,
+                    pem: &pem,
+                    profile: &profile,
+                    region: &region,
+                    forwards: &[],
+                },
+            ) {
+                Ok(alias) => alias,
+                Err(err) => {
+                    self.tunnel_errors.insert(row.key.clone(), err);
+                    return;
+                }
+            };
+
+            match ec2_manager::tunnel::Tunnel::spawn(&alias, &row.forwards, signature) {
+                Ok(tunnel) => {
+                    self.tunnel_errors.remove(&row.key);
+                    // Forget any cleared failure so the next one speaks up.
+                    if self
+                        .config
+                        .clear_tunnel_dismissal(&row.account_id, &row.env)
+                    {
+                        let _ = self.config.save();
+                    }
+                    self.log_info(format!(
+                        "tunnel {}: started via {alias} ({} forward(s))",
+                        row.label,
+                        row.forwards.len()
+                    ));
+                    self.port_tunnels.insert(row.key.clone(), tunnel);
+                }
+                Err(err) => {
+                    self.log_error(format!("tunnel {}: {err}", row.label));
+                    self.tunnel_errors.insert(row.key.clone(), err);
+                }
+            }
+        }
+
+        /// Stop one environment's tunnel.
+        fn stop_port_tunnel(&mut self, key: &str, label: &str) {
+            if self.port_tunnels.remove(key).is_some() {
+                self.log_info(format!("tunnel {label}: stopped"));
+            }
+        }
+
+        /// Kill every tunnel. Called on app close — an invisible ssh session
+        /// left running is one the user has no way to find.
+        fn stop_all_port_tunnels(&mut self) {
+            let count = self.port_tunnels.len();
+            self.port_tunnels.clear();
+            if count > 0 {
+                self.log_info(format!("tunnels: stopped {count}"));
+            }
+        }
+
+        /// Name, AWS profile and region for a bastion instance id.
+        fn bastion_connection_details(
+            &self,
+            account_id: &str,
+            instance_id: &str,
+        ) -> Option<(String, String, String)> {
+            let (inv, ctx) = self.profile_inventory_cache.get(account_id)?;
+            let instance = inv
+                .instances
+                .iter()
+                .find(|i| i.instance_id == instance_id)?;
+            Some((
+                instance.name.clone().unwrap_or_default(),
+                ctx.profile.clone(),
+                ctx.region.clone(),
+            ))
+        }
+
+        /// Start every enabled environment's tunnel that is not already up.
+        fn sync_port_tunnels(&mut self) {
+            let rows = self.port_forward_rows();
+            for row in rows {
+                let enabled = self.config.tunnel_enabled(&row.account_id, &row.env);
+                if enabled {
+                    self.start_port_tunnel(&row);
+                } else {
+                    self.stop_port_tunnel(&row.key.clone(), &row.label.clone());
+                }
+            }
+        }
+
+        /// Start any enabled tunnel that is not running and now can be.
+        ///
+        /// This is what makes "authorize the account and the forwards come
+        /// up" work without the user going back to the window: an account
+        /// whose credentials arrive late is picked up on the next poll.
+        /// Throttled, and it only logs when a reason *changes*, so an
+        /// environment that stays unauthorized does not fill the log.
+        fn poll_port_tunnels(&mut self) {
+            if self.last_tunnel_poll_at.elapsed() < Duration::from_secs(15) {
+                return;
+            }
+            self.last_tunnel_poll_at = Instant::now();
+
+            let rows = self.port_forward_rows();
+            for row in rows {
+                if !self.config.tunnel_enabled(&row.account_id, &row.env) {
+                    continue;
+                }
+                let alive = self
+                    .port_tunnels
+                    .get_mut(&row.key)
+                    .map(|t| t.is_running())
+                    .unwrap_or(false);
+                if alive {
+                    continue;
+                }
+                if let Some(dead) = self.port_tunnels.remove(&row.key) {
+                    let why = dead
+                        .last_error()
+                        .unwrap_or_else(|| "session ended".to_string());
+                    self.log_warn(format!("tunnel {}: {why}", row.label));
+                    self.tunnel_errors.insert(row.key.clone(), why);
+                }
+                let before = self.tunnel_errors.get(&row.key).cloned();
+                self.start_port_tunnel(&row);
+                let after = self.tunnel_errors.get(&row.key).cloned();
+                // Only say something when the situation actually changed.
+                if let Some(why) = &after {
+                    if before.as_ref() != Some(why) {
+                        self.log_warn(format!("tunnel {}: {why}", row.label));
+                    }
+                }
+            }
+            self.refresh_tunnel_status();
+        }
+
+        /// Is there an error on the toolbar the user could clear?
+        ///
+        /// A *running* Scripts status is deliberately not clearable: hiding
+        /// live progress helps nobody, and it clears itself when the run ends.
+        fn has_clearable_status(&self) -> bool {
+            let failed = |s: &Option<(String, ScriptState)>| {
+                s.as_ref()
+                    .map(|(_, state)| *state == ScriptState::Failed)
+                    .unwrap_or(false)
+            };
+            failed(&self.script_status)
+                || failed(&self.tunnel_status)
+                || !self.message.is_empty()
+        }
+
+        /// Clear every error message on the toolbar.
+        ///
+        /// The tunnel line needs more than blanking the field: it is
+        /// recomputed from live state on every poll, so it would reappear
+        /// within seconds. Clearing it therefore dismisses the underlying
+        /// failures — which silences them without stopping the retry, so an
+        /// account regaining access still forwards on its own.
+        fn clear_status_messages(&mut self) {
+            if let Some((_, ScriptState::Failed)) = self.script_status {
+                self.script_status = None;
+            }
+            self.message.clear();
+            self.script_status_highlight = None;
+
+            if let Some((_, ScriptState::Failed)) = self.tunnel_status {
+                let rows = self.port_forward_rows();
+                let mut dismissed = false;
+                for row in &rows {
+                    if let Some(why) = self.tunnel_errors.get(&row.key).cloned() {
+                        self.config
+                            .dismiss_tunnel_error(&row.account_id, &row.env, &why);
+                        dismissed = true;
+                    }
+                }
+                if dismissed {
+                    let _ = self.config.save();
+                    self.log_info(
+                        "tunnels: errors cleared (still retrying; they forward \
+                         on their own if access returns)",
+                    );
+                }
+                self.tunnel_status = None;
+            }
+        }
+
+        /// Refresh the tunnel status line and the hosts-file prompt.
+        ///
+        /// Yellow while environments are forwarding, red once one is stuck —
+        /// the same treatment as any other error in the app, which matters
+        /// because the sessions themselves are invisible.
+        fn refresh_tunnel_status(&mut self) {
+            let rows = self.port_forward_rows();
+            let enabled: Vec<PortForwardRow> = rows
+                .iter()
+                .filter(|r| self.config.tunnel_enabled(&r.account_id, &r.env))
+                .cloned()
+                .collect();
+            if enabled.is_empty() {
+                self.tunnel_status = None;
+                return;
+            }
+
+            let mut running: Vec<String> = Vec::new();
+            let mut blocked: Vec<(String, String)> = Vec::new();
+            for row in &enabled {
+                let alive = self
+                    .port_tunnels
+                    .get_mut(&row.key)
+                    .map(|t| t.is_running())
+                    .unwrap_or(false);
+                if alive {
+                    running.push(row.label.clone());
+                } else {
+                    let why = self
+                        .tunnel_errors
+                        .get(&row.key)
+                        .cloned()
+                        .unwrap_or_else(|| "not started".to_string());
+                    // A failure the user cleared stays visible in the Port
+                    // Forwards window but stops driving the toolbar: an
+                    // account someone has permanently lost must not shout
+                    // forever. Retries continue regardless.
+                    if !self.config.tunnel_error_dismissed(
+                        &row.account_id,
+                        &row.env,
+                        &why,
+                    ) {
+                        blocked.push((row.label.clone(), why));
+                    }
+                }
+            }
+
+            // Naming every environment gets unreadable past a handful, and
+            // "all" is the case the user actually wants to read quickly.
+            let name_list = |labels: &[String], total: usize| -> String {
+                if labels.len() == total {
+                    "all environments".to_string()
+                } else {
+                    labels.join(", ")
+                }
+            };
+
+            self.tunnel_status = if blocked.is_empty() {
+                Some((
+                    format!(
+                        "Forwarding ports for {}",
+                        name_list(&running, enabled.len())
+                    ),
+                    ScriptState::Running,
+                ))
+            } else {
+                let labels: Vec<String> =
+                    blocked.iter().map(|(l, _)| l.clone()).collect();
+                let reason = if blocked
+                    .iter()
+                    .all(|(_, why)| why.contains("needs authorizing"))
+                {
+                    " — authorize the account and they start on their own"
+                } else {
+                    " — see Port Forwards"
+                };
+                Some((
+                    format!(
+                        "Ports not forwarded for {}{reason}",
+                        name_list(&labels, enabled.len())
+                    ),
+                    ScriptState::Failed,
+                ))
+            };
+
+            self.check_tunnel_hosts_entries(&enabled);
+        }
+
+        /// Check the hosts file against every environment being forwarded and
+        /// raise the copy-paste prompt when something is missing.
+        ///
+        /// Only when the missing set *changes*: this runs on every attempt,
+        /// and a dialog re-opening every fifteen seconds would be unusable.
+        fn check_tunnel_hosts_entries(&mut self, enabled: &[PortForwardRow]) {
+            let mut missing: Vec<String> = Vec::new();
+            let mut snippet = String::new();
+            for row in enabled {
+                let part = ec2_manager::forwards::hosts_snippet(&row.env, &row.forwards);
+                if part.trim().is_empty() {
+                    continue;
+                }
+                for f in row.forwards.iter().filter(|f| f.needs_hosts_entry()) {
+                    missing.push(f.host.clone());
+                }
+                snippet.push_str(&part);
+                snippet.push('\n');
+            }
+            missing.sort();
+            missing.dedup();
+
+            if missing == self.tunnel_hosts_missing {
+                return;
+            }
+            self.tunnel_hosts_missing = missing.clone();
+            if missing.is_empty() {
+                return;
+            }
+            let path = self.config.hosts_file_path();
+            self.log_warn(format!(
+                "forwards: {} name(s) missing from {path}: {}",
+                missing.len(),
+                missing.join(", ")
+            ));
+            self.hosts_prompt = Some((snippet, path));
+        }
+
+        /// Render the "add these hosts entries" prompt.
+        fn render_hosts_prompt(&mut self, ctx: &egui::Context) {
+            let Some((snippet, path)) = self.hosts_prompt.clone() else {
+                return;
+            };
+            let mut open = true;
+            let mut close = false;
+            egui::Window::new("Hosts File Entries Needed")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(560.0)
+                .open(&mut open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(
+                        "These names have no entry in your hosts file. The \
+                         tunnels still work addressed by IP — this is only \
+                         needed to use the names themselves.",
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label("File:");
+                        ui.label(egui::RichText::new(&path).strong());
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "Editing it needs an admin editor; this app only \
+                             ever reads it.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().max_height(220.0).show(
+                        ui,
+                        |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut snippet.clone())
+                                    .desired_width(f32::INFINITY)
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                        },
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Copy entries").clicked() {
+                            ui.ctx().copy_text(snippet.clone());
+                        }
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            if close || !open {
+                self.hosts_prompt = None;
+            }
+        }
+
+        /// Environments that are switched on but not currently forwarding,
+        /// with the reason for each. Drives the summary banner.
+        fn port_forward_problems(&mut self) -> Vec<(String, String)> {
+            let rows = self.port_forward_rows();
+            let mut out = Vec::new();
+            for row in rows {
+                if !self.config.tunnel_enabled(&row.account_id, &row.env) {
+                    continue;
+                }
+                let alive = self
+                    .port_tunnels
+                    .get_mut(&row.key)
+                    .map(|t| t.is_running())
+                    .unwrap_or(false);
+                if alive {
+                    continue;
+                }
+                let why = self
+                    .tunnel_errors
+                    .get(&row.key)
+                    .cloned()
+                    .unwrap_or_else(|| "not started".to_string());
+                if self
+                    .config
+                    .tunnel_error_dismissed(&row.account_id, &row.env, &why)
+                {
+                    continue;
+                }
+                out.push((row.label.clone(), why));
+            }
+            out
+        }
+
+        /// Render the Port Forwards window.
+        ///
+        /// These sessions are invisible by design, so this is the only place
+        /// a dead one is visible. It shows status per environment, the
+        /// bastion each goes through, and why one is not running.
+        fn render_port_forwards_window(&mut self, ctx: &egui::Context) {
+            if !self.show_port_forwards {
+                return;
+            }
+            let rows = self.port_forward_rows();
+            // Poll liveness before drawing, so a session that died since the
+            // last frame shows as stopped rather than running.
+            let mut running: HashMap<String, bool> = HashMap::new();
+            for row in &rows {
+                let alive = self
+                    .port_tunnels
+                    .get_mut(&row.key)
+                    .map(|t| t.is_running())
+                    .unwrap_or(false);
+                if !alive {
+                    if let Some(dead) = self.port_tunnels.remove(&row.key) {
+                        let why = dead
+                            .last_error()
+                            .unwrap_or_else(|| "session ended".to_string());
+                        self.log_warn(format!("tunnel {}: {why}", row.label));
+                        self.tunnel_errors.insert(row.key.clone(), why);
+                    }
+                }
+                running.insert(row.key.clone(), alive);
+            }
+
+            let problems = self.port_forward_problems();
+            let mut open = true;
+            let mut toggle: Option<(PortForwardRow, bool)> = None;
+            let mut start_all = false;
+            let mut stop_all = false;
+            let mut dismiss: Option<(PortForwardRow, String)> = None;
+            let mut clear_all = false;
+
+            egui::Window::new("Port Forwards")
+                .open(&mut open)
+                .resizable(true)
+                .default_width(560.0)
+                .show(ctx, |ui| {
+                    if rows.is_empty() {
+                        ui.label(
+                            "No environments have forwards declared. Add them to \
+                             forwards.json and rebuild.",
+                        );
+                        return;
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "One hidden ssh session per environment, holding its \
+                             forwards open. They stop when the app closes.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.add_space(4.0);
+
+                    // Which environments are not forwarding, and why. These
+                    // sessions are invisible, so this banner is the only
+                    // place a problem shows up.
+                    if !problems.is_empty() {
+                        let unauth: Vec<&(String, String)> = problems
+                            .iter()
+                            .filter(|(_, why)| why.contains("needs authorizing"))
+                            .collect();
+                        let headline = if unauth.len() == problems.len()
+                            && unauth.len() == rows.len()
+                        {
+                            "No environments are forwarding — every account still \
+                             needs authorizing. They start on their own once you \
+                             authorize."
+                                .to_string()
+                        } else {
+                            format!(
+                                "{} of {} environments are not forwarding:",
+                                problems.len(),
+                                rows.len()
+                            )
+                        };
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 150, 60),
+                            headline,
+                        );
+                        for (label, why) in &problems {
+                            ui.label(
+                                egui::RichText::new(format!("• {label} — {why}"))
+                                    .small(),
+                            );
+                        }
+                        if !unauth.is_empty() {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Authorize those accounts (Refresh on the \
+                                     Inventory page); their forwards start \
+                                     automatically, no need to come back here.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        }
+                        ui.add_space(4.0);
+                    }
+
+                    for collision in &self.forward_collisions {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 80, 80),
+                            collision.message(),
+                        );
+                    }
+
+                    egui::Grid::new("port_forward_grid")
+                        .num_columns(4)
+                        .spacing([12.0, 6.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("On").strong());
+                            ui.label(egui::RichText::new("Environment").strong());
+                            ui.label(egui::RichText::new("Status").strong());
+                            ui.label(egui::RichText::new("Bastion").strong());
+                            ui.end_row();
+
+                            for row in &rows {
+                                let enabled = self
+                                    .config
+                                    .tunnel_enabled(&row.account_id, &row.env);
+                                let mut checked = enabled;
+                                if ui.checkbox(&mut checked, "").changed() {
+                                    toggle = Some((row.clone(), checked));
+                                }
+                                ui.label(&row.label);
+
+                                let alive =
+                                    running.get(&row.key).copied().unwrap_or(false);
+                                if alive {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(120, 180, 120),
+                                        format!(
+                                            "running · {} forward(s)",
+                                            row.forwards.len()
+                                        ),
+                                    );
+                                } else if !enabled {
+                                    ui.colored_label(
+                                        egui::Color32::GRAY,
+                                        "off",
+                                    );
+                                } else {
+                                    let why = self
+                                        .tunnel_errors
+                                        .get(&row.key)
+                                        .cloned()
+                                        .unwrap_or_else(|| "not started".to_string());
+                                    let cleared = self.config.tunnel_error_dismissed(
+                                        &row.account_id,
+                                        &row.env,
+                                        &why,
+                                    );
+                                    ui.horizontal(|ui| {
+                                        if cleared {
+                                            // Still shown here — this window
+                                            // is where you come to look.
+                                            ui.colored_label(
+                                                egui::Color32::GRAY,
+                                                format!("{why} (cleared)"),
+                                            );
+                                        } else {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(220, 150, 60),
+                                                &why,
+                                            );
+                                            if ui
+                                                .small_button("Clear")
+                                                .on_hover_text(
+                                                    "Stop showing this in the \
+                                                     toolbar. It keeps retrying, \
+                                                     and forwards on its own if \
+                                                     access comes back.",
+                                                )
+                                                .clicked()
+                                            {
+                                                dismiss = Some((row.clone(), why.clone()));
+                                            }
+                                        }
+                                    });
+                                }
+
+                                match &row.bastion {
+                                    Some(id) => {
+                                        ui.label(egui::RichText::new(id).small())
+                                    }
+                                    None => ui.colored_label(
+                                        egui::Color32::from_rgb(220, 150, 60),
+                                        egui::RichText::new("none saved").small(),
+                                    ),
+                                };
+                                ui.end_row();
+                            }
+                        });
+
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Start all").clicked() {
+                            start_all = true;
+                        }
+                        if ui.button("Stop all").clicked() {
+                            stop_all = true;
+                        }
+                        if !problems.is_empty()
+                            && ui
+                                .button("Clear all errors")
+                                .on_hover_text(
+                                    "Silence the current failures in the \
+                                     toolbar. They keep retrying.",
+                                )
+                                .clicked()
+                        {
+                            clear_all = true;
+                        }
+                    });
+
+                    // The forwards themselves, per environment.
+                    ui.add_space(6.0);
+                    for row in &rows {
+                        egui::CollapsingHeader::new(format!(
+                            "{} — forwards ({})",
+                            row.label,
+                            row.forwards.len()
+                        ))
+                        .id_salt(format!("pf_{}", row.key))
+                        .show(ui, |ui| {
+                            for fwd in &row.forwards {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{}:{} → {}:{}",
+                                        fwd.ip,
+                                        fwd.local_port,
+                                        fwd.host,
+                                        fwd.remote_port
+                                    ))
+                                    .small(),
+                                );
+                            }
+                        });
+                    }
+                });
+
+            if let Some((row, enabled)) = toggle {
+                self.config
+                    .set_tunnel_enabled(&row.account_id, &row.env, enabled);
+                let _ = self.config.save();
+                if enabled {
+                    self.start_port_tunnel(&row);
+                } else {
+                    self.stop_port_tunnel(&row.key, &row.label);
+                }
+            }
+            if start_all {
+                for row in &rows {
+                    self.config
+                        .set_tunnel_enabled(&row.account_id, &row.env, true);
+                }
+                let _ = self.config.save();
+                self.sync_port_tunnels();
+            }
+            if stop_all {
+                for row in &rows {
+                    self.config
+                        .set_tunnel_enabled(&row.account_id, &row.env, false);
+                    self.stop_port_tunnel(&row.key.clone(), &row.label.clone());
+                }
+                let _ = self.config.save();
+            }
+            if let Some((row, why)) = dismiss {
+                self.config
+                    .dismiss_tunnel_error(&row.account_id, &row.env, &why);
+                let _ = self.config.save();
+                self.log_info(format!(
+                    "tunnel {}: error cleared (still retrying)",
+                    row.label
+                ));
+            }
+            if clear_all {
+                for row in &rows {
+                    if let Some(why) = self.tunnel_errors.get(&row.key).cloned() {
+                        self.config
+                            .dismiss_tunnel_error(&row.account_id, &row.env, &why);
+                    }
+                }
+                let _ = self.config.save();
+            }
+            if !open {
+                self.show_port_forwards = false;
+            }
+            self.refresh_tunnel_status();
+        }
+
         /// Entry point for "Open in VS Code". Resolves the instance's
         /// profile/context and either launches directly (when the pem is
         /// known and the user opted out of the prompt) or opens the
@@ -5532,18 +6425,35 @@ mod gui {
                 &hosts,
                 &env,
             );
+            for warning in ec2_manager::forwards::duplicate_host_warnings(
+                &hosts,
+                &resolved_forwards,
+            ) {
+                self.log_warn(warning);
+            }
 
             // Fast path: user opted out of the prompt and a pem is known.
             if suppressed {
                 if let Some(pem) = resolved_pem.clone() {
                     let remote = default_remote_dir(&ssh_user);
-                    let directives: Vec<String> = resolved_forwards
-                        .iter()
-                        .filter(|f| {
-                            !self.config.forward_disabled(&profile_id, &env, &f.host)
-                        })
-                        .map(|f| f.directive())
-                        .collect();
+                    // With the background tunnel on it owns the forwards, so
+                    // the block carries none: VS Code connecting to the same
+                    // alias would otherwise fight it for every port and one
+                    // of the two would fail to bind.
+                    let directives: Vec<String> =
+                        if self.config.tunnel_enabled(&profile_id, &env) {
+                            Vec::new()
+                        } else {
+                            resolved_forwards
+                                .iter()
+                                .filter(|f| {
+                                    !self
+                                        .config
+                                        .forward_disabled(&profile_id, &env, &f.host)
+                                })
+                                .map(|f| f.directive())
+                                .collect()
+                        };
                     if let Err(err) = self.launch_vscode(
                         &instance.instance_id,
                         &instance_name,
@@ -5848,16 +6758,34 @@ mod gui {
                         };
                         let missing_any =
                             dlg.forwards.iter().any(|(f, _)| f.needs_hosts_entry());
+                        let by_tunnel = self
+                            .config
+                            .tunnel_enabled(&dlg.profile_id, &dlg.env);
                         egui::CollapsingHeader::new(header)
                             .default_open(dlg.forwards_open)
                             .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(if by_tunnel {
+                                        "Carried by the background tunnel for \
+                                         this environment (Port Forwards)."
+                                    } else {
+                                        "Written into this host's ssh config — \
+                                         the background tunnel is off for this \
+                                         environment."
+                                    })
+                                    .small()
+                                    .weak(),
+                                );
                                 for (fwd, enabled) in dlg.forwards.iter_mut() {
                                     ui.horizontal(|ui| {
                                         ui.checkbox(
                                             enabled,
                                             format!(
                                                 "{}:{} → {}:{}",
-                                                fwd.ip, fwd.port, fwd.host, fwd.port
+                                                fwd.ip,
+                                                fwd.local_port,
+                                                fwd.host,
+                                                fwd.remote_port
                                             ),
                                         );
                                         // Where the local IP came from, so a
@@ -6027,12 +6955,18 @@ mod gui {
                         !*enabled,
                     );
                 }
-                let directives: Vec<String> = dlg
-                    .forwards
-                    .iter()
-                    .filter(|(_, on)| *on)
-                    .map(|(f, _)| f.directive())
-                    .collect();
+                // See the fast path above: the tunnel owns the forwards
+                // whenever it is on, so the block carries none.
+                let directives: Vec<String> =
+                    if self.config.tunnel_enabled(&dlg.profile_id, &dlg.env) {
+                        Vec::new()
+                    } else {
+                        dlg.forwards
+                            .iter()
+                            .filter(|(_, on)| *on)
+                            .map(|(f, _)| f.directive())
+                            .collect()
+                    };
                 if let Err(err) = self.config.save() {
                     self.log_warn(format!("failed to save pem config: {err}"));
                 }
@@ -14715,6 +15649,7 @@ mod gui {
                 self.poll_credentials_changes();
                 self.poll_auth_expiry();
                 self.poll_ssh_config();
+                self.poll_port_tunnels();
                 self.poll_stale_connection_tabs();
                 if self.poll_connection_events() {
                     // More output queued than we processed this frame;
@@ -14777,6 +15712,9 @@ mod gui {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     // Persist window state before closing
                     let _ = self.config.save();
+                    // Hidden ssh sessions must not outlive the app: the user
+                    // has no window to find them in.
+                    self.stop_all_port_tunnels();
                     let active = self.pty_sessions.len();
                     if active > 0 {
                         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -14842,6 +15780,8 @@ mod gui {
 
                 // WSL setup popup
                 self.render_pem_dialog(ctx);
+                self.render_port_forwards_window(ctx);
+                self.render_hosts_prompt(ctx);
                 self.render_settings_pem_dialog(ctx);
                 self.render_file_browser_defaults_dialog(ctx);
                 self.render_create_user_dialog(ctx);
@@ -15009,6 +15949,9 @@ mod gui {
                     }
                 }
 
+                // Set by the toolbar's ✖ and acted on after the panel, so
+                // the clear does not borrow `self` inside its own closure.
+                let mut clear_status = false;
                 egui::TopBottomPanel::top("top").show(ctx, |ui| {
                     egui::MenuBar::new().ui(ui, |ui| {
                         let edit_menu_resp = ui.menu_button("Edit", |ui| {
@@ -15547,6 +16490,20 @@ mod gui {
                             }
                         }
 
+                        // Port forwards. The sessions are hidden, so the
+                        // count here is the only at-a-glance sign they are up.
+                        {
+                            let up = self.port_tunnels.len();
+                            let label = if up > 0 {
+                                format!("Port Forwards ({up})")
+                            } else {
+                                "Port Forwards".to_string()
+                            };
+                            if ui.button(label).clicked() {
+                                self.show_port_forwards = !self.show_port_forwards;
+                            }
+                        }
+
                         let tab_count = self.connections.tabs().len();
                         let close_all_label = if tab_count > 0 {
                             format!("Close All ({tab_count})")
@@ -15578,13 +16535,33 @@ mod gui {
                         };
                         ui.colored_label(color, text);
                     }
+                    if let Some((text, state)) = self.tunnel_status.clone() {
+                        let color = match state {
+                            ScriptState::Running => flashing_yellow(ui),
+                            ScriptState::Failed => egui::Color32::from_rgb(220, 60, 60),
+                        };
+                        ui.colored_label(color, text);
+                    }
                     if let Some(hl) = self.script_status_highlight.clone() {
                         ui.colored_label(flashing_yellow(ui), hl);
                     }
                     if !self.message.is_empty() {
                         ui.label(self.message.clone());
                     }
+                    // One clear for whatever is on the bar — an error nobody
+                    // can act on should not be permanent furniture.
+                    if self.has_clearable_status()
+                        && ui
+                            .small_button("✖")
+                            .on_hover_text("Clear this message")
+                            .clicked()
+                    {
+                        clear_status = true;
+                    }
                 });
+                if clear_status {
+                    self.clear_status_messages();
+                }
 
                 if self.main_tab == MainTab::Inventory {
                 egui::SidePanel::left("controls")

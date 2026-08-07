@@ -330,11 +330,26 @@ Environments key on the `MMODAL_ENV` tag, like everything else.
   expensive for an app with a CrowdStrike quarantine in its history. The path
   is configurable (`forwards_hosts_file` in config.ini) so a user can point at
   whatever copy they keep.
+- **Matching is by endpoint, never by comment.** Which endpoints belong to an
+  environment comes from forwards.json; the hosts file is searched by DNS name
+  wherever that name appears. Plenty of hosts files are a bare list of
+  `IP name` lines with no section comments at all, and those users must get
+  the same result as the ones who annotate. A section comment is only ever
+  *additive*: an entry under `# AUCT` that forwards.json does not declare is
+  offered too, since the user has said it belongs there.
 - **Where the user's hosts file resolves a name, the forward binds that IP**
   (`ForwardSource::HostsIp`), not the one in forwards.json. That is what lets
   an existing setup work untouched, and it closes a hazard: if forwards.json
   names an IP the user already points a *different* name at, binding it would
   silently hijack theirs.
+- A name mapped to two different addresses uses the first, as the file itself
+  resolves, and logs a warning — a stale line above the live one would
+  otherwise bind an address the machine does not resolve the name to, which
+  looks exactly like a broken tunnel.
+- `parse_hosts` tolerates `IP:port name:port`, and such a port beats the name
+  rules. The system hosts file cannot carry one (Windows' DNS client rejects
+  the line), so this only applies to a private endpoint list a user points at
+  via `forwards_hosts_file`. In the normal case ports come from `port_rules`.
 - **A missing hosts entry is not a failure.** The tunnel resolves its remote
   name on the bastion, so it works addressed by IP; the hosts entry only lets
   the user type the name in a browser. Those rows are flagged and
@@ -352,6 +367,38 @@ Environments key on the `MMODAL_ENV` tag, like everything else.
   arrives switched on rather than silently absent.
 - `ServerAliveInterval 30` is in every managed block: an SSM tunnel carrying
   an idle forward gets dropped without keepalives.
+
+### Background port-forward tunnels
+
+`src/tunnel.rs` runs one hidden `ssh` per environment (`CREATE_NO_WINDOW`),
+holding that environment's forwards open independently of VS Code. The **Port
+Forwards** button (left of Close All) opens the window that manages them. On
+by default per environment; the opt-*out* is stored (`forward_ports_off.<id>.<ENV>`).
+
+- **The tunnel owns the forwards, so the managed block carries none** while it
+  is on. Both would bind the same ports and whichever connected second would
+  fail on every one, decided by timing. Switching the tunnel off for an
+  environment puts the `LocalForward` lines back in that block.
+- **Every environment's tunnel runs at once**, so two environments claiming
+  the same local `ip:port` is a hard conflict. `forwards::collisions` finds it
+  at startup and the clashing forward is dropped from the later environment —
+  with `ExitOnForwardFailure=yes` the failed bind would otherwise kill that
+  whole tunnel, invisibly.
+- **`ExitOnForwardFailure=yes` is deliberate.** The window is hidden, so a
+  half-forwarded session that keeps running looks exactly like a working one
+  until something fails to connect much later.
+- **An unauthorized account is not an error, it is a wait.** `start_port_tunnel`
+  refuses to spawn without `AuthStatus::Ok` (a hidden process dying on a
+  credentials error is invisible), and `poll_port_tunnels` starts it the moment
+  the account is authorized — the user does not have to return to the window.
+  The poll only logs when a reason *changes*, so a permanently unauthorized
+  environment does not fill the log.
+- **stderr is captured** (bounded to 50 lines) and `Drop` kills the child.
+  Both are load-bearing for an invisible process: nothing else explains why a
+  tunnel died, and an ssh session outliving the app is one the user cannot
+  find. The GUI also calls `stop_all_port_tunnels` on close.
+- The newline every 60s is for the remote **shell** (`TMOUT` on a hardened
+  bastion), not the transport — `ServerAliveInterval` covers that.
 
 ### Instance search
 
