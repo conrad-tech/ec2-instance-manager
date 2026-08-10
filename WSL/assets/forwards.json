@@ -28,6 +28,13 @@
     "like kafka-postgres-proxy takes the port of whichever rule is listed",
     "first. Add a service type here rather than porting every entry.",
     "",
+    "A service on a non-standard port MUST have a rule here, or it silently",
+    "gets default_port and the forward is broken in a way that looks fine:",
+    "the local bind succeeds, so the window reports the ports forwarded,",
+    "and only a request through the tunnel finds that nothing answers. The",
+    "vault rule exists because every vault_addr in accounts.json is :8200.",
+    "Keep the two files in agreement.",
+    "",
     "The hosts file is optional and is only ever read. With no entry a",
     "forward still works, reached at its IP (https://127.200.20.1) instead",
     "of by name; the app offers the lines to paste in when any are missing."
@@ -60,7 +67,8 @@
   "port_rules": [
     { "match": "postgres", "port": 5432 },
     { "match": "solr", "port": 8984 },
-    { "match": "kafka", "port": 9094 }
+    { "match": "kafka", "port": 9094 },
+    { "match": "vault", "port": 8200 }
   ],
 
   "environments": {}

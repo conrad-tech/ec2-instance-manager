@@ -867,6 +867,31 @@ mod tests {
     }
 
     #[test]
+    /// Vault does not listen on 443, and `accounts.json` says so in every
+    /// `vault_addr` (`https://vault.<env>....:8200`). Without a rule here the
+    /// name falls through to `default_port`, so the tunnel binds the local
+    /// port fine — the window truthfully says "forwarding N ports" — and then
+    /// nothing answers, because the far side has nothing on 443. The two
+    /// files have to agree.
+    #[test]
+    fn the_shipped_rules_forward_vault_on_its_own_port() {
+        let config = ForwardsConfig::bundled();
+        assert_eq!(config.port_for("vault.dev1.example.com", None), 8200);
+        assert_eq!(config.port_for("VAULT.PROD.EXAMPLE.COM", None), 8200);
+    }
+
+    /// The vault rule must not swallow names it does not own — `port_rules`
+    /// are substring matches checked in order, so a badly placed or overly
+    /// broad rule silently re-ports other services.
+    #[test]
+    fn the_vault_rule_leaves_other_services_alone() {
+        let config = ForwardsConfig::bundled();
+        assert_eq!(config.port_for("pg-postgres01.auct.example.net", None), 5432);
+        assert_eq!(config.port_for("solr01.dev1.example.net", None), 8984);
+        assert_eq!(config.port_for("uweb01.dev1.example.net", None), 443);
+    }
+
+    #[test]
     fn tunnel_args_carry_every_forward_and_fail_loudly() {
         let hosts = parse_hosts("127.9.9.1  uweb.example.net\n");
         let out = resolve_forwards(&config(), &hosts, "AUCT");
