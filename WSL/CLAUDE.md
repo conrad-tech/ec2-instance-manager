@@ -397,8 +397,16 @@ by default per environment; the opt-*out* is stored (`forward_ports_off.<id>.<EN
   Both are load-bearing for an invisible process: nothing else explains why a
   tunnel died, and an ssh session outliving the app is one the user cannot
   find. The GUI also calls `stop_all_port_tunnels` on close.
-- The newline every 60s is for the remote **shell** (`TMOUT` on a hardened
-  bastion), not the transport — `ServerAliveInterval` covers that.
+- **There is no remote shell** (`ssh -N`). A shell only adds a `TMOUT` that
+  logs an idle session out however healthy the connection is, and a stdin
+  that anything written lands in. `ServerAliveInterval=30` keeps the
+  transport up and `poll_port_tunnels` restarts whatever dies — both work on
+  a session with nothing to keep busy. (An earlier version held a shell open
+  with a newline every 60s; `-N` removes the thing that defended against.)
+- **A tunnel that was up and drops is logged at error level** and recorded in
+  `tunnel_failures` with a count. The record survives the restart on purpose:
+  a session that drops and recovers inside the 15s poll would otherwise leave
+  no trace on screen, and these processes are invisible.
 
 ### Instance search
 

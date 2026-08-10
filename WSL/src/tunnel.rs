@@ -7,29 +7,24 @@
 //!   makes every failure silent unless we surface it. So stderr is captured
 //!   and kept, `ExitOnForwardFailure=yes` turns a half-forwarded session into
 //!   a dead one, and the caller polls [`Tunnel::is_running`] to notice.
+//! - **There is no remote shell** (`ssh -N`). The forwards are the whole
+//!   point, and a shell only adds a `TMOUT` that logs an idle session out
+//!   however healthy the connection is. `ServerAliveInterval` keeps the
+//!   transport up, and the caller restarts anything that dies — both of
+//!   which work on a session with no shell to keep busy.
 //! - **A tunnel cannot outlive the app.** [`Drop`] kills the child, and the
 //!   GUI also stops them all on close. An invisible ssh session left running
 //!   after the app quits is a process the user has no way to find.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use crate::forwards::ResolvedForward;
-
-/// How often a newline is written to the session.
-///
-/// `ServerAliveInterval` already keeps the transport up; this is for the
-/// remote *shell*, which on a hardened bastion has a `TMOUT` that logs an
-/// idle login out regardless of how healthy the connection is.
-const KEEPALIVE: Duration = Duration::from_secs(60);
 
 /// A running background tunnel.
 pub struct Tunnel {
     child: Child,
-    stop: Arc<AtomicBool>,
     /// Host alias the session connects to.
     pub alias: String,
     /// Signature of the forward set it was started with, so the caller can
@@ -50,7 +45,10 @@ impl Tunnel {
         let mut command = Command::new("ssh");
         command
             .args(&args)
-            .stdin(Stdio::piped())
+            // `-N` opens no session channel, so stdin is never read. Null
+            // rather than piped: there is nothing to write to, and an open
+            // pipe would only invite someone to try.
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         #[cfg(windows)]
@@ -65,28 +63,7 @@ impl Tunnel {
             .spawn()
             .map_err(|e| format!("could not start ssh: {e}"))?;
 
-        let stop = Arc::new(AtomicBool::new(false));
         let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
-        // Keepalive: a newline every minute for as long as the tunnel lives.
-        if let Some(mut stdin) = child.stdin.take() {
-            let stop_flag = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                while !stop_flag.load(Ordering::Relaxed) {
-                    // Sleep in slices so stopping does not wait a full minute.
-                    for _ in 0..60 {
-                        if stop_flag.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        std::thread::sleep(KEEPALIVE / 60);
-                    }
-                    if stdin.write_all(b"\n").is_err() || stdin.flush().is_err() {
-                        // Session is gone; the caller notices via is_running.
-                        return;
-                    }
-                }
-            });
-        }
 
         // Capture stderr. Without this a hidden process fails mutely.
         if let Some(stderr) = child.stderr.take() {
@@ -110,7 +87,6 @@ impl Tunnel {
 
         Ok(Self {
             child,
-            stop,
             alias: alias.to_string(),
             signature,
             errors,
@@ -133,9 +109,8 @@ impl Tunnel {
         self.errors().last().cloned()
     }
 
-    /// Kill the session and stop its keepalive.
+    /// Kill the session.
     pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -149,21 +124,15 @@ impl Drop for Tunnel {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::time::Duration;
 
-    /// The keepalive has to be sliced finely enough that stopping a tunnel
-    /// is not a minute-long wait — the GUI kills these on close.
-    #[test]
-    fn keepalive_slice_is_responsive() {
-        assert_eq!(KEEPALIVE, Duration::from_secs(60));
-        assert!(KEEPALIVE / 60 <= Duration::from_secs(1));
-    }
+    use super::*;
 
     /// A command that exits immediately stands in for a dead session.
     #[test]
     fn is_running_reports_a_finished_process() {
         let mut child = Command::new("true")
-            .stdin(Stdio::piped())
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -175,7 +144,6 @@ mod tests {
                 let _ = child.wait();
                 child
             },
-            stop: Arc::new(AtomicBool::new(false)),
             alias: "test".to_string(),
             signature: String::new(),
             errors: Arc::new(Mutex::new(Vec::new())),

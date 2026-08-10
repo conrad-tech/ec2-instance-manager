@@ -4008,6 +4008,11 @@ mod gui {
         /// Why a tunnel is not running, keyed the same way. Kept separate
         /// from `port_tunnels` so a failure survives the process being gone.
         tunnel_errors: HashMap<String, String>,
+        /// Last death of a tunnel that was previously up, and how many times
+        /// it has happened. Survives a successful restart: a session that
+        /// drops and recovers within the poll would otherwise leave no trace
+        /// on screen at all, and these processes are invisible.
+        tunnel_failures: HashMap<String, (String, u32)>,
         /// Whether the Port Forwards window is open.
         show_port_forwards: bool,
         /// Throttle for `poll_port_tunnels`.
@@ -4335,6 +4340,7 @@ mod gui {
                 forwards_config: ec2_manager::forwards::ForwardsConfig::bundled(),
                 port_tunnels: HashMap::new(),
                 tunnel_errors: HashMap::new(),
+                tunnel_failures: HashMap::new(),
                 show_port_forwards: false,
                 last_tunnel_poll_at: Instant::now(),
                 tunnel_status: None,
@@ -5689,9 +5695,17 @@ mod gui {
                         let _ = self.config.save();
                     }
                     self.log_info(format!(
-                        "tunnel {}: started via {alias} ({} forward(s))",
+                        "tunnel {}: started — ssh -N {alias}, {} forward(s): {}",
                         row.label,
-                        row.forwards.len()
+                        row.forwards.len(),
+                        row.forwards
+                            .iter()
+                            .map(|f| format!(
+                                "{}:{}->{}:{}",
+                                f.ip, f.local_port, f.host, f.remote_port
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(" ")
                     ));
                     self.port_tunnels.insert(row.key.clone(), tunnel);
                 }
@@ -5780,7 +5794,20 @@ mod gui {
                     let why = dead
                         .last_error()
                         .unwrap_or_else(|| "session ended".to_string());
-                    self.log_warn(format!("tunnel {}: {why}", row.label));
+                    // A tunnel that was up and died is an error, not a
+                    // warning: nothing else on screen would say so.
+                    self.log_error(format!(
+                        "tunnel {}: dropped — {why}",
+                        row.label
+                    ));
+                    let count = self
+                        .tunnel_failures
+                        .get(&row.key)
+                        .map(|(_, n)| *n)
+                        .unwrap_or(0)
+                        + 1;
+                    self.tunnel_failures
+                        .insert(row.key.clone(), (why.clone(), count));
                     self.tunnel_errors.insert(row.key.clone(), why);
                 }
                 let before = self.tunnel_errors.get(&row.key).cloned();
@@ -6087,7 +6114,18 @@ mod gui {
                         let why = dead
                             .last_error()
                             .unwrap_or_else(|| "session ended".to_string());
-                        self.log_warn(format!("tunnel {}: {why}", row.label));
+                        self.log_error(format!(
+                            "tunnel {}: dropped — {why}",
+                            row.label
+                        ));
+                        let count = self
+                            .tunnel_failures
+                            .get(&row.key)
+                            .map(|(_, n)| *n)
+                            .unwrap_or(0)
+                            + 1;
+                        self.tunnel_failures
+                            .insert(row.key.clone(), (why.clone(), count));
                         self.tunnel_errors.insert(row.key.clone(), why);
                     }
                 }
@@ -6201,13 +6239,29 @@ mod gui {
                                 let alive =
                                     running.get(&row.key).copied().unwrap_or(false);
                                 if alive {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(120, 180, 120),
-                                        format!(
-                                            "running · {} forward(s)",
-                                            row.forwards.len()
-                                        ),
-                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(120, 180, 120),
+                                            format!(
+                                                "running · {} forward(s)",
+                                                row.forwards.len()
+                                            ),
+                                        );
+                                        // A drop that the poll already
+                                        // repaired still gets said out loud
+                                        // here — otherwise it is invisible.
+                                        if let Some((why, count)) =
+                                            self.tunnel_failures.get(&row.key)
+                                        {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(220, 150, 60),
+                                                egui::RichText::new(format!(
+                                                    "(dropped {count}×, last: {why})"
+                                                ))
+                                                .small(),
+                                            );
+                                        }
+                                    });
                                 } else if !enabled {
                                     ui.colored_label(
                                         egui::Color32::GRAY,

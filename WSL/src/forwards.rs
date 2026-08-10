@@ -413,6 +413,12 @@ pub fn hosts_snippet(env: &str, forwards: &[ResolvedForward]) -> String {
 /// die and say so in the log.
 pub fn tunnel_args(alias: &str, forwards: &[ResolvedForward]) -> Vec<String> {
     let mut args = vec![
+        // No remote command: the forwards are the entire point, and a login
+        // shell is a liability. A shell brings a TMOUT that logs an idle
+        // session out however healthy the connection is, and gives us a
+        // stdin that anything we write lands in. `ServerAliveInterval` keeps
+        // the transport up without one.
+        "-N".to_string(),
         "-o".to_string(),
         "ExitOnForwardFailure=yes".to_string(),
         // The block sets this too, but a user editing their own config
@@ -865,6 +871,8 @@ mod tests {
         let hosts = parse_hosts("127.9.9.1  uweb.example.net\n");
         let out = resolve_forwards(&config(), &hosts, "AUCT");
         let args = tunnel_args("web-jane-i-1", &out);
+        // No remote shell: nothing to time out, nothing to type into.
+        assert!(args.contains(&"-N".to_string()));
         // Fails rather than half-forwarding: the window is hidden, so a
         // partly working tunnel would be invisible.
         assert!(args.windows(2).any(|w| w
