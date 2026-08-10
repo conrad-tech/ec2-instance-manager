@@ -25,4 +25,5 @@ pub mod tunnel;
 pub mod util;
 pub mod vault_iam;
 pub mod workflow;
+pub mod wsl;
 pub mod wsl_setup;

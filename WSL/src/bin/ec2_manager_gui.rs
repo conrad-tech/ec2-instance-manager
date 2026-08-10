@@ -546,6 +546,14 @@ mod gui {
         alias: String,
         forwards: Vec<ec2_manager::forwards::ResolvedForward>,
         signature: String,
+        /// ssh binary to run. Under WSL this is the **Windows** client: a
+        /// tunnel started by the Linux one binds WSL's own loopback, which
+        /// no Windows browser can reach, and it fails silently — the process
+        /// is alive, the binds succeeded, and nothing ever arrives.
+        program: String,
+        /// Config handed to that client with `-F`, when it is not the one it
+        /// would read by default.
+        config_file: Option<String>,
     }
 
     /// Whether a tunnel has been shown to carry traffic, not just to have
@@ -6610,6 +6618,75 @@ mod gui {
             rows
         }
 
+        /// Write the Windows client's own copy of this host's block and
+        /// return the Windows path to hand it with `-F`.
+        ///
+        /// A separate file rather than the managed one, because the two
+        /// clients need different text: the Windows client wants
+        /// `C:\…` for the key, and it cannot read the WSL config location
+        /// at all. Handing it over explicitly also leaves the user's own
+        /// Windows ssh config — which they hand-maintain — untouched.
+        ///
+        /// The block carries no `LocalForward`: the forwards go on the
+        /// command line, exactly as in the native path.
+        fn write_windows_tunnel_config(
+            &mut self,
+            bastion: &str,
+            instance_name: &str,
+            user: &str,
+            pem: &str,
+            profile: &str,
+            region: &str,
+        ) -> std::result::Result<String, String> {
+            if !ec2_manager::wsl::windows_ssh_available() {
+                return Err(format!(
+                    "running under WSL but the Windows ssh client is not at {} \
+                     — forwards started inside WSL cannot be reached from a \
+                     Windows browser",
+                    ec2_manager::wsl::WINDOWS_SSH
+                ));
+            }
+            let win_pem = ec2_manager::wsl::to_windows_path(pem).ok_or_else(|| {
+                format!("could not express the key path {pem} for the Windows ssh client")
+            })?;
+            // Windows OpenSSH refuses a private key whose permissions it
+            // cannot vouch for, and a file reached over \\wsl.localhost does
+            // not present the ownership it wants. Say so once, plainly,
+            // rather than letting the tunnel die on it.
+            if !ec2_manager::wsl::pem_is_windows_native(pem) {
+                self.log_warn(format!(
+                    "tunnel: the key {pem} is on the WSL filesystem; the \
+                     Windows ssh client may refuse it. Keeping it under \
+                     /mnt/<drive>/… avoids that."
+                ));
+            }
+
+            let block = ec2_manager::ssh_config::vscode_host_block(
+                &ec2_manager::ssh_config::ManagedHost {
+                    instance_id: bastion,
+                    name: instance_name,
+                    user,
+                    pem: &win_pem,
+                    profile,
+                    region,
+                    forwards: &[],
+                },
+            );
+            let path = ec2_manager::wsl::windows_managed_config()
+                .ok_or_else(|| "could not resolve home directory".to_string())?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+            }
+            std::fs::write(&path, block)
+                .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+            ec2_manager::wsl::to_windows_path(&path.to_string_lossy()).ok_or_else(|| {
+                "could not express the generated ssh config for the Windows \
+                 client — is WSL_DISTRO_NAME set?"
+                    .to_string()
+            })
+        }
+
         /// Resolve everything one environment's tunnel needs and write its
         /// managed ssh block, without spawning anything.
         ///
@@ -6621,7 +6698,7 @@ mod gui {
         /// exact text, so rewording one silently un-dismisses every error a
         /// user has cleared.
         fn resolve_tunnel_launch(
-            &self,
+            &mut self,
             row: &PortForwardRow,
             bastion: &str,
         ) -> std::result::Result<TunnelLaunch, String> {
@@ -6675,10 +6752,31 @@ mod gui {
                 },
             )?;
 
+            // Under WSL the forwards have to be bound by the Windows client
+            // or they land in WSL's network namespace, unreachable from the
+            // browser. That client cannot use the block we just wrote (WSL
+            // paths, WSL config location), so it gets its own copy with the
+            // pem translated, handed over explicitly with `-F`.
+            let (program, config_file) = if ec2_manager::wsl::is_wsl() {
+                let win_config = self.write_windows_tunnel_config(
+                    bastion,
+                    &instance_name,
+                    &user,
+                    &pem,
+                    &profile,
+                    &region,
+                )?;
+                (ec2_manager::wsl::WINDOWS_SSH.to_string(), Some(win_config))
+            } else {
+                ("ssh".to_string(), None)
+            };
+
             Ok(TunnelLaunch {
                 alias,
                 forwards: row.forwards.clone(),
                 signature: ec2_manager::forwards::tunnel_signature(&row.forwards),
+                program,
+                config_file,
             })
         }
 
@@ -6771,10 +6869,14 @@ mod gui {
                 self.port_tunnels.remove(&row.key);
 
                 match ec2_manager::tunnel::Tunnel::spawn(
-                    &launch.alias,
-                    &launch.forwards,
-                    launch.signature,
-                    bastion.clone(),
+                    ec2_manager::tunnel::TunnelSpec {
+                        program: &launch.program,
+                        config_file: launch.config_file.as_deref(),
+                        alias: &launch.alias,
+                        forwards: &launch.forwards,
+                        signature: launch.signature.clone(),
+                        bastion: bastion.clone(),
+                    },
                 ) {
                     Ok(tunnel) => {
                         self.tunnel_errors.remove(&row.key);
@@ -8026,10 +8128,14 @@ mod gui {
                     describe_forwards(&launch.forwards)
                 ));
                 match ec2_manager::tunnel::Tunnel::spawn(
-                    &launch.alias,
-                    &launch.forwards,
-                    launch.signature,
-                    bastion.clone(),
+                    ec2_manager::tunnel::TunnelSpec {
+                        program: &launch.program,
+                        config_file: launch.config_file.as_deref(),
+                        alias: &launch.alias,
+                        forwards: &launch.forwards,
+                        signature: launch.signature.clone(),
+                        bastion: bastion.clone(),
+                    },
                 ) {
                     Ok(tunnel) => {
                         let now = Instant::now();

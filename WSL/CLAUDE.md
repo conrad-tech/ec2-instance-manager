@@ -422,6 +422,26 @@ the tunnel dies.
   Vault IAM, which is why that change is logged at warn and stated in the
   dialog. An empty secondary is stored as empty, never refused — plenty of
   environments have one box.
+- **Under WSL the tunnel runs the Windows ssh client** (`src/wsl.rs`). WSL2
+  has its own network namespace, so `ssh -L 127.200.20.4:443 …` started by
+  the Linux client binds *WSL's* loopback and no Windows browser can reach
+  it. WSL2's localhost forwarding only mirrors `127.0.0.1`, never the
+  distinct `127.200.x` addresses the forwards rely on to give each service
+  its own name. The failure looks exactly like success from inside the app —
+  process alive, binds succeeded, nothing ever arrives, so not even stderr.
+  - The Windows client cannot use the managed block: it holds WSL paths and
+    lives where that client does not look. So a second copy is written with
+    the pem translated to `C:\…` and handed over with **`-F`**, which also
+    leaves the user's hand-maintained Windows ssh config alone.
+  - **Credentials need no bridging**: `wsl_setup` symlinks the WSL AWS
+    directory to the Windows one, so the `aws ssm start-session` in the
+    ProxyCommand authenticates either side. `ProxyCommand` names bare `aws`,
+    which the Windows client resolves on the Windows PATH.
+  - **A key on the WSL filesystem is warned about, not blocked.** Windows
+    OpenSSH refuses a private key whose permissions it cannot vouch for, and
+    a file reached over `\\wsl.localhost` does not present the ownership it
+    wants. `pem_is_windows_native` drives that warning; a key under
+    `/mnt/<drive>/…` avoids the question.
 - **Each row has a scrollable "session output" pane** showing the hidden
   ssh process's stderr **live**, not only once it dies. This is the one
   place a specific failure mode is visible: every local bind succeeds — so

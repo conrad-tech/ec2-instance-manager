@@ -52,16 +52,45 @@ pub struct Tunnel {
     errors: Arc<Mutex<Vec<String>>>,
 }
 
+/// What to spawn, and with which client.
+///
+/// The client is a parameter because a WSL build has to run the **Windows**
+/// ssh, or its forwards bind WSL's loopback where no Windows browser can
+/// reach them. See [`crate::wsl`].
+pub struct TunnelSpec<'a> {
+    /// ssh binary to run — `"ssh"` natively, the Windows client under WSL.
+    pub program: &'a str,
+    /// Passed as `-F`. Set when the block this alias lives in is not the one
+    /// the chosen client reads by default, which is the WSL case: the
+    /// Windows client would otherwise look in the Windows user's own config.
+    pub config_file: Option<&'a str>,
+    pub alias: &'a str,
+    pub forwards: &'a [ResolvedForward],
+    pub signature: String,
+    pub bastion: String,
+}
+
 impl Tunnel {
-    /// Spawn a hidden `ssh` session carrying `forwards`.
-    pub fn spawn(
-        alias: &str,
-        forwards: &[ResolvedForward],
-        signature: String,
-        bastion: String,
-    ) -> std::result::Result<Self, String> {
-        let args = crate::forwards::tunnel_args(alias, forwards);
-        let mut command = Command::new("ssh");
+    /// Spawn a hidden ssh session carrying `forwards`.
+    pub fn spawn(spec: TunnelSpec<'_>) -> std::result::Result<Self, String> {
+        let TunnelSpec {
+            program,
+            config_file,
+            alias,
+            forwards,
+            signature,
+            bastion,
+        } = spec;
+        let mut args: Vec<String> = Vec::new();
+        if let Some(config) = config_file {
+            // Before everything else: ssh keeps the first value it obtains
+            // for a keyword, and this file is the whole configuration for
+            // this connection.
+            args.push("-F".to_string());
+            args.push(config.to_string());
+        }
+        args.extend(crate::forwards::tunnel_args(alias, forwards));
+        let mut command = Command::new(program);
         command
             .args(&args)
             // `-N` opens no session channel, so stdin is never read. Null
