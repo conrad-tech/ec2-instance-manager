@@ -413,6 +413,14 @@ pub fn hosts_snippet(env: &str, forwards: &[ResolvedForward]) -> String {
 /// die and say so in the log.
 pub fn tunnel_args(alias: &str, forwards: &[ResolvedForward]) -> Vec<String> {
     let mut args = vec![
+        // Verbose. These sessions are invisible and their only account of
+        // themselves is the stderr the window shows, so the connection
+        // handshake belongs in it: a session that starts, never finishes
+        // connecting through the SSM ProxyCommand and therefore binds
+        // nothing looks identical to a healthy one without it — alive, no
+        // output, no exit. The same `ssh -v` run by hand is what diagnoses
+        // it, so run it that way in the first place.
+        "-v".to_string(),
         // No remote command: the forwards are the entire point, and a login
         // shell is a liability. A shell brings a TMOUT that logs an idle
         // session out however healthy the connection is, and gives us a

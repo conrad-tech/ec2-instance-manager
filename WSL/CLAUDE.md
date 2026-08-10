@@ -488,6 +488,30 @@ the tunnel dies.
   bastion hides what the dialog flags. The secondary excludes the primary
   from its pool: an environment with one bastion gets a primary and no
   failover, which is the correct answer.
+- **"Working" is answered by `Tunnel::is_bound`, not by process liveness.**
+  A session behind the SSM `ProxyCommand` will sit alive indefinitely
+  without ever finishing its connection — binding nothing, writing nothing,
+  exiting never — and `is_running`, uptime and `ExitOnForwardFailure` all
+  report that as healthy. Only asking the listener distinguishes it, so the
+  poll TCP-connects to the first forward's own bind. Refused means not
+  bound; accepted (even if ssh then closes it because the *remote* dial
+  failed) means ssh is listening, which is the question. A tunnel alive past
+  `TUNNEL_PROVEN_AFTER` with nothing bound now reads **"not connected —
+  alive 2m but no ports bound"** in red, where it used to claim to be
+  forwarding.
+- **Tunnels run `ssh -v`.** These processes are invisible and the session
+  pane is their only account of themselves, so the handshake belongs in it:
+  the failure above is diagnosed exactly by the `ssh -v` a user would run by
+  hand, so it is run that way in the first place. `MAX_STDERR_LINES` is 500
+  to hold the handshake *and* the channel errors that follow it.
+- **The curl probe takes its endpoint from the environment's own forwards**,
+  not from `accounts::vault_addr_for`. accounts.json ships as template data,
+  so its host matched nothing real and the probe silently skipped every
+  time. A declared address still wins where one is configured for real;
+  otherwise the environment's own `vault` forward is used. Only an HTTP
+  service is worth curling — probing Postgres or Kafka would report a
+  working forward as broken — and having nothing to ask is a skip, since
+  `is_bound` already covers whether ssh is listening.
 - **The Status column shows uptime, not "running".** `is_running` is
   `try_wait` — it only says the ssh *process* exists, and `Tunnel::spawn`
   returns the moment it does, while an auth failure or a refused bind takes

@@ -29,7 +29,11 @@ use crate::forwards::ResolvedForward;
 /// local binds all succeeded — the session looks perfectly healthy — while
 /// every remote dial is refused. ssh reports that as `channel N: open
 /// failed: connect failed: …`, one line per attempt.
-const MAX_STDERR_LINES: usize = 200;
+///
+/// Deep enough to hold the `-v` handshake (~100 lines) *and* the channel
+/// errors that come after it: the handshake must not push out the failure
+/// it was there to explain.
+const MAX_STDERR_LINES: usize = 500;
 
 /// A running background tunnel.
 pub struct Tunnel {
@@ -146,6 +150,25 @@ impl Tunnel {
             started: Instant::now(),
             errors,
         })
+    }
+
+    /// Whether a forward's local port is actually accepting connections.
+    ///
+    /// This is the only honest test that a tunnel is working. `is_running`
+    /// says the process exists, and a session behind an SSM `ProxyCommand`
+    /// will sit alive indefinitely without ever finishing its connection —
+    /// binding nothing, writing nothing, exiting never. Age cannot tell that
+    /// apart from a healthy session either; only asking the listener can.
+    ///
+    /// A refused connection means not bound. Anything else — accepted, or
+    /// even accepted and then closed because the *remote* dial failed —
+    /// means ssh is listening, which is what this answers.
+    pub fn is_bound(ip: &str, port: u16) -> bool {
+        use std::net::{SocketAddr, TcpStream};
+        let Ok(addr) = format!("{ip}:{port}").parse::<SocketAddr>() else {
+            return false;
+        };
+        TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok()
     }
 
     /// How long since the session was spawned.

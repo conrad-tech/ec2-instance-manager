@@ -4492,6 +4492,11 @@ mod gui {
         /// drops and recovers within the poll would otherwise leave no trace
         /// on screen at all, and these processes are invisible.
         tunnel_failures: HashMap<String, (String, u32)>,
+        /// Whether each environment's first forward is actually accepting
+        /// connections. Re-checked on the poll; the only honest answer to
+        /// "is this working", since a session behind an SSM ProxyCommand can
+        /// stay alive forever without ever binding.
+        tunnel_bound: HashMap<String, bool>,
         /// Most recent stderr from each environment's session, kept after it
         /// dies so the output that explains a death is still readable.
         ///
@@ -4883,6 +4888,7 @@ mod gui {
                 forwards_config: ec2_manager::forwards::ForwardsConfig::bundled(),
                 port_tunnels: HashMap::new(),
                 tunnel_stderr: HashMap::new(),
+                tunnel_bound: HashMap::new(),
                 tunnel_probes: HashMap::new(),
                 probe_tx,
                 probe_rx,
@@ -6882,6 +6888,7 @@ mod gui {
                         self.tunnel_errors.remove(&row.key);
                         // New session, so any previous verdict is stale.
                         self.tunnel_probes.remove(&row.key);
+                        self.tunnel_bound.remove(&row.key);
                         // Forget any cleared failure so the next one speaks up.
                         if self
                             .config
@@ -6997,31 +7004,47 @@ mod gui {
                 return;
             }
 
-            // No Vault for this environment is a skip, not a failure. The
-            // check is opt-in by configuration precisely so environments
-            // without one are not reported as unverifiable.
-            let Some(addr) =
-                ec2_manager::accounts::vault_addr_for(&row.account_id, &row.env)
-            else {
-                self.tunnel_probes.insert(row.key.clone(), ProbeState::Skipped);
-                return;
-            };
-            let Some((host, _)) = ec2_manager::probe::parse_endpoint(&addr) else {
-                self.tunnel_probes.insert(row.key.clone(), ProbeState::Skipped);
-                return;
-            };
-            // Vault has to be one of the hosts we actually forward, or the
+            // Pick the endpoint out of this environment's own forwards.
+            //
+            // Deliberately not from `accounts::vault_addr_for`: that comes
+            // from accounts.json, which ships as template data, so its host
+            // matches nothing real and the probe silently skipped. The
+            // forwards are the thing actually being tested, and they carry
+            // the true name — whatever the site calls its Vault.
+            //
+            // Whichever endpoint is chosen must be one we forward, or the
             // request would leave through the machine's own network and
             // "verify" something this tunnel has nothing to do with.
+            let declared_host =
+                ec2_manager::accounts::vault_addr_for(&row.account_id, &row.env)
+                    .and_then(|addr| ec2_manager::probe::parse_endpoint(&addr))
+                    .map(|(host, _)| host);
             let Some(fwd) = row
                 .forwards
                 .iter()
-                .find(|f| f.host.eq_ignore_ascii_case(&host))
+                // An exact match on a declared address wins where one is
+                // configured for real...
+                .find(|f| {
+                    declared_host
+                        .as_deref()
+                        .is_some_and(|h| f.host.eq_ignore_ascii_case(h))
+                })
+                // ...otherwise the environment's own Vault forward. Only an
+                // HTTP service is worth curling: a probe against Postgres or
+                // Kafka would report a working forward as broken.
+                .or_else(|| {
+                    row.forwards
+                        .iter()
+                        .find(|f| f.host.to_ascii_lowercase().contains("vault"))
+                })
                 .cloned()
             else {
+                // Nothing HTTP to ask. Not a failure — `is_bound` still
+                // covers whether ssh is listening at all.
                 self.tunnel_probes.insert(row.key.clone(), ProbeState::Skipped);
                 return;
             };
+            let host = fwd.host.clone();
 
             self.tunnel_probes.insert(row.key.clone(), ProbeState::Running);
             let tx = self.probe_tx.clone();
@@ -7110,6 +7133,7 @@ mod gui {
             // A verdict about a session that no longer exists is worse than
             // none, so the next session re-verifies from scratch.
             self.tunnel_probes.remove(&row.key);
+            self.tunnel_bound.remove(&row.key);
             // Keep the final stderr: it is what explains the death, and the
             // Tunnel is about to be dropped.
             let final_stderr = dead.errors();
@@ -7181,8 +7205,31 @@ mod gui {
                     .map(|t| t.is_running())
                     .unwrap_or(false);
                 if alive {
-                    // Up and settled: confirm it actually carries traffic.
-                    self.maybe_probe_tunnel(&row);
+                    // "Alive" is not "working". Ask the listener.
+                    let bound = row
+                        .forwards
+                        .first()
+                        .map(|f| {
+                            ec2_manager::tunnel::Tunnel::is_bound(&f.ip, f.local_port)
+                        })
+                        .unwrap_or(false);
+                    let was = self.tunnel_bound.insert(row.key.clone(), bound);
+                    if !bound && was != Some(false) {
+                        self.log_warn(format!(
+                            "tunnel {}: the session is alive but nothing is \
+                             listening on {} — it has not finished connecting \
+                             through SSM. Expand its session output for the \
+                             ssh handshake.",
+                            row.label,
+                            row.forwards
+                                .first()
+                                .map(|f| format!("{}:{}", f.ip, f.local_port))
+                                .unwrap_or_default()
+                        ));
+                    }
+                    if bound {
+                        self.maybe_probe_tunnel(&row);
+                    }
                     continue;
                 }
                 if let Some(dead) = self.port_tunnels.remove(&row.key) {
@@ -7638,7 +7685,35 @@ mod gui {
                                         // Below the threshold ssh has not yet
                                         // had time to fail, so claiming it is
                                         // forwarding would be a guess.
-                                        if age < TUNNEL_PROVEN_AFTER {
+                                        let bound =
+                                            self.tunnel_bound.get(&row.key).copied();
+                                        if bound == Some(false)
+                                            && age >= TUNNEL_PROVEN_AFTER
+                                        {
+                                            // The failure this window used to
+                                            // report as success: process
+                                            // alive, nothing listening,
+                                            // because the SSM ProxyCommand
+                                            // never finished connecting.
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(220, 80, 80),
+                                                format!(
+                                                    "not connected — alive {} but \
+                                                     no ports bound",
+                                                    format_uptime(age)
+                                                ),
+                                            )
+                                            .on_hover_text(
+                                                "ssh is running but never \
+                                                 finished connecting through \
+                                                 SSM, so it has bound nothing. \
+                                                 Expand this environment's \
+                                                 session output for the \
+                                                 handshake.",
+                                            );
+                                        } else if age < TUNNEL_PROVEN_AFTER
+                                            || bound.is_none()
+                                        {
                                             ui.colored_label(
                                                 egui::Color32::from_rgb(220, 200, 120),
                                                 format!(
