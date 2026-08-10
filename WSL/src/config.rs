@@ -329,6 +329,31 @@ impl AppConfig {
         self.ssh_user_default.insert(key, user.to_string());
     }
 
+    /// Save the bastions, login user and key chosen in the Port Forwards
+    /// window's Login dialog.
+    ///
+    /// Deliberately writes the keys the rest of the app already reads rather
+    /// than a private set: the pem and user are what Open in VS Code
+    /// resolves, and the bastions are the pair the Scripts dialogs share. One
+    /// place to fix a terminated bastion is the point.
+    ///
+    /// An empty `secondary` is stored as empty rather than refused — plenty
+    /// of environments have one box, and the Scripts dialogs already accept
+    /// a half-filled pair.
+    pub fn set_port_forward_login(
+        &mut self,
+        account_id: &str,
+        env: &str,
+        primary: &str,
+        secondary: &str,
+        user: &str,
+        pem: &str,
+    ) {
+        self.set_vscode_defaults(account_id, env, pem, user);
+        self.add_pem_to_library(pem);
+        self.set_bastion_selection(account_id, env, primary, secondary);
+    }
+
     /// Record the "don't ask again" opt-out for one environment.
     pub fn suppress_vscode_prompt(&mut self, profile_id: &str, env: &str) {
         self.vscode_pem_suppressed
@@ -1244,6 +1269,68 @@ fn parse_port_forward_preset(raw: &str) -> Option<PortForwardPreset> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// All four values land under the keys the rest of the app already
+    /// reads, so fixing a login here fixes Open in VS Code and the Scripts
+    /// dialogs too — that shared storage is the point of the feature.
+    #[test]
+    fn set_port_forward_login_writes_pem_user_and_both_bastions() {
+        let mut cfg = AppConfig::default();
+        cfg.set_port_forward_login(
+            "123456789012",
+            "AUCT",
+            "i-0primary",
+            "i-0secondary",
+            "bconrad",
+            "/keys/auct.pem",
+        );
+
+        assert_eq!(
+            cfg.resolve_pem("123456789012", "AUCT", "i-0primary").as_deref(),
+            Some("/keys/auct.pem")
+        );
+        assert_eq!(cfg.resolve_ssh_user("123456789012", "AUCT"), "bconrad");
+        assert_eq!(
+            cfg.bastion_selection("123456789012", "AUCT"),
+            Some(("i-0primary".to_string(), "i-0secondary".to_string()))
+        );
+    }
+
+    /// Most environments have one bastion. Refusing an empty secondary
+    /// would make the dialog unusable there, and the Scripts dialogs
+    /// already accept a half-filled pair.
+    #[test]
+    fn set_port_forward_login_accepts_an_empty_secondary() {
+        let mut cfg = AppConfig::default();
+        cfg.set_port_forward_login(
+            "123456789012",
+            "AUCT",
+            "i-0primary",
+            "",
+            "bconrad",
+            "/keys/auct.pem",
+        );
+        assert_eq!(
+            cfg.bastion_selection("123456789012", "AUCT"),
+            Some(("i-0primary".to_string(), String::new()))
+        );
+    }
+
+    /// The pem is added to the shared library, so a key chosen here shows
+    /// up in the Open in VS Code dropdown rather than only in this dialog.
+    #[test]
+    fn set_port_forward_login_adds_the_pem_to_the_library() {
+        let mut cfg = AppConfig::default();
+        cfg.set_port_forward_login(
+            "123456789012",
+            "AUCT",
+            "i-0primary",
+            "",
+            "bconrad",
+            "/keys/auct.pem",
+        );
+        assert!(cfg.sorted_pem_library().iter().any(|p| p == "/keys/auct.pem"));
+    }
 
     /// The dropdowns list keys by filename, so that — not the directory or
     /// the order they were discovered in — is what has to sort.

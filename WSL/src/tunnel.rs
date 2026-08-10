@@ -19,6 +19,7 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::forwards::ResolvedForward;
 
@@ -30,6 +31,15 @@ pub struct Tunnel {
     /// Signature of the forward set it was started with, so the caller can
     /// tell that the resolved forwards have changed underneath it.
     pub signature: String,
+    /// Instance id of the bastion this session goes through — the pair's
+    /// primary, or the secondary after a failover. The caller shows this,
+    /// because an environment quietly running on its backup looks exactly
+    /// like one running normally.
+    pub bastion: String,
+    /// When the session was spawned. The caller uses [`Tunnel::age`] at the
+    /// moment it notices a death to tell "never connected" from "ran fine
+    /// for an hour and then dropped" — only the first is worth failing over.
+    started: Instant,
     /// stderr from the hidden process — the only account of why it died.
     errors: Arc<Mutex<Vec<String>>>,
 }
@@ -40,6 +50,7 @@ impl Tunnel {
         alias: &str,
         forwards: &[ResolvedForward],
         signature: String,
+        bastion: String,
     ) -> std::result::Result<Self, String> {
         let args = crate::forwards::tunnel_args(alias, forwards);
         let mut command = Command::new("ssh");
@@ -89,8 +100,20 @@ impl Tunnel {
             child,
             alias: alias.to_string(),
             signature,
+            bastion,
+            started: Instant::now(),
             errors,
         })
+    }
+
+    /// How long since the session was spawned.
+    ///
+    /// Read when a death is noticed, not continuously: a session that never
+    /// managed to connect dies within a few seconds, so a small age at the
+    /// moment of detection means "this bastion did not work", while a large
+    /// one means a working tunnel dropped and should simply be restarted.
+    pub fn age(&self) -> Duration {
+        self.started.elapsed()
     }
 
     /// Whether the session is still up. Polling `try_wait` rather than
@@ -124,8 +147,6 @@ impl Drop for Tunnel {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
     /// A command that exits immediately stands in for a dead session.
@@ -146,8 +167,32 @@ mod tests {
             },
             alias: "test".to_string(),
             signature: String::new(),
+            bastion: "i-0test".to_string(),
+            started: Instant::now(),
             errors: Arc::new(Mutex::new(Vec::new())),
         };
         assert!(!tunnel.is_running());
+    }
+
+    /// A session that has only just been spawned reports a small age. The
+    /// caller's failover decision hangs on this: a young corpse means the
+    /// bastion never worked, an old one means a good tunnel dropped.
+    #[test]
+    fn age_starts_near_zero() {
+        let child = Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn true");
+        let tunnel = Tunnel {
+            child,
+            alias: "test".to_string(),
+            signature: String::new(),
+            bastion: "i-0test".to_string(),
+            started: Instant::now(),
+            errors: Arc::new(Mutex::new(Vec::new())),
+        };
+        assert!(tunnel.age() < Duration::from_secs(1));
     }
 }

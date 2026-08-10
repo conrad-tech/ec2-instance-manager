@@ -518,8 +518,94 @@ mod gui {
         /// Forwards after removing the user's unticked ones and any whose
         /// bind another environment already claimed.
         forwards: Vec<ec2_manager::forwards::ResolvedForward>,
-        /// Primary bastion from the shared `bastion_pair` cache.
-        bastion: Option<String>,
+        /// The environment's bastions in preference order — primary first,
+        /// then the secondary if one is saved — from the shared
+        /// `bastion_pair` cache. Empty when nothing is saved.
+        ///
+        /// A list rather than one id because the tunnel fails over: if the
+        /// primary cannot be reached the session is retried on the
+        /// secondary. Only one is ever connected at a time.
+        bastions: Vec<String>,
+    }
+
+    impl PortForwardRow {
+        /// The configured primary, if any.
+        fn primary_bastion(&self) -> Option<&str> {
+            self.bastions.first().map(String::as_str)
+        }
+    }
+
+    /// Everything needed to spawn one environment's tunnel, once the bastion,
+    /// login and key have been resolved and the managed ssh block written.
+    ///
+    /// Produced by `resolve_tunnel_launch` and consumed by both the real start
+    /// and the Login dialog's test, so the test cannot succeed on a
+    /// configuration the real start would refuse.
+    struct TunnelLaunch {
+        /// Host alias in the managed `config.d/ec2-manager` block.
+        alias: String,
+        forwards: Vec<ec2_manager::forwards::ResolvedForward>,
+        signature: String,
+    }
+
+    /// How the Login dialog's Test button is getting on.
+    ///
+    /// `Running` owns the [`ec2_manager::tunnel::Tunnel`] itself rather than
+    /// a handle: dropping the dialog therefore kills the child (see its
+    /// `Drop`), and a run that survives its deadline can be handed straight
+    /// to `port_tunnels` without a second session ever being spawned.
+    enum TestState {
+        Idle,
+        Running {
+            tunnel: ec2_manager::tunnel::Tunnel,
+            /// Bastion this attempt is going through.
+            bastion: String,
+            /// Bastions still untried, in order. A test that dies on the
+            /// primary rolls on to the secondary exactly as the real tunnel
+            /// does — the point of the test is that it is the real thing.
+            remaining: Vec<String>,
+            deadline: Instant,
+            started: Instant,
+        },
+        Passed {
+            bastion: String,
+            forwards: usize,
+            elapsed: Duration,
+        },
+        Failed {
+            stderr: Vec<String>,
+            hint: Option<&'static str>,
+            elapsed: Duration,
+        },
+    }
+
+    /// Modal state for the Port Forwards window's per-row "Login…" button.
+    ///
+    /// Present on every row, not only failing ones: the case it exists for is
+    /// a setup that used to work and stopped — a terminated bastion, a
+    /// deleted login, a rotated key.
+    struct PortForwardLoginDialog {
+        /// `vscode_key(account_id, env)` — the row this belongs to.
+        key: String,
+        account_id: String,
+        env: String,
+        /// Environment name as the window shows it, for logs and the title.
+        label: String,
+        /// The bastion the tunnel connects through.
+        primary_id: String,
+        primary_label: String,
+        primary_query: String,
+        /// Failover target, tried when the primary will not hold a session.
+        /// Optional — plenty of environments have one box.
+        secondary_id: String,
+        secondary_label: String,
+        secondary_query: String,
+        /// True when the saved id names an instance not in the inventory.
+        primary_stale: bool,
+        secondary_stale: bool,
+        user: String,
+        pem: String,
+        test: TestState,
     }
 
     /// Modal state for the "Open in VS Code" pem-selection prompt.
@@ -4368,8 +4454,15 @@ mod gui {
         /// drops and recovers within the poll would otherwise leave no trace
         /// on screen at all, and these processes are invisible.
         tunnel_failures: HashMap<String, (String, u32)>,
+        /// Which of an environment's bastions the next attempt should start
+        /// with, as an index into `PortForwardRow::bastions`. Advanced by
+        /// `note_tunnel_failover`; in memory only, since which box a tunnel
+        /// happens to be on is a fact about this run, not a setting.
+        tunnel_bastion_pref: HashMap<String, usize>,
         /// Whether the Port Forwards window is open.
         show_port_forwards: bool,
+        /// Open "Login…" dialog for one Port Forwards row, if any.
+        port_forward_login: Option<PortForwardLoginDialog>,
         /// Throttle for `poll_port_tunnels`.
         last_tunnel_poll_at: Instant,
         /// Tunnel status line, rendered like the Scripts one (yellow while
@@ -4735,6 +4828,8 @@ mod gui {
                 protected_users: features.protected_users.clone(),
                 forwards_config: ec2_manager::forwards::ForwardsConfig::bundled(),
                 port_tunnels: HashMap::new(),
+                tunnel_bastion_pref: HashMap::new(),
+                port_forward_login: None,
                 tunnel_errors: HashMap::new(),
                 tunnel_failures: HashMap::new(),
                 show_port_forwards: false,
@@ -6434,18 +6529,25 @@ mod gui {
                             )
                         })
                         .collect();
-                    let bastion = self
+                    // Primary first, then the secondary — the order the
+                    // tunnel tries them in. Blank halves are dropped rather
+                    // than kept as empty strings, so "has a secondary" is
+                    // just the list's length.
+                    let bastions = self
                         .config
                         .bastion_selection(&row.account_id, &row.env)
-                        .map(|(primary, _)| primary)
-                        .filter(|p| !p.is_empty());
+                        .map(|(primary, secondary)| vec![primary, secondary])
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|b| !b.trim().is_empty())
+                        .collect();
                     rows.push(PortForwardRow {
                         label: script_env_label(&row),
                         account_id: row.account_id.clone(),
                         env: row.env.clone(),
                         key,
                         forwards,
-                        bastion,
+                        bastions,
                     });
                 }
             }
@@ -6453,13 +6555,23 @@ mod gui {
             rows
         }
 
-        /// Start the tunnel for one environment, replacing any running one
-        /// whose forward set no longer matches.
-        fn start_port_tunnel(&mut self, row: &PortForwardRow) {
+        /// Resolve everything one environment's tunnel needs and write its
+        /// managed ssh block, without spawning anything.
+        ///
+        /// Shared by [`Self::start_port_tunnel`] and the Login dialog's Test
+        /// button, so a test cannot pass on a configuration the real start
+        /// would reject. The error strings are the ones the Port Forwards
+        /// window has always shown: `render_port_forwards_window` matches on
+        /// `"needs authorizing"` and `tunnel_error_dismissed` keys on the
+        /// exact text, so rewording one silently un-dismisses every error a
+        /// user has cleared.
+        fn resolve_tunnel_launch(
+            &self,
+            row: &PortForwardRow,
+            bastion: &str,
+        ) -> std::result::Result<TunnelLaunch, String> {
             if row.forwards.is_empty() {
-                self.tunnel_errors
-                    .insert(row.key.clone(), "no forwards for this environment".into());
-                return;
+                return Err("no forwards for this environment".into());
             }
             // An unauthenticated account cannot open a session, and trying
             // produces a hidden process that dies with a credentials error
@@ -6467,61 +6579,36 @@ mod gui {
             // `poll_port_tunnels` starts it the moment it is.
             if self.script_env_auth(&row.account_id) != AuthStatus::Ok {
                 let name = self.profile_display_name(&row.account_id);
-                self.tunnel_errors.insert(
-                    row.key.clone(),
-                    format!("{name} needs authorizing — forwards start once it is"),
-                );
-                return;
+                return Err(format!(
+                    "{name} needs authorizing — forwards start once it is"
+                ));
             }
 
-            let signature = ec2_manager::forwards::tunnel_signature(&row.forwards);
-            if let Some(existing) = self.port_tunnels.get_mut(&row.key) {
-                if existing.signature == signature && existing.is_running() {
-                    return;
-                }
-                self.port_tunnels.remove(&row.key);
+            if bastion.trim().is_empty() {
+                return Err("no bastion saved for this environment — set one with \
+                            the Login button"
+                    .into());
             }
-
-            let Some(bastion) = row.bastion.clone() else {
-                self.tunnel_errors.insert(
-                    row.key.clone(),
-                    "no bastion saved for this environment — pick one in a \
-                     Scripts dialog first"
-                        .into(),
-                );
-                return;
-            };
             let Some((instance_name, profile, region)) =
-                self.bastion_connection_details(&row.account_id, &bastion)
+                self.bastion_connection_details(&row.account_id, bastion)
             else {
-                self.tunnel_errors.insert(
-                    row.key.clone(),
-                    format!("{bastion} is not in the loaded inventory — refresh"),
-                );
-                return;
+                return Err(format!("{bastion} is not in the loaded inventory — refresh"));
             };
             let user = self.config.resolve_ssh_user(&row.account_id, &row.env);
-            let Some(pem) = self.config.resolve_pem(&row.account_id, &row.env, &bastion)
+            let Some(pem) = self.config.resolve_pem(&row.account_id, &row.env, bastion)
             else {
-                self.tunnel_errors.insert(
-                    row.key.clone(),
-                    "no pem saved for this environment — open a box in VS Code \
-                     once to choose one"
-                        .into(),
-                );
-                return;
+                return Err("no pem saved for this environment — set one with the \
+                            Login button, or open a box in VS Code"
+                    .into());
             };
 
             // The block carries no LocalForward: the tunnel owns the
             // forwards, so VS Code connecting to the same alias cannot
             // fight it for the ports.
-            if let Err(err) = ec2_manager::ssh_config::ensure_include_directive() {
-                self.tunnel_errors.insert(row.key.clone(), err);
-                return;
-            }
-            let alias = match ec2_manager::ssh_config::write_managed_block(
+            ec2_manager::ssh_config::ensure_include_directive()?;
+            let alias = ec2_manager::ssh_config::write_managed_block(
                 &ec2_manager::ssh_config::ManagedHost {
-                    instance_id: &bastion,
+                    instance_id: bastion,
                     name: &instance_name,
                     user: &user,
                     pem: &pem,
@@ -6529,43 +6616,148 @@ mod gui {
                     region: &region,
                     forwards: &[],
                 },
-            ) {
-                Ok(alias) => alias,
-                Err(err) => {
-                    self.tunnel_errors.insert(row.key.clone(), err);
+            )?;
+
+            Ok(TunnelLaunch {
+                alias,
+                forwards: row.forwards.clone(),
+                signature: ec2_manager::forwards::tunnel_signature(&row.forwards),
+            })
+        }
+
+        /// The environment's bastions in the order this attempt should try
+        /// them: whichever one is currently preferred first, then the rest.
+        ///
+        /// The preference starts at the primary and advances on a failure
+        /// (see [`Self::note_tunnel_failover`]), which is what makes the
+        /// failover sticky — once a session is happily up on the secondary
+        /// it is not disturbed to go back, and only another failure swings
+        /// the preference around again.
+        fn tunnel_attempt_order(&self, row: &PortForwardRow) -> Vec<String> {
+            if row.bastions.is_empty() {
+                // One empty attempt, so the caller still produces the
+                // "no bastion saved" message rather than silently doing
+                // nothing.
+                return vec![String::new()];
+            }
+            let start = self
+                .tunnel_bastion_pref
+                .get(&row.key)
+                .copied()
+                .unwrap_or(0);
+            bastion_attempt_order(&row.bastions, start)
+        }
+
+        /// Move the preferred bastion on by one, so the next attempt for this
+        /// environment starts with the other box.
+        ///
+        /// In memory only, deliberately: which bastion a tunnel happens to be
+        /// on is a fact about this run, not a setting. Persisting it would
+        /// mean an outage during one session quietly re-aimed every later
+        /// one, with nothing in the UI saying so.
+        fn note_tunnel_failover(&mut self, row: &PortForwardRow) {
+            if row.bastions.len() < 2 {
+                return;
+            }
+            let next = (self
+                .tunnel_bastion_pref
+                .get(&row.key)
+                .copied()
+                .unwrap_or(0)
+                + 1)
+                % row.bastions.len();
+            self.tunnel_bastion_pref.insert(row.key.clone(), next);
+        }
+
+        /// Start the tunnel for one environment, replacing any running one
+        /// whose forward set no longer matches.
+        ///
+        /// Tries each bastion in turn, so an environment whose primary has
+        /// been terminated (or is simply refusing connections) comes up on
+        /// its secondary instead of not at all.
+        fn start_port_tunnel(&mut self, row: &PortForwardRow) {
+            let signature = ec2_manager::forwards::tunnel_signature(&row.forwards);
+            // A session already carrying exactly these forwards is left
+            // alone, checked before anything else: a healthy tunnel must not
+            // collect an error string because its account's credentials
+            // lapsed.
+            if let Some(existing) = self.port_tunnels.get_mut(&row.key) {
+                if existing.signature == signature && existing.is_running() {
                     return;
                 }
-            };
+            }
 
-            match ec2_manager::tunnel::Tunnel::spawn(&alias, &row.forwards, signature) {
-                Ok(tunnel) => {
-                    self.tunnel_errors.remove(&row.key);
-                    // Forget any cleared failure so the next one speaks up.
-                    if self
-                        .config
-                        .clear_tunnel_dismissal(&row.account_id, &row.env)
-                    {
-                        let _ = self.config.save();
+            let order = self.tunnel_attempt_order(row);
+            let mut last_error = String::new();
+            for (attempt, bastion) in order.iter().enumerate() {
+                let launch = match self.resolve_tunnel_launch(row, bastion) {
+                    Ok(launch) => launch,
+                    Err(err) => {
+                        // A bastion that cannot even be resolved is worth
+                        // saying out loud only when another one follows —
+                        // otherwise this is the message the window shows.
+                        if attempt + 1 < order.len() {
+                            self.log_warn(format!(
+                                "tunnel {}: {bastion} unusable — {err}; trying the \
+                                 next bastion",
+                                row.label
+                            ));
+                        }
+                        last_error = err;
+                        continue;
                     }
-                    self.log_info(format!(
-                        "tunnel {}: started — ssh -N {alias}, {} forward(s): {}",
-                        row.label,
-                        row.forwards.len(),
-                        row.forwards
-                            .iter()
-                            .map(|f| format!(
-                                "{}:{}->{}:{}",
-                                f.ip, f.local_port, f.host, f.remote_port
-                            ))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    ));
-                    self.port_tunnels.insert(row.key.clone(), tunnel);
+                };
+
+                // Only now drop the stale session. Resolving can fail, and
+                // killing a working tunnel to then start nothing is worse
+                // than leaving it up.
+                self.port_tunnels.remove(&row.key);
+
+                match ec2_manager::tunnel::Tunnel::spawn(
+                    &launch.alias,
+                    &launch.forwards,
+                    launch.signature,
+                    bastion.clone(),
+                ) {
+                    Ok(tunnel) => {
+                        self.tunnel_errors.remove(&row.key);
+                        // Forget any cleared failure so the next one speaks up.
+                        if self
+                            .config
+                            .clear_tunnel_dismissal(&row.account_id, &row.env)
+                        {
+                            let _ = self.config.save();
+                        }
+                        let which = self.bastion_role(row, bastion);
+                        self.log_info(format!(
+                            "tunnel {}: started on {bastion}{which} — ssh -N {}, \
+                             {} forward(s): {}",
+                            row.label,
+                            launch.alias,
+                            launch.forwards.len(),
+                            describe_forwards(&launch.forwards)
+                        ));
+                        self.port_tunnels.insert(row.key.clone(), tunnel);
+                        return;
+                    }
+                    Err(err) => {
+                        self.log_error(format!("tunnel {}: {bastion} — {err}", row.label));
+                        last_error = err;
+                    }
                 }
-                Err(err) => {
-                    self.log_error(format!("tunnel {}: {err}", row.label));
-                    self.tunnel_errors.insert(row.key.clone(), err);
-                }
+            }
+            self.tunnel_errors.insert(row.key.clone(), last_error);
+        }
+
+        /// `" (secondary)"` when this bastion is not the configured primary,
+        /// otherwise empty. Used in logs and in the window's Bastion column:
+        /// an environment quietly running on its backup looks exactly like
+        /// one running normally, which is the sort of invisible state this
+        /// window exists to surface.
+        fn bastion_role(&self, row: &PortForwardRow, bastion: &str) -> &'static str {
+            match row.primary_bastion() {
+                Some(primary) if primary == bastion => "",
+                _ => " (secondary)",
             }
         }
 
@@ -6608,12 +6800,85 @@ mod gui {
         fn sync_port_tunnels(&mut self) {
             let rows = self.port_forward_rows();
             for row in rows {
+                if self.login_test_in_flight(&row.key) {
+                    continue;
+                }
                 let enabled = self.config.tunnel_enabled(&row.account_id, &row.env);
                 if enabled {
                     self.start_port_tunnel(&row);
                 } else {
                     self.stop_port_tunnel(&row.key.clone(), &row.label.clone());
                 }
+            }
+        }
+
+        /// Whether the Login dialog is currently testing this environment.
+        ///
+        /// A test deliberately stops the environment's tunnel and spawns an
+        /// identical session, so for those few seconds the row looks exactly
+        /// like one that needs starting. Without this guard the poll would
+        /// start a competing session on the same local ports and, with
+        /// `ExitOnForwardFailure=yes`, kill both.
+        fn login_test_in_flight(&self, key: &str) -> bool {
+            self.port_forward_login
+                .as_ref()
+                .is_some_and(|dlg| {
+                    dlg.key == key && matches!(dlg.test, TestState::Running { .. })
+                })
+        }
+
+        /// A session died: log it, count it, and decide whether it is worth
+        /// failing over to the other bastion.
+        ///
+        /// The test is the tunnel's **age at the moment we notice**, not the
+        /// reason it gave. A session that never managed to connect dies
+        /// within a few seconds, so a young corpse means "this bastion did
+        /// not work" and the next attempt should try the other one; an old
+        /// one means a good tunnel dropped, and moving it to the backup for
+        /// that would be an overreaction.
+        ///
+        /// The threshold has to clear the 15s poll interval, since that is
+        /// how stale the detection can be — a session that died at 2s may
+        /// not be noticed for another 15.
+        fn record_tunnel_death(
+            &mut self,
+            row: &PortForwardRow,
+            dead: ec2_manager::tunnel::Tunnel,
+        ) {
+            let why = dead
+                .last_error()
+                .unwrap_or_else(|| "session ended".to_string());
+            let age = dead.age();
+            let died_young = age < Duration::from_secs(30);
+            // A tunnel that was up and died is an error, not a warning:
+            // nothing else on screen would say so.
+            self.log_error(format!(
+                "tunnel {}: dropped after {:.0}s on {} — {why}",
+                row.label,
+                age.as_secs_f32(),
+                dead.bastion
+            ));
+            let count = self
+                .tunnel_failures
+                .get(&row.key)
+                .map(|(_, n)| *n)
+                .unwrap_or(0)
+                + 1;
+            self.tunnel_failures
+                .insert(row.key.clone(), (why.clone(), count));
+            self.tunnel_errors.insert(row.key.clone(), why);
+
+            if died_young && row.bastions.len() > 1 {
+                self.note_tunnel_failover(row);
+                let next = self
+                    .tunnel_attempt_order(row)
+                    .first()
+                    .cloned()
+                    .unwrap_or_default();
+                self.log_warn(format!(
+                    "tunnel {}: {} did not hold a session — failing over to {next}",
+                    row.label, dead.bastion
+                ));
             }
         }
 
@@ -6635,6 +6900,10 @@ mod gui {
                 if !self.config.tunnel_enabled(&row.account_id, &row.env) {
                     continue;
                 }
+                // A test owns this environment's ports for its duration.
+                if self.login_test_in_flight(&row.key) {
+                    continue;
+                }
                 let alive = self
                     .port_tunnels
                     .get_mut(&row.key)
@@ -6644,24 +6913,7 @@ mod gui {
                     continue;
                 }
                 if let Some(dead) = self.port_tunnels.remove(&row.key) {
-                    let why = dead
-                        .last_error()
-                        .unwrap_or_else(|| "session ended".to_string());
-                    // A tunnel that was up and died is an error, not a
-                    // warning: nothing else on screen would say so.
-                    self.log_error(format!(
-                        "tunnel {}: dropped — {why}",
-                        row.label
-                    ));
-                    let count = self
-                        .tunnel_failures
-                        .get(&row.key)
-                        .map(|(_, n)| *n)
-                        .unwrap_or(0)
-                        + 1;
-                    self.tunnel_failures
-                        .insert(row.key.clone(), (why.clone(), count));
-                    self.tunnel_errors.insert(row.key.clone(), why);
+                    self.record_tunnel_death(&row, dead);
                 }
                 let before = self.tunnel_errors.get(&row.key).cloned();
                 self.start_port_tunnel(&row);
@@ -6786,9 +7038,20 @@ mod gui {
             self.tunnel_status = if blocked.is_empty() {
                 Some((
                     format!(
-                        "Forwarding ports for {}",
-                        name_list(&running, enabled.len())
+                        "Forwarding ports for {} ({} tunnel{} up)",
+                        name_list(&running, enabled.len()),
+                        running.len(),
+                        if running.len() == 1 { "" } else { "s" }
                     ),
+                    // `ScriptState` has only Running and Failed, and Running
+                    // is what colours this line — so the wording has to carry
+                    // the distinction instead. This is a steady state, not a
+                    // connect in progress: there is no connecting state,
+                    // since `alive` comes straight off `try_wait`, and the
+                    // message only appears once a session is up and carrying
+                    // its forwards. Without the count it reads as a spinner,
+                    // and a tunnel that came up minutes ago looks like one
+                    // that has been hanging for minutes.
                     ScriptState::Running,
                 ))
             } else {
@@ -6956,6 +7219,7 @@ mod gui {
             // Poll liveness before drawing, so a session that died since the
             // last frame shows as stopped rather than running.
             let mut running: HashMap<String, bool> = HashMap::new();
+            let mut on_bastion: HashMap<String, String> = HashMap::new();
             for row in &rows {
                 let alive = self
                     .port_tunnels
@@ -6964,23 +7228,13 @@ mod gui {
                     .unwrap_or(false);
                 if !alive {
                     if let Some(dead) = self.port_tunnels.remove(&row.key) {
-                        let why = dead
-                            .last_error()
-                            .unwrap_or_else(|| "session ended".to_string());
-                        self.log_error(format!(
-                            "tunnel {}: dropped — {why}",
-                            row.label
-                        ));
-                        let count = self
-                            .tunnel_failures
-                            .get(&row.key)
-                            .map(|(_, n)| *n)
-                            .unwrap_or(0)
-                            + 1;
-                        self.tunnel_failures
-                            .insert(row.key.clone(), (why.clone(), count));
-                        self.tunnel_errors.insert(row.key.clone(), why);
+                        self.record_tunnel_death(row, dead);
                     }
+                }
+                // Which bastion this environment is actually on, so the
+                // column can say so rather than always naming the primary.
+                if let Some(live) = self.port_tunnels.get(&row.key) {
+                    on_bastion.insert(row.key.clone(), live.bastion.clone());
                 }
                 running.insert(row.key.clone(), alive);
             }
@@ -6992,6 +7246,7 @@ mod gui {
             let mut stop_all = false;
             let mut dismiss: Option<(PortForwardRow, String)> = None;
             let mut clear_all = false;
+            let mut open_login: Option<PortForwardRow> = None;
 
             egui::Window::new("Port Forwards")
                 .open(&mut open)
@@ -7069,7 +7324,7 @@ mod gui {
                     }
 
                     egui::Grid::new("port_forward_grid")
-                        .num_columns(4)
+                        .num_columns(5)
                         .spacing([12.0, 6.0])
                         .striped(true)
                         .show(ui, |ui| {
@@ -7077,6 +7332,7 @@ mod gui {
                             ui.label(egui::RichText::new("Environment").strong());
                             ui.label(egui::RichText::new("Status").strong());
                             ui.label(egui::RichText::new("Bastion").strong());
+                            ui.label("");
                             ui.end_row();
 
                             for row in &rows {
@@ -7160,15 +7416,45 @@ mod gui {
                                     });
                                 }
 
-                                match &row.bastion {
+                                // Prefer the bastion the session is actually
+                                // on: an environment quietly running on its
+                                // backup looks exactly like a healthy one.
+                                match on_bastion
+                                    .get(&row.key)
+                                    .map(String::as_str)
+                                    .or_else(|| row.primary_bastion())
+                                {
                                     Some(id) => {
-                                        ui.label(egui::RichText::new(id).small())
+                                        let role = self.bastion_role(row, id);
+                                        if role.is_empty() {
+                                            ui.label(egui::RichText::new(id).small())
+                                        } else {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(220, 150, 60),
+                                                egui::RichText::new(format!(
+                                                    "{id}{role}"
+                                                ))
+                                                .small(),
+                                            )
+                                        }
                                     }
                                     None => ui.colored_label(
                                         egui::Color32::from_rgb(220, 150, 60),
                                         egui::RichText::new("none saved").small(),
                                     ),
                                 };
+
+                                if ui
+                                    .small_button("Login…")
+                                    .on_hover_text(
+                                        "Set the bastions, login user and key \
+                                         this environment connects with, and \
+                                         test them.",
+                                    )
+                                    .clicked()
+                                {
+                                    open_login = Some(row.clone());
+                                }
                                 ui.end_row();
                             }
                         });
@@ -7220,6 +7506,9 @@ mod gui {
                     }
                 });
 
+            if let Some(row) = open_login {
+                self.open_port_forward_login(&row);
+            }
             if let Some((row, enabled)) = toggle {
                 self.config
                     .set_tunnel_enabled(&row.account_id, &row.env, enabled);
@@ -7268,6 +7557,468 @@ mod gui {
                 self.show_port_forwards = false;
             }
             self.refresh_tunnel_status();
+        }
+
+        /// Open the Login dialog for one environment, prefilled from what is
+        /// saved. Available on every row, whatever its status — the case this
+        /// exists for is a setup that used to work and stopped.
+        fn open_port_forward_login(&mut self, row: &PortForwardRow) {
+            let available = self.env_instances(&row.account_id, &row.env);
+            let (saved_primary, saved_secondary) = self
+                .config
+                .bastion_selection(&row.account_id, &row.env)
+                .unwrap_or_default();
+            let (primary_id, primary_label, primary_stale) =
+                port_forward_login_bastion(&saved_primary, &available);
+            let (secondary_id, secondary_label, secondary_stale) =
+                port_forward_login_bastion(&saved_secondary, &available);
+            let user = self.config.resolve_ssh_user(&row.account_id, &row.env);
+            let pem = self
+                .config
+                .resolve_pem(&row.account_id, &row.env, &primary_id)
+                .unwrap_or_default();
+
+            self.log_info(format!(
+                "tunnel {}: login dialog opened — primary={} secondary={} \
+                 user={user} pem={}",
+                row.label,
+                if primary_id.is_empty() { "none" } else { &primary_id },
+                if secondary_id.is_empty() { "none" } else { &secondary_id },
+                if pem.is_empty() {
+                    "none".to_string()
+                } else {
+                    pem_basename(&pem)
+                },
+            ));
+
+            self.port_forward_login = Some(PortForwardLoginDialog {
+                key: row.key.clone(),
+                account_id: row.account_id.clone(),
+                env: row.env.clone(),
+                label: row.label.clone(),
+                primary_id,
+                primary_label,
+                primary_query: self.primary_bastion_filter.clone(),
+                secondary_id,
+                secondary_label,
+                secondary_query: self.secondary_bastion_filter.clone(),
+                primary_stale,
+                secondary_stale,
+                user,
+                pem,
+                test: TestState::Idle,
+            });
+        }
+
+        /// Persist the dialog's values and clear the row's stale error.
+        fn save_port_forward_login(&mut self, dlg: &PortForwardLoginDialog) {
+            let previous = self
+                .config
+                .bastion_selection(&dlg.account_id, &dlg.env)
+                .map(|(primary, _)| primary)
+                .unwrap_or_default();
+            if !previous.is_empty() && previous != dlg.primary_id {
+                // The pair is shared with Bastion New User, Bastion User
+                // Delete and Vault IAM. Re-aiming those silently would be
+                // nasty.
+                self.log_warn(format!(
+                    "tunnel {}: primary bastion changed {previous} → {} (also used \
+                     by the Scripts dialogs)",
+                    dlg.label, dlg.primary_id
+                ));
+            }
+            self.config.set_port_forward_login(
+                &dlg.account_id,
+                &dlg.env,
+                &dlg.primary_id,
+                &dlg.secondary_id,
+                &dlg.user,
+                &dlg.pem,
+            );
+            let _ = self.config.save();
+            self.tunnel_errors.remove(&dlg.key);
+            self.config.clear_tunnel_dismissal(&dlg.account_id, &dlg.env);
+            // The saved pair has changed, so a failover preference picked
+            // against the old one means nothing. Start from the primary.
+            self.tunnel_bastion_pref.remove(&dlg.key);
+            self.log_info(format!(
+                "tunnel {}: login saved — primary={} secondary={} user={} pem={}",
+                dlg.label,
+                dlg.primary_id,
+                if dlg.secondary_id.is_empty() {
+                    "none"
+                } else {
+                    &dlg.secondary_id
+                },
+                dlg.user,
+                dlg.pem
+            ));
+        }
+
+        /// Spawn the identical session the tunnel would, and start watching.
+        ///
+        /// Not a cheap `ssh … true` probe: this carries the real `-L`
+        /// forwards under `ExitOnForwardFailure=yes`, which is where these
+        /// sessions actually die. The environment's own tunnel is stopped
+        /// first — a byte-identical session binds the same local ports, so
+        /// leaving it up would fail the test with `Address already in use`
+        /// *because* the thing works.
+        fn start_port_forward_login_test(&mut self, dlg: &mut PortForwardLoginDialog) {
+            let Some(row) = self
+                .port_forward_rows()
+                .into_iter()
+                .find(|r| r.key == dlg.key)
+            else {
+                dlg.test = TestState::Failed {
+                    stderr: vec!["this environment is no longer listed — refresh".into()],
+                    hint: None,
+                    elapsed: Duration::ZERO,
+                };
+                return;
+            };
+
+            self.stop_port_tunnel(&dlg.key.clone(), &dlg.label.clone());
+            let order = self.tunnel_attempt_order(&row);
+            self.spawn_login_test(dlg, &row, order);
+        }
+
+        /// Try the next bastion in `order`, watching whatever starts.
+        ///
+        /// Walks the same list the real start walks, so a test that cannot
+        /// hold a session on the primary rolls on to the secondary exactly as
+        /// forwarding would — otherwise the test would report a failure the
+        /// live tunnel recovers from on its own.
+        fn spawn_login_test(
+            &mut self,
+            dlg: &mut PortForwardLoginDialog,
+            row: &PortForwardRow,
+            order: Vec<String>,
+        ) {
+            let mut remaining = order;
+            let mut last_error = String::new();
+            while !remaining.is_empty() {
+                let bastion = remaining.remove(0);
+                let launch = match self.resolve_tunnel_launch(row, &bastion) {
+                    Ok(launch) => launch,
+                    Err(err) => {
+                        self.log_warn(format!(
+                            "tunnel {}: test login not started on {bastion} — {err}",
+                            dlg.label
+                        ));
+                        last_error = err;
+                        continue;
+                    }
+                };
+                self.log_info(format!(
+                    "tunnel {}: test login on {bastion}{} — ssh -N {}, {} forward(s): {}",
+                    dlg.label,
+                    self.bastion_role(row, &bastion),
+                    launch.alias,
+                    launch.forwards.len(),
+                    describe_forwards(&launch.forwards)
+                ));
+                match ec2_manager::tunnel::Tunnel::spawn(
+                    &launch.alias,
+                    &launch.forwards,
+                    launch.signature,
+                    bastion.clone(),
+                ) {
+                    Ok(tunnel) => {
+                        let now = Instant::now();
+                        dlg.test = TestState::Running {
+                            tunnel,
+                            bastion,
+                            remaining,
+                            // Long enough for an SSM-proxied handshake,
+                            // short enough that a user waits it out rather
+                            // than wondering.
+                            deadline: now + Duration::from_secs(5),
+                            started: now,
+                        };
+                        return;
+                    }
+                    Err(err) => {
+                        self.log_error(format!(
+                            "tunnel {}: test login — {err}",
+                            dlg.label
+                        ));
+                        last_error = err;
+                    }
+                }
+            }
+            let hint = classify_tunnel_failure(&last_error);
+            dlg.test = TestState::Failed {
+                stderr: vec![last_error],
+                hint,
+                elapsed: Duration::ZERO,
+            };
+        }
+
+        /// Advance a running test. Called every frame while the dialog is open.
+        ///
+        /// `is_running` is `try_wait` underneath, so this never blocks — the
+        /// same idiom `poll_port_tunnels` uses. A session that outlives its
+        /// deadline **becomes** the environment's tunnel when the row is on,
+        /// so the thing that was tested is the thing that keeps running;
+        /// otherwise it is dropped, and `Drop` kills the child.
+        fn poll_port_forward_login_test(
+            &mut self,
+            dlg: &mut PortForwardLoginDialog,
+            ctx: &egui::Context,
+        ) {
+            let TestState::Running {
+                tunnel,
+                deadline,
+                started,
+                ..
+            } = &mut dlg.test
+            else {
+                return;
+            };
+            // Keep the live counter ticking without an input event.
+            ctx.request_repaint_after(Duration::from_millis(100));
+            let dead = !tunnel.is_running();
+            let expired = Instant::now() >= *deadline;
+            if !dead && !expired {
+                return;
+            }
+
+            let elapsed = started.elapsed();
+            let TestState::Running {
+                tunnel,
+                bastion,
+                remaining,
+                ..
+            } = std::mem::replace(&mut dlg.test, TestState::Idle)
+            else {
+                return;
+            };
+
+            if dead {
+                let stderr = tunnel.errors();
+                let hint = classify_tunnel_failure(&stderr.join("\n"));
+                self.log_error(format!(
+                    "tunnel {}: test login failed on {bastion} after {:.1}s",
+                    dlg.label,
+                    elapsed.as_secs_f32()
+                ));
+                for line in &stderr {
+                    self.log_error(format!("tunnel {}: test login — {line}", dlg.label));
+                }
+                // Roll on to the next bastion, as the live tunnel would.
+                if !remaining.is_empty() {
+                    if let Some(row) = self
+                        .port_forward_rows()
+                        .into_iter()
+                        .find(|r| r.key == dlg.key)
+                    {
+                        self.log_warn(format!(
+                            "tunnel {}: {bastion} did not hold a session — testing \
+                             the next bastion",
+                            dlg.label
+                        ));
+                        self.spawn_login_test(dlg, &row, remaining);
+                        return;
+                    }
+                }
+                dlg.test = TestState::Failed { stderr, hint, elapsed };
+                return;
+            }
+
+            let forwards = self
+                .port_forward_rows()
+                .into_iter()
+                .find(|r| r.key == dlg.key)
+                .map(|r| r.forwards.len())
+                .unwrap_or(0);
+            let adopt = self.config.tunnel_enabled(&dlg.account_id, &dlg.env);
+            self.log_info(format!(
+                "tunnel {}: test login passed on {bastion} in {:.1}s — {forwards} \
+                 forward(s) bound; {}",
+                dlg.label,
+                elapsed.as_secs_f32(),
+                if adopt {
+                    "adopted as the live tunnel"
+                } else {
+                    "discarded (environment is off)"
+                }
+            ));
+            if adopt {
+                self.port_tunnels.insert(dlg.key.clone(), tunnel);
+                self.tunnel_errors.remove(&dlg.key);
+            }
+            dlg.test = TestState::Passed {
+                bastion,
+                forwards,
+                elapsed,
+            };
+        }
+
+        /// Render the per-environment Login dialog.
+        fn render_port_forward_login_dialog(&mut self, ctx: &egui::Context) {
+            let Some(mut dlg) = self.port_forward_login.take() else {
+                return;
+            };
+            self.poll_port_forward_login_test(&mut dlg, ctx);
+
+            let mut window_open = true;
+            let mut do_save = false;
+            let mut do_test = false;
+            let mut do_close = false;
+            let available = self.env_instances(&dlg.account_id, &dlg.env);
+            let library = self.config.sorted_pem_library();
+            let stale_note = |ui: &mut egui::Ui, which: &str| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 150, 60),
+                    egui::RichText::new(format!(
+                        "The saved {which} is not in this environment's inventory \
+                         — it may have been terminated. Pick another."
+                    ))
+                    .small(),
+                );
+            };
+
+            egui::Window::new(format!("{} — login", dlg.label))
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    // `bastion_combo_ui` is an associated function (no
+                    // `self`), unlike the module-level helpers below it.
+                    Self::bastion_combo_ui(
+                        ui,
+                        "pf_login_primary",
+                        "Primary bastion (the tunnel connects through this):",
+                        &dlg.primary_query.clone(),
+                        &mut dlg.primary_id,
+                        &mut dlg.primary_label,
+                        &available,
+                    );
+                    if dlg.primary_stale {
+                        stale_note(ui, "primary bastion");
+                    }
+
+                    Self::bastion_combo_ui(
+                        ui,
+                        "pf_login_secondary",
+                        "Secondary bastion (used if the primary will not connect):",
+                        &dlg.secondary_query.clone(),
+                        &mut dlg.secondary_id,
+                        &mut dlg.secondary_label,
+                        &available,
+                    );
+                    if dlg.secondary_stale {
+                        stale_note(ui, "secondary bastion");
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .small_button("Clear secondary")
+                            .on_hover_text(
+                                "Leave this environment with one bastion and \
+                                 no failover.",
+                            )
+                            .clicked()
+                        {
+                            dlg.secondary_id.clear();
+                            dlg.secondary_label.clear();
+                            dlg.secondary_stale = false;
+                        }
+                    });
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Login user:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dlg.user)
+                                .desired_width(160.0),
+                        );
+                    });
+
+                    ui.label("Key (pem):");
+                    ui.horizontal(|ui| {
+                        let selected_text = if dlg.pem.is_empty() {
+                            "(choose a key)".to_string()
+                        } else {
+                            pem_basename(&dlg.pem)
+                        };
+                        egui::ComboBox::from_id_salt("pf_login_pem")
+                            .selected_text(selected_text)
+                            .width(260.0)
+                            .height(PEM_COMBO_POPUP_H)
+                            .show_ui(ui, |ui| {
+                                if let Some(picked) =
+                                    pem_library_combo_items(ui, &library, &dlg.pem)
+                                {
+                                    dlg.pem = picked;
+                                }
+                            });
+                        if ui.button("+ Add pem...").clicked() {
+                            let mut dialog = rfd::FileDialog::new()
+                                .add_filter("SSH key", &["pem", "key"]);
+                            if let Some(home) = ec2_manager::util::home_dir() {
+                                dialog = dialog.set_directory(home.join(".ssh"));
+                            }
+                            if let Some(picked) = dialog.pick_file() {
+                                dlg.pem = picked.to_string_lossy().to_string();
+                            }
+                        }
+                    });
+
+                    ui.label(
+                        egui::RichText::new(
+                            "These are the same key and login Open in VS Code \
+                             uses, and the same bastions the Scripts dialogs \
+                             run against.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let testing =
+                            matches!(dlg.test, TestState::Running { .. });
+                        if ui
+                            .add_enabled(
+                                !testing,
+                                egui::Button::new("Test login"),
+                            )
+                            .on_hover_text(
+                                "Saves, then opens the identical hidden ssh \
+                                 session the tunnel uses, forwards and all — \
+                                 failing over to the secondary just as it would.",
+                            )
+                            .clicked()
+                        {
+                            do_test = true;
+                        }
+                        render_test_state(ui, &mut dlg.test);
+                    });
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            do_save = true;
+                            do_close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_close = true;
+                        }
+                    });
+                });
+
+            if do_test {
+                // Testing unsaved edits tests nothing, and a pass that was
+                // not persisted is worse than no test at all.
+                self.save_port_forward_login(&dlg);
+                self.start_port_forward_login_test(&mut dlg);
+            } else if do_save {
+                self.save_port_forward_login(&dlg);
+            }
+            if window_open && !do_close {
+                self.port_forward_login = Some(dlg);
+            }
         }
 
         /// Entry point for "Open in VS Code". Resolves the instance's
@@ -16692,6 +17443,7 @@ mod gui {
                 // WSL setup popup
                 self.render_pem_dialog(ctx);
                 self.render_port_forwards_window(ctx);
+                self.render_port_forward_login_dialog(ctx);
                 self.render_hosts_prompt(ctx);
                 self.render_settings_pem_dialog(ctx);
                 self.render_file_browser_defaults_dialog(ctx);
@@ -19271,6 +20023,124 @@ mod gui {
         }
     }
 
+    /// A one-line hint for an ssh failure, or `None` when the message is not
+    /// one we recognise.
+    ///
+    /// The caller always prints stderr verbatim underneath this; the hint
+    /// annotates it and never replaces it. That is why an unfamiliar error
+    /// returns `None` instead of a best guess — a wrong hint sends the user to
+    /// change the wrong field, which is worse than reading raw ssh output.
+    fn classify_tunnel_failure(stderr: &str) -> Option<&'static str> {
+        let lower = stderr.to_ascii_lowercase();
+        if lower.contains("permission denied") {
+            Some("the key or the login user is wrong")
+        } else if lower.contains("address already in use")
+            || lower.contains("cannot listen to port")
+        {
+            Some("another process is already holding that local port")
+        } else if lower.contains("could not resolve")
+            || lower.contains("connection refused")
+            || lower.contains("targetnotconnected")
+            || lower.contains("no such instance")
+        {
+            Some("the bastion could not be reached")
+        } else {
+            None
+        }
+    }
+
+    /// `ip:local->host:remote` for each forward, space separated — the form
+    /// the tunnel logs use, so a start line and a test line read alike.
+    fn describe_forwards(forwards: &[ec2_manager::forwards::ResolvedForward]) -> String {
+        forwards
+            .iter()
+            .map(|f| format!("{}:{}->{}:{}", f.ip, f.local_port, f.host, f.remote_port))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The bastions to try, rotated so the currently preferred one is first
+    /// and the others follow in order.
+    ///
+    /// Every bastion appears exactly once: an attempt that has failed over to
+    /// the secondary must still fall back to the primary if the secondary is
+    /// the one that is now down, or a single outage on the backup would leave
+    /// the environment with nothing to try.
+    fn bastion_attempt_order(bastions: &[String], start: usize) -> Vec<String> {
+        if bastions.is_empty() {
+            return Vec::new();
+        }
+        let start = start % bastions.len();
+        (0..bastions.len())
+            .map(|i| bastions[(start + i) % bastions.len()].clone())
+            .collect()
+    }
+
+    /// The Test button's result line.
+    fn render_test_state(ui: &mut egui::Ui, state: &mut TestState) {
+        match state {
+            TestState::Idle => {}
+            TestState::Running { started, bastion, .. } => {
+                ui.spinner();
+                ui.label(format!(
+                    "testing {bastion}… {:.1}s",
+                    started.elapsed().as_secs_f32()
+                ));
+            }
+            TestState::Passed { bastion, forwards, elapsed } => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(120, 180, 120),
+                    format!(
+                        "connected to {bastion} in {:.1}s — {forwards} forward(s) bound",
+                        elapsed.as_secs_f32()
+                    ),
+                );
+            }
+            TestState::Failed { stderr, hint, elapsed } => {
+                ui.vertical(|ui| {
+                    let headline = match hint {
+                        Some(hint) => format!(
+                            "failed after {:.1}s — {hint}",
+                            elapsed.as_secs_f32()
+                        ),
+                        None => format!("failed after {:.1}s", elapsed.as_secs_f32()),
+                    };
+                    ui.colored_label(egui::Color32::from_rgb(220, 80, 80), headline);
+                    // Verbatim, always. The hint points; this explains.
+                    for line in stderr {
+                        ui.label(egui::RichText::new(line.as_str()).small().weak());
+                    }
+                });
+            }
+        }
+    }
+
+    /// What the Login dialog's bastion combo shows for a saved instance id:
+    /// `(id, label, is_stale)`.
+    ///
+    /// Unlike [`retain_available_bastion`], a saved id missing from the
+    /// environment is **kept and flagged** rather than cleared. A terminated
+    /// bastion is exactly the failure this dialog exists to fix, and blanking
+    /// the field hides the cause.
+    fn port_forward_login_bastion(
+        saved: &str,
+        available: &[(String, String)],
+    ) -> (String, String, bool) {
+        let saved = saved.trim();
+        if saved.is_empty() {
+            return (String::new(), String::new(), false);
+        }
+        match available.iter().find(|(id, _)| id == saved) {
+            Some((id, name)) if name.trim().is_empty() => (id.clone(), id.clone(), false),
+            Some((id, name)) => (id.clone(), format!("{name}  {id}"), false),
+            None => (
+                saved.to_string(),
+                format!("{saved} — no longer in inventory"),
+                true,
+            ),
+        }
+    }
+
     /// Keep a cached bastion id only if that instance is still offered in the
     /// selected environment, otherwise clear it.
     ///
@@ -20459,6 +21329,161 @@ mod gui {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// With no failover recorded the primary is tried first and the
+        /// secondary is the fallback — the ordinary case.
+        #[test]
+        fn bastion_attempt_order_starts_at_the_primary() {
+            let bastions = vec!["i-0primary".to_string(), "i-0secondary".to_string()];
+            assert_eq!(
+                bastion_attempt_order(&bastions, 0),
+                vec!["i-0primary".to_string(), "i-0secondary".to_string()]
+            );
+        }
+
+        /// After a failover the secondary leads — but the primary is still in
+        /// the list. If the secondary is the one now down, an environment
+        /// whose order had dropped the primary would have nothing left to
+        /// try.
+        #[test]
+        fn bastion_attempt_order_rotates_and_keeps_every_bastion() {
+            let bastions = vec!["i-0primary".to_string(), "i-0secondary".to_string()];
+            assert_eq!(
+                bastion_attempt_order(&bastions, 1),
+                vec!["i-0secondary".to_string(), "i-0primary".to_string()]
+            );
+        }
+
+        /// The preference is a counter that only ever increments, so it runs
+        /// past the end of the list and has to wrap.
+        #[test]
+        fn bastion_attempt_order_wraps_a_preference_past_the_end() {
+            let bastions = vec!["i-0primary".to_string(), "i-0secondary".to_string()];
+            assert_eq!(
+                bastion_attempt_order(&bastions, 4),
+                vec!["i-0primary".to_string(), "i-0secondary".to_string()]
+            );
+            assert_eq!(
+                bastion_attempt_order(&bastions, 5),
+                vec!["i-0secondary".to_string(), "i-0primary".to_string()]
+            );
+        }
+
+        /// One bastion is the common case and must not rotate into nothing.
+        #[test]
+        fn bastion_attempt_order_handles_a_single_bastion() {
+            let bastions = vec!["i-0only".to_string()];
+            assert_eq!(
+                bastion_attempt_order(&bastions, 3),
+                vec!["i-0only".to_string()]
+            );
+        }
+
+        /// No bastions saved yields no attempts — the caller substitutes the
+        /// "none saved" message rather than spawning anything.
+        #[test]
+        fn bastion_attempt_order_is_empty_without_bastions() {
+            assert!(bastion_attempt_order(&[], 0).is_empty());
+        }
+
+        /// The three failures a user actually hits, each with a hint that
+        /// names the field they need to change. The raw stderr is always
+        /// shown too, so the hint only has to point — it does not have to
+        /// explain.
+        #[test]
+        fn classify_tunnel_failure_names_the_usual_ssh_rejections() {
+            assert_eq!(
+                classify_tunnel_failure("bconrad@10.1.2.3: Permission denied (publickey)."),
+                Some("the key or the login user is wrong"),
+            );
+            assert_eq!(
+                classify_tunnel_failure(
+                    "bind [127.0.0.1]:5432: Address already in use\n\
+                     channel_setup_fwd_listener_tcpip: cannot listen to port: 5432"
+                ),
+                Some("another process is already holding that local port"),
+            );
+            assert_eq!(
+                classify_tunnel_failure(
+                    "ssh: Could not resolve hostname i-0785b0: Name or service not known"
+                ),
+                Some("the bastion could not be reached"),
+            );
+        }
+
+        /// An unrecognised failure returns None rather than a guess. The
+        /// caller shows stderr verbatim either way, and a confident wrong
+        /// hint about an unfamiliar error is worse than no hint at all.
+        #[test]
+        fn classify_tunnel_failure_returns_none_for_an_unknown_error() {
+            assert_eq!(
+                classify_tunnel_failure(
+                    "kex_exchange_identification: read: Connection reset"
+                ),
+                None
+            );
+            assert_eq!(classify_tunnel_failure(""), None);
+        }
+
+        /// Matching is case-insensitive: the wording of these messages
+        /// varies between OpenSSH builds and the Windows client.
+        #[test]
+        fn classify_tunnel_failure_ignores_case() {
+            assert_eq!(
+                classify_tunnel_failure("PERMISSION DENIED (PUBLICKEY)"),
+                Some("the key or the login user is wrong"),
+            );
+        }
+
+        /// A saved bastion that is no longer in the inventory stays selected
+        /// and says so. `retain_available_bastion` blanks it, which is right
+        /// for the Scripts dialogs — an unavailable box there means the
+        /// dialog is aimed at nothing. Here the terminated instance is the
+        /// user's whole diagnosis, and emptying the field turns "this broke"
+        /// into "you never configured this".
+        #[test]
+        fn port_forward_login_bastion_flags_one_that_is_gone() {
+            let available = vec![("i-0new".to_string(), "bastion-auct".to_string())];
+            let (id, label, stale) = port_forward_login_bastion("i-0gone", &available);
+            assert_eq!(id, "i-0gone");
+            assert_eq!(label, "i-0gone — no longer in inventory");
+            assert!(stale);
+        }
+
+        /// A bastion that is still there selects normally, labelled the way
+        /// the Scripts dropdowns label it.
+        #[test]
+        fn port_forward_login_bastion_selects_one_still_present() {
+            let available = vec![("i-0new".to_string(), "bastion-auct".to_string())];
+            let (id, label, stale) = port_forward_login_bastion("i-0new", &available);
+            assert_eq!(id, "i-0new");
+            assert_eq!(label, "bastion-auct  i-0new");
+            assert!(!stale);
+        }
+
+        /// Nothing saved is not a stale value — the dialog opens with an
+        /// empty combo reading "choose", not a warning about an instance
+        /// that never existed. The secondary bastion is legitimately empty
+        /// on most environments, so this is the common case, not an edge.
+        #[test]
+        fn port_forward_login_bastion_treats_nothing_saved_as_not_stale() {
+            let available = vec![("i-0new".to_string(), "bastion-auct".to_string())];
+            let (id, label, stale) = port_forward_login_bastion("", &available);
+            assert!(id.is_empty());
+            assert!(label.is_empty());
+            assert!(!stale);
+        }
+
+        /// An instance with no Name tag falls back to the bare id, as the
+        /// Scripts dropdowns do — and is not mistaken for a missing one.
+        #[test]
+        fn port_forward_login_bastion_handles_an_unnamed_instance() {
+            let available = vec![("i-0new".to_string(), String::new())];
+            let (id, label, stale) = port_forward_login_bastion("i-0new", &available);
+            assert_eq!(id, "i-0new");
+            assert_eq!(label, "i-0new");
+            assert!(!stale);
+        }
 
         /// A filename shared by two keys identifies neither, so those rows
         /// carry their full path — without it the only way to tell them
