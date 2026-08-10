@@ -488,6 +488,19 @@ the tunnel dies.
   bastion hides what the dialog flags. The secondary excludes the primary
   from its pool: an environment with one bastion gets a primary and no
   failover, which is the correct answer.
+- **The tunnel can never stop to ask a question**
+  (`StrictHostKeyChecking=accept-new`, `BatchMode=yes`). It is spawned with
+  `CREATE_NO_WINDOW` and a null stdin, so a prompt is a *hang*, not a
+  failure. Every instance id is a new host name, so the first connection to
+  one hits ssh's default `ask` and stops dead on "The authenticity of host …
+  can't be established" with nobody to type yes — sitting alive,
+  authenticated to nothing, binding nothing, writing nothing. From outside
+  that is indistinguishable from a healthy tunnel, and it is what made a
+  whole afternoon's forwarding silently do nothing while the window reported
+  `up 2m · 9 forward(s)`. Running the same command by hand works precisely
+  because a console can answer. **`accept-new`, never `no`:** an unknown
+  host is trusted on first sight, as an interactive user would, but a
+  *changed* key is still refused.
 - **"Working" is answered by `Tunnel::is_bound`, not by process liveness.**
   A session behind the SSM `ProxyCommand` will sit alive indefinitely
   without ever finishing its connection — binding nothing, writing nothing,

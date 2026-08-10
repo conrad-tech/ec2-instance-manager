@@ -421,6 +421,26 @@ pub fn tunnel_args(alias: &str, forwards: &[ResolvedForward]) -> Vec<String> {
         // output, no exit. The same `ssh -v` run by hand is what diagnoses
         // it, so run it that way in the first place.
         "-v".to_string(),
+        // This session can never answer a question. It is spawned with no
+        // console and a null stdin, so ssh's default
+        // `StrictHostKeyChecking=ask` is a dead end: every instance id is a
+        // new host name, and the first connection to one stops dead on
+        // "The authenticity of host … can't be established" with nobody to
+        // type yes. It does not fail loudly either — it sits there
+        // authenticated to nothing, binding nothing, writing nothing, which
+        // is indistinguishable from a healthy tunnel from the outside.
+        //
+        // `accept-new` rather than `no`: an unknown host is trusted on
+        // first sight, which is what an interactive user would have done
+        // anyway, but a host whose key has *changed* is still refused. `no`
+        // would silently accept a substituted key.
+        //
+        // `BatchMode=yes` covers the rest of the same class — a password or
+        // passphrase prompt fails immediately instead of hanging.
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
         // No remote command: the forwards are the entire point, and a login
         // shell is a liability. A shell brings a TMOUT that logs an idle
         // session out however healthy the connection is, and gives us a
@@ -927,6 +947,42 @@ mod tests {
         assert!(args.contains(&"127.200.20.2:5432:pg-postgres.example.net:5432".to_string()));
         // The alias is last, as ssh expects.
         assert_eq!(args.last().unwrap(), "web-jane-i-1");
+    }
+
+    /// The tunnel is spawned with no console and a null stdin, so anything
+    /// ssh would *ask* is a hang, not a failure.
+    ///
+    /// Every instance id is a new host name, so the first connection to one
+    /// hits `StrictHostKeyChecking=ask` and stops dead on "The authenticity
+    /// of host … can't be established" with nobody to answer — sitting
+    /// alive, bound to nothing, writing nothing, which from outside is
+    /// indistinguishable from a working tunnel. That is the bug this
+    /// prevents, and it cost a long afternoon to find.
+    ///
+    /// `accept-new`, never `no`: a first sighting is trusted, a *changed*
+    /// key is still refused.
+    #[test]
+    fn tunnel_args_can_never_stop_to_ask_a_question() {
+        let hosts = parse_hosts("127.9.9.1  uweb.example.net\n");
+        let out = resolve_forwards(&config(), &hosts, "AUCT");
+        let args = tunnel_args("web-jane-i-1", &out);
+        assert!(args.windows(2).any(|w| w
+            == ["-o".to_string(), "StrictHostKeyChecking=accept-new".to_string()]));
+        assert!(args.windows(2).any(|w| w
+            == ["-o".to_string(), "BatchMode=yes".to_string()]));
+        assert!(
+            !args.iter().any(|a| a.contains("StrictHostKeyChecking=no")),
+            "`no` would accept a substituted host key silently"
+        );
+    }
+
+    /// Verbose, because the session pane is the only account these
+    /// invisible processes give of themselves — and the handshake is where
+    /// a session that never finishes connecting shows it.
+    #[test]
+    fn tunnel_args_are_verbose() {
+        let out = resolve_forwards(&config(), &[], "AUCT");
+        assert!(tunnel_args("web-jane-i-1", &out).contains(&"-v".to_string()));
     }
 
     /// The signature has to change when the forward set does, so a stale

@@ -152,7 +152,38 @@ impl Tunnel {
         })
     }
 
-    /// Whether a forward's local port is actually accepting connections.
+    /// How many forwards **this** session reports having bound.
+    ///
+    /// `ssh -v` announces each one as `Local forwarding listening on <ip>
+    /// port <n>.`, so the session speaks for itself. That attribution is the
+    /// whole point: a TCP connect to the bind address only proves *someone*
+    /// is listening, and when a user has their own ssh session up on the same
+    /// addresses it proves the wrong thing entirely — the window went green
+    /// for tunnels that had bound nothing, and back to red when the unrelated
+    /// session was killed.
+    pub fn bound_forwards(&self) -> usize {
+        self.errors()
+            .iter()
+            .filter(|line| line.contains("Local forwarding listening on"))
+            .count()
+    }
+
+    /// Whether this session has finished authenticating.
+    ///
+    /// Distinguishes "still negotiating" from "connected but bound nothing",
+    /// which look identical from outside and want different answers.
+    pub fn is_authenticated(&self) -> bool {
+        self.errors()
+            .iter()
+            .any(|line| line.starts_with("Authenticated to") || line.contains("Authenticated to "))
+    }
+
+    /// Whether a forward's local port is accepting connections.
+    ///
+    /// Note this says nothing about **who** is listening — see
+    /// [`Tunnel::bound_forwards`] for the attributable answer. Kept for the
+    /// case where that is genuinely the question: something already holds
+    /// the address.
     ///
     /// This is the only honest test that a tunnel is working. `is_running`
     /// says the process exists, and a session behind an SSM `ProxyCommand`

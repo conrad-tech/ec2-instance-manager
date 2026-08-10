@@ -4492,11 +4492,18 @@ mod gui {
         /// drops and recovers within the poll would otherwise leave no trace
         /// on screen at all, and these processes are invisible.
         tunnel_failures: HashMap<String, (String, u32)>,
-        /// Whether each environment's first forward is actually accepting
-        /// connections. Re-checked on the poll; the only honest answer to
-        /// "is this working", since a session behind an SSM ProxyCommand can
-        /// stay alive forever without ever binding.
+        /// Whether each environment's session has bound forwards **of its
+        /// own**. Re-checked on the poll; the only honest answer to "is this
+        /// working", since a session behind an SSM ProxyCommand can stay
+        /// alive forever without ever binding.
         tunnel_bound: HashMap<String, bool>,
+        /// When each session's forwards actually came up.
+        ///
+        /// Not the process's age, which is what the row used to show: a
+        /// session that never finishes connecting keeps accruing "uptime"
+        /// beside forwards that do not exist, and killing an unrelated ssh
+        /// session does not reset it because it was never measuring that.
+        tunnel_bound_at: HashMap<String, Instant>,
         /// Most recent stderr from each environment's session, kept after it
         /// dies so the output that explains a death is still readable.
         ///
@@ -4889,6 +4896,7 @@ mod gui {
                 port_tunnels: HashMap::new(),
                 tunnel_stderr: HashMap::new(),
                 tunnel_bound: HashMap::new(),
+                tunnel_bound_at: HashMap::new(),
                 tunnel_probes: HashMap::new(),
                 probe_tx,
                 probe_rx,
@@ -6889,6 +6897,8 @@ mod gui {
                         // New session, so any previous verdict is stale.
                         self.tunnel_probes.remove(&row.key);
                         self.tunnel_bound.remove(&row.key);
+                        self.tunnel_bound_at.remove(&row.key);
+            self.tunnel_bound_at.remove(&row.key);
                         // Forget any cleared failure so the next one speaks up.
                         if self
                             .config
@@ -7134,6 +7144,7 @@ mod gui {
             // none, so the next session re-verifies from scratch.
             self.tunnel_probes.remove(&row.key);
             self.tunnel_bound.remove(&row.key);
+            self.tunnel_bound_at.remove(&row.key);
             // Keep the final stderr: it is what explains the death, and the
             // Tunnel is about to be dropped.
             let final_stderr = dead.errors();
@@ -7205,26 +7216,35 @@ mod gui {
                     .map(|t| t.is_running())
                     .unwrap_or(false);
                 if alive {
-                    // "Alive" is not "working". Ask the listener.
-                    let bound = row
-                        .forwards
-                        .first()
-                        .map(|f| {
-                            ec2_manager::tunnel::Tunnel::is_bound(&f.ip, f.local_port)
-                        })
-                        .unwrap_or(false);
+                    // "Alive" is not "working" — and neither is "something is
+                    // listening on that address". Ask the session itself:
+                    // `ssh -v` announces each bind it makes, so a forward
+                    // another process happens to hold cannot be mistaken for
+                    // ours.
+                    let (bound, authed) = self
+                        .port_tunnels
+                        .get(&row.key)
+                        .map(|t| (t.bound_forwards() > 0, t.is_authenticated()))
+                        .unwrap_or((false, false));
                     let was = self.tunnel_bound.insert(row.key.clone(), bound);
+                    if bound {
+                        self.tunnel_bound_at
+                            .entry(row.key.clone())
+                            .or_insert_with(Instant::now);
+                    } else {
+                        self.tunnel_bound_at.remove(&row.key);
+                    }
                     if !bound && was != Some(false) {
                         self.log_warn(format!(
-                            "tunnel {}: the session is alive but nothing is \
-                             listening on {} — it has not finished connecting \
-                             through SSM. Expand its session output for the \
-                             ssh handshake.",
+                            "tunnel {}: the session is alive but has bound no \
+                             forwards of its own ({}). Expand its session \
+                             output for the ssh handshake.",
                             row.label,
-                            row.forwards
-                                .first()
-                                .map(|f| format!("{}:{}", f.ip, f.local_port))
-                                .unwrap_or_default()
+                            if authed {
+                                "authenticated, then stopped"
+                            } else {
+                                "never finished authenticating"
+                            }
                         ));
                     }
                     if bound {
@@ -7722,12 +7742,19 @@ mod gui {
                                                 ),
                                             );
                                         } else {
+                                            // Since the forwards came up,
+                                            // not since the process started.
+                                            let forwarding_for = self
+                                                .tunnel_bound_at
+                                                .get(&row.key)
+                                                .map(|t| t.elapsed())
+                                                .unwrap_or(age);
                                             ui.colored_label(
                                                 egui::Color32::from_rgb(120, 180, 120),
                                                 format!(
-                                                    "up {} · {} forward(s)",
-                                                    format_uptime(age),
-                                                    row.forwards.len()
+                                                    "forwarding {} ports · up {}",
+                                                    row.forwards.len(),
+                                                    format_uptime(forwarding_for)
                                                 ),
                                             );
                                         }
