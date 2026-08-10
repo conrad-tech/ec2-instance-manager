@@ -2149,6 +2149,47 @@ mod gui {
     /// worker that parses the script's output is Windows-gated), so the
     /// allow keeps the Linux dev build warning-free without loosening
     /// dead-code checking on the target that ships them.
+    /// What the automatic `fed up` login is doing, for the status line.
+    ///
+    /// Only the Windows build constructs anything past `Idle`/`Disabled` (the
+    /// worker is Windows-gated), so the allow keeps the Linux dev build
+    /// warning-free — the same treatment `EmailStatus` gets below.
+    /// What the automatic `fed up` refresh is doing.
+    #[derive(Clone, Debug)]
+    enum FedState {
+        /// Not gated on for this user.
+        Disabled,
+        /// Nothing has run yet.
+        Idle,
+        /// `fed up` is running.
+        Running,
+        /// Okta wants a device authorization. The page is open and the code
+        /// is on the clipboard; the user signs in from here.
+        AwaitingSignIn { code: String, url: String },
+        /// Credentials are good; the next refresh is scheduled.
+        Authenticated,
+        /// Waiting to retry after a failure, with the reason and the attempt.
+        Retrying {
+            error: ec2_manager::fed_auth::FedError,
+            attempt: u32,
+        },
+        /// The retry window closed. Stood down until the user signs in by
+        /// hand — this is what the red line shows.
+        Stalled(ec2_manager::fed_auth::FedError),
+    }
+
+    /// Fed worker → UI.
+    #[derive(Clone, Debug)]
+    enum FedEvent {
+        /// `fed` printed an activation URL and code.
+        DeviceCode { url: String, code: String },
+        /// One run finished. `None` = authenticated.
+        Finished(Option<ec2_manager::fed_auth::FedError>),
+        /// A line for the app log (the raw `fed up` output lives here, which
+        /// is how the output patterns get tightened against the real thing).
+        Log(String),
+    }
+
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     #[derive(Clone, Debug)]
     enum EmailStatus {
@@ -2364,6 +2405,127 @@ mod gui {
             .and_then(|exe| exe.parent().map(|d| d.join("send_access_email.ps1")))
             .unwrap_or_else(|| std::path::PathBuf::from("send_access_email.ps1"))
     }
+
+    /// Open `url` in the user's default browser.
+    ///
+    /// Shells out rather than linking a browser crate, matching how this app
+    /// already reaches `aws` and `curl`. The URL is quoted because `cmd`'s
+    /// `start` treats `&` as a command separator, and the empty `""` is
+    /// `start`'s title argument — without it `start` reads the quoted URL as
+    /// the window title and opens nothing.
+    fn open_in_browser(url: &str) -> std::result::Result<(), String> {
+        let result = if cfg!(target_os = "windows") {
+            std::process::Command::new("cmd")
+                .args(["/C", "start", "", url])
+                .spawn()
+        } else {
+            std::process::Command::new("xdg-open").arg(url).spawn()
+        };
+        result
+            .map(|_| ())
+            .map_err(|e| format!("could not open a browser for {url}: {e}"))
+    }
+
+    /// Run one `fed up` and report on `tx`.
+    ///
+    /// Streams the output rather than waiting for the process, because `fed`
+    /// prints its activation URL partway through and then **blocks** waiting
+    /// for the sign-in to be approved. Waiting for exit before reading would
+    /// hand the user a code that had already timed out.
+    ///
+    /// The app's involvement ends at opening the page and copying the code.
+    /// The code, username, password and MFA prompt are the user's to do.
+    fn run_fed_worker(cfg: ec2_manager::features::FedAuthFeature, tx: Sender<FedEvent>) {
+        use ec2_manager::fed_auth::{classify_exit, parse_device_code, FedError, FedOutcome};
+        use std::io::{BufRead, BufReader};
+
+        let argv = cfg.resolved_command();
+        let (exe, args) = argv.split_first().expect("resolved_command is never empty");
+
+        let mut child = match std::process::Command::new(exe)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(FedEvent::Finished(Some(FedError::Command(format!(
+                    "could not run {}: {e}",
+                    argv.join(" ")
+                )))));
+                return;
+            }
+        };
+
+        // stderr is drained on its own thread: `fed` may write the prompt to
+        // either stream, and a full pipe on the one we are not reading would
+        // block the process forever.
+        let stderr_handle = child.stderr.take().map(|err| {
+            std::thread::spawn(move || {
+                let mut buf = String::new();
+                // `Result::ok` would resolve to the crate's own one-parameter
+                // `Result<T>` alias (src/error.rs), which is in scope here — hence
+                // the closure.
+                for line in BufReader::new(err).lines().map_while(|l| l.ok()) {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+                buf
+            })
+        });
+
+        let mut collected = String::new();
+        let mut prompted = false;
+        if let Some(out) = child.stdout.take() {
+            for line in BufReader::new(out).lines().map_while(|l| l.ok()) {
+                collected.push_str(&line);
+                collected.push('\n');
+                // Only the first prompt is acted on — `fed` can redraw the
+                // line, and reopening the tab under the user mid-sign-in
+                // would be worse than useless.
+                if !prompted {
+                    if let Some((url, code)) = parse_device_code(&line) {
+                        prompted = true;
+                        let _ = tx.send(FedEvent::DeviceCode { url, code });
+                    }
+                }
+            }
+        }
+
+        let status = child.wait();
+        if let Some(handle) = stderr_handle {
+            if let Ok(err) = handle.join() {
+                collected.push_str(&err);
+                // Late prompt: `fed` wrote it to stderr, so it only surfaces
+                // once the process is done. Still worth showing — the user
+                // can retry against a fresh code.
+                if !prompted {
+                    if let Some((url, code)) = parse_device_code(&collected) {
+                        let _ = tx.send(FedEvent::DeviceCode { url, code });
+                    }
+                }
+            }
+        }
+
+        // Logged in full: the classification patterns were written without
+        // access to `fed`, and this is how they get corrected against it.
+        let _ = tx.send(FedEvent::Log(format!(
+            "fed up output: {}",
+            collected.trim()
+        )));
+
+        let exit_code = status.ok().and_then(|s| s.code());
+        match classify_exit(&collected, exit_code) {
+            FedOutcome::Authenticated => {
+                let _ = tx.send(FedEvent::Finished(None));
+            }
+            FedOutcome::Failed(msg) => {
+                let _ = tx.send(FedEvent::Finished(Some(FedError::Command(msg))));
+            }
+        }
+    }
+
 
     /// The ordered (flag, value) pairs handed to `send_access_email.ps1`.
     /// Shared by `build_email_command` (which quotes them into a shell string
@@ -4063,6 +4225,34 @@ mod gui {
         /// Alerts fetch worker → UI.
         alerts_tx: Sender<AlertsFetch>,
         alerts_rx: Receiver<AlertsFetch>,
+        /// Build-time gate: whether the automatic `fed up` login runs for the
+        /// current OS user (features.json `fed_auth`, which needs both
+        /// `enabled` and a named user).
+        fed_auth_enabled: bool,
+        /// Command + timings for the automatic refresh.
+        fed_auth_cfg: ec2_manager::features::FedAuthFeature,
+        /// What the automatic refresh is doing, and why it last failed.
+        fed_state: FedState,
+        /// When to run `fed up` next. `None` means nothing is scheduled —
+        /// either it is running now, or it has stood down.
+        fed_next_run_at: Option<Instant>,
+        /// When the current run of failures started, for the retry window.
+        /// Cleared on any success.
+        fed_retrying_since: Option<Instant>,
+        /// True while a worker is in flight, so the timer cannot stack runs.
+        fed_running: bool,
+        /// `~/.aws/credentials` mtime at the moment the retry window closed.
+        ///
+        /// This is how "manually resolved" is detected: once the user signs
+        /// in by hand, `fed` rewrites that file, the mtime moves, and the
+        /// 15-minute loop starts itself again. Comparing against a stored
+        /// mtime rather than "are the credentials valid" matters — creds can
+        /// still be valid while `fed up` fails, and that must not read as
+        /// resolution.
+        fed_stalled_at_mtime: Option<SystemTime>,
+        /// Fed worker → UI.
+        fed_tx: Sender<FedEvent>,
+        fed_rx: Receiver<FedEvent>,
         /// Outlook access-email automation config (from features.json).
         access_email: ec2_manager::features::AccessEmailConfig,
         /// Access-email worker → UI: the outcome of the automatic send.
@@ -4150,6 +4340,7 @@ mod gui {
             let (preflight_tx, preflight_rx) = mpsc::channel();
             let (alerts_tx, alerts_rx) = mpsc::channel();
             let (email_tx, email_rx) = mpsc::channel();
+            let (fed_tx, fed_rx) = mpsc::channel();
             let features = ec2_manager::features::load();
             #[cfg(target_os = "windows")]
             let (ui_tx, ui_rx) = mpsc::channel();
@@ -4361,6 +4552,18 @@ mod gui {
                 alerts_window: None,
                 alerts_tx,
                 alerts_rx,
+                fed_auth_enabled: features
+                    .fed_auth_enabled_for(&ec2_manager::features::current_os_user()),
+                fed_auth_cfg: features.fed_auth.clone(),
+                fed_state: FedState::Disabled,
+                // Scheduled by `poll_fed_auth` on the first frame once the
+                // gate is known, so startup runs it immediately.
+                fed_next_run_at: None,
+                fed_retrying_since: None,
+                fed_running: false,
+                fed_stalled_at_mtime: None,
+                fed_tx,
+                fed_rx,
                 access_email: features.access_email.clone(),
                 email_tx,
                 email_rx,
@@ -4669,6 +4872,183 @@ mod gui {
         /// Periodically check whether any authenticated profile has expired
         /// based on its `expires_at` timestamp (time-based, independent of
         /// credentials file changes).
+        /// Drive the automatic `fed up` refresh: drain worker events, resume
+        /// after a manual sign-in, then start the next run when it comes due.
+        ///
+        /// The schedule lives in `ec2_manager::fed_auth::next_delay` —
+        /// 2-minute retries inside a 10-minute window, then a 15-minute
+        /// refresh once authenticated.
+        fn poll_fed_auth(&mut self) {
+            if !self.fed_auth_enabled {
+                return;
+            }
+
+            // First frame: nothing scheduled, nothing running — run now.
+            if self.fed_next_run_at.is_none()
+                && !self.fed_running
+                && matches!(self.fed_state, FedState::Disabled)
+            {
+                self.fed_state = FedState::Idle;
+                self.fed_next_run_at = Some(Instant::now());
+            }
+
+            while let Ok(event) = self.fed_rx.try_recv() {
+                match event {
+                    FedEvent::Log(msg) => self.log_info(format!("fed_auth: {msg}")),
+                    FedEvent::DeviceCode { url, code } => self.on_fed_device_code(url, code),
+                    FedEvent::Finished(result) => {
+                        self.fed_running = false;
+                        self.on_fed_run_finished(result);
+                    }
+                }
+            }
+
+            self.resume_fed_after_manual_signin();
+
+            let due = self.fed_next_run_at.is_some_and(|at| Instant::now() >= at);
+            if due && !self.fed_running {
+                self.start_fed_run();
+            }
+        }
+
+        /// Okta wants a device authorization: open the page and put the code
+        /// on the clipboard, then get out of the way.
+        ///
+        /// `fed up` is still running at this point — it blocks until the
+        /// sign-in is approved — so this schedules nothing. Whatever the user
+        /// does next is reflected in that run's exit code.
+        fn on_fed_device_code(&mut self, url: String, code: String) {
+            match clipboard_set_text_with_retry(&code) {
+                Ok(()) => self.log_info(format!(
+                    "fed_auth: activation code {code} copied to the clipboard"
+                )),
+                // Not fatal — the code is on screen in the status line, so
+                // the user can still type it.
+                Err(e) => self.log_warn(format!(
+                    "fed_auth: could not copy the activation code ({e}); \
+                     it is shown in the status line"
+                )),
+            }
+            if let Err(e) = open_in_browser(&url) {
+                self.log_error(format!("fed_auth: {e}"));
+            } else {
+                self.log_info(format!("fed_auth: opened {url}"));
+            }
+            self.fed_state = FedState::AwaitingSignIn { code, url };
+        }
+
+        /// Apply one run's verdict: reschedule on success, step the retry
+        /// window on failure, or stand down when the window closes.
+        fn on_fed_run_finished(
+            &mut self,
+            result: Option<ec2_manager::fed_auth::FedError>,
+        ) {
+            use ec2_manager::fed_auth::{next_delay, FedOutcome};
+            let policy = self.fed_auth_cfg.retry_policy();
+
+            let Some(err) = result else {
+                self.fed_retrying_since = None;
+                self.fed_stalled_at_mtime = None;
+                self.fed_state = FedState::Authenticated;
+                self.fed_next_run_at = Some(Instant::now() + policy.steady);
+                self.log_info("fed_auth: authenticated".to_string());
+                // The credentials file just changed; the existing mtime
+                // watcher picks that up rather than duplicating the refresh.
+                return;
+            };
+
+            let since = *self.fed_retrying_since.get_or_insert_with(Instant::now);
+            let retrying_for = since.elapsed();
+            let outcome = FedOutcome::Failed(err.to_string());
+
+            match next_delay(&policy, &outcome, retrying_for) {
+                Some(delay) => {
+                    let attempt =
+                        (retrying_for.as_secs() / policy.interval.as_secs().max(1)) as u32 + 1;
+                    self.log_warn(format!("fed_auth: attempt {attempt} failed — {err}"));
+                    self.fed_state = FedState::Retrying { error: err, attempt };
+                    self.fed_next_run_at = Some(Instant::now() + delay);
+                }
+                None => {
+                    // Window closed. Stand down and note where the
+                    // credentials file was, so a manual sign-in restarts the
+                    // loop by itself.
+                    let stalled = ec2_manager::fed_auth::FedError::GaveUp(Box::new(err));
+                    self.log_error(format!("fed_auth: {stalled}"));
+                    self.fed_state = FedState::Stalled(stalled);
+                    self.fed_next_run_at = None;
+                    self.fed_retrying_since = None;
+                    self.fed_stalled_at_mtime = credentials::credentials_mtime();
+                }
+            }
+        }
+
+        /// Restart the 15-minute loop once the user has signed in by hand.
+        ///
+        /// Detected by `~/.aws/credentials` changing since we stood down —
+        /// that is what a successful manual `fed up` does. Deliberately *not*
+        /// "are the credentials currently valid": they can still be valid
+        /// while `fed up` fails, and treating that as resolution would spin
+        /// the loop straight back into the same failure.
+        fn resume_fed_after_manual_signin(&mut self) {
+            if !matches!(self.fed_state, FedState::Stalled(_)) {
+                return;
+            }
+            let stalled_at = self.fed_stalled_at_mtime;
+            let now = credentials::credentials_mtime();
+            if now == stalled_at {
+                return;
+            }
+            self.log_info(
+                "fed_auth: credentials were renewed manually — resuming the automatic \
+                 refresh"
+                    .to_string(),
+            );
+            self.fed_stalled_at_mtime = None;
+            self.fed_state = FedState::Idle;
+            // Confirm with a real run rather than assuming; whatever it says
+            // drives the schedule from here.
+            self.fed_next_run_at = Some(Instant::now());
+        }
+
+        /// Spawn the worker for one `fed up` attempt.
+        fn start_fed_run(&mut self) {
+            self.fed_running = true;
+            self.fed_next_run_at = None;
+            self.fed_state = FedState::Running;
+            let cfg = self.fed_auth_cfg.clone();
+            let tx = self.fed_tx.clone();
+            std::thread::spawn(move || run_fed_worker(cfg, tx));
+        }
+
+        /// The status line for the toolbar, when the refresh has something
+        /// worth showing.
+        ///
+        /// Only a stand-down is red. A retry is amber — it is still working
+        /// and usually fixes itself, so painting it red would train the user
+        /// to ignore the colour that matters.
+        fn fed_status_line(&self) -> Option<(egui::Color32, String)> {
+            const RED: egui::Color32 = egui::Color32::from_rgb(220, 80, 80);
+            const AMBER: egui::Color32 = egui::Color32::from_rgb(220, 150, 60);
+            const GREY: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
+            match &self.fed_state {
+                FedState::Disabled | FedState::Idle | FedState::Authenticated => None,
+                FedState::Running => Some((GREY, "fed up: running…".to_string())),
+                // The code is shown as well as copied: if the clipboard was
+                // busy, or the user copied something else in between, this is
+                // the only place left to read it from.
+                FedState::AwaitingSignIn { code, .. } => Some((
+                    AMBER,
+                    format!("fed up: sign in on the page that opened — code {code} (copied)"),
+                )),
+                FedState::Retrying { error, attempt } => Some((
+                    AMBER,
+                    format!("fed up: attempt {attempt} failed — {error} Retrying…"),
+                )),
+                FedState::Stalled(error) => Some((RED, format!("fed up: {error}"))),
+            }
+        }
+
         fn poll_auth_expiry(&mut self) {
             if self.last_auth_expiry_check_at.elapsed() < AUTH_EXPIRY_CHECK_INTERVAL {
                 return;
@@ -15702,6 +16082,10 @@ mod gui {
                 self.poll_profile_choice_changes();
                 self.poll_credentials_changes();
                 self.poll_auth_expiry();
+                // Runs before the credential watcher on the next frame, so a
+                // successful `fed up` is picked up by the existing mtime poll
+                // rather than needing its own refresh path.
+                self.poll_fed_auth();
                 self.poll_ssh_config();
                 self.poll_port_tunnels();
                 self.poll_stale_connection_tabs();
@@ -16189,6 +16573,55 @@ mod gui {
                             ui.label(format!("Auth: {}", live_auth));
                         }
                     });
+
+                    // Automatic `fed up` refresh. Lives in the top bar rather
+                    // than the Connections toolbar because it runs at startup
+                    // and on a timer, so it has to be visible from any tab.
+                    if let Some((color, text)) = self.fed_status_line() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.colored_label(color, text);
+                            match &self.fed_state {
+                                // Stood down: offer a manual kick, since
+                                // otherwise the only way back is to sign in
+                                // and wait for the credentials file to move.
+                                FedState::Stalled(_) => {
+                                    if ui
+                                        .small_button("Retry")
+                                        .on_hover_text("Run fed up again now")
+                                        .clicked()
+                                    {
+                                        self.fed_retrying_since = None;
+                                        self.fed_stalled_at_mtime = None;
+                                        self.fed_next_run_at = Some(Instant::now());
+                                        self.fed_state = FedState::Idle;
+                                    }
+                                }
+                                // Mid sign-in: the page is already open and
+                                // the code copied, but a clipboard manager or
+                                // a stray copy can lose it.
+                                FedState::AwaitingSignIn { code, url } => {
+                                    let (code, url) = (code.clone(), url.clone());
+                                    if ui
+                                        .small_button("Copy code")
+                                        .on_hover_text("Put the activation code back on the clipboard")
+                                        .clicked()
+                                    {
+                                        ui.ctx().copy_text(code);
+                                    }
+                                    if ui
+                                        .small_button("Reopen page")
+                                        .on_hover_text(url.clone())
+                                        .clicked()
+                                    {
+                                        if let Err(e) = open_in_browser(&url) {
+                                            self.log_error(format!("fed_auth: {e}"));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        });
+                    }
 
                     ui.horizontal_wrapped(|ui| {
                         if ui

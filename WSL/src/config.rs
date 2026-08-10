@@ -1499,6 +1499,35 @@ mod tests {
     }
 
     #[test]
+    fn the_config_stores_nothing_for_the_fed_refresh() {
+        // Signing in is the user's job: the app runs `fed up`, opens the
+        // activation URL and copies the code, and that is all. It holds no
+        // federation credential of any kind, so nothing here should mention
+        // one. This also guards against a later "helpful" re-addition.
+        let cfg = AppConfig::default();
+        let text = cfg.to_text();
+        for banned in [
+            "fed_password",
+            "fed_pass",
+            "fed_secret",
+            "fed_blob",
+            "fed_username",
+        ] {
+            assert!(
+                !text.contains(banned),
+                "config.ini must carry no federation credential (found {banned})"
+            );
+        }
+        // Keys left behind by an earlier build are simply unknown and
+        // dropped, not carried forward.
+        let legacy =
+            AppConfig::parse("fed_password_blob=01000000d08c9d\nfed_username=bconrad\n");
+        let round_tripped = legacy.to_text();
+        assert!(!round_tripped.contains("fed_password_blob"));
+        assert!(!round_tripped.contains("fed_username"));
+    }
+
+    #[test]
     fn file_browser_paths_round_trip() {
         let mut cfg = AppConfig::default();
         cfg.set_file_browser_path("i-0abc123", "/home/efs/conrad1861");

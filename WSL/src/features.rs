@@ -72,6 +72,77 @@ pub struct Features {
     /// Outlook "access email" automation config (Windows only). Controls
     /// how the post-create email is encrypted and whether it may auto-send.
     pub access_email: AccessEmailConfig,
+    /// Automatic `fed up` credential refresh: who gets it and how it is timed.
+    pub fed_auth: FedAuthFeature,
+}
+
+/// The `fed_auth` section of `assets/features.json`.
+///
+/// Gates the automatic `fed up` refresh: the app runs the corporate
+/// federation CLI on startup and every 15 minutes, retrying a failure for 10
+/// minutes before standing down. When Okta asks for a device authorization it
+/// opens the activation URL and copies the code to the clipboard — the user
+/// signs in themselves.
+///
+/// It ships disabled with an empty allow-list and needs both, so a stray
+/// `["*"]` cannot switch it on for a whole site.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct FedAuthFeature {
+    /// Master switch. Off in the shipped file.
+    pub enabled: bool,
+    /// OS usernames allowed to use it (case-insensitive). `["*"]` means
+    /// everyone, an empty list means nobody. Shipped empty.
+    pub allowed_users: Vec<String>,
+    /// The command to run, as argv. Empty falls back to `["fed", "up"]`.
+    pub command: Vec<String>,
+    /// Seconds between attempts while retrying a failure. 0 uses the default
+    /// (120).
+    pub retry_interval_secs: u64,
+    /// Seconds to keep retrying before giving up. 0 uses the default (600).
+    pub retry_window_secs: u64,
+    /// Seconds between attempts once authenticated. 0 uses the default (900).
+    pub refresh_interval_secs: u64,
+}
+
+impl FedAuthFeature {
+    /// True when `user` may use the automatic refresh. Requires both the
+    /// master switch and the allow-list — see the note on [`FedAuthFeature`].
+    pub fn is_allowed_user(&self, user: &str) -> bool {
+        self.enabled && user_in_list(&self.allowed_users, user)
+    }
+
+    /// The command to run, falling back to `fed up`.
+    pub fn resolved_command(&self) -> Vec<String> {
+        let argv: Vec<String> = self
+            .command
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if argv.is_empty() {
+            vec!["fed".to_string(), "up".to_string()]
+        } else {
+            argv
+        }
+    }
+
+    /// The retry/refresh timings, with 0 meaning "use the default".
+    pub fn retry_policy(&self) -> crate::fed_auth::RetryPolicy {
+        let d = crate::fed_auth::RetryPolicy::default();
+        let or_default = |secs: u64, fallback: std::time::Duration| {
+            if secs == 0 {
+                fallback
+            } else {
+                std::time::Duration::from_secs(secs)
+            }
+        };
+        crate::fed_auth::RetryPolicy {
+            interval: or_default(self.retry_interval_secs, d.interval),
+            window: or_default(self.retry_window_secs, d.window),
+            steady: or_default(self.refresh_interval_secs, d.steady),
+        }
+    }
 }
 
 /// Shared allow-list match used by every `allowed_users` gate: OS username,
@@ -344,6 +415,9 @@ impl Default for Features {
             personal_scripts: PersonalScriptsFeature::default(),
             vault_iam: VaultIamFeature::default(),
             access_email: AccessEmailConfig::default(),
+            // Derived Default: `enabled` false and an empty allow-list, which
+            // is the fail-closed state this feature must land in.
+            fed_auth: FedAuthFeature::default(),
         }
     }
 }
@@ -397,6 +471,13 @@ impl Features {
     pub fn vault_iam_delete_enabled_for(&self, user: &str) -> bool {
         self.vault_iam.is_allowed_user(user)
             && self.vault_iam.is_delete_allowed_user(user)
+    }
+
+    /// True when the automatic `fed up` login should run for `user`. Fails
+    /// closed twice over: a malformed features.json leaves `enabled` false
+    /// *and* the allow-list empty.
+    pub fn fed_auth_enabled_for(&self, user: &str) -> bool {
+        self.fed_auth.is_allowed_user(user)
     }
 
     /// Host the git credential store is scoped to.
@@ -631,6 +712,87 @@ mod tests {
             "assets/features.json must ship an empty delete_allowed_users"
         );
     }
+
+    #[test]
+    fn shipped_features_keep_the_fed_refresh_off() {
+        // The refresh runs a corporate CLI on a timer and pops a browser
+        // window. That is opt-in per site: an admin has to set enabled AND
+        // name the user.
+        let f = load();
+        assert!(
+            !f.fed_auth_enabled_for("any.user"),
+            "assets/features.json must ship fed_auth disabled with an empty allow-list"
+        );
+        assert!(!f.fed_auth.enabled, "fed_auth.enabled must ship false");
+        assert!(
+            f.fed_auth.allowed_users.is_empty(),
+            "fed_auth.allowed_users must ship empty"
+        );
+    }
+
+    #[test]
+    fn the_fed_refresh_needs_both_the_switch_and_the_list() {
+        // Either half alone is not enough — a stray ["*"] must not switch this
+        // on for a whole site, and `enabled` must not switch it on for users
+        // nobody named.
+        let list_only: Features =
+            serde_json::from_str(r#"{"fed_auth":{"allowed_users":["*"]}}"#).expect("parses");
+        assert!(!list_only.fed_auth_enabled_for("bconrad"));
+
+        let switch_only: Features =
+            serde_json::from_str(r#"{"fed_auth":{"enabled":true}}"#).expect("parses");
+        assert!(!switch_only.fed_auth_enabled_for("bconrad"));
+
+        let both: Features =
+            serde_json::from_str(r#"{"fed_auth":{"enabled":true,"allowed_users":["bconrad"]}}"#)
+                .expect("parses");
+        assert!(both.fed_auth_enabled_for("bconrad"));
+        assert!(both.fed_auth_enabled_for("BConrad"), "case-insensitive");
+        assert!(!both.fed_auth_enabled_for("someone.else"));
+        assert!(!both.fed_auth_enabled_for(""), "unknown user fails closed");
+    }
+
+    #[test]
+    fn the_fed_refresh_fails_closed_when_absent_or_malformed() {
+        let absent: Features = serde_json::from_str("{}").expect("parses");
+        assert!(!absent.fed_auth_enabled_for("bconrad"));
+        assert!(!Features::default().fed_auth_enabled_for("bconrad"));
+    }
+
+    #[test]
+    fn the_fed_command_falls_back_to_fed_up() {
+        let f: Features = serde_json::from_str("{}").expect("parses");
+        assert_eq!(f.fed_auth.resolved_command(), vec!["fed", "up"]);
+        // Blank entries are dropped, not passed through as empty argv slots.
+        let blanks: Features =
+            serde_json::from_str(r#"{"fed_auth":{"command":["  ",""]}}"#).expect("parses");
+        assert_eq!(blanks.fed_auth.resolved_command(), vec!["fed", "up"]);
+        let custom: Features =
+            serde_json::from_str(r#"{"fed_auth":{"command":["fed","up","--profile","x"]}}"#)
+                .expect("parses");
+        assert_eq!(
+            custom.fed_auth.resolved_command(),
+            vec!["fed", "up", "--profile", "x"]
+        );
+    }
+
+    #[test]
+    fn zero_timings_mean_use_the_defaults() {
+        let f: Features = serde_json::from_str("{}").expect("parses");
+        assert_eq!(f.fed_auth.retry_policy(), crate::fed_auth::RetryPolicy::default());
+        let custom: Features = serde_json::from_str(
+            r#"{"fed_auth":{"retry_interval_secs":30,"retry_window_secs":0}}"#,
+        )
+        .expect("parses");
+        let p = custom.fed_auth.retry_policy();
+        assert_eq!(p.interval, std::time::Duration::from_secs(30));
+        assert_eq!(
+            p.window,
+            crate::fed_auth::RetryPolicy::default().window,
+            "0 keeps the default rather than meaning 'never retry'"
+        );
+    }
+
 
     #[test]
     fn vault_iam_delete_follows_its_own_list() {

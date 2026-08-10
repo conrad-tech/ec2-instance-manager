@@ -51,5 +51,14 @@
     "encrypt_permission_service": 1,
     "encrypt_smime_flag": 0,
     "encrypt_sendkeys": "%6"
+  },
+  "_fed_auth_comment": "Automatic 'fed up' refresh. Runs the federation CLI at startup and every refresh_interval_secs. A failure retries every retry_interval_secs for up to retry_window_secs, then stands down and waits for you to sign in by hand — the timer resumes on its own once ~/.aws/credentials is renewed. When Okta asks for a device authorization the app opens the activation URL and copies the code to your clipboard; you paste it and do the username, password and MFA yourself. The app never stores a password and never synthesises a keystroke. Ships disabled with an empty allow-list and needs BOTH 'enabled': true and a named user. Zero timings mean use the defaults (120 / 600 / 900 seconds).",
+  "fed_auth": {
+    "enabled": false,
+    "allowed_users": [],
+    "command": ["fed", "up"],
+    "retry_interval_secs": 120,
+    "retry_window_secs": 600,
+    "refresh_interval_secs": 900
   }
 }

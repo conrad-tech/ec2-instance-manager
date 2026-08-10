@@ -1,0 +1,348 @@
+//! Classification and scheduling for the automatic `fed up` refresh.
+//!
+//! The GUI runs the corporate `fed up` command on startup and on a timer so
+//! the user never has to remember to refresh their AWS credentials by hand.
+//! This module holds the parts that can be reasoned about without a Windows
+//! box or an Okta tenant: what one run's output *meant*, and when to run it
+//! again.
+//!
+//! **Signing in is the user's job.** When Okta asks for a device
+//! authorization the app opens the activation URL and puts the code on the
+//! clipboard — then stops. The code, username, password and MFA confirmation
+//! are all typed by the person at the keyboard. Nothing here stores a
+//! password or synthesises a keystroke.
+//!
+//! **The output patterns are best-effort.** `fed` is a corporate tool that
+//! could not be run while this was written, so the classification leans on
+//! the process exit code first and treats the text as corroboration. Every
+//! run's raw output is logged by the caller precisely so these patterns can
+//! be tightened against the real thing.
+
+use std::time::Duration;
+
+/// The verdict for a **completed** `fed up`.
+///
+/// A device-authorization prompt is not a verdict — `fed` prints it partway
+/// through and then blocks waiting for approval — so it is handled while the
+/// output streams (see [`parse_device_code`]) and does not appear here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FedOutcome {
+    /// Exited cleanly — credentials are good.
+    Authenticated,
+    /// The run failed. Carries a one-line summary for the status panel.
+    Failed(String),
+}
+
+/// Why the automatic refresh failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FedError {
+    /// `fed up` reported an error, or could not be run at all.
+    Command(String),
+    /// The retry window closed with every attempt failing. Carries the last
+    /// error, so the status line still names a cause rather than just
+    /// "gave up".
+    GaveUp(Box<FedError>),
+}
+
+impl std::fmt::Display for FedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Command(msg) => write!(f, "fed up failed: {msg}"),
+            Self::GaveUp(last) => write!(
+                f,
+                "gave up after the retry window — last error: {last}. \
+                 Sign in manually; the 15-minute refresh resumes on its own \
+                 once your credentials are renewed."
+            ),
+        }
+    }
+}
+
+/// Timings for the retry loop. Field values come from features.json so a site
+/// with a slower `fed` can widen them without a rebuild.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Gap between attempts while retrying after a failure.
+    pub interval: Duration,
+    /// Total time to keep retrying before giving up and waiting for the user.
+    pub window: Duration,
+    /// Gap between attempts once authenticated.
+    pub steady: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(120),
+            window: Duration::from_secs(600),
+            steady: Duration::from_secs(900),
+        }
+    }
+}
+
+/// Text that means the run failed, matched case-insensitively.
+///
+/// Only consulted when the exit code is unavailable — a process that exited 0
+/// is taken at its word, since ordinary progress output ("0 errors") would
+/// otherwise trip these.
+const FAILURE_MARKERS: &[&str] = &[
+    "error",
+    "failed",
+    "unable to",
+    "unauthorized",
+    "access denied",
+    "timed out",
+    "timeout",
+    "not logged in",
+    "could not",
+];
+
+/// Pull the activation URL and code out of `fed up`'s device-authorization
+/// line, e.g.
+///
+/// ```text
+/// Go to https://example.okta.com/activate and enter code MXKD-9QRP
+/// ```
+///
+/// Fed one line at a time while the command streams, so the browser opens
+/// while `fed` is still waiting rather than after it gives up.
+///
+/// Deliberately loose: it takes the first `https://` token and the first
+/// token after "enter code", rather than matching the sentence as a whole, so
+/// a reworded prompt keeps working. Returns `None` unless **both** are found
+/// — a URL with no code is nothing the user can act on.
+pub fn parse_device_code(text: &str) -> Option<(String, String)> {
+    let url = text
+        .split_whitespace()
+        .find(|t| t.starts_with("https://") || t.starts_with("http://"))
+        .map(|t| t.trim_end_matches(['.', ',', ')', '"', '\'']).to_string())?;
+
+    let lower = text.to_ascii_lowercase();
+    let idx = lower.find("enter code")? + "enter code".len();
+    let code = text[idx..]
+        .split_whitespace()
+        .next()?
+        .trim_end_matches(['.', ',', ')', '"', '\''])
+        .to_string();
+    if code.is_empty() {
+        return None;
+    }
+    Some((url, code))
+}
+
+/// Interpret a finished `fed up`.
+///
+/// `output` is stdout and stderr together; `exit_code` is `None` when the
+/// process could not be waited on. Any device-authorization prompt in the
+/// output is ignored here — by the time the process has exited, whether the
+/// user completed the sign-in is what the exit code says.
+pub fn classify_exit(output: &str, exit_code: Option<i32>) -> FedOutcome {
+    match exit_code {
+        Some(0) => FedOutcome::Authenticated,
+        Some(code) => FedOutcome::Failed(
+            last_meaningful_line(output)
+                .unwrap_or_else(|| format!("fed up exited with code {code}")),
+        ),
+        None => {
+            let lower = output.to_ascii_lowercase();
+            if FAILURE_MARKERS.iter().any(|m| lower.contains(m)) {
+                FedOutcome::Failed(
+                    last_meaningful_line(output)
+                        .unwrap_or_else(|| "fed up reported an error".to_string()),
+                )
+            } else {
+                FedOutcome::Authenticated
+            }
+        }
+    }
+}
+
+/// The line to show the user for a failure: the last non-blank line, which is
+/// where a CLI usually puts its error.
+fn last_meaningful_line(output: &str) -> Option<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .map(|l| l.chars().take(200).collect())
+}
+
+/// How long to wait before running `fed up` again.
+///
+/// `retrying_for` is how long we have already been retrying this failure —
+/// zero for the first failure after a good run. `None` means the retry window
+/// is exhausted: stop, and wait for the user to sign in by hand.
+pub fn next_delay(
+    policy: &RetryPolicy,
+    outcome: &FedOutcome,
+    retrying_for: Duration,
+) -> Option<Duration> {
+    match outcome {
+        FedOutcome::Authenticated => Some(policy.steady),
+        FedOutcome::Failed(_) => {
+            // The attempt that would land past the window is not worth
+            // making: give up now rather than sleeping two minutes to time
+            // out anyway.
+            if retrying_for + policy.interval > policy.window {
+                None
+            } else {
+                Some(policy.interval)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The line as it appears in `fed up`'s own output.
+    const PROMPT: &str =
+        "Go to https://example.okta.com/activate and enter code MXKD-9QRP";
+
+    #[test]
+    fn the_activation_url_and_code_are_pulled_out_of_the_prompt() {
+        assert_eq!(
+            parse_device_code(PROMPT),
+            Some((
+                "https://example.okta.com/activate".to_string(),
+                "MXKD-9QRP".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn the_prompt_is_found_among_other_output() {
+        let out = format!("checking session...\n{PROMPT}\nwaiting for approval\n");
+        let (url, code) = parse_device_code(&out).expect("prompt is still found");
+        assert_eq!(url, "https://example.okta.com/activate");
+        assert_eq!(code, "MXKD-9QRP");
+    }
+
+    #[test]
+    fn trailing_punctuation_is_not_part_of_the_code() {
+        let (url, code) =
+            parse_device_code("Go to https://x.okta.com/activate. and enter code ABCD1234.")
+                .expect("parses");
+        assert_eq!(url, "https://x.okta.com/activate");
+        assert_eq!(code, "ABCD1234");
+    }
+
+    #[test]
+    fn output_without_both_halves_is_not_a_device_prompt() {
+        // A URL with no code leaves the user nothing to paste, and a code
+        // with no URL leaves them nowhere to paste it.
+        assert_eq!(parse_device_code("see https://example.okta.com/help"), None);
+        assert_eq!(parse_device_code("enter code ABCD1234"), None);
+        assert_eq!(parse_device_code(""), None);
+    }
+
+    #[test]
+    fn a_clean_exit_is_authenticated() {
+        assert_eq!(classify_exit("", Some(0)), FedOutcome::Authenticated);
+        assert_eq!(
+            classify_exit("Session refreshed for account 1234\n", Some(0)),
+            FedOutcome::Authenticated
+        );
+    }
+
+    #[test]
+    fn a_completed_run_is_judged_on_its_exit_code_not_the_prompt() {
+        // The prompt is expected partway through — it was already acted on
+        // while the output streamed. What matters at exit is whether the
+        // user finished signing in.
+        assert_eq!(classify_exit(PROMPT, Some(0)), FedOutcome::Authenticated);
+        assert!(matches!(
+            classify_exit(PROMPT, Some(1)),
+            FedOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn a_nonzero_exit_is_a_failure_carrying_the_last_line() {
+        let out = "connecting\nError: could not reach the identity provider\n";
+        match classify_exit(out, Some(1)) {
+            FedOutcome::Failed(msg) => assert!(msg.contains("could not reach"), "{msg}"),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_nonzero_exit_with_no_output_still_names_the_code() {
+        match classify_exit("", Some(3)) {
+            FedOutcome::Failed(msg) => assert!(msg.contains('3'), "{msg}"),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn without_an_exit_code_the_text_decides() {
+        assert!(matches!(
+            classify_exit("Error: unauthorized", None),
+            FedOutcome::Failed(_)
+        ));
+        assert_eq!(
+            classify_exit("Session is current", None),
+            FedOutcome::Authenticated
+        );
+    }
+
+    #[test]
+    fn a_clean_exit_is_taken_at_its_word() {
+        // Progress text can legitimately contain the word "error" — the exit
+        // code is the authority when we have one, or a successful run whose
+        // summary mentions "0 errors" would loop forever.
+        assert_eq!(
+            classify_exit("0 errors, 0 warnings\n", Some(0)),
+            FedOutcome::Authenticated
+        );
+    }
+
+    #[test]
+    fn success_schedules_the_steady_refresh() {
+        let p = RetryPolicy::default();
+        assert_eq!(
+            next_delay(&p, &FedOutcome::Authenticated, Duration::ZERO),
+            Some(Duration::from_secs(900))
+        );
+    }
+
+    #[test]
+    fn failures_retry_every_two_minutes_until_the_window_closes() {
+        let p = RetryPolicy::default();
+        let fail = FedOutcome::Failed("nope".to_string());
+        // 0, 2, 4, 6, 8 minutes in: another 2-minute wait still lands inside
+        // the 10-minute window.
+        for minutes in [0, 2, 4, 6, 8] {
+            assert_eq!(
+                next_delay(&p, &fail, Duration::from_secs(minutes * 60)),
+                Some(Duration::from_secs(120)),
+                "{minutes}m in"
+            );
+        }
+        // At 9 minutes the next attempt would land at 11 — past the window,
+        // so stop and wait for the user rather than sleep two minutes to fail
+        // anyway.
+        assert_eq!(next_delay(&p, &fail, Duration::from_secs(9 * 60)), None);
+        assert_eq!(next_delay(&p, &fail, Duration::from_secs(10 * 60)), None);
+    }
+
+    #[test]
+    fn giving_up_names_the_cause_and_says_what_happens_next() {
+        let msg =
+            FedError::GaveUp(Box::new(FedError::Command("no network".to_string()))).to_string();
+        assert!(msg.contains("no network"), "{msg}");
+        // The user has to know the loop comes back on its own, or they will
+        // assume the feature is dead until they restart the app.
+        assert!(msg.contains("resumes"), "{msg}");
+    }
+
+    #[test]
+    fn the_shipped_policy_matches_the_documented_timings() {
+        // 2-minute retries for 10 minutes, then a 15-minute refresh.
+        let p = RetryPolicy::default();
+        assert_eq!(p.interval, Duration::from_secs(2 * 60));
+        assert_eq!(p.window, Duration::from_secs(10 * 60));
+        assert_eq!(p.steady, Duration::from_secs(15 * 60));
+    }
+}

@@ -7,6 +7,7 @@ pub mod connection_tabs;
 pub mod credentials;
 pub mod diagnostics;
 pub mod error;
+pub mod fed_auth;
 pub mod features;
 pub mod filter;
 pub mod forwards;
