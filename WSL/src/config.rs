@@ -302,6 +302,36 @@ impl AppConfig {
             .unwrap_or_else(|| "ec2-user".to_string())
     }
 
+    /// The pem saved for **this environment only** — no per-instance
+    /// override, no account-wide fallback.
+    ///
+    /// [`Self::resolve_pem`] layers instance → environment → account, which
+    /// is right for Open in VS Code: an account with one environment sets a
+    /// key once in Settings and every box inherits it. It is wrong for an
+    /// account hosting several environments, where inheriting means an
+    /// environment nobody has configured quietly connects with another
+    /// environment's key — and reports success while doing it.
+    pub fn env_pem(&self, profile_id: &str, env: &str) -> Option<String> {
+        self.ssh_pem_default
+            .get(&Self::vscode_key(profile_id, env))
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+    }
+
+    /// The login saved for **this environment only**, falling back to
+    /// `ec2-user` but never to the account-wide entry.
+    ///
+    /// `ec2-user` is a real default — the AMI's own account — rather than
+    /// another environment's answer, so inheriting *it* is safe in a way that
+    /// inheriting a sibling environment's login is not.
+    pub fn env_ssh_user(&self, profile_id: &str, env: &str) -> String {
+        self.ssh_user_default
+            .get(&Self::vscode_key(profile_id, env))
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| "ec2-user".to_string())
+    }
+
     /// Whether "don't ask again" was ticked for this environment.
     ///
     /// Deliberately does *not* fall back to the account-wide entry when the
@@ -475,7 +505,25 @@ impl AppConfig {
     /// no environment dimension — collapses to the bare account id, which is
     /// also the key older builds wrote, so those accounts keep exactly one
     /// entry across the upgrade.
+    ///
+    /// The environment is **upper-cased**, for the same reason
+    /// [`Self::vscode_key`] upper-cases it: the tag is free text, and `dev1`
+    /// and `DEV1` are one environment everywhere else in the app. Without
+    /// this an account whose instances are tagged inconsistently gets one pem
+    /// entry but two bastion entries. Builds before this wrote the tag's own
+    /// casing, which [`Self::bastion_key_legacy`] still reads.
     fn bastion_key(account_id: &str, env: &str) -> String {
+        let env = env.trim();
+        if env.is_empty() {
+            account_id.to_string()
+        } else {
+            format!("{account_id}.{}", env.to_uppercase())
+        }
+    }
+
+    /// The pre-upper-casing spelling of [`Self::bastion_key`], read so an
+    /// existing selection survives the change rather than needing re-picking.
+    fn bastion_key_legacy(account_id: &str, env: &str) -> String {
         let env = env.trim();
         if env.is_empty() {
             account_id.to_string()
@@ -491,10 +539,38 @@ impl AppConfig {
     /// per-environment selection, so an existing saved pair is offered as the
     /// starting value the first time a newly-split account is opened.
     pub fn bastion_selection(&self, account_id: &str, env: &str) -> Option<(String, String)> {
+        self.env_bastion_selection(account_id, env).or_else(|| {
+            Self::split_bastion_pair(self.bastion_selections.get(account_id)?)
+        })
+    }
+
+    /// The pair saved for **this environment only**, with no fall back to the
+    /// account-wide entry.
+    ///
+    /// An account hosting several environments has one bastion pair per
+    /// environment, so inheriting the account entry means whichever
+    /// environment was configured first silently becomes the default for the
+    /// rest — and a dialog prefilled that way is one careless Save from
+    /// writing the wrong boxes as this environment's own. The Port Forwards
+    /// window uses this; the Scripts dialogs keep the inheriting
+    /// [`Self::bastion_selection`], whose fallback is what carries a
+    /// pre-per-environment selection forward.
+    pub fn env_bastion_selection(
+        &self,
+        account_id: &str,
+        env: &str,
+    ) -> Option<(String, String)> {
         let raw = self
             .bastion_selections
             .get(&Self::bastion_key(account_id, env))
-            .or_else(|| self.bastion_selections.get(account_id))?;
+            .or_else(|| {
+                self.bastion_selections
+                    .get(&Self::bastion_key_legacy(account_id, env))
+            })?;
+        Self::split_bastion_pair(raw)
+    }
+
+    fn split_bastion_pair(raw: &str) -> Option<(String, String)> {
         let mut parts = raw.splitn(2, '|');
         let primary = parts.next().unwrap_or("").to_string();
         let secondary = parts.next().unwrap_or("").to_string();
@@ -1269,6 +1345,95 @@ fn parse_port_forward_preset(raw: &str) -> Option<PortForwardPreset> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of the strict accessors: an account hosting two
+    /// environments must not let the one configured first become the
+    /// default for the other. `resolve_*` deliberately still inherits —
+    /// that is what Open in VS Code relies on.
+    #[test]
+    fn env_lookups_do_not_inherit_the_account_entry() {
+        let mut cfg = AppConfig::default();
+        // An account-wide entry, as the Settings dialog writes it.
+        cfg.set_vscode_defaults("123456789012", "", "/keys/account.pem", "shared");
+        cfg.set_bastion_selection("123456789012", "", "i-0account", "");
+
+        // The inheriting resolvers see it...
+        assert_eq!(
+            cfg.resolve_pem("123456789012", "DEV2", "i-0x").as_deref(),
+            Some("/keys/account.pem")
+        );
+        assert_eq!(cfg.resolve_ssh_user("123456789012", "DEV2"), "shared");
+        assert!(cfg.bastion_selection("123456789012", "DEV2").is_some());
+
+        // ...the strict ones do not.
+        assert_eq!(cfg.env_pem("123456789012", "DEV2"), None);
+        assert_eq!(cfg.env_ssh_user("123456789012", "DEV2"), "ec2-user");
+        assert_eq!(cfg.env_bastion_selection("123456789012", "DEV2"), None);
+    }
+
+    /// Two environments in one account keep entirely separate entries.
+    #[test]
+    fn env_lookups_keep_two_environments_apart() {
+        let mut cfg = AppConfig::default();
+        cfg.set_port_forward_login(
+            "123456789012",
+            "DEV1",
+            "i-0dev1",
+            "",
+            "alice",
+            "/keys/dev1.pem",
+        );
+        cfg.set_port_forward_login(
+            "123456789012",
+            "DEV2",
+            "i-0dev2",
+            "",
+            "bob",
+            "/keys/dev2.pem",
+        );
+
+        assert_eq!(cfg.env_pem("123456789012", "DEV1").as_deref(), Some("/keys/dev1.pem"));
+        assert_eq!(cfg.env_pem("123456789012", "DEV2").as_deref(), Some("/keys/dev2.pem"));
+        assert_eq!(cfg.env_ssh_user("123456789012", "DEV1"), "alice");
+        assert_eq!(cfg.env_ssh_user("123456789012", "DEV2"), "bob");
+        assert_eq!(
+            cfg.env_bastion_selection("123456789012", "DEV1"),
+            Some(("i-0dev1".to_string(), String::new()))
+        );
+        assert_eq!(
+            cfg.env_bastion_selection("123456789012", "DEV2"),
+            Some(("i-0dev2".to_string(), String::new()))
+        );
+    }
+
+    /// `MMODAL_ENV` is free text, so `dev1` and `DEV1` are one environment.
+    /// `vscode_key` has always upper-cased for this reason; `bastion_key`
+    /// did not, which gave such an account one pem entry but two bastion
+    /// entries.
+    #[test]
+    fn bastion_selection_ignores_environment_casing() {
+        let mut cfg = AppConfig::default();
+        cfg.set_bastion_selection("123456789012", "dev1", "i-0primary", "i-0secondary");
+        assert_eq!(
+            cfg.env_bastion_selection("123456789012", "DEV1"),
+            Some(("i-0primary".to_string(), "i-0secondary".to_string()))
+        );
+    }
+
+    /// A pair written by a build that stored the tag's own casing is still
+    /// found, so upper-casing the key does not make anyone re-pick.
+    #[test]
+    fn bastion_selection_reads_a_legacy_lowercase_key() {
+        let mut cfg = AppConfig::default();
+        cfg.bastion_selections.insert(
+            "123456789012.dev1".to_string(),
+            "i-0old|i-0oldsecond".to_string(),
+        );
+        assert_eq!(
+            cfg.env_bastion_selection("123456789012", "dev1"),
+            Some(("i-0old".to_string(), "i-0oldsecond".to_string()))
+        );
+    }
 
     /// All four values land under the keys the rest of the app already
     /// reads, so fixing a login here fixes Open in VS Code and the Scripts

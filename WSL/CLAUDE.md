@@ -410,7 +410,7 @@ by default per environment; the opt-*out* is stored (`forward_ports_off.<id>.<EN
 
 ### Port Forwards: the Login dialog, and bastion failover
 
-**The Login… button is on every row, not only broken ones.** The case it
+**The Setup button is on every row, not only broken ones.** The case it
 exists for is a setup that worked and stopped — a terminated bastion, a
 deleted login, a rotated key — which looks identical to a working row until
 the tunnel dies.
@@ -422,6 +422,70 @@ the tunnel dies.
   Vault IAM, which is why that change is logged at warn and stated in the
   dialog. An empty secondary is stored as empty, never refused — plenty of
   environments have one box.
+- **`src/probe.rs` verifies a forward end to end.** Surviving
+  `TUNNEL_PROVEN_AFTER` proves ssh **bound** the local ports; it proves
+  nothing about the far side, because ssh only opens the remote connection
+  when a forward is first *used*. So a listener can sit there looking healthy
+  and fail the moment a browser hits it. One `curl` through the tunnel
+  settles it, and the row then says `verified` or `nothing answering through
+  it` rather than implying either.
+  - **The endpoint is the environment's `vault_addr`**, and an environment
+    without one is `Skipped`, not failed — the check is opt-in by
+    configuration. Vault must also be among that environment's forwards, or
+    the request would leave via the machine's own network and "verify"
+    something this tunnel has nothing to do with.
+  - **Reaching the server is the test, not the reply.** Vault answers
+    `/v1/sys/health` with 429/472/501/503 when standby, DR, uninitialised or
+    sealed — all working forwards. Even a TLS complaint proves bytes crossed.
+    Only a connect failure or timeout means `Unreachable`. `-k` is set
+    because this is reachability, not authentication.
+  - **`--resolve` pins the name to the local bind**, so the probe works with
+    no hosts entry (most users have none) while keeping the hostname in the
+    URL for SNI and `Host`.
+  - **curl failing is `Inconclusive`, never `Unreachable`.** Reporting "not
+    forwarded" because curl is missing would send someone to debug a healthy
+    tunnel.
+  - Runs **once per session**, cleared whenever the tunnel is replaced, so a
+    restart or failover re-verifies. It is a `curl` per tunnel lifetime, not
+    per poll.
+- **A bastion dropdown with exactly one candidate selects it**
+  (`sole_bastion_candidate`). It counts candidates *after* the dropdown's own
+  filter via the shared `bastion_candidates`, or it would pick something the
+  list does not show. It only fills an **empty** field — a saved selection,
+  including a stale one, is left alone, since silently replacing a terminated
+  bastion hides what the dialog flags. The secondary excludes the primary
+  from its pool: an environment with one bastion gets a primary and no
+  failover, which is the correct answer.
+- **The Status column shows uptime, not "running".** `is_running` is
+  `try_wait` — it only says the ssh *process* exists, and `Tunnel::spawn`
+  returns the moment it does, while an auth failure or a refused bind takes
+  another second or two to arrive. A bare "running · N forward(s)" therefore
+  read identically for a healthy session and one about to die, and with the
+  15s restart poll a permanently broken environment claimed to be running for
+  part of every cycle. Under `TUNNEL_PROVEN_AFTER` (10s) the row says
+  `connecting… 3s`; past it, `up 4m · 3 forward(s)`. Surviving that long means
+  ssh authenticated and bound every forward, since `ExitOnForwardFailure=yes`
+  would have killed it otherwise. Uptime is also what distinguishes a working
+  tunnel from one being restarted every poll — the latter never gets past
+  seconds. The window requests a repaint while anything is connecting, or the
+  counter would look stuck exactly when it is being watched.
+- **Port Forwards reads strictly per environment — no account fallback.**
+  `env_pem`, `env_ssh_user` and `env_bastion_selection` look up the exact
+  `<account>.<ENV>` key only. The inheriting `resolve_pem` /
+  `resolve_ssh_user` / `bastion_selection` still exist and are still right
+  for Open in VS Code and the Scripts dialogs, where an account with one
+  environment sets a value once in Settings and everything inherits it. They
+  are wrong here: several accounts host **two** environments, so inheriting
+  means whichever environment was configured first silently becomes the
+  default for the other — the tunnel connects with the wrong key, and the
+  Setup dialog prefilled that way is one Save from writing those values as
+  this environment's own. `env_ssh_user` still defaults to `ec2-user`, since
+  that is the AMI's own account rather than a sibling environment's answer.
+- **`bastion_key` upper-cases the environment**, as `vscode_key` always has.
+  `MMODAL_ENV` is free text, so an account tagged `dev1` on some instances
+  and `DEV1` on others previously got one pem entry but *two* bastion
+  entries. `bastion_key_legacy` still reads the old tag-cased spelling, so
+  an existing selection survives the change without being re-picked.
 - **A saved bastion missing from the inventory is kept and flagged**
   (`port_forward_login_bastion`), not cleared the way
   `retain_available_bastion` clears it for the Scripts dialogs. The
@@ -614,6 +678,20 @@ existing selections survive; an empty `env` normalizes back to that key.
 Because an inherited pair can name a box from elsewhere,
 `retain_available_bastion` clears any id not present in the selected
 environment — otherwise the dialog opens pre-aimed at the wrong hosts.
+
+**A dropdown offering exactly one bastion preselects it**, here as in the Port
+Forwards login dialog — `sole_bastion_candidate` and `sole_secondary_bastion`
+are shared, so the rules under "Port Forwards: the Login dialog" hold for
+these dialogs too (fills only an empty field, counts candidates *after* the
+filter, and never repeats the primary as the secondary).
+
+What is specific to the Scripts dialogs is *where* it runs: inside
+`load_bastion_pair`, which all three call on open **and** again on every
+Environment change. So switching the dropdown to a one-bastion environment
+prefills it, rather than only the environment the dialog happened to open on.
+The secondary's exclusion of the primary matters more here than for the
+tunnel: a pair naming one box makes the user scripts run their commands on it
+twice.
 
 ### Vault IAM Access (Scripts menu)
 

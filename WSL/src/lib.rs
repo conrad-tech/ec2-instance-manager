@@ -15,6 +15,7 @@ pub mod gui_cli;
 pub mod inventory;
 pub mod models;
 pub mod obf_core;
+pub mod probe;
 pub mod profile_choice;
 pub mod script_env;
 pub mod sim;
