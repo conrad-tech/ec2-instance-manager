@@ -408,6 +408,73 @@ by default per environment; the opt-*out* is stored (`forward_ports_off.<id>.<EN
   a session that drops and recovers inside the 15s poll would otherwise leave
   no trace on screen, and these processes are invisible.
 
+### Port Forwards: the Login dialog, and bastion failover
+
+**The Login… button is on every row, not only broken ones.** The case it
+exists for is a setup that worked and stopped — a terminated bastion, a
+deleted login, a rotated key — which looks identical to a working row until
+the tunnel dies.
+
+- **It writes the keys everything else reads**, via
+  `AppConfig::set_port_forward_login`: the pem and login are what Open in VS
+  Code resolves, and the bastions are the pair the Scripts dialogs share.
+  Changing the primary re-aims Bastion New User, Bastion User Delete and
+  Vault IAM, which is why that change is logged at warn and stated in the
+  dialog. An empty secondary is stored as empty, never refused — plenty of
+  environments have one box.
+- **A saved bastion missing from the inventory is kept and flagged**
+  (`port_forward_login_bastion`), not cleared the way
+  `retain_available_bastion` clears it for the Scripts dialogs. The
+  terminated instance is the diagnosis; blanking the field turns "this broke"
+  into "you never configured this".
+
+**The secondary bastion is a failover, not just a Scripts setting.**
+`start_port_tunnel` walks the pair via `tunnel_attempt_order`.
+
+- **A bastion that will not resolve is skipped immediately** and the next is
+  tried in the same call.
+- **A session that dies young fails the bastion over.** The test is
+  `Tunnel::age` at the moment the death is noticed, not the reason given: a
+  session that never connected dies in seconds, while an old one is a good
+  tunnel dropping, and moving that to the backup would be an overreaction.
+  The 30s threshold has to clear the 15s poll — a session that died at 2s may
+  not be noticed for another 15.
+- **Sticky, and the rotation keeps every bastion.** A tunnel happily up on
+  the secondary is not disturbed to go back; a failure *on* the secondary
+  falls back to the primary, or one outage on the backup would leave nothing
+  to try.
+- **The preference is in memory only.** Which box a tunnel happens to be on
+  is a fact about this run. Persisting it would mean an outage during one
+  session quietly re-aimed every later one.
+- **The Bastion column shows the box actually carrying the session**, flagged
+  `(secondary)`. An environment quietly running on its backup otherwise looks
+  exactly like a healthy one.
+
+**Test login is the real tunnel, not a probe.** It spawns through
+`Tunnel::spawn` with the actual `-L` forwards under
+`ExitOnForwardFailure=yes` — port binding is where these sessions actually
+die, so a connection-only test would pass on a setup that cannot forward.
+`resolve_tunnel_launch` is shared with `start_port_tunnel`, so there is one
+definition of "can this connect", and the test walks the same failover order.
+
+- **The environment's tunnel is stopped first and the passing session is
+  adopted.** A byte-identical session binds the same ports, so leaving the
+  old one up fails the test with `Address already in use` *because* the thing
+  works; and respawning after a pass would throw away the session just proven.
+- **`login_test_in_flight` makes `poll_port_tunnels` and `sync_port_tunnels`
+  skip that environment** for the duration. Without it the poll starts a
+  competing session on the same ports and `ExitOnForwardFailure` kills both.
+- **The watch is frame-polled, never blocking.** `is_running` is `try_wait`,
+  the same idiom as `poll_port_tunnels`; egui is immediate mode and a 5s wait
+  would freeze the app. `TestState::Running` owns the `Tunnel`, so closing the
+  dialog mid-test kills the child via `Drop`.
+- **Failure hints annotate stderr, never replace it**
+  (`classify_tunnel_failure` returns `None` for anything unfamiliar). A
+  confident wrong hint sends the user to change the wrong field.
+- **Elapsed time is in both result log lines** because "should this be quick?"
+  is otherwise unanswerable from the log, and the dialog counts up live so a
+  slow connect looks slow rather than hung.
+
 ### Instance search
 
 `filter::searchable_text` is the *whole* haystack for the search box —

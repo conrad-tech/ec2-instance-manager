@@ -73,19 +73,56 @@ struct PortForwardLoginDialog {
     account_id: String,
     env: String,
     label: String,
-    bastion_id: String,
-    bastion_label: String,
-    bastion_query: String,
+    primary_id: String,
+    primary_label: String,
+    primary_query: String,
+    secondary_id: String,
+    secondary_label: String,
+    secondary_query: String,
     user: String,
     pem: String,
     test: TestState,
 }
 ```
 
-Three fields, all reusing widgets that exist:
+Four fields, all reusing widgets that exist:
 
-- **Bastion** — `bastion_combo_ui`, given the instance list narrowed to this
-  environment, exactly as the Scripts dialogs narrow theirs.
+- **Primary bastion** — `bastion_combo_ui`, given the instance list narrowed to
+  this environment, exactly as the Scripts dialogs narrow theirs. **This is the
+  one the tunnel connects through**; the secondary plays no part in forwarding.
+- **Secondary bastion** — the same widget, seeded from
+  `secondary_bastion_filter`. It is the tunnel's **failover target**, and also
+  the box Bastion New User mirrors its run onto. Optional — an empty secondary
+  is a valid pair and simply means no failover.
+
+## Failover
+
+`start_port_tunnel` walks the pair rather than trying one box, so an
+environment whose primary has been terminated — or is merely refusing
+connections — comes up on its secondary instead of not at all.
+
+- **A bastion that will not resolve is skipped immediately** (terminated, not
+  in the inventory, no pem) and the next one is tried in the same call.
+- **A session that dies young fails the bastion over.** The test is the
+  tunnel's age at the moment the death is noticed, not the reason it gave: a
+  session that never connected dies within seconds, while an old one is a good
+  tunnel dropping and moving it to the backup for that would be an
+  overreaction. The threshold is 30s, which has to clear the 15s poll interval
+  — a session that died at 2s may not be noticed for another 15.
+- **It is sticky.** Once a session is happily up on the secondary it is not
+  disturbed to go back; only another failure swings the preference around. The
+  rotation keeps **every** bastion in the list, so a failure on the secondary
+  falls back to the primary rather than leaving nothing to try.
+- **The preference lives in memory, never in config.** Which box a tunnel
+  happens to be on is a fact about this run. Persisting it would mean an
+  outage during one session quietly re-aimed every later one.
+- **The Bastion column shows the box actually carrying the session**, flagged
+  when it is the secondary. An environment quietly running on its backup
+  otherwise looks exactly like a healthy one.
+
+Test login walks the same order, so a test that cannot hold a session on the
+primary rolls on to the secondary exactly as forwarding would — otherwise the
+test would report a failure the live tunnel recovers from on its own.
 - **Login user** — plain text, prefilled from `resolve_ssh_user`, so it shows
   the effective `ec2-user` default rather than an empty box that hides it.
 - **Key (pem)** — `pem_library_combo_items` at `PEM_COMBO_POPUP_H`, with a
@@ -177,12 +214,14 @@ them:
 
 | Value   | Call                                                       | Key                |
 |---------|------------------------------------------------------------|--------------------|
-| pem     | `set_vscode_defaults(account, env, pem, user)`             | `<id>.<ENV>`       |
-| user    | same call                                                   | `<id>.<ENV>`       |
-| bastion | `set_bastion_selection(account, env, primary, secondary)`  | `bastion_pair.<id>.<env>` |
+| pem      | `set_vscode_defaults(account, env, pem, user)`            | `<id>.<ENV>`       |
+| user     | same call                                                  | `<id>.<ENV>`       |
+| bastions | `set_bastion_selection(account, env, primary, secondary)` | `bastion_pair.<id>.<env>` |
 
-The **existing secondary bastion is preserved**, not blanked — the Scripts
-dialogs use the pair, and this dialog only edits the primary.
+Both halves of the pair are written, because both are editable. An empty
+secondary is stored as empty rather than refused — that is what the Scripts
+dialogs already accept, and forcing a second bastion on an environment that has
+one box would make the dialog unusable there.
 
 Save is followed by `config.save()`, `tunnel_errors.remove(&key)` and
 `clear_tunnel_dismissal`, so a corrected environment stops reporting its old
