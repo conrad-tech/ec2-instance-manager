@@ -2659,7 +2659,11 @@ mod gui {
                 ("-Code", code.to_string()),
                 ("-TitleMatch", cfg.resolved_title_match()),
                 ("-CredentialTarget", cfg.resolved_credential_target()),
-                ("-Username", ec2_manager::features::current_os_user()),
+                // No -Username: the script reads it from the vault entry, so
+                // the one typed in the password dialog is what gets typed on
+                // the Okta page. Passing %USERNAME% here would silently
+                // override it, which is what the dialog's own tooltip
+                // promises it does not.
             ],
             None,
         )?;
@@ -5514,9 +5518,11 @@ mod gui {
                         ),
                     );
                     ui.label(
-                        "You can set or remove it outside the app instead: Control Panel \
-                         → Credential Manager → Windows Credentials, or \
-                         cmdkey /generic:<target> /user:<you> /pass",
+                        "You can set or remove it outside the app instead: \
+                         cmdkey /generic:<target> /user:<you> /pass, or Control Panel \
+                         → Credential Manager → Windows Credentials → \
+                         \"Add a generic credential\" (it must be a GENERIC \
+                         credential, not a Windows one).",
                     );
 
                     ui.add_space(10.0);

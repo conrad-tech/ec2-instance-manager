@@ -28,7 +28,13 @@
     equivalent and Login mode will find the result:
 
         cmdkey /generic:ec2-manager-fed /user:you /pass
-        Control Panel -> Credential Manager -> Windows Credentials -> Add
+        Control Panel -> Credential Manager -> Windows Credentials
+          -> "Add a generic credential"
+
+    It must be a GENERIC credential, not a "Windows credential": CredRead is
+    called with CRED_TYPE_GENERIC and will not see one stored under the other
+    type. `cmdkey /generic:` gets this right; the Control Panel offers both
+    links on the same page.
 
     What no scheme can do is stop code running as *you* from reading it —
     anything the sign-in can decrypt unattended, malware running as you can
@@ -160,6 +166,19 @@ public static class Cred {
             // to come from CredentialBlobSize rather than PtrToStringUni's own
             // scan.
             return Marshal.PtrToStringUni(c.CredentialBlob, (int)(c.CredentialBlobSize / 2));
+        } finally {
+            CredFree(raw);
+        }
+    }
+
+    /// The username recorded alongside the password, or null.
+    public static string ReadUser(string target) {
+        IntPtr raw;
+        if (!CredRead(target, GENERIC, 0, out raw)) { return null; }
+        try {
+            CREDENTIAL c = (CREDENTIAL)Marshal.PtrToStructure(raw, typeof(CREDENTIAL));
+            if (c.UserName == IntPtr.Zero) { return null; }
+            return Marshal.PtrToStringUni(c.UserName);
         } finally {
             CredFree(raw);
         }
@@ -354,6 +373,17 @@ $plain = [Cred]::Read($CredentialTarget)
 if ([string]::IsNullOrEmpty($plain)) {
     Write-Fail "no password stored in Credential Manager under '$CredentialTarget'"
 }
+
+# The username is stored with the password, so the one entered in the app's
+# password dialog is the one typed on the Okta page. -Username overrides it;
+# %USERNAME% is the last resort.
+if ([string]::IsNullOrWhiteSpace($Username)) {
+    $Username = [Cred]::ReadUser($CredentialTarget)
+}
+if ([string]::IsNullOrWhiteSpace($Username)) {
+    $Username = $env:USERNAME
+}
+Write-Status "username-$Username"
 
 $chrome = Resolve-Chrome
 Write-Status 'opening-browser'
