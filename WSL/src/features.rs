@@ -79,10 +79,14 @@ pub struct Features {
 /// The `fed_auth` section of `assets/features.json`.
 ///
 /// Gates the automatic `fed up` refresh: the app runs the corporate
-/// federation CLI on startup and every 15 minutes, retrying a failure for 10
-/// minutes before standing down. When Okta asks for a device authorization it
-/// opens the activation URL and copies the code to the clipboard — the user
-/// signs in themselves.
+/// federation CLI when the cached credentials **expire**, retrying a failure
+/// for 10 minutes before standing down.
+///
+/// Expiry-driven rather than on a timer: `fed_expire` in `~/.aws/credentials`
+/// already says exactly when the credentials die, so there is nothing to gain
+/// from asking on a clock. It also makes the feature testable — backdate
+/// `fed_expire` and the run fires within a second, because the credentials
+/// file is already watched by mtime.
 ///
 /// It ships disabled with an empty allow-list and needs both, so a stray
 /// `["*"]` cannot switch it on for a whole site.
@@ -97,12 +101,38 @@ pub struct FedAuthFeature {
     /// The command to run, as argv. Empty falls back to `["fed", "up"]`.
     pub command: Vec<String>,
     /// Seconds between attempts while retrying a failure. 0 uses the default
-    /// (120).
+    /// (120). Also the minimum gap between any two attempts, so an expiry
+    /// that `fed up` does not clear cannot spin.
     pub retry_interval_secs: u64,
     /// Seconds to keep retrying before giving up. 0 uses the default (600).
     pub retry_window_secs: u64,
-    /// Seconds between attempts once authenticated. 0 uses the default (900).
-    pub refresh_interval_secs: u64,
+    /// Drive the Okta sign-in automatically rather than handing the user the
+    /// activation page: type the code, the username and the password from
+    /// Windows Credential Manager, then confirm the MFA prompt.
+    ///
+    /// **Off in the shipped file, and separate from `enabled` on purpose.**
+    /// Typing a domain password into an identity provider and clicking
+    /// through MFA is behaviour an EDR scores as credential theft, and this
+    /// app has a CrowdStrike quarantine in its history. With this off the
+    /// feature still does the useful part — it runs `fed up` on expiry, opens
+    /// the page and copies the code — and never synthesises a keystroke.
+    ///
+    /// When on it is the *primary* path, but not the only one: if the script
+    /// is missing, no password is stored, or the focus guard trips, it falls
+    /// back to opening the page and copying the code.
+    pub auto_sign_in: bool,
+    /// Window-title fragment the browser step requires before it will type
+    /// anything, matched case-insensitively. This is the focus guard: a
+    /// mistimed keystroke must never put a domain password into whatever
+    /// window happens to be frontmost. Empty falls back to "okta".
+    pub browser_title_match: String,
+    /// Windows Credential Manager target name holding the federation
+    /// password. Empty falls back to `ec2-manager-fed`.
+    ///
+    /// The password is **never** stored by this app — the script reads the
+    /// vault at the moment it needs it, so it can be set or revoked entirely
+    /// outside the app with `cmdkey` or Control Panel.
+    pub credential_target: String,
 }
 
 impl FedAuthFeature {
@@ -127,7 +157,7 @@ impl FedAuthFeature {
         }
     }
 
-    /// The retry/refresh timings, with 0 meaning "use the default".
+    /// The retry timings, with 0 meaning "use the default".
     pub fn retry_policy(&self) -> crate::fed_auth::RetryPolicy {
         let d = crate::fed_auth::RetryPolicy::default();
         let or_default = |secs: u64, fallback: std::time::Duration| {
@@ -140,7 +170,36 @@ impl FedAuthFeature {
         crate::fed_auth::RetryPolicy {
             interval: or_default(self.retry_interval_secs, d.interval),
             window: or_default(self.retry_window_secs, d.window),
-            steady: or_default(self.refresh_interval_secs, d.steady),
+        }
+    }
+
+    /// True when the automatic sign-in should run for `user`. Requires the
+    /// feature gate *and* its own flag — see the note on [`Self::auto_sign_in`].
+    pub fn auto_sign_in_for(&self, user: &str) -> bool {
+        self.is_allowed_user(user) && self.auto_sign_in
+    }
+
+    /// The window-title fragment the browser step requires, falling back to
+    /// "okta". Never empty — that check is what keeps the password out of the
+    /// wrong window.
+    pub fn resolved_title_match(&self) -> String {
+        let t = self.browser_title_match.trim();
+        if t.is_empty() {
+            "okta".to_string()
+        } else {
+            t.to_string()
+        }
+    }
+
+    /// The Credential Manager target name, falling back to `ec2-manager-fed`.
+    /// Never empty — an empty target would read whatever happens to be first
+    /// in the vault.
+    pub fn resolved_credential_target(&self) -> String {
+        let t = self.credential_target.trim();
+        if t.is_empty() {
+            "ec2-manager-fed".to_string()
+        } else {
+            t.to_string()
         }
     }
 }
@@ -757,6 +816,60 @@ mod tests {
         let absent: Features = serde_json::from_str("{}").expect("parses");
         assert!(!absent.fed_auth_enabled_for("bconrad"));
         assert!(!Features::default().fed_auth_enabled_for("bconrad"));
+    }
+
+    #[test]
+    fn the_shipped_file_keeps_the_automatic_sign_in_off() {
+        // Typing a domain password into an identity provider is its own
+        // opt-in, on top of the feature gate. The shipped file must hand it
+        // to nobody.
+        let f = load();
+        assert!(!f.fed_auth.auto_sign_in, "auto_sign_in must ship false");
+        assert!(!f.fed_auth.auto_sign_in_for("any.user"));
+    }
+
+    #[test]
+    fn the_automatic_sign_in_needs_the_feature_gate_too() {
+        // auto_sign_in alone must not switch anything on: without `enabled`
+        // and a named user there is no refresh to sign in for.
+        let flag_only: Features =
+            serde_json::from_str(r#"{"fed_auth":{"auto_sign_in":true}}"#).expect("parses");
+        assert!(!flag_only.fed_auth.auto_sign_in_for("bconrad"));
+
+        let gated_only: Features = serde_json::from_str(
+            r#"{"fed_auth":{"enabled":true,"allowed_users":["bconrad"]}}"#,
+        )
+        .expect("parses");
+        assert!(
+            gated_only.fed_auth_enabled_for("bconrad"),
+            "the refresh itself is on"
+        );
+        assert!(
+            !gated_only.fed_auth.auto_sign_in_for("bconrad"),
+            "but the sign-in is not"
+        );
+
+        let all: Features = serde_json::from_str(
+            r#"{"fed_auth":{"enabled":true,"allowed_users":["bconrad"],"auto_sign_in":true}}"#,
+        )
+        .expect("parses");
+        assert!(all.fed_auth.auto_sign_in_for("bconrad"));
+        assert!(!all.fed_auth.auto_sign_in_for("someone.else"));
+    }
+
+    #[test]
+    fn the_focus_guard_and_vault_target_are_never_empty() {
+        // A blank title match would disable the check that keeps the password
+        // out of the wrong window; a blank target would read whatever is
+        // first in the vault.
+        let blank: Features = serde_json::from_str(
+            r#"{"fed_auth":{"browser_title_match":"  ","credential_target":" "}}"#,
+        )
+        .expect("parses");
+        assert_eq!(blank.fed_auth.resolved_title_match(), "okta");
+        assert_eq!(blank.fed_auth.resolved_credential_target(), "ec2-manager-fed");
+        assert!(!load().fed_auth.resolved_title_match().is_empty());
+        assert!(!load().fed_auth.resolved_credential_target().is_empty());
     }
 
     #[test]

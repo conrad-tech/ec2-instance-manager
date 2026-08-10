@@ -1,16 +1,18 @@
 //! Classification and scheduling for the automatic `fed up` refresh.
 //!
-//! The GUI runs the corporate `fed up` command on startup and on a timer so
-//! the user never has to remember to refresh their AWS credentials by hand.
+//! The GUI runs the corporate `fed up` command when the cached credentials
+//! expire, so the user never has to remember to refresh them by hand.
 //! This module holds the parts that can be reasoned about without a Windows
 //! box or an Okta tenant: what one run's output *meant*, and when to run it
 //! again.
 //!
-//! **Signing in is the user's job.** When Okta asks for a device
-//! authorization the app opens the activation URL and puts the code on the
-//! clipboard — then stops. The code, username, password and MFA confirmation
-//! are all typed by the person at the keyboard. Nothing here stores a
-//! password or synthesises a keystroke.
+//! Runs are driven by **credential expiry**, not a timer: `fed_expire` in
+//! `~/.aws/credentials` already says when the credentials die, and that file
+//! is watched. Backdating it is therefore a realistic test.
+//!
+//! Signing in is the user's job unless `fed_auth.auto_sign_in` is on. By
+//! default the app opens the activation URL, puts the code on the clipboard
+//! and stops — nothing here stores a password or synthesises a keystroke.
 //!
 //! **The output patterns are best-effort.** `fed` is a corporate tool that
 //! could not be run while this was written, so the classification leans on
@@ -38,6 +40,16 @@ pub enum FedOutcome {
 pub enum FedError {
     /// `fed up` reported an error, or could not be run at all.
     Command(String),
+    /// The automatic sign-in named a problem precisely: the focus guard
+    /// tripped, Chrome was missing, the vault had nothing to read.
+    Browser(String),
+    /// The sign-in walk ran to completion but `fed up` still did not
+    /// authenticate.
+    ///
+    /// An **inference**, not a reading of the page: SendKeys cannot see the
+    /// DOM, so a password Okta rejected is invisible. What we can say is that
+    /// every keystroke went in and it still failed.
+    NotAuthenticated,
     /// The retry window closed with every attempt failing. Carries the last
     /// error, so the status line still names a cause rather than just
     /// "gave up".
@@ -48,11 +60,18 @@ impl std::fmt::Display for FedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Command(msg) => write!(f, "fed up failed: {msg}"),
+            Self::Browser(msg) => write!(f, "the automatic sign-in failed: {msg}"),
+            Self::NotAuthenticated => write!(
+                f,
+                "the sign-in completed but fed up did not authenticate — the saved \
+                 password was most likely rejected on the Okta page. Re-save it from \
+                 the Scripts menu."
+            ),
             Self::GaveUp(last) => write!(
                 f,
                 "gave up after the retry window — last error: {last}. \
-                 Sign in manually; the 15-minute refresh resumes on its own \
-                 once your credentials are renewed."
+                 Sign in manually; the automatic refresh arms itself again as \
+                 soon as your credentials are renewed."
             ),
         }
     }
@@ -66,8 +85,6 @@ pub struct RetryPolicy {
     pub interval: Duration,
     /// Total time to keep retrying before giving up and waiting for the user.
     pub window: Duration,
-    /// Gap between attempts once authenticated.
-    pub steady: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -75,7 +92,6 @@ impl Default for RetryPolicy {
         Self {
             interval: Duration::from_secs(120),
             window: Duration::from_secs(600),
-            steady: Duration::from_secs(900),
         }
     }
 }
@@ -167,18 +183,57 @@ fn last_meaningful_line(output: &str) -> Option<String> {
         .map(|l| l.chars().take(200).collect())
 }
 
+/// One line of `fed_login.ps1`'s output, when the automatic sign-in is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptEvent {
+    /// Progress: `opening-browser`, `entering-code`, `entering-password`, …
+    Status(String),
+    /// A named failure. These are the precise ones — surface them verbatim.
+    Error(String),
+    /// A `-DryRun` report of a keystroke that would have been sent.
+    DryRun(String),
+}
+
+/// Parse one line of `fed_login.ps1` output. Anything unrecognised is `None`
+/// and belongs in the log, not the status line.
+pub fn parse_script_marker(line: &str) -> Option<ScriptEvent> {
+    let line = line.trim();
+    for (prefix, make) in [
+        (
+            "FEDLOGIN_STATUS:",
+            &ScriptEvent::Status as &dyn Fn(String) -> ScriptEvent,
+        ),
+        ("FEDLOGIN_ERROR:", &ScriptEvent::Error),
+        ("FEDLOGIN_DRYRUN:", &ScriptEvent::DryRun),
+    ] {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                return None;
+            }
+            return Some(make(rest.to_string()));
+        }
+    }
+    None
+}
+
 /// How long to wait before running `fed up` again.
 ///
 /// `retrying_for` is how long we have already been retrying this failure —
-/// zero for the first failure after a good run. `None` means the retry window
-/// is exhausted: stop, and wait for the user to sign in by hand.
+/// zero for the first failure after a good run.
+///
+/// `None` means nothing is scheduled. For a success that is the normal state
+/// — expiry triggers the next run. For a failure it means the retry window is
+/// exhausted: stop, and wait for the user to sign in by hand.
 pub fn next_delay(
     policy: &RetryPolicy,
     outcome: &FedOutcome,
     retrying_for: Duration,
 ) -> Option<Duration> {
     match outcome {
-        FedOutcome::Authenticated => Some(policy.steady),
+        // Nothing is scheduled after a success: the next run is whenever the
+        // credentials expire, which the caller learns from `fed_expire`.
+        FedOutcome::Authenticated => None,
         FedOutcome::Failed(_) => {
             // The attempt that would land past the window is not worth
             // making: give up now rather than sleeping two minutes to time
@@ -299,12 +354,11 @@ mod tests {
     }
 
     #[test]
-    fn success_schedules_the_steady_refresh() {
+    fn success_schedules_nothing_because_expiry_drives_the_next_run() {
+        // Re-running on a clock would ask a question `fed_expire` has
+        // already answered.
         let p = RetryPolicy::default();
-        assert_eq!(
-            next_delay(&p, &FedOutcome::Authenticated, Duration::ZERO),
-            Some(Duration::from_secs(900))
-        );
+        assert_eq!(next_delay(&p, &FedOutcome::Authenticated, Duration::ZERO), None);
     }
 
     #[test]
@@ -332,17 +386,56 @@ mod tests {
         let msg =
             FedError::GaveUp(Box::new(FedError::Command("no network".to_string()))).to_string();
         assert!(msg.contains("no network"), "{msg}");
-        // The user has to know the loop comes back on its own, or they will
-        // assume the feature is dead until they restart the app.
-        assert!(msg.contains("resumes"), "{msg}");
+        // The user has to know it arms itself again, or they will assume the
+        // feature is dead until they restart the app.
+        assert!(msg.contains("arms itself again"), "{msg}");
     }
 
     #[test]
     fn the_shipped_policy_matches_the_documented_timings() {
-        // 2-minute retries for 10 minutes, then a 15-minute refresh.
+        // 2-minute retries for 10 minutes; no periodic refresh at all.
         let p = RetryPolicy::default();
         assert_eq!(p.interval, Duration::from_secs(2 * 60));
         assert_eq!(p.window, Duration::from_secs(10 * 60));
-        assert_eq!(p.steady, Duration::from_secs(15 * 60));
+    }
+
+    #[test]
+    fn the_script_markers_are_parsed_by_kind() {
+        assert_eq!(
+            parse_script_marker("FEDLOGIN_STATUS:entering-code"),
+            Some(ScriptEvent::Status("entering-code".to_string()))
+        );
+        assert_eq!(
+            parse_script_marker("FEDLOGIN_ERROR:chrome.exe not found"),
+            Some(ScriptEvent::Error("chrome.exe not found".to_string()))
+        );
+        assert_eq!(
+            parse_script_marker("FEDLOGIN_DRYRUN:would send the password"),
+            Some(ScriptEvent::DryRun("would send the password".to_string()))
+        );
+    }
+
+    #[test]
+    fn ordinary_script_output_is_not_a_marker() {
+        assert_eq!(parse_script_marker("PS C:\\> whatever"), None);
+        assert_eq!(parse_script_marker(""), None);
+        // A marker with nothing after the colon carries no information.
+        assert_eq!(parse_script_marker("FEDLOGIN_ERROR:"), None);
+        assert_eq!(parse_script_marker("FEDLOGIN_ERROR:   "), None);
+    }
+
+    #[test]
+    fn the_sign_in_failure_sources_read_differently() {
+        // The user has to be able to tell "fed up itself broke" from "the
+        // automation broke" from "your saved password is wrong".
+        let cmd = FedError::Command("session expired".to_string()).to_string();
+        assert!(cmd.contains("fed up failed"), "{cmd}");
+
+        let browser = FedError::Browser("focus guard tripped".to_string()).to_string();
+        assert!(browser.contains("automatic sign-in failed"), "{browser}");
+
+        let pw = FedError::NotAuthenticated.to_string();
+        assert!(pw.contains("password"), "{pw}");
+        assert!(pw.contains("Okta"), "{pw}");
     }
 }

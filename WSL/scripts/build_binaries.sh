@@ -273,10 +273,16 @@ package_windows_zip() {
     cp "${ROOT_DIR}/assets/scripts/send_access_email.ps1" \
        "${WINDOWS_DIST_DIR}/send_access_email.ps1"
   fi
+  # Same treatment for the optional fed sign-in helper, for the same reason.
+  if [[ -f "${ROOT_DIR}/assets/scripts/fed_login.ps1" ]]; then
+    cp "${ROOT_DIR}/assets/scripts/fed_login.ps1" \
+       "${WINDOWS_DIST_DIR}/fed_login.ps1"
+  fi
   local candidates=(
     "${WINDOWS_DIST_DIR}/${CLI_APP_NAME}_${APP_VERSION}.exe"
     "${WINDOWS_DIST_DIR}/${GUI_APP_NAME}_${APP_VERSION}.exe"
     "${WINDOWS_DIST_DIR}/send_access_email.ps1"
+    "${WINDOWS_DIST_DIR}/fed_login.ps1"
     "${WINDOWS_DIST_DIR}/WALKTHROUGH.md"
     "${WINDOWS_DIST_DIR}/libgcc_s_seh-1.dll"
     "${WINDOWS_DIST_DIR}/libstdc++-6.dll"

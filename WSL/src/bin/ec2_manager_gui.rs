@@ -2166,6 +2166,8 @@ mod gui {
         /// Okta wants a device authorization. The page is open and the code
         /// is on the clipboard; the user signs in from here.
         AwaitingSignIn { code: String, url: String },
+        /// The automatic sign-in is driving the page (auto_sign_in only).
+        SigningIn(String),
         /// Credentials are good; the next refresh is scheduled.
         Authenticated,
         /// Waiting to retry after a failure, with the reason and the attempt.
@@ -2178,11 +2180,24 @@ mod gui {
         Stalled(ec2_manager::fed_auth::FedError),
     }
 
+    /// The "save my federation password" dialog (auto_sign_in only).
+    ///
+    /// The password is held here only until it is handed to PowerShell on
+    /// stdin for Credential Manager; it is never written to config.ini.
+    struct FedPasswordDialog {
+        password: String,
+        /// Show the typed characters. Off by default.
+        reveal: bool,
+        username: String,
+    }
+
     /// Fed worker → UI.
     #[derive(Clone, Debug)]
     enum FedEvent {
         /// `fed` printed an activation URL and code.
         DeviceCode { url: String, code: String },
+        /// Progress from the automatic sign-in script.
+        SignInStep(String),
         /// One run finished. `None` = authenticated.
         Finished(Option<ec2_manager::fed_auth::FedError>),
         /// A line for the app log (the raw `fed up` output lives here, which
@@ -2414,16 +2429,174 @@ mod gui {
     /// `start`'s title argument — without it `start` reads the quoted URL as
     /// the window title and opens nothing.
     fn open_in_browser(url: &str) -> std::result::Result<(), String> {
-        let result = if cfg!(target_os = "windows") {
+        #[cfg(target_os = "windows")]
+        let result = {
+            use std::os::windows::process::CommandExt;
             std::process::Command::new("cmd")
                 .args(["/C", "start", "", url])
+                // Or a console flashes up behind the browser — the GUI is
+                // windows_subsystem="windows" and has none of its own.
+                .creation_flags(CREATE_NO_WINDOW)
                 .spawn()
-        } else {
-            std::process::Command::new("xdg-open").arg(url).spawn()
         };
+        #[cfg(not(target_os = "windows"))]
+        let result = std::process::Command::new("xdg-open").arg(url).spawn();
+
         result
             .map(|_| ())
             .map_err(|e| format!("could not open a browser for {url}: {e}"))
+    }
+
+    /// Suppress the console window a child process would otherwise pop up.
+    /// The GUI is `windows_subsystem = "windows"`, so any console app it
+    /// spawns gets a fresh window unless this is set.
+    #[cfg(target_os = "windows")]
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    /// Build the command for one `fed up`.
+    ///
+    /// On Windows it runs **through `cmd /C`**, which is what makes
+    /// `"command": ["fed", "up"]` behave like typing `fed up` at a prompt.
+    /// `Command::new("fed")` would append `.exe` and never consult `PATHEXT`,
+    /// so a `fed.bat` or `fed.cmd` wrapper — the usual shape for a corporate
+    /// CLI — would fail with a bare "program not found". `cmd` resolves the
+    /// name the same way the shell does.
+    ///
+    /// argv is kept as a list rather than one string so an admin can add a
+    /// flag without worrying about quoting. The elements are passed
+    /// individually and `cmd` reassembles them.
+    fn fed_command(argv: &[String]) -> std::process::Command {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            let mut cmd = std::process::Command::new("cmd");
+            cmd.arg("/C").args(argv).creation_flags(CREATE_NO_WINDOW);
+            cmd
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let (exe, args) = argv.split_first().expect("argv is never empty");
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args(args);
+            cmd
+        }
+    }
+
+    /// Absolute path to `fed_login.ps1`, shipped next to the executable for
+    /// the same EDR reason as [`access_email_script_path`].
+    ///
+    /// Only the Windows `run_fed_script` calls it, so the Linux dev build
+    /// sees it unused — same treatment as `EmailStatus`.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn fed_login_script_path() -> std::path::PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|d| d.join("fed_login.ps1")))
+            .unwrap_or_else(|| std::path::PathBuf::from("fed_login.ps1"))
+    }
+
+    /// Spawn `fed_login.ps1` in one of its Credential Manager modes
+    /// (`Store`, `Check`, `Clear`) or in `Login`, returning its stdout.
+    ///
+    /// `stdin_line` is written to the child's stdin rather than passed as an
+    /// argument, so a password never appears in the process list.
+    #[cfg(target_os = "windows")]
+    fn run_fed_script(
+        args: &[(&str, String)],
+        stdin_line: Option<&str>,
+    ) -> std::result::Result<String, String> {
+        use std::io::{Read, Write};
+        use std::os::windows::process::CommandExt;
+
+        let script = fed_login_script_path();
+        if !script.exists() {
+            return Err(format!(
+                "fed_login.ps1 was not found next to the executable ({})",
+                script.display()
+            ));
+        }
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&script);
+        for (flag, value) in args {
+            cmd.arg(flag).arg(value);
+        }
+        // No -WindowStyle Hidden (an EDR pattern); CREATE_NO_WINDOW instead,
+        // which suppresses the console without the flagged switch.
+        let mut child = cmd
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("could not start PowerShell: {e}"))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Some(line) = stdin_line {
+                let _ = writeln!(stdin, "{line}");
+            }
+            let _ = stdin.flush();
+        }
+        let mut out = String::new();
+        if let Some(mut pipe) = child.stdout.take() {
+            let _ = pipe.read_to_string(&mut out);
+        }
+        let _ = child.wait();
+        Ok(out)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn run_fed_script(
+        _args: &[(&str, String)],
+        _stdin_line: Option<&str>,
+    ) -> std::result::Result<String, String> {
+        Err("the automatic sign-in is Windows-only".to_string())
+    }
+
+    /// Drive the Okta sign-in through `fed_login.ps1`.
+    ///
+    /// `Ok(())` means the walk completed and `fed up` should be left to reach
+    /// its own verdict. `Err` means it never got going — the caller falls
+    /// back to handing the user the page.
+    fn run_fed_sign_in(
+        cfg: &ec2_manager::features::FedAuthFeature,
+        url: &str,
+        code: &str,
+        tx: &Sender<FedEvent>,
+    ) -> std::result::Result<(), String> {
+        use ec2_manager::fed_auth::{parse_script_marker, ScriptEvent};
+
+        let out = run_fed_script(
+            &[
+                ("-Mode", "Login".to_string()),
+                ("-Url", url.to_string()),
+                ("-Code", code.to_string()),
+                ("-TitleMatch", cfg.resolved_title_match()),
+                ("-CredentialTarget", cfg.resolved_credential_target()),
+                ("-Username", ec2_manager::features::current_os_user()),
+            ],
+            None,
+        )?;
+
+        let mut error: Option<String> = None;
+        for line in out.lines() {
+            match parse_script_marker(line) {
+                Some(ScriptEvent::Status(s)) => {
+                    let _ = tx.send(FedEvent::SignInStep(s));
+                }
+                Some(ScriptEvent::Error(e)) => error = Some(e),
+                Some(ScriptEvent::DryRun(d)) => {
+                    let _ = tx.send(FedEvent::Log(format!("sign-in dry run: {d}")));
+                }
+                None => {
+                    let _ = tx.send(FedEvent::Log(format!("fed_login: {line}")));
+                }
+            }
+        }
+        match error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Run one `fed up` and report on `tx`.
@@ -2435,15 +2608,17 @@ mod gui {
     ///
     /// The app's involvement ends at opening the page and copying the code.
     /// The code, username, password and MFA prompt are the user's to do.
-    fn run_fed_worker(cfg: ec2_manager::features::FedAuthFeature, tx: Sender<FedEvent>) {
+    fn run_fed_worker(
+        cfg: ec2_manager::features::FedAuthFeature,
+        auto_sign_in: bool,
+        tx: Sender<FedEvent>,
+    ) {
         use ec2_manager::fed_auth::{classify_exit, parse_device_code, FedError, FedOutcome};
         use std::io::{BufRead, BufReader};
 
         let argv = cfg.resolved_command();
-        let (exe, args) = argv.split_first().expect("resolved_command is never empty");
 
-        let mut child = match std::process::Command::new(exe)
-            .args(args)
+        let mut child = match fed_command(&argv)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -2487,7 +2662,25 @@ mod gui {
                 if !prompted {
                     if let Some((url, code)) = parse_device_code(&line) {
                         prompted = true;
-                        let _ = tx.send(FedEvent::DeviceCode { url, code });
+                        // Auto sign-in is the primary path when on, but not
+                        // the only one: anything that stops the script (no
+                        // script, empty vault, focus guard) falls through to
+                        // handing the user the page, with the code still
+                        // fresh because `fed` is only just now waiting.
+                        let handled = auto_sign_in
+                            && match run_fed_sign_in(&cfg, &url, &code, &tx) {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    let _ = tx.send(FedEvent::Log(format!(
+                                        "automatic sign-in did not run ({e}); \
+                                         handing over the page"
+                                    )));
+                                    false
+                                }
+                            };
+                        if !handled {
+                            let _ = tx.send(FedEvent::DeviceCode { url, code });
+                        }
                     }
                 }
             }
@@ -4239,8 +4432,20 @@ mod gui {
         /// When the current run of failures started, for the retry window.
         /// Cleared on any success.
         fed_retrying_since: Option<Instant>,
-        /// True while a worker is in flight, so the timer cannot stack runs.
+        /// True while a worker is in flight, so nothing can stack runs.
         fed_running: bool,
+        /// Whether the automatic Okta sign-in is on for this user
+        /// (`fed_auth.auto_sign_in` plus the feature gate).
+        fed_auto_sign_in: bool,
+        /// When the last attempt started. Enforces a floor between runs so an
+        /// expiry `fed up` does not clear cannot spin.
+        fed_last_attempt_at: Option<Instant>,
+        /// Whether Credential Manager holds a federation password. Answered
+        /// by a `-Mode Check`; `None` until it replies. Only ever presence —
+        /// the app never holds the password itself.
+        fed_password_present: Option<bool>,
+        /// The "save my federation password" dialog, when open.
+        fed_password_dialog: Option<FedPasswordDialog>,
         /// `~/.aws/credentials` mtime at the moment the retry window closed.
         ///
         /// This is how "manually resolved" is detected: once the user signs
@@ -4561,6 +4766,12 @@ mod gui {
                 fed_next_run_at: None,
                 fed_retrying_since: None,
                 fed_running: false,
+                fed_auto_sign_in: features
+                    .fed_auth
+                    .auto_sign_in_for(&ec2_manager::features::current_os_user()),
+                fed_last_attempt_at: None,
+                fed_password_present: None,
+                fed_password_dialog: None,
                 fed_stalled_at_mtime: None,
                 fed_tx,
                 fed_rx,
@@ -4614,6 +4825,27 @@ mod gui {
                 });
             }
             app.log_info("application started");
+            // The name every `allowed_users` gate is matched against, and what
+            // each one decided. Without this a gate that does not match is
+            // invisible: the button simply never appears, with nothing to say
+            // the name was wrong.
+            //
+            // This is the **host** account (%USERNAME% on Windows, $USER on
+            // Linux) read from the process the GUI itself runs in — not the
+            // login inside an embedded WSL/SSM terminal, which is a child
+            // process started later and never consulted here.
+            app.log_info(format!(
+                "gates: os_user='{}' (from {}) — git_scripts={} alerts={} \
+                 vault_iam={} vault_iam_delete={} fed_auth={} fed_auto_sign_in={}",
+                if os_user.is_empty() { "(unset!)" } else { &os_user },
+                if cfg!(target_os = "windows") { "%USERNAME%" } else { "$USER" },
+                app.git_scripts_enabled,
+                app.alerts_enabled,
+                features.vault_iam_enabled_for(&os_user),
+                features.vault_iam_delete_enabled_for(&os_user),
+                app.fed_auth_enabled,
+                app.fed_auto_sign_in,
+            ));
             // Report the compiled-in access-email config immediately, so a
             // config that did not survive a rebuild or a pull is visible
             // without having to create a user first.
@@ -4883,19 +5115,18 @@ mod gui {
                 return;
             }
 
-            // First frame: nothing scheduled, nothing running — run now.
-            if self.fed_next_run_at.is_none()
-                && !self.fed_running
-                && matches!(self.fed_state, FedState::Disabled)
-            {
+            if matches!(self.fed_state, FedState::Disabled) {
                 self.fed_state = FedState::Idle;
-                self.fed_next_run_at = Some(Instant::now());
             }
 
             while let Ok(event) = self.fed_rx.try_recv() {
                 match event {
                     FedEvent::Log(msg) => self.log_info(format!("fed_auth: {msg}")),
                     FedEvent::DeviceCode { url, code } => self.on_fed_device_code(url, code),
+                    FedEvent::SignInStep(step) => {
+                        self.log_info(format!("fed_auth: sign-in {step}"));
+                        self.fed_state = FedState::SigningIn(step);
+                    }
                     FedEvent::Finished(result) => {
                         self.fed_running = false;
                         self.on_fed_run_finished(result);
@@ -4905,10 +5136,65 @@ mod gui {
 
             self.resume_fed_after_manual_signin();
 
+            // A scheduled retry that has come due.
             let due = self.fed_next_run_at.is_some_and(|at| Instant::now() >= at);
             if due && !self.fed_running {
-                self.start_fed_run();
+                self.start_fed_run("retry".to_string());
+                return;
             }
+
+            // Otherwise: expired credentials are the trigger.
+            if let Some(reason) = self.fed_expiry_trigger() {
+                self.start_fed_run(reason);
+            }
+        }
+
+        /// Why a `fed up` should start now, or `None` to stay put.
+        ///
+        /// The trigger is **credential expiry**, read from `fed_expire` in
+        /// `~/.aws/credentials` via `profile_auth_infos`. That file is already
+        /// watched by mtime (1s) and by `poll_auth_expiry` (10s), so
+        /// backdating `fed_expire` fires a run within a second — which is how
+        /// this gets tested without waiting hours for a real expiry.
+        fn fed_expiry_trigger(&self) -> Option<String> {
+            if self.fed_running {
+                return None;
+            }
+            // Stood down, or waiting out a retry / a sign-in the user is
+            // partway through: not ours to restart.
+            if matches!(
+                self.fed_state,
+                FedState::Stalled(_)
+                    | FedState::Retrying { .. }
+                    | FedState::AwaitingSignIn { .. }
+                    | FedState::SigningIn(_)
+            ) {
+                return None;
+            }
+            // Floor between any two attempts. Without it, a `fed up` that
+            // exits 0 without actually clearing the expiry — a different
+            // profile, a partial refresh — would spin as fast as the frame
+            // rate.
+            let interval = self.fed_auth_cfg.retry_policy().interval;
+            if self
+                .fed_last_attempt_at
+                .is_some_and(|at| at.elapsed() < interval)
+            {
+                return None;
+            }
+            // Only profiles that federate: one with no `fed_expire` at all
+            // reads as Missing forever (a static key, or an account this user
+            // has never authenticated), and `fed up` would never fix it.
+            let expired: Vec<&str> = self
+                .profile_auth_infos
+                .iter()
+                .filter(|a| a.auth_status == AuthStatus::Expired)
+                .map(|a| a.profile_id.as_str())
+                .collect();
+            if expired.is_empty() {
+                return None;
+            }
+            Some(format!("credentials expired for {}", expired.join(", ")))
         }
 
         /// Okta wants a device authorization: open the page and put the code
@@ -4950,10 +5236,11 @@ mod gui {
                 self.fed_retrying_since = None;
                 self.fed_stalled_at_mtime = None;
                 self.fed_state = FedState::Authenticated;
-                self.fed_next_run_at = Some(Instant::now() + policy.steady);
+                // Nothing scheduled: the next run is triggered by the new
+                // credentials expiring. The mtime watcher picks up the file
+                // `fed up` just wrote and refreshes the auth status from it.
+                self.fed_next_run_at = None;
                 self.log_info("fed_auth: authenticated".to_string());
-                // The credentials file just changed; the existing mtime
-                // watcher picks that up rather than duplicating the refresh.
                 return;
             };
 
@@ -5011,14 +5298,197 @@ mod gui {
             self.fed_next_run_at = Some(Instant::now());
         }
 
-        /// Spawn the worker for one `fed up` attempt.
-        fn start_fed_run(&mut self) {
+        /// Spawn the worker for one `fed up` attempt. `reason` is logged so
+        /// the trigger is visible when testing against a backdated
+        /// `fed_expire`.
+        fn start_fed_run(&mut self, reason: String) {
+            self.log_info(format!("fed_auth: running fed up ({reason})"));
             self.fed_running = true;
             self.fed_next_run_at = None;
+            self.fed_last_attempt_at = Some(Instant::now());
             self.fed_state = FedState::Running;
             let cfg = self.fed_auth_cfg.clone();
+            let auto = self.fed_auto_sign_in;
             let tx = self.fed_tx.clone();
-            std::thread::spawn(move || run_fed_worker(cfg, tx));
+            std::thread::spawn(move || run_fed_worker(cfg, auto, tx));
+        }
+
+        /// Ask Credential Manager whether a password is stored, for the
+        /// Scripts-menu label. Cheap, and only meaningful with auto sign-in.
+        fn refresh_fed_password_presence(&mut self) {
+            if !self.fed_auto_sign_in {
+                return;
+            }
+            let target = self.fed_auth_cfg.resolved_credential_target();
+            let out = run_fed_script(
+                &[("-Mode", "Check".to_string()), ("-CredentialTarget", target)],
+                None,
+            );
+            self.fed_password_present = match out {
+                Ok(text) => Some(text.contains("FEDLOGIN_STATUS:password-set")),
+                Err(e) => {
+                    self.log_warn(format!("fed_auth: could not read the vault ({e})"));
+                    None
+                }
+            };
+        }
+
+        /// Open the federation-password dialog.
+        fn open_fed_password_dialog(&mut self) {
+            self.refresh_fed_password_presence();
+            self.fed_password_dialog = Some(FedPasswordDialog {
+                password: String::new(),
+                reveal: false,
+                username: ec2_manager::features::current_os_user(),
+            });
+        }
+
+        /// Render "save my federation password".
+        ///
+        /// The typed password goes straight to `fed_login.ps1 -Mode Store`
+        /// over stdin and into Windows Credential Manager. It is never
+        /// written to config.ini and never passed as an argument.
+        fn render_fed_password_dialog(&mut self, ctx: &egui::Context) {
+            let Some(mut dlg) = self.fed_password_dialog.take() else {
+                return;
+            };
+            let mut window_open = true;
+            let (mut do_save, mut do_cancel, mut do_clear) = (false, false, false);
+            let has_saved = self.fed_password_present.unwrap_or(false);
+            let target = self.fed_auth_cfg.resolved_credential_target();
+
+            egui::Window::new("Federation Password")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(
+                        "Used by the automatic Okta sign-in when fed up asks for a \
+                         device authorization.",
+                    );
+                    ui.add_space(6.0);
+                    egui::Grid::new("fed_pw_grid")
+                        .num_columns(2)
+                        .spacing([10.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Username:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut dlg.username)
+                                    .desired_width(320.0),
+                            )
+                            .on_hover_text(
+                                "Recorded alongside the password in Credential \
+                                 Manager, and typed on the Okta username page. \
+                                 Defaults to your PC username.",
+                            );
+                            ui.end_row();
+
+                            ui.label("Password:");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut dlg.password)
+                                        .password(!dlg.reveal)
+                                        .hint_text(if has_saved {
+                                            "leave blank to keep the stored one"
+                                        } else {
+                                            "not stored yet"
+                                        })
+                                        .desired_width(280.0),
+                                );
+                                let (icon, hint) =
+                                    if dlg.reveal { ("🔒", "Hide") } else { ("👁", "Show") };
+                                if ui.small_button(icon).on_hover_text(hint).clicked() {
+                                    dlg.reveal = !dlg.reveal;
+                                }
+                            });
+                            ui.end_row();
+                        });
+
+                    ui.add_space(6.0);
+                    // Say plainly where it goes and what that does and does
+                    // not protect against. Claiming more than is true would
+                    // be worse than saying nothing.
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 150, 60),
+                        format!(
+                            "⚠ Stored in Windows Credential Manager as '{target}', not in \
+                             this app — encrypted by Windows and tied to your account, so \
+                             it will not read back for another user or on another machine. \
+                             It does NOT protect against anything running as you."
+                        ),
+                    );
+                    ui.label(
+                        "You can set or remove it outside the app instead: Control Panel \
+                         → Credential Manager → Windows Credentials, or \
+                         cmdkey /generic:<target> /user:<you> /pass",
+                    );
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            do_save = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                        if has_saved
+                            && ui
+                                .button("Forget stored password")
+                                .on_hover_text(
+                                    "The sign-in will hand you the activation page \
+                                     instead",
+                                )
+                                .clicked()
+                        {
+                            do_clear = true;
+                        }
+                    });
+                });
+
+            if do_cancel || !window_open {
+                return;
+            }
+            if do_clear {
+                let t = target.clone();
+                match run_fed_script(
+                    &[("-Mode", "Clear".to_string()), ("-CredentialTarget", t)],
+                    None,
+                ) {
+                    Ok(_) => {
+                        self.fed_password_present = Some(false);
+                        self.log_info(format!("fed_auth: cleared vault entry '{target}'"));
+                    }
+                    Err(e) => self.log_error(format!("fed_auth: could not clear it ({e})")),
+                }
+                return;
+            }
+            if do_save {
+                // Moved out of the dialog so the plaintext exists in exactly
+                // one place, on its way to the vault.
+                let password = std::mem::take(&mut dlg.password);
+                if password.is_empty() {
+                    return; // username-only edit; nothing to store
+                }
+                let args = [
+                    ("-Mode", "Store".to_string()),
+                    ("-CredentialTarget", target.clone()),
+                    ("-Username", dlg.username.trim().to_string()),
+                ];
+                match run_fed_script(&args, Some(&password)) {
+                    Ok(out) if out.contains("FEDLOGIN_STATUS:password-set") => {
+                        self.fed_password_present = Some(true);
+                        self.log_info(format!("fed_auth: password stored in '{target}'"));
+                    }
+                    Ok(out) => self.log_error(format!(
+                        "fed_auth: the password was not stored — {}",
+                        out.trim()
+                    )),
+                    Err(e) => self.log_error(format!("fed_auth: could not store it ({e})")),
+                }
+                return;
+            }
+            self.fed_password_dialog = Some(dlg);
         }
 
         /// The status line for the toolbar, when the refresh has something
@@ -5041,6 +5511,9 @@ mod gui {
                     AMBER,
                     format!("fed up: sign in on the page that opened — code {code} (copied)"),
                 )),
+                FedState::SigningIn(step) => {
+                    Some((GREY, format!("fed up: signing in — {step}…")))
+                }
                 FedState::Retrying { error, attempt } => Some((
                     AMBER,
                     format!("fed up: attempt {attempt} failed — {error} Retrying…"),
@@ -16227,6 +16700,7 @@ mod gui {
                 self.render_script_editor(ctx);
                 self.render_script_delete_confirm(ctx);
                 self.render_pat_dialog(ctx);
+                self.render_fed_password_dialog(ctx);
                 self.render_script_result_popup(ctx);
                 self.render_alerts_window(ctx);
                 self.pump_script_runs();
@@ -16721,6 +17195,7 @@ mod gui {
                         let mut delete_script: Option<usize> = None;
                         let mut add_script = false;
                         let mut edit_pat = false;
+                        let mut edit_fed_password = false;
                         let mut open_vault_iam: Option<bool> = None;
                         egui::ComboBox::from_id_salt("scripts_menu")
                             .selected_text(format!("Scripts ({script_count})"))
@@ -16893,6 +17368,30 @@ mod gui {
                                         }
                                     });
                                 }
+                                // Only with the automatic sign-in on: without
+                                // it no password is ever used, so offering to
+                                // store one would be misleading.
+                                if self.fed_auto_sign_in {
+                                    ui.horizontal(|ui| {
+                                        ui.label(match self.fed_password_present {
+                                            Some(true) => "Federation Password (in vault)",
+                                            Some(false) => "Federation Password (not set)",
+                                            None => "Federation Password",
+                                        });
+                                        if ui
+                                            .small_button("✏")
+                                            .on_hover_text(
+                                                "Password the automatic Okta sign-in \
+                                                 types, stored in Windows Credential \
+                                                 Manager",
+                                            )
+                                            .clicked()
+                                        {
+                                            edit_fed_password = true;
+                                            ui.close();
+                                        }
+                                    });
+                                }
                             });
                         if let Some(i) = run_default {
                             self.run_default_script(i);
@@ -16911,6 +17410,9 @@ mod gui {
                         }
                         if edit_pat {
                             self.open_pat_dialog(None);
+                        }
+                        if edit_fed_password {
+                            self.open_fed_password_dialog();
                         }
                         if let Some(delete) = open_vault_iam {
                             self.open_vault_iam_dialog(delete);

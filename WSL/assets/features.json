@@ -52,13 +52,15 @@
     "encrypt_smime_flag": 0,
     "encrypt_sendkeys": "%6"
   },
-  "_fed_auth_comment": "Automatic 'fed up' refresh. Runs the federation CLI at startup and every refresh_interval_secs. A failure retries every retry_interval_secs for up to retry_window_secs, then stands down and waits for you to sign in by hand — the timer resumes on its own once ~/.aws/credentials is renewed. When Okta asks for a device authorization the app opens the activation URL and copies the code to your clipboard; you paste it and do the username, password and MFA yourself. The app never stores a password and never synthesises a keystroke. Ships disabled with an empty allow-list and needs BOTH 'enabled': true and a named user. Zero timings mean use the defaults (120 / 600 / 900 seconds).",
+  "_fed_auth_comment": "Automatic 'fed up' credential refresh. Triggered by EXPIRY, not a timer: the app watches fed_expire in ~/.aws/credentials and runs fed up when it lapses, so backdating that value is a realistic way to test. A failure retries every retry_interval_secs for up to retry_window_secs, then stands down and waits for you to sign in by hand; it arms itself again as soon as the credentials file is renewed. allowed_users matches the HOST account the GUI runs as (%USERNAME% on Windows, $USER on Linux) -- NOT the login inside an embedded WSL or SSM terminal, and not your AWS or Okta username. The app logs the name it detected and every gate's verdict at startup ('gates: os_user=...'), so check the log panel if a feature does not appear. 'command' is argv, so [\"fed\",\"up\"] runs `fed up` -- on Windows it goes through `cmd /C` so the name resolves via PATHEXT exactly as it does at a prompt, which is what makes a fed.bat or fed.cmd wrapper work. auto_sign_in drives the Okta page itself (types the code, the username, and the password from Windows Credential Manager, then confirms MFA) instead of handing you the activation page. IT IS OFF BY DEFAULT AND SEPARATE FROM 'enabled' ON PURPOSE: typing a domain password into an identity provider and clicking through MFA is behaviour an EDR scores as credential theft, and this app has a CrowdStrike quarantine in its history. With it off the feature still runs fed up on expiry, opens the page and copies the code, and never synthesises a keystroke. With it on it is the primary path but falls back to open-and-copy if the script is missing, the vault is empty, or the focus guard trips. The password is never stored by this app -- set it from the Scripts menu, or outside the app with cmdkey /generic:ec2-manager-fed /user:you /pass. browser_title_match is the focus guard: nothing is typed unless the foreground window is Chrome AND its title contains it. Zero timings mean use the defaults (120 / 600 seconds).",
   "fed_auth": {
     "enabled": false,
     "allowed_users": [],
     "command": ["fed", "up"],
     "retry_interval_secs": 120,
     "retry_window_secs": 600,
-    "refresh_interval_secs": 900
+    "auto_sign_in": false,
+    "browser_title_match": "okta",
+    "credential_target": "ec2-manager-fed"
   }
 }

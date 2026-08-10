@@ -1,0 +1,396 @@
+<#
+.SYNOPSIS
+    Optional automatic Okta sign-in for the `fed up` credential refresh.
+
+.DESCRIPTION
+    Only runs when fed_auth.auto_sign_in is true in features.json. With it
+    off — the shipped default — the app opens the activation page, copies the
+    code, and this script is never invoked.
+
+    Modes:
+
+    -Mode Login    Open Chrome on the Okta activation URL, type the device
+                   code, and walk the username / password / MFA-confirm pages.
+    -Mode Store    Read one line from STDIN and write it to Windows Credential
+                   Manager under -CredentialTarget.
+    -Mode Check    Report whether a credential exists for -CredentialTarget.
+    -Mode Clear    Delete the credential for -CredentialTarget.
+
+    WHERE THE PASSWORD LIVES
+    ------------------------
+    In Windows Credential Manager, never in this app's config. The vault
+    encrypts it and binds it to the Windows account that stored it: another
+    user, or the same file copied to another machine, cannot read it back.
+    The plaintext is only ever in memory between reading the vault and
+    sending the keystroke.
+
+    You do not have to use this script to store it. Both of these are
+    equivalent and Login mode will find the result:
+
+        cmdkey /generic:ec2-manager-fed /user:you /pass
+        Control Panel -> Credential Manager -> Windows Credentials -> Add
+
+    What no scheme can do is stop code running as *you* from reading it —
+    anything the sign-in can decrypt unattended, malware running as you can
+    too.
+
+    WHY THIS IS OPT-IN
+    ------------------
+    Login mode types a domain password into an identity provider and confirms
+    an MFA prompt. Endpoint protection scores that as credential theft, and
+    the app shipping this script has a CrowdStrike quarantine in its history.
+    It needs fed_auth.enabled, a named user in fed_auth.allowed_users, AND
+    fed_auth.auto_sign_in — three separate opt-ins.
+
+    THE FOCUS GUARD IS THE SAFETY PROPERTY
+    --------------------------------------
+    SendKeys types into whatever window is frontmost. If focus moves between
+    the wait and the keystroke, a domain password lands wherever it went — a
+    chat window, a shared screen, a terminal that logs. So every send is
+    preceded by Assert-Target, which requires the foreground window to belong
+    to chrome.exe AND its title to contain -TitleMatch. On a mismatch the
+    script aborts rather than typing. Do not "simplify" that away.
+
+    EVERY FIELD IS CLEARED BEFORE IT IS TYPED
+    -----------------------------------------
+    SendKeys cannot read the DOM, so nothing here can tell whether a field is
+    already populated. Okta prefills the username most of the time and Chrome
+    may fill the password box, and typing into either without clearing first
+    appends rather than replaces. Send-FieldText sends Ctrl+A ahead of the
+    text; on an empty field that selects nothing and costs nothing.
+
+.NOTES
+    Run from beside the executable, never copied to %TEMP% and run from there,
+    and never with -WindowStyle Hidden. Both are patterns EDRs quarantine on
+    sight; see the access-email notes in CLAUDE.md.
+#>
+
+[CmdletBinding()]
+param(
+    [ValidateSet('Login', 'Store', 'Check', 'Clear')]
+    [string]$Mode = 'Login',
+
+    # Credential Manager target name holding the federation password.
+    [string]$CredentialTarget = 'ec2-manager-fed',
+
+    # Login mode: the activation URL from `fed up`.
+    [string]$Url = '',
+
+    # Login mode: the device code from `fed up`.
+    [string]$Code = '',
+
+    # Store mode: the username recorded alongside the password.
+    # Login mode: typed over the username field (cleared first, so a prefill
+    # is replaced rather than appended to).
+    [string]$Username = '',
+
+    # Foreground-window title fragment required before anything is typed.
+    [string]$TitleMatch = 'okta',
+
+    # Explicit chrome.exe path. Empty searches the usual install locations.
+    [string]$ChromePath = '',
+
+    # Seconds to wait for the activation page to appear.
+    [int]$PageTimeoutSec = 60,
+
+    # Seconds to allow between page transitions.
+    [int]$StepDelaySec = 3,
+
+    # Walk every step and run every guard, but send no keystrokes. Use this to
+    # check timing and the focus guard without the password going anywhere.
+    [switch]$DryRun
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+# Markers the GUI parses out of stdout. Keep these stable.
+function Write-Status([string]$state) { Write-Output "FEDLOGIN_STATUS:$state" }
+function Write-Fail([string]$msg) {
+    Write-Output "FEDLOGIN_ERROR:$msg"
+    exit 1
+}
+
+# ------------------------------------------------- Credential Manager -------
+
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class Cred {
+    private const uint GENERIC = 1;
+    private const uint PERSIST_LOCAL_MACHINE = 2;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct CREDENTIAL {
+        public uint Flags;
+        public uint Type;
+        public IntPtr TargetName;
+        public IntPtr Comment;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+        public uint CredentialBlobSize;
+        public IntPtr CredentialBlob;
+        public uint Persist;
+        public uint AttributeCount;
+        public IntPtr Attributes;
+        public IntPtr TargetAlias;
+        public IntPtr UserName;
+    }
+
+    [DllImport("advapi32.dll", EntryPoint = "CredReadW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CredRead(string target, uint type, uint flags, out IntPtr cred);
+
+    [DllImport("advapi32.dll", EntryPoint = "CredWriteW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CredWrite(ref CREDENTIAL cred, uint flags);
+
+    [DllImport("advapi32.dll", EntryPoint = "CredDeleteW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CredDelete(string target, uint type, uint flags);
+
+    [DllImport("advapi32.dll", EntryPoint = "CredFree")]
+    private static extern void CredFree(IntPtr buffer);
+
+    /// Returns the stored password, or null when there is no such credential.
+    public static string Read(string target) {
+        IntPtr raw;
+        if (!CredRead(target, GENERIC, 0, out raw)) { return null; }
+        try {
+            CREDENTIAL c = (CREDENTIAL)Marshal.PtrToStructure(raw, typeof(CREDENTIAL));
+            if (c.CredentialBlob == IntPtr.Zero || c.CredentialBlobSize == 0) { return null; }
+            // The blob is UTF-16 and is NOT null-terminated, so the length has
+            // to come from CredentialBlobSize rather than PtrToStringUni's own
+            // scan.
+            return Marshal.PtrToStringUni(c.CredentialBlob, (int)(c.CredentialBlobSize / 2));
+        } finally {
+            CredFree(raw);
+        }
+    }
+
+    public static bool Exists(string target) {
+        IntPtr raw;
+        if (!CredRead(target, GENERIC, 0, out raw)) { return false; }
+        CredFree(raw);
+        return true;
+    }
+
+    public static bool Write(string target, string user, string password) {
+        byte[] blob = System.Text.Encoding.Unicode.GetBytes(password);
+        IntPtr blobPtr = Marshal.AllocCoTaskMem(blob.Length);
+        Marshal.Copy(blob, 0, blobPtr, blob.Length);
+        // Wipe our managed copy as soon as it is in unmanaged memory.
+        Array.Clear(blob, 0, blob.Length);
+
+        IntPtr targetPtr = Marshal.StringToCoTaskMemUni(target);
+        IntPtr userPtr = Marshal.StringToCoTaskMemUni(
+            String.IsNullOrEmpty(user) ? Environment.UserName : user);
+        try {
+            CREDENTIAL c = new CREDENTIAL();
+            c.Type = GENERIC;
+            c.TargetName = targetPtr;
+            c.CredentialBlob = blobPtr;
+            c.CredentialBlobSize = (uint)(password.Length * 2);
+            c.Persist = PERSIST_LOCAL_MACHINE;
+            c.UserName = userPtr;
+            return CredWrite(ref c, 0);
+        } finally {
+            Marshal.ZeroFreeCoTaskMemUnicode(blobPtr);
+            Marshal.FreeCoTaskMem(targetPtr);
+            Marshal.FreeCoTaskMem(userPtr);
+        }
+    }
+
+    public static bool Delete(string target) {
+        return CredDelete(target, GENERIC, 0);
+    }
+}
+'@
+
+if ([string]::IsNullOrWhiteSpace($CredentialTarget)) {
+    Write-Fail 'no -CredentialTarget given'
+}
+
+switch ($Mode) {
+    'Check' {
+        if ([Cred]::Exists($CredentialTarget)) { Write-Status 'password-set' }
+        else { Write-Status 'password-not-set' }
+        exit 0
+    }
+    'Clear' {
+        if ([Cred]::Delete($CredentialTarget)) { Write-Status 'password-cleared' }
+        else { Write-Status 'password-not-set' }
+        exit 0
+    }
+    'Store' {
+        $plain = [Console]::In.ReadLine()
+        if ([string]::IsNullOrEmpty($plain)) { Write-Fail 'no password on stdin' }
+        $ok = [Cred]::Write($CredentialTarget, $Username, $plain)
+        $plain = $null
+        [GC]::Collect()
+        if (-not $ok) { Write-Fail "Credential Manager rejected the write for '$CredentialTarget'" }
+        Write-Status 'password-set'
+        exit 0
+    }
+}
+
+# ------------------------------------------------------------------ Login ---
+
+if ([string]::IsNullOrWhiteSpace($Url)) { Write-Fail 'no -Url given' }
+if ([string]::IsNullOrWhiteSpace($Code)) { Write-Fail 'no -Code given' }
+if ([string]::IsNullOrWhiteSpace($TitleMatch)) {
+    Write-Fail 'no -TitleMatch given; refusing to type without a focus guard'
+}
+
+Add-Type -AssemblyName System.Windows.Forms
+
+Add-Type @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class Fg {
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr h);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll")]
+    public static extern int GetWindowThreadProcessId(IntPtr h, out int pid);
+    public static string Title() {
+        IntPtr h = GetForegroundWindow();
+        if (h == IntPtr.Zero) return "";
+        int n = GetWindowTextLength(h);
+        if (n <= 0) return "";
+        StringBuilder sb = new StringBuilder(n + 1);
+        GetWindowText(h, sb, sb.Capacity);
+        return sb.ToString();
+    }
+    public static int Pid() {
+        IntPtr h = GetForegroundWindow();
+        if (h == IntPtr.Zero) return 0;
+        int pid; GetWindowThreadProcessId(h, out pid); return pid;
+    }
+}
+'@
+
+function Get-ForegroundProcessName {
+    $procId = [Fg]::Pid()
+    if ($procId -eq 0) { return '' }
+    try { return (Get-Process -Id $procId -ErrorAction Stop).ProcessName }
+    catch { return '' }
+}
+
+<#
+    The guard. Both halves matter: the title alone would pass for a lookalike
+    page or a renamed window in another app, and the process alone would pass
+    for any Chrome tab, including whatever the user just switched to.
+#>
+function Assert-Target([string]$what) {
+    $title = [Fg]::Title()
+    $proc = Get-ForegroundProcessName
+    if ($proc -notmatch '^(?i)chrome$') {
+        Write-Fail "focus guard: foreground window belongs to '$proc', not chrome — aborted before $what"
+    }
+    if ($title -notlike "*$TitleMatch*") {
+        Write-Fail "focus guard: foreground title '$title' does not contain '$TitleMatch' — aborted before $what"
+    }
+}
+
+function Wait-ForTarget([int]$timeoutSec) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $title = [Fg]::Title()
+        $proc = Get-ForegroundProcessName
+        if ($proc -match '^(?i)chrome$' -and $title -like "*$TitleMatch*") { return $true }
+        Start-Sleep -Seconds 1
+    }
+    return $false
+}
+
+# SendKeys reads +^%~(){}[] as control characters, so every one of them in a
+# literal string has to be braced. A password containing '(' would otherwise
+# be silently mistyped.
+function ConvertTo-SendKeysLiteral([string]$s) {
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $s.ToCharArray()) {
+        if ('+^%~(){}[]'.Contains($ch)) {
+            [void]$sb.Append('{').Append($ch).Append('}')
+        } else {
+            [void]$sb.Append($ch)
+        }
+    }
+    return $sb.ToString()
+}
+
+function Send-Guarded([string]$keys, [string]$what) {
+    Assert-Target $what
+    if ($DryRun) {
+        Write-Output "FEDLOGIN_DRYRUN:would send $what"
+        return
+    }
+    [System.Windows.Forms.SendKeys]::SendWait($keys)
+}
+
+# Type into a field that may already have something in it — see the header.
+function Send-FieldText([string]$text, [string]$what) {
+    Send-Guarded '^a' "clearing $what"
+    Send-Guarded (ConvertTo-SendKeysLiteral $text) $what
+}
+
+function Resolve-Chrome {
+    if (-not [string]::IsNullOrWhiteSpace($ChromePath)) {
+        if (Test-Path $ChromePath) { return $ChromePath }
+        Write-Fail "chrome not found at -ChromePath '$ChromePath'"
+    }
+    $candidates = @(
+        "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+        "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
+        "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
+    )
+    foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
+    Write-Fail 'chrome.exe not found; set the chrome path in features.json'
+}
+
+# The vault is read up front: with nothing stored there is no point opening a
+# browser the user then has to finish in anyway. Failing here lets the app
+# fall back to its open-page-and-copy-code path with the code still fresh.
+$plain = [Cred]::Read($CredentialTarget)
+if ([string]::IsNullOrEmpty($plain)) {
+    Write-Fail "no password stored in Credential Manager under '$CredentialTarget'"
+}
+
+$chrome = Resolve-Chrome
+Write-Status 'opening-browser'
+Start-Process -FilePath $chrome -ArgumentList $Url | Out-Null
+
+if (-not (Wait-ForTarget $PageTimeoutSec)) {
+    Write-Fail "the activation page did not reach the foreground within ${PageTimeoutSec}s (looking for a chrome window titled like '*$TitleMatch*')"
+}
+
+# --- Activation code -------------------------------------------------------
+Write-Status 'entering-code'
+Send-FieldText $Code 'the activation code'
+Send-Guarded '{ENTER}' 'submitting the activation code'
+Start-Sleep -Seconds $StepDelaySec
+
+# --- Username --------------------------------------------------------------
+Write-Status 'entering-username'
+if (-not [string]::IsNullOrWhiteSpace($Username)) {
+    Send-FieldText $Username 'the username'
+}
+Send-Guarded '{ENTER}' 'submitting the username'
+Start-Sleep -Seconds $StepDelaySec
+
+# --- Password --------------------------------------------------------------
+Write-Status 'entering-password'
+try {
+    Send-FieldText $plain 'the password'
+} finally {
+    $plain = $null
+    [GC]::Collect()
+}
+Send-Guarded '{ENTER}' 'submitting the password'
+Start-Sleep -Seconds $StepDelaySec
+
+# --- MFA confirm -----------------------------------------------------------
+Write-Status 'confirming-mfa'
+Send-Guarded '{ENTER}' 'confirming the MFA prompt'
+
+Write-Status 'done'
+exit 0
