@@ -422,6 +422,18 @@ the tunnel dies.
   Vault IAM, which is why that change is logged at warn and stated in the
   dialog. An empty secondary is stored as empty, never refused — plenty of
   environments have one box.
+- **Each row has a scrollable "session output" pane** showing the hidden
+  ssh process's stderr **live**, not only once it dies. This is the one
+  place a specific failure mode is visible: every local bind succeeds — so
+  the session is up, the status is green, and nothing looks wrong — while
+  every *remote* dial is refused, because ssh only connects `host:port` on
+  the bastion when a forward is actually used. ssh reports that as
+  `channel N: open failed: connect failed: …` on stderr and nowhere else.
+  `tunnel_stderr` keeps the last session's output after it dies, since the
+  `Tunnel` (and its buffer) is dropped at that point. The pane sets
+  `ScrollStyle::solid()` and `AlwaysVisible` for the reason recorded under
+  the pem dropdown: the default floating bar has `dormant_*_opacity` of
+  0.0, so it is invisible until hovered and the pane reads as unscrollable.
 - **`src/probe.rs` verifies a forward end to end.** Surviving
   `TUNNEL_PROVEN_AFTER` proves ssh **bound** the local ports; it proves
   nothing about the far side, because ssh only opens the remote connection

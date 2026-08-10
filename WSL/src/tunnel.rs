@@ -23,6 +23,14 @@ use std::time::{Duration, Instant};
 
 use crate::forwards::ResolvedForward;
 
+/// How much of a session's stderr is kept.
+///
+/// The window shows this live, so it is the only account of a tunnel whose
+/// local binds all succeeded — the session looks perfectly healthy — while
+/// every remote dial is refused. ssh reports that as `channel N: open
+/// failed: connect failed: …`, one line per attempt.
+const MAX_STDERR_LINES: usize = 200;
+
 /// A running background tunnel.
 pub struct Tunnel {
     child: Child,
@@ -87,7 +95,12 @@ impl Tunnel {
                     }
                     if let Ok(mut sink) = sink.lock() {
                         // Bounded: a session that spews cannot grow forever.
-                        if sink.len() >= 50 {
+                        // Deep enough to hold a run of `channel N: open
+                        // failed` lines, which is what diagnoses a forward
+                        // whose local bind works and whose remote dial does
+                        // not — one per attempt, so a browser reload can
+                        // produce several at once.
+                        if sink.len() >= MAX_STDERR_LINES {
                             sink.remove(0);
                         }
                         sink.push(line);

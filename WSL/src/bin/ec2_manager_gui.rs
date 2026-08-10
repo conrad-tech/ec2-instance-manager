@@ -4484,6 +4484,14 @@ mod gui {
         /// drops and recovers within the poll would otherwise leave no trace
         /// on screen at all, and these processes are invisible.
         tunnel_failures: HashMap<String, (String, u32)>,
+        /// Most recent stderr from each environment's session, kept after it
+        /// dies so the output that explains a death is still readable.
+        ///
+        /// This is the only visible account of the failure mode where every
+        /// local bind succeeds — so the session is up and looks healthy —
+        /// and every remote dial is refused. ssh only says so on stderr, and
+        /// only when a forward is actually used.
+        tunnel_stderr: HashMap<String, Vec<String>>,
         /// Whether each environment's forwards have been shown to carry
         /// traffic. Keyed like `port_tunnels`, and cleared whenever the
         /// session is replaced — a verdict about a session that no longer
@@ -4866,6 +4874,7 @@ mod gui {
                 protected_users: features.protected_users.clone(),
                 forwards_config: ec2_manager::forwards::ForwardsConfig::bundled(),
                 port_tunnels: HashMap::new(),
+                tunnel_stderr: HashMap::new(),
                 tunnel_probes: HashMap::new(),
                 probe_tx,
                 probe_rx,
@@ -6999,6 +7008,12 @@ mod gui {
             // A verdict about a session that no longer exists is worse than
             // none, so the next session re-verifies from scratch.
             self.tunnel_probes.remove(&row.key);
+            // Keep the final stderr: it is what explains the death, and the
+            // Tunnel is about to be dropped.
+            let final_stderr = dead.errors();
+            if !final_stderr.is_empty() {
+                self.tunnel_stderr.insert(row.key.clone(), final_stderr);
+            }
             let why = dead
                 .last_error()
                 .unwrap_or_else(|| "session ended".to_string());
@@ -7393,6 +7408,10 @@ mod gui {
                 if let Some(live) = self.port_tunnels.get(&row.key) {
                     on_bastion.insert(row.key.clone(), live.bastion.clone());
                     running.insert(row.key.clone(), live.age());
+                    let lines = live.errors();
+                    if !lines.is_empty() {
+                        self.tunnel_stderr.insert(row.key.clone(), lines);
+                    }
                 }
                 // The poll would get to this within 15s, but the window is
                 // where someone waits for the answer.
@@ -7681,6 +7700,77 @@ mod gui {
                                     .small(),
                                 );
                             }
+                        });
+
+                        // What the hidden ssh process is saying. A session
+                        // whose local binds all succeeded looks healthy in
+                        // every other column while each remote dial is
+                        // refused — `channel N: open failed: connect failed`
+                        // is the only place that shows, and it only appears
+                        // when a forward is actually used.
+                        let lines = self
+                            .tunnel_stderr
+                            .get(&row.key)
+                            .cloned()
+                            .unwrap_or_default();
+                        egui::CollapsingHeader::new(format!(
+                            "{} — session output ({})",
+                            row.label,
+                            lines.len()
+                        ))
+                        .id_salt(format!("pf_err_{}", row.key))
+                        .show(ui, |ui| {
+                            if lines.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Nothing yet. ssh reports a refused \
+                                         forward only when something uses it, \
+                                         so open the page you cannot reach and \
+                                         look again.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                return;
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.small_button("Copy").clicked() {
+                                    ui.ctx().copy_text(lines.join("\n"));
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "last {} line(s), newest at the bottom",
+                                        lines.len()
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                            });
+                            // The default ScrollStyle is floating, whose
+                            // dormant opacities are both 0.0 — the bar is
+                            // invisible until hovered, which reads as "this
+                            // pane does not scroll". solid() is opaque and
+                            // reserves its own width.
+                            ui.spacing_mut().scroll =
+                                egui::style::ScrollStyle::solid();
+                            egui::ScrollArea::vertical()
+                                .id_salt(format!("pf_err_scroll_{}", row.key))
+                                .max_height(TUNNEL_LOG_H)
+                                .auto_shrink([false, true])
+                                .stick_to_bottom(true)
+                                .scroll_bar_visibility(
+                                    egui::scroll_area::ScrollBarVisibility
+                                        ::AlwaysVisible,
+                                )
+                                .show(ui, |ui| {
+                                    for line in &lines {
+                                        ui.label(
+                                            egui::RichText::new(line.as_str())
+                                                .small()
+                                                .monospace(),
+                                        );
+                                    }
+                                });
                         });
                     }
                 });
@@ -20389,6 +20479,11 @@ mod gui {
             .collect();
         sole_bastion_candidate(&pool, filter, chosen)
     }
+
+    /// Height of the per-environment session-output pane before it scrolls.
+    /// Tall enough to read a run of channel errors without the window
+    /// growing past the screen when several environments are expanded.
+    const TUNNEL_LOG_H: f32 = 160.0;
 
     /// How long a session must survive before it counts as connected.
     ///
