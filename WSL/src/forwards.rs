@@ -867,24 +867,36 @@ mod tests {
     }
 
     #[test]
-    /// Vault does not listen on 443, and `accounts.json` says so in every
-    /// `vault_addr` (`https://vault.<env>....:8200`). Without a rule here the
-    /// name falls through to `default_port`, so the tunnel binds the local
-    /// port fine — the window truthfully says "forwarding N ports" — and then
-    /// nothing answers, because the far side has nothing on 443. The two
-    /// files have to agree.
+    /// Vault reaches `default_port` like any other web service, because the
+    /// deployment this ships to fronts it with TLS on 443 — confirmed
+    /// against a working `LocalForward 127.200.20.4:443 vault.…:443`.
+    ///
+    /// A `vault → 8200` rule was added once, inferred from the `vault_addr`
+    /// values in `accounts.json`. That file ships as template data
+    /// (`vault.dev1.YOUR-COMPANY.com:8200`) and its ports describe nobody's
+    /// deployment, so the rule moved a working forward off 443 and broke it.
+    /// This test exists to stop that being re-derived from the same
+    /// non-evidence: change it only against a LocalForward line known to
+    /// work.
     #[test]
-    fn the_shipped_rules_forward_vault_on_its_own_port() {
+    fn the_shipped_rules_leave_vault_on_the_default_port() {
         let config = ForwardsConfig::bundled();
-        assert_eq!(config.port_for("vault.dev1.example.com", None), 8200);
-        assert_eq!(config.port_for("VAULT.PROD.EXAMPLE.COM", None), 8200);
+        assert_eq!(config.port_for("vault.scpp-ct.example.net", None), 443);
+        assert_eq!(config.port_for("VAULT.PROD.EXAMPLE.COM", None), 443);
     }
 
-    /// The vault rule must not swallow names it does not own — `port_rules`
-    /// are substring matches checked in order, so a badly placed or overly
-    /// broad rule silently re-ports other services.
+    /// An explicit port always wins, so a site whose Vault really is on 8200
+    /// says so per entry without needing a rule that re-ports everyone's.
     #[test]
-    fn the_vault_rule_leaves_other_services_alone() {
+    fn an_explicit_port_still_overrides_the_default_for_vault() {
+        let config = ForwardsConfig::bundled();
+        assert_eq!(config.port_for("vault.example.net", Some(8200)), 8200);
+    }
+
+    /// The named services keep their ports — these are substring matches, so
+    /// any new rule risks silently re-porting a name it does not own.
+    #[test]
+    fn the_shipped_rules_keep_the_named_services_on_their_ports() {
         let config = ForwardsConfig::bundled();
         assert_eq!(config.port_for("pg-postgres01.auct.example.net", None), 5432);
         assert_eq!(config.port_for("solr01.dev1.example.net", None), 8984);
