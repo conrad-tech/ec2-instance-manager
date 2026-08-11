@@ -4698,6 +4698,14 @@ mod gui {
         /// expiring that is *not* in here is new information and bypasses the
         /// floor, so a second account lapsing is not ignored for two minutes.
         fed_last_attempt_expired: std::collections::HashSet<String>,
+        /// Throttle for `report_fed_idle_with_unusable_creds`.
+        fed_last_idle_report: Option<Instant>,
+        /// Profiles with at least one expired credential section — the
+        /// trigger's input. Cached because computing it reads the
+        /// credentials file.
+        fed_expired_profiles: Vec<String>,
+        /// When that list was last recomputed.
+        fed_expired_checked_at: Option<Instant>,
         /// Whether Credential Manager holds a federation password. Answered
         /// by a `-Mode Check`; `None` until it replies. Only ever presence —
         /// the app never holds the password itself.
@@ -5039,6 +5047,9 @@ mod gui {
                     .auto_sign_in_for(&ec2_manager::features::current_os_user()),
                 fed_last_attempt_at: None,
                 fed_last_attempt_expired: std::collections::HashSet::new(),
+                fed_last_idle_report: None,
+                fed_expired_profiles: Vec::new(),
+                fed_expired_checked_at: None,
                 fed_password_present: None,
                 fed_password_dialog: None,
                 fed_stalled_at_mtime: None,
@@ -5399,6 +5410,28 @@ mod gui {
                 self.fed_state = FedState::Idle;
             }
 
+            // Which profiles have an expired section. Recomputed on a short
+            // throttle rather than per frame — it reads ~/.aws/credentials,
+            // and 2s is far finer than any expiry needs while still catching
+            // a hand-edit almost immediately.
+            const EXPIRY_SCAN_EVERY: Duration = Duration::from_secs(2);
+            if self
+                .fed_expired_checked_at
+                .is_none_or(|at| at.elapsed() >= EXPIRY_SCAN_EVERY)
+            {
+                self.fed_expired_checked_at = Some(Instant::now());
+                let found = credentials::profiles_with_expired_sections(&self.config.profiles);
+                if found != self.fed_expired_profiles {
+                    if !found.is_empty() {
+                        self.log_info(format!(
+                            "fed_auth: expired credential section(s) for {}",
+                            found.join(", ")
+                        ));
+                    }
+                    self.fed_expired_profiles = found;
+                }
+            }
+
             while let Ok(event) = self.fed_rx.try_recv() {
                 match event {
                     FedEvent::Log(msg) => self.log_info(format!("fed_auth: {msg}")),
@@ -5426,7 +5459,54 @@ mod gui {
             // Otherwise: expired credentials are the trigger.
             if let Some(reason) = self.fed_expiry_trigger() {
                 self.start_fed_run(reason);
+            } else {
+                self.report_fed_idle_with_unusable_creds();
             }
+        }
+
+        /// Say so when credentials are unusable but nothing will run for them.
+        ///
+        /// `Missing` is skipped by the trigger on purpose — a profile that
+        /// never had a `fed_expire` (a static key, an account never
+        /// authenticated) would otherwise start `fed up` forever. But an
+        /// **unparseable** `fed_expire` reads as `Missing` too, and then
+        /// nothing happens with no explanation at all. `fed_expire` accepts a
+        /// Unix epoch or `YYYY-MM-DDTHH:MM:SS[Z]`; a bare date or a space
+        /// instead of the `T` silently lands here.
+        ///
+        /// Throttled, and only while genuinely idle, so it cannot become
+        /// noise.
+        fn report_fed_idle_with_unusable_creds(&mut self) {
+            const EVERY: Duration = Duration::from_secs(300);
+            if self.fed_running
+                || !matches!(self.fed_state, FedState::Idle | FedState::Authenticated)
+            {
+                return;
+            }
+            if self
+                .fed_last_idle_report
+                .is_some_and(|at| at.elapsed() < EVERY)
+            {
+                return;
+            }
+            let missing: Vec<&str> = self
+                .profile_auth_infos
+                .iter()
+                .filter(|a| a.auth_status == AuthStatus::Missing)
+                .map(|a| a.profile_id.as_str())
+                .collect();
+            if missing.is_empty() {
+                return;
+            }
+            self.fed_last_idle_report = Some(Instant::now());
+            self.log_warn(format!(
+                "fed_auth: not running for {} — no usable fed_expire in \
+                 ~/.aws/credentials (absent, or not a Unix epoch or \
+                 YYYY-MM-DDTHH:MM:SSZ). An expired account needs a parseable \
+                 date to be seen as expired rather than as one that never \
+                 federates.",
+                missing.join(", ")
+            ));
         }
 
         /// Why a `fed up` should start now, or `None` to stay put.
@@ -5451,15 +5531,13 @@ mod gui {
             ) {
                 return None;
             }
-            // Only profiles that federate: one with no `fed_expire` at all
-            // reads as Missing forever (a static key, or an account this user
-            // has never authenticated), and `fed up` would never fix it.
-            let expired: Vec<&str> = self
-                .profile_auth_infos
-                .iter()
-                .filter(|a| a.auth_status == AuthStatus::Expired)
-                .map(|a| a.profile_id.as_str())
-                .collect();
+            // Per *section*, not per profile. `profile_auth_infos` reports
+            // the best status across every credential section matching an
+            // account, so an account with a live role and a lapsed one reads
+            // Ok and would never refresh until the last section lapsed too.
+            // See `credentials::profiles_with_expired_sections`.
+            let expired: Vec<&str> =
+                self.fed_expired_profiles.iter().map(String::as_str).collect();
             if expired.is_empty() {
                 return None;
             }
@@ -5603,12 +5681,8 @@ mod gui {
             self.fed_running = true;
             self.fed_next_run_at = None;
             self.fed_last_attempt_at = Some(Instant::now());
-            self.fed_last_attempt_expired = self
-                .profile_auth_infos
-                .iter()
-                .filter(|a| a.auth_status == AuthStatus::Expired)
-                .map(|a| a.profile_id.clone())
-                .collect();
+            self.fed_last_attempt_expired =
+                self.fed_expired_profiles.iter().cloned().collect();
             self.fed_state = FedState::Running;
             let cfg = self.fed_auth_cfg.clone();
             let auto = self.fed_auto_sign_in;
