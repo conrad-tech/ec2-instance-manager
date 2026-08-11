@@ -18829,71 +18829,80 @@ mod gui {
                         }
                     });
 
+                // Notifications are a *list*: each on its own line, newest
+                // below, with one Clear control level with the first. Laid
+                // out here rather than inside the menu bar — that bar wraps,
+                // so it put every message on a line of its own and pushed
+                // the button to a line below all of them, level with
+                // nothing.
+                let has_status = self.script_status.is_some()
+                    || self.tunnel_status.is_some()
+                    || self.script_status_highlight.is_some()
+                    || !self.message.is_empty();
+                if has_status {
                     let status_color = |state: &ScriptState, ui: &egui::Ui| match state {
                         ScriptState::Running => flashing_yellow(ui),
                         ScriptState::Failed => egui::Color32::from_rgb(220, 60, 60),
                         ScriptState::Ok => egui::Color32::from_rgb(120, 180, 120),
                     };
-                    if let Some((text, state)) = self.script_status.clone() {
-                        ui.colored_label(status_color(&state, ui), text);
-                    }
-                    if let Some((text, state)) = self.tunnel_status.clone() {
-                        // The success line is transient. Expiry is judged
-                        // here rather than in `refresh_tunnel_status`, which
-                        // only runs on the 15s poll — the banner would
-                        // otherwise outstay its minute by up to that long.
-                        let expired = matches!(state, ScriptState::Ok)
-                            && self
-                                .tunnel_ok_since
-                                .map(|t| t.elapsed() >= TUNNEL_OK_BANNER)
-                                .unwrap_or(true);
-                        if !expired {
-                            if let (ScriptState::Ok, Some(since)) =
-                                (&state, self.tunnel_ok_since)
-                            {
-                                // Come back and clear it on time, rather than
-                                // whenever something else happens to repaint.
-                                ctx.request_repaint_after(
-                                    TUNNEL_OK_BANNER.saturating_sub(since.elapsed()),
-                                );
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            if let Some((text, state)) = self.script_status.clone() {
+                                ui.colored_label(status_color(&state, ui), text);
                             }
-                            ui.colored_label(status_color(&state, ui), text);
-                        }
-                    }
-                    if let Some(hl) = self.script_status_highlight.clone() {
-                        ui.colored_label(flashing_yellow(ui), hl);
-                    }
-                    if !self.message.is_empty() {
-                        ui.label(self.message.clone());
-                    }
-                    // Pushed to the far right rather than trailing the
-                    // messages: it is one control for everything on the bar,
-                    // and sitting immediately after a message of varying
-                    // length made it wander. An error nobody can act on
-                    // should not be permanent furniture, but the button
-                    // should not be hunted for either.
-                    if self.has_clearable_status() {
-                        ui.with_layout(
-                            // `Align::TOP`, not `Center`: the messages stack,
-                            // so this row grows with them and a centred
-                            // button sinks to the middle of the list, sitting
-                            // level with nothing. Anchored to the top it
-                            // stays beside the first message however many
-                            // arrive underneath.
-                            egui::Layout::right_to_left(egui::Align::TOP),
-                            |ui| {
-                                if ui
-                                    .button("Clear Notifications")
-                                    .on_hover_text(
-                                        "Dismiss the messages on this bar.",
-                                    )
-                                    .clicked()
-                                {
-                                    clear_status = true;
+                            if let Some((text, state)) = self.tunnel_status.clone() {
+                                // The success line is transient. Expiry is
+                                // judged here rather than in
+                                // `refresh_tunnel_status`, which only runs on
+                                // the 15s poll — the banner would otherwise
+                                // outstay its minute by up to that long.
+                                let expired = matches!(state, ScriptState::Ok)
+                                    && self
+                                        .tunnel_ok_since
+                                        .map(|t| t.elapsed() >= TUNNEL_OK_BANNER)
+                                        .unwrap_or(true);
+                                if !expired {
+                                    if let (ScriptState::Ok, Some(since)) =
+                                        (&state, self.tunnel_ok_since)
+                                    {
+                                        // Come back and clear it on time,
+                                        // rather than whenever something else
+                                        // happens to repaint.
+                                        ctx.request_repaint_after(
+                                            TUNNEL_OK_BANNER
+                                                .saturating_sub(since.elapsed()),
+                                        );
+                                    }
+                                    ui.colored_label(status_color(&state, ui), text);
                                 }
-                            },
-                        );
-                    }
+                            }
+                            if let Some(hl) = self.script_status_highlight.clone() {
+                                ui.colored_label(flashing_yellow(ui), hl);
+                            }
+                            if !self.message.is_empty() {
+                                ui.label(self.message.clone());
+                            }
+                        });
+                        // Far right, and anchored to the top so it sits level
+                        // with the first message however many arrive below.
+                        if self.has_clearable_status() {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::TOP),
+                                |ui| {
+                                    if ui
+                                        .button("Clear Notifications")
+                                        .on_hover_text(
+                                            "Dismiss the messages on this bar.",
+                                        )
+                                        .clicked()
+                                    {
+                                        clear_status = true;
+                                    }
+                                },
+                            );
+                        }
+                    });
+                }
                 });
                 if clear_status {
                     self.clear_status_messages();
