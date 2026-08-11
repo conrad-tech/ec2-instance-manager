@@ -129,7 +129,18 @@ pub struct FedAuthFeature {
     /// When on it is the *primary* path, but not the only one: if the script
     /// is missing, no password is stored, or the focus guard trips, it falls
     /// back to opening the page and copying the code.
+    ///
+    /// Gated by [`Self::auto_sign_in_allowed_users`] as well, so a site can
+    /// give everyone the refresh and only some people the automation.
     pub auto_sign_in: bool,
+    /// OS usernames additionally allowed the automatic sign-in.
+    ///
+    /// Separate from `allowed_users` and empty by default, so being handed
+    /// the refresh does not hand you the automation -- the same stance
+    /// `vault_iam.delete_allowed_users` takes. A user must be on **both**
+    /// lists, and `auto_sign_in` must be on, for a keystroke to be
+    /// synthesised.
+    pub auto_sign_in_allowed_users: Vec<String>,
     /// Window-title fragments the browser step accepts before it will type
     /// anything, matched case-insensitively; **any** one matching is enough.
     /// This is the focus guard: a mistimed keystroke must never put a domain
@@ -198,10 +209,15 @@ impl FedAuthFeature {
         }
     }
 
-    /// True when the automatic sign-in should run for `user`. Requires the
-    /// feature gate *and* its own flag — see the note on [`Self::auto_sign_in`].
+    /// True when the automatic sign-in should run for `user`.
+    ///
+    /// Needs all three: the feature gate, the master switch, and this user on
+    /// the sign-in list. Fails closed at every step -- see the note on
+    /// [`Self::auto_sign_in_allowed_users`].
     pub fn auto_sign_in_for(&self, user: &str) -> bool {
-        self.is_allowed_user(user) && self.auto_sign_in
+        self.is_allowed_user(user)
+            && self.auto_sign_in
+            && user_in_list(&self.auto_sign_in_allowed_users, user)
     }
 
     /// The window-title fragments the browser step accepts, as the
@@ -852,6 +868,46 @@ mod tests {
         assert!(!Features::default().fed_auth_enabled_for("bconrad"));
     }
 
+    /// The shipped PowerShell must be pure ASCII.
+    ///
+    /// Windows PowerShell 5.1 reads a `.ps1` with no BOM as Windows-1252,
+    /// not UTF-8. An em dash is UTF-8 `E2 80 94`, and that trailing `0x94`
+    /// decodes as U+201D -- a smart closing quote, which PowerShell honours
+    /// as a string delimiter. One inside a double-quoted string therefore
+    /// ends the string early, turns the remainder of the line into code, and
+    /// the file stops parsing with a brace error a dozen lines away.
+    ///
+    /// That is not hypothetical: it shipped, and the sign-in silently never
+    /// ran because the script died at parse time before emitting a single
+    /// marker.
+    #[test]
+    fn the_shipped_powershell_is_ascii_only() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/scripts");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("assets/scripts exists") {
+            let path = entry.expect("readable entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("ps1") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("readable script");
+            for (i, line) in text.lines().enumerate() {
+                if let Some(ch) = line.chars().find(|c| !c.is_ascii()) {
+                    panic!(
+                        "{}:{} contains non-ASCII {:?} (U+{:04X}). Windows PowerShell \
+                         reads these files as Windows-1252, where such bytes can act \
+                         as string delimiters and break parsing. Use ASCII.",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        i + 1,
+                        ch,
+                        ch as u32
+                    );
+                }
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no .ps1 files found under {}", dir.display());
+    }
+
     #[test]
     fn the_shipped_file_keeps_the_automatic_sign_in_off() {
         // Typing a domain password into an identity provider is its own
@@ -860,6 +916,57 @@ mod tests {
         let f = load();
         assert!(!f.fed_auth.auto_sign_in, "auto_sign_in must ship false");
         assert!(!f.fed_auth.auto_sign_in_for("any.user"));
+    }
+
+    #[test]
+    fn the_automatic_sign_in_has_its_own_allow_list() {
+        // The point of the split: hand everyone the refresh, hand the
+        // keystroke automation to a named few.
+        let f: Features = serde_json::from_str(
+            r#"{"fed_auth":{"enabled":true,"allowed_users":["*"],
+                 "auto_sign_in":true,"auto_sign_in_allowed_users":["conra"]}}"#,
+        )
+        .expect("parses");
+        assert!(f.fed_auth_enabled_for("someone.else"), "everyone gets the refresh");
+        assert!(
+            !f.fed_auth.auto_sign_in_for("someone.else"),
+            "but not the automation"
+        );
+        assert!(f.fed_auth.auto_sign_in_for("conra"));
+        assert!(f.fed_auth.auto_sign_in_for("CONRA"), "case-insensitive");
+    }
+
+    #[test]
+    fn the_automatic_sign_in_needs_the_refresh_gate_as_well() {
+        // On the sign-in list but not the refresh one: nothing to sign in for.
+        let f: Features = serde_json::from_str(
+            r#"{"fed_auth":{"enabled":true,"allowed_users":[],
+                 "auto_sign_in":true,"auto_sign_in_allowed_users":["conra"]}}"#,
+        )
+        .expect("parses");
+        assert!(!f.fed_auth.auto_sign_in_for("conra"));
+    }
+
+    #[test]
+    fn the_master_switch_still_overrides_the_sign_in_list() {
+        // One place to turn the automation off site-wide without editing the
+        // list, mirroring how `enabled` sits above `allowed_users`.
+        let f: Features = serde_json::from_str(
+            r#"{"fed_auth":{"enabled":true,"allowed_users":["*"],
+                 "auto_sign_in":false,"auto_sign_in_allowed_users":["*"]}}"#,
+        )
+        .expect("parses");
+        assert!(f.fed_auth_enabled_for("conra"));
+        assert!(!f.fed_auth.auto_sign_in_for("conra"));
+    }
+
+    #[test]
+    fn the_shipped_sign_in_list_is_empty() {
+        let f = load();
+        assert!(
+            f.fed_auth.auto_sign_in_allowed_users.is_empty(),
+            "auto_sign_in_allowed_users must ship empty"
+        );
     }
 
     #[test]
@@ -883,12 +990,13 @@ mod tests {
             "but the sign-in is not"
         );
 
+        // Still not enough without the sign-in list -- see
+        // `the_automatic_sign_in_has_its_own_allow_list`.
         let all: Features = serde_json::from_str(
             r#"{"fed_auth":{"enabled":true,"allowed_users":["bconrad"],"auto_sign_in":true}}"#,
         )
         .expect("parses");
-        assert!(all.fed_auth.auto_sign_in_for("bconrad"));
-        assert!(!all.fed_auth.auto_sign_in_for("someone.else"));
+        assert!(!all.fed_auth.auto_sign_in_for("bconrad"));
     }
 
     #[test]

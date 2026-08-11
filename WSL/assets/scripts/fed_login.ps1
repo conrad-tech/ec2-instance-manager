@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     Only runs when fed_auth.auto_sign_in is true in features.json. With it
-    off — the shipped default — the app opens the activation page, copies the
+    off -- the shipped default -- the app opens the activation page, copies the
     code, and this script is never invoked.
 
     Modes:
@@ -36,7 +36,7 @@
     type. `cmdkey /generic:` gets this right; the Control Panel offers both
     links on the same page.
 
-    What no scheme can do is stop code running as *you* from reading it —
+    What no scheme can do is stop code running as *you* from reading it --
     anything the sign-in can decrypt unattended, malware running as you can
     too.
 
@@ -46,12 +46,12 @@
     an MFA prompt. Endpoint protection scores that as credential theft, and
     the app shipping this script has a CrowdStrike quarantine in its history.
     It needs fed_auth.enabled, a named user in fed_auth.allowed_users, AND
-    fed_auth.auto_sign_in — three separate opt-ins.
+    fed_auth.auto_sign_in -- three separate opt-ins.
 
     THE FOCUS GUARD IS THE SAFETY PROPERTY
     --------------------------------------
     SendKeys types into whatever window is frontmost. If focus moves between
-    the wait and the keystroke, a domain password lands wherever it went — a
+    the wait and the keystroke, a domain password lands wherever it went -- a
     chat window, a shared screen, a terminal that logs. So every send is
     preceded by Assert-Target, which requires the foreground window to belong
     to chrome.exe AND its title to contain -TitleMatch. On a mismatch the
@@ -318,7 +318,7 @@ function Test-TitleMatch([string]$title) {
 
     It WAITS for a match rather than sampling one instant. Each step of the
     sign-in submits a form and the next page takes a moment to load and
-    retitle, so a single sample turns every transition into a race — which is
+    retitle, so a single sample turns every transition into a race -- which is
     exactly how the MFA step failed: the title had moved on from the sign-in
     page and the guard refused before the page had settled.
 #>
@@ -332,12 +332,12 @@ function Assert-Target([string]$what) {
         if ($proc -match '^(?i)chrome$' -and (Test-TitleMatch $title)) { return }
         Start-Sleep -Milliseconds 250
     }
-    # Report whichever half is actually wrong — the title is the one that
+    # Report whichever half is actually wrong -- the title is the one that
     # needs configuring, so name it and what was expected.
     if ($proc -notmatch '^(?i)chrome$') {
-        Write-Fail "focus guard: foreground window belongs to '$proc', not chrome — aborted before $what"
+        Write-Fail "focus guard: foreground window belongs to '$proc', not chrome -- aborted before $what"
     }
-    Write-Fail "focus guard: foreground title '$title' matches none of '$TitleMatch' — aborted before $what (add a fragment of that title to fed_auth.browser_title_match)"
+    Write-Fail "focus guard: foreground title '$title' matches none of '$TitleMatch' -- aborted before $what (add a fragment of that title to fed_auth.browser_title_match)"
 }
 
 function Wait-ForTarget([int]$timeoutSec) {
@@ -375,7 +375,7 @@ function Send-Guarded([string]$keys, [string]$what) {
     [System.Windows.Forms.SendKeys]::SendWait($keys)
 }
 
-# Type into a field that may already have something in it — see the header.
+# Type into a field that may already have something in it -- see the header.
 function Send-FieldText([string]$text, [string]$what) {
     Send-Guarded '^a' "clearing $what"
     Send-Guarded (ConvertTo-SendKeysLiteral $text) $what

@@ -2295,7 +2295,12 @@ mod gui {
         Running,
         /// Okta wants a device authorization. The page is open and the code
         /// is on the clipboard; the user signs in from here.
-        AwaitingSignIn { code: String, url: String },
+        AwaitingSignIn {
+            code: String,
+            url: String,
+            /// Why the automatic sign-in did not do this for you.
+            sign_in_error: Option<String>,
+        },
         /// The automatic sign-in is driving the page (auto_sign_in only).
         SigningIn(String),
         /// Credentials are good; the next refresh is scheduled.
@@ -2325,7 +2330,15 @@ mod gui {
     #[derive(Clone, Debug)]
     enum FedEvent {
         /// `fed` printed an activation URL and code.
-        DeviceCode { url: String, code: String },
+        ///
+        /// `sign_in_error` is set when the automatic sign-in was supposed to
+        /// handle this and could not, so the reason reaches the status line
+        /// instead of only the log.
+        DeviceCode {
+            url: String,
+            code: String,
+            sign_in_error: Option<String>,
+        },
         /// Progress from the automatic sign-in script.
         SignInStep(String),
         /// One run finished. `None` = authenticated.
@@ -2851,6 +2864,7 @@ mod gui {
                         // script, empty vault, focus guard) falls through to
                         // handing the user the page, with the code still
                         // fresh because `fed` is only just now waiting.
+                        let mut sign_in_error = None;
                         let handled = auto_sign_in
                             && match run_fed_sign_in(&cfg, &url, &code, &tx) {
                                 Ok(()) => true,
@@ -2859,11 +2873,16 @@ mod gui {
                                         "automatic sign-in did not run ({e}); \
                                          handing over the page"
                                     )));
+                                    sign_in_error = Some(e);
                                     false
                                 }
                             };
                         if !handled {
-                            let _ = tx.send(FedEvent::DeviceCode { url, code });
+                            let _ = tx.send(FedEvent::DeviceCode {
+                                url,
+                                code,
+                                sign_in_error,
+                            });
                         }
                     }
                 }
@@ -2903,7 +2922,11 @@ mod gui {
                 // can retry against a fresh code.
                 if !prompted {
                     if let Some((url, code)) = parse_device_code(&collected) {
-                        let _ = tx.send(FedEvent::DeviceCode { url, code });
+                        let _ = tx.send(FedEvent::DeviceCode {
+                            url,
+                            code,
+                            sign_in_error: None,
+                        });
                     }
                 }
             }
@@ -5435,7 +5458,11 @@ mod gui {
             while let Ok(event) = self.fed_rx.try_recv() {
                 match event {
                     FedEvent::Log(msg) => self.log_info(format!("fed_auth: {msg}")),
-                    FedEvent::DeviceCode { url, code } => self.on_fed_device_code(url, code),
+                    FedEvent::DeviceCode {
+                        url,
+                        code,
+                        sign_in_error,
+                    } => self.on_fed_device_code(url, code, sign_in_error),
                     FedEvent::SignInStep(step) => {
                         self.log_info(format!("fed_auth: sign-in {step}"));
                         self.fed_state = FedState::SigningIn(step);
@@ -5574,7 +5601,12 @@ mod gui {
         /// `fed up` is still running at this point — it blocks until the
         /// sign-in is approved — so this schedules nothing. Whatever the user
         /// does next is reflected in that run's exit code.
-        fn on_fed_device_code(&mut self, url: String, code: String) {
+        fn on_fed_device_code(
+            &mut self,
+            url: String,
+            code: String,
+            sign_in_error: Option<String>,
+        ) {
             match clipboard_set_text_with_retry(&code) {
                 Ok(()) => self.log_info(format!(
                     "fed_auth: activation code {code} copied to the clipboard"
@@ -5591,7 +5623,11 @@ mod gui {
             } else {
                 self.log_info(format!("fed_auth: opened {url}"));
             }
-            self.fed_state = FedState::AwaitingSignIn { code, url };
+            self.fed_state = FedState::AwaitingSignIn {
+                code,
+                url,
+                sign_in_error,
+            };
         }
 
         /// Apply one run's verdict: reschedule on success, step the retry
@@ -5886,9 +5922,23 @@ mod gui {
                 // The code is shown as well as copied: if the clipboard was
                 // busy, or the user copied something else in between, this is
                 // the only place left to read it from.
-                FedState::AwaitingSignIn { code, .. } => Some((
+                // The reason the automatic sign-in bowed out belongs on
+                // screen, not only in the log: it is the one thing that says
+                // what to fix, and it was being missed.
+                FedState::AwaitingSignIn {
+                    code,
+                    sign_in_error,
+                    ..
+                } => Some((
                     AMBER,
-                    format!("fed up: sign in on the page that opened — code {code} (copied)"),
+                    match sign_in_error {
+                        Some(err) => format!(
+                            "fed up: code {code} (copied) — auto sign-in bowed out: {err}"
+                        ),
+                        None => format!(
+                            "fed up: sign in on the page that opened — code {code} (copied)"
+                        ),
+                    },
                 )),
                 FedState::SigningIn(step) => {
                     Some((GREY, format!("fed up: signing in — {step}…")))
@@ -18580,7 +18630,7 @@ mod gui {
                                 // Mid sign-in: the page is already open and
                                 // the code copied, but a clipboard manager or
                                 // a stray copy can lose it.
-                                FedState::AwaitingSignIn { code, url } => {
+                                FedState::AwaitingSignIn { code, url, .. } => {
                                     let (code, url) = (code.clone(), url.clone());
                                     if ui
                                         .small_button("Copy code")
