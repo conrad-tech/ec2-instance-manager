@@ -488,6 +488,19 @@ the tunnel dies.
   bastion hides what the dialog flags. The secondary excludes the primary
   from its pool: an environment with one bastion gets a primary and no
   failover, which is the correct answer.
+- **The "all forwarding" toolbar line is green and transient.**
+  `ScriptState` gained an `Ok` variant (solid green, no flash) because the
+  healthy state was being drawn in the flashing yellow of work in progress,
+  so a tunnel up for minutes read as one hanging for minutes. It then hides
+  itself after `TUNNEL_OK_BANNER` (60s): a permanent banner announcing that
+  things work is noise on a bar whose job is to carry problems. It shows
+  again on recovery, which is what `tunnel_ok_since` being cleared on any
+  failure buys. Expiry is judged **at render**, not in
+  `refresh_tunnel_status` — that only runs on the 15s poll, so the banner
+  would overstay by up to that long — and the toolbar requests a repaint at
+  the expiry instant rather than waiting for something else to redraw.
+  `has_clearable_status` still counts only `Failed`, so the green line has
+  no ✖: it is not something to dismiss.
 - **The tunnel can never stop to ask a question**
   (`StrictHostKeyChecking=accept-new`, `BatchMode=yes`). It is spawned with
   `CREATE_NO_WINDOW` and a null stdin, so a prompt is a *hang*, not a

@@ -927,7 +927,17 @@ mod gui {
         Running,
         /// The run failed before it could start — shown solid red.
         Failed,
+        /// Everything is fine — shown solid green, and for the tunnels only
+        /// briefly. A permanent banner saying things work is noise on a
+        /// toolbar whose job is to carry problems; it earns its place for a
+        /// moment after the state *changes* and then gets out of the way.
+        Ok,
     }
+
+    /// How long the "everything is forwarding" line stays on the toolbar
+    /// before hiding itself. It reappears if forwarding breaks and recovers,
+    /// because that transition is worth seeing.
+    const TUNNEL_OK_BANNER: Duration = Duration::from_secs(60);
 
     /// Time windows offered in the Alerts window, in minutes.
     const ALERT_WINDOWS: [(i64, &str); 5] = [
@@ -4534,6 +4544,10 @@ mod gui {
         /// working, red on failure). Kept separate from `script_status` so a
         /// tunnel cannot stomp an in-flight Scripts run.
         tunnel_status: Option<(String, ScriptState)>,
+        /// When every enabled environment last became healthy, or `None`
+        /// while any is not. Drives the self-expiring success banner, and
+        /// resetting it on failure is what makes a recovery show again.
+        tunnel_ok_since: Option<Instant>,
         /// Hosts entries missing last time forwarding was attempted. Used to
         /// raise the copy-paste prompt when the set *changes*, rather than
         /// every poll.
@@ -4907,6 +4921,7 @@ mod gui {
                 show_port_forwards: false,
                 last_tunnel_poll_at: Instant::now(),
                 tunnel_status: None,
+                tunnel_ok_since: None,
                 tunnel_hosts_missing: Vec::new(),
                 hosts_prompt: None,
                 forward_collisions: Vec::new(),
@@ -7375,6 +7390,16 @@ mod gui {
                 }
             };
 
+            if blocked.is_empty() {
+                // Entering the healthy state starts the window; staying in it
+                // does not restart it.
+                if self.tunnel_ok_since.is_none() {
+                    self.tunnel_ok_since = Some(Instant::now());
+                }
+            } else {
+                // So a recovery shows again rather than passing silently.
+                self.tunnel_ok_since = None;
+            }
             self.tunnel_status = if blocked.is_empty() {
                 Some((
                     format!(
@@ -7383,16 +7408,11 @@ mod gui {
                         running.len(),
                         if running.len() == 1 { "" } else { "s" }
                     ),
-                    // `ScriptState` has only Running and Failed, and Running
-                    // is what colours this line — so the wording has to carry
-                    // the distinction instead. This is a steady state, not a
-                    // connect in progress: there is no connecting state,
-                    // since `alive` comes straight off `try_wait`, and the
-                    // message only appears once a session is up and carrying
-                    // its forwards. Without the count it reads as a spinner,
-                    // and a tunnel that came up minutes ago looks like one
-                    // that has been hanging for minutes.
-                    ScriptState::Running,
+                    // Green and steady, not the flashing yellow of work in
+                    // progress — this is the finished state, and it reads as
+                    // a spinner otherwise. It also hides itself after
+                    // TUNNEL_OK_BANNER; see the toolbar.
+                    ScriptState::Ok,
                 ))
             } else {
                 let labels: Vec<String> =
@@ -18809,19 +18829,36 @@ mod gui {
                         }
                     });
 
+                    let status_color = |state: &ScriptState, ui: &egui::Ui| match state {
+                        ScriptState::Running => flashing_yellow(ui),
+                        ScriptState::Failed => egui::Color32::from_rgb(220, 60, 60),
+                        ScriptState::Ok => egui::Color32::from_rgb(120, 180, 120),
+                    };
                     if let Some((text, state)) = self.script_status.clone() {
-                        let color = match state {
-                            ScriptState::Running => flashing_yellow(ui),
-                            ScriptState::Failed => egui::Color32::from_rgb(220, 60, 60),
-                        };
-                        ui.colored_label(color, text);
+                        ui.colored_label(status_color(&state, ui), text);
                     }
                     if let Some((text, state)) = self.tunnel_status.clone() {
-                        let color = match state {
-                            ScriptState::Running => flashing_yellow(ui),
-                            ScriptState::Failed => egui::Color32::from_rgb(220, 60, 60),
-                        };
-                        ui.colored_label(color, text);
+                        // The success line is transient. Expiry is judged
+                        // here rather than in `refresh_tunnel_status`, which
+                        // only runs on the 15s poll — the banner would
+                        // otherwise outstay its minute by up to that long.
+                        let expired = matches!(state, ScriptState::Ok)
+                            && self
+                                .tunnel_ok_since
+                                .map(|t| t.elapsed() >= TUNNEL_OK_BANNER)
+                                .unwrap_or(true);
+                        if !expired {
+                            if let (ScriptState::Ok, Some(since)) =
+                                (&state, self.tunnel_ok_since)
+                            {
+                                // Come back and clear it on time, rather than
+                                // whenever something else happens to repaint.
+                                ctx.request_repaint_after(
+                                    TUNNEL_OK_BANNER.saturating_sub(since.elapsed()),
+                                );
+                            }
+                            ui.colored_label(status_color(&state, ui), text);
+                        }
                     }
                     if let Some(hl) = self.script_status_highlight.clone() {
                         ui.colored_label(flashing_yellow(ui), hl);
@@ -18829,15 +18866,27 @@ mod gui {
                     if !self.message.is_empty() {
                         ui.label(self.message.clone());
                     }
-                    // One clear for whatever is on the bar — an error nobody
-                    // can act on should not be permanent furniture.
-                    if self.has_clearable_status()
-                        && ui
-                            .small_button("✖")
-                            .on_hover_text("Clear this message")
-                            .clicked()
-                    {
-                        clear_status = true;
+                    // Pushed to the far right rather than trailing the
+                    // messages: it is one control for everything on the bar,
+                    // and sitting immediately after a message of varying
+                    // length made it wander. An error nobody can act on
+                    // should not be permanent furniture, but the button
+                    // should not be hunted for either.
+                    if self.has_clearable_status() {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui
+                                    .button("Clear Notifications")
+                                    .on_hover_text(
+                                        "Dismiss the messages on this bar.",
+                                    )
+                                    .clicked()
+                                {
+                                    clear_status = true;
+                                }
+                            },
+                        );
                     }
                 });
                 if clear_status {
