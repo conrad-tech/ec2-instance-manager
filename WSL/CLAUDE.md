@@ -858,6 +858,48 @@ The Windows smoke test uses PowerShell (`default_terminal=powershell`) in the gu
 
 ## Troubleshooting
 
+### Bastion create "fails on the secondary" — account MISSING, group present
+
+Symptom: the create finishes, the SSH test fails, and `create_diagnostics.sh`
+reports `account : MISSING` on the secondary while `group : <user>:x:NNNN:`
+exists. The `home`/`keydir`/`authkeys`/`userpem` lines are absent too — not a
+separate fault, they come from a `sudo -n -u <user>` block that cannot run
+without the account. `sudoers` may still be listed: it is written by four
+**separate** GUI steps (`sudoers_grant.sh`), so its presence proves nothing
+about whether the mirror got as far as `useradd`.
+
+That state means `groupadd` succeeded and `useradd` did not, in
+`secondary_mirror.sh`. Both used to run under `2>/dev/null || true`, so the one
+sentence naming the cause was discarded and the step reported only
+`secondary: FAILED to create <user>`. They now report a real failure (non-zero
+exit) and still swallow the benign `GROUP=100` / skel / "home already exists"
+warnings, which come with exit 0. On failure the step also prints who holds
+that uid and gid on the secondary, because the likely causes are a **UID
+already taken** there (the two bastions' user tables drift when accounts are
+created in different orders) and a **stale group of the same name with a
+different GID**, which makes `groupadd -g` fail and then `useradd -g` fail
+against a GID that does not exist.
+
+**Not to be confused with the restore feature.** Restore added nothing to the
+create path: `7ccc181` left the secondary steps untouched, and the mirror is
+byte-identical to before it was extracted into an asset (`bc47563`).
+
+**Separately, the mirror step was taking the wrong timeout.** The worker picked
+its 40s wait by matching `stat -c %u /efs/home`, but `143e690` had refactored
+the step to `stat -c %u "$H"` — so the match silently stopped working and the
+step took the 6s `STEP_WAIT` while its own retry loop runs up to ~24s. Nothing
+fails loudly when that happens: the worker logs `TIMEOUT — prompt bump missed`
+and sends the *next* step into a shell still running this one, where the TTY
+hands those bytes to the running command instead of bash (the same mechanism as
+"Multi-line paste" below). The matcher is now `SECONDARY_MIRROR_MARK` and
+`secondary_mirror_step_matches_its_wait` pins the const and the script
+together, since they live in different files and drifted apart once already.
+
+When triaging: get the secondary tab's scrollback and the `[secondary i-…]`
+lines from the app log. `secondary: useradd failed: …` names the cause outright;
+`step N/M done in …ms (TIMEOUT — prompt bump missed)` means the drip-feed
+desynced instead.
+
 ### Multi-line paste — only first command runs
 
 Symptom: user pastes N commands from Notepad, all N lines appear echoed in the terminal, but `history` shows only the first (and occasionally 2–3 fast ones); subsequent lines never execute.

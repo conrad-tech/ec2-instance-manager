@@ -2248,6 +2248,21 @@ mod gui {
         flashing_color(ui, 255, 205, 0)
     }
 
+    /// A notification-bar message. Bold under the light theme: the status
+    /// colors (yellow especially, and the flashing variants, which spend
+    /// half their cycle at low alpha) were picked against a dark panel and
+    /// wash out on a light one. Weight buys back the contrast without
+    /// changing the colors, so green/red/yellow keep meaning the same
+    /// thing in both themes.
+    fn notification_text(ui: &egui::Ui, color: egui::Color32, text: impl Into<String>) -> egui::RichText {
+        let rich = egui::RichText::new(text).color(color);
+        if ui.visuals().dark_mode {
+            rich
+        } else {
+            rich.strong()
+        }
+    }
+
     /// Open the OS file manager showing `path`. On Windows this opens
     /// Explorer with the file highlighted (`/select,`); elsewhere it opens
     /// the containing folder via `xdg-open`. Best-effort; errors ignored.
@@ -3996,6 +4011,20 @@ mod gui {
     /// settle. Inserted right after `sudo su` so the root shell gets the
     /// custom PS1 / vim-paste / ssh-config setup before the script runs.
     const PREP_STEP_SENTINEL: &str = "\u{0}__prep_terminal__\u{0}";
+
+    /// Substring that identifies the secondary EFS-mirror step, which needs a
+    /// far longer wait than an ordinary step: it retries for ~24s while the
+    /// shared home becomes visible on this bastion.
+    ///
+    /// It is a marker rather than an inline literal because the match silently
+    /// stopped working once: the matcher looked for `stat -c %u /efs/home`
+    /// while the step had been refactored to `stat -c %u "$H"`, so the mirror
+    /// spent a year taking the 6s `STEP_WAIT`. A step that outlives its wait
+    /// does not fail — the worker logs `TIMEOUT — prompt bump missed` and
+    /// sends the *next* step into a shell still running this one, where the
+    /// TTY hands those bytes to the running command instead of bash.
+    /// `secondary_mirror_step_matches_its_wait` now pins the two together.
+    const SECONDARY_MIRROR_MARK: &str = "UID_NUM=$(stat -c %u";
 
     #[derive(Debug, PartialEq, Eq)]
     struct RowAction {
@@ -11609,8 +11638,14 @@ mod gui {
                 // the secondary may have cached "no such user" for up to the
                 // attribute-cache TTL — then mirror the UID/GID and create
                 // the local account. Kept as a single step so the retry loop
-                // doesn't race the drip-feed. The `stat -c %u /efs/home`
-                // substring flags it for the longer worker timeout.
+                // doesn't race the drip-feed. `SECONDARY_MIRROR_MARK` is what
+                // flags it for the longer worker timeout — see that const for
+                // why the flag is not just an inline literal.
+                // groupadd/useradd report a real failure (non-zero) and stay
+                // quiet about the benign GROUP=100/skel/"home exists" warnings,
+                // which come with exit 0. Discarding both meant a secondary
+                // that failed said only "FAILED to create <user>", and the one
+                // sentence naming the cause was thrown away.
                 // Obfuscated template (see build.rs / deobf_asset); `__USER__`
                 // matches every `{username}` in the old inline command. The
                 // `stat -c %u`/`useradd`/`groupadd` body was the most
@@ -12254,8 +12289,13 @@ mod gui {
                         } else {
                             let dir = |ok: bool| if ok { "OK" } else { "FAILED" };
                             let mut msg = format!(
+                                // ASCII arrows, not U+2192: egui's bundled
+                                // font has no glyph for it and the dialog
+                                // rendered a tofu box where the direction
+                                // should be — in the one message whose whole
+                                // job is saying which way the login failed.
                                 "User '{username}' {did}, but SSH test failed \
-                                 (primary→secondary: {}, secondary→primary: {}). \
+                                 (primary -> secondary: {}, secondary -> primary: {}). \
                                  See diagnostics below.",
                                 dir(p2s),
                                 dir(s2p),
@@ -12448,7 +12488,7 @@ mod gui {
                         CREATE_WAIT
                     } else if step.starts_with("bash /root/delete_user.sh") {
                         DELETE_WAIT
-                    } else if step.contains("stat -c %u /efs/home") {
+                    } else if step.contains(SECONDARY_MIRROR_MARK) {
                         // Secondary EFS-home wait + mirror (retries up to ~24s).
                         Duration::from_secs(40)
                     } else {
@@ -18841,7 +18881,8 @@ mod gui {
                     ui.horizontal_top(|ui| {
                         ui.vertical(|ui| {
                             if let Some((text, state)) = self.script_status.clone() {
-                                ui.colored_label(status_color(&state, ui), text);
+                                let c = status_color(&state, ui);
+                                ui.label(notification_text(ui, c, text));
                             }
                             if let Some((text, state)) = self.tunnel_status.clone() {
                                 // The success line is transient. Expiry is
@@ -18866,14 +18907,17 @@ mod gui {
                                                 .saturating_sub(since.elapsed()),
                                         );
                                     }
-                                    ui.colored_label(status_color(&state, ui), text);
+                                    let c = status_color(&state, ui);
+                                    ui.label(notification_text(ui, c, text));
                                 }
                             }
                             if let Some(hl) = self.script_status_highlight.clone() {
-                                ui.colored_label(flashing_yellow(ui), hl);
+                                let c = flashing_yellow(ui);
+                                ui.label(notification_text(ui, c, hl));
                             }
                             if !self.message.is_empty() {
-                                ui.label(self.message.clone());
+                                let c = ui.visuals().text_color();
+                                ui.label(notification_text(ui, c, self.message.clone()));
                             }
                         });
                         // Far right, and anchored to the top so it sits level
@@ -23173,7 +23217,33 @@ mod gui {
             assert!(!s.contains('\n'), "secondary must stay one line");
             assert!(s.starts_with("cd ~ && H=/efs/home/jane.doe;"));
             assert!(s.contains("useradd -u") && s.contains("groupadd -g"));
-            assert!(s.ends_with("|| echo \"secondary: FAILED to create jane.doe\""));
+            // A failure has to name itself. Reporting only "FAILED to create"
+            // and discarding useradd's own sentence is what made a broken
+            // secondary undiagnosable from the screen.
+            assert!(s.contains("secondary: FAILED to create jane.doe"));
+            assert!(s.contains("|| echo \"secondary: useradd failed: $UERR\""));
+            assert!(s.contains("|| echo \"secondary: groupadd failed: $GERR\""));
+            assert!(s.contains("held by: $(getent passwd"));
+        }
+
+        /// The mirror step retries for ~24s, so it must match the branch that
+        /// gives it 40s rather than the 6s `STEP_WAIT`. These two lived in
+        /// different files and silently drifted apart once already: the
+        /// matcher looked for `stat -c %u /efs/home` after the script had been
+        /// refactored to `stat -c %u "$H"`, and nothing failed — the step just
+        /// started timing out, letting the next step be sent into a shell that
+        /// was still running this one.
+        #[test]
+        fn secondary_mirror_step_matches_its_wait() {
+            let s = deobf_named(
+                include_bytes!(concat!(env!("OUT_DIR"), "/secondary_mirror.sh.obf")),
+                "jane.doe",
+            );
+            assert!(
+                s.contains(SECONDARY_MIRROR_MARK),
+                "the mirror step must contain SECONDARY_MIRROR_MARK ({SECONDARY_MIRROR_MARK:?}) \
+                 or it silently falls back to the 6s STEP_WAIT; step was: {s}"
+            );
         }
 
         #[test]
