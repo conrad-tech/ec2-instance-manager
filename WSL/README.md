@@ -24,6 +24,12 @@ Rust-only EC2 + SSM instance explorer with:
   bound to an IAM role, then read both back to verify), and an admin-gated
   **Vault IAM Delete** that undoes it.
   See [Scripts menu (bastion user management)](#scripts-menu-bastion-user-management).
+- **Port forwards** (GUI, Connections page) — one hidden `ssh` session per
+  environment holding that environment's forwards open, so an internal service
+  is reachable in a browser without starting anything by hand. Per-environment
+  setup for the bastion, login and key; failover to a secondary bastion; a Test
+  connection that opens the real session; and a live `ssh -v` log per
+  environment. See [Port forwards](#port-forwards).
 - **Access email** (Windows) — after a create, copy a ready-to-run command that
   composes, encrypts and sends the bastion-access email with the PEM attached.
   You run it in your own terminal; the app never sends anything itself.
@@ -515,6 +521,178 @@ Use any hex color code (`#RRGGBB`). Here are some suggested defaults:
 | Brown | `#b4783c` | Legacy |
 
 Colors can also be customized at runtime via **right-click on a legend item** or **Edit > Account Tab Colors > Edit**. Runtime overrides are saved to `config.ini` and take priority over `accounts.json`.
+
+## Port forwards
+
+Reaching an internal service from your workstation means tunnelling it through a
+bastion. The app keeps **one hidden `ssh` session per environment** holding that
+environment's forwards open, so `https://vault.dev1.example.net` in a browser
+works without you starting anything by hand. The sessions stop when the app
+closes.
+
+The **Port Forwards** button on the Connections toolbar (left of Close All)
+opens the window that manages them.
+
+### The window
+
+| Column | Meaning |
+|--------|---------|
+| **On** | Whether this environment's tunnel runs. **On by default** — the opt-*out* is what gets saved (`forward_ports_off.<account>.<ENV>` in `config.ini`). |
+| **Environment** | The `MMODAL_ENV` value, uppercased. |
+| **Status** | See below. |
+| **Bastion** | The box actually carrying the session, flagged `(secondary)` when it has failed over. |
+| **Setup** | Opens the connection-setup dialog for that environment. |
+
+Status values, and what each one actually proves:
+
+- `connecting to i-0abc… 3s` — the session has started but has not yet bound
+  its ports.
+- `forwarding 9 ports · up 4m` — **the session itself reported binding those
+  ports** (read from its own `ssh -v` output, so another program listening on
+  the same address cannot be mistaken for it). The clock runs from the bind,
+  not from process start.
+- `forwarding 9 ports · up 4m · verified` — a request through the tunnel was
+  answered. See [Verification](#verification).
+- `not connected — alive 2m but no ports bound` — ssh is running but never
+  finished connecting, so nothing is forwarded. Expand that environment's
+  **session output** for the reason.
+- Anything else is the reason it has not started, e.g. `no pem saved for this
+  environment` or `<account> needs authorizing — forwards start once it is`.
+
+Below the table, each environment has two collapsible sections: its **forwards**
+(`ip:port → host:port`) and its **session output** — the live `ssh -v` log from
+that hidden process, scrollable, with a Copy button. That log is the first place
+to look when something is not working, since these sessions are otherwise
+invisible.
+
+The toolbar shows `Forwarded ports for all environments (4 tunnels up)` in green
+for a minute once everything is up, then hides itself; it comes back for another
+minute if forwarding breaks and recovers.
+
+### Setup: bastion, login and key
+
+Every row has a **Setup** button — including working ones, since the usual
+reason to open it is a setup that used to work and stopped (a terminated
+bastion, a deleted login, a rotated key).
+
+- **Primary bastion** — the box the tunnel connects through.
+- **Secondary bastion** — the failover target, tried when the primary will not
+  hold a session. Optional; one bastion means no failover.
+- **Login user** — defaults to `ec2-user`.
+- **Key (pem)** — chosen from the shared key library, or added with
+  **+ Add pem...**.
+
+A dropdown offering exactly one bastion selects it for you. A saved bastion that
+is no longer in the inventory stays selected and is flagged **"no longer in
+inventory"** rather than being silently cleared — that terminated instance is
+usually the whole explanation.
+
+These are the **same** key and login that **Open in VS Code** uses, and the same
+bastion pair the Scripts dialogs run against, so fixing a login here fixes it
+everywhere. Changing the primary bastion therefore re-aims Bastion New User,
+Bastion User Delete and Vault IAM as well; the dialog says so and it is recorded
+in the log.
+
+Values are stored **per environment** (`<account_id>.<ENV>`), and Port Forwards
+reads only that key — it never inherits an account-wide default. An account
+hosting two environments would otherwise connect one with the other's key.
+
+### Test connection
+
+**Test connection** saves your changes, then opens the identical hidden session
+the tunnel uses — the real `-L` forwards under `ExitOnForwardFailure=yes`, and
+the same failover to the secondary. It is not a cheap reachability probe: port
+binding is where these sessions actually fail.
+
+It counts up while it runs, and either reports `connected to i-0abc… in 4.2s —
+9 forward(s) bound` or shows ssh's own error with a hint (`the key or the login
+user is wrong`, `another process is already holding that local port`, `the
+bastion could not be reached`). The raw stderr is always shown underneath.
+
+If the environment is switched on, the session that passed **becomes** the live
+tunnel rather than being thrown away and restarted.
+
+### Failover
+
+If the primary bastion cannot be reached — terminated, missing from the
+inventory, or simply refusing connections — the tunnel retries on the secondary.
+A session that dies within 30s of starting counts as "this bastion did not
+work"; one that dies after running for an hour is treated as a dropped
+connection and restarted on the same box.
+
+Failover is **sticky**: a tunnel happily up on the secondary is not moved back
+to disturb it. The rotation keeps both boxes in play, so a later failure on the
+secondary falls back to the primary. Which box a session is on is a fact about
+that run and is never written to `config.ini`.
+
+### Verification
+
+Binding a local port only proves ssh is listening; it does not prove anything
+reaches the far side, because ssh does not dial the remote host until a forward
+is first used. So once a tunnel settles, the app makes one request through it
+with `curl` and reports `verified` or `nothing answering through it`.
+
+The endpoint is that environment's **Vault** forward. An environment with no
+Vault forward is skipped rather than reported as failed — `is_bound` already
+answers whether ssh is listening. Any HTTP reply counts as proof, including
+`503`/`429` from a sealed or standby Vault.
+
+### Configuring which ports are forwarded
+
+Forwards come from the compiled-in `assets/forwards.json` plus your hosts file.
+Edit that file and rebuild to change them.
+
+```json
+{
+  "default_port": 443,
+  "port_rules": [
+    { "match": "postgres", "port": 5432 },
+    { "match": "solr", "port": 8984 }
+  ],
+  "environments": {
+    "DEV1": [
+      { "ip": "127.200.10.1", "host": "uweb01.dev1.example.net" },
+      { "ip": "127.200.10.2", "host": "admin01.dev1.example.net", "port": 8443 }
+    ]
+  }
+}
+```
+
+- `key` — the `MMODAL_ENV` tag, matched **case-insensitively**.
+- `ip` — the loopback address bound on your machine. **Ignored where your hosts
+  file already resolves `host`** — that IP wins, so an existing setup keeps
+  working.
+- `port` — optional. Omitted, the port comes from the first matching entry in
+  `port_rules`, and failing that from `default_port`.
+
+**A service on a non-standard port needs a `port_rules` entry**, or it silently
+gets `default_port` and the forward breaks in a way that looks fine: the local
+bind succeeds, the window says the ports are forwarded, and only a request
+through the tunnel finds nothing there. Take the port from a `LocalForward` line
+you know works.
+
+Every environment's tunnel runs at once, so **no two environments may share an
+`ip:port`**. Give each its own range (`127.200.10.x`, `127.200.20.x`). A clash is
+detected at startup and the later environment's forward is dropped, but the fix
+is distinct addresses.
+
+Entries under a single-word comment in your hosts file (`# DEV1`) are picked up
+for that environment too, even when `forwards.json` does not declare them.
+
+**The hosts file is only ever read, never written.** A forward works without an
+entry — the remote name is resolved on the bastion — the entry just lets you
+type the name in a browser instead of the loopback IP. Where entries are
+missing, the app offers the lines to paste in.
+
+### Running from WSL
+
+If you run the Linux build under WSL, the tunnel is started with the **Windows**
+ssh client (`C:\Windows\System32\OpenSSH\ssh.exe`) so its ports bind where your
+browser can reach them. A tunnel started by the Linux client binds inside WSL's
+own network namespace, which Windows cannot reach at all, and it fails silently.
+Keep your `.pem` under `/mnt/<drive>/…` — Windows OpenSSH refuses a private key
+whose permissions it cannot vouch for, which includes one reached over
+`\\wsl.localhost`.
 
 ## Scripts menu (bastion user management)
 

@@ -7403,7 +7403,7 @@ mod gui {
             self.tunnel_status = if blocked.is_empty() {
                 Some((
                     format!(
-                        "Forwarding ports for {} ({} tunnel{} up)",
+                        "Forwarded ports for {} ({} tunnel{} up)",
                         name_list(&running, enabled.len()),
                         running.len(),
                         if running.len() == 1 { "" } else { "s" }
@@ -18874,7 +18874,13 @@ mod gui {
                     // should not be hunted for either.
                     if self.has_clearable_status() {
                         ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
+                            // `Align::TOP`, not `Center`: the messages stack,
+                            // so this row grows with them and a centred
+                            // button sinks to the middle of the list, sitting
+                            // level with nothing. Anchored to the top it
+                            // stays beside the first message however many
+                            // arrive underneath.
+                            egui::Layout::right_to_left(egui::Align::TOP),
                             |ui| {
                                 if ui
                                     .button("Clear Notifications")
