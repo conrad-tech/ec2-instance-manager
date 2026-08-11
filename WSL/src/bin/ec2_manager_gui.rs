@@ -4694,6 +4694,10 @@ mod gui {
         /// When the last attempt started. Enforces a floor between runs so an
         /// expiry `fed up` does not clear cannot spin.
         fed_last_attempt_at: Option<Instant>,
+        /// Profiles already expired when that attempt started. A profile
+        /// expiring that is *not* in here is new information and bypasses the
+        /// floor, so a second account lapsing is not ignored for two minutes.
+        fed_last_attempt_expired: std::collections::HashSet<String>,
         /// Whether Credential Manager holds a federation password. Answered
         /// by a `-Mode Check`; `None` until it replies. Only ever presence —
         /// the app never holds the password itself.
@@ -5034,6 +5038,7 @@ mod gui {
                     .fed_auth
                     .auto_sign_in_for(&ec2_manager::features::current_os_user()),
                 fed_last_attempt_at: None,
+                fed_last_attempt_expired: std::collections::HashSet::new(),
                 fed_password_present: None,
                 fed_password_dialog: None,
                 fed_stalled_at_mtime: None,
@@ -5335,12 +5340,23 @@ mod gui {
                             ));
                             self.prime_cache_from_disk(pid);
                         }
+                        self.refresh_profile(pid, true);
                     } else {
-                        self.log_info(format!(
-                            "credentials renewed for profile={pid}, refreshing"
+                        // Already authenticated and merely re-issued — which
+                        // is what every `fed up` does, and what saving an
+                        // edit to ~/.aws/credentials does. The inventory is
+                        // not stale just because the credentials were
+                        // rewritten, so this does NOT force a refresh:
+                        // doing so re-fetched every authenticated account on
+                        // every write to that file, which is exactly how the
+                        // describe calls hit their rate limit and then
+                        // looped. The periodic refresh still covers
+                        // staleness.
+                        self.log_debug(format!(
+                            "credentials re-issued for profile={pid}; \
+                             inventory left alone"
                         ));
                     }
-                    self.refresh_profile(pid, true);
                 }
                 // Rebuild colors so newly-primed profiles appear in the
                 // environment color map / legend immediately.
@@ -5435,17 +5451,6 @@ mod gui {
             ) {
                 return None;
             }
-            // Floor between any two attempts. Without it, a `fed up` that
-            // exits 0 without actually clearing the expiry — a different
-            // profile, a partial refresh — would spin as fast as the frame
-            // rate.
-            let interval = self.fed_auth_cfg.retry_policy().interval;
-            if self
-                .fed_last_attempt_at
-                .is_some_and(|at| at.elapsed() < interval)
-            {
-                return None;
-            }
             // Only profiles that federate: one with no `fed_expire` at all
             // reads as Missing forever (a static key, or an account this user
             // has never authenticated), and `fed up` would never fix it.
@@ -5457,6 +5462,30 @@ mod gui {
                 .collect();
             if expired.is_empty() {
                 return None;
+            }
+
+            // Floor between attempts, so a `fed up` that exits without
+            // actually clearing an expiry cannot spin as fast as the frame
+            // rate.
+            //
+            // It applies only to expiries we have already tried for. An
+            // account that has *just* expired is new information and runs
+            // immediately — otherwise a second account lapsing shortly after
+            // the first was silently ignored for two minutes, which read as
+            // "sometimes it runs, sometimes it doesn't".
+            let unseen: Vec<&str> = expired
+                .iter()
+                .copied()
+                .filter(|p| !self.fed_last_attempt_expired.contains(*p))
+                .collect();
+            if unseen.is_empty() {
+                let interval = self.fed_auth_cfg.retry_policy().interval;
+                if self
+                    .fed_last_attempt_at
+                    .is_some_and(|at| at.elapsed() < interval)
+                {
+                    return None;
+                }
             }
             Some(format!("credentials expired for {}", expired.join(", ")))
         }
@@ -5499,6 +5528,10 @@ mod gui {
             let Some(err) = result else {
                 self.fed_retrying_since = None;
                 self.fed_stalled_at_mtime = None;
+                // The set only means "expiries we tried and did not clear".
+                // Once one is cleared, the same account lapsing later is new
+                // information again.
+                self.fed_last_attempt_expired.clear();
                 self.fed_state = FedState::Authenticated;
                 // Nothing scheduled: the next run is triggered by the new
                 // credentials expiring. The mtime watcher picks up the file
@@ -5570,6 +5603,12 @@ mod gui {
             self.fed_running = true;
             self.fed_next_run_at = None;
             self.fed_last_attempt_at = Some(Instant::now());
+            self.fed_last_attempt_expired = self
+                .profile_auth_infos
+                .iter()
+                .filter(|a| a.auth_status == AuthStatus::Expired)
+                .map(|a| a.profile_id.clone())
+                .collect();
             self.fed_state = FedState::Running;
             let cfg = self.fed_auth_cfg.clone();
             let auto = self.fed_auto_sign_in;
