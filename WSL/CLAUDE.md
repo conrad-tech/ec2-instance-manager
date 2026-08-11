@@ -708,9 +708,13 @@ wording differ. Delete is the genuinely separate path, and the code below
 - **Never passes `--sudo`**, so sudoers is untouched and an existing grant
   survives.
 
-**Restore refuses the `protected_users` list**, which previously only gated
-delete. Restore replaces `authorized_keys`, so pointed at a shared account
-like `ec2-user` it would revoke the key everyone uses.
+**Restore is open to every user and every username.** The menu row is ungated
+(no `allowed_users` list), and `protected_users` gates delete only — it briefly
+gated restore too and that was removed on 2026-08-11, because re-keying a
+shared account like `ec2-user` after its PEM is lost is exactly the job restore
+exists for. The consequence is real and intended: restore replaces
+`authorized_keys`, so a restore aimed at a shared account revokes the key
+everyone on that bastion uses. The dialog's ⚠ line says so.
 
 Every Scripts menu row carries hover text saying what it does; the personal
 and default script rows show a trimmed preview of the body itself

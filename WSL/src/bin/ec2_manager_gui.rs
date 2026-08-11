@@ -10927,20 +10927,14 @@ mod gui {
                     self.create_user_dialog = Some(dlg);
                     return;
                 }
-                // Restore replaces authorized_keys, so pointed at a shared
-                // account like ec2-user it would revoke the key everyone
-                // uses. Both destructive modes refuse the protected list.
+                // Only delete refuses the protected list — it is the one that
+                // removes an account. Restore re-issues a key to a user who
+                // already exists and is deliberately open to every username,
+                // including the shared ones: re-keying ec2-user on a bastion
+                // whose key has been lost is a thing an admin needs to do.
                 if dlg.mode.is_delete() && self.is_protected_user(&username) {
                     dlg.error = Some(format!(
                         "'{username}' is a protected user and cannot be deleted."
-                    ));
-                    self.create_user_dialog = Some(dlg);
-                    return;
-                }
-                if dlg.mode.is_restore() && self.is_protected_user(&username) {
-                    dlg.error = Some(format!(
-                        "'{username}' is a protected user — restoring would \
-                         revoke the key everyone shares."
                     ));
                     self.create_user_dialog = Some(dlg);
                     return;
