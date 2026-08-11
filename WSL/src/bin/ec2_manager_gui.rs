@@ -2657,7 +2657,11 @@ mod gui {
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            // Captured, not discarded: a script that never *starts* — blocked
+            // by execution policy, a syntax error — writes here and leaves
+            // stdout empty. Throwing it away made that read as success, so
+            // the sign-in would silently do nothing and report nothing.
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| format!("could not start PowerShell: {e}"))?;
 
@@ -2671,7 +2675,29 @@ mod gui {
         if let Some(mut pipe) = child.stdout.take() {
             let _ = pipe.read_to_string(&mut out);
         }
-        let _ = child.wait();
+        let mut err = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut err);
+        }
+        let code = child.wait().ok().and_then(|s| s.code());
+
+        // The script reports through markers, and `Write-Fail` emits one
+        // before exiting 1 — so a non-zero exit *with* a marker is a normal,
+        // already-described failure and belongs to the caller. No marker at
+        // all means it never got as far as running.
+        if !out.contains("FEDLOGIN_") && code != Some(0) {
+            let detail: String = err.trim().chars().take(300).collect();
+            return Err(format!(
+                "fed_login.ps1 produced no output and exited with {} — {}",
+                code.map(|c| c.to_string())
+                    .unwrap_or_else(|| "no exit code".to_string()),
+                if detail.is_empty() {
+                    "no error text either".to_string()
+                } else {
+                    detail
+                }
+            ));
+        }
         Ok(out)
     }
 
@@ -2784,18 +2810,42 @@ mod gui {
             })
         });
 
+        // stdout is read on its own thread and handed back a line at a time,
+        // so this one can enforce a deadline. `fed up` blocks until the
+        // device authorization is approved, and a sign-in the user walks
+        // away from would otherwise pin the worker — and with it
+        // `fed_running`, and with that every later expiry — until the app
+        // restarts. A blocking read here could not be interrupted.
+        let (line_tx, line_rx) = mpsc::channel::<String>();
+        let stdout = child.stdout.take();
+        let stdout_handle = std::thread::spawn(move || {
+            if let Some(out) = stdout {
+                for line in BufReader::new(out).lines().map_while(|l| l.ok()) {
+                    if line_tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
         let mut collected = String::new();
         let mut prompted = false;
-        if let Some(out) = child.stdout.take() {
-            for line in BufReader::new(out).lines().map_while(|l| l.ok()) {
+        let mut timed_out = false;
+        let deadline = Instant::now() + cfg.run_timeout();
+
+        // Consume one line: record it, and act on the first device prompt.
+        let take_line = |line: String,
+                             collected: &mut String,
+                             prompted: &mut bool| {
+            {
                 collected.push_str(&line);
                 collected.push('\n');
                 // Only the first prompt is acted on — `fed` can redraw the
                 // line, and reopening the tab under the user mid-sign-in
                 // would be worse than useless.
-                if !prompted {
+                if !*prompted {
                     if let Some((url, code)) = parse_device_code(&line) {
-                        prompted = true;
+                        *prompted = true;
                         // Auto sign-in is the primary path when on, but not
                         // the only one: anything that stops the script (no
                         // script, empty vault, focus guard) falls through to
@@ -2818,9 +2868,33 @@ mod gui {
                     }
                 }
             }
+        };
+
+        let exit_code = loop {
+            while let Ok(line) = line_rx.try_recv() {
+                take_line(line, &mut collected, &mut prompted);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status.code(),
+                Ok(None) => {}
+                Err(_) => break None,
+            }
+            if Instant::now() >= deadline {
+                timed_out = true;
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+
+        // The reader ends when the pipe closes, which the exit or the kill
+        // above has already done.
+        let _ = stdout_handle.join();
+        while let Ok(line) = line_rx.try_recv() {
+            take_line(line, &mut collected, &mut prompted);
         }
 
-        let status = child.wait();
         if let Some(handle) = stderr_handle {
             if let Ok(err) = handle.join() {
                 collected.push_str(&err);
@@ -2842,7 +2916,15 @@ mod gui {
             collected.trim()
         )));
 
-        let exit_code = status.ok().and_then(|s| s.code());
+        if timed_out {
+            let _ = tx.send(FedEvent::Finished(Some(FedError::Command(format!(
+                "fed up did not finish within {}s and was stopped — the sign-in \
+                 was probably never completed",
+                cfg.run_timeout().as_secs()
+            )))));
+            return;
+        }
+
         match classify_exit(&collected, exit_code) {
             FedOutcome::Authenticated => {
                 let _ = tx.send(FedEvent::Finished(None));

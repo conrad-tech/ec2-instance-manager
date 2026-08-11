@@ -90,8 +90,15 @@ param(
     # is replaced rather than appended to).
     [string]$Username = '',
 
-    # Foreground-window title fragment required before anything is typed.
-    [string]$TitleMatch = 'okta',
+    # Foreground-window title fragments accepted before anything is typed,
+    # pipe-separated; any one matching is enough. A list rather than one
+    # value because the sign-in walks several pages that do not share a
+    # title.
+    [string]$TitleMatch = 'okta|sign in|verify',
+
+    # Seconds the focus guard will wait for a matching window before giving
+    # up. Sampling a single instant made every page transition a race.
+    [int]$GuardWaitSec = 10,
 
     # Explicit chrome.exe path. Empty searches the usual install locations.
     [string]$ChromePath = '',
@@ -295,20 +302,42 @@ function Get-ForegroundProcessName {
     catch { return '' }
 }
 
+# Any one of the -TitleMatch fragments matching is enough.
+function Test-TitleMatch([string]$title) {
+    foreach ($frag in ($TitleMatch -split '\|')) {
+        $f = $frag.Trim()
+        if ($f -and $title -like "*$f*") { return $true }
+    }
+    return $false
+}
+
 <#
     The guard. Both halves matter: the title alone would pass for a lookalike
     page or a renamed window in another app, and the process alone would pass
     for any Chrome tab, including whatever the user just switched to.
+
+    It WAITS for a match rather than sampling one instant. Each step of the
+    sign-in submits a form and the next page takes a moment to load and
+    retitle, so a single sample turns every transition into a race — which is
+    exactly how the MFA step failed: the title had moved on from the sign-in
+    page and the guard refused before the page had settled.
 #>
 function Assert-Target([string]$what) {
-    $title = [Fg]::Title()
-    $proc = Get-ForegroundProcessName
+    $deadline = (Get-Date).AddSeconds($GuardWaitSec)
+    $title = ''
+    $proc = ''
+    while ((Get-Date) -lt $deadline) {
+        $title = [Fg]::Title()
+        $proc = Get-ForegroundProcessName
+        if ($proc -match '^(?i)chrome$' -and (Test-TitleMatch $title)) { return }
+        Start-Sleep -Milliseconds 250
+    }
+    # Report whichever half is actually wrong — the title is the one that
+    # needs configuring, so name it and what was expected.
     if ($proc -notmatch '^(?i)chrome$') {
         Write-Fail "focus guard: foreground window belongs to '$proc', not chrome — aborted before $what"
     }
-    if ($title -notlike "*$TitleMatch*") {
-        Write-Fail "focus guard: foreground title '$title' does not contain '$TitleMatch' — aborted before $what"
-    }
+    Write-Fail "focus guard: foreground title '$title' matches none of '$TitleMatch' — aborted before $what (add a fragment of that title to fed_auth.browser_title_match)"
 }
 
 function Wait-ForTarget([int]$timeoutSec) {
@@ -316,7 +345,7 @@ function Wait-ForTarget([int]$timeoutSec) {
     while ((Get-Date) -lt $deadline) {
         $title = [Fg]::Title()
         $proc = Get-ForegroundProcessName
-        if ($proc -match '^(?i)chrome$' -and $title -like "*$TitleMatch*") { return $true }
+        if ($proc -match '^(?i)chrome$' -and (Test-TitleMatch $title)) { return $true }
         Start-Sleep -Seconds 1
     }
     return $false
@@ -390,7 +419,7 @@ Write-Status 'opening-browser'
 Start-Process -FilePath $chrome -ArgumentList $Url | Out-Null
 
 if (-not (Wait-ForTarget $PageTimeoutSec)) {
-    Write-Fail "the activation page did not reach the foreground within ${PageTimeoutSec}s (looking for a chrome window titled like '*$TitleMatch*')"
+    Write-Fail "the activation page did not reach the foreground within ${PageTimeoutSec}s (looking for a chrome window whose title matches one of '$TitleMatch')"
 }
 
 # --- Activation code -------------------------------------------------------

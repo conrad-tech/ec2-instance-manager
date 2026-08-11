@@ -106,6 +106,15 @@ pub struct FedAuthFeature {
     pub retry_interval_secs: u64,
     /// Seconds to keep retrying before giving up. 0 uses the default (600).
     pub retry_window_secs: u64,
+    /// Seconds one `fed up` may run before it is stopped. 0 uses the default
+    /// (300).
+    ///
+    /// `fed up` blocks until the device authorization is approved, so a
+    /// sign-in nobody finishes would otherwise pin the worker forever — and
+    /// with it every later expiry, since only one run happens at a time.
+    /// Long enough for a human to work through the Okta pages, short enough
+    /// that an abandoned one recovers on its own.
+    pub run_timeout_secs: u64,
     /// Drive the Okta sign-in automatically rather than handing the user the
     /// activation page: type the code, the username and the password from
     /// Windows Credential Manager, then confirm the MFA prompt.
@@ -121,11 +130,18 @@ pub struct FedAuthFeature {
     /// is missing, no password is stored, or the focus guard trips, it falls
     /// back to opening the page and copying the code.
     pub auto_sign_in: bool,
-    /// Window-title fragment the browser step requires before it will type
-    /// anything, matched case-insensitively. This is the focus guard: a
-    /// mistimed keystroke must never put a domain password into whatever
-    /// window happens to be frontmost. Empty falls back to "okta".
-    pub browser_title_match: String,
+    /// Window-title fragments the browser step accepts before it will type
+    /// anything, matched case-insensitively; **any** one matching is enough.
+    /// This is the focus guard: a mistimed keystroke must never put a domain
+    /// password into whatever window happens to be frontmost.
+    ///
+    /// A list rather than one string because the sign-in walks several pages
+    /// — activation, username, password, MFA — and they do not share a title.
+    /// A single fragment that matches the first page will abort on a later
+    /// one. Accepts a JSON array, one string, or a comma-separated string.
+    /// Empty falls back to the shipped set.
+    #[serde(deserialize_with = "string_or_list")]
+    pub browser_title_match: Vec<String>,
     /// Windows Credential Manager target name holding the federation
     /// password. Empty falls back to `ec2-manager-fed`.
     ///
@@ -173,21 +189,39 @@ impl FedAuthFeature {
         }
     }
 
+    /// How long one `fed up` may run before it is stopped.
+    pub fn run_timeout(&self) -> std::time::Duration {
+        if self.run_timeout_secs == 0 {
+            std::time::Duration::from_secs(300)
+        } else {
+            std::time::Duration::from_secs(self.run_timeout_secs)
+        }
+    }
+
     /// True when the automatic sign-in should run for `user`. Requires the
     /// feature gate *and* its own flag — see the note on [`Self::auto_sign_in`].
     pub fn auto_sign_in_for(&self, user: &str) -> bool {
         self.is_allowed_user(user) && self.auto_sign_in
     }
 
-    /// The window-title fragment the browser step requires, falling back to
-    /// "okta". Never empty — that check is what keeps the password out of the
-    /// wrong window.
+    /// The window-title fragments the browser step accepts, as the
+    /// pipe-separated form the script parses. Never empty — that check is
+    /// what keeps the password out of the wrong window, so an empty config
+    /// falls back to the shipped set rather than disabling it.
+    ///
+    /// `|` is the separator because a window title will not contain one.
     pub fn resolved_title_match(&self) -> String {
-        let t = self.browser_title_match.trim();
-        if t.is_empty() {
-            "okta".to_string()
+        let joined = self
+            .browser_title_match
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("|");
+        if joined.is_empty() {
+            "okta|sign in|verify".to_string()
         } else {
-            t.to_string()
+            joined
         }
     }
 
@@ -861,15 +895,53 @@ mod tests {
     fn the_focus_guard_and_vault_target_are_never_empty() {
         // A blank title match would disable the check that keeps the password
         // out of the wrong window; a blank target would read whatever is
-        // first in the vault.
+        // first in the vault. Both fall back rather than going quiet.
         let blank: Features = serde_json::from_str(
             r#"{"fed_auth":{"browser_title_match":"  ","credential_target":" "}}"#,
         )
         .expect("parses");
-        assert_eq!(blank.fed_auth.resolved_title_match(), "okta");
+        assert_eq!(blank.fed_auth.resolved_title_match(), "okta|sign in|verify");
         assert_eq!(blank.fed_auth.resolved_credential_target(), "ec2-manager-fed");
         assert!(!load().fed_auth.resolved_title_match().is_empty());
         assert!(!load().fed_auth.resolved_credential_target().is_empty());
+    }
+
+    #[test]
+    fn the_focus_guard_takes_several_title_fragments() {
+        // The sign-in walks activation -> username -> password -> MFA, and
+        // those pages do not share a title. One fragment matching the first
+        // page aborted the run on a later one, which is the bug this fixes.
+        let list: Features = serde_json::from_str(
+            r#"{"fed_auth":{"browser_title_match":["Sign In","Verify"]}}"#,
+        )
+        .expect("parses");
+        assert_eq!(list.fed_auth.resolved_title_match(), "Sign In|Verify");
+
+        // A single string still works — an existing config must not break.
+        let one: Features =
+            serde_json::from_str(r#"{"fed_auth":{"browser_title_match":"Sign In"}}"#)
+                .expect("parses");
+        assert_eq!(one.fed_auth.resolved_title_match(), "Sign In");
+
+        // As does the comma-separated spelling, and blanks are dropped rather
+        // than becoming an empty fragment that matches everything.
+        let csv: Features = serde_json::from_str(
+            r#"{"fed_auth":{"browser_title_match":"Sign In, ,Verify"}}"#,
+        )
+        .expect("parses");
+        assert_eq!(csv.fed_auth.resolved_title_match(), "Sign In|Verify");
+    }
+
+    #[test]
+    fn the_shipped_title_fragments_cover_the_whole_sign_in() {
+        // Guards the shipped list against being narrowed back to one value.
+        let shipped = load().fed_auth.resolved_title_match();
+        for frag in ["okta", "sign in", "verify"] {
+            assert!(
+                shipped.contains(frag),
+                "shipped browser_title_match should cover '{frag}': {shipped}"
+            );
+        }
     }
 
     #[test]
