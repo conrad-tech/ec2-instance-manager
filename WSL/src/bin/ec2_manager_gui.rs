@@ -2315,17 +2315,6 @@ mod gui {
         Stalled(ec2_manager::fed_auth::FedError),
     }
 
-    /// The "save my federation password" dialog (auto_sign_in only).
-    ///
-    /// The password is held here only until it is handed to PowerShell on
-    /// stdin for Credential Manager; it is never written to config.ini.
-    struct FedPasswordDialog {
-        password: String,
-        /// Show the typed characters. Off by default.
-        reveal: bool,
-        username: String,
-    }
-
     /// Fed worker → UI.
     #[derive(Clone, Debug)]
     enum FedEvent {
@@ -2638,17 +2627,14 @@ mod gui {
             .unwrap_or_else(|| std::path::PathBuf::from("fed_login.ps1"))
     }
 
-    /// Spawn `fed_login.ps1` in one of its Credential Manager modes
-    /// (`Store`, `Check`, `Clear`) or in `Login`, returning its stdout.
+    /// Spawn `fed_login.ps1` and return its stdout.
     ///
-    /// `stdin_line` is written to the child's stdin rather than passed as an
-    /// argument, so a password never appears in the process list.
+    /// No stdin: the script only ever *reads* Windows Credential Manager, so
+    /// no password crosses this boundary in either direction. Setting one is
+    /// the user's job, with `cmdkey` or Control Panel.
     #[cfg(target_os = "windows")]
-    fn run_fed_script(
-        args: &[(&str, String)],
-        stdin_line: Option<&str>,
-    ) -> std::result::Result<String, String> {
-        use std::io::{Read, Write};
+    fn run_fed_script(args: &[(&str, String)]) -> std::result::Result<String, String> {
+        use std::io::Read;
         use std::os::windows::process::CommandExt;
 
         let script = fed_login_script_path();
@@ -2668,7 +2654,7 @@ mod gui {
         // which suppresses the console without the flagged switch.
         let mut child = cmd
             .creation_flags(CREATE_NO_WINDOW)
-            .stdin(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             // Captured, not discarded: a script that never *starts* — blocked
             // by execution policy, a syntax error — writes here and leaves
@@ -2678,12 +2664,6 @@ mod gui {
             .spawn()
             .map_err(|e| format!("could not start PowerShell: {e}"))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Some(line) = stdin_line {
-                let _ = writeln!(stdin, "{line}");
-            }
-            let _ = stdin.flush();
-        }
         let mut out = String::new();
         if let Some(mut pipe) = child.stdout.take() {
             let _ = pipe.read_to_string(&mut out);
@@ -2715,10 +2695,7 @@ mod gui {
     }
 
     #[cfg(not(target_os = "windows"))]
-    fn run_fed_script(
-        _args: &[(&str, String)],
-        _stdin_line: Option<&str>,
-    ) -> std::result::Result<String, String> {
+    fn run_fed_script(_args: &[(&str, String)]) -> std::result::Result<String, String> {
         Err("the automatic sign-in is Windows-only".to_string())
     }
 
@@ -2735,21 +2712,15 @@ mod gui {
     ) -> std::result::Result<(), String> {
         use ec2_manager::fed_auth::{parse_script_marker, ScriptEvent};
 
-        let out = run_fed_script(
-            &[
-                ("-Mode", "Login".to_string()),
-                ("-Url", url.to_string()),
-                ("-Code", code.to_string()),
-                ("-TitleMatch", cfg.resolved_title_match()),
-                ("-CredentialTarget", cfg.resolved_credential_target()),
-                // No -Username: the script reads it from the vault entry, so
-                // the one typed in the password dialog is what gets typed on
-                // the Okta page. Passing %USERNAME% here would silently
-                // override it, which is what the dialog's own tooltip
-                // promises it does not.
-            ],
-            None,
-        )?;
+        let out = run_fed_script(&[
+            ("-Url", url.to_string()),
+            ("-Code", code.to_string()),
+            ("-TitleMatch", cfg.resolved_title_match()),
+            ("-CredentialTarget", cfg.resolved_credential_target()),
+            // No -Username: the script reads it from the vault entry, so the
+            // `/user:` recorded with the credential is what gets typed on the
+            // Okta page. Passing %USERNAME% here would silently override it.
+        ])?;
 
         let mut error: Option<String> = None;
         for line in out.lines() {
@@ -4729,12 +4700,6 @@ mod gui {
         fed_expired_profiles: Vec<String>,
         /// When that list was last recomputed.
         fed_expired_checked_at: Option<Instant>,
-        /// Whether Credential Manager holds a federation password. Answered
-        /// by a `-Mode Check`; `None` until it replies. Only ever presence —
-        /// the app never holds the password itself.
-        fed_password_present: Option<bool>,
-        /// The "save my federation password" dialog, when open.
-        fed_password_dialog: Option<FedPasswordDialog>,
         /// `~/.aws/credentials` mtime at the moment the retry window closed.
         ///
         /// This is how "manually resolved" is detected: once the user signs
@@ -5073,8 +5038,6 @@ mod gui {
                 fed_last_idle_report: None,
                 fed_expired_profiles: Vec::new(),
                 fed_expired_checked_at: None,
-                fed_password_present: None,
-                fed_password_dialog: None,
                 fed_stalled_at_mtime: None,
                 fed_tx,
                 fed_rx,
@@ -5724,186 +5687,6 @@ mod gui {
             let auto = self.fed_auto_sign_in;
             let tx = self.fed_tx.clone();
             std::thread::spawn(move || run_fed_worker(cfg, auto, tx));
-        }
-
-        /// Ask Credential Manager whether a password is stored, for the
-        /// Scripts-menu label. Cheap, and only meaningful with auto sign-in.
-        fn refresh_fed_password_presence(&mut self) {
-            if !self.fed_auto_sign_in {
-                return;
-            }
-            let target = self.fed_auth_cfg.resolved_credential_target();
-            let out = run_fed_script(
-                &[("-Mode", "Check".to_string()), ("-CredentialTarget", target)],
-                None,
-            );
-            self.fed_password_present = match out {
-                Ok(text) => Some(text.contains("FEDLOGIN_STATUS:password-set")),
-                Err(e) => {
-                    self.log_warn(format!("fed_auth: could not read the vault ({e})"));
-                    None
-                }
-            };
-        }
-
-        /// Open the federation-password dialog.
-        fn open_fed_password_dialog(&mut self) {
-            self.refresh_fed_password_presence();
-            self.fed_password_dialog = Some(FedPasswordDialog {
-                password: String::new(),
-                reveal: false,
-                username: ec2_manager::features::current_os_user(),
-            });
-        }
-
-        /// Render "save my federation password".
-        ///
-        /// The typed password goes straight to `fed_login.ps1 -Mode Store`
-        /// over stdin and into Windows Credential Manager. It is never
-        /// written to config.ini and never passed as an argument.
-        fn render_fed_password_dialog(&mut self, ctx: &egui::Context) {
-            let Some(mut dlg) = self.fed_password_dialog.take() else {
-                return;
-            };
-            let mut window_open = true;
-            let (mut do_save, mut do_cancel, mut do_clear) = (false, false, false);
-            let has_saved = self.fed_password_present.unwrap_or(false);
-            let target = self.fed_auth_cfg.resolved_credential_target();
-
-            egui::Window::new("Federation Password")
-                .collapsible(false)
-                .resizable(false)
-                .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(
-                        "Used by the automatic Okta sign-in when fed up asks for a \
-                         device authorization.",
-                    );
-                    ui.add_space(6.0);
-                    egui::Grid::new("fed_pw_grid")
-                        .num_columns(2)
-                        .spacing([10.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label("Username:");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut dlg.username)
-                                    .desired_width(320.0),
-                            )
-                            .on_hover_text(
-                                "Recorded alongside the password in Credential \
-                                 Manager, and typed on the Okta username page. \
-                                 Defaults to your PC username.",
-                            );
-                            ui.end_row();
-
-                            ui.label("Password:");
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut dlg.password)
-                                        .password(!dlg.reveal)
-                                        .hint_text(if has_saved {
-                                            "leave blank to keep the stored one"
-                                        } else {
-                                            "not stored yet"
-                                        })
-                                        .desired_width(280.0),
-                                );
-                                let (icon, hint) =
-                                    if dlg.reveal { ("🔒", "Hide") } else { ("👁", "Show") };
-                                if ui.small_button(icon).on_hover_text(hint).clicked() {
-                                    dlg.reveal = !dlg.reveal;
-                                }
-                            });
-                            ui.end_row();
-                        });
-
-                    ui.add_space(6.0);
-                    // Say plainly where it goes and what that does and does
-                    // not protect against. Claiming more than is true would
-                    // be worse than saying nothing.
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 150, 60),
-                        format!(
-                            "⚠ Stored in Windows Credential Manager as '{target}', not in \
-                             this app — encrypted by Windows and tied to your account, so \
-                             it will not read back for another user or on another machine. \
-                             It does NOT protect against anything running as you."
-                        ),
-                    );
-                    ui.label(
-                        "You can set or remove it outside the app instead: \
-                         cmdkey /generic:<target> /user:<you> /pass, or Control Panel \
-                         → Credential Manager → Windows Credentials → \
-                         \"Add a generic credential\" (it must be a GENERIC \
-                         credential, not a Windows one).",
-                    );
-
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Save").clicked() {
-                            do_save = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            do_cancel = true;
-                        }
-                        if has_saved
-                            && ui
-                                .button("Forget stored password")
-                                .on_hover_text(
-                                    "The sign-in will hand you the activation page \
-                                     instead",
-                                )
-                                .clicked()
-                        {
-                            do_clear = true;
-                        }
-                    });
-                });
-
-            if do_cancel || !window_open {
-                return;
-            }
-            if do_clear {
-                let t = target.clone();
-                match run_fed_script(
-                    &[("-Mode", "Clear".to_string()), ("-CredentialTarget", t)],
-                    None,
-                ) {
-                    Ok(_) => {
-                        self.fed_password_present = Some(false);
-                        self.log_info(format!("fed_auth: cleared vault entry '{target}'"));
-                    }
-                    Err(e) => self.log_error(format!("fed_auth: could not clear it ({e})")),
-                }
-                return;
-            }
-            if do_save {
-                // Moved out of the dialog so the plaintext exists in exactly
-                // one place, on its way to the vault.
-                let password = std::mem::take(&mut dlg.password);
-                if password.is_empty() {
-                    return; // username-only edit; nothing to store
-                }
-                let args = [
-                    ("-Mode", "Store".to_string()),
-                    ("-CredentialTarget", target.clone()),
-                    ("-Username", dlg.username.trim().to_string()),
-                ];
-                match run_fed_script(&args, Some(&password)) {
-                    Ok(out) if out.contains("FEDLOGIN_STATUS:password-set") => {
-                        self.fed_password_present = Some(true);
-                        self.log_info(format!("fed_auth: password stored in '{target}'"));
-                    }
-                    Ok(out) => self.log_error(format!(
-                        "fed_auth: the password was not stored — {}",
-                        out.trim()
-                    )),
-                    Err(e) => self.log_error(format!("fed_auth: could not store it ({e})")),
-                }
-                return;
-            }
-            self.fed_password_dialog = Some(dlg);
         }
 
         /// The status line for the toolbar, when the refresh has something
@@ -18251,7 +18034,6 @@ mod gui {
                 self.render_script_editor(ctx);
                 self.render_script_delete_confirm(ctx);
                 self.render_pat_dialog(ctx);
-                self.render_fed_password_dialog(ctx);
                 self.render_script_result_popup(ctx);
                 self.render_alerts_window(ctx);
                 self.pump_script_runs();
@@ -18746,7 +18528,6 @@ mod gui {
                         let mut delete_script: Option<usize> = None;
                         let mut add_script = false;
                         let mut edit_pat = false;
-                        let mut edit_fed_password = false;
                         let mut open_vault_iam: Option<bool> = None;
                         egui::ComboBox::from_id_salt("scripts_menu")
                             .selected_text(format!("Scripts ({script_count})"))
@@ -18919,30 +18700,6 @@ mod gui {
                                         }
                                     });
                                 }
-                                // Only with the automatic sign-in on: without
-                                // it no password is ever used, so offering to
-                                // store one would be misleading.
-                                if self.fed_auto_sign_in {
-                                    ui.horizontal(|ui| {
-                                        ui.label(match self.fed_password_present {
-                                            Some(true) => "Federation Password (in vault)",
-                                            Some(false) => "Federation Password (not set)",
-                                            None => "Federation Password",
-                                        });
-                                        if ui
-                                            .small_button("✏")
-                                            .on_hover_text(
-                                                "Password the automatic Okta sign-in \
-                                                 types, stored in Windows Credential \
-                                                 Manager",
-                                            )
-                                            .clicked()
-                                        {
-                                            edit_fed_password = true;
-                                            ui.close();
-                                        }
-                                    });
-                                }
                             });
                         if let Some(i) = run_default {
                             self.run_default_script(i);
@@ -18961,9 +18718,6 @@ mod gui {
                         }
                         if edit_pat {
                             self.open_pat_dialog(None);
-                        }
-                        if edit_fed_password {
-                            self.open_fed_password_dialog();
                         }
                         if let Some(delete) = open_vault_iam {
                             self.open_vault_iam_dialog(delete);

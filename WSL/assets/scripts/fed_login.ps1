@@ -7,25 +7,18 @@
     off -- the shipped default -- the app opens the activation page, copies the
     code, and this script is never invoked.
 
-    Modes:
-
-    -Mode Login    Open Chrome on the Okta activation URL, type the device
-                   code, and walk the username / password / MFA-confirm pages.
-    -Mode Store    Read one line from STDIN and write it to Windows Credential
-                   Manager under -CredentialTarget.
-    -Mode Check    Report whether a credential exists for -CredentialTarget.
-    -Mode Clear    Delete the credential for -CredentialTarget.
+    Opens Chrome on the Okta activation URL, types the device code, and walks
+    the username / password / MFA-confirm pages.
 
     WHERE THE PASSWORD LIVES
     ------------------------
-    In Windows Credential Manager, never in this app's config. The vault
-    encrypts it and binds it to the Windows account that stored it: another
-    user, or the same file copied to another machine, cannot read it back.
-    The plaintext is only ever in memory between reading the vault and
-    sending the keystroke.
+    In Windows Credential Manager, and nowhere else. This script only ever
+    READS it; neither it nor the app can write, test for, or delete it, and
+    the app never sees the plaintext at all. The vault encrypts it and binds
+    it to the Windows account that stored it: another user, or the same file
+    copied to another machine, cannot read it back.
 
-    You do not have to use this script to store it. Both of these are
-    equivalent and Login mode will find the result:
+    Set it yourself, either way round:
 
         cmdkey /generic:ec2-manager-fed /user:you /pass
         Control Panel -> Credential Manager -> Windows Credentials
@@ -35,6 +28,9 @@
     called with CRED_TYPE_GENERIC and will not see one stored under the other
     type. `cmdkey /generic:` gets this right; the Control Panel offers both
     links on the same page.
+
+    The username recorded alongside it (the /user: value) is what gets typed
+    on the Okta username page.
 
     What no scheme can do is stop code running as *you* from reading it --
     anything the sign-in can decrypt unattended, malware running as you can
@@ -73,21 +69,18 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Login', 'Store', 'Check', 'Clear')]
-    [string]$Mode = 'Login',
-
-    # Credential Manager target name holding the federation password.
+    # Credential Manager target name holding the federation password. Read
+    # only -- this script never writes to the vault.
     [string]$CredentialTarget = 'ec2-manager-fed',
 
-    # Login mode: the activation URL from `fed up`.
+    # The activation URL from `fed up`.
     [string]$Url = '',
 
-    # Login mode: the device code from `fed up`.
+    # The device code from `fed up`.
     [string]$Code = '',
 
-    # Store mode: the username recorded alongside the password.
-    # Login mode: typed over the username field (cleared first, so a prefill
-    # is replaced rather than appended to).
+    # Typed over the username field (cleared first, so a prefill is replaced
+    # rather than appended to). Empty reads it from the vault entry.
     [string]$Username = '',
 
     # Foreground-window title fragments accepted before anything is typed,
@@ -132,7 +125,6 @@ using System.Runtime.InteropServices;
 
 public static class Cred {
     private const uint GENERIC = 1;
-    private const uint PERSIST_LOCAL_MACHINE = 2;
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct CREDENTIAL {
@@ -152,12 +144,6 @@ public static class Cred {
 
     [DllImport("advapi32.dll", EntryPoint = "CredReadW", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool CredRead(string target, uint type, uint flags, out IntPtr cred);
-
-    [DllImport("advapi32.dll", EntryPoint = "CredWriteW", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool CredWrite(ref CREDENTIAL cred, uint flags);
-
-    [DllImport("advapi32.dll", EntryPoint = "CredDeleteW", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool CredDelete(string target, uint type, uint flags);
 
     [DllImport("advapi32.dll", EntryPoint = "CredFree")]
     private static extern void CredFree(IntPtr buffer);
@@ -191,70 +177,11 @@ public static class Cred {
         }
     }
 
-    public static bool Exists(string target) {
-        IntPtr raw;
-        if (!CredRead(target, GENERIC, 0, out raw)) { return false; }
-        CredFree(raw);
-        return true;
-    }
-
-    public static bool Write(string target, string user, string password) {
-        byte[] blob = System.Text.Encoding.Unicode.GetBytes(password);
-        IntPtr blobPtr = Marshal.AllocCoTaskMem(blob.Length);
-        Marshal.Copy(blob, 0, blobPtr, blob.Length);
-        // Wipe our managed copy as soon as it is in unmanaged memory.
-        Array.Clear(blob, 0, blob.Length);
-
-        IntPtr targetPtr = Marshal.StringToCoTaskMemUni(target);
-        IntPtr userPtr = Marshal.StringToCoTaskMemUni(
-            String.IsNullOrEmpty(user) ? Environment.UserName : user);
-        try {
-            CREDENTIAL c = new CREDENTIAL();
-            c.Type = GENERIC;
-            c.TargetName = targetPtr;
-            c.CredentialBlob = blobPtr;
-            c.CredentialBlobSize = (uint)(password.Length * 2);
-            c.Persist = PERSIST_LOCAL_MACHINE;
-            c.UserName = userPtr;
-            return CredWrite(ref c, 0);
-        } finally {
-            Marshal.ZeroFreeCoTaskMemUnicode(blobPtr);
-            Marshal.FreeCoTaskMem(targetPtr);
-            Marshal.FreeCoTaskMem(userPtr);
-        }
-    }
-
-    public static bool Delete(string target) {
-        return CredDelete(target, GENERIC, 0);
-    }
 }
 '@
 
 if ([string]::IsNullOrWhiteSpace($CredentialTarget)) {
     Write-Fail 'no -CredentialTarget given'
-}
-
-switch ($Mode) {
-    'Check' {
-        if ([Cred]::Exists($CredentialTarget)) { Write-Status 'password-set' }
-        else { Write-Status 'password-not-set' }
-        exit 0
-    }
-    'Clear' {
-        if ([Cred]::Delete($CredentialTarget)) { Write-Status 'password-cleared' }
-        else { Write-Status 'password-not-set' }
-        exit 0
-    }
-    'Store' {
-        $plain = [Console]::In.ReadLine()
-        if ([string]::IsNullOrEmpty($plain)) { Write-Fail 'no password on stdin' }
-        $ok = [Cred]::Write($CredentialTarget, $Username, $plain)
-        $plain = $null
-        [GC]::Collect()
-        if (-not $ok) { Write-Fail "Credential Manager rejected the write for '$CredentialTarget'" }
-        Write-Status 'password-set'
-        exit 0
-    }
 }
 
 # ------------------------------------------------------------------ Login ---
@@ -400,7 +327,7 @@ function Resolve-Chrome {
 # fall back to its open-page-and-copy-code path with the code still fresh.
 $plain = [Cred]::Read($CredentialTarget)
 if ([string]::IsNullOrEmpty($plain)) {
-    Write-Fail "no password stored in Credential Manager under '$CredentialTarget'"
+    Write-Fail "no password in Credential Manager under '$CredentialTarget'. Set one with: cmdkey /generic:$CredentialTarget /user:<your-okta-user> /pass  (it must be a GENERIC credential)"
 }
 
 # The username is stored with the password, so the one entered in the app's
