@@ -2642,12 +2642,6 @@ mod gui {
         flashing_color(ui, 255, 205, 0)
     }
 
-    /// A notification-bar message. Bold under the light theme: the status
-    /// colors (yellow especially, and the flashing variants, which spend
-    /// half their cycle at low alpha) were picked against a dark panel and
-    /// wash out on a light one. Weight buys back the contrast without
-    /// changing the colors, so green/red/yellow keep meaning the same
-    /// thing in both themes.
     /// `ui.colored_label`, but with the light-theme weight from
     /// [`notification_text`].
     ///
@@ -2670,6 +2664,13 @@ mod gui {
         ui.label(rich)
     }
 
+    /// A notification-bar message. Bold under the light theme: the status
+    /// colors (yellow especially, and the flashing variants, which spend
+    /// half their cycle at low alpha) were picked against a dark panel and
+    /// wash out on a light one. Weight buys back the contrast without
+    /// changing the colors, so green/red/yellow keep meaning the same
+    /// thing in both themes.
+    ///
     /// Takes `impl Into<RichText>` rather than a string so a caller that has
     /// already styled its text — `.small()`, say — keeps that styling instead
     /// of having it silently dropped on the way through.
@@ -21520,9 +21521,15 @@ mod gui {
         const AMBER: egui::Color32 = egui::Color32::from_rgb(220, 150, 60);
         const GREY: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
         const GREEN: egui::Color32 = egui::Color32::from_rgb(120, 180, 120);
+        // The same yellow as `flashing_yellow`, without the animation.
+        const YELLOW: egui::Color32 = egui::Color32::from_rgb(255, 205, 0);
         match state {
             FedState::Disabled | FedState::Idle | FedState::Authenticated => None,
-            FedState::Running => Some((GREY, "fed up: running…".to_string())),
+            // Work in progress, in the same yellow the script status bar
+            // uses for it. Solid rather than flashing: the fed line's other
+            // states are steady, and a flash on this one line would read as
+            // something to act on when there is nothing to do but wait.
+            FedState::Running => Some((YELLOW, "fed up: running…".to_string())),
             // The code is shown as well as copied: if the clipboard was
             // busy, or the user copied something else in between, this is
             // the only place left to read it from.
@@ -24297,6 +24304,12 @@ mod gui {
             .expect("line");
             assert_ne!(color, red, "a retry is still working");
             assert!(fed_status_for(&FedState::Authenticated).is_none());
+
+            // Running is work in progress, in the same yellow the script
+            // status bar uses for it — not the grey of something idle.
+            let (color, text) = fed_status_for(&FedState::Running).expect("line");
+            assert_eq!(color, egui::Color32::from_rgb(255, 205, 0));
+            assert!(text.ends_with('…'), "{text}");
         }
 
         /// Every status-coloured label goes through `note_label`, so a stray
