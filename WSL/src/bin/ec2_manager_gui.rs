@@ -2039,10 +2039,11 @@ mod gui {
     /// tables first is the only way the number can be known to be free on the
     /// box the account also has to exist on.
     ///
-    /// Accounts missing from one side are created first — that is what puts
-    /// the spent numbers into both tables, and it is the repair the user asked
-    /// for. What cannot be repaired safely is reported and does not stop the
-    /// create, which takes a number free on both either way.
+    /// Repairs put an account onto the numbers its own home already carries —
+    /// the add creates it there, the realign moves it there. Neither touches a
+    /// file, which is what makes them safe to do unattended. What cannot be
+    /// repaired safely is reported and does not stop the create, which takes a
+    /// number free on both either way.
     fn run_create_preflight(
         primary_ctx: AwsContext,
         primary_id: String,
@@ -2069,70 +2070,122 @@ mod gui {
                  free on both bastions."
             )),
         };
-        let primary = match read(&primary_ctx, &primary_id) {
-            Ok(t) => user_sync::parse_dump(&t),
-            Err(e) => {
-                let _ = tx.send(fail("primary", e));
-                return;
-            }
-        };
-        let secondary = match read(&secondary_ctx, &secondary_id) {
-            Ok(t) => user_sync::parse_dump(&t),
-            Err(e) => {
-                let _ = tx.send(fail("secondary", e));
-                return;
-            }
-        };
 
-        let rows = user_sync::plan(&primary, &secondary);
         let mut report = String::new();
         let mut synced = 0usize;
-        let mut attention = Vec::new();
+        let mut attention: Vec<String> = Vec::new();
+        let mut primary;
+        let mut secondary;
 
-        for row in &rows {
-            match &row.action {
-                Action::Add {
-                    missing_from,
-                    uid,
-                    gid,
-                    home,
-                } => {
-                    let (ctx, id) = match missing_from {
-                        Side::Primary => (&primary_ctx, &primary_id),
-                        Side::Secondary => (&secondary_ctx, &secondary_id),
-                    };
-                    let cmd = user_sync::add_command(&row.name, *uid, *gid, home);
-                    match exec_remote_command(&None, ctx, id, &cmd, Duration::from_secs(60)) {
-                        Ok(_) => {
-                            synced += 1;
-                            report.push_str(&format!(
-                                "synced {} ({uid}/{gid}) onto the {} ({id})\n",
-                                row.name,
-                                missing_from.label()
-                            ));
-                        }
-                        // A sync failure is not fatal to the create: the id is
-                        // chosen above every number either box has spent, so
-                        // it stays free whether or not this account landed.
-                        Err(e) => {
-                            let msg =
-                                format!("could not sync {} onto the {}: {e}", row.name, missing_from.label());
-                            report.push_str(&format!("{msg}\n"));
-                            attention.push(msg);
+        // Two passes, because one repair can unblock another: an account
+        // holding a number that belongs to somebody else has to vacate it
+        // before the rightful owner can be created there, and the plan is
+        // computed from a single snapshot. A second read sees the vacancy.
+        // Two is enough — a repair only ever moves an account onto the number
+        // its own home already carries, so it frees at most the one it left.
+        let mut pass = 1;
+        loop {
+            primary = match read(&primary_ctx, &primary_id) {
+                Ok(t) => user_sync::parse_dump(&t),
+                Err(e) => {
+                    let _ = tx.send(fail("primary", e));
+                    return;
+                }
+            };
+            secondary = match read(&secondary_ctx, &secondary_id) {
+                Ok(t) => user_sync::parse_dump(&t),
+                Err(e) => {
+                    let _ = tx.send(fail("secondary", e));
+                    return;
+                }
+            };
+
+            let rows = user_sync::plan(&primary, &secondary);
+            let blocked = rows
+                .iter()
+                .any(|r| matches!(r.action, Action::Conflict { .. }));
+            let mut applied = 0usize;
+            attention.clear();
+
+            for row in &rows {
+                let (side, cmd, what) = match &row.action {
+                    Action::Add {
+                        side,
+                        uid,
+                        gid,
+                        home,
+                    } => (
+                        *side,
+                        user_sync::add_command(&row.name, *uid, *gid, home),
+                        format!("created {} as {uid}/{gid}", row.name),
+                    ),
+                    Action::Realign {
+                        side,
+                        from_uid,
+                        from_gid,
+                        to_uid,
+                        to_gid,
+                    } => (
+                        *side,
+                        user_sync::realign_command(&row.name, *to_uid, *to_gid),
+                        format!(
+                            "realigned {} from {from_uid}/{from_gid} to {to_uid}/{to_gid} \
+                             (its home's own numbers)",
+                            row.name
+                        ),
+                    ),
+                    Action::Mismatch { .. }
+                    | Action::Conflict { .. }
+                    | Action::HomeCollision { .. }
+                    | Action::SharedGroup { .. } => {
+                        attention.push(format!("{}: {}", row.name, row.action.tag()));
+                        continue;
+                    }
+                    Action::Match { .. } => continue,
+                };
+                let (ctx, id) = match side {
+                    Side::Primary => (&primary_ctx, &primary_id),
+                    Side::Secondary => (&secondary_ctx, &secondary_id),
+                };
+                match exec_remote_command(&None, ctx, id, &cmd, Duration::from_secs(60)) {
+                    Ok(out) => {
+                        applied += 1;
+                        report.push_str(&format!("{what} on the {} ({id})\n", side.label()));
+                        // usermod refuses while the account has a running
+                        // process, and says so on its output rather than by
+                        // failing the command. Losing that would report a
+                        // repair that did not happen.
+                        if !out.trim().is_empty() {
+                            report.push_str(&format!("  {}\n", out.trim()));
                         }
                     }
+                    // Not fatal to the create: the id it will use is chosen
+                    // above every number either box has spent, so it stays free
+                    // whether or not this repair landed.
+                    Err(e) => {
+                        let msg =
+                            format!("could not repair {} on the {}: {e}", row.name, side.label());
+                        report.push_str(&format!("{msg}\n"));
+                        attention.push(msg);
+                    }
                 }
-                Action::Mismatch { .. } | Action::Conflict { .. } => {
-                    attention.push(format!("{}: {}", row.name, row.action.tag()));
-                }
-                Action::Match { .. } => {}
             }
+            synced += applied;
+
+            // Only worth looking again when something moved AND something was
+            // blocked; otherwise the second read would say the same thing.
+            if pass >= 2 || applied == 0 || !blocked {
+                break;
+            }
+            report
+                .push_str("a repair freed a number that was blocking another — checking again\n");
+            pass += 1;
         }
 
         let uid = user_sync::choose_shared_id(&primary, &secondary);
         report.push_str(&format!(
             "chose uid/gid {uid}, free on both bastions\n{}",
-            user_sync::render(&rows)
+            user_sync::render(&user_sync::plan(&primary, &secondary))
         ));
         let _ = tx.send(CreatePreflightOutcome {
             uid: Some(uid),
@@ -2160,27 +2213,39 @@ mod gui {
         let mut out = String::new();
         let mut added = 0usize;
         for row in &rows {
-            let Action::Add {
-                missing_from,
-                uid,
-                gid,
-                home,
-            } = &row.action
-            else {
-                continue;
+            let (side, cmd, what) = match &row.action {
+                Action::Add {
+                    side,
+                    uid,
+                    gid,
+                    home,
+                } => (
+                    *side,
+                    user_sync::add_command(&row.name, *uid, *gid, home),
+                    format!("created {} {uid}/{gid}", row.name),
+                ),
+                Action::Realign {
+                    side,
+                    to_uid,
+                    to_gid,
+                    ..
+                } => (
+                    *side,
+                    user_sync::realign_command(&row.name, *to_uid, *to_gid),
+                    format!("realigned {} onto {to_uid}/{to_gid}", row.name),
+                ),
+                _ => continue,
             };
-            let (ctx, id) = match missing_from {
+            let (ctx, id) = match side {
                 Side::Primary => (&primary_ctx, &primary_id),
                 Side::Secondary => (&secondary_ctx, &secondary_id),
             };
-            let cmd = user_sync::add_command(&row.name, *uid, *gid, home);
             match exec_remote_command(&None, ctx, id, &cmd, Duration::from_secs(60)) {
                 Ok(text) => {
                     added += 1;
                     out.push_str(&format!(
-                        "[{} {id}] created {} {uid}/{gid}\n{}\n",
-                        missing_from.label(),
-                        row.name,
+                        "[{} {id}] {what}\n{}\n",
+                        side.label(),
                         text.trim()
                     ));
                 }
@@ -2189,7 +2254,7 @@ mod gui {
                 // nobody asked for.
                 Err(e) => out.push_str(&format!(
                     "[{} {id}] FAILED {}: {e}\n",
-                    missing_from.label(),
+                    side.label(),
                     row.name
                 )),
             }
@@ -11275,7 +11340,7 @@ mod gui {
                     UserSyncOutcome::Applied { added, output } => {
                         // Verbatim, not a count: this created accounts, and a
                         // summary is not something anyone can audit later.
-                        self.log_info(format!("user_sync: created {added} account(s)\n{output}"));
+                        self.log_info(format!("user_sync: repaired {added} account(s)\n{output}"));
                     }
                     UserSyncOutcome::Failed(msg) => {
                         self.log_error(format!("user_sync: {msg}"));
@@ -11300,7 +11365,7 @@ mod gui {
                     }
                     UserSyncOutcome::Applied { added, .. } => {
                         dlg.status =
-                            Some(format!("Created {added} account(s). Scan again to confirm."));
+                            Some(format!("Repaired {added} account(s). Scan again to confirm."));
                         // The rows are now stale — they say "missing" about
                         // accounts that exist. Clearing them disables the
                         // apply button until a fresh scan replaces them.
@@ -11359,7 +11424,7 @@ mod gui {
             let adds = dlg
                 .rows
                 .iter()
-                .filter(|r| r.action.is_add())
+                .filter(|r| r.action.is_repairable())
                 .count();
 
             egui::Window::new("Scripts — Bastion User Sync")
@@ -11494,9 +11559,9 @@ mod gui {
                             do_scan = true;
                         }
                         let apply_label = if adds == 0 {
-                            "Create missing accounts".to_string()
+                            "Repair accounts".to_string()
                         } else {
-                            format!("Create {adds} missing account(s)")
+                            format!("Repair {adds} account(s)")
                         };
                         if ui
                             .add_enabled(ready && adds > 0, egui::Button::new(apply_label))
@@ -11568,8 +11633,8 @@ mod gui {
                 std::thread::spawn(move || run_user_sync_scan(pctx, pid, sctx, sid, tx));
             } else if do_apply {
                 self.log_warn(format!(
-                    "user_sync: creating {} missing account(s) on {pid}/{sid}",
-                    rows.iter().filter(|r| r.action.is_add()).count()
+                    "user_sync: repairing {} account(s) on {pid}/{sid}",
+                    rows.iter().filter(|r| r.action.is_repairable()).count()
                 ));
                 std::thread::spawn(move || {
                     run_user_sync_apply(rows, pctx, pid, sctx, sid, tx)
@@ -12769,8 +12834,8 @@ mod gui {
                 }
                 if outcome.synced > 0 {
                     self.log_warn(format!(
-                        "create_new_user: brought the bastions into line first — created {} \
-                         account(s) that existed on only one of them",
+                        "create_new_user: brought the bastions into line first — {} \
+                         account(s) created or realigned onto their home's numbers",
                         outcome.synced
                     ));
                 }

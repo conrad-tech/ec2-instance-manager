@@ -740,64 +740,109 @@ above 60000 are excluded from the floor because root is squashed to `nobody`
 (65534) on EFS, and one file owned by it would push every future account past
 65535.
 
+**The home directory on EFS is the authority**, not either passwd file. The
+files already carry the numbers that matter, both boxes see the same ones, and
+they are the thing being protected. That choice is what makes most repairs
+cheap: moving an *account* onto its own home's numbers is a `usermod` and
+**chowns nothing**, because the files already hold the destination. Moving the
+home onto the account would be the opposite — a recursive `chown` of live data.
+Getting this backwards is why an earlier version refused to fix a uid mismatch
+at all.
+
 **Every create runs a pre-flight first** (`begin_create_preflight` →
-`run_create_preflight`). It reads both bastions' account tables, creates any
-account that exists on only one of them, and then picks the uid/gid for the new
-user with `choose_shared_id` — the lowest number free as **both** a uid and a
-gid on **both** boxes, above everything either has spent on a shared home. That
-number is passed to the script as `--uid`, and the script's own `pick_shared_id`
-is only the fallback for a run by hand, because a script can only ever see the
-box it runs on. That blind spot is the bug: the primary picked its own lowest
-free uid, the secondary had spent it on somebody else, and the mirror failed
-with `UID nnnn is not unique` after the account was half made.
+`run_create_preflight`). It reads both bastions, repairs what it can, and then
+picks the new user's uid/gid with `choose_shared_id` — the lowest number free
+as **both** a uid and a gid on **both** boxes, above everything either has
+spent on a shared home. That number is passed as `--uid`; the script's own
+`pick_shared_id` is only the fallback for a run by hand, because a script can
+only see the box it runs on. That blind spot is the original bug: the primary
+picked its own lowest free uid, the secondary had spent it on somebody else,
+and the mirror failed with `UID nnnn is not unique` after the account was half
+made.
 
-- **A pre-flight that cannot read a bastion aborts the create.** Creating with
-  an unchecked number is exactly what went wrong; there is no useful fallback.
-- **A divergence it cannot repair does not block the create.** A uid that
-  differs between the boxes, or a number held by someone else, is logged as a
-  standing fault — the new account still takes a number free on both, so it is
-  sound regardless.
-- **Restore skips the pre-flight entirely.** The account already exists and
-  keeps whatever uid it has, so there is nothing to align and nothing to
-  allocate. `restore_takes_neither_an_id_nor_sudo` pins that.
-- The floor includes `HOMEOWN` rows — the owner of every directory under
-  `/efs/home` — so a home that outlived its account (deleted on both boxes,
-  directory left behind) still reserves its number rather than handing its
-  files to somebody new.
+The two repairs it applies, both putting an account onto its home's numbers:
 
-**Bastion User Sync** (`src/user_sync.rs`, gated by `user_sync.allowed_users`,
-shipped `[]`) is the same comparison as a dialog, for auditing and for
-repairing drift without creating anyone. It is the one Scripts dialog that does
-**not** drip-feed a terminal: it needs both account tables before it can decide
-anything, and the secondary's session is deferred until the primary finishes,
-so it goes over `exec_remote_command` (SSM send-command) in a worker and does
-the comparison in Rust — plain data in, plain data out, and tested as such.
+- **ADD** — the account exists on one box only. Created on the other with the
+  same numbers, `-M`, so it lands on files already owned by them.
+- **REALIGN** — the account exists but disagrees with its own home.
+  `groupmod` + `usermod` onto the home's numbers. `usermod` refuses while the
+  account has a running process, which is the right answer: renumbering out
+  from under a live session leaves a shell writing files nobody owns. It
+  reports that on stdout rather than failing the command, so the pre-flight
+  logs the output instead of assuming the repair landed.
 
-What it will and will not do is the whole design:
+**Every user gets a private group: one gid per home, named after the user.**
+`create_new_user.sh` guarantees it for new accounts (`pick_shared_id` hands one
+number to both the uid and the gid, and the group is created with the
+username), and the audit enforces it on the existing ones. `realign_command`
+creates the group where a box has none — half a mirror leaves exactly that, and
+`usermod -g` fails against a gid no group holds.
 
-- **Creating a missing account is safe** where the target has both numbers
-  free: the home already exists on the shared mount, owned by those very
-  numbers, so `-M` lands the account on files that are already theirs.
-- **It never renumbers.** Correcting a uid that differs between the boxes
-  means `usermod -u` plus a recursive `chown` of a live home on a shared
-  filesystem. Those rows are reported, not repaired.
-- **It never takes over a number.** That needs `useradd --non-unique`, which
-  makes two people one identity on EFS — the exact hazard this exists to
-  prevent.
-- **A group of the account's own name carrying the right gid is not a
-  conflict.** That is precisely what a half-finished mirror leaves behind, so
-  refusing it would strand the rows this exists to fix.
-- **The dump's in-use tables are unfiltered on purpose.** A uid held by a
-  *system* account still blocks a `useradd`, so `UIDU`/`GIDU` carry the whole
-  passwd/group table while `ACCT` carries only the managed set (a home under
-  `/efs/home`). Filtering both the same way would call a number free and then
-  fail against it.
+What it will not repair, and why:
+
+- **SHARED-ID — two homes owned by one uid.** Unrepairable here: one of them
+  must be renumbered, and *that* is the recursive chown of live data. Until a
+  human settles it, whichever account holds the number can read the other's
+  files. Every other verdict about such a name is suppressed, since "align to
+  the home" has two answers. **This is the state the bastions are in now**,
+  from the 1011 incident.
+- **SHARED-ID also covers gids.** Two homes on one gid means each carries
+  group access to the other's files, which is the private-group rule broken.
+  Same reason it cannot be fixed here: settling it is a `chgrp` of live data.
+- **SHARED-GRP — the home's gid is a shared group** (`users`) rather than the
+  user's own. No account change repairs it: the home needs its own gid, and
+  that `chgrp` can only be run **by the user**, since root is squashed to
+  `nobody` on EFS and cannot touch files inside a 0700 home.
+  A group merely *sitting* on the number because it is misplaced is **not**
+  this — it gets realigned away and the second pass finds the number free, so
+  it is reported as CONFLICT rather than sending someone to fix what fixes
+  itself (`a_group_that_will_be_realigned_away_is_not_a_shared_group`).
+- **DIFFERS** — the boxes disagree and the home is gone, so nothing arbitrates
+  and neither number can be called correct.
+- **CONFLICT** — the repair needs a number already spent there. Taking it
+  needs `--non-unique`, which makes two people one identity on shared storage.
+
+**The pre-flight makes two passes when one repair unblocks another.** An
+account holding a number that belongs to somebody else has to vacate it before
+the rightful owner can be created there, and the plan comes from a single
+snapshot — so the first pass reports `CONFLICT` and the second, after the
+realign, sees the vacancy. Two is enough: a repair only ever moves an account
+onto the number its own home already carries, so it frees at most the one it
+left. The second read only happens when something moved *and* something was
+blocked, so the ordinary case still costs one round trip.
+
+Worth keeping straight, because they look alike: **two accounts on different
+boxes holding one number is repairable** — the homes still say who each of them
+should be, so the wrong one is realigned and the other is then created.
+**Two homes owned by one number is not** — that is `SHARED-ID`, and it has no
+answer, because "align the account to its home" gives two.
+`one_number_held_by_two_accounts_on_different_boxes` and
+`the_shared_id_case_is_two_homes_not_two_accounts` pin the difference.
+
+A pre-flight that cannot read a bastion **aborts the create**: creating with an
+unchecked number is the failure being fixed. Anything it could not repair is
+logged but does **not** block, since the new account takes a number free on
+both regardless. **Restore skips the pre-flight** — the account exists and
+keeps its uid.
+
+**Bastion User Sync** (gated by `user_sync.allowed_users`, shipped `[]`) is the
+same comparison as a dialog, for auditing and for repairing drift without
+creating anyone. It is the one Scripts dialog that does **not** drip-feed a
+terminal: it needs both account tables before deciding anything, and the
+secondary's session is deferred until the primary finishes, so it goes over
+`exec_remote_command` (SSM send-command) in a worker and compares in Rust —
+plain data in, plain data out, and tested as such.
+
+**The dump's in-use tables are unfiltered on purpose.** A uid held by a
+*system* account still blocks a `useradd`, so `UIDU`/`GIDU` carry the whole
+passwd/group table while `ACCT` carries only the managed set (a home under
+`/efs/home`) and `HOMEOWN` carries the shared mount itself. Filtering them the
+same way would call a number free and then fail against it.
 
 **There is no cron.** An earlier version installed one on both bastions;
 checking at create time replaces it, and is better: it runs exactly when the
 answer matters, needs no root cron entry or log file on either box, and cannot
-drift out of step with the app. Nothing repairs the boxes on a schedule now —
-the sync dialog is there for a deliberate sweep.
+drift out of step with the app.
 
 ### Scripts dialogs select an environment, not an account
 
