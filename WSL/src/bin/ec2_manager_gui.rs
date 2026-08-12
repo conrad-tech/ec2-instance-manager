@@ -1555,21 +1555,21 @@ mod gui {
         use ec2_manager::ssh_config::PemValidation;
         match ec2_manager::ssh_config::validate_pem(pem_path) {
             PemValidation::Ok => {
-                ui.colored_label(
+                note_label(ui, 
                     egui::Color32::GREEN,
                     "Key file found and looks valid.",
                 );
                 true
             }
             PemValidation::NotAKey => {
-                ui.colored_label(
+                note_label(ui, 
                     egui::Color32::RED,
                     "File exists but does not look like a private key.",
                 );
                 false
             }
             PemValidation::Missing { parent_exists } => {
-                ui.colored_label(egui::Color32::RED, "Key file not found.");
+                note_label(ui, egui::Color32::RED, "Key file not found.");
                 if parent_exists {
                     let suggestions =
                         ec2_manager::ssh_config::suggest_keys_near(pem_path);
@@ -2648,8 +2648,37 @@ mod gui {
     /// wash out on a light one. Weight buys back the contrast without
     /// changing the colors, so green/red/yellow keep meaning the same
     /// thing in both themes.
-    fn notification_text(ui: &egui::Ui, color: egui::Color32, text: impl Into<String>) -> egui::RichText {
-        let rich = egui::RichText::new(text).color(color);
+    /// `ui.colored_label`, but with the light-theme weight from
+    /// [`notification_text`].
+    ///
+    /// Every status-coloured label goes through this rather than
+    /// `colored_label` directly, because the reason for the weight applies to
+    /// all of them equally: the colours were chosen against a dark panel, and
+    /// on a light one they wash out — yellow worst, and the flashing variants
+    /// spend half their cycle at low alpha. Adding weight keeps green, amber
+    /// and red meaning exactly what they meant before, which changing the
+    /// colours per theme would not.
+    ///
+    /// Deliberately-grey labels (`off`, `(cleared)`) keep `colored_label`:
+    /// grey is there to say "this is background", and weight would fight it.
+    fn note_label(
+        ui: &mut egui::Ui,
+        color: egui::Color32,
+        text: impl Into<egui::RichText>,
+    ) -> egui::Response {
+        let rich = notification_text(ui, color, text);
+        ui.label(rich)
+    }
+
+    /// Takes `impl Into<RichText>` rather than a string so a caller that has
+    /// already styled its text — `.small()`, say — keeps that styling instead
+    /// of having it silently dropped on the way through.
+    fn notification_text(
+        ui: &egui::Ui,
+        color: egui::Color32,
+        text: impl Into<egui::RichText>,
+    ) -> egui::RichText {
+        let rich = text.into().color(color);
         if ui.visuals().dark_mode {
             rich
         } else {
@@ -6139,49 +6168,8 @@ mod gui {
             std::thread::spawn(move || run_fed_worker(cfg, auto, tx));
         }
 
-        /// The status line for the toolbar, when the refresh has something
-        /// worth showing.
-        ///
-        /// Only a stand-down is red. A retry is amber — it is still working
-        /// and usually fixes itself, so painting it red would train the user
-        /// to ignore the colour that matters.
-        fn fed_status_line(&self) -> Option<(egui::Color32, String)> {
-            const RED: egui::Color32 = egui::Color32::from_rgb(220, 80, 80);
-            const AMBER: egui::Color32 = egui::Color32::from_rgb(220, 150, 60);
-            const GREY: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
-            match &self.fed_state {
-                FedState::Disabled | FedState::Idle | FedState::Authenticated => None,
-                FedState::Running => Some((GREY, "fed up: running…".to_string())),
-                // The code is shown as well as copied: if the clipboard was
-                // busy, or the user copied something else in between, this is
-                // the only place left to read it from.
-                // The reason the automatic sign-in bowed out belongs on
-                // screen, not only in the log: it is the one thing that says
-                // what to fix, and it was being missed.
-                FedState::AwaitingSignIn {
-                    code,
-                    sign_in_error,
-                    ..
-                } => Some((
-                    AMBER,
-                    match sign_in_error {
-                        Some(err) => format!(
-                            "fed up: code {code} (copied) — auto sign-in bowed out: {err}"
-                        ),
-                        None => format!(
-                            "fed up: sign in on the page that opened — code {code} (copied)"
-                        ),
-                    },
-                )),
-                FedState::SigningIn(step) => {
-                    Some((GREY, format!("fed up: signing in — {step}…")))
-                }
-                FedState::Retrying { error, attempt } => Some((
-                    AMBER,
-                    format!("fed up: attempt {attempt} failed — {error} Retrying…"),
-                )),
-                FedState::Stalled(error) => Some((RED, format!("fed up: {error}"))),
-            }
+            fn fed_status_line(&self) -> Option<(egui::Color32, String)> {
+            fed_status_for(&self.fed_state)
         }
 
         fn poll_auth_expiry(&mut self) {
@@ -8144,7 +8132,7 @@ mod gui {
                                 rows.len()
                             )
                         };
-                        ui.colored_label(
+                        note_label(ui, 
                             egui::Color32::from_rgb(220, 150, 60),
                             headline,
                         );
@@ -8169,7 +8157,7 @@ mod gui {
                     }
 
                     for collision in &self.forward_collisions {
-                        ui.colored_label(
+                        note_label(ui, 
                             egui::Color32::from_rgb(220, 80, 80),
                             collision.message(),
                         );
@@ -8213,7 +8201,7 @@ mod gui {
                                             // alive, nothing listening,
                                             // because the SSM ProxyCommand
                                             // never finished connecting.
-                                            ui.colored_label(
+                                            note_label(ui, 
                                                 egui::Color32::from_rgb(220, 80, 80),
                                                 format!(
                                                     "not connected — alive {} but \
@@ -8232,7 +8220,7 @@ mod gui {
                                         } else if age < TUNNEL_PROVEN_AFTER
                                             || bound.is_none()
                                         {
-                                            ui.colored_label(
+                                            note_label(ui, 
                                                 egui::Color32::from_rgb(220, 200, 120),
                                                 format!(
                                                     "connecting… {:.0}s",
@@ -8247,7 +8235,7 @@ mod gui {
                                                 .get(&row.key)
                                                 .map(|t| t.elapsed())
                                                 .unwrap_or(age);
-                                            ui.colored_label(
+                                            note_label(ui, 
                                                 egui::Color32::from_rgb(120, 180, 120),
                                                 format!(
                                                     "forwarding {} ports · up {}",
@@ -8262,7 +8250,7 @@ mod gui {
                                         if let Some((why, count)) =
                                             self.tunnel_failures.get(&row.key)
                                         {
-                                            ui.colored_label(
+                                            note_label(ui, 
                                                 egui::Color32::from_rgb(220, 150, 60),
                                                 egui::RichText::new(format!(
                                                     "(dropped {count}×, last: {why})"
@@ -8296,7 +8284,7 @@ mod gui {
                                                 format!("{why} (cleared)"),
                                             );
                                         } else {
-                                            ui.colored_label(
+                                            note_label(ui, 
                                                 egui::Color32::from_rgb(220, 150, 60),
                                                 &why,
                                             );
@@ -8329,7 +8317,7 @@ mod gui {
                                         if role.is_empty() {
                                             ui.label(egui::RichText::new(id).small())
                                         } else {
-                                            ui.colored_label(
+                                            note_label(ui, 
                                                 egui::Color32::from_rgb(220, 150, 60),
                                                 egui::RichText::new(format!(
                                                     "{id}{role}"
@@ -8338,7 +8326,7 @@ mod gui {
                                             )
                                         }
                                     }
-                                    None => ui.colored_label(
+                                    None => note_label(ui, 
                                         egui::Color32::from_rgb(220, 150, 60),
                                         egui::RichText::new("none saved").small(),
                                     ),
@@ -8882,7 +8870,7 @@ mod gui {
             let available = self.env_instances(&dlg.account_id, &dlg.env);
             let library = self.config.sorted_pem_library();
             let stale_note = |ui: &mut egui::Ui, which: &str| {
-                ui.colored_label(
+                note_label(ui, 
                     egui::Color32::from_rgb(220, 150, 60),
                     egui::RichText::new(format!(
                         "The saved {which} is not in this environment's inventory \
@@ -8930,7 +8918,7 @@ mod gui {
                     {
                         // Failing over to the box we just failed away from
                         // is not a failover; it just retries the same host.
-                        ui.colored_label(
+                        note_label(ui, 
                             egui::Color32::from_rgb(220, 150, 60),
                             egui::RichText::new(
                                 "Both bastions are the same box — that gives \
@@ -9418,7 +9406,7 @@ mod gui {
                     );
                     if let Some(owner) = remote_dir_owner(&dlg.remote_path) {
                         if owner != dlg.ssh_user.trim() {
-                            ui.colored_label(
+                            note_label(ui, 
                                 egui::Color32::from_rgb(220, 160, 40),
                                 format!(
                                     "Folder is {owner}'s home but the login is \
@@ -9490,7 +9478,7 @@ mod gui {
                                                 egui::Color32::from_rgb(220, 160, 40),
                                             ),
                                         };
-                                        ui.colored_label(
+                                        note_label(ui, 
                                             color,
                                             egui::RichText::new(note).small(),
                                         );
@@ -10309,7 +10297,7 @@ mod gui {
                     });
 
                     if let Some(err) = &error {
-                        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
+                        note_label(ui, egui::Color32::from_rgb(220, 60, 60), err);
                     }
                     ui.separator();
 
@@ -10351,7 +10339,7 @@ mod gui {
                                         } else {
                                             format!("#{}", a.tiny_id)
                                         });
-                                        ui.colored_label(
+                                        note_label(ui, 
                                             priority_color(&a.priority),
                                             if a.priority.is_empty() {
                                                 "-"
@@ -10367,7 +10355,7 @@ mod gui {
                                         if a.acknowledged {
                                             ui.label("ack");
                                         } else {
-                                            ui.colored_label(
+                                            note_label(ui, 
                                                 egui::Color32::from_rgb(220, 160, 60),
                                                 "unack",
                                             );
@@ -10750,7 +10738,7 @@ mod gui {
                         });
 
                     if let Some(err) = &dlg.error {
-                        ui.colored_label(egui::Color32::from_rgb(220, 60, 60), err);
+                        note_label(ui, egui::Color32::from_rgb(220, 60, 60), err);
                     }
 
                     ui.add_space(4.0);
@@ -11033,7 +11021,7 @@ mod gui {
                     ui.add_space(4.0);
                     match dlg.mode {
                         UserScriptMode::Delete => {
-                            ui.colored_label(
+                            note_label(ui, 
                                 egui::Color32::from_rgb(220, 150, 60),
                                 "⚠ Removes the account, keys, and home directory (/efs/home/<user>).",
                             );
@@ -11041,7 +11029,7 @@ mod gui {
                         UserScriptMode::Restore => {
                             // Say plainly what a restore destroys: the old
                             // key stops working the moment this runs.
-                            ui.colored_label(
+                            note_label(ui, 
                                 egui::Color32::from_rgb(220, 150, 60),
                                 "⚠ Issues a new key for an existing user and \
                                  revokes their old one. Sudo and home are left \
@@ -11081,12 +11069,12 @@ mod gui {
                     // only fail.
                     if let Some(warn) = &auth_warning {
                         ui.add_space(6.0);
-                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), warn);
+                        note_label(ui, egui::Color32::from_rgb(220, 80, 80), warn);
                     }
 
                     if let Some(err) = &dlg.error {
                         ui.add_space(6.0);
-                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+                        note_label(ui, egui::Color32::from_rgb(220, 80, 80), err);
                     }
 
                     if dlg.mode.is_delete() {
@@ -11535,11 +11523,11 @@ mod gui {
 
                     if let Some(warn) = &auth_warning {
                         ui.add_space(6.0);
-                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), warn);
+                        note_label(ui, egui::Color32::from_rgb(220, 80, 80), warn);
                     }
                     if let Some(err) = &dlg.error {
                         ui.add_space(6.0);
-                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+                        note_label(ui, egui::Color32::from_rgb(220, 80, 80), err);
                     }
                     if let Some(status) = &dlg.status {
                         ui.add_space(6.0);
@@ -11852,7 +11840,7 @@ mod gui {
 
                     ui.add_space(4.0);
                     if dlg.delete {
-                        ui.colored_label(
+                        note_label(ui, 
                             egui::Color32::from_rgb(220, 150, 60),
                             "⚠ Removes the AWS auth role and the policy from Vault.",
                         );
@@ -11870,12 +11858,12 @@ mod gui {
                     // — see the matching block in `render_create_user_dialog`.
                     if let Some(warn) = &auth_warning {
                         ui.add_space(6.0);
-                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), warn);
+                        note_label(ui, egui::Color32::from_rgb(220, 80, 80), warn);
                     }
 
                     if let Some(err) = &dlg.error {
                         ui.add_space(6.0);
-                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+                        note_label(ui, egui::Color32::from_rgb(220, 80, 80), err);
                     }
 
                     if dlg.delete {
@@ -12705,7 +12693,7 @@ mod gui {
                     } else {
                         egui::Color32::from_rgb(220, 60, 60)
                     };
-                    ui.colored_label(color, &popup.message);
+                    note_label(ui, color, &popup.message);
                     if let Some(path) = &popup.pem_path {
                         ui.add_space(8.0);
                         ui.label("PEM saved to:");
@@ -12734,7 +12722,7 @@ mod gui {
                                     egui::Color32::from_rgb(220, 60, 60),
                                 ),
                             };
-                            ui.colored_label(tint, text);
+                            note_label(ui, tint, text);
                         }
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
@@ -12767,7 +12755,7 @@ mod gui {
                         });
                         if popup.email_copied {
                             ui.add_space(4.0);
-                            ui.colored_label(
+                            note_label(ui, 
                                 egui::Color32::from_rgb(90, 200, 90),
                                 "Command copied. Now run it in your terminal.",
                             );
@@ -17429,7 +17417,7 @@ mod gui {
             // Show drop hint when files are being hovered
             let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
             if hovering {
-                ui.colored_label(egui::Color32::YELLOW, "Drop files here to upload");
+                note_label(ui, egui::Color32::YELLOW, "Drop files here to upload");
             }
 
 
@@ -17747,7 +17735,7 @@ mod gui {
                     });
                 }
                 FileOpStatus::Error(err) => {
-                    ui.colored_label(egui::Color32::RED, truncate(err, 40));
+                    note_label(ui, egui::Color32::RED, truncate(err, 40));
                 }
                 FileOpStatus::Idle => {}
             }
@@ -18153,9 +18141,9 @@ mod gui {
                 ui.label(&remote_path);
                 if !editor_status.is_empty() {
                     if editor_status.starts_with("Error") || editor_status.starts_with("Save failed") {
-                        ui.colored_label(egui::Color32::RED, &editor_status);
+                        note_label(ui, egui::Color32::RED, &editor_status);
                     } else if editor_status == "Saved" {
-                        ui.colored_label(egui::Color32::GREEN, &editor_status);
+                        note_label(ui, egui::Color32::GREEN, &editor_status);
                     } else {
                         ui.label(&editor_status);
                     }
@@ -18520,7 +18508,7 @@ mod gui {
                         ui.label("Fetching volumes...");
                     });
                 } else if let Some(err) = &self.detail_volumes_error {
-                    ui.colored_label(egui::Color32::RED, format!("Error: {err}"));
+                    note_label(ui, egui::Color32::RED, format!("Error: {err}"));
                 } else if self.detail_volumes.is_empty() {
                     ui.label("No volumes found");
                 } else {
@@ -19293,7 +19281,7 @@ mod gui {
                     // and on a timer, so it has to be visible from any tab.
                     if let Some((color, text)) = self.fed_status_line() {
                         ui.horizontal_wrapped(|ui| {
-                            ui.colored_label(color, text);
+                            note_label(ui, color, text);
                             match &self.fed_state {
                                 // Stood down: offer a manual kick, since
                                 // otherwise the only way back is to sign in
@@ -19862,14 +19850,14 @@ mod gui {
                                     .unwrap_or(false);
 
                                 if is_wsl_missing {
-                                    ui.colored_label(
+                                    note_label(ui, 
                                         egui::Color32::YELLOW,
                                         "WSL not installed",
                                     );
                                     ui.label("Install WSL from PowerShell (admin):");
                                     ui.monospace("wsl --install");
                                 } else {
-                                    ui.colored_label(
+                                    note_label(ui, 
                                         egui::Color32::YELLOW,
                                         "WSL setup incomplete",
                                     );
@@ -21518,6 +21506,63 @@ mod gui {
         }
     }
 
+    /// The toolbar's `fed up` status line, or `None` when there is nothing
+    /// worth showing.
+    ///
+    /// Only a stand-down is red. A retry is amber — it is still working and
+    /// usually fixes itself, so painting it red would train the user to ignore
+    /// the colour that matters.
+    ///
+    /// A free function rather than a method so the colour of each state can be
+    /// asserted without building an `App`.
+    fn fed_status_for(state: &FedState) -> Option<(egui::Color32, String)> {
+        const RED: egui::Color32 = egui::Color32::from_rgb(220, 80, 80);
+        const AMBER: egui::Color32 = egui::Color32::from_rgb(220, 150, 60);
+        const GREY: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
+        const GREEN: egui::Color32 = egui::Color32::from_rgb(120, 180, 120);
+        match state {
+            FedState::Disabled | FedState::Idle | FedState::Authenticated => None,
+            FedState::Running => Some((GREY, "fed up: running…".to_string())),
+            // The code is shown as well as copied: if the clipboard was
+            // busy, or the user copied something else in between, this is
+            // the only place left to read it from.
+            // The reason the automatic sign-in bowed out belongs on
+            // screen, not only in the log: it is the one thing that says
+            // what to fix, and it was being missed.
+            FedState::AwaitingSignIn {
+                code,
+                sign_in_error,
+                ..
+            } => Some((
+                AMBER,
+                match sign_in_error {
+                    Some(err) => format!(
+                        "fed up: code {code} (copied) — auto sign-in bowed out: {err}"
+                    ),
+                    None => format!(
+                        "fed up: sign in on the page that opened — code {code} (copied)"
+                    ),
+                },
+            )),
+            // `done` is the sign-in script's last word, so it is the one
+            // step that is not still in progress — green, and without the
+            // trailing ellipsis the other steps carry. The same green as
+            // `ScriptState::Ok`, so "this worked" reads the same wherever
+            // it appears on this bar.
+            FedState::SigningIn(step) if step == "done" => {
+                Some((GREEN, "fed up: signing in — done".to_string()))
+            }
+            FedState::SigningIn(step) => {
+                Some((GREY, format!("fed up: signing in — {step}…")))
+            }
+            FedState::Retrying { error, attempt } => Some((
+                AMBER,
+                format!("fed up: attempt {attempt} failed — {error} Retrying…"),
+            )),
+            FedState::Stalled(error) => Some((RED, format!("fed up: {error}"))),
+        }
+    }
+
     /// Environment label as every Scripts dialog shows it: always uppercase.
     ///
     /// Shared by the Bastion New User / Bastion User Delete dropdown and both
@@ -21744,7 +21789,7 @@ mod gui {
                 ));
             }
             TestState::Passed { bastion, forwards, elapsed } => {
-                ui.colored_label(
+                note_label(ui, 
                     egui::Color32::from_rgb(120, 180, 120),
                     format!(
                         "connected to {bastion} in {:.1}s — {forwards} forward(s) bound",
@@ -21761,7 +21806,7 @@ mod gui {
                         ),
                         None => format!("failed after {:.1}s", elapsed.as_secs_f32()),
                     };
-                    ui.colored_label(egui::Color32::from_rgb(220, 80, 80), headline);
+                    note_label(ui, egui::Color32::from_rgb(220, 80, 80), headline);
                     // Verbatim, always. The hint points; this explains.
                     for line in stderr {
                         ui.label(egui::RichText::new(line.as_str()).small().weak());
@@ -24212,6 +24257,84 @@ mod gui {
                 assert_eq!(
                     create_run_line("/p.sh", "jane.doe", UserScriptMode::Restore, sudo, uid),
                     "bash /p.sh --user jane.doe --restore"
+                );
+            }
+        }
+
+        /// `done` is the sign-in script's last word, so it is the one step
+        /// that is not still in progress. Green, and the same green as
+        /// `ScriptState::Ok`, so "this worked" reads the same across the bar.
+        #[test]
+        fn a_finished_sign_in_is_green_and_the_steps_before_it_are_not() {
+            let green = egui::Color32::from_rgb(120, 180, 120);
+            let (color, text) =
+                fed_status_for(&FedState::SigningIn("done".to_string())).expect("a line");
+            assert_eq!(color, green);
+            assert_eq!(text, "fed up: signing in — done");
+            assert!(!text.ends_with('…'), "done is not still happening: {text}");
+
+            for step in ["entering-code", "entering-password", "confirming-mfa"] {
+                let (color, text) =
+                    fed_status_for(&FedState::SigningIn(step.to_string())).expect("a line");
+                assert_ne!(color, green, "{step} is still in progress");
+                assert!(text.ends_with('…'), "{text}");
+            }
+        }
+
+        /// The colours that carry meaning must not drift: only a stand-down is
+        /// red, and a retry stays amber because it usually fixes itself.
+        #[test]
+        fn only_a_stand_down_is_red() {
+            let red = egui::Color32::from_rgb(220, 80, 80);
+            use ec2_manager::fed_auth::FedError;
+            let (color, _) =
+                fed_status_for(&FedState::Stalled(FedError::Command("nope".into()))).expect("line");
+            assert_eq!(color, red);
+            let (color, _) = fed_status_for(&FedState::Retrying {
+                error: FedError::Command("nope".into()),
+                attempt: 2,
+            })
+            .expect("line");
+            assert_ne!(color, red, "a retry is still working");
+            assert!(fed_status_for(&FedState::Authenticated).is_none());
+        }
+
+        /// Every status-coloured label goes through `note_label`, so a stray
+        /// direct call would be a notification that stays thin on a light
+        /// panel — the exact thing this fixes, and invisible in review. The
+        /// only two allowed are the deliberately-grey ones, where weight would
+        /// fight the colour's purpose.
+        #[test]
+        fn status_coloured_labels_all_carry_the_light_theme_weight() {
+            // Built at runtime: spelled out, this test's own source would
+            // match itself and the count would be meaningless.
+            let needle = format!("ui.{}(", "colored_label");
+            let src = include_str!("ec2_manager_gui.rs");
+            let lines: Vec<(usize, &str)> = src
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| l.contains(&needle))
+                .collect();
+            assert_eq!(
+                lines.len(),
+                2,
+                "only the two grey labels may bypass note_label; found:\n{}",
+                lines
+                    .iter()
+                    .map(|(i, l)| format!("{}: {}", i + 1, l.trim()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            // ...and they must still be the grey ones. The colour sits on the
+            // following line in both, so look at a small window.
+            let all: Vec<&str> = src.lines().collect();
+            for (i, line) in &lines {
+                let window = all[*i..(*i + 3).min(all.len())].join(" ");
+                assert!(
+                    window.contains("Color32::GRAY"),
+                    "a non-grey label bypassed note_label at line {}: {}",
+                    i + 1,
+                    line.trim()
                 );
             }
         }
