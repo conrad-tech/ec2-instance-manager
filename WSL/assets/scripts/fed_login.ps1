@@ -83,6 +83,15 @@ param(
     # rather than appended to). Empty reads it from the vault entry.
     [string]$Username = '',
 
+    # Process names accepted at the MFA confirm step only, pipe-separated and
+    # matched as an unanchored, case-insensitive regex.
+    #
+    # Okta Verify is its OWN window -- borderless and centred, so it looks
+    # like a Chrome popup, but it is a separate process and the chrome-only
+    # guard refuses it. That step types no secret (a bare Enter), so widening
+    # it there is safe in a way it would not be for the password.
+    [string]$MfaProcessMatch = 'chrome|okta',
+
     # Foreground-window title fragments accepted before anything is typed,
     # pipe-separated; any one matching is enough. A list rather than one
     # value because the sign-in walks several pages that do not share a
@@ -249,20 +258,20 @@ function Test-TitleMatch([string]$title) {
     exactly how the MFA step failed: the title had moved on from the sign-in
     page and the guard refused before the page had settled.
 #>
-function Assert-Target([string]$what) {
+function Assert-Target([string]$what, [string]$procPattern = '^(?i)chrome$') {
     $deadline = (Get-Date).AddSeconds($GuardWaitSec)
     $title = ''
     $proc = ''
     while ((Get-Date) -lt $deadline) {
         $title = [Fg]::Title()
         $proc = Get-ForegroundProcessName
-        if ($proc -match '^(?i)chrome$' -and (Test-TitleMatch $title)) { return }
+        if ($proc -match $procPattern -and (Test-TitleMatch $title)) { return }
         Start-Sleep -Milliseconds 250
     }
-    # Report whichever half is actually wrong -- the title is the one that
-    # needs configuring, so name it and what was expected.
-    if ($proc -notmatch '^(?i)chrome$') {
-        Write-Fail "focus guard: foreground window belongs to '$proc', not chrome -- aborted before $what"
+    # Report whichever half is actually wrong, and name the value that needs
+    # configuring -- both halves are things a tenant can differ on.
+    if ($proc -notmatch $procPattern) {
+        Write-Fail "focus guard: foreground window belongs to '$proc', which does not match '$procPattern' -- aborted before $what"
     }
     Write-Fail "focus guard: foreground title '$title' matches none of '$TitleMatch' -- aborted before $what (add a fragment of that title to fed_auth.browser_title_match)"
 }
@@ -293,8 +302,8 @@ function ConvertTo-SendKeysLiteral([string]$s) {
     return $sb.ToString()
 }
 
-function Send-Guarded([string]$keys, [string]$what) {
-    Assert-Target $what
+function Send-Guarded([string]$keys, [string]$what, [string]$procPattern = '^(?i)chrome$') {
+    Assert-Target $what $procPattern
     if ($DryRun) {
         Write-Output "FEDLOGIN_DRYRUN:would send $what"
         return
@@ -376,7 +385,9 @@ Start-Sleep -Seconds $StepDelaySec
 
 # --- MFA confirm -----------------------------------------------------------
 Write-Status 'confirming-mfa'
-Send-Guarded '{ENTER}' 'confirming the MFA prompt'
+# The only send that accepts a non-Chrome window: Okta Verify owns this
+# prompt. It carries no secret, and the title check still applies.
+Send-Guarded '{ENTER}' 'confirming the MFA prompt' $MfaProcessMatch
 
 Write-Status 'done'
 exit 0
