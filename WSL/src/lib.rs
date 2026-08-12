@@ -22,6 +22,7 @@ pub mod sim;
 pub mod ssh_config;
 pub mod terminal;
 pub mod tunnel;
+pub mod user_sync;
 pub mod util;
 pub mod vault_iam;
 pub mod workflow;

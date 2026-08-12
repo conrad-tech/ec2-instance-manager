@@ -69,6 +69,8 @@ pub struct Features {
     pub personal_scripts: PersonalScriptsFeature,
     /// "Vault IAM Access" entry in the Scripts menu: who may see it.
     pub vault_iam: VaultIamFeature,
+    /// "Bastion User Sync" entry in the Scripts menu: who may see it.
+    pub user_sync: UserSyncFeature,
     /// Outlook "access email" automation config (Windows only). Controls
     /// how the post-create email is encrypted and whether it may auto-send.
     pub access_email: AccessEmailConfig,
@@ -153,6 +155,20 @@ pub struct FedAuthFeature {
     /// Empty falls back to the shipped set.
     #[serde(deserialize_with = "string_or_list")]
     pub browser_title_match: Vec<String>,
+    /// Process names accepted at the **MFA confirm step only**, matched
+    /// case-insensitively as an unanchored regex. Empty falls back to
+    /// `chrome|okta`.
+    ///
+    /// Okta Verify owns that prompt in its own borderless, centred window --
+    /// it looks like a Chrome popup but is a separate process, so the
+    /// chrome-only focus guard refuses it and the sign-in stops one keystroke
+    /// from done.
+    ///
+    /// Only this step is widened, and only because it types no secret: it is
+    /// a bare Enter. Every step that types the code, the username or the
+    /// password still requires Chrome. The title check applies throughout.
+    #[serde(deserialize_with = "string_or_list")]
+    pub mfa_process_match: Vec<String>,
     /// Windows Credential Manager target name holding the federation
     /// password. Empty falls back to `ec2-manager-fed`.
     ///
@@ -241,6 +257,24 @@ impl FedAuthFeature {
         }
     }
 
+    /// Process names the MFA confirm step accepts, pipe-joined for the
+    /// script. Never empty -- a blank pattern would match every process and
+    /// remove the check entirely.
+    pub fn resolved_mfa_process_match(&self) -> String {
+        let joined = self
+            .mfa_process_match
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("|");
+        if joined.is_empty() {
+            "chrome|okta".to_string()
+        } else {
+            joined
+        }
+    }
+
     /// The Credential Manager target name, falling back to `ec2-manager-fed`.
     /// Never empty — an empty target would read whatever happens to be first
     /// in the vault.
@@ -297,6 +331,28 @@ impl VaultIamFeature {
     /// create list is not enough — delete has its own list.
     pub fn is_delete_allowed_user(&self, user: &str) -> bool {
         user_in_list(&self.delete_allowed_users, user)
+    }
+}
+
+/// The `user_sync` section of `assets/features.json`.
+///
+/// Gates **Bastion User Sync**, which compares the accounts on a pair of
+/// bastions and can create the ones missing from either, plus install the
+/// cron entry that keeps doing it. It reads and writes accounts on both
+/// boxes, so it ships with an empty list — the same fail-closed stance as
+/// `alerts`, `personal_scripts` and `vault_iam.delete_allowed_users`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct UserSyncFeature {
+    /// OS usernames allowed to see the entry (case-insensitive).
+    /// `["*"]` for everyone, an empty list for nobody. Shipped empty.
+    pub allowed_users: Vec<String>,
+}
+
+impl UserSyncFeature {
+    /// True when `user` may see the Bastion User Sync entry.
+    pub fn is_allowed_user(&self, user: &str) -> bool {
+        user_in_list(&self.allowed_users, user)
     }
 }
 
@@ -523,6 +579,9 @@ impl Default for Features {
             alerts: AlertsFeature::default(),
             personal_scripts: PersonalScriptsFeature::default(),
             vault_iam: VaultIamFeature::default(),
+            // Derived Default: an empty allow-list, which is the fail-closed
+            // state this feature must land in.
+            user_sync: UserSyncFeature::default(),
             access_email: AccessEmailConfig::default(),
             // Derived Default: `enabled` false and an empty allow-list, which
             // is the fail-closed state this feature must land in.
@@ -580,6 +639,13 @@ impl Features {
     pub fn vault_iam_delete_enabled_for(&self, user: &str) -> bool {
         self.vault_iam.is_allowed_user(user)
             && self.vault_iam.is_delete_allowed_user(user)
+    }
+
+    /// True when the **Bastion User Sync** entry should be shown to `user`.
+    /// Fails closed: a malformed features.json yields an empty allow-list,
+    /// and the shipped file ships one.
+    pub fn user_sync_enabled_for(&self, user: &str) -> bool {
+        self.user_sync.is_allowed_user(user)
     }
 
     /// True when the automatic `fed up` login should run for `user`. Fails
@@ -811,6 +877,40 @@ mod tests {
         );
     }
 
+    /// User Sync reads and writes accounts on both bastions and can install a
+    /// root cron entry, so it ships closed like alerts and personal_scripts —
+    /// an admin adds names and rebuilds.
+    #[test]
+    fn user_sync_is_hidden_by_default() {
+        let f = load();
+        assert!(
+            !f.user_sync_enabled_for("any.user"),
+            "assets/features.json must ship an empty user_sync.allowed_users"
+        );
+        assert!(f.user_sync.allowed_users.is_empty());
+    }
+
+    #[test]
+    fn user_sync_allow_list_is_honoured() {
+        let f: Features =
+            serde_json::from_str(r#"{"user_sync":{"allowed_users":["bconrad"]}}"#).expect("parses");
+        assert!(f.user_sync_enabled_for("bconrad"));
+        assert!(f.user_sync_enabled_for("BConrad"), "match is case-insensitive");
+        assert!(!f.user_sync_enabled_for("someone.else"));
+
+        let all: Features =
+            serde_json::from_str(r#"{"user_sync":{"allowed_users":["*"]}}"#).expect("parses");
+        assert!(all.user_sync_enabled_for("anyone"));
+    }
+
+    /// A malformed file must not hand out a feature that writes accounts.
+    #[test]
+    fn user_sync_fails_closed_on_a_missing_section() {
+        let f: Features = serde_json::from_str("{}").expect("parses");
+        assert!(!f.user_sync_enabled_for("anyone"));
+        assert!(!Features::default().user_sync_enabled_for("anyone"));
+    }
+
     #[test]
     fn vault_iam_delete_is_hidden_by_default() {
         // Everyone sees create in the shipped file; nobody sees delete.
@@ -1012,6 +1112,23 @@ mod tests {
         assert_eq!(blank.fed_auth.resolved_credential_target(), "ec2-manager-fed");
         assert!(!load().fed_auth.resolved_title_match().is_empty());
         assert!(!load().fed_auth.resolved_credential_target().is_empty());
+    }
+
+    #[test]
+    fn the_mfa_step_accepts_its_own_window_but_never_an_empty_pattern() {
+        // Okta Verify owns the confirm prompt in a separate process, so the
+        // chrome-only guard has to widen for that one step. A blank pattern
+        // would match everything and remove the check, so it falls back.
+        let blank: Features =
+            serde_json::from_str(r#"{"fed_auth":{"mfa_process_match":"  "}}"#).expect("parses");
+        assert_eq!(blank.fed_auth.resolved_mfa_process_match(), "chrome|okta");
+        assert!(!load().fed_auth.resolved_mfa_process_match().is_empty());
+
+        let custom: Features = serde_json::from_str(
+            r#"{"fed_auth":{"mfa_process_match":["chrome","OktaVerify"]}}"#,
+        )
+        .expect("parses");
+        assert_eq!(custom.fed_auth.resolved_mfa_process_match(), "chrome|OktaVerify");
     }
 
     #[test]

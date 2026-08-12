@@ -7,11 +7,14 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 --user <username> [--pem <pem_path>] [--force] [--sudo] [--restore] [--help]"
+  echo "Usage: $0 --user <username> [--pem <pem_path>] [--force] [--sudo] [--uid <n>] [--restore] [--help]"
   echo " --user <username> Required. New username to create"
   echo " --pem <pem_path> Optional. PEM output path (default: /root/<username>.pem)"
   echo " --force Optional. Overwrite existing PEM file"
   echo " --sudo Optional. Configure sudo access (NOPASSWD:ALL)"
+  echo " --uid <n> Optional. Create with this uid AND gid. Chosen by the app"
+  echo "                    from BOTH bastions' tables; without it the script"
+  echo "                    picks one this bastion can see (see pick_shared_id)."
   echo " --restore Optional. Restore access for an EXISTING user: require the"
   echo "                    account to exist, replace authorized_keys (revoking"
   echo "                    the lost key) and overwrite any existing PEM."
@@ -28,6 +31,8 @@ PEM_PATH=""
 FORCE=0
 SUDO=0
 RESTORE=0
+# Explicit id from the caller. Empty means allocate one locally.
+WANT_ID=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -46,6 +51,14 @@ while [[ $# -gt 0 ]]; do
     --sudo)
       SUDO=1
       shift
+      ;;
+    --uid)
+      WANT_ID="${2:-}"
+      if [[ ! "$WANT_ID" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: --uid needs a number."
+        exit 1
+      fi
+      shift 2
       ;;
     --restore)
       # Restoring implies overwriting the PEM: the original run left one at
@@ -133,23 +146,78 @@ if [[ -z "$PUB_KEY" ]]; then
   exit 1
 fi
 
+# One number for both the uid and the gid, free on this bastion and above
+# every id already owning something under the shared /efs/home.
+#
+# Letting useradd and groupadd choose for themselves is what broke: they are
+# separate allocators over separate databases, each taking its own lowest free
+# number. An account came out uid 1011 / gid 1012 because GID 1011 was spent
+# here while UID 1011 was not — and UID 1011 belonged to a different person on
+# the secondary. The secondary mirrors these numbers exactly, because EFS
+# authorises by number and not by name, so an id already spent over there
+# leaves a half-created account and an SSH test that fails.
+#
+# /efs/home is the one thing both bastions share, which makes the directories
+# in it the registry of ids handed out on either box. Ids at or above 60000
+# are ignored: root is squashed to nobody (65534) on EFS, and a single file
+# owned by it would otherwise push every future account past 65535.
+pick_shared_id() {
+  local max=999 v
+  for v in $(stat -c '%u %g' /efs/home/* 2>/dev/null | tr ' ' '\n' || true); do
+    if [[ "$v" =~ ^[0-9]+$ ]] && (( v > max )) && (( v < 60000 )); then
+      max=$v
+    fi
+  done
+  local id=$(( max + 1 ))
+  while getent passwd "$id" >/dev/null 2>&1 || getent group "$id" >/dev/null 2>&1; do
+    id=$(( id + 1 ))
+  done
+  printf '%s' "$id"
+}
+
+# An id passed in beats the local pick: the caller chose it after reading
+# BOTH bastions' tables, and this script can only see the one it runs on --
+# which is exactly how an account came to hold a number the secondary had
+# already spent. The local pick stays for a run by hand.
+NEW_ID=""
+if ! id "$USERNAME" >/dev/null 2>&1; then
+  if [[ -n "$WANT_ID" ]]; then
+    NEW_ID="$WANT_ID"
+    if getent passwd "$NEW_ID" >/dev/null 2>&1 || getent group "$NEW_ID" >/dev/null 2>&1; then
+      echo "ERROR: uid/gid $NEW_ID is already in use on this bastion."
+      echo "Run Bastion User Sync: the two bastions disagree about who holds it."
+      exit 1
+    fi
+    echo "Using uid/gid $NEW_ID (chosen from both bastions)."
+  else
+    NEW_ID="$(pick_shared_id)"
+    echo "Allocating uid/gid $NEW_ID (free here, and above every /efs/home owner)."
+  fi
+fi
+
+# groupadd/useradd report a real failure and stay quiet about the benign
+# GROUP=100 / skel / "home already exists" warnings, which come with exit 0.
+# Discarding both is what left the secondary saying only that it had failed.
 if getent group "$USERNAME" >/dev/null 2>&1; then
   echo "Group '$USERNAME' already exists."
 else
   if id "$USERNAME" >/dev/null 2>&1; then
     echo "Skipping group creation because user '$USERNAME' already exists."
   else
-    # Suppress benign useradd/groupadd warnings (GROUP=100 default, skel,
-    # "home already exists") so they don't look like real errors. A genuine
-    # failure still aborts via `set -e`.
-    groupadd "$USERNAME" 2>/dev/null
+    if ! GERR="$(groupadd -g "$NEW_ID" "$USERNAME" 2>&1)"; then
+      echo "ERROR: groupadd failed: $GERR"
+      exit 1
+    fi
   fi
 fi
 
 if id "$USERNAME" >/dev/null 2>&1; then
   echo "Skipping user creation because user '$USERNAME' already exists."
 else
-  useradd -m -d "$HOME_DIR" -g "$USERNAME" "$USERNAME" 2>/dev/null
+  if ! UERR="$(useradd -u "$NEW_ID" -m -d "$HOME_DIR" -g "$USERNAME" "$USERNAME" 2>&1)"; then
+    echo "ERROR: useradd failed: $UERR"
+    exit 1
+  fi
   USER_CREATED=1
 fi
 

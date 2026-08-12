@@ -721,6 +721,84 @@ and default script rows show a trimmed preview of the body itself
 (`script_hover_text`), since a name like "prep" says nothing about what is
 about to be pasted into a live shell.
 
+### uid/gid allocation, and Bastion User Sync
+
+Both bastions mount the same EFS at `/efs/home`, and **NFS authorises by
+number, not by name**. An account is therefore only usable on both boxes when
+its uid *and* gid are identical on both — a user whose numbers differ cannot
+read their own home directory (and the key material in it) on the box that
+disagrees, while whoever holds that number there can.
+
+**`create_new_user.sh` allocates one number for both** (`pick_shared_id`),
+above every id already owning something under `/efs/home` and free in this
+box's own passwd *and* group. Letting `useradd` and `groupadd` choose for
+themselves is what broke: they are separate allocators over separate
+databases, each taking its own lowest free number, so an account came out
+uid 1011 / gid 1012 — and 1011 belonged to a different person on the
+secondary, which failed the mirror with `UID 1011 is not unique`. Ids at or
+above 60000 are excluded from the floor because root is squashed to `nobody`
+(65534) on EFS, and one file owned by it would push every future account past
+65535.
+
+**Every create runs a pre-flight first** (`begin_create_preflight` →
+`run_create_preflight`). It reads both bastions' account tables, creates any
+account that exists on only one of them, and then picks the uid/gid for the new
+user with `choose_shared_id` — the lowest number free as **both** a uid and a
+gid on **both** boxes, above everything either has spent on a shared home. That
+number is passed to the script as `--uid`, and the script's own `pick_shared_id`
+is only the fallback for a run by hand, because a script can only ever see the
+box it runs on. That blind spot is the bug: the primary picked its own lowest
+free uid, the secondary had spent it on somebody else, and the mirror failed
+with `UID nnnn is not unique` after the account was half made.
+
+- **A pre-flight that cannot read a bastion aborts the create.** Creating with
+  an unchecked number is exactly what went wrong; there is no useful fallback.
+- **A divergence it cannot repair does not block the create.** A uid that
+  differs between the boxes, or a number held by someone else, is logged as a
+  standing fault — the new account still takes a number free on both, so it is
+  sound regardless.
+- **Restore skips the pre-flight entirely.** The account already exists and
+  keeps whatever uid it has, so there is nothing to align and nothing to
+  allocate. `restore_takes_neither_an_id_nor_sudo` pins that.
+- The floor includes `HOMEOWN` rows — the owner of every directory under
+  `/efs/home` — so a home that outlived its account (deleted on both boxes,
+  directory left behind) still reserves its number rather than handing its
+  files to somebody new.
+
+**Bastion User Sync** (`src/user_sync.rs`, gated by `user_sync.allowed_users`,
+shipped `[]`) is the same comparison as a dialog, for auditing and for
+repairing drift without creating anyone. It is the one Scripts dialog that does
+**not** drip-feed a terminal: it needs both account tables before it can decide
+anything, and the secondary's session is deferred until the primary finishes,
+so it goes over `exec_remote_command` (SSM send-command) in a worker and does
+the comparison in Rust — plain data in, plain data out, and tested as such.
+
+What it will and will not do is the whole design:
+
+- **Creating a missing account is safe** where the target has both numbers
+  free: the home already exists on the shared mount, owned by those very
+  numbers, so `-M` lands the account on files that are already theirs.
+- **It never renumbers.** Correcting a uid that differs between the boxes
+  means `usermod -u` plus a recursive `chown` of a live home on a shared
+  filesystem. Those rows are reported, not repaired.
+- **It never takes over a number.** That needs `useradd --non-unique`, which
+  makes two people one identity on EFS — the exact hazard this exists to
+  prevent.
+- **A group of the account's own name carrying the right gid is not a
+  conflict.** That is precisely what a half-finished mirror leaves behind, so
+  refusing it would strand the rows this exists to fix.
+- **The dump's in-use tables are unfiltered on purpose.** A uid held by a
+  *system* account still blocks a `useradd`, so `UIDU`/`GIDU` carry the whole
+  passwd/group table while `ACCT` carries only the managed set (a home under
+  `/efs/home`). Filtering both the same way would call a number free and then
+  fail against it.
+
+**There is no cron.** An earlier version installed one on both bastions;
+checking at create time replaces it, and is better: it runs exactly when the
+answer matters, needs no root cron entry or log file on either box, and cannot
+drift out of step with the app. Nothing repairs the boxes on a schedule now —
+the sync dialog is there for a deliberate sweep.
+
 ### Scripts dialogs select an environment, not an account
 
 Several AWS accounts host **two environments**, told apart by each instance's
@@ -899,6 +977,13 @@ When triaging: get the secondary tab's scrollback and the `[secondary i-…]`
 lines from the app log. `secondary: useradd failed: …` names the cause outright;
 `step N/M done in …ms (TIMEOUT — prompt bump missed)` means the drip-feed
 desynced instead.
+
+**Root cause, found 2026-08-11:** `useradd: UID 1011 is not unique`. The
+primary allocated uid 1011 while 1011 belonged to a different person on the
+secondary — someone had created that account on one bastion and not the other,
+so the two boxes' counters had drifted. See "uid/gid allocation, and Bastion
+User Sync" above for the fix on both sides: new accounts now take one number
+free on both, and the existing drift is repaired by the sync dialog.
 
 ### Multi-line paste — only first command runs
 

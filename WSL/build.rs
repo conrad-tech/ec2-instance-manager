@@ -128,6 +128,7 @@ fn emit_obfuscated_assets() {
         ("delete_diagnostics.sh.obf", "assets/scripts/delete_diagnostics.sh"),
         ("secondary_mirror.sh.obf", "assets/scripts/secondary_mirror.sh"),
         ("sudoers_grant.sh.obf", "assets/scripts/sudoers_grant.sh"),
+        ("user_sync_dump.sh.obf", "assets/scripts/user_sync_dump.sh"),
     ];
 
     for (out_name, src) in assets {

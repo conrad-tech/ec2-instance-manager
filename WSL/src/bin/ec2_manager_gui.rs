@@ -819,6 +819,55 @@ mod gui {
         focus_top: bool,
     }
 
+    /// Modal state for "Scripts → Bastion User Sync".
+    ///
+    /// Unlike the other Scripts dialogs this one does not drip-feed a terminal:
+    /// it needs both bastions' account tables *before* it can decide anything,
+    /// and the secondary's session is deferred until the primary finishes. So
+    /// it goes over `exec_remote_command` (SSM send-command) in a worker, the
+    /// same path the create diagnostics take, and the comparison itself is
+    /// [`ec2_manager::user_sync`] — plain data in, plain data out, and tested
+    /// as such.
+    #[derive(Default)]
+    struct UserSyncDialog {
+        /// Account (config profile_id) whose bastions we compare.
+        env_profile_id: String,
+        /// `MMODAL_ENV` selected within that account; empty when untagged.
+        env_name: String,
+        primary_query: String,
+        primary_id: String,
+        secondary_query: String,
+        secondary_id: String,
+        /// Last scan's verdicts. Empty until Scan has run — the apply button
+        /// is driven off this, so nothing can be created unseen.
+        rows: Vec<ec2_manager::user_sync::Row>,
+        /// Rendered report, shown in the scrolling pane.
+        report: String,
+        /// One-line count under the report.
+        summary: String,
+        /// A worker is running; buttons are disabled and the window says so.
+        busy: bool,
+        /// Progress/result line under the buttons.
+        status: Option<String>,
+        /// Inline validation or failure, shown in red.
+        error: Option<String>,
+    }
+
+    /// User-sync worker → UI.
+    enum UserSyncOutcome {
+        /// A scan finished.
+        Scanned {
+            rows: Vec<ec2_manager::user_sync::Row>,
+            report: String,
+            summary: String,
+        },
+        /// Accounts were created. `output` is the raw remote output, logged
+        /// verbatim — this writes accounts, so it leaves a full account of
+        /// itself rather than a count.
+        Applied { added: usize, output: String },
+        Failed(String),
+    }
+
     /// Tracks an in-flight Vault IAM Access run so the verdict marker can be
     /// read off the terminal once its steps finish.
     struct VaultIamRun {
@@ -999,6 +1048,38 @@ mod gui {
         clear: bool,
         /// Human-readable summary shown when not clear (or on check error).
         report: String,
+    }
+
+    /// A create waiting on its pre-flight, held while the two bastions are
+    /// compared. Mirrors `pending_delete`, which waits on the active-session
+    /// check the same way.
+    struct PendingCreate {
+        username: String,
+        env: String,
+        env_name: String,
+        grant_sudo: bool,
+        primary_id: String,
+        secondary_id: String,
+    }
+
+    /// Result of the create pre-flight: align the bastions, then pick the
+    /// number the new account will hold on both.
+    struct CreatePreflightOutcome {
+        /// The uid/gid to create with, free on both boxes. `None` means the
+        /// pre-flight could not read a bastion, and the create is abandoned —
+        /// creating with an unchecked number is how this went wrong before.
+        uid: Option<u32>,
+        /// Accounts created to bring the two boxes into line first.
+        synced: usize,
+        /// Divergences left behind — a uid that differs between the boxes, or
+        /// a number held by somebody else. They do not block this create,
+        /// which takes a number free on both regardless, but they are a
+        /// standing fault and the user is told.
+        attention: Vec<String>,
+        /// Everything the pre-flight did, for the log.
+        report: String,
+        /// Set when the create must not proceed.
+        error: Option<String>,
     }
 
     /// Result of a post-run verification worker.
@@ -1868,6 +1949,254 @@ mod gui {
         }
     }
 
+    /// Wrap a script body so it survives `aws ssm send-command`, the same way
+    /// every other multi-line script this app runs remotely is handed over.
+    fn b64_script_command(script: &str) -> String {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
+        format!("echo {b64} | base64 -d | bash")
+    }
+
+    /// Read both bastions' account tables and work out what it would take to
+    /// make them agree.
+    ///
+    /// Both boxes are read before anything is decided, because a verdict about
+    /// one is meaningless without the other — a uid is only free if it is free
+    /// *there*.
+    fn run_user_sync_scan(
+        primary_ctx: AwsContext,
+        primary_id: String,
+        secondary_ctx: AwsContext,
+        secondary_id: String,
+        tx: Sender<UserSyncOutcome>,
+    ) {
+        use ec2_manager::user_sync;
+        let dump = b64_script_command(&deobf_asset(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/user_sync_dump.sh.obf"
+        ))));
+        let read = |ctx: &AwsContext, id: &str| -> std::result::Result<String, String> {
+            exec_remote_command(&None, ctx, id, &dump, Duration::from_secs(60))
+        };
+        let primary = match read(&primary_ctx, &primary_id) {
+            Ok(t) => user_sync::parse_dump(&t),
+            Err(e) => {
+                let _ = tx.send(UserSyncOutcome::Failed(format!(
+                    "could not read the primary ({primary_id}): {e}"
+                )));
+                return;
+            }
+        };
+        let secondary = match read(&secondary_ctx, &secondary_id) {
+            Ok(t) => user_sync::parse_dump(&t),
+            Err(e) => {
+                let _ = tx.send(UserSyncOutcome::Failed(format!(
+                    "could not read the secondary ({secondary_id}): {e}"
+                )));
+                return;
+            }
+        };
+        let rows = user_sync::plan(&primary, &secondary);
+        let _ = tx.send(UserSyncOutcome::Scanned {
+            report: user_sync::render(&rows),
+            summary: user_sync::summary(&rows),
+            rows,
+        });
+    }
+
+    /// The command line that runs `create_new_user.sh` on the primary.
+    ///
+    /// `--uid` carries the number the pre-flight found free on BOTH bastions.
+    /// Without it the script falls back to its own local pick, which can only
+    /// see the box it runs on — the very thing that produced an account
+    /// holding a number the secondary had already spent.
+    ///
+    /// Restore never carries one: the account already exists and keeps
+    /// whatever uid it has. It never carries `--sudo` either, so an existing
+    /// grant survives untouched rather than being re-applied.
+    fn create_run_line(
+        remote_path: &str,
+        username: &str,
+        mode: UserScriptMode,
+        grant_sudo: bool,
+        uid: Option<u32>,
+    ) -> String {
+        if mode.is_restore() {
+            return format!("bash {remote_path} --user {username} --restore");
+        }
+        let id = uid.map(|u| format!(" --uid {u}")).unwrap_or_default();
+        let sudo = if grant_sudo { " --sudo" } else { "" };
+        format!("bash {remote_path} --user {username}{id}{sudo}")
+    }
+
+    /// Bastion New User's pre-flight: bring the two boxes into line, then
+    /// choose the number the new account will hold on both.
+    ///
+    /// This runs before every create because the alternative is what already
+    /// happened: the primary picked its own lowest free uid, the secondary had
+    /// spent that number on somebody else, and the mirror failed with `UID
+    /// nnnn is not unique` after the account was half made. Reading both
+    /// tables first is the only way the number can be known to be free on the
+    /// box the account also has to exist on.
+    ///
+    /// Accounts missing from one side are created first — that is what puts
+    /// the spent numbers into both tables, and it is the repair the user asked
+    /// for. What cannot be repaired safely is reported and does not stop the
+    /// create, which takes a number free on both either way.
+    fn run_create_preflight(
+        primary_ctx: AwsContext,
+        primary_id: String,
+        secondary_ctx: AwsContext,
+        secondary_id: String,
+        tx: Sender<CreatePreflightOutcome>,
+    ) {
+        use ec2_manager::user_sync::{self, Action, Side};
+        let dump = b64_script_command(&deobf_asset(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/user_sync_dump.sh.obf"
+        ))));
+        let read = |ctx: &AwsContext, id: &str| -> std::result::Result<String, String> {
+            exec_remote_command(&None, ctx, id, &dump, Duration::from_secs(60))
+        };
+        let fail = |what: &str, e: String| CreatePreflightOutcome {
+            uid: None,
+            synced: 0,
+            attention: Vec::new(),
+            report: String::new(),
+            error: Some(format!(
+                "could not read the {what}'s accounts ({e}). The create was not \
+                 started: without both tables there is no number known to be \
+                 free on both bastions."
+            )),
+        };
+        let primary = match read(&primary_ctx, &primary_id) {
+            Ok(t) => user_sync::parse_dump(&t),
+            Err(e) => {
+                let _ = tx.send(fail("primary", e));
+                return;
+            }
+        };
+        let secondary = match read(&secondary_ctx, &secondary_id) {
+            Ok(t) => user_sync::parse_dump(&t),
+            Err(e) => {
+                let _ = tx.send(fail("secondary", e));
+                return;
+            }
+        };
+
+        let rows = user_sync::plan(&primary, &secondary);
+        let mut report = String::new();
+        let mut synced = 0usize;
+        let mut attention = Vec::new();
+
+        for row in &rows {
+            match &row.action {
+                Action::Add {
+                    missing_from,
+                    uid,
+                    gid,
+                    home,
+                } => {
+                    let (ctx, id) = match missing_from {
+                        Side::Primary => (&primary_ctx, &primary_id),
+                        Side::Secondary => (&secondary_ctx, &secondary_id),
+                    };
+                    let cmd = user_sync::add_command(&row.name, *uid, *gid, home);
+                    match exec_remote_command(&None, ctx, id, &cmd, Duration::from_secs(60)) {
+                        Ok(_) => {
+                            synced += 1;
+                            report.push_str(&format!(
+                                "synced {} ({uid}/{gid}) onto the {} ({id})\n",
+                                row.name,
+                                missing_from.label()
+                            ));
+                        }
+                        // A sync failure is not fatal to the create: the id is
+                        // chosen above every number either box has spent, so
+                        // it stays free whether or not this account landed.
+                        Err(e) => {
+                            let msg =
+                                format!("could not sync {} onto the {}: {e}", row.name, missing_from.label());
+                            report.push_str(&format!("{msg}\n"));
+                            attention.push(msg);
+                        }
+                    }
+                }
+                Action::Mismatch { .. } | Action::Conflict { .. } => {
+                    attention.push(format!("{}: {}", row.name, row.action.tag()));
+                }
+                Action::Match { .. } => {}
+            }
+        }
+
+        let uid = user_sync::choose_shared_id(&primary, &secondary);
+        report.push_str(&format!(
+            "chose uid/gid {uid}, free on both bastions\n{}",
+            user_sync::render(&rows)
+        ));
+        let _ = tx.send(CreatePreflightOutcome {
+            uid: Some(uid),
+            synced,
+            attention,
+            report,
+            error: None,
+        });
+    }
+
+    /// Create the accounts the scan found safe to create, each on the bastion
+    /// it is missing from.
+    ///
+    /// Driven off the rows the user was shown rather than a fresh scan: what
+    /// gets created must be what the report said would be created.
+    fn run_user_sync_apply(
+        rows: Vec<ec2_manager::user_sync::Row>,
+        primary_ctx: AwsContext,
+        primary_id: String,
+        secondary_ctx: AwsContext,
+        secondary_id: String,
+        tx: Sender<UserSyncOutcome>,
+    ) {
+        use ec2_manager::user_sync::{self, Action, Side};
+        let mut out = String::new();
+        let mut added = 0usize;
+        for row in &rows {
+            let Action::Add {
+                missing_from,
+                uid,
+                gid,
+                home,
+            } = &row.action
+            else {
+                continue;
+            };
+            let (ctx, id) = match missing_from {
+                Side::Primary => (&primary_ctx, &primary_id),
+                Side::Secondary => (&secondary_ctx, &secondary_id),
+            };
+            let cmd = user_sync::add_command(&row.name, *uid, *gid, home);
+            match exec_remote_command(&None, ctx, id, &cmd, Duration::from_secs(60)) {
+                Ok(text) => {
+                    added += 1;
+                    out.push_str(&format!(
+                        "[{} {id}] created {} {uid}/{gid}\n{}\n",
+                        missing_from.label(),
+                        row.name,
+                        text.trim()
+                    ));
+                }
+                // One failure must not abandon the rest: the accounts are
+                // independent, and stopping halfway leaves a partial repair
+                // nobody asked for.
+                Err(e) => out.push_str(&format!(
+                    "[{} {id}] FAILED {}: {e}\n",
+                    missing_from.label(),
+                    row.name
+                )),
+            }
+        }
+        let _ = tx.send(UserSyncOutcome::Applied { added, output: out });
+    }
+
     /// Run the base64-wrapped active-session probe on one instance.
     /// Returns (active, detail). On error, active=true (fail safe).
     fn preflight_active_check(ctx: &AwsContext, id: &str, cmd: &str) -> (bool, String) {
@@ -2731,6 +3060,7 @@ mod gui {
             ("-Url", url.to_string()),
             ("-Code", code.to_string()),
             ("-TitleMatch", cfg.resolved_title_match()),
+            ("-MfaProcessMatch", cfg.resolved_mfa_process_match()),
             ("-CredentialTarget", cfg.resolved_credential_target()),
             // No -Username: the script reads it from the vault entry, so the
             // `/user:` recorded with the credential is what gets typed on the
@@ -4577,6 +4907,19 @@ mod gui {
         /// Build-time gate: whether the Vault IAM Access entry is shown to the
         /// current OS user (features.json `vault_iam.allowed_users`).
         vault_iam_enabled: bool,
+        /// Active "Scripts → Bastion User Sync" dialog, if any.
+        user_sync_dialog: Option<UserSyncDialog>,
+        /// Whether the Bastion User Sync entry is shown to the current OS
+        /// user (features.json `user_sync.allowed_users`). Ships closed.
+        user_sync_enabled: bool,
+        /// User-sync worker → UI.
+        user_sync_tx: Sender<UserSyncOutcome>,
+        user_sync_rx: Receiver<UserSyncOutcome>,
+        /// Create pre-flight worker → UI.
+        create_pre_tx: Sender<CreatePreflightOutcome>,
+        create_pre_rx: Receiver<CreatePreflightOutcome>,
+        /// The create waiting on its pre-flight, if any.
+        pending_create: Option<PendingCreate>,
         /// Build-time gate for the destructive Vault IAM Delete entry
         /// (features.json `vault_iam.delete_allowed_users`); needs the create
         /// gate too.
@@ -4829,6 +5172,8 @@ mod gui {
             let (alerts_tx, alerts_rx) = mpsc::channel();
             let (probe_tx, probe_rx) = mpsc::channel();
             let (email_tx, email_rx) = mpsc::channel();
+            let (user_sync_tx, user_sync_rx) = mpsc::channel();
+            let (create_pre_tx, create_pre_rx) = mpsc::channel();
             let (fed_tx, fed_rx) = mpsc::channel();
             let features = ec2_manager::features::load();
             #[cfg(target_os = "windows")]
@@ -5012,6 +5357,14 @@ mod gui {
                 vault_iam_delete_enabled: features.vault_iam_delete_enabled_for(
                     &ec2_manager::features::current_os_user(),
                 ),
+                user_sync_dialog: None,
+                user_sync_enabled: features
+                    .user_sync_enabled_for(&ec2_manager::features::current_os_user()),
+                user_sync_tx,
+                user_sync_rx,
+                create_pre_tx,
+                create_pre_rx,
+                pending_create: None,
                 pending_script_runs: Vec::new(),
                 allow_delete_user: features.allow_delete_user,
                 primary_bastion_filter: features.primary_bastion_filter.clone(),
@@ -10836,6 +11189,34 @@ mod gui {
 
         /// Open the "Vault IAM Access" dialog (or its delete twin), pre-filled
         /// from the current environment and its cached bastion pair.
+        /// Open "Scripts → Bastion User Sync", prefilled the same way the
+        /// other Scripts dialogs are: the default environment and whatever
+        /// bastion pair is cached for it.
+        fn open_user_sync_dialog(&mut self) {
+            let (env, env_name) = self.default_script_environment();
+            let mut primary_id = String::new();
+            let mut primary_query = String::new();
+            let mut secondary_id = String::new();
+            let mut secondary_query = String::new();
+            self.load_bastion_pair(
+                &env,
+                &env_name,
+                &mut primary_id,
+                &mut primary_query,
+                &mut secondary_id,
+                &mut secondary_query,
+            );
+            self.user_sync_dialog = Some(UserSyncDialog {
+                env_profile_id: env,
+                env_name,
+                primary_query,
+                primary_id,
+                secondary_query,
+                secondary_id,
+                ..Default::default()
+            });
+        }
+
         fn open_vault_iam_dialog(&mut self, delete: bool) {
             let (env, env_name) = self.default_script_environment();
             let mut primary_id = String::new();
@@ -10877,6 +11258,325 @@ mod gui {
         }
 
         /// Render the "Scripts → Vault IAM Access" modal.
+        /// Drain the user-sync worker channel.
+        ///
+        /// Every outcome is logged *before* the dialog is touched, and drained
+        /// into a Vec first, so the log and the dialog are never borrowed at
+        /// once. The log entry is written even when the dialog has since been
+        /// closed — a run that created accounts must leave a record whether or
+        /// not anyone was still watching the window.
+        fn poll_user_sync(&mut self) {
+            let outcomes: Vec<UserSyncOutcome> = self.user_sync_rx.try_iter().collect();
+            for outcome in outcomes {
+                match &outcome {
+                    UserSyncOutcome::Scanned { summary, .. } => {
+                        self.log_info(format!("user_sync: scan — {summary}"));
+                    }
+                    UserSyncOutcome::Applied { added, output } => {
+                        // Verbatim, not a count: this created accounts, and a
+                        // summary is not something anyone can audit later.
+                        self.log_info(format!("user_sync: created {added} account(s)\n{output}"));
+                    }
+                    UserSyncOutcome::Failed(msg) => {
+                        self.log_error(format!("user_sync: {msg}"));
+                    }
+                }
+
+                let Some(dlg) = self.user_sync_dialog.as_mut() else {
+                    continue;
+                };
+                dlg.busy = false;
+                match outcome {
+                    UserSyncOutcome::Scanned {
+                        rows,
+                        report,
+                        summary,
+                    } => {
+                        dlg.status = Some(summary.clone());
+                        dlg.summary = summary;
+                        dlg.report = report;
+                        dlg.rows = rows;
+                        dlg.error = None;
+                    }
+                    UserSyncOutcome::Applied { added, .. } => {
+                        dlg.status =
+                            Some(format!("Created {added} account(s). Scan again to confirm."));
+                        // The rows are now stale — they say "missing" about
+                        // accounts that exist. Clearing them disables the
+                        // apply button until a fresh scan replaces them.
+                        dlg.rows.clear();
+                        dlg.report.clear();
+                        dlg.summary.clear();
+                    }
+                    UserSyncOutcome::Failed(msg) => {
+                        dlg.error = Some(msg);
+                    }
+                }
+            }
+        }
+
+        /// The AWS context for the dialog's selected environment, and the two
+        /// bastion ids. `None` when anything needed is unset.
+        fn user_sync_targets(&self) -> Option<(AwsContext, String, AwsContext, String)> {
+            let dlg = self.user_sync_dialog.as_ref()?;
+            if dlg.primary_id.is_empty() || dlg.secondary_id.is_empty() {
+                return None;
+            }
+            let ctx = self
+                .profile_inventory_cache
+                .get(&dlg.env_profile_id)
+                .map(|(_, c)| c.clone())
+                .or_else(|| self.context.clone())?;
+            Some((
+                ctx.clone(),
+                dlg.primary_id.clone(),
+                ctx,
+                dlg.secondary_id.clone(),
+            ))
+        }
+
+        /// Render the "Scripts → Bastion User Sync" modal.
+        fn render_user_sync_dialog(&mut self, ctx: &egui::Context) {
+            let Some(mut dlg) = self.user_sync_dialog.take() else {
+                return;
+            };
+            let environments = self.script_environments();
+            let instances = self.env_instances(&dlg.env_profile_id, &dlg.env_name);
+            let primary_filter = self.primary_bastion_filter.clone();
+            let secondary_filter = self.secondary_bastion_filter.clone();
+            let env_auth: Vec<AuthStatus> = environments
+                .iter()
+                .map(|e| self.script_env_auth(&e.account_id))
+                .collect();
+            let auth_warning = self.script_env_auth_warning(&dlg.env_profile_id);
+
+            let mut window_open = true;
+            let mut do_scan = false;
+            let mut do_apply = false;
+            let mut do_cancel = false;
+            let mut env_changed = false;
+
+            let adds = dlg
+                .rows
+                .iter()
+                .filter(|r| r.action.is_add())
+                .count();
+
+            egui::Window::new("Scripts — Bastion User Sync")
+                .collapsible(false)
+                .resizable(true)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    egui::Grid::new("user_sync_grid")
+                        .num_columns(2)
+                        .spacing([10.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Environment:");
+                            let env_label = environments
+                                .iter()
+                                .position(|e| {
+                                    e.account_id == dlg.env_profile_id && e.env == dlg.env_name
+                                })
+                                .map(|i| {
+                                    script_env_label_with_auth(&environments[i], env_auth[i])
+                                })
+                                .unwrap_or_else(|| "Select…".to_string());
+                            let prev = (dlg.env_profile_id.clone(), dlg.env_name.clone());
+                            egui::ComboBox::from_id_salt("user_sync_env")
+                                .selected_text(env_label)
+                                .width(360.0)
+                                .show_ui(ui, |ui| {
+                                    for (row, auth) in environments.iter().zip(env_auth.iter()) {
+                                        let selected = row.account_id == dlg.env_profile_id
+                                            && row.env == dlg.env_name;
+                                        if ui
+                                            .selectable_label(
+                                                selected,
+                                                script_env_label_with_auth(row, *auth),
+                                            )
+                                            .clicked()
+                                        {
+                                            dlg.env_profile_id = row.account_id.clone();
+                                            dlg.env_name = row.env.clone();
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            if (dlg.env_profile_id.clone(), dlg.env_name.clone()) != prev {
+                                env_changed = true;
+                            }
+                            ui.end_row();
+                        });
+
+                    ui.add_space(6.0);
+                    Self::bastion_combo_ui(
+                        ui,
+                        "user_sync_primary",
+                        "Primary Bastion:",
+                        &primary_filter,
+                        &mut dlg.primary_id,
+                        &mut dlg.primary_query,
+                        &instances,
+                    );
+                    ui.add_space(6.0);
+                    Self::bastion_combo_ui(
+                        ui,
+                        "user_sync_secondary",
+                        "Secondary Bastion:",
+                        &secondary_filter,
+                        &mut dlg.secondary_id,
+                        &mut dlg.secondary_query,
+                        &instances,
+                    );
+
+                    ui.add_space(8.0);
+                    ui.label(
+                        "Compares every account with a home under /efs/home. Both bastions \
+                         mount the same EFS and NFS matches on the number, so a uid or gid \
+                         that differs between them is an account that cannot read its own \
+                         home on one side.",
+                    );
+
+                    ui.add_space(8.0);
+                    // Monospace and solid scrollbar for the same reason the
+                    // tunnel session pane uses them: the default floating bar
+                    // has 0.0 dormant opacity, so a scrollable pane reads as
+                    // unscrollable until the pointer happens to be over it.
+                    ui.scope(|ui| {
+                        ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+                        egui::ScrollArea::both()
+                            .max_height(180.0)
+                            .auto_shrink([false, false])
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                            )
+                            .show(ui, |ui| {
+                                if dlg.report.is_empty() {
+                                    ui.weak("Run Scan to compare the two bastions.");
+                                } else {
+                                    ui.monospace(&dlg.report);
+                                }
+                            });
+                    });
+                    if !dlg.summary.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(&dlg.summary);
+                    }
+
+
+                    if let Some(warn) = &auth_warning {
+                        ui.add_space(6.0);
+                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), warn);
+                    }
+                    if let Some(err) = &dlg.error {
+                        ui.add_space(6.0);
+                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+                    }
+                    if let Some(status) = &dlg.status {
+                        ui.add_space(6.0);
+                        ui.label(status);
+                    }
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        let ready = auth_warning.is_none()
+                            && !dlg.primary_id.is_empty()
+                            && !dlg.secondary_id.is_empty()
+                            && !dlg.busy;
+                        if ui
+                            .add_enabled(ready, egui::Button::new("Scan"))
+                            .on_disabled_hover_text(auth_warning.clone().unwrap_or_else(|| {
+                                "Choose an environment and both bastions.".to_string()
+                            }))
+                            .clicked()
+                        {
+                            do_scan = true;
+                        }
+                        let apply_label = if adds == 0 {
+                            "Create missing accounts".to_string()
+                        } else {
+                            format!("Create {adds} missing account(s)")
+                        };
+                        if ui
+                            .add_enabled(ready && adds > 0, egui::Button::new(apply_label))
+                            .on_disabled_hover_text(
+                                "Scan first; enabled when there is something safe to create.",
+                            )
+                            .clicked()
+                        {
+                            do_apply = true;
+                        }
+                        if ui.button("Close").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                    if dlg.busy {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Working…");
+                        });
+                        // Nothing else redraws while an SSM round-trip is out,
+                        // so the spinner would sit frozen.
+                        ui.ctx().request_repaint_after(Duration::from_millis(200));
+                    }
+                });
+
+            if do_cancel || !window_open {
+                self.user_sync_dialog = None;
+                return;
+            }
+
+            if env_changed {
+                let (account, env) = (dlg.env_profile_id.clone(), dlg.env_name.clone());
+                self.load_bastion_pair(
+                    &account,
+                    &env,
+                    &mut dlg.primary_id,
+                    &mut dlg.primary_query,
+                    &mut dlg.secondary_id,
+                    &mut dlg.secondary_query,
+                );
+                // A report about the previous environment must not sit under
+                // the new one's name.
+                dlg.rows.clear();
+                dlg.report.clear();
+                dlg.summary.clear();
+                dlg.status = None;
+            }
+
+            if do_scan || do_apply {
+                dlg.busy = true;
+                dlg.error = None;
+            }
+            let rows = dlg.rows.clone();
+            self.user_sync_dialog = Some(dlg);
+
+            let Some((pctx, pid, sctx, sid)) = self.user_sync_targets() else {
+                if do_scan || do_apply {
+                    if let Some(d) = self.user_sync_dialog.as_mut() {
+                        d.busy = false;
+                        d.error = Some("Choose an environment and both bastions.".to_string());
+                    }
+                }
+                return;
+            };
+            let tx = self.user_sync_tx.clone();
+            if do_scan {
+                self.log_info(format!("user_sync: scanning {pid} and {sid}…"));
+                std::thread::spawn(move || run_user_sync_scan(pctx, pid, sctx, sid, tx));
+            } else if do_apply {
+                self.log_warn(format!(
+                    "user_sync: creating {} missing account(s) on {pid}/{sid}",
+                    rows.iter().filter(|r| r.action.is_add()).count()
+                ));
+                std::thread::spawn(move || {
+                    run_user_sync_apply(rows, pctx, pid, sctx, sid, tx)
+                });
+            }
+        }
+
         fn render_vault_iam_dialog(&mut self, ctx: &egui::Context) {
             let Some(mut dlg) = self.vault_iam_dialog.take() else {
                 return;
@@ -11457,9 +12157,21 @@ mod gui {
                     primary_id,
                     secondary_id,
                 );
-            } else {
+            } else if mode.is_restore() {
+                // Restore takes no number: the account already exists, and its
+                // uid is whatever it has always been. Nothing to align.
                 self.enqueue_user_script(
                     mode,
+                    username,
+                    env,
+                    env_name,
+                    grant_sudo,
+                    primary_id,
+                    secondary_id,
+                    None,
+                );
+            } else {
+                self.begin_create_preflight(
                     username,
                     env,
                     env_name,
@@ -11479,6 +12191,52 @@ mod gui {
                     .protected_users
                     .iter()
                     .any(|p| p.trim().to_ascii_lowercase() == n)
+        }
+
+        /// Kick off the create pre-flight: compare the two bastions, create
+        /// whatever is missing from either, and choose the uid/gid the new
+        /// account will hold on both. `poll_script_events` starts the create
+        /// itself once this reports back.
+        fn begin_create_preflight(
+            &mut self,
+            username: &str,
+            env: &str,
+            env_name: &str,
+            grant_sudo: bool,
+            primary_id: &str,
+            secondary_id: &str,
+        ) {
+            let ctx = self
+                .profile_inventory_cache
+                .get(env)
+                .map(|(_, c)| c.clone())
+                .or_else(|| self.context.clone());
+            let Some(ctx) = ctx else {
+                let msg = "create_new_user: no AWS context; cannot check the bastions";
+                self.log_error(msg);
+                self.set_script_status(msg, ScriptState::Failed);
+                return;
+            };
+            self.pending_create = Some(PendingCreate {
+                username: username.to_string(),
+                env: env.to_string(),
+                env_name: env_name.to_string(),
+                grant_sudo,
+                primary_id: primary_id.to_string(),
+                secondary_id: secondary_id.to_string(),
+            });
+            self.log_info(format!(
+                "create_new_user: checking that {primary_id} and {secondary_id} agree \
+                 about their users before creating '{username}'…"
+            ));
+            self.set_script_status(
+                format!("Checking both bastions agree before creating '{username}'…"),
+                ScriptState::Running,
+            );
+            let tx = self.create_pre_tx.clone();
+            let (pid, sid) = (primary_id.to_string(), secondary_id.to_string());
+            let sctx = ctx.clone();
+            std::thread::spawn(move || run_create_preflight(ctx, pid, sctx, sid, tx));
         }
 
         /// Kick off the delete pre-flight active-session check. On success
@@ -11559,6 +12317,9 @@ mod gui {
             grant_sudo: bool,
             primary_id: &str,
             secondary_id: &str,
+            // uid/gid chosen by the pre-flight from both bastions' tables.
+            // `None` for delete and restore, neither of which allocates.
+            uid: Option<u32>,
         ) {
             use base64::Engine;
             let delete = mode.is_delete();
@@ -11610,13 +12371,8 @@ mod gui {
                 // replace authorized_keys and overwrite the old PEM; --sudo
                 // is never combined with it, so an existing grant survives
                 // untouched rather than being re-applied.
-                let run_line = if mode.is_restore() {
-                    format!("bash {remote_path} --user {username} --restore")
-                } else if grant_sudo {
-                    format!("bash {remote_path} --user {username} --sudo")
-                } else {
-                    format!("bash {remote_path} --user {username}")
-                };
+                let run_line =
+                    create_run_line(remote_path, username, mode, grant_sudo, uid);
                 let primary = vec![
                     "sudo su".to_string(),
                     PREP_STEP_SENTINEL.to_string(),
@@ -11996,6 +12752,46 @@ mod gui {
 
             // Delete pre-flight results: proceed only if both bastions are
             // clear, otherwise report why the delete was aborted.
+            // Create pre-flight: the bastions have been compared and aligned,
+            // and a number free on both has been chosen. Now start the create.
+            let pre: Vec<CreatePreflightOutcome> = self.create_pre_rx.try_iter().collect();
+            for outcome in pre {
+                let Some(pc) = self.pending_create.take() else {
+                    continue;
+                };
+                if !outcome.report.trim().is_empty() {
+                    self.log_info(format!("create_new_user pre-flight:\n{}", outcome.report));
+                }
+                if let Some(err) = outcome.error {
+                    self.log_error(format!("create_new_user: {err}"));
+                    self.show_script_result("Create Aborted", err, false, None, None);
+                    continue;
+                }
+                if outcome.synced > 0 {
+                    self.log_warn(format!(
+                        "create_new_user: brought the bastions into line first — created {} \
+                         account(s) that existed on only one of them",
+                        outcome.synced
+                    ));
+                }
+                // Reported, not fatal: the chosen number is free on both
+                // regardless, so this create is sound even while some other
+                // account remains divergent.
+                for note in &outcome.attention {
+                    self.log_warn(format!("create_new_user pre-flight: {note}"));
+                }
+                self.enqueue_user_script(
+                    UserScriptMode::Create,
+                    &pc.username,
+                    &pc.env,
+                    &pc.env_name,
+                    pc.grant_sudo,
+                    &pc.primary_id,
+                    &pc.secondary_id,
+                    outcome.uid,
+                );
+            }
+
             while let Ok(outcome) = self.preflight_rx.try_recv() {
                 if let Some(pd) = self.pending_delete.take() {
                     if outcome.clear {
@@ -12011,6 +12807,7 @@ mod gui {
                             false,
                             &pd.primary_id,
                             &pd.secondary_id,
+                            None,
                         );
                     } else {
                         self.log_error(outcome.report.clone());
@@ -18071,6 +18868,8 @@ mod gui {
                 self.render_file_browser_defaults_dialog(ctx);
                 self.render_create_user_dialog(ctx);
                 self.render_vault_iam_dialog(ctx);
+                self.poll_user_sync();
+                self.render_user_sync_dialog(ctx);
                 self.render_script_editor(ctx);
                 self.render_script_delete_confirm(ctx);
                 self.render_pat_dialog(ctx);
@@ -18557,6 +19356,7 @@ mod gui {
 
                         let script_count = 2
                             + usize::from(self.allow_delete_user)
+                            + usize::from(self.user_sync_enabled)
                             + usize::from(self.vault_iam_enabled)
                             + usize::from(self.vault_iam_delete_enabled)
                             + self.default_scripts.len()
@@ -18569,6 +19369,7 @@ mod gui {
                         let mut add_script = false;
                         let mut edit_pat = false;
                         let mut open_vault_iam: Option<bool> = None;
+                        let mut open_user_sync = false;
                         egui::ComboBox::from_id_salt("scripts_menu")
                             .selected_text(format!("Scripts ({script_count})"))
                             .show_ui(ui, |ui| {
@@ -18613,6 +19414,23 @@ mod gui {
                                         .clicked()
                                 {
                                     open_dialog = Some(UserScriptMode::Delete);
+                                    ui.close();
+                                }
+                                if self.user_sync_enabled
+                                    && ui
+                                        .selectable_label(false, "Bastion User Sync…")
+                                        .on_hover_text(
+                                            "Compare the accounts on both bastions and \
+                                             create the ones missing from either, using \
+                                             the same uid and gid. Both boxes share \
+                                             /efs/home and NFS matches on the number, so \
+                                             an account whose numbers differ cannot read \
+                                             its own home on one of them. Can also \
+                                             schedule itself on both bastions.",
+                                        )
+                                        .clicked()
+                                {
+                                    open_user_sync = true;
                                     ui.close();
                                 }
                                 if self.vault_iam_enabled
@@ -18758,6 +19576,9 @@ mod gui {
                         }
                         if edit_pat {
                             self.open_pat_dialog(None);
+                        }
+                        if open_user_sync {
+                            self.open_user_sync_dialog();
                         }
                         if let Some(delete) = open_vault_iam {
                             self.open_vault_iam_dialog(delete);
@@ -23244,6 +24065,87 @@ mod gui {
                 "the mirror step must contain SECONDARY_MIRROR_MARK ({SECONDARY_MIRROR_MARK:?}) \
                  or it silently falls back to the 6s STEP_WAIT; step was: {s}"
             );
+        }
+
+        /// The dump has to name the same three record types `parse_dump`
+        /// reads, and must not filter the in-use tables: a uid held by a
+        /// *system* account still blocks a useradd, so a conflict report built
+        /// from the managed accounts alone would miss it and the apply would
+        /// fail against a number it had called free.
+        #[test]
+        fn user_sync_dump_reports_managed_accounts_and_every_id_in_use() {
+            let s = deobf_asset(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/user_sync_dump.sh.obf"
+            )));
+            assert!(s.contains("ACCT") && s.contains("UIDU") && s.contains("GIDU"));
+            // Managed = a home on the shared mount.
+            assert!(s.contains("/efs/home"));
+            assert!(s.contains("/etc/passwd") && s.contains("/etc/group"));
+            // The UIDU/GIDU sweeps carry no range or home filter.
+            let uidu = s.lines().find(|l| l.contains("UIDU")).expect("UIDU line");
+            assert!(
+                !uidu.contains("efs/home") && !uidu.contains(">= 1000"),
+                "the in-use table must be unfiltered: {uidu}"
+            );
+        }
+
+
+
+        /// The create must carry the number the pre-flight chose from both
+        /// bastions. Losing it silently returns to the script's local pick —
+        /// which is the bug: it can only see the box it runs on.
+        #[test]
+        fn the_create_run_line_carries_the_preflight_id() {
+            let line = create_run_line(
+                "/root/create_new_user.sh",
+                "jane.doe",
+                UserScriptMode::Create,
+                false,
+                Some(1013),
+            );
+            assert_eq!(
+                line,
+                "bash /root/create_new_user.sh --user jane.doe --uid 1013"
+            );
+
+            let sudo = create_run_line(
+                "/root/create_new_user.sh",
+                "jane.doe",
+                UserScriptMode::Create,
+                true,
+                Some(1013),
+            );
+            assert_eq!(
+                sudo,
+                "bash /root/create_new_user.sh --user jane.doe --uid 1013 --sudo"
+            );
+        }
+
+        /// Without a chosen id the line must stay exactly as it was, so a
+        /// pre-flight that could not run still produces a working command.
+        #[test]
+        fn a_create_with_no_chosen_id_is_unchanged() {
+            assert_eq!(
+                create_run_line("/p.sh", "jane.doe", UserScriptMode::Create, false, None),
+                "bash /p.sh --user jane.doe"
+            );
+            assert_eq!(
+                create_run_line("/p.sh", "jane.doe", UserScriptMode::Create, true, None),
+                "bash /p.sh --user jane.doe --sudo"
+            );
+        }
+
+        /// Restore allocates nothing and must never re-apply sudo: the account
+        /// exists, keeps its uid, and an existing grant is left alone.
+        #[test]
+        fn restore_takes_neither_an_id_nor_sudo() {
+            for (sudo, uid) in [(false, None), (true, Some(1013))] {
+                assert_eq!(
+                    create_run_line("/p.sh", "jane.doe", UserScriptMode::Restore, sudo, uid),
+                    "bash /p.sh --user jane.doe --restore"
+                );
+            }
         }
 
         #[test]
