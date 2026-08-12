@@ -17,10 +17,12 @@
   "_vault_iam_comment": "\"Vault IAM Access\" entry in the Scripts menu. It opens a dialog (IAM role ARN, policy HCL, AWS role name, policy name, environment, primary/secondary bastion, VAULT_ADDR, VAULT_TOKEN), then on the PRIMARY bastion writes the policy, writes auth/aws/role/<name> bound to the IAM role, and reads both back to verify. It reuses primary_bastion_filter / secondary_bastion_filter above for the bastion dropdowns. allowed_users lists the OS usernames that see the entry: [\"*\"] = everyone (the shipped default), [] = nobody, or name specific users to restrict it. The Environment dropdown lists ACCOUNT -> ENVIRONMENT pairs (an account can host more than one environment, told apart by each instance's MMODAL_ENV tag), and picking one narrows both bastion dropdowns to that environment's instances. VAULT_ADDR is pre-filled from the selected environment's \"vault_addr\" in accounts.json, falling back to the account-level \"vault_addr\", and is editable; environments with neither open with a blank box that must be filled in by hand. The VAULT_TOKEN is typed per run and is NEVER stored — not in this file, not in config.ini.",
   "_vault_iam_delete_comment": "\"Vault IAM Delete\" is the flip of Vault IAM Access: same dialog minus the ARN and policy boxes, it runs 'vault delete auth/aws/role/<name>' + 'vault policy delete <name>' on the primary bastion, lists the remaining roles, and confirms both objects are gone. Meant for tearing down a test role before re-running the create. It is DESTRUCTIVE, so it has its own list and ships empty (nobody). A user must be on BOTH allowed_users and delete_allowed_users to see it — being able to create does not imply being able to delete. Add usernames to delete_allowed_users and rebuild to hand it out.",
   "vault_iam": {
-    "allowed_users": ["*"],
+    "allowed_users": [
+      "*"
+    ],
     "delete_allowed_users": []
   },
-  "_user_sync_comment": "\"Bastion User Sync\" entry in the Scripts menu. Both bastions mount the same EFS at /efs/home, and NFS authorises by NUMBER rather than by name, so an account is only usable on both boxes when its uid AND gid are identical on both. Drift arrives when someone creates an account on one bastion and not the other: that box then hands the next new user a number the other box has already spent, and the create fails on the secondary with 'UID nnnn is not unique', leaving a half-made account. NOTE that Bastion New User already does this check automatically -- every create reads both bastions first, creates anything missing from either, and allocates a uid/gid free on both -- so this dialog is for auditing, and for repairing drift without creating anyone. It scans a chosen environment's primary and secondary, reports every account with a home under /efs/home, and creates the ones missing from either side using the SAME uid/gid, but only where both numbers are free on the target. It never renumbers an account whose uid differs between the boxes (that needs usermod plus a recursive chown of a live home on a shared filesystem) and never takes over a number held by someone else (that needs useradd --non-unique, which makes two people one identity on EFS); both are reported for a human to settle. allowed_users lists the OS usernames that see the entry: [\"*\"] = everyone, [] = nobody (the shipped default), or name specific users. It writes accounts on both bastions, so it ships closed -- add usernames and rebuild to hand it out.",
+  "_user_sync_comment": "\"Bastion User Sync\" entry in the Scripts menu. Both bastions mount the same EFS at /efs/home, and NFS authorises by NUMBER rather than by name, so an account is only usable on both boxes when its uid AND gid are identical on both. Drift arrives when someone creates an account on one bastion and not the other: that box then hands the next new user a number the other box has already spent, and the create fails on the secondary with 'UID nnnn is not unique', leaving a half-made account. NOTE that Bastion New User already does this check automatically -- every create reads both bastions first, creates anything missing from either, and allocates a uid/gid free on both -- so this dialog is for auditing, and for repairing drift without creating anyone. It scans a chosen environment's primary and secondary, reports every account with a home under /efs/home, and creates the ones missing from either side using the SAME uid/gid, but only where both numbers are free on the target. It never renumbers an account whose uid differs between the boxes (that needs usermod plus a recursive chown of a live home on a shared filesystem) and never takes over a number held by someone else (that needs useradd --non-unique, which makes two people one identity on EFS); both are reported for a human to settle. allowed_users lists the OS usernames that see the entry: [\"*\"] = everyone, [] = nobody (the shipped default), or name specific users. It writes accounts on both bastions, so it ships closed -- add usernames and rebuild to hand it out..",
   "user_sync": {
     "allowed_users": []
   },
@@ -47,7 +49,10 @@
   "access_email": {
     "enabled": true,
     "auto_run": true,
-    "email_domains": ["test.com", "test2.com"],
+    "email_domains": [
+      "test.com",
+      "test2.com"
+    ],
     "email_local_format": "flast",
     "email_local_max_suffix": 20,
     "encrypt_template_guid": "{00000000-0000-0000-0000-000000000000}",
@@ -60,14 +65,24 @@
   "fed_auth": {
     "enabled": false,
     "allowed_users": [],
-    "command": ["fed", "up"],
+    "command": [
+      "fed",
+      "up"
+    ],
     "retry_interval_secs": 120,
     "retry_window_secs": 600,
     "run_timeout_secs": 300,
     "auto_sign_in": false,
     "auto_sign_in_allowed_users": [],
-    "browser_title_match": ["okta", "sign in", "verify"],
-    "mfa_process_match": ["chrome", "okta"],
+    "browser_title_match": [
+      "okta",
+      "sign in",
+      "verify"
+    ],
+    "mfa_process_match": [
+      "chrome",
+      "okta"
+    ],
     "credential_target": "ec2-manager-fed"
   }
 }
