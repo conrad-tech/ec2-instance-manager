@@ -192,6 +192,11 @@ pub enum ScriptEvent {
     Error(String),
     /// A `-DryRun` report of a keystroke that would have been sent.
     DryRun(String),
+    /// A diagnostic from the script about what it could and could not see —
+    /// whether it managed to focus the activation box, whether the code
+    /// arrived prefilled. Belongs in the log, not on the status line: it
+    /// explains a sign-in after the fact rather than reporting progress.
+    Note(String),
 }
 
 /// Parse one line of `fed_login.ps1` output. Anything unrecognised is `None`
@@ -205,6 +210,7 @@ pub fn parse_script_marker(line: &str) -> Option<ScriptEvent> {
         ),
         ("FEDLOGIN_ERROR:", &ScriptEvent::Error),
         ("FEDLOGIN_DRYRUN:", &ScriptEvent::DryRun),
+        ("FEDLOGIN_NOTE:", &ScriptEvent::Note),
     ] {
         if let Some(rest) = line.strip_prefix(prefix) {
             let rest = rest.trim();
@@ -254,6 +260,21 @@ mod tests {
     /// The line as it appears in `fed up`'s own output.
     const PROMPT: &str =
         "Go to https://example.okta.com/activate and enter code MXKD-9QRP";
+
+    /// A note is a diagnostic, not progress: it must not be mistaken for a
+    /// status, which drives the toolbar line.
+    #[test]
+    fn a_note_is_parsed_and_is_not_a_status() {
+        assert_eq!(
+            parse_script_marker("FEDLOGIN_NOTE:focused the activation code box"),
+            Some(ScriptEvent::Note("focused the activation code box".to_string()))
+        );
+        assert!(matches!(
+            parse_script_marker("FEDLOGIN_STATUS:entering-code"),
+            Some(ScriptEvent::Status(_))
+        ));
+        assert_eq!(parse_script_marker("FEDLOGIN_NOTE:"), None);
+    }
 
     #[test]
     fn the_activation_url_and_code_are_pulled_out_of_the_prompt() {

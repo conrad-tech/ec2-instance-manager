@@ -55,11 +55,40 @@
 
     EVERY FIELD IS CLEARED BEFORE IT IS TYPED
     -----------------------------------------
-    SendKeys cannot read the DOM, so nothing here can tell whether a field is
-    already populated. Okta prefills the username most of the time and Chrome
-    may fill the password box, and typing into either without clearing first
-    appends rather than replaces. Send-FieldText sends Ctrl+A ahead of the
-    text; on an empty field that selects nothing and costs nothing.
+    SendKeys cannot read the DOM, so it cannot tell whether a field is already
+    populated. Okta prefills the username most of the time and Chrome may fill
+    the password box, and typing into either without clearing first appends
+    rather than replaces. Send-FieldText sends Ctrl+A ahead of the text; on an
+    empty field that selects nothing and costs nothing.
+
+    THE ACTIVATION BOX IS FOCUSED AND READ BACK
+    -------------------------------------------
+    SendKeys types into whatever holds keyboard focus. Okta does not reliably
+    focus the activation-code box, and a run that typed into the page body
+    still walked every remaining step and reported success -- a "done" with
+    nothing signed in, which is worse than an error.
+
+    Three things now stand against that, weakest first. The code is passed as
+    ?user_code= so the page can prefill it (RFC 8628's "complete" verification
+    URI, which Okta honours -- and which costs nothing where it is ignored);
+    the box is focused through the UI Automation tree, where Chrome publishes
+    the same <input> the DevTools inspector shows; and the field is READ BACK
+    before Enter, failing loudly when it is empty.
+
+    The lookup is scoped to the page Document, so the omnibox and the find bar
+    -- Edit controls both -- can never be the thing that gets focused. Within
+    it, a field whose accessible name matches -CodeFieldMatch wins, and
+    otherwise the first Edit in the page is taken. Both halves are needed:
+    the name comes from the <label>, which Okta leaves unassociated often
+    enough that it can be blank, while the DOM id it publishes as AutomationId
+    ("input28") is regenerated per load and name="userCode" is not published
+    at all. The activation page has exactly one box, which makes the
+    positional fallback unambiguous there.
+
+    Reading the tree is best-effort throughout: unavailable UIA, an unbuilt
+    tree or a differently-worded label all fall back to typing blind, which is
+    what happened before regardless. Only a field that reads back EMPTY is
+    treated as failure; a field that cannot be read is not evidence.
 
 .NOTES
     Run from beside the executable, never copied to %TEMP% and run from there,
@@ -104,6 +133,13 @@ param(
 
     # Explicit chrome.exe path. Empty searches the usual install locations.
     [string]$ChromePath = '',
+
+    # Accessible name of the activation-code box, matched as an unanchored
+    # case-insensitive regex. Chrome computes that name from the field's
+    # <label>, so this is the visible "Activation Code" text -- NOT the DOM
+    # id, which Okta generates fresh each load ("input28") and which would
+    # therefore match nothing on the next visit.
+    [string]$CodeFieldMatch = 'activation.?code|usercode',
 
     # Seconds to wait for the activation page to appear.
     [int]$PageTimeoutSec = 60,
@@ -223,6 +259,7 @@ public static class Fg {
         GetWindowText(h, sb, sb.Capacity);
         return sb.ToString();
     }
+    public static IntPtr Handle() { return GetForegroundWindow(); }
     public static int Pid() {
         IntPtr h = GetForegroundWindow();
         if (h == IntPtr.Zero) return 0;
@@ -317,6 +354,134 @@ function Send-FieldText([string]$text, [string]$what) {
     Send-Guarded (ConvertTo-SendKeysLiteral $text) $what
 }
 
+# --- Reading the page ------------------------------------------------------
+#
+# SendKeys types into whatever holds keyboard focus, and cannot tell whether
+# anything received it. That is how a run reported "done" having entered
+# nothing: Okta did not autofocus the activation box, every keystroke went to
+# the page body, and the script pressed on regardless.
+#
+# The accessibility tree is the way out. Chrome publishes the same <input> to
+# UI Automation, where it can be focused deliberately and -- the point -- read
+# back afterwards. This does not replace the focus guard: UIA says which
+# control to type into, Assert-Target still decides whether typing is allowed
+# at all.
+#
+# Every function here is best-effort and returns $null on any failure. Chrome
+# may not have its accessibility tree built yet, UIA may be unavailable, and a
+# tenant may word the label differently -- none of which should be the reason
+# a sign-in fails, since blind typing is exactly what happens today.
+$script:UiaReady = $false
+try {
+    Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
+    Add-Type -AssemblyName UIAutomationTypes -ErrorAction Stop
+    $script:UiaReady = $true
+} catch {
+    Write-Output "FEDLOGIN_NOTE:accessibility unavailable ($($_.Exception.Message)); typing blind"
+}
+
+# The activation-code box, as Chrome publishes it to UI Automation.
+#
+# Scoped to the page Document, never the whole window. The omnibox and the
+# find bar are Edit controls too, and focusing one of those would type the
+# activation code into the address bar. Everything inside the Document is
+# page content, which is what the selector in the DevTools inspector refers
+# to.
+#
+# Matching is by accessible name first and position second, because neither
+# alone is reliable:
+#
+#   - The name comes from the field's <label>. Okta's markup leaves aria-label
+#     empty, so the name exists only if that label is associated with the
+#     input; when it is not, the name is blank and no pattern can match it.
+#   - The DOM id ("input28") IS published, as AutomationId -- but Okta
+#     regenerates it per page load, so it is worthless across visits, and
+#     name="userCode" is not published by UIA at all.
+#
+# So: prefer a named match, and otherwise take the first Edit in the page.
+# The activation page has exactly one box, which makes that unambiguous
+# there; the named match is what keeps it honest on the busier pages.
+function Get-PageDocument {
+    if (-not $script:UiaReady) { return $null }
+    try {
+        $h = [Fg]::Handle()
+        if ($h -eq [IntPtr]::Zero) { return $null }
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($h)
+        if ($null -eq $root) { return $null }
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Document)
+        return $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+    } catch {
+        return $null
+    }
+}
+
+function Get-WebField([string]$namePattern) {
+    if (-not $script:UiaReady) { return $null }
+    try {
+        $doc = Get-PageDocument
+        if ($null -eq $doc) { return $null }
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Edit)
+        $found = $doc.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+        if ($null -eq $found -or $found.Count -eq 0) { return $null }
+
+        $first = $null
+        foreach ($el in $found) {
+            $name = ''
+            try { $name = $el.Current.Name } catch { $name = '' }
+            if ($namePattern -and $name -and ($name -match $namePattern)) { return $el }
+            if ($null -eq $first) { $first = $el }
+        }
+        # Nothing named like the code box. On a single-field page that is the
+        # unlabelled activation box; on a page with several it is the first,
+        # which is the one a fresh page focuses anyway.
+        return $first
+    } catch {
+        return $null
+    }
+}
+
+# Wait for the field to exist, then give it keyboard focus. Returns $true only
+# when focus was actually set, so the caller can say what it did.
+function Focus-WebField([string]$namePattern, [int]$timeoutSec = 10) {
+    if (-not $script:UiaReady) { return $false }
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $el = Get-WebField $namePattern
+        if ($null -ne $el) {
+            try {
+                $el.SetFocus()
+                return $true
+            } catch {
+                # Focusable only while the window is foreground; the guard
+                # below will catch a window that moved.
+                return $false
+            }
+        }
+        Start-Sleep -Milliseconds 400
+    }
+    return $false
+}
+
+# What the field currently contains, or $null when it cannot be read.
+#
+# $null and '' are deliberately different: empty means "read it, it is empty"
+# (a real failure), while $null means "could not read it" (fall back to the
+# old blind behaviour rather than inventing a verdict).
+function Get-WebFieldValue([string]$namePattern) {
+    $el = Get-WebField $namePattern
+    if ($null -eq $el) { return $null }
+    try {
+        $pattern = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+        return $pattern.Current.Value
+    } catch {
+        return $null
+    }
+}
+
 function Resolve-Chrome {
     if (-not [string]::IsNullOrWhiteSpace($ChromePath)) {
         if (Test-Path $ChromePath) { return $ChromePath }
@@ -352,15 +517,57 @@ Write-Status "username-$Username"
 
 $chrome = Resolve-Chrome
 Write-Status 'opening-browser'
-Start-Process -FilePath $chrome -ArgumentList $Url | Out-Null
+
+# Ask Okta to prefill the code rather than typing it. The device-activation
+# page accepts it as a query parameter, and a field that arrives already
+# filled cannot be missed by a focus problem. It is additive: a tenant that
+# ignores the parameter just shows the empty box, and the typing below runs
+# as before.
+$openUrl = $Url
+if (-not [string]::IsNullOrWhiteSpace($Code) -and $Url -notmatch '[?&]user_code=') {
+    $sep = '?'
+    if ($Url.Contains('?')) { $sep = '&' }
+    $openUrl = "$Url$sep" + 'user_code=' + [uri]::EscapeDataString($Code)
+}
+Start-Process -FilePath $chrome -ArgumentList $openUrl | Out-Null
 
 if (-not (Wait-ForTarget $PageTimeoutSec)) {
     Write-Fail "the activation page did not reach the foreground within ${PageTimeoutSec}s (looking for a chrome window whose title matches one of '$TitleMatch')"
 }
 
 # --- Activation code -------------------------------------------------------
+#
+# The box is not reliably focused when the page settles -- that is the whole
+# reason this step used to type into nothing and still report success. Focus
+# it deliberately where the accessibility tree allows, and either way check
+# afterwards that something is actually in it.
 Write-Status 'entering-code'
-Send-FieldText $Code 'the activation code'
+if (Focus-WebField $CodeFieldMatch $GuardWaitSec) {
+    Write-Output 'FEDLOGIN_NOTE:focused the activation code box'
+} else {
+    Write-Output 'FEDLOGIN_NOTE:could not focus the activation code box; typing blind'
+}
+
+$prefilled = Get-WebFieldValue $CodeFieldMatch
+if ($prefilled -eq $Code) {
+    # The URL prefill worked; typing would only risk appending to it.
+    Write-Output 'FEDLOGIN_NOTE:code was prefilled from the URL'
+} else {
+    Send-FieldText $Code 'the activation code'
+}
+
+# Read it back before submitting. An empty box here means every keystroke went
+# somewhere else, and pressing Enter on it walks the rest of the script
+# through pages that never appear -- ending, as it did, with a cheerful
+# "done" and no sign-in. $null is "could not read", which is not evidence of
+# failure and must not fail the run.
+if (-not $DryRun) {
+    $entered = Get-WebFieldValue $CodeFieldMatch
+    if ($null -ne $entered -and $entered.Trim() -eq '') {
+        Write-Fail "the activation code box was still empty after typing -- the page did not have keyboard focus. Nothing was signed in. If the box is labelled something other than 'Activation Code' on this tenant, pass -CodeFieldMatch to match it."
+    }
+}
+
 Send-Guarded '{ENTER}' 'submitting the activation code'
 Start-Sleep -Seconds $StepDelaySec
 

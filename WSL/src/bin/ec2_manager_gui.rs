@@ -3142,6 +3142,9 @@ mod gui {
                 Some(ScriptEvent::DryRun(d)) => {
                     let _ = tx.send(FedEvent::Log(format!("sign-in dry run: {d}")));
                 }
+                Some(ScriptEvent::Note(n)) => {
+                    let _ = tx.send(FedEvent::Log(format!("sign-in: {n}")));
+                }
                 None => {
                     let _ = tx.send(FedEvent::Log(format!("fed_login: {line}")));
                 }
