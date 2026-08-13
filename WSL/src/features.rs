@@ -155,6 +155,29 @@ pub struct FedAuthFeature {
     /// Empty falls back to the shipped set.
     #[serde(deserialize_with = "string_or_list")]
     pub browser_title_match: Vec<String>,
+    /// Arguments passed to Chrome ahead of the activation URL. Empty falls
+    /// back to `--new-window`.
+    ///
+    /// That default is load-bearing: with Chrome already running, a bare
+    /// `chrome.exe <url>` opens a *tab* in whatever window exists, which may
+    /// be minimised, behind other windows, or on another virtual desktop.
+    /// The sign-in then times out waiting for a foreground window, on a page
+    /// that loaded fine but nowhere it could be typed into.
+    ///
+    /// A separate profile (`--user-data-dir=...`) is *not* the default:
+    /// remembered-device cookies live in the profile, so a fresh one tends to
+    /// invite more verification rather than less.
+    #[serde(deserialize_with = "string_or_list")]
+    pub chrome_args: Vec<String>,
+    /// Close the browser window the sign-in drove once `fed up` reports the
+    /// credentials renewed. Shipped on.
+    ///
+    /// Closes that **window** -- `WM_CLOSE` to the handle the script
+    /// reported -- never the `chrome.exe` process, which with `--new-window`
+    /// is shared with whatever else the user has open. Only ever a window the
+    /// automation itself opened and drove; a sign-in the user finished by
+    /// hand is left alone.
+    pub close_browser_on_success: bool,
     /// Process names accepted at the **MFA confirm step only**, matched
     /// case-insensitively as an unanchored regex. Empty falls back to
     /// `chrome|okta`.
@@ -252,6 +275,23 @@ impl FedAuthFeature {
             .join("|");
         if joined.is_empty() {
             "okta|sign in|verify".to_string()
+        } else {
+            joined
+        }
+    }
+
+    /// Arguments handed to Chrome, space-joined for the script. Never empty
+    /// -- see the note on [`Self::chrome_args`].
+    pub fn resolved_chrome_args(&self) -> String {
+        let joined = self
+            .chrome_args
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if joined.is_empty() {
+            "--new-window".to_string()
         } else {
             joined
         }
@@ -1112,6 +1152,26 @@ mod tests {
         assert_eq!(blank.fed_auth.resolved_credential_target(), "ec2-manager-fed");
         assert!(!load().fed_auth.resolved_title_match().is_empty());
         assert!(!load().fed_auth.resolved_credential_target().is_empty());
+    }
+
+    #[test]
+    fn chrome_always_gets_a_new_window_unless_told_otherwise() {
+        // Without it, an already-running Chrome opens a tab in some existing
+        // window and the sign-in waits for a foreground page that never
+        // comes forward.
+        let blank: Features =
+            serde_json::from_str(r#"{"fed_auth":{"chrome_args":"  "}}"#).expect("parses");
+        assert_eq!(blank.fed_auth.resolved_chrome_args(), "--new-window");
+        assert_eq!(load().fed_auth.resolved_chrome_args(), "--new-window");
+
+        let custom: Features = serde_json::from_str(
+            r#"{"fed_auth":{"chrome_args":["--new-window","--profile-directory=Profile 1"]}}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            custom.fed_auth.resolved_chrome_args(),
+            "--new-window --profile-directory=Profile 1"
+        );
     }
 
     #[test]

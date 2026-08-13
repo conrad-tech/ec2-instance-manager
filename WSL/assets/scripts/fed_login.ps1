@@ -131,6 +131,22 @@ param(
     # up. Sampling a single instant made every page transition a race.
     [int]$GuardWaitSec = 10,
 
+    # Arguments passed to Chrome ahead of the URL, space-separated.
+    #
+    # --new-window is the default and it matters. With Chrome already
+    # running, a bare `chrome.exe <url>` opens a TAB in whatever window
+    # exists -- which may be minimised, behind other windows, or on another
+    # virtual desktop. The wait below then times out on a page that loaded
+    # perfectly well, just nowhere it could be typed into. That is the
+    # "sometimes it opens visibly, sometimes it does not" case. A new window
+    # is created foreground.
+    #
+    # A separate profile (--user-data-dir=...) is deliberately NOT the
+    # default. It would guarantee a clean window, but remembered-device
+    # cookies live in the profile, so signing in from a fresh one tends to
+    # invite MORE verification, not less.
+    [string]$ChromeArgs = '--new-window',
+
     # Explicit chrome.exe path. Empty searches the usual install locations.
     [string]$ChromePath = '',
 
@@ -140,6 +156,17 @@ param(
     # id, which Okta generates fresh each load ("input28") and which would
     # therefore match nothing on the next visit.
     [string]$CodeFieldMatch = 'activation.?code|usercode',
+
+    # Accessible name of the username box, same idea as -CodeFieldMatch.
+    [string]$UserFieldMatch = 'user.?name|^user$|email',
+
+    # Accessible name of the password box. Focused but never read back.
+    [string]$PasswordFieldMatch = 'password',
+
+    # Seconds to let a page settle before touching its fields. A window can
+    # be foreground and correctly titled while the document is still laying
+    # out, and focusing a field that is about to be replaced loses it again.
+    [int]$SettleSec = 2,
 
     # Seconds to wait for the activation page to appear.
     [int]$PageTimeoutSec = 60,
@@ -260,6 +287,9 @@ public static class Fg {
         return sb.ToString();
     }
     public static IntPtr Handle() { return GetForegroundWindow(); }
+    public static long Handle() {
+        return (long)GetForegroundWindow();
+    }
     public static int Pid() {
         IntPtr h = GetForegroundWindow();
         if (h == IntPtr.Zero) return 0;
@@ -482,6 +512,90 @@ function Get-WebFieldValue([string]$namePattern) {
     }
 }
 
+<#
+    Which element currently has keyboard focus, desktop-wide.
+
+    This is how a click outside the box becomes visible: the moment focus
+    moves, this returns something else. UI Automation also raises a
+    focus-changed *event*, but a synchronous script gets the same protection
+    by reading this immediately before each send -- and without an event
+    handler that could fire on another thread mid-keystroke.
+
+    $null means "cannot tell", which is never treated as failure.
+#>
+function Get-FocusedElement {
+    if (-not $script:UiaReady) { return $null }
+    try { return [System.Windows.Automation.AutomationElement]::FocusedElement }
+    catch { return $null }
+}
+
+<#
+    Is the focused element the field we mean? $true / $false / $null for
+    "cannot tell".
+
+    Matched on name and automation id, the same two properties Get-WebField
+    searches, so a pattern that finds a field also recognises it here.
+#>
+function Test-FieldFocused([string]$namePattern) {
+    $el = Get-FocusedElement
+    if ($null -eq $el) { return $null }
+    try {
+        $name = [string]$el.Current.Name
+        $id = [string]$el.Current.AutomationId
+        return (($name -match $namePattern) -or ($id -match $namePattern))
+    } catch {
+        return $null
+    }
+}
+
+<#
+    Put $text into the field matching $namePattern, and keep at it.
+
+    Focus is the whole problem: the box is not reliably focused when a page
+    settles, and a stray click while the sequence runs takes it away again.
+    So rather than typing once and hoping, each attempt re-focuses through
+    the accessibility tree, clears whatever is there, types, and reads the
+    value back. A miss costs one more attempt instead of the whole run.
+
+    Returns $true when the field reads back as $text, $false when it does
+    not, and $null when the value cannot be read at all (a password box
+    reports empty by design, so "cannot read" must never be treated as
+    failure).
+#>
+function Set-FieldWithRetry(
+    [string]$namePattern,
+    [string]$text,
+    [string]$what,
+    [int]$attempts = 3
+) {
+    for ($i = 1; $i -le $attempts; $i++) {
+        [void](Focus-WebField $namePattern $GuardWaitSec)
+        # Focus-WebField reports whether SetFocus threw, not whether focus
+        # actually landed -- a click elsewhere between the two is exactly the
+        # case we are guarding. Ask the desktop who really has it.
+        $focused = Test-FieldFocused $namePattern
+        if ($focused -eq $false) {
+            Write-Output "FEDLOGIN_NOTE:$what lost focus before typing (attempt $i); retrying"
+            Start-Sleep -Milliseconds 600
+            continue
+        }
+        Send-FieldText $text $what
+
+        $seen = Get-WebFieldValue $namePattern
+        if ($null -eq $seen) {
+            # Unreadable: no evidence either way, so accept it rather than
+            # retyping into a field that may already be correct.
+            return $null
+        }
+        if ($seen.Trim() -eq $text.Trim()) {
+            return $true
+        }
+        Write-Output "FEDLOGIN_NOTE:$what did not take (attempt $i of $attempts); retrying"
+        Start-Sleep -Milliseconds 600
+    }
+    return $false
+}
+
 function Resolve-Chrome {
     if (-not [string]::IsNullOrWhiteSpace($ChromePath)) {
         if (Test-Path $ChromePath) { return $ChromePath }
@@ -529,11 +643,28 @@ if (-not [string]::IsNullOrWhiteSpace($Code) -and $Url -notmatch '[?&]user_code=
     if ($Url.Contains('?')) { $sep = '&' }
     $openUrl = "$Url$sep" + 'user_code=' + [uri]::EscapeDataString($Code)
 }
-Start-Process -FilePath $chrome -ArgumentList $openUrl | Out-Null
+$chromeArgv = @()
+foreach ($a in ($ChromeArgs -split '\s+')) {
+    if (-not [string]::IsNullOrWhiteSpace($a)) { $chromeArgv += $a }
+}
+$chromeArgv += $openUrl
+Start-Process -FilePath $chrome -ArgumentList $chromeArgv | Out-Null
 
 if (-not (Wait-ForTarget $PageTimeoutSec)) {
     Write-Fail "the activation page did not reach the foreground within ${PageTimeoutSec}s (looking for a chrome window whose title matches one of '$TitleMatch')"
 }
+
+# Tell the app which window this is, so it can close that one -- and only
+# that one -- when the credentials come back renewed. A handle, not a pid:
+# with --new-window on an already-running Chrome the process is shared with
+# the rest of the user's browsing, and killing it would take their tabs with
+# it.
+Write-Output "FEDLOGIN_HWND:$([Fg]::Handle())"
+
+# Let the page finish settling before touching it. A window can be foreground
+# and titled correctly while the document is still laying out, and focusing a
+# field that is about to be replaced just loses it again.
+Start-Sleep -Seconds $SettleSec
 
 # --- Activation code -------------------------------------------------------
 #
@@ -542,16 +673,15 @@ if (-not (Wait-ForTarget $PageTimeoutSec)) {
 # it deliberately where the accessibility tree allows, and either way check
 # afterwards that something is actually in it.
 Write-Status 'entering-code'
-if (Focus-WebField $CodeFieldMatch $GuardWaitSec) {
-    Write-Output 'FEDLOGIN_NOTE:focused the activation code box'
-} else {
-    Write-Output 'FEDLOGIN_NOTE:could not focus the activation code box; typing blind'
-}
-
 $prefilled = Get-WebFieldValue $CodeFieldMatch
 if ($prefilled -eq $Code) {
     # The URL prefill worked; typing would only risk appending to it.
     Write-Output 'FEDLOGIN_NOTE:code was prefilled from the URL'
+} elseif (-not $DryRun) {
+    $ok = Set-FieldWithRetry $CodeFieldMatch $Code 'the activation code'
+    if ($ok -eq $false) {
+        Write-Fail "the activation code box would not take the code after several tries -- the page kept losing keyboard focus. Nothing was signed in. If the box is labelled something other than 'Activation Code' on this tenant, pass -CodeFieldMatch to match it."
+    }
 } else {
     Send-FieldText $Code 'the activation code'
 }
@@ -561,27 +691,50 @@ if ($prefilled -eq $Code) {
 # through pages that never appear -- ending, as it did, with a cheerful
 # "done" and no sign-in. $null is "could not read", which is not evidence of
 # failure and must not fail the run.
-if (-not $DryRun) {
-    $entered = Get-WebFieldValue $CodeFieldMatch
-    if ($null -ne $entered -and $entered.Trim() -eq '') {
-        Write-Fail "the activation code box was still empty after typing -- the page did not have keyboard focus. Nothing was signed in. If the box is labelled something other than 'Activation Code' on this tenant, pass -CodeFieldMatch to match it."
-    }
-}
-
 Send-Guarded '{ENTER}' 'submitting the activation code'
 Start-Sleep -Seconds $StepDelaySec
 
 # --- Username --------------------------------------------------------------
 Write-Status 'entering-username'
+Start-Sleep -Seconds $SettleSec
 if (-not [string]::IsNullOrWhiteSpace($Username)) {
-    Send-FieldText $Username 'the username'
+    if ($DryRun) {
+        Send-FieldText $Username 'the username'
+    } else {
+        $ok = Set-FieldWithRetry $UserFieldMatch $Username 'the username'
+        if ($ok -eq $false) {
+            Write-Fail "the username box would not take the value after several tries -- the page kept losing keyboard focus. Nothing was signed in. If it is labelled something else on this tenant, pass -UserFieldMatch to match it."
+        }
+    }
 }
 Send-Guarded '{ENTER}' 'submitting the username'
 Start-Sleep -Seconds $StepDelaySec
 
 # --- Password --------------------------------------------------------------
 Write-Status 'entering-password'
+Start-Sleep -Seconds $SettleSec
 try {
+    # Focused the same way as the others, but NOT read back: a password box
+    # reports an empty value through the accessibility tree by design, so a
+    # read would prove nothing -- and anything that did read it would be a
+    # place the plaintext could leak to.
+    # Focus is checked, then re-checked, and this is the one field where that
+    # is the ONLY check available: a password box reports an empty value
+    # through the accessibility tree by design, so there is no reading it
+    # back. Typing a password into whatever the user just clicked is the
+    # failure this whole guard exists to prevent, so a miss here aborts
+    # rather than typing blind.
+    $pwFocused = $null
+    for ($i = 1; $i -le 3; $i++) {
+        [void](Focus-WebField $PasswordFieldMatch $GuardWaitSec)
+        $pwFocused = Test-FieldFocused $PasswordFieldMatch
+        if ($pwFocused -ne $false) { break }
+        Write-Output "FEDLOGIN_NOTE:the password box lost focus (attempt $i); retrying"
+        Start-Sleep -Milliseconds 600
+    }
+    if ($pwFocused -eq $false) {
+        Write-Fail 'the password box would not hold keyboard focus -- something else kept taking it. Nothing was typed, and nothing was signed in.'
+    }
     Send-FieldText $plain 'the password'
 } finally {
     $plain = $null

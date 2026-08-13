@@ -138,6 +138,12 @@ command per terminal.
   and `-WindowStyle Hidden` is not used. Both are patterns EDRs quarantine on
   sight. `build_binaries.sh`'s `package_windows_zip` copies the script beside
   the exe rather than embedding it, for the same reason.
+  The console window is still suppressed, by `CREATE_NO_WINDOW` on the spawn —
+  an ordinary Win32 process-creation flag, and what every other child process
+  here already uses (`run_fed_script`, `open_in_browser`, the tunnels). That is
+  the substitution to keep: no console *and* no flagged PowerShell switch.
+  Until 2026-08-13 this one spawn lacked the flag, so a PowerShell window sat
+  over the result popup for the length of the Outlook run.
   (History worth knowing: `050a4b9` removed auto-run believing it triggered
   CrowdStrike; `2c31e8c` later found the app was still quarantined with *all*
   email code gone, so email was never the trigger.)

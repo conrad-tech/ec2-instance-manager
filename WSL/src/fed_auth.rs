@@ -197,6 +197,9 @@ pub enum ScriptEvent {
     /// arrived prefilled. Belongs in the log, not on the status line: it
     /// explains a sign-in after the fact rather than reporting progress.
     Note(String),
+    /// The window handle the sign-in drove, so the caller can close that one
+    /// window afterwards.
+    Window(isize),
 }
 
 /// Parse one line of `fed_login.ps1` output. Anything unrecognised is `None`
@@ -219,6 +222,16 @@ pub fn parse_script_marker(line: &str) -> Option<ScriptEvent> {
             }
             return Some(make(rest.to_string()));
         }
+    }
+    // The one marker that is not text. A handle of 0 is dropped rather than
+    // carried: closing window 0 would close nothing at best.
+    if let Some(rest) = line.strip_prefix("FEDLOGIN_HWND:") {
+        return rest
+            .trim()
+            .parse::<isize>()
+            .ok()
+            .filter(|h| *h != 0)
+            .map(ScriptEvent::Window);
     }
     None
 }
@@ -434,6 +447,18 @@ mod tests {
             parse_script_marker("FEDLOGIN_DRYRUN:would send the password"),
             Some(ScriptEvent::DryRun("would send the password".to_string()))
         );
+    }
+
+    #[test]
+    fn a_window_handle_marker_is_parsed_as_a_number() {
+        assert_eq!(
+            parse_script_marker("FEDLOGIN_HWND:132456"),
+            Some(ScriptEvent::Window(132456))
+        );
+        // Nothing usable: closing window 0 would close nothing at best.
+        assert_eq!(parse_script_marker("FEDLOGIN_HWND:0"), None);
+        assert_eq!(parse_script_marker("FEDLOGIN_HWND:notanumber"), None);
+        assert_eq!(parse_script_marker("FEDLOGIN_HWND:"), None);
     }
 
     #[test]

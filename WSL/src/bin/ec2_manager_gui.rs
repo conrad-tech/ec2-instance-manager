@@ -2769,6 +2769,9 @@ mod gui {
         },
         /// Progress from the automatic sign-in script.
         SignInStep(String),
+        /// Handle of the browser window the sign-in drove, so it can be
+        /// closed once the credentials come back renewed.
+        BrowserWindow(isize),
         /// One run finished. `None` = authenticated.
         Finished(Option<ec2_manager::fed_auth::FedError>),
         /// A line for the app log (the raw `fed up` output lives here, which
@@ -3156,6 +3159,7 @@ mod gui {
             ("-Code", code.to_string()),
             ("-TitleMatch", cfg.resolved_title_match()),
             ("-MfaProcessMatch", cfg.resolved_mfa_process_match()),
+            ("-ChromeArgs", cfg.resolved_chrome_args()),
             ("-CredentialTarget", cfg.resolved_credential_target()),
             // No -Username: the script reads it from the vault entry, so the
             // `/user:` recorded with the credential is what gets typed on the
@@ -3171,6 +3175,9 @@ mod gui {
                 Some(ScriptEvent::Error(e)) => error = Some(e),
                 Some(ScriptEvent::DryRun(d)) => {
                     let _ = tx.send(FedEvent::Log(format!("sign-in dry run: {d}")));
+                }
+                Some(ScriptEvent::Window(hwnd)) => {
+                    let _ = tx.send(FedEvent::BrowserWindow(hwnd));
                 }
                 Some(ScriptEvent::Note(n)) => {
                     let _ = tx.send(FedEvent::Log(format!("sign-in: {n}")));
@@ -3432,7 +3439,10 @@ mod gui {
     ///   and executing it is a pattern EDRs quarantine on sight. A missing file
     ///   is an error, not a reason to fall back to temp.
     /// * **No `-WindowStyle Hidden`.** Hidden PowerShell is itself a detection
-    ///   heuristic. A brief console window is the accepted cost.
+    ///   heuristic. The console is suppressed with `CREATE_NO_WINDOW` instead —
+    ///   the same thing `run_fed_script` and every other spawn here does, and
+    ///   an ordinary Win32 process-creation flag rather than a flagged
+    ///   PowerShell switch. Do not swap one for the other.
     ///
     /// `-Quiet` is appended so the script suppresses its own message boxes; the
     /// GUI shows the outcome instead, from the marker on stdout.
@@ -3447,6 +3457,8 @@ mod gui {
     ) -> std::result::Result<std::process::Child, String> {
         // `std::result::Result` is spelled out because the crate's own
         // `Result<T>` alias (src/error.rs) is in scope and takes one parameter.
+        use std::os::windows::process::CommandExt;
+
         let path = access_email_script_path();
         if !path.exists() {
             return Err(format!(
@@ -3463,6 +3475,11 @@ mod gui {
             cmd.arg(flag).arg(value);
         }
         cmd.arg("-Quiet")
+            // The GUI is windows_subsystem="windows" and owns no console, so
+            // without this PowerShell gets a fresh window that sits on top of
+            // the result popup for the length of the Outlook run. stdout is
+            // piped either way, so nothing was being read off that console.
+            .creation_flags(CREATE_NO_WINDOW)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
         cmd.spawn()
@@ -5152,6 +5169,11 @@ mod gui {
         fed_retrying_since: Option<Instant>,
         /// True while a worker is in flight, so nothing can stack runs.
         fed_running: bool,
+        /// Window the sign-in drove, closed on success when
+        /// `close_browser_on_success` is set. Cleared once used, so a later
+        /// run can never close a stale handle -- which by then may belong to
+        /// something else entirely.
+        fed_browser_window: Option<isize>,
         /// Whether the automatic Okta sign-in is on for this user
         /// (`fed_auth.auto_sign_in` plus the feature gate).
         fed_auto_sign_in: bool,
@@ -5510,6 +5532,7 @@ mod gui {
                 fed_next_run_at: None,
                 fed_retrying_since: None,
                 fed_running: false,
+                fed_browser_window: None,
                 fed_auto_sign_in: features
                     .fed_auth
                     .auto_sign_in_for(&ec2_manager::features::current_os_user()),
@@ -5906,6 +5929,9 @@ mod gui {
                         code,
                         sign_in_error,
                     } => self.on_fed_device_code(url, code, sign_in_error),
+                    FedEvent::BrowserWindow(hwnd) => {
+                        self.fed_browser_window = Some(hwnd);
+                    }
                     FedEvent::SignInStep(step) => {
                         self.log_info(format!("fed_auth: sign-in {step}"));
                         self.fed_state = FedState::SigningIn(step);
@@ -6089,6 +6115,7 @@ mod gui {
                 // Once one is cleared, the same account lapsing later is new
                 // information again.
                 self.fed_last_attempt_expired.clear();
+                self.close_fed_browser_window();
                 self.fed_state = FedState::Authenticated;
                 // Nothing scheduled: the next run is triggered by the new
                 // credentials expiring. The mtime watcher picks up the file
@@ -6150,6 +6177,49 @@ mod gui {
             // Confirm with a real run rather than assuming; whatever it says
             // drives the schedule from here.
             self.fed_next_run_at = Some(Instant::now());
+        }
+
+        /// Close the window the sign-in drove, now the credentials are
+        /// confirmed renewed.
+        ///
+        /// `WM_CLOSE` to that one window, never a kill of `chrome.exe`: with
+        /// `--new-window` the process is usually shared with the rest of the
+        /// user's browsing, so killing it would take their tabs with it.
+        /// `WM_CLOSE` is also the polite form -- the same thing clicking the
+        /// X does -- so Chrome tears the window down itself.
+        ///
+        /// The handle is taken, not copied: a stale one from an earlier run
+        /// may belong to an unrelated window by now.
+        fn close_fed_browser_window(&mut self) {
+            let Some(hwnd) = self.fed_browser_window.take() else {
+                return;
+            };
+            if !self.fed_auth_cfg.close_browser_on_success {
+                return;
+            }
+            #[cfg(target_os = "windows")]
+            {
+                const WM_CLOSE: u32 = 0x0010;
+                // Declared here rather than pulling in a windows crate for
+                // one call, matching how the rest of this file reaches the
+                // OS.
+                #[link(name = "user32")]
+                unsafe extern "system" {
+                    fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+                }
+                // SAFETY: a handle the script reported for a window it had
+                // just driven. A window that has since closed makes this a
+                // no-op returning 0 — PostMessage does not dereference it.
+                let ok = unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) } != 0;
+                self.log_info(format!(
+                    "fed_auth: {} the sign-in browser window",
+                    if ok { "closed" } else { "could not close" }
+                ));
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = hwnd;
+            }
         }
 
         /// Spawn the worker for one `fed up` attempt. `reason` is logged so
