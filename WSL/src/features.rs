@@ -1020,6 +1020,75 @@ mod tests {
     /// That is not hypothetical: it shipped, and the sign-in silently never
     /// ran because the script died at parse time before emitting a single
     /// marker.
+    /// No two members of an embedded C# class may share a name and parameter
+    /// list.
+    ///
+    /// The `Add-Type` blocks in the PowerShell assets are compiled at run
+    /// time, so a duplicate is not a parse error here but a crash there --
+    /// "Type 'Fg' already defines a member called 'Handle' with the same
+    /// parameter types" -- and the script dies before emitting a single
+    /// marker. C# does not overload on return type, so adding a `long
+    /// Handle()` beside an `IntPtr Handle()` breaks the whole file.
+    ///
+    /// That has happened, which is why this exists. Nothing in a Linux build
+    /// compiles this C#, so without a check like it the first sign is a
+    /// failed sign-in on someone's desk.
+    #[test]
+    fn embedded_csharp_has_no_duplicate_members() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/scripts");
+        for entry in std::fs::read_dir(&dir).expect("assets/scripts exists") {
+            let path = entry.expect("readable entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("ps1") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("readable script");
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+
+            let mut seen: std::collections::HashMap<(String, String), usize> =
+                std::collections::HashMap::new();
+            let mut in_csharp = false;
+            for (i, line) in text.lines().enumerate() {
+                let t = line.trim();
+                // The heredocs holding C# open with `Add-Type @'` and close
+                // with a lone `'@`.
+                if t.starts_with("Add-Type @'") {
+                    in_csharp = true;
+                    seen.clear();
+                    continue;
+                }
+                if in_csharp && t == "'@" {
+                    in_csharp = false;
+                    continue;
+                }
+                if !in_csharp || !t.starts_with("public static ") {
+                    continue;
+                }
+                let Some((before, after)) = t["public static ".len()..].split_once('(') else {
+                    continue;
+                };
+                // Last token before the paren is the member name; anything
+                // ahead of it is the return type and modifiers like `extern`.
+                let Some(member) = before.split_whitespace().next_back() else {
+                    continue;
+                };
+                let params = after.split(')').next().unwrap_or("").trim().to_string();
+                let key = (member.to_string(), params);
+                if let Some(first) = seen.get(&key) {
+                    panic!(
+                        "{name}:{} declares '{}' again, already declared at line {}. \
+                         C# does not overload on return type, so Add-Type will refuse \
+                         the whole class at run time and the script will die before \
+                         producing any output.",
+                        i + 1,
+                        key.0,
+                        first
+                    );
+                }
+                seen.insert(key, i + 1);
+            }
+        }
+    }
+
     #[test]
     fn the_shipped_powershell_is_ascii_only() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/scripts");

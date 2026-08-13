@@ -287,9 +287,6 @@ public static class Fg {
         return sb.ToString();
     }
     public static IntPtr Handle() { return GetForegroundWindow(); }
-    public static long Handle() {
-        return (long)GetForegroundWindow();
-    }
     public static int Pid() {
         IntPtr h = GetForegroundWindow();
         if (h == IntPtr.Zero) return 0;
@@ -659,7 +656,7 @@ if (-not (Wait-ForTarget $PageTimeoutSec)) {
 # with --new-window on an already-running Chrome the process is shared with
 # the rest of the user's browsing, and killing it would take their tabs with
 # it.
-Write-Output "FEDLOGIN_HWND:$([Fg]::Handle())"
+Write-Output "FEDLOGIN_HWND:$([Fg]::Handle().ToInt64())"
 
 # Let the page finish settling before touching it. A window can be foreground
 # and titled correctly while the document is still laying out, and focusing a
