@@ -714,6 +714,26 @@ wording differ. Delete is the genuinely separate path, and the code below
 - **Never passes `--sudo`**, so sudoers is untouched and an existing grant
   survives.
 
+**A protected user can be deleted, but only with a second confirmation.**
+`protected_users` used to make delete impossible without editing
+features.json and rebuilding. It is now a confirmation: when the typed name is
+on the list, Bastion User Delete shows a red line naming it and a second
+checkbox — *Confirm to delete protected user '<user>'* — and the Delete button
+stays disabled until **both** boxes are ticked (`delete_confirmed`). A separate
+box on purpose: the everyday one is ticked on every delete and stops being
+read, while this one appears rarely and names the user, which is the moment
+someone notices they typed `ec2-user` rather than `ec2user`.
+
+`begin_delete_preflight` enforces the same rule where a stale dialog state
+cannot bypass it, and logs at **warn** naming the user when the confirmation is
+given — this is the one delete where the record matters.
+
+**It does not unlock system accounts.** `delete_user.sh` keeps its own
+hardcoded `PROTECTED_USERS` list *and* refuses any uid below 1000, so `root`,
+`ec2-user`, `ssm-user` and friends are still refused on the bastion no matter
+what is ticked here. What the confirmation unlocks is the *configurable* layer:
+a site-specific name added to `features.json`.
+
 **Restore is open to every user and every username.** The menu row is ungated
 (no `allowed_users` list), and `protected_users` gates delete only — it briefly
 gated restore too and that was removed on 2026-08-11, because re-keying a

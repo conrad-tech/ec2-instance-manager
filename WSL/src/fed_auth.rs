@@ -85,6 +85,10 @@ pub struct RetryPolicy {
     pub interval: Duration,
     /// Total time to keep retrying before giving up and waiting for the user.
     pub window: Duration,
+    /// Gap between attempts when the failure is [`is_access_pending`] -- the
+    /// sign-in worked and only an account entitlement is missing. Shorter,
+    /// because that resolves on its own in well under the general interval.
+    pub access_interval: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -92,6 +96,7 @@ impl Default for RetryPolicy {
         Self {
             interval: Duration::from_secs(120),
             window: Duration::from_secs(600),
+            access_interval: Duration::from_secs(30),
         }
     }
 }
@@ -236,6 +241,36 @@ pub fn parse_script_marker(line: &str) -> Option<ScriptEvent> {
     None
 }
 
+/// Text saying the sign-in itself worked and only an account entitlement is
+/// missing -- `fed` reports this with a URL to request access.
+const ACCESS_PENDING_MARKERS: &[&str] = &[
+    "do not have access",
+    "don't have access",
+    "does not have access",
+    "no access to",
+    "not authorized",
+    "not entitled",
+    "request access",
+    "access request",
+];
+
+/// Whether a failure is the "signed in, but not entitled to that account
+/// yet" kind.
+///
+/// Worth separating because it is not really a failed sign-in: the login
+/// succeeded, and what is missing is an entitlement that frequently lands
+/// within a minute. Retrying on the general interval wastes most of that.
+///
+/// A URL is **required**, not incidental. `fed` prints one to request access
+/// with, and demanding it keeps the phrase matching from catching an
+/// ordinary "not authorized" that will never resolve on its own -- which
+/// would otherwise be retried hard for the whole window.
+pub fn is_access_pending(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let has_url = lower.contains("http://") || lower.contains("https://");
+    has_url && ACCESS_PENDING_MARKERS.iter().any(|m| lower.contains(m))
+}
+
 /// How long to wait before running `fed up` again.
 ///
 /// `retrying_for` is how long we have already been retrying this failure —
@@ -244,6 +279,19 @@ pub fn parse_script_marker(line: &str) -> Option<ScriptEvent> {
 /// `None` means nothing is scheduled. For a success that is the normal state
 /// — expiry triggers the next run. For a failure it means the retry window is
 /// exhausted: stop, and wait for the user to sign in by hand.
+/// The gap to use before the next attempt at this particular failure.
+///
+/// Exposed so the caller can number attempts against the same interval it is
+/// actually waiting -- counting 2-minute attempts while retrying every 30
+/// seconds would report a fifth of the truth.
+pub fn retry_interval_for(policy: &RetryPolicy, message: &str) -> Duration {
+    if is_access_pending(message) {
+        policy.access_interval
+    } else {
+        policy.interval
+    }
+}
+
 pub fn next_delay(
     policy: &RetryPolicy,
     outcome: &FedOutcome,
@@ -253,14 +301,15 @@ pub fn next_delay(
         // Nothing is scheduled after a success: the next run is whenever the
         // credentials expire, which the caller learns from `fed_expire`.
         FedOutcome::Authenticated => None,
-        FedOutcome::Failed(_) => {
+        FedOutcome::Failed(msg) => {
+            let interval = retry_interval_for(policy, msg);
             // The attempt that would land past the window is not worth
-            // making: give up now rather than sleeping two minutes to time
+            // making: give up now rather than sleeping through it to time
             // out anyway.
-            if retrying_for + policy.interval > policy.window {
+            if retrying_for + interval > policy.window {
                 None
             } else {
-                Some(policy.interval)
+                Some(interval)
             }
         }
     }
@@ -395,6 +444,50 @@ mod tests {
         assert_eq!(next_delay(&p, &FedOutcome::Authenticated, Duration::ZERO), None);
     }
 
+    /// What `fed` prints when the sign-in worked but an account is not yet
+    /// entitled.
+    const NO_ACCESS: &str = "You do not have access to account 123456789012. \
+        Request it at https://access.example.com/request/123";
+
+    #[test]
+    fn a_missing_entitlement_is_told_apart_from_a_failed_sign_in() {
+        assert!(is_access_pending(NO_ACCESS));
+        assert!(is_access_pending(
+            "user not authorized for this account -- see https://x.example/req"
+        ));
+        // The wording alone is not enough. `fed` prints a URL to request
+        // access with, and without one this is an ordinary authorization
+        // failure that will not resolve on its own -- retrying it every 30s
+        // for ten minutes would just be noise.
+        assert!(!is_access_pending("user is not authorized for this account"));
+        assert!(!is_access_pending("do not have access"));
+        // Nor is a URL alone: plenty of output carries one.
+        assert!(!is_access_pending("see https://docs.example.com for details"));
+        assert!(!is_access_pending(""));
+    }
+
+    #[test]
+    fn a_missing_entitlement_retries_far_sooner() {
+        let p = RetryPolicy::default();
+        let pending = FedOutcome::Failed(NO_ACCESS.to_string());
+        assert_eq!(
+            next_delay(&p, &pending, Duration::ZERO),
+            Some(Duration::from_secs(30)),
+            "an entitlement usually lands inside a minute"
+        );
+        // The window still applies -- it just fits many more attempts.
+        assert_eq!(
+            next_delay(&p, &pending, Duration::from_secs(9 * 60 + 40)),
+            None,
+            "the next attempt would land past the 10-minute window"
+        );
+        // And a general failure is unaffected.
+        assert_eq!(
+            next_delay(&p, &FedOutcome::Failed("nope".to_string()), Duration::ZERO),
+            Some(Duration::from_secs(120))
+        );
+    }
+
     #[test]
     fn failures_retry_every_two_minutes_until_the_window_closes() {
         let p = RetryPolicy::default();
@@ -431,6 +524,7 @@ mod tests {
         let p = RetryPolicy::default();
         assert_eq!(p.interval, Duration::from_secs(2 * 60));
         assert_eq!(p.window, Duration::from_secs(10 * 60));
+        assert_eq!(p.access_interval, Duration::from_secs(30));
     }
 
     #[test]

@@ -108,6 +108,15 @@ pub struct FedAuthFeature {
     pub retry_interval_secs: u64,
     /// Seconds to keep retrying before giving up. 0 uses the default (600).
     pub retry_window_secs: u64,
+    /// Seconds between attempts when the failure is only a missing account
+    /// entitlement -- signed in fine, but `fed` reports no access to one
+    /// account and gives a URL to request it. 0 uses the default (30).
+    ///
+    /// Much shorter than `retry_interval_secs` on purpose: the sign-in
+    /// already worked, and an entitlement usually lands within a minute, so
+    /// the general interval spends most of its time waiting for something
+    /// that has already happened.
+    pub access_retry_interval_secs: u64,
     /// Seconds one `fed up` may run before it is stopped. 0 uses the default
     /// (300).
     ///
@@ -236,6 +245,7 @@ impl FedAuthFeature {
         crate::fed_auth::RetryPolicy {
             interval: or_default(self.retry_interval_secs, d.interval),
             window: or_default(self.retry_window_secs, d.window),
+            access_interval: or_default(self.access_retry_interval_secs, d.access_interval),
         }
     }
 

@@ -763,6 +763,14 @@ mod gui {
         grant_sudo: bool,
         /// Delete mode: confirmation checkbox — Delete is disabled until set.
         confirm_delete: bool,
+        /// Delete mode: a *second* confirmation, shown only when the typed
+        /// name is on the `protected_users` list.
+        ///
+        /// Separate from `confirm_delete` on purpose. That one is ticked for
+        /// every delete and so stops being read; this one appears rarely and
+        /// names the user, which is the point at which someone notices they
+        /// typed `ec2-user` rather than `ec2user`.
+        confirm_protected: bool,
         /// Text typed in the primary-bastion filter box.
         primary_query: String,
         /// Text typed in the secondary-bastion filter box.
@@ -2640,6 +2648,21 @@ mod gui {
     /// saved" highlight.
     fn flashing_yellow(ui: &egui::Ui) -> egui::Color32 {
         flashing_color(ui, 255, 205, 0)
+    }
+
+    /// Whether a delete has every confirmation it needs.
+    ///
+    /// An ordinary delete needs one tick. A protected name needs a second,
+    /// which is deliberately *not* the same box: the first is ticked on every
+    /// delete and so stops being read, while the second appears rarely and
+    /// names the user — which is the moment someone notices they typed
+    /// `ec2-user` rather than `ec2user`.
+    ///
+    /// This is only the app's own gate. `delete_user.sh` keeps its hardcoded
+    /// refusal of system accounts and of any uid below 1000, and no amount of
+    /// ticking here reaches past that.
+    fn delete_confirmed(protected: bool, confirm_delete: bool, confirm_protected: bool) -> bool {
+        confirm_delete && (!protected || confirm_protected)
     }
 
     /// `ui.colored_label`, but with the light-theme weight from
@@ -6131,9 +6154,20 @@ mod gui {
 
             match next_delay(&policy, &outcome, retrying_for) {
                 Some(delay) => {
+                    // Counted against the interval actually in use, not the
+                    // general one: a missing entitlement retries every 30s,
+                    // and dividing that elapsed time by 120 would report a
+                    // fifth of the attempts really made.
+                    let step = ec2_manager::fed_auth::retry_interval_for(
+                        &policy,
+                        &err.to_string(),
+                    );
                     let attempt =
-                        (retrying_for.as_secs() / policy.interval.as_secs().max(1)) as u32 + 1;
-                    self.log_warn(format!("fed_auth: attempt {attempt} failed — {err}"));
+                        (retrying_for.as_secs() / step.as_secs().max(1)) as u32 + 1;
+                    self.log_warn(format!(
+                        "fed_auth: attempt {attempt} failed — {err} (next in {}s)",
+                        delay.as_secs()
+                    ));
                     self.fed_state = FedState::Retrying { error: err, attempt };
                     self.fed_next_run_at = Some(Instant::now() + delay);
                 }
@@ -11012,6 +11046,17 @@ mod gui {
                 .map(|e| self.script_env_auth(&e.account_id))
                 .collect();
             let auth_warning = self.script_env_auth_warning(&dlg.env_profile_id);
+            // Cloned for the same reason: the closure borrows `dlg`, and the
+            // list has to be consulted against what is being typed *now*, so
+            // the confirmation appears on the keystroke that makes it apply.
+            let protected_users = self.protected_users.clone();
+            let is_protected = move |name: &str| {
+                let n = name.trim().to_ascii_lowercase();
+                !n.is_empty()
+                    && protected_users
+                        .iter()
+                        .any(|p| p.trim().to_ascii_lowercase() == n)
+            };
 
             let mut window_open = true;
             let mut do_run = false;
@@ -11148,6 +11193,8 @@ mod gui {
                         note_label(ui, egui::Color32::from_rgb(220, 80, 80), err);
                     }
 
+                    let protected_target =
+                        dlg.mode.is_delete() && is_protected(&dlg.username);
                     if dlg.mode.is_delete() {
                         ui.add_space(6.0);
                         let confirm_text = if dlg.username.trim().is_empty() {
@@ -11159,15 +11206,45 @@ mod gui {
                             )
                         };
                         ui.checkbox(&mut dlg.confirm_delete, confirm_text);
+
+                        // Only for a protected name, and only in delete mode.
+                        // A box that is always there is one that is always
+                        // ticked; this one appears for the accounts worth
+                        // stopping over, and says which.
+                        if protected_target {
+                            ui.add_space(4.0);
+                            note_label(
+                                ui,
+                                egui::Color32::from_rgb(220, 80, 80),
+                                format!(
+                                    "'{}' is a protected user — shared accounts \
+                                     revoke access for everyone using them.",
+                                    dlg.username.trim()
+                                ),
+                            );
+                            ui.checkbox(
+                                &mut dlg.confirm_protected,
+                                format!(
+                                    "Confirm to delete protected user '{}'",
+                                    dlg.username.trim()
+                                ),
+                            );
+                        }
                     }
 
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         let run_label = dlg.mode.run_label();
                         // In delete mode the button is disabled until the
-                        // confirmation checkbox is ticked, and in every mode
-                        // while the account isn't authenticated.
-                        let run_enabled = (!dlg.mode.is_delete() || dlg.confirm_delete)
+                        // confirmation checkbox is ticked — both of them, when
+                        // the target is protected — and in every mode while
+                        // the account isn't authenticated.
+                        let run_enabled = (!dlg.mode.is_delete()
+                            || delete_confirmed(
+                                protected_target,
+                                dlg.confirm_delete,
+                                dlg.confirm_protected,
+                            ))
                             && auth_warning.is_none();
                         if ui
                             .add_enabled(run_enabled, egui::Button::new(run_label))
@@ -11219,14 +11296,25 @@ mod gui {
                     self.create_user_dialog = Some(dlg);
                     return;
                 }
-                // Only delete refuses the protected list — it is the one that
-                // removes an account. Restore re-issues a key to a user who
-                // already exists and is deliberately open to every username,
-                // including the shared ones: re-keying ec2-user on a bastion
-                // whose key has been lost is a thing an admin needs to do.
-                if dlg.mode.is_delete() && self.is_protected_user(&username) {
+                // Only delete consults the protected list — it is the one
+                // that removes an account. Restore re-issues a key to a user
+                // who already exists and is deliberately open to every
+                // username, including the shared ones: re-keying ec2-user on
+                // a bastion whose key has been lost is a thing an admin needs
+                // to do.
+                //
+                // A protected name is now a confirmation rather than a
+                // refusal, so an admin can remove a site-specific account
+                // without editing features.json and rebuilding. The button is
+                // already disabled until `confirm_protected` is ticked; this
+                // is the same rule enforced where it cannot be bypassed by a
+                // stale dialog state.
+                if dlg.mode.is_delete()
+                    && self.is_protected_user(&username)
+                    && !dlg.confirm_protected
+                {
                     dlg.error = Some(format!(
-                        "'{username}' is a protected user and cannot be deleted."
+                        "'{username}' is a protected user — tick the confirmation to delete it."
                     ));
                     self.create_user_dialog = Some(dlg);
                     return;
@@ -11262,6 +11350,7 @@ mod gui {
                     dlg.grant_sudo,
                     &dlg.primary_id,
                     &dlg.secondary_id,
+                    dlg.confirm_protected,
                 );
                 self.create_user_dialog = None;
                 return;
@@ -12266,6 +12355,7 @@ mod gui {
         /// only proceeds once it clears (see `poll_script_events`).
         #[allow(clippy::too_many_arguments)]
         #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::too_many_arguments)]
         fn start_user_script_run(
             &mut self,
             mode: UserScriptMode,
@@ -12275,6 +12365,9 @@ mod gui {
             grant_sudo: bool,
             primary_id: &str,
             secondary_id: &str,
+            // Delete only: the operator ticked the extra confirmation for a
+            // name on the protected list.
+            confirm_protected: bool,
         ) {
             if mode.is_delete() {
                 self.begin_delete_preflight(
@@ -12283,6 +12376,7 @@ mod gui {
                     env_name,
                     primary_id,
                     secondary_id,
+                    confirm_protected,
                 );
             } else if mode.is_restore() {
                 // Restore takes no number: the account already exists, and its
@@ -12368,6 +12462,7 @@ mod gui {
 
         /// Kick off the delete pre-flight active-session check. On success
         /// (both bastions idle) `poll_script_events` enqueues the delete.
+        #[allow(clippy::too_many_arguments)]
         fn begin_delete_preflight(
             &mut self,
             username: &str,
@@ -12375,15 +12470,29 @@ mod gui {
             env_name: &str,
             primary_id: &str,
             secondary_id: &str,
+            confirm_protected: bool,
         ) {
-            // Safety backstop: never delete a protected/system account.
+            // Backstop for a protected account, now that the dialog can
+            // confirm one rather than refuse it. Unconfirmed is still a hard
+            // stop here, so nothing reaches the bastions on a stale dialog
+            // state or a future caller that forgets to ask.
+            //
+            // Confirming is logged at warn and names the user: this is the
+            // one delete where the record of who asked for it matters.
             if self.is_protected_user(username) {
-                let msg = format!(
-                    "Refusing to delete protected user '{username}'."
-                );
-                self.log_error(msg.clone());
-                self.show_script_result("Delete Blocked", msg, false, None, None);
-                return;
+                if !confirm_protected {
+                    let msg = format!(
+                        "Refusing to delete protected user '{username}'."
+                    );
+                    self.log_error(msg.clone());
+                    self.show_script_result("Delete Blocked", msg, false, None, None);
+                    return;
+                }
+                self.log_warn(format!(
+                    "delete_user: '{username}' is a protected user and the \
+                     confirmation was given — proceeding. delete_user.sh still \
+                     refuses system accounts and any uid below 1000 on its own."
+                ));
             }
             let ctx = self
                 .profile_inventory_cache
@@ -19732,6 +19841,7 @@ mod gui {
                                     env_name,
                                     grant_sudo: false,
                                     confirm_delete: false,
+                confirm_protected: false,
                                     primary_query,
                                     secondary_query,
                                     primary_id,
@@ -24420,6 +24530,25 @@ mod gui {
                     line.trim()
                 );
             }
+        }
+
+        /// A protected name needs BOTH ticks. The everyday confirmation is
+        /// given on every delete and so stops being read; the second one is
+        /// the one that actually stops someone.
+        #[test]
+        fn deleting_a_protected_user_takes_a_second_confirmation() {
+            // Ordinary user: one tick is enough, and the protected box is
+            // irrelevant because it is never shown.
+            assert!(delete_confirmed(false, true, false));
+            assert!(!delete_confirmed(false, false, false));
+
+            // Protected user: one tick is not enough.
+            assert!(!delete_confirmed(true, true, false));
+            assert!(delete_confirmed(true, true, true));
+
+            // And the second never substitutes for the first — ticking only
+            // the protected box must not arm the button.
+            assert!(!delete_confirmed(true, false, true));
         }
 
         #[test]
