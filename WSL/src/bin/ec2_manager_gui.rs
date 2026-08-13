@@ -51,6 +51,11 @@ mod gui {
     use ec2_manager::workflow::find_instance;
     use ec2_manager::wsl_setup;
 
+    /// Window/taskbar icon, decoded once at startup by `app_icon()`.
+    /// `assets/app_icon.ico` is the same picture in the format the Windows
+    /// shell reads off the exe; keep the two in step.
+    const APP_ICON_PNG: &[u8] = include_bytes!("../../assets/app_icon.png");
+
     const GUI_DEFAULT_WIDTH: f32 = 1720.0;
     const GUI_DEFAULT_HEIGHT: f32 = 980.0;
     const GUI_MIN_WIDTH: f32 = 1280.0;
@@ -4841,10 +4846,36 @@ mod gui {
         }
     }
 
+    /// The window icon, as a PNG we ship ourselves.
+    ///
+    /// eframe supplies a fallback when no icon is set (`load_default_egui_icon`
+    /// — the same "e"), which is why the app appeared to have an icon without
+    /// ever asking for one. Relying on that is the bug: it is a *default*, and
+    /// a version bump is free to change or drop it. `assets/app_icon.png` is a
+    /// copy of that image, so the icon looks identical and now belongs to us.
+    ///
+    /// This covers the live window only. What Explorer, the Start menu and a
+    /// pinned taskbar shortcut show comes from the exe's own resource, which
+    /// `build.rs` embeds from `assets/app_icon.ico` — the same picture.
+    fn app_icon() -> Option<egui::IconData> {
+        match eframe::icon_data::from_png_bytes(APP_ICON_PNG) {
+            Ok(icon) => Some(icon),
+            Err(err) => {
+                // Cosmetic: run without one rather than refusing to start.
+                eprintln!("warning: could not decode the app icon: {err}");
+                None
+            }
+        }
+    }
+
     fn default_native_options() -> eframe::NativeOptions {
         let config = AppConfig::load().unwrap_or_default();
         let mut viewport = egui::ViewportBuilder::default()
             .with_min_inner_size([GUI_MIN_WIDTH, GUI_MIN_HEIGHT]);
+
+        if let Some(icon) = app_icon() {
+            viewport = viewport.with_icon(icon);
+        }
 
         if let (Some(w), Some(h)) = (config.window_w, config.window_h) {
             viewport = viewport.with_inner_size([w, h]);
@@ -24587,6 +24618,43 @@ mod gui {
             assert!(GUI_DEFAULT_HEIGHT >= 900.0);
             assert!(GUI_MIN_WIDTH >= 1200.0);
             assert!(GUI_MIN_HEIGHT >= 700.0);
+        }
+
+        #[test]
+        fn the_app_icon_decodes() {
+            // The icon is no longer eframe's fallback, so nothing else notices
+            // if this asset is replaced with something undecodable — the app
+            // would just start iconless, which is exactly the symptom being
+            // fixed here.
+            let icon = app_icon().expect("assets/app_icon.png decodes");
+            assert_eq!(icon.width, icon.height, "the icon must be square");
+            assert!(icon.width >= 256, "too small to scale up cleanly");
+            assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+        }
+
+        #[test]
+        fn the_windows_icon_resource_carries_the_shell_sizes() {
+            // build.rs hands this file to windres, and fails soft — so a
+            // malformed .ico costs the taskbar icon with only a cargo warning
+            // to say so. Check the directory here instead.
+            const ICO: &[u8] = include_bytes!("../../assets/app_icon.ico");
+            assert_eq!(&ICO[0..4], &[0, 0, 1, 0], "not an icon directory");
+            let count = u16::from_le_bytes([ICO[4], ICO[5]]) as usize;
+            assert!(count >= 4, "only {count} size(s) in the icon");
+
+            let sizes: Vec<u32> = (0..count)
+                .map(|i| match ICO[6 + 16 * i] {
+                    // 0 is how the format spells 256 in a single byte.
+                    0 => 256,
+                    n => n as u32,
+                })
+                .collect();
+            // 16 is the taskbar/title-bar size and 256 is what Explorer's
+            // large-icon views ask for; Windows scales one of these badly if
+            // the nearest entry is far off.
+            for wanted in [16, 32, 256] {
+                assert!(sizes.contains(&wanted), "no {wanted}px entry in {sizes:?}");
+            }
         }
 
         fn mods(ctrl: bool, alt: bool, shift: bool) -> egui::Modifiers {

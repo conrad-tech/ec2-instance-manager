@@ -199,6 +199,46 @@ Key functions:
 - `pty_command_for_context()` — spawns `aws` directly with SSM args in live mode
 - `resize_pty_session()` — propagates resize to both vt100 parser and PTY master
 
+### App icon — two places, both needed
+
+The "e" glyph is set **twice**, and the two cover different things. Losing
+either one is a bug that only shows up in some of the places an icon appears.
+
+- **`assets/app_icon.png` → `ViewportBuilder::with_icon`** is the *live
+  window*: the taskbar button while running, alt-tab, the title bar. eframe
+  applies it with `WM_SETICON` once the window exists.
+- **`assets/app_icon.ico` → the exe's Win32 resource**, embedded by
+  `embed_windows_icon()` in `build.rs`, is the *file on disk*: Explorer, the
+  Start menu, and a **pinned taskbar shortcut**. None of those ever run the
+  app, so none of them can see the `WM_SETICON` one.
+
+**The app used to set neither.** What it was showing was eframe's own fallback
+(`load_default_egui_icon`, `eframe/data/icon.png`) — which is where the glyph
+came from, and `assets/app_icon.png` is a byte copy of it so nothing changed
+visually. Depending on a fallback meant the icon was a crate default one bump
+away from changing, and the exe had no `.rsrc` section at all, so anything
+reading the file got the generic executable glyph.
+
+- **`windres` runs from `OUT_DIR` on bare filenames.** Same hazard as the
+  `dlltool` one below: the repo path has a space in it. The `.ico` is copied
+  next to the generated `.rc` so no path is ever passed.
+- **The whole step fails soft** — no `windres`, an MSVC target, a bad run — as
+  a `cargo:warning`. An icon must not break a build. The consequence is that a
+  broken `.ico` costs the icon *silently*, which is what
+  `the_windows_icon_resource_carries_the_shell_sizes` is for.
+- Only `ec2_manager_gui` gets it (`rustc-link-arg-bin`); the CLI is a console
+  tool.
+- The `.ico` carries 16/24/32/48/64/128 as DIB and 256 as PNG. 16 is the
+  taskbar size and 256 is Explorer's large-icon view; Windows scales badly
+  when the nearest entry is far off.
+- `strip = true` does not touch `.rsrc` — verified on the release
+  cross-compile.
+
+**A pinned shortcut can still look stale**, and that is Windows, not the
+build: it caches by exe path, and `build_binaries.sh` renames each release to
+`ec2_manager_gui_${APP_VERSION}.exe`, so a pin made against an older version
+points at a file that is no longer there. Re-pin after upgrading.
+
 ### On-call alerts (Alerts button)
 
 `src/alerts.rs` fetches the Jira Service Management Operations alert feed

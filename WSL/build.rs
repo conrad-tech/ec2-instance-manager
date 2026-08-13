@@ -97,6 +97,108 @@ fn main() {
 
     validate_features();
     emit_obfuscated_assets();
+    embed_windows_icon();
+}
+
+/// Compile `assets/app_icon.ico` into the GUI executable as its Win32 icon
+/// resource (Windows targets only).
+///
+/// This is what Explorer, the Start menu, alt-tab and — the case that started
+/// this — a **pinned taskbar shortcut** read, because all of them look at the
+/// file on disk and never see the icon eframe sets on the live window at
+/// runtime. Without a resource here they fall back to the generic executable
+/// glyph, so the "e" came and went depending on how the app was launched.
+///
+/// Three things are deliberate:
+///
+/// - **It fails soft.** No `windres`, an unknown target, a failed run — all
+///   are `cargo:warning=` and carry on. An icon must never break a build.
+/// - **`windres` runs from `OUT_DIR` on bare filenames.** The repo path
+///   contains a space (`/mnt/d/Work Projects/...`) and the mingw tools are
+///   careless about quoting the paths they hand to their own child processes;
+///   that is exactly the `dlltool` failure documented in CLAUDE.md. Copying
+///   the `.ico` next to the generated `.rc` and passing neither a directory
+///   keeps a space out of the command entirely.
+/// - **It targets `ec2_manager_gui` only.** `ec2_manager` is a console tool.
+fn embed_windows_icon() {
+    let icon_src = Path::new("assets/app_icon.ico");
+    println!("cargo:rerun-if-changed={}", icon_src.display());
+    println!("cargo:rerun-if-env-changed=WINDRES");
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    // The .o windres emits is a GNU-format object; the MSVC linker wants a
+    // .res from rc.exe instead. Skip rather than emit something that will not
+    // link — the runtime icon still covers the window itself.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("gnu") {
+        println!(
+            "cargo:warning=app icon not embedded: only the *-pc-windows-gnu \
+             target is supported (needs windres)"
+        );
+        return;
+    }
+
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is always set for build scripts");
+    let out_dir = Path::new(&out_dir);
+
+    if let Err(err) = std::fs::copy(icon_src, out_dir.join("app_icon.ico")) {
+        println!(
+            "cargo:warning=app icon not embedded: could not copy {}: {err}",
+            icon_src.display()
+        );
+        return;
+    }
+    // Resource id 1: the lowest-numbered ICON resource is the one Windows
+    // shows for the file, so this must stay 1.
+    if let Err(err) = std::fs::write(out_dir.join("app_icon.rc"), "1 ICON \"app_icon.ico\"\n") {
+        println!("cargo:warning=app icon not embedded: could not write app_icon.rc: {err}");
+        return;
+    }
+
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(explicit) = std::env::var("WINDRES") {
+        candidates.push(explicit);
+    }
+    candidates.push(match arch.as_str() {
+        "x86" => "i686-w64-mingw32-windres".to_string(),
+        _ => "x86_64-w64-mingw32-windres".to_string(),
+    });
+    // Building natively under MSYS2/MinGW, where the tool is unprefixed.
+    candidates.push("windres".to_string());
+
+    for windres in &candidates {
+        let result = std::process::Command::new(windres)
+            .current_dir(out_dir)
+            .args(["-i", "app_icon.rc", "-O", "coff", "-o", "app_icon.o"])
+            .output();
+        match result {
+            // Not installed under this name — try the next spelling.
+            Err(_) => continue,
+            Ok(output) if !output.status.success() => {
+                println!(
+                    "cargo:warning=app icon not embedded: {windres} failed ({}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                return;
+            }
+            Ok(_) => {
+                println!(
+                    "cargo:rustc-link-arg-bin=ec2_manager_gui={}",
+                    out_dir.join("app_icon.o").display()
+                );
+                return;
+            }
+        }
+    }
+
+    println!(
+        "cargo:warning=app icon not embedded: no windres found (tried {}). \
+         Install binutils-mingw-w64, or set WINDRES.",
+        candidates.join(", ")
+    );
 }
 
 /// Encrypt each compiled-in asset with the shared keystream and write the
