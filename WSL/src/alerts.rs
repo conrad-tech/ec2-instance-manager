@@ -5,7 +5,7 @@
 //! into [`Alert`] rows. Account / Environment / App are not top-level fields
 //! on the API response — they arrive as `"Key: value"` strings inside the
 //! alert's `tags` array (e.g. `"Account: 123456789012"`, `"Environment: Dev"`),
-//! so [`Alert::from_json`] splits them back out.
+//! so [`Alert::from_raw`] splits them back out.
 //!
 //! HTTP goes through `curl`, matching how the rest of the app shells out to
 //! `aws` rather than linking an HTTP stack. The API token is passed on curl's
@@ -258,9 +258,11 @@ pub fn fetch_recent(auth: &AlertsAuth, window_min: i64) -> Result<Vec<Alert>> {
     Ok(out)
 }
 
-/// Reject anything that would escape the URL path when interpolated. Alert
-/// ids from the API are `[0-9a-f-]` plus a numeric suffix; nothing else is
-/// legitimate, and the acknowledge POST is a mutation.
+/// Reject anything that would escape the URL path when interpolated. Accepts
+/// ASCII alphanumerics plus `-`/`_`, up to 128 characters — permissive enough
+/// to also cover a schedule id, while still refusing `/`, `.`, `%`,
+/// whitespace, empty, and over-long values. The acknowledge POST is a
+/// mutation, so this is the one validation guarding it.
 fn validate_alert_id(alert_id: &str) -> Result<()> {
     let ok = !alert_id.is_empty()
         && alert_id.len() <= 128
@@ -324,10 +326,20 @@ fn curl_request(
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = if stderr.trim().is_empty() { stdout.trim().to_string() } else { stderr.trim().to_string() };
         let detail: String = detail.chars().take(300).collect();
+        // `query` never carries credentials — those go to stdin via `-K -` —
+        // so folding it into the reported URL cannot leak the token. Without
+        // this, a failed page of `fetch_recent` (up to 20 pages, each with
+        // its own `offset`) reported only the bare endpoint, with no way to
+        // tell which page failed.
+        let display_url = if query.is_empty() {
+            url.to_string()
+        } else {
+            let pairs: Vec<String> = query.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            format!("{url}?{}", pairs.join("&"))
+        };
         return Err(AppError::CommandFailed {
             program: "curl".to_string(),
-            // The URL only — never the config on stdin, which holds the token.
-            args: vec![url.to_string()],
+            args: vec![display_url],
             stderr: detail,
         });
     }
@@ -583,6 +595,13 @@ mod tests {
         assert_eq!(a.extra.get("alertname").map(String::as_str), Some("Read-OK-STATUS-Warning"));
         assert_eq!(a.account, "123456789012");
         assert_eq!(a.environment, "DEV1");
+        // The feed carries this unrendered-template key verbatim. A later task
+        // must never MATCH against it, but parsing must not silently drop it
+        // either — a key-based filter added here would be invisible otherwise.
+        assert_eq!(
+            a.extra.get("{{extraProperties}}").map(String::as_str),
+            Some("{alertname=Read-OK-STATUS-Warning}")
+        );
     }
 
     #[test]
