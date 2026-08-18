@@ -12,6 +12,7 @@
 //! **stdin** (`-K -`), never in argv, so it does not show up in the process
 //! list.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -71,6 +72,18 @@ pub struct Alert {
     /// From the `App: …` tag.
     pub app: String,
     pub tags: Vec<String>,
+    /// Free-text body. Absent from the list view on some integrations, so
+    /// never assume it is populated.
+    pub description: String,
+    /// `extraProperties`, string values only. Non-string values are dropped
+    /// rather than failing the alert.
+    ///
+    /// Note the feed sometimes carries a literal `{{extraProperties}}` key —
+    /// an unrendered template holding a flattened copy of this same map. It
+    /// is kept here verbatim but must never be matched against: it duplicates
+    /// values that also appear properly, and it disappears the day the
+    /// template is fixed.
+    pub extra: BTreeMap<String, String>,
 }
 
 /// Raw shape of a single alert in the API response. Unknown fields ignored;
@@ -90,6 +103,9 @@ struct RawAlert {
     source: String,
     count: u64,
     tags: Vec<String>,
+    description: String,
+    #[serde(rename = "extraProperties")]
+    extra_properties: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The alert list envelope. The API has used both `values` and `data` for the
@@ -131,6 +147,11 @@ impl Alert {
         let account = first_tag_value(&raw.tags, "Account");
         let environment = first_tag_value(&raw.tags, "Environment");
         let app = first_tag_value(&raw.tags, "App");
+        let extra = raw
+            .extra_properties
+            .into_iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+            .collect::<BTreeMap<_, _>>();
         Self {
             id: raw.id,
             tiny_id: raw.tiny_id,
@@ -145,6 +166,8 @@ impl Alert {
             environment,
             app,
             tags: raw.tags,
+            description: raw.description,
+            extra,
         }
     }
 
@@ -235,34 +258,34 @@ pub fn fetch_recent(auth: &AlertsAuth, window_min: i64) -> Result<Vec<Alert>> {
     Ok(out)
 }
 
-/// One GET against the alerts endpoint. Credentials go in on stdin via curl's
-/// `-K -` config so the token never appears in argv.
-fn curl_get(auth: &AlertsAuth, base: &str, offset: u32) -> Result<String> {
-    let mut cmd = Command::new("curl");
-    cmd.args([
-        "-sS",
-        "--fail-with-body",
-        "-K",
-        "-",
-        "-G",
-        "-H",
-        "Accept: application/json",
-        "--data-urlencode",
-        "sort=createdAt",
-        "--data-urlencode",
-        "order=desc",
-        "--data-urlencode",
-        &format!("size={PAGE_SIZE}"),
-        "--data-urlencode",
-        &format!("offset={offset}"),
-        base,
-    ]);
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
+/// Reject anything that would escape the URL path when interpolated. Alert
+/// ids from the API are `[0-9a-f-]` plus a numeric suffix; nothing else is
+/// legitimate, and the acknowledge POST is a mutation.
+fn validate_alert_id(alert_id: &str) -> Result<()> {
+    let ok = !alert_id.is_empty()
+        && alert_id.len() <= 128
+        && alert_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(AppError::InvalidArgument(format!(
+            "alerts: refusing malformed alert id ({} chars)",
+            alert_id.len()
+        )))
+    }
+}
 
+/// One request. `query` pairs are sent with `-G --data-urlencode` for GET;
+/// `post_body` switches it to a POST with a JSON body. Credentials go in on
+/// stdin via curl's `-K -` config so the token never appears in argv.
+fn curl_request(
+    auth: &AlertsAuth,
+    url: &str,
+    query: &[(&str, String)],
+    post_body: Option<&str>,
+) -> Result<String> {
     // curl config-file syntax: quotes in the token/email would break out of
     // the quoted value, so reject them rather than mangle the config.
     if auth.email.contains('"') || auth.token.contains('"') {
@@ -270,6 +293,23 @@ fn curl_get(auth: &AlertsAuth, base: &str, offset: u32) -> Result<String> {
             "alerts: email/token must not contain double quotes".to_string(),
         ));
     }
+    let mut cmd = Command::new("curl");
+    cmd.args(["-sS", "--fail-with-body", "-K", "-", "-H", "Accept: application/json"]);
+    match post_body {
+        Some(body) => {
+            cmd.args(["-X", "POST", "-H", "Content-Type: application/json", "-d", body]);
+        }
+        None => {
+            cmd.arg("-G");
+            for (k, v) in query {
+                cmd.args(["--data-urlencode", &format!("{k}={v}")]);
+            }
+        }
+    }
+    cmd.arg(url);
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
 
     let mut child = cmd.spawn()?;
     {
@@ -282,22 +322,98 @@ fn curl_get(auth: &AlertsAuth, base: &str, offset: u32) -> Result<String> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            stderr.trim().to_string()
-        };
-        // Truncate: an HTML error page from a proxy would otherwise fill the
-        // status bar.
+        let detail = if stderr.trim().is_empty() { stdout.trim().to_string() } else { stderr.trim().to_string() };
         let detail: String = detail.chars().take(300).collect();
         return Err(AppError::CommandFailed {
             program: "curl".to_string(),
             // The URL only — never the config on stdin, which holds the token.
-            args: vec![format!("{base}?offset={offset}")],
+            args: vec![url.to_string()],
             stderr: detail,
         });
     }
     Ok(stdout)
+}
+
+/// Base `…/v1` for this site.
+fn ops_base(auth: &AlertsAuth) -> String {
+    format!("https://api.atlassian.com/jsm/ops/api/{}/v1", auth.cloud_id.trim())
+}
+
+fn require_complete(auth: &AlertsAuth) -> Result<()> {
+    if auth.is_complete() {
+        Ok(())
+    } else {
+        Err(AppError::InvalidArgument(
+            "alerts: email, token and cloud id must all be set".to_string(),
+        ))
+    }
+}
+
+/// Parse a single-alert response. The API returns the alert either bare or
+/// wrapped in `{"data": …}` / `{"value": …}` depending on the endpoint.
+pub fn parse_single_alert(body: &str) -> Result<Alert> {
+    let v: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| AppError::Parse(format!("alerts: could not parse alert: {e}")))?;
+    let inner = v.get("data").or_else(|| v.get("value")).unwrap_or(&v);
+    let raw: RawAlert = serde_json::from_value(inner.clone())
+        .map_err(|e| AppError::Parse(format!("alerts: unexpected alert shape: {e}")))?;
+    Ok(Alert::from_raw(raw))
+}
+
+/// The newest `count` alerts, newest first. One request, no paging — the
+/// remediation poller wants a fixed-size window of recent alerts, not a
+/// time-bounded walk.
+pub fn fetch_latest(auth: &AlertsAuth, count: u32) -> Result<Vec<Alert>> {
+    require_complete(auth)?;
+    let url = format!("{}/alerts", ops_base(auth));
+    let body = curl_request(
+        auth,
+        &url,
+        &[
+            ("sort", "createdAt".to_string()),
+            ("order", "desc".to_string()),
+            ("size", count.clamp(1, 100).to_string()),
+        ],
+        None,
+    )?;
+    let (alerts, _next) = parse_alerts_page(&body)?;
+    Ok(alerts)
+}
+
+/// One alert by id. Used for the last-look abort and the stage-2 closure
+/// watch, so its failure must stay distinguishable from "not closed".
+pub fn fetch_alert(auth: &AlertsAuth, alert_id: &str) -> Result<Alert> {
+    require_complete(auth)?;
+    validate_alert_id(alert_id)?;
+    let url = format!("{}/alerts/{alert_id}", ops_base(auth));
+    let body = curl_request(auth, &url, &[], None)?;
+    parse_single_alert(&body)
+}
+
+/// Acknowledge an alert. Only ever called on the on-call path: acking off
+/// call would suppress the real on-call engineer's escalation.
+pub fn acknowledge_alert(auth: &AlertsAuth, alert_id: &str) -> Result<()> {
+    require_complete(auth)?;
+    validate_alert_id(alert_id)?;
+    let url = format!("{}/alerts/{alert_id}/acknowledge", ops_base(auth));
+    curl_request(auth, &url, &[], Some("{}"))?;
+    Ok(())
+}
+
+/// One GET against the alerts endpoint. Credentials go in on stdin via curl's
+/// `-K -` config so the token never appears in argv.
+fn curl_get(auth: &AlertsAuth, base: &str, offset: u32) -> Result<String> {
+    curl_request(
+        auth,
+        base,
+        &[
+            ("sort", "createdAt".to_string()),
+            ("order", "desc".to_string()),
+            ("size", PAGE_SIZE.to_string()),
+            ("offset", offset.to_string()),
+        ],
+        None,
+    )
 }
 
 /// The cutoff timestamp `window_min` ago, in the same RFC 3339 form the API
@@ -420,5 +536,93 @@ mod tests {
     #[test]
     fn malformed_json_is_an_error_not_a_panic() {
         assert!(parse_alerts_page("not json").is_err());
+    }
+
+    /// Trimmed from a real response captured 2026-08-13. See the spec appendix.
+    const SAMPLE_ALERT: &str = r#"{
+      "id": "823106d9-c5b9-4900-be29-33025114eebc-1786652659622",
+      "tinyId": "428315",
+      "createdAt": "2026-08-13T20:24:19.622Z",
+      "status": "closed",
+      "priority": "P4",
+      "acknowledged": false,
+      "message": "xxxx",
+      "source": "Grafana",
+      "count": 1,
+      "tags": ["Account: 123456789012", "App: reaper", "Environment: DEV1"],
+      "extraProperties": {
+        "alertname": "Read-OK-STATUS-Warning",
+        "Panel_ID": "4",
+        "Threshold": "85",
+        "{{extraProperties}}": "{alertname=Read-OK-STATUS-Warning}"
+      },
+      "description": "Instance i-0abc123def4567890 is unhealthy",
+      "closeTime": "2026-08-13T20:25:19.616Z"
+    }"#;
+
+    #[test]
+    fn a_single_alert_carries_its_description_and_extra_properties() {
+        let a = parse_single_alert(SAMPLE_ALERT).expect("parses");
+        assert_eq!(a.tiny_id, "428315");
+        assert_eq!(a.status, "closed");
+        assert_eq!(a.description, "Instance i-0abc123def4567890 is unhealthy");
+        assert_eq!(a.extra.get("alertname").map(String::as_str), Some("Read-OK-STATUS-Warning"));
+        assert_eq!(a.account, "123456789012");
+        assert_eq!(a.environment, "DEV1");
+    }
+
+    #[test]
+    fn non_string_extra_properties_are_dropped_not_fatal() {
+        // A numeric or nested value must not fail the whole alert.
+        let body = r#"{"id":"x","extraProperties":{"a":"1","b":2,"c":{"d":"e"}}}"#;
+        let a = parse_single_alert(body).expect("parses");
+        assert_eq!(a.extra.get("a").map(String::as_str), Some("1"));
+        assert!(a.extra.get("b").is_none());
+        assert!(a.extra.get("c").is_none());
+    }
+
+    #[test]
+    fn an_alert_with_no_extra_properties_at_all_still_parses() {
+        let a = parse_single_alert(r#"{"id":"x","status":"open"}"#).expect("parses");
+        assert!(a.extra.is_empty());
+        assert!(a.description.is_empty());
+    }
+
+    #[test]
+    fn a_page_still_parses_with_the_new_fields_present() {
+        let body = format!(r#"{{"values":[{SAMPLE_ALERT}]}}"#);
+        let (alerts, next) = parse_alerts_page(&body).expect("parses");
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].description, "Instance i-0abc123def4567890 is unhealthy");
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn the_data_envelope_is_still_accepted() {
+        let body = format!(r#"{{"data":[{SAMPLE_ALERT}]}}"#);
+        let (alerts, _) = parse_alerts_page(&body).expect("parses");
+        assert_eq!(alerts.len(), 1);
+    }
+
+    #[test]
+    fn an_incomplete_auth_is_refused_before_any_request() {
+        let auth = AlertsAuth::default();
+        assert!(fetch_latest(&auth, 10).is_err());
+        assert!(fetch_alert(&auth, "abc").is_err());
+        assert!(acknowledge_alert(&auth, "abc").is_err());
+    }
+
+    #[test]
+    fn an_alert_id_with_a_slash_is_refused() {
+        // The id is interpolated into a URL path. A traversal in it would aim
+        // the request — including the acknowledge POST — at another endpoint.
+        let auth = AlertsAuth {
+            email: "a@b.c".into(),
+            token: "t".into(),
+            cloud_id: "cloud".into(),
+        };
+        assert!(fetch_alert(&auth, "../schedules").is_err());
+        assert!(acknowledge_alert(&auth, "a/b").is_err());
+        assert!(fetch_alert(&auth, "has space").is_err());
     }
 }
