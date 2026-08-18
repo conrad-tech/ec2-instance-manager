@@ -778,12 +778,48 @@ mod tests {
     }
 
     #[test]
-    fn the_script_never_sets_e() {
-        // `set -e` would exit on a failing `down` and never reach `up -d`,
-        // stranding reaper stopped with its watchdog off — the one state this
-        // whole design exists to avoid.
-        assert!(!REAPER_FIX_SH.contains("set -e"));
-        assert!(REAPER_FIX_SH.contains("set -u"));
+    fn the_script_never_enables_errexit_in_any_form() {
+        // Any spelling of exit-on-error -- `-e`, `-o errexit`, or a combined
+        // short form like `-eu`/`-ue` -- would exit on a failing `down` and
+        // never reach `up -d`, stranding reaper stopped with its watchdog
+        // off. A literal grep for "set -e" only catches the first spelling,
+        // so this walks every `set` invocation's flags instead.
+        let mut saw_set_u = false;
+        for line in REAPER_FIX_SH.lines() {
+            let l = line.trim();
+            if l.starts_with('#') || l.is_empty() {
+                continue;
+            }
+            let words: Vec<&str> = l.split_whitespace().collect();
+            if words.first() != Some(&"set") {
+                continue;
+            }
+            let mut i = 1;
+            while i < words.len() {
+                let w = words[i];
+                if w == "-o" {
+                    if let Some(next) = words.get(i + 1) {
+                        assert_ne!(
+                            next.trim_end_matches(';'),
+                            "errexit",
+                            "errexit enabled via -o: {l}"
+                        );
+                    }
+                    i += 2;
+                    continue;
+                }
+                if let Some(flags) = w.strip_prefix('-') {
+                    if !flags.starts_with('-') {
+                        assert!(!flags.contains('e'), "errexit enabled: {l}");
+                        if flags.contains('u') {
+                            saw_set_u = true;
+                        }
+                    }
+                }
+                i += 1;
+            }
+        }
+        assert!(saw_set_u, "script never sets -u");
     }
 
     #[test]
@@ -813,5 +849,24 @@ mod tests {
     #[test]
     fn the_script_asks_compose_for_json() {
         assert!(REAPER_FIX_SH.contains("compose ps --format json"));
+    }
+
+    #[test]
+    fn the_compose_ps_line_does_not_merge_stderr_into_the_parsed_block() {
+        // Everything between the PS markers is parsed as JSON, and any line that
+        // is not JSON downgrades the whole run to Indeterminate. `docker compose`
+        // writes warnings to stderr on every subcommand that loads the compose
+        // file -- the obsolete `version:` key is the common one -- so merging
+        // stderr here turns a successful remediation into a false escalation on
+        // any box with a legacy compose file. stderr stays on stderr, where SSM
+        // captures it separately.
+        let ps_line = REAPER_FIX_SH
+            .lines()
+            .find(|l| l.contains("compose ps"))
+            .expect("the script runs compose ps");
+        assert!(
+            !ps_line.contains("2>&1"),
+            "compose ps must not merge stderr into the parsed block: {ps_line}"
+        );
     }
 }

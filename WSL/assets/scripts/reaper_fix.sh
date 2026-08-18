@@ -49,7 +49,7 @@ fi
 # The authority for the verdict. Everything above is context for a human
 # reading the log.
 echo "__RE_PS_BEGIN__"
-docker compose ps --format json 2>&1
+docker compose ps --format json
 echo "__RE_PS_END__"
 
 echo "__RE_END__"
