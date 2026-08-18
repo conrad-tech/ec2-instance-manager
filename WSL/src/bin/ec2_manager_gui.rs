@@ -21527,9 +21527,10 @@ mod gui {
         /// The on-call lookup could not be answered. Handling degrades to
         /// off call; the fix still runs.
         LookupFailed { detail: String },
-        /// The armed path ran to a conclusion. `code` is the only thing that
-        /// may ever cross the org boundary; `instance` is for the local log
-        /// only.
+        /// The armed path is done trying, whether that's a completed
+        /// remediation or a failure to even start one (e.g. no credentials
+        /// for the target account). `code` is the only thing that may ever
+        /// cross the org boundary; `instance` is for the local log only.
         Outcome { code: String, instance: String },
     }
 
@@ -21557,6 +21558,30 @@ mod gui {
         )
     }
 
+    /// Seam over the two alert-API calls the remediation sequence makes
+    /// (`ack`, then `fetch` for the last look and every stage-2 poll), so
+    /// the *sequence* — not just the pure decision functions it calls — can
+    /// be driven by a test double that records call order and count. The
+    /// real implementation is `JsmAlertOps`, below.
+    trait AlertOps {
+        fn ack(&self, alert_id: &str) -> std::result::Result<(), String>;
+        fn fetch(&self, alert_id: &str) -> std::result::Result<ec2_manager::alerts::Alert, String>;
+    }
+
+    /// The real `AlertOps`: delegates straight to the alerts API.
+    struct JsmAlertOps<'a> {
+        auth: &'a ec2_manager::alerts::AlertsAuth,
+    }
+
+    impl AlertOps for JsmAlertOps<'_> {
+        fn ack(&self, alert_id: &str) -> std::result::Result<(), String> {
+            ec2_manager::alerts::acknowledge_alert(self.auth, alert_id).map_err(|e| e.to_string())
+        }
+        fn fetch(&self, alert_id: &str) -> std::result::Result<ec2_manager::alerts::Alert, String> {
+            ec2_manager::alerts::fetch_alert(self.auth, alert_id).map_err(|e| e.to_string())
+        }
+    }
+
     /// Run the remediation and decide what it earned.
     ///
     /// Order is load-bearing. The acknowledge happens before the fix and only
@@ -21565,18 +21590,22 @@ mod gui {
     /// the first mutating command: once `compose down` has run there is no
     /// standing down, because that would leave reaper stopped with its
     /// watchdog off.
+    ///
+    /// `exec` is the one-shot remote command; it is a closure rather than an
+    /// `AwsContext` + `exec_remote_command` call so a test can substitute a
+    /// canned transcript with no AWS, no SSM and no network. It is called at
+    /// most once (`FnOnce`) — this function never retries the fix itself.
     fn run_reaper_remediation(
-        auth: &ec2_manager::alerts::AlertsAuth,
+        ops: &impl AlertOps,
         cfg: &ec2_manager::features::ReaperFeature,
-        ctx: &AwsContext,
         target: &ec2_manager::reaper::Target,
         on_call: bool,
+        exec: impl FnOnce(&str) -> std::result::Result<String, String>,
     ) -> Option<ec2_manager::reaper::OutcomeCode> {
-        use ec2_manager::alerts;
         use ec2_manager::reaper::{self, OutcomeCode, Verdict};
 
         if on_call {
-            if let Err(e) = alerts::acknowledge_alert(auth, &target.alert_id) {
+            if let Err(e) = ops.ack(&target.alert_id) {
                 // Not fatal: failing to ack costs a duplicate page, whereas
                 // refusing to fix costs the outage.
                 eprintln!("reaper: could not acknowledge {}: {e}", target.instance_id);
@@ -21586,7 +21615,7 @@ mod gui {
         // Last look. A sixty-second self-close is real and observed on this
         // feed. A failed lookup here is logged and the run PROCEEDS — a
         // lookup failure must not block a real remediation.
-        match alerts::fetch_alert(auth, &target.alert_id) {
+        match ops.fetch(&target.alert_id) {
             Ok(a) if reaper::alert_is_closed(&a.status) => {
                 eprintln!("reaper: {} closed before we acted", target.instance_id);
                 return None;
@@ -21597,13 +21626,7 @@ mod gui {
 
         // ---- committed from here: no standing down between `down` and
         // `up -d` would leave the stack down with its watchdog off. ----
-        let out = match exec_remote_command(
-            &None,
-            ctx,
-            &target.instance_id,
-            &reaper_fix_command(),
-            cfg.send_command_timeout(),
-        ) {
+        let out = match exec(&reaper_fix_command()) {
             Ok(o) => o,
             Err(e) => {
                 eprintln!("reaper: send-command failed on {}: {e}", target.instance_id);
@@ -21630,7 +21653,7 @@ mod gui {
         let mut closed = false;
         while std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_secs(30));
-            match alerts::fetch_alert(auth, &target.alert_id) {
+            match ops.fetch(&target.alert_id) {
                 Ok(a) if reaper::alert_is_closed(&a.status) => {
                     closed = true;
                     break;
@@ -21644,6 +21667,27 @@ mod gui {
     }
 
     /// Poll the alert feed and decide what reaper remediation is due.
+    ///
+    /// Each armed remediation runs on its own detached thread — the loop
+    /// below only ever blocks on the network calls needed to decide whether
+    /// an alert is due, never on a remediation itself. `run_reaper_remediation`
+    /// can take the whole stage-2 window (up to ~17 minutes end to end); if
+    /// it ran inline here, a second, independent incident tripping around
+    /// the same time would not even be *fetched* again until the first one's
+    /// window finished. `ReaperState` stays owned by this thread and is
+    /// never shared or locked — `mark_handled` runs here, before the spawn,
+    /// so two polls can never both pick up the same alert before either
+    /// marks it; everything the spawned thread needs (the auth, the config,
+    /// the app config, the target) is cloned in, not shared.
+    ///
+    /// The spawned handle is dropped, not joined: on app close the process
+    /// exits and every in-flight remediation thread is killed with it,
+    /// mid-`ack`/`fetch`/`exec_remote_command` — there is no graceful
+    /// shutdown here, consistent with every other worker thread in this
+    /// file. If `exec_remote_command` had already been sent, the SSM command
+    /// keeps running on the instance regardless (it was fire-and-forget from
+    /// the app's point of view); what is lost is only this app's record of
+    /// the outcome and the ack/verdict/close bookkeeping around it.
     fn start_reaper_poll(
         auth: ec2_manager::alerts::AlertsAuth,
         cfg: ec2_manager::features::ReaperFeature,
@@ -21723,49 +21767,71 @@ mod gui {
                                 continue;
                             }
 
-                            // Marked handled BEFORE the remediation runs: it
-                            // blocks for up to the whole stage-2 window, and
-                            // marking afterwards would let the next poll pick
-                            // up the same alert again.
+                            // Marked handled BEFORE the remediation runs and
+                            // BEFORE the spawn: it blocks for up to the whole
+                            // stage-2 window, and marking afterwards (or from
+                            // inside the spawned thread) would let the next
+                            // poll iteration pick up the same alert again
+                            // while the first is still in flight.
                             state.mark_handled(
                                 &target.alert_id,
                                 &target.instance_id,
                                 now_ms,
                             );
 
-                            let ctx = match build_context_with_profile(
-                                Mode::Live,
-                                &app_config,
-                                None,
-                                Some(target.account_id.as_str()),
-                            ) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    eprintln!(
-                                        "reaper: no credentials for {}: {e}",
-                                        target.account_id
-                                    );
-                                    let code = if on_call {
-                                        reaper::OutcomeCode::Failure
-                                    } else {
-                                        reaper::OutcomeCode::FailureQuiet
-                                    };
-                                    let _ = tx.send(ReaperEvent::Outcome {
+                            // Moved in by value: `target` is owned here and
+                            // not used again this iteration, so it moves
+                            // rather than clones. `auth`/`cfg`/`app_config`
+                            // are needed again on the next iteration and the
+                            // next poll, so those are cloned, not moved.
+                            let auth_for_thread = auth.clone();
+                            let cfg_for_thread = cfg.clone();
+                            let app_config_for_thread = app_config.clone();
+                            let tx_for_thread = tx.clone();
+                            std::thread::spawn(move || {
+                                let target = target;
+                                let ctx = match build_context_with_profile(
+                                    Mode::Live,
+                                    &app_config_for_thread,
+                                    None,
+                                    Some(target.account_id.as_str()),
+                                ) {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "reaper: no credentials for {}: {e}",
+                                            target.account_id
+                                        );
+                                        let code = if on_call {
+                                            reaper::OutcomeCode::Failure
+                                        } else {
+                                            reaper::OutcomeCode::FailureQuiet
+                                        };
+                                        let _ = tx_for_thread.send(ReaperEvent::Outcome {
+                                            code: code.as_str().to_string(),
+                                            instance: target.instance_id.clone(),
+                                        });
+                                        return;
+                                    }
+                                };
+
+                                let ops = JsmAlertOps { auth: &auth_for_thread };
+                                let timeout = cfg_for_thread.send_command_timeout();
+                                let iid = target.instance_id.clone();
+                                let outcome = run_reaper_remediation(
+                                    &ops,
+                                    &cfg_for_thread,
+                                    &target,
+                                    on_call,
+                                    |cmd| exec_remote_command(&None, &ctx, &iid, cmd, timeout),
+                                );
+                                if let Some(code) = outcome {
+                                    let _ = tx_for_thread.send(ReaperEvent::Outcome {
                                         code: code.as_str().to_string(),
                                         instance: target.instance_id.clone(),
                                     });
-                                    continue;
                                 }
-                            };
-
-                            if let Some(code) =
-                                run_reaper_remediation(&auth, &cfg, &ctx, &target, on_call)
-                            {
-                                let _ = tx.send(ReaperEvent::Outcome {
-                                    code: code.as_str().to_string(),
-                                    instance: target.instance_id.clone(),
-                                });
-                            }
+                            });
                         }
                     }
                     Err(e) => {
@@ -23682,6 +23748,191 @@ mod gui {
             let text = String::from_utf8(decoded).expect("utf8");
             assert!(text.contains("__RE_BEGIN__"));
             assert!(text.contains("compose up -d"));
+        }
+
+        /// Test double for `AlertOps`. Records every call (in order) so a
+        /// test can assert both count and ordering — the thing the pure
+        /// decision functions (`parse_verdict`, `decide_outcome`,
+        /// `alert_is_closed`) cannot cover, because none of them see the
+        /// *sequence* `run_reaper_remediation` drives them in.
+        struct FakeAlertOps {
+            log: std::cell::RefCell<Vec<&'static str>>,
+            ack_ok: bool,
+            /// What every `fetch` call reports — the last look and any
+            /// stage-2 poll alike. None of the tests below need a fetch
+            /// answer to change partway through, because every one of them
+            /// is set up to return `Verdict::Failed`, which returns before
+            /// the stage-2 loop is ever entered (and its 30s sleep with it).
+            fetch_result: std::result::Result<&'static str, &'static str>,
+        }
+
+        impl AlertOps for FakeAlertOps {
+            fn ack(&self, _alert_id: &str) -> std::result::Result<(), String> {
+                self.log.borrow_mut().push("ack");
+                if self.ack_ok {
+                    Ok(())
+                } else {
+                    Err("ack failed".to_string())
+                }
+            }
+            fn fetch(
+                &self,
+                _alert_id: &str,
+            ) -> std::result::Result<ec2_manager::alerts::Alert, String> {
+                self.log.borrow_mut().push("fetch");
+                match self.fetch_result {
+                    Ok(status) => Ok(ec2_manager::alerts::Alert {
+                        status: status.to_string(),
+                        ..Default::default()
+                    }),
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+        }
+
+        fn test_reaper_target() -> ec2_manager::reaper::Target {
+            ec2_manager::reaper::Target {
+                alert_id: "alert-1".to_string(),
+                instance_id: "i-0abc123def4567890".to_string(),
+                account_id: "111111111111".to_string(),
+                environment: "DEV1".to_string(),
+            }
+        }
+
+        /// A transcript `parse_verdict` reads as `Verdict::Failed` — the
+        /// shortest one, since `RE_NODIR` short-circuits before the
+        /// `compose ps` block is even looked for. Used so every ordering
+        /// test below returns before the stage-2 loop (and its 30s sleep)
+        /// is ever entered — none of these tests are about stage 2.
+        fn failing_transcript() -> String {
+            use ec2_manager::reaper::{RE_BEGIN, RE_END, RE_NODIR};
+            format!("{RE_BEGIN}\n{RE_NODIR}\n{RE_END}\n")
+        }
+
+        #[test]
+        fn off_call_never_acknowledges() {
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let _ = run_reaper_remediation(&ops, &cfg, &target, false, |_| {
+                Ok(failing_transcript())
+            });
+            assert!(!ops.log.borrow().contains(&"ack"));
+        }
+
+        #[test]
+        fn a_failed_on_call_lookup_degrading_to_off_call_never_acknowledges() {
+            // The poll loop passes `on_call = false` whenever the lookup
+            // itself failed (see `start_reaper_poll`) — from
+            // `run_reaper_remediation`'s point of view that is identical to
+            // being off call, so this is the same assertion under the name
+            // the failure mode is actually known by.
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let _ = run_reaper_remediation(&ops, &cfg, &target, false, |_| {
+                Ok(failing_transcript())
+            });
+            assert_eq!(ops.log.borrow().iter().filter(|c| **c == "ack").count(), 0);
+        }
+
+        #[test]
+        fn on_call_acknowledges_exactly_once_before_the_first_fetch() {
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let _ = run_reaper_remediation(&ops, &cfg, &target, true, |_| {
+                Ok(failing_transcript())
+            });
+            let log = ops.log.borrow();
+            assert_eq!(log.iter().filter(|c| **c == "ack").count(), 1);
+            assert_eq!(log.first(), Some(&"ack"));
+            assert_eq!(log.iter().position(|c| *c == "fetch"), Some(1));
+        }
+
+        #[test]
+        fn an_alert_already_closed_at_the_last_look_never_execs() {
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("closed"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let exec_calls = std::cell::Cell::new(0);
+            let outcome = run_reaper_remediation(&ops, &cfg, &target, true, |_| {
+                exec_calls.set(exec_calls.get() + 1);
+                Ok(failing_transcript())
+            });
+            assert_eq!(exec_calls.get(), 0);
+            assert!(outcome.is_none());
+        }
+
+        #[test]
+        fn a_failed_verdict_takes_zero_stage_2_fetches() {
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let outcome = run_reaper_remediation(&ops, &cfg, &target, true, |_| {
+                Ok(failing_transcript())
+            });
+            // Exactly one fetch: the last look. A stage-2 poll would be a
+            // second one, and `Verdict::Failed` must return before that
+            // loop is ever entered.
+            assert_eq!(ops.log.borrow().iter().filter(|c| **c == "fetch").count(), 1);
+            assert_eq!(outcome, Some(ec2_manager::reaper::OutcomeCode::Failure));
+        }
+
+        #[test]
+        fn a_failed_acknowledge_still_proceeds_to_exec() {
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: false,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let exec_calls = std::cell::Cell::new(0);
+            let outcome = run_reaper_remediation(&ops, &cfg, &target, true, |_| {
+                exec_calls.set(exec_calls.get() + 1);
+                Ok(failing_transcript())
+            });
+            assert_eq!(exec_calls.get(), 1);
+            assert!(outcome.is_some());
+        }
+
+        #[test]
+        fn a_failed_last_look_still_proceeds_to_exec() {
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Err("jsm unreachable"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let exec_calls = std::cell::Cell::new(0);
+            let outcome = run_reaper_remediation(&ops, &cfg, &target, false, |_| {
+                exec_calls.set(exec_calls.get() + 1);
+                Ok(failing_transcript())
+            });
+            assert_eq!(exec_calls.get(), 1);
+            assert!(outcome.is_some());
         }
 
         /// One candidate means there is no choice to make, so the dialog
