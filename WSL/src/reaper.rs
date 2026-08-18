@@ -168,6 +168,18 @@ pub fn parse_verdict(output: &str) -> Verdict {
         return Verdict::Failed("/opt/reaper is not present on this instance".to_string());
     }
 
+    // Exactly one of each, or the block's boundaries are not trustworthy.
+    // A stray end marker — echoed by a container log line, or by shell
+    // tracing — would truncate the block and hide a failing service behind
+    // a prefix of healthy ones.
+    let begins = output.matches(RE_PS_BEGIN).count();
+    let ends = output.matches(RE_PS_END).count();
+    if begins != 1 || ends != 1 {
+        return Verdict::Indeterminate(format!(
+            "compose ps block markers appeared {begins}x/{ends}x, expected 1x/1x"
+        ));
+    }
+
     let Some(block) = output
         .split_once(RE_PS_BEGIN)
         .and_then(|(_, rest)| rest.split_once(RE_PS_END))
@@ -186,12 +198,20 @@ pub fn parse_verdict(output: &str) -> Verdict {
         }
     }
 
+    // A line we could not read is a service whose state we do not know.
+    // Judging the stack from the lines that happened to parse would report
+    // a box as fixed on partial evidence — the one outcome that must be
+    // impossible here. Note this is Indeterminate, not Failed: we did not
+    // observe a failure, we failed to observe.
+    if unparsed > 0 {
+        return Verdict::Indeterminate(format!(
+            "compose ps output partly unreadable ({unparsed} line(s)); \
+             stack state not established"
+        ));
+    }
+
     if records.is_empty() {
-        return if unparsed > 0 {
-            Verdict::Indeterminate(format!("compose ps output unreadable ({unparsed} lines)"))
-        } else {
-            Verdict::Failed("compose ps listed no services — nothing came back up".to_string())
-        };
+        return Verdict::Failed("compose ps listed no services — nothing came back up".to_string());
     }
 
     let down: Vec<String> = records
@@ -432,8 +452,8 @@ mod tests {
 
     fn run_output(ps: &str) -> String {
         format!(
-            "__RE_BEGIN__\n__RE_WD_STOPPED__\n__RE_DOWN_OK__\n__RE_UP_OK__\n\
-             __RE_PS_BEGIN__\n{ps}\n__RE_PS_END__\n__RE_END__\n"
+            "{RE_BEGIN}\n__RE_WD_STOPPED__\n__RE_DOWN_OK__\n__RE_UP_OK__\n\
+             {RE_PS_BEGIN}\n{ps}\n{RE_PS_END}\n{RE_END}\n"
         )
     }
 
@@ -478,8 +498,8 @@ mod tests {
         // The command was cut off — by the send-command timeout, a dropped
         // session, the box dying. Reporting success here is the one outcome
         // that must be impossible.
-        let cut = "__RE_BEGIN__\n__RE_WD_STOPPED__\n__RE_DOWN_OK__\n";
-        assert!(matches!(parse_verdict(cut), Verdict::Indeterminate(_)));
+        let cut = format!("{RE_BEGIN}\n__RE_WD_STOPPED__\n__RE_DOWN_OK__\n");
+        assert!(matches!(parse_verdict(&cut), Verdict::Indeterminate(_)));
     }
 
     #[test]
@@ -489,8 +509,8 @@ mod tests {
 
     #[test]
     fn a_missing_directory_is_a_failure_not_a_success() {
-        let out = "__RE_BEGIN__\n__RE_NODIR__\n__RE_END__\n";
-        match parse_verdict(out) {
+        let out = format!("{RE_BEGIN}\n{RE_NODIR}\n{RE_END}\n");
+        match parse_verdict(&out) {
             Verdict::Failed(why) => assert!(why.contains("/opt/reaper"), "got {why}"),
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -510,8 +530,8 @@ mod tests {
         // `compose ps` is the authority, not the step marker — the same rule as
         // Tunnel::is_bound: ask the thing itself.
         let out = format!(
-            "__RE_BEGIN__\n__RE_WD_STOPPED__\n__RE_DOWN_OK__\n__RE_UP_FAIL__\n\
-             __RE_PS_BEGIN__\n{}\n__RE_PS_END__\n__RE_END__\n",
+            "{RE_BEGIN}\n__RE_WD_STOPPED__\n__RE_DOWN_OK__\n__RE_UP_FAIL__\n\
+             {RE_PS_BEGIN}\n{}\n{RE_PS_END}\n{RE_END}\n",
             r#"{"Name":"reaper-api","State":"running"}"#
         );
         assert_eq!(parse_verdict(&out), Verdict::Success);
@@ -521,11 +541,34 @@ mod tests {
     fn a_failed_watchdog_stop_does_not_by_itself_fail_the_run() {
         // The watchdog may already be stopped. What matters is the stack.
         let out = format!(
-            "__RE_BEGIN__\n__RE_WD_FAIL__\n__RE_DOWN_OK__\n__RE_UP_OK__\n\
-             __RE_PS_BEGIN__\n{}\n__RE_PS_END__\n__RE_END__\n",
+            "{RE_BEGIN}\n__RE_WD_FAIL__\n__RE_DOWN_OK__\n__RE_UP_OK__\n\
+             {RE_PS_BEGIN}\n{}\n{RE_PS_END}\n{RE_END}\n",
             r#"{"Name":"reaper-api","State":"running"}"#
         );
         assert_eq!(parse_verdict(&out), Verdict::Success);
+    }
+
+    #[test]
+    fn a_partly_unreadable_compose_block_is_indeterminate_not_success() {
+        // One service parses and is up; the other line is garbage. Judging from
+        // the readable half alone would report the stack as fixed while a
+        // service's state was never established.
+        let ps = "{\"Name\":\"reaper-api\",\"State\":\"running\"}\nreaper-worker exited(1";
+        assert!(matches!(parse_verdict(&run_output(ps)), Verdict::Indeterminate(_)));
+    }
+
+    #[test]
+    fn a_repeated_ps_end_marker_is_indeterminate_not_a_truncated_success() {
+        // A stray end marker before the real one would otherwise truncate the
+        // block, hiding the failing service that follows it. The doubled
+        // marker here is the point of the test, so it stays literal rather
+        // than interpolating RE_PS_END once.
+        let out = format!(
+            "__RE_BEGIN__\n__RE_PS_BEGIN__\n{}\n__RE_PS_END__\n{}\n__RE_PS_END__\n__RE_END__\n",
+            r#"{"Name":"reaper-api","State":"running"}"#,
+            r#"{"Name":"reaper-worker","State":"exited"}"#
+        );
+        assert!(matches!(parse_verdict(&out), Verdict::Indeterminate(_)));
     }
 
     const COOLDOWN: u64 = 30 * 60 * 1000;
