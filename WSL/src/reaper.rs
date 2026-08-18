@@ -107,6 +107,106 @@ pub fn match_alert(alert: &Alert, cfg: &ReaperFeature) -> Option<Target> {
     })
 }
 
+pub const RE_BEGIN: &str = "__RE_BEGIN__";
+pub const RE_END: &str = "__RE_END__";
+pub const RE_NODIR: &str = "__RE_NODIR__";
+pub const RE_PS_BEGIN: &str = "__RE_PS_BEGIN__";
+pub const RE_PS_END: &str = "__RE_PS_END__";
+
+/// What the remote run proved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// `compose ps` reported every service up.
+    Success,
+    /// The run completed and the stack is not up.
+    Failed(String),
+    /// The run's outcome could not be established. Never treated as success,
+    /// and reported separately from `Failed` so nobody is sent to debug a fix
+    /// that may well have worked.
+    Indeterminate(String),
+}
+
+/// Is one `compose ps` record a running service?
+fn record_is_running(v: &serde_json::Value) -> bool {
+    let state = v.get("State").and_then(|s| s.as_str()).unwrap_or("");
+    if state.eq_ignore_ascii_case("running") {
+        return true;
+    }
+    // Some compose versions put "Up 3 seconds" in Status and a lifecycle
+    // word in State.
+    v.get("Status")
+        .and_then(|s| s.as_str())
+        .map(|s| s.trim_start().starts_with("Up"))
+        .unwrap_or(false)
+}
+
+fn record_name(v: &serde_json::Value) -> String {
+    v.get("Name")
+        .or_else(|| v.get("Service"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("(unnamed)")
+        .to_string()
+}
+
+/// Decide what the remote output proves.
+///
+/// `compose ps` is the authority, not the per-step markers: a 30s `timeout`
+/// can kill an `up -d` that in fact succeeded a moment later, so treating
+/// `__RE_UP_FAIL__` as the verdict would escalate a working fix.
+pub fn parse_verdict(output: &str) -> Verdict {
+    if !output.contains(RE_BEGIN) {
+        return Verdict::Indeterminate(
+            "no begin marker — the script did not start".to_string(),
+        );
+    }
+    if !output.contains(RE_END) {
+        return Verdict::Indeterminate(
+            "no end marker — the run was cut off before it finished".to_string(),
+        );
+    }
+    if output.contains(RE_NODIR) {
+        return Verdict::Failed("/opt/reaper is not present on this instance".to_string());
+    }
+
+    let Some(block) = output
+        .split_once(RE_PS_BEGIN)
+        .and_then(|(_, rest)| rest.split_once(RE_PS_END))
+        .map(|(inner, _)| inner)
+    else {
+        return Verdict::Indeterminate("no compose ps block in the output".to_string());
+    };
+
+    let mut records: Vec<serde_json::Value> = Vec::new();
+    let mut unparsed = 0usize;
+    for line in block.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(serde_json::Value::Array(items)) => records.extend(items),
+            Ok(v) => records.push(v),
+            Err(_) => unparsed += 1,
+        }
+    }
+
+    if records.is_empty() {
+        return if unparsed > 0 {
+            Verdict::Indeterminate(format!("compose ps output unreadable ({unparsed} lines)"))
+        } else {
+            Verdict::Failed("compose ps listed no services — nothing came back up".to_string())
+        };
+    }
+
+    let down: Vec<String> = records
+        .iter()
+        .filter(|r| !record_is_running(r))
+        .map(record_name)
+        .collect();
+
+    if down.is_empty() {
+        Verdict::Success
+    } else {
+        Verdict::Failed(format!("not running after restart: {}", down.join(", ")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +338,103 @@ mod tests {
         // EC2 ids are lowercase hex; accepting uppercase would match
         // unrelated identifiers that happen to start "I-".
         assert_eq!(find_instance_id("i-0ABC1234"), None);
+    }
+
+    fn run_output(ps: &str) -> String {
+        format!(
+            "__RE_BEGIN__\n__RE_WD_STOPPED__\n__RE_DOWN_OK__\n__RE_UP_OK__\n\
+             __RE_PS_BEGIN__\n{ps}\n__RE_PS_END__\n__RE_END__\n"
+        )
+    }
+
+    #[test]
+    fn every_service_running_is_a_success() {
+        let ps = r#"{"Name":"reaper-api","State":"running"}
+{"Name":"reaper-worker","State":"running"}"#;
+        assert_eq!(parse_verdict(&run_output(ps)), Verdict::Success);
+    }
+
+    #[test]
+    fn a_json_array_from_compose_is_accepted_too() {
+        // Older compose emits one array; newer emits NDJSON. Both are real.
+        let ps = r#"[{"Name":"reaper-api","State":"running"}]"#;
+        assert_eq!(parse_verdict(&run_output(ps)), Verdict::Success);
+    }
+
+    #[test]
+    fn an_up_status_string_counts_as_running() {
+        let ps = r#"{"Name":"reaper-api","State":"exited","Status":"Up 3 seconds"}"#;
+        assert_eq!(parse_verdict(&run_output(ps)), Verdict::Success);
+    }
+
+    #[test]
+    fn one_service_not_running_is_a_failure_naming_it() {
+        let ps = r#"{"Name":"reaper-api","State":"running"}
+{"Name":"reaper-worker","State":"exited"}"#;
+        match parse_verdict(&run_output(ps)) {
+            Verdict::Failed(why) => assert!(why.contains("reaper-worker"), "got {why}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_services_at_all_is_a_failure() {
+        // `compose ps` succeeding with an empty list means nothing came back up.
+        assert!(matches!(parse_verdict(&run_output("")), Verdict::Failed(_)));
+    }
+
+    #[test]
+    fn a_missing_end_marker_is_indeterminate_never_success() {
+        // The command was cut off — by the send-command timeout, a dropped
+        // session, the box dying. Reporting success here is the one outcome
+        // that must be impossible.
+        let cut = "__RE_BEGIN__\n__RE_WD_STOPPED__\n__RE_DOWN_OK__\n";
+        assert!(matches!(parse_verdict(cut), Verdict::Indeterminate(_)));
+    }
+
+    #[test]
+    fn a_missing_begin_marker_is_indeterminate() {
+        assert!(matches!(parse_verdict("random ssm noise"), Verdict::Indeterminate(_)));
+    }
+
+    #[test]
+    fn a_missing_directory_is_a_failure_not_a_success() {
+        let out = "__RE_BEGIN__\n__RE_NODIR__\n__RE_END__\n";
+        match parse_verdict(out) {
+            Verdict::Failed(why) => assert!(why.contains("/opt/reaper"), "got {why}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unparseable_compose_output_is_indeterminate_not_failed() {
+        // Escalating "the fix failed" when we only failed to *read* the result
+        // sends someone to debug the wrong thing.
+        let out = run_output("Error response from daemon: something");
+        assert!(matches!(parse_verdict(&out), Verdict::Indeterminate(_)));
+    }
+
+    #[test]
+    fn a_timeout_killed_up_still_passes_when_compose_ps_says_running() {
+        // 30s `timeout` can kill an `up -d` that succeeded a moment later.
+        // `compose ps` is the authority, not the step marker — the same rule as
+        // Tunnel::is_bound: ask the thing itself.
+        let out = format!(
+            "__RE_BEGIN__\n__RE_WD_STOPPED__\n__RE_DOWN_OK__\n__RE_UP_FAIL__\n\
+             __RE_PS_BEGIN__\n{}\n__RE_PS_END__\n__RE_END__\n",
+            r#"{"Name":"reaper-api","State":"running"}"#
+        );
+        assert_eq!(parse_verdict(&out), Verdict::Success);
+    }
+
+    #[test]
+    fn a_failed_watchdog_stop_does_not_by_itself_fail_the_run() {
+        // The watchdog may already be stopped. What matters is the stack.
+        let out = format!(
+            "__RE_BEGIN__\n__RE_WD_FAIL__\n__RE_DOWN_OK__\n__RE_UP_OK__\n\
+             __RE_PS_BEGIN__\n{}\n__RE_PS_END__\n__RE_END__\n",
+            r#"{"Name":"reaper-api","State":"running"}"#
+        );
+        assert_eq!(parse_verdict(&out), Verdict::Success);
     }
 }
