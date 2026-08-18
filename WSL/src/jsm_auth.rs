@@ -3,12 +3,20 @@
 //!
 //! `assets/features.json` is committed, so it is the *last* resort and
 //! ships every value blank. The everyday source is Windows Credential
-//! Manager, holding four separate generic credentials:
+//! Manager, holding five separate generic credentials:
 //!
-//! - `ec2_manager/jsm`             — username = Atlassian email, password = API token
-//! - `ec2_manager/jsm_cloud_id`    — password = cloud id (username is a placeholder)
-//! - `ec2_manager/jsm_schedule_id` — password = schedule id (username ignored)
-//! - `ec2_manager/jsm_account_id`  — password = account id (username ignored)
+//! - `ec2_manager/jsm`               — username = Atlassian email, password = API token
+//! - `ec2_manager/jsm_cloud_id`      — password = cloud id (username is a placeholder)
+//! - `ec2_manager/jsm_schedule_id`   — password = schedule id (username ignored)
+//! - `ec2_manager/jsm_account_id`    — password = the caller's *Atlassian*
+//!   account id (e.g. `5b10ac8d82e05b22cc7d4ef5`), used only to find
+//!   yourself in the JSM on-call response. Unrelated to any AWS account id
+//!   — elsewhere in this codebase (`Alert.account`, `Target.account_id`)
+//!   `account_id` means an AWS account, so this constant is named
+//!   `ATLASSIAN_ACCOUNT_ID_TARGET` to keep the two from being confused.
+//! - `ec2_manager/opsgenie_api_key`  — password = the Opsgenie API key
+//!   (username ignored). See `opsgenie_api_key` for why this is a
+//!   different authentication scheme, not just another credential.
 //!
 //! Every value resolves environment → credential store → compiled-in
 //! fallback, checked independently per field so one present override never
@@ -23,8 +31,11 @@ pub const JSM_CREDENTIAL_TARGET: &str = "ec2_manager/jsm";
 pub const CLOUD_ID_TARGET: &str = "ec2_manager/jsm_cloud_id";
 /// Credential Manager target for the on-call schedule id (password field only).
 pub const SCHEDULE_ID_TARGET: &str = "ec2_manager/jsm_schedule_id";
-/// Credential Manager target for the account id (password field only).
-pub const ACCOUNT_ID_TARGET: &str = "ec2_manager/jsm_account_id";
+/// Credential Manager target for the caller's *Atlassian* account id
+/// (password field only) — unrelated to any AWS account id.
+pub const ATLASSIAN_ACCOUNT_ID_TARGET: &str = "ec2_manager/jsm_account_id";
+/// Credential Manager target for the Opsgenie API key (password field only).
+pub const OPSGENIE_API_KEY_TARGET: &str = "ec2_manager/opsgenie_api_key";
 
 /// First non-blank of the candidates, trimmed. Blank-but-set is treated as
 /// absent: `export JIRA_TOKEN=` must not shadow a real stored credential.
@@ -96,6 +107,35 @@ pub fn load_auth(feature: &AlertsFeature) -> AlertsAuth {
         std::env::var("JIRA_TOKEN").ok(),
         std::env::var("CLOUD_ID").ok(),
     )
+}
+
+/// Wraps a resolved value as `Some` unless it is blank, matching the
+/// blank-is-absent rule the rest of this module uses. Pure and separately
+/// testable, since `opsgenie_api_key` itself is not — it is hardwired to
+/// the real `OPSGENIE_API_KEY` environment variable.
+fn some_unless_blank(v: String) -> Option<String> {
+    if v.trim().is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// The Opsgenie API key, if one is configured.
+///
+/// Separate from the Atlassian email/token pair because it is a different
+/// authentication scheme, not a different credential for the same one:
+/// Opsgenie-lineage endpoints take `Authorization: GenieKey <key>`, where
+/// the Jira REST endpoints take Basic `email:token`. The JSM Ops schedule
+/// endpoints are Opsgenie-lineage, which is a candidate explanation for the
+/// 403 seen there while the alerts endpoint works on Basic.
+///
+/// Returns `None` when unset, so a caller can fall back to Basic auth
+/// rather than failing — this is an addition to the existing credentials,
+/// never a replacement for them.
+pub fn opsgenie_api_key() -> Option<String> {
+    let v = resolve_id("OPSGENIE_API_KEY", OPSGENIE_API_KEY_TARGET, "");
+    some_unless_blank(v)
 }
 
 #[cfg(test)]
@@ -230,5 +270,46 @@ mod tests {
         std::env::remove_var(var);
         let result = resolve_id(var, "ec2_manager/does_not_exist_d", "");
         assert_eq!(result, "");
+    }
+
+    // -- opsgenie_api_key ---------------------------------------------------
+    //
+    // `opsgenie_api_key` itself is hardwired to the real `OPSGENIE_API_KEY`
+    // variable, so it is not called directly here — a developer with that
+    // variable set locally would get a different (correct!) result than CI,
+    // which is exactly the flakiness the coordinator flagged. Instead:
+    // `some_unless_blank` (the wrapping logic) is tested directly, and the
+    // env-var path it wraps is exercised through `resolve_id` with a
+    // throwaway variable name, the same way the tests above do.
+
+    #[test]
+    fn some_unless_blank_treats_whitespace_as_absent() {
+        assert_eq!(some_unless_blank("   ".to_string()), None);
+        assert_eq!(some_unless_blank(String::new()), None);
+    }
+
+    #[test]
+    fn some_unless_blank_keeps_a_real_value() {
+        assert_eq!(
+            some_unless_blank("genie-key-123".to_string()),
+            Some("genie-key-123".to_string())
+        );
+    }
+
+    #[test]
+    fn the_opsgenie_style_resolution_yields_none_when_nothing_is_set() {
+        let var = "TEST_REAPER_ID_E";
+        std::env::remove_var(var);
+        let resolved = resolve_id(var, "ec2_manager/does_not_exist_e", "");
+        assert_eq!(some_unless_blank(resolved), None);
+    }
+
+    #[test]
+    fn the_opsgenie_style_resolution_yields_some_when_the_environment_is_set() {
+        let var = "TEST_REAPER_ID_F";
+        std::env::set_var(var, "genie-key-123");
+        let resolved = resolve_id(var, "ec2_manager/does_not_exist_f", "");
+        std::env::remove_var(var);
+        assert_eq!(some_unless_blank(resolved), Some("genie-key-123".to_string()));
     }
 }
