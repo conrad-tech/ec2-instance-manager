@@ -400,6 +400,20 @@ pub fn acknowledge_alert(auth: &AlertsAuth, alert_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Raw body of the schedule's current on-call response. Returned unparsed:
+/// `oncall::response_mentions` scans it, since the shape is not stable.
+pub fn fetch_on_calls(auth: &AlertsAuth, schedule_id: &str) -> Result<String> {
+    require_complete(auth)?;
+    // Same character rules — it is interpolated into a URL path, and relaxing
+    // this would widen the validation that also guards the acknowledge POST.
+    // Consequence: `schedule_id` must be the id, not a friendly schedule name
+    // (names may contain spaces). The error names the field, so this is
+    // self-explanatory when someone configures a name by mistake.
+    validate_alert_id(schedule_id)?;
+    let url = format!("{}/schedules/{schedule_id}/on-calls", ops_base(auth));
+    curl_request(auth, &url, &[("flat", "true".to_string())], None)
+}
+
 /// One GET against the alerts endpoint. Credentials go in on stdin via curl's
 /// `-K -` config so the token never appears in argv.
 fn curl_get(auth: &AlertsAuth, base: &str, offset: u32) -> Result<String> {
