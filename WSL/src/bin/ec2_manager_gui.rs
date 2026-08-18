@@ -21598,9 +21598,9 @@ mod gui {
         }
     }
 
-    /// May a remediation proceed with this account id and auth status?
+    /// May a remediation proceed with this account id, auth status, and mode?
     ///
-    /// `build_context_with_profile` never returns `Err` for either of the two
+    /// `build_context_with_profile` never returns `Err` for either of two
     /// cases this exists to catch — an account id absent from the local
     /// credentials file, or a blank `Alert.account` from a missing `Account:`
     /// tag — it returns `Ok(ctx)` with `auth_status` set to `Expired` or
@@ -21612,8 +21612,27 @@ mod gui {
     /// `start_port_tunnel`'s refusal to spawn without `AuthStatus::Ok`; the
     /// stakes here are worse, because this path mutates the page before it
     /// can fail.
-    fn remediation_precondition_met(account_id: &str, status: AuthStatus) -> bool {
-        !account_id.trim().is_empty() && status == AuthStatus::Ok
+    ///
+    /// `mode` closes a second, sharper gap: `build_context_with_profile`
+    /// resolves `profile` from the account id *before* branching on
+    /// `Mode::Sim`, and the Sim branch's early return reuses that same,
+    /// potentially real profile — it fakes `account_id`/`arn`/`user_id` and
+    /// hardcodes `auth_status: Ok`, so neither of the two checks above stops
+    /// it. `exec_remote_command`/`ssm_send_command` never look at `ctx.mode`
+    /// either — they shell to the real `aws` binary unconditionally. So a
+    /// Sim-mode launch of an app with reaper armed, pointed at an alert whose
+    /// `Account:` tag matches an account the user has real working
+    /// credentials for, would otherwise run a genuine `compose down` on a
+    /// real production instance. `ctx.mode` is trustworthy here even though
+    /// `ctx.profile`/`auth_status` are not for this purpose: it is always set
+    /// to the literal `mode` argument `build_context_with_profile` was
+    /// called with (see both its `Sim` and non-`Sim` return paths in
+    /// `src/aws_context.rs`), never derived from anything Sim fakes. This is
+    /// deliberately a reaper-local check rather than a change to
+    /// `aws_context.rs`/`ssm_send_command` — both are shared by many other
+    /// callers, and broadening that blast radius is out of scope here.
+    fn remediation_precondition_met(account_id: &str, status: AuthStatus, mode: &Mode) -> bool {
+        !account_id.trim().is_empty() && status == AuthStatus::Ok && *mode == Mode::Live
     }
 
     /// Gate `run_reaper_remediation` on `remediation_precondition_met`, and
@@ -21637,7 +21656,21 @@ mod gui {
         exec: impl FnOnce(&AwsContext, &str) -> std::result::Result<String, String>,
     ) -> Option<ec2_manager::reaper::OutcomeCode> {
         let ctx = match ctx_result {
-            Ok(c) if remediation_precondition_met(account_id, c.auth_status) => c,
+            Ok(c) if remediation_precondition_met(account_id, c.auth_status, &c.mode) => c,
+            Ok(c) if c.mode != Mode::Live => {
+                // Distinct from the auth_status/account_id arm below, and
+                // logged at warn: someone who armed the feature and then
+                // launched in Sim needs to see *why* nothing happened, not
+                // have it look like the poll thread silently did nothing.
+                eprintln!(
+                    "reaper: warn: refusing to remediate {} — app is running in {} mode, \
+                     not live; armed reaper remediation only runs in Live mode — \
+                     acknowledge withheld",
+                    target.instance_id,
+                    c.mode.as_str()
+                );
+                return Some(reaper_failure_tier(on_call));
+            }
             Ok(c) => {
                 eprintln!(
                     "reaper: refusing to remediate {} — account={account_id:?} \
@@ -24152,6 +24185,52 @@ mod gui {
             assert_eq!(exec_calls.get(), 1);
             assert_eq!(ops.log.borrow().iter().filter(|c| **c == "ack").count(), 1);
             assert!(outcome.is_some());
+        }
+
+        /// A context that is otherwise perfect — non-blank account id,
+        /// `AuthStatus::Ok` — but whose `mode` is `Sim` must still be
+        /// refused. This is the case `build_context_with_profile`'s Sim
+        /// branch produces: it fakes `auth_status: Ok` and reuses whatever
+        /// profile the account id resolved to, so the auth_status/account_id
+        /// check alone would let it through and reach a real `aws` shell-out
+        /// via `exec_remote_command`. `mode` on the context is trustworthy
+        /// here because it is always the literal argument
+        /// `build_context_with_profile` was called with, never faked by the
+        /// Sim branch itself.
+        #[test]
+        fn a_sim_mode_context_issues_zero_acks_and_never_execs() {
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let ctx = AwsContext {
+                mode: Mode::Sim,
+                profile: "111111111111".to_string(),
+                account_id: Some("111111111111".to_string()),
+                arn: None,
+                user_id: None,
+                region: "us-east-1".to_string(),
+                auth_status: AuthStatus::Ok,
+            };
+            let exec_calls = std::cell::Cell::new(0);
+            let outcome = remediate_if_authorized(
+                Ok(ctx),
+                &target.account_id,
+                &ops,
+                &cfg,
+                &target,
+                true,
+                |_ctx, _cmd| {
+                    exec_calls.set(exec_calls.get() + 1);
+                    Ok(failing_transcript())
+                },
+            );
+            assert_eq!(exec_calls.get(), 0);
+            assert!(ops.log.borrow().is_empty());
+            assert_eq!(outcome, Some(ec2_manager::reaper::OutcomeCode::Failure));
         }
 
         /// One candidate means there is no choice to make, so the dialog
