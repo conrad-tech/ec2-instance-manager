@@ -14,17 +14,11 @@ const INSTANCE_ID_KEYS: [&str; 4] = ["InstanceId", "instanceId", "instance_id", 
 
 /// The `{{extraProperties}}` key is an unrendered template holding a
 /// flattened copy of the whole map. Matching it would double-count and would
-/// fire on alerts that merely mention reaper inside that copy.
+/// fire on alerts that merely mention reaper inside that copy. Only used by
+/// the tests that cover that hazard — see `match_alert`'s doc comment for the
+/// production-code version of this note.
+#[cfg(test)]
 const JUNK_EXTRA_KEY: &str = "{{extraProperties}}";
-
-// Not `#[allow(dead_code)]`: the point of this constant is that the matcher
-// itself never reads it (see `match_alert`, which only ever looks up
-// `alertname` by name). The one real usage lives in the test that covers the
-// hazard, which is invisible to a non-test `cargo build`, so this const-eval
-// assertion gives the constant a use outside `#[cfg(test)]` without changing
-// any runtime behaviour — a lint workaround that also happens to double as a
-// standing invariant check.
-const _: () = assert!(!JUNK_EXTRA_KEY.is_empty());
 
 /// What a matched reaper alert tells us to act on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +75,12 @@ pub fn find_instance_id(text: &str) -> Option<String> {
 /// two of ten alerts carrying an unrendered `&{%…%}%` template and two more
 /// with no App tag at all — so a garbage or absent value is "no
 /// information", never a non-match.
+///
+/// Identification deliberately reads only the `alertname` key by name, never
+/// the whole `extraProperties` map: the feed carries a literal
+/// `{{extraProperties}}` key holding a flattened copy of that whole map, and
+/// matching against it would fire on alerts that merely mention this app
+/// inside an unrendered template.
 pub fn match_alert(alert: &Alert, cfg: &ReaperFeature) -> Option<Target> {
     let alertname = alert.extra.get("alertname").map(String::as_str).unwrap_or("");
     let identified = contains_ci(alertname, &cfg.alertname_contains)
@@ -346,6 +346,22 @@ mod tests {
     }
 
     #[test]
+    fn an_instance_id_inside_the_junk_key_is_never_used() {
+        // The alert IS legitimately identified here, so the matcher reaches the
+        // instance-id search. `{{extraProperties}}` holds a flattened copy of
+        // the whole map and may therefore contain a real instance id — reading
+        // it would remediate a box named only by an unrendered template.
+        let mut a = alert();
+        a.description = "reaper stalled".to_string(); // identified, but no id
+        a.message = String::new();
+        a.extra.insert(
+            JUNK_EXTRA_KEY.to_string(),
+            "{alertname=reaper-stalled, InstanceId=i-0abc123def4567890}".to_string(),
+        );
+        assert!(match_alert(&a, &cfg()).is_none());
+    }
+
+    #[test]
     fn a_blank_rule_never_matches_everything() {
         // An unconfigured *_contains must match nothing, not match all.
         let empty = ReaperFeature::default();
@@ -391,6 +407,27 @@ mod tests {
         // EC2 ids are lowercase hex; accepting uppercase would match
         // unrelated identifiers that happen to start "I-".
         assert_eq!(find_instance_id("i-0ABC1234"), None);
+    }
+
+    #[test]
+    fn find_instance_id_never_panics_on_degenerate_input() {
+        // This function slices &str by BYTE index. Every index it advances past
+        // is matched as ASCII ('i', '-', hex, word-class), so a multi-byte code
+        // point can never land inside a slice — but nothing proved that until
+        // now, and the loop is exactly the kind of code a later refactor breaks.
+        assert_eq!(find_instance_id(""), None);
+        assert_eq!(find_instance_id("i"), None);
+        assert_eq!(find_instance_id("i-"), None);
+        assert_eq!(find_instance_id("i-0abc12"), None); // ends mid-token
+        assert_eq!(find_instance_id("café"), None);
+        assert_eq!(find_instance_id("日本語のテキスト"), None);
+        // A valid id surrounded by multi-byte text is still found intact.
+        assert_eq!(
+            find_instance_id("café i-0abc1234 café"),
+            Some("i-0abc1234".to_string())
+        );
+        // A multi-byte character immediately adjacent on both sides.
+        assert_eq!(find_instance_id("é-0abc1234"), None);
     }
 
     fn run_output(ps: &str) -> String {
