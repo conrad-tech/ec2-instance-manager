@@ -231,6 +231,7 @@ fn emit_obfuscated_assets() {
         ("secondary_mirror.sh.obf", "assets/scripts/secondary_mirror.sh"),
         ("sudoers_grant.sh.obf", "assets/scripts/sudoers_grant.sh"),
         ("user_sync_dump.sh.obf", "assets/scripts/user_sync_dump.sh"),
+        ("reaper_fix.sh.obf", "assets/scripts/reaper_fix.sh"),
     ];
 
     for (out_name, src) in assets {

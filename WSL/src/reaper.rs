@@ -723,6 +723,25 @@ mod tests {
     }
 
     #[test]
+    fn an_indeterminate_run_that_closed_is_a_success_off_call_too() {
+        // Completes the truth table: closure outranks an unreadable verdict
+        // regardless of who holds the pager.
+        let unknown = Verdict::Indeterminate("cut off".into());
+        assert_eq!(decide_outcome(false, &unknown, true), OutcomeCode::Ok);
+    }
+
+    #[test]
+    fn a_known_failure_is_not_excused_by_the_alert_closing() {
+        // The two rules conflict only here. "Closed" normally wins, because the
+        // symptom going away is the real question — but not when we positively
+        // observed the stack fail to come back. Something else closed that
+        // alert, and a failed remediation must still be reported.
+        let failed = Verdict::Failed("reaper-worker not running".into());
+        assert_eq!(decide_outcome(true, &failed, true), OutcomeCode::Failure);
+        assert_eq!(decide_outcome(false, &failed, true), OutcomeCode::FailureQuiet);
+    }
+
+    #[test]
     fn the_wire_codes_carry_nothing_identifying() {
         // The subject is the entire payload. No instance, account, environment,
         // or product name may appear in it.
@@ -736,5 +755,63 @@ mod tests {
         assert_eq!(OutcomeCode::FailureQuiet.as_str(), "RE-N");
         assert_eq!(OutcomeCode::Ok.as_str(), "RE-K");
         assert_eq!(OutcomeCode::Canary.as_str(), "RE-C");
+    }
+
+    /// The script and these constants live in different files and are matched by
+    /// string. `secondary_mirror_step_matches_its_wait` exists because exactly
+    /// that pairing drifted apart once already.
+    const REAPER_FIX_SH: &str = include_str!("../assets/scripts/reaper_fix.sh");
+
+    #[test]
+    fn the_script_emits_every_marker_the_parser_looks_for() {
+        for m in [RE_BEGIN, RE_END, RE_NODIR, RE_PS_BEGIN, RE_PS_END] {
+            assert!(REAPER_FIX_SH.contains(m), "script never emits {m}");
+        }
+    }
+
+    #[test]
+    fn the_script_checks_the_directory_before_stopping_the_watchdog() {
+        // Wrong box: a no-op must not leave self-healing switched off.
+        let dir_check = REAPER_FIX_SH.find("-d /opt/reaper").expect("has the check");
+        let wd_stop = REAPER_FIX_SH.find("stop reaper-watchdog").expect("stops the watchdog");
+        assert!(dir_check < wd_stop, "the directory check must come first");
+    }
+
+    #[test]
+    fn the_script_never_sets_e() {
+        // `set -e` would exit on a failing `down` and never reach `up -d`,
+        // stranding reaper stopped with its watchdog off — the one state this
+        // whole design exists to avoid.
+        assert!(!REAPER_FIX_SH.contains("set -e"));
+        assert!(REAPER_FIX_SH.contains("set -u"));
+    }
+
+    #[test]
+    fn the_script_brings_the_stack_up_detached() {
+        // A bare `docker compose up` never returns; it would hang to the
+        // send-command timeout and be reported as a failure *because it worked*.
+        assert!(REAPER_FIX_SH.contains("compose up -d"));
+        for line in REAPER_FIX_SH.lines() {
+            let l = line.trim();
+            if l.starts_with('#') {
+                continue;
+            }
+            if l.contains("compose up") {
+                assert!(l.contains("-d"), "non-detached up: {l}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_script_never_restarts_the_watchdog() {
+        // Leaving it stopped is deliberate: it is what makes a *successful* fix
+        // worth reporting at all.
+        assert!(!REAPER_FIX_SH.contains("start reaper-watchdog"));
+        assert!(!REAPER_FIX_SH.contains("restart reaper-watchdog"));
+    }
+
+    #[test]
+    fn the_script_asks_compose_for_json() {
+        assert!(REAPER_FIX_SH.contains("compose ps --format json"));
     }
 }
