@@ -851,6 +851,50 @@ mod tests {
         assert!(REAPER_FIX_SH.contains("compose ps --format json"));
     }
 
+    /// `ssm_wait_for_command`'s deadline and `send_command_timeout_secs` live
+    /// in different files (`ec2_manager_gui.rs` and `assets/features.json`)
+    /// and are matched only by the fact that one is supposed to outlast the
+    /// other — the same shape as `secondary_mirror_step_matches_its_wait`,
+    /// which exists because a step's wait and its match string drifted apart
+    /// there without either build failing. Here the risk is a script that
+    /// grows a slower step than the configured timeout expects.
+    ///
+    /// This sums every `timeout N` budget the script itself declares (`down`
+    /// and `up -d`, 30s each) and checks the shipped
+    /// `send_command_timeout_secs` clears that sum with real headroom —
+    /// enough left over for `systemctl stop`, `compose ps`, and SSM's own
+    /// dispatch latency, none of which are bounded by a `timeout` in the
+    /// script. A fixed 20s margin is arbitrary but not tight: the shipped
+    /// value (90s) against the current budget (60s) leaves 30s, and this
+    /// fails loudly the day someone adds a third `timeout` step without
+    /// widening the config to match.
+    #[test]
+    fn the_shipped_send_command_timeout_clears_the_scripts_own_timeout_budgets_with_headroom() {
+        const MARGIN_SECS: u64 = 20;
+
+        let mut budget_secs: u64 = 0;
+        for line in REAPER_FIX_SH.lines() {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            for (i, w) in words.iter().enumerate() {
+                if *w == "timeout" {
+                    if let Some(n) = words.get(i + 1).and_then(|s| s.parse::<u64>().ok()) {
+                        budget_secs += n;
+                    }
+                }
+            }
+        }
+        assert!(budget_secs > 0, "script declares no timeout budgets to check");
+
+        let shipped = crate::features::load().reaper.send_command_timeout_secs;
+        assert!(
+            shipped >= budget_secs + MARGIN_SECS,
+            "shipped send_command_timeout_secs ({shipped}s) does not clear the script's own \
+             timeout budget ({budget_secs}s) by the {MARGIN_SECS}s margin this test requires; \
+             ssm_wait_for_command's real deadline now honours this value directly (it no longer \
+             has its own hardcoded 30s), so a too-small config value truncates a real run"
+        );
+    }
+
     #[test]
     fn the_compose_ps_line_does_not_merge_stderr_into_the_parsed_block() {
         // Everything between the PS markers is parsed as JSON, and any line that

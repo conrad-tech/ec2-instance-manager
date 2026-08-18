@@ -34,13 +34,18 @@ else
   echo "__RE_WD_FAIL__"
 fi
 
-if timeout 30 docker compose down 2>&1; then
+# stdout only, deliberately -- same reasoning as the `compose ps` block
+# below. `get-command-invocation` caps StandardOutputContent at 24KB, and
+# these lines are only human context; merging stderr in risks pushing the
+# machine-read verdict block past that cap on a large stack. SSM still
+# captures stderr separately.
+if timeout 30 docker compose down; then
   echo "__RE_DOWN_OK__"
 else
   echo "__RE_DOWN_FAIL__"
 fi
 
-if timeout 30 docker compose up -d 2>&1; then
+if timeout 30 docker compose up -d; then
   echo "__RE_UP_OK__"
 else
   echo "__RE_UP_FAIL__"

@@ -1833,7 +1833,7 @@ mod gui {
         }
         let command_id =
             ssm_send_command(&ctx.profile, &ctx.region, instance_id, command)?;
-        ssm_wait_for_command(&ctx.profile, &ctx.region, instance_id, &command_id)
+        ssm_wait_for_command(&ctx.profile, &ctx.region, instance_id, &command_id, timeout)
     }
 
     /// Post-create verification: SSH from primary→secondary and
@@ -5455,6 +5455,7 @@ mod gui {
                             auth,
                             features.reaper.clone(),
                             config.clone(),
+                            options.mode.clone(),
                         ))
                     } else {
                         reaper_startup_log
@@ -21582,6 +21583,73 @@ mod gui {
         }
     }
 
+    /// The failure tier a remediation earns purely from who holds the pager —
+    /// shared by every place that has to report "something stopped this from
+    /// completing" without yet having a verdict to weigh in.
+    fn reaper_failure_tier(on_call: bool) -> ec2_manager::reaper::OutcomeCode {
+        if on_call {
+            ec2_manager::reaper::OutcomeCode::Failure
+        } else {
+            ec2_manager::reaper::OutcomeCode::FailureQuiet
+        }
+    }
+
+    /// May a remediation proceed with this account id and auth status?
+    ///
+    /// `build_context_with_profile` never returns `Err` for either of the two
+    /// cases this exists to catch — an account id absent from the local
+    /// credentials file, or a blank `Alert.account` from a missing `Account:`
+    /// tag — it returns `Ok(ctx)` with `auth_status` set to `Expired` or
+    /// `Missing`. Nothing downstream inspects that field, so without this
+    /// check the sequence on an unauthorised or untagged account is:
+    /// acknowledge the alert, fail to exec, read back `Indeterminate`, wait
+    /// out the whole stage-2 window, and only then report `RE-F` — a real
+    /// page absorbed by an ack with nothing behind it. Mirrors
+    /// `start_port_tunnel`'s refusal to spawn without `AuthStatus::Ok`; the
+    /// stakes here are worse, because this path mutates the page before it
+    /// can fail.
+    fn remediation_precondition_met(account_id: &str, status: AuthStatus) -> bool {
+        !account_id.trim().is_empty() && status == AuthStatus::Ok
+    }
+
+    /// Gate `run_reaper_remediation` on `remediation_precondition_met`, and
+    /// give the `Err` from `build_context_with_profile` and a failed
+    /// precondition the same handling — one log line, one wire code, and a
+    /// return before anything acknowledges — rather than duplicating that
+    /// arm for each.
+    ///
+    /// `ctx_result` is the already-produced result of
+    /// `build_context_with_profile`, and `exec` receives the unwrapped
+    /// `&AwsContext` only once the precondition has passed — this keeps the
+    /// function testable against `FakeAlertOps` with a hand-built
+    /// `AwsContext`, no AWS, SSM or network involved.
+    fn remediate_if_authorized(
+        ctx_result: ec2_manager::error::Result<AwsContext>,
+        account_id: &str,
+        ops: &impl AlertOps,
+        cfg: &ec2_manager::features::ReaperFeature,
+        target: &ec2_manager::reaper::Target,
+        on_call: bool,
+        exec: impl FnOnce(&AwsContext, &str) -> std::result::Result<String, String>,
+    ) -> Option<ec2_manager::reaper::OutcomeCode> {
+        let ctx = match ctx_result {
+            Ok(c) if remediation_precondition_met(account_id, c.auth_status) => c,
+            Ok(c) => {
+                eprintln!(
+                    "reaper: refusing to remediate {} — account={account_id:?} \
+                     auth_status={} — acknowledge withheld",
+                    target.instance_id, c.auth_status
+                );
+                return Some(reaper_failure_tier(on_call));
+            }
+            Err(e) => {
+                eprintln!("reaper: no credentials for {account_id}: {e}");
+                return Some(reaper_failure_tier(on_call));
+            }
+        };
+        run_reaper_remediation(ops, cfg, target, on_call, |cmd| exec(&ctx, cmd))
+    }
+
     /// Run the remediation and decide what it earned.
     ///
     /// Order is load-bearing. The acknowledge happens before the fix and only
@@ -21602,7 +21670,7 @@ mod gui {
         on_call: bool,
         exec: impl FnOnce(&str) -> std::result::Result<String, String>,
     ) -> Option<ec2_manager::reaper::OutcomeCode> {
-        use ec2_manager::reaper::{self, OutcomeCode, Verdict};
+        use ec2_manager::reaper::{self, Verdict};
 
         if on_call {
             if let Err(e) = ops.ack(&target.alert_id) {
@@ -21641,11 +21709,7 @@ mod gui {
             // Don't spend the stage-2 window on a stack already known to be
             // down.
             eprintln!("reaper: {} failed: {why}", target.instance_id);
-            return Some(if on_call {
-                OutcomeCode::Failure
-            } else {
-                OutcomeCode::FailureQuiet
-            });
+            return Some(reaper_failure_tier(on_call));
         }
 
         // Stage 2: the symptom going away is the real test.
@@ -21688,10 +21752,18 @@ mod gui {
     /// keeps running on the instance regardless (it was fire-and-forget from
     /// the app's point of view); what is lost is only this app's record of
     /// the outcome and the ack/verdict/close bookkeeping around it.
+    ///
+    /// `mode` is the app's own launch-time `Mode` (`--sim` vs. live),
+    /// captured once at startup and cloned into each spawned thread — the
+    /// same context every other AWS call in the app already respects. It is
+    /// deliberately not read from live app state: this thread starts before
+    /// `Self` exists and never touches it afterward, so there is nothing to
+    /// read from except what is passed in here.
     fn start_reaper_poll(
         auth: ec2_manager::alerts::AlertsAuth,
         cfg: ec2_manager::features::ReaperFeature,
         app_config: ec2_manager::config::AppConfig,
+        mode: Mode,
     ) -> ReaperRuntime {
         use ec2_manager::{alerts, oncall, reaper};
 
@@ -21787,43 +21859,28 @@ mod gui {
                             let auth_for_thread = auth.clone();
                             let cfg_for_thread = cfg.clone();
                             let app_config_for_thread = app_config.clone();
+                            let mode_for_thread = mode.clone();
                             let tx_for_thread = tx.clone();
                             std::thread::spawn(move || {
                                 let target = target;
-                                let ctx = match build_context_with_profile(
-                                    Mode::Live,
+                                let ctx_result = build_context_with_profile(
+                                    mode_for_thread,
                                     &app_config_for_thread,
                                     None,
                                     Some(target.account_id.as_str()),
-                                ) {
-                                    Ok(c) => c,
-                                    Err(e) => {
-                                        eprintln!(
-                                            "reaper: no credentials for {}: {e}",
-                                            target.account_id
-                                        );
-                                        let code = if on_call {
-                                            reaper::OutcomeCode::Failure
-                                        } else {
-                                            reaper::OutcomeCode::FailureQuiet
-                                        };
-                                        let _ = tx_for_thread.send(ReaperEvent::Outcome {
-                                            code: code.as_str().to_string(),
-                                            instance: target.instance_id.clone(),
-                                        });
-                                        return;
-                                    }
-                                };
+                                );
 
                                 let ops = JsmAlertOps { auth: &auth_for_thread };
                                 let timeout = cfg_for_thread.send_command_timeout();
                                 let iid = target.instance_id.clone();
-                                let outcome = run_reaper_remediation(
+                                let outcome = remediate_if_authorized(
+                                    ctx_result,
+                                    &target.account_id,
                                     &ops,
                                     &cfg_for_thread,
                                     &target,
                                     on_call,
-                                    |cmd| exec_remote_command(&None, &ctx, &iid, cmd, timeout),
+                                    |ctx, cmd| exec_remote_command(&None, ctx, &iid, cmd, timeout),
                                 );
                                 if let Some(code) = outcome {
                                     let _ = tx_for_thread.send(ReaperEvent::Outcome {
@@ -23620,11 +23677,12 @@ mod gui {
         region: &str,
         instance_id: &str,
         command_id: &str,
+        timeout: Duration,
     ) -> std::result::Result<String, String> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + timeout;
         loop {
             if Instant::now() > deadline {
-                return Err("ssm command timed out after 30s".to_string());
+                return Err(format!("ssm command timed out after {}s", timeout.as_secs()));
             }
             std::thread::sleep(Duration::from_millis(100));
             let output = aws_command()
@@ -23932,6 +23990,157 @@ mod gui {
                 Ok(failing_transcript())
             });
             assert_eq!(exec_calls.get(), 1);
+            assert!(outcome.is_some());
+        }
+
+        /// A context whose `auth_status` is not `Ok` — the shape
+        /// `build_context_with_profile` actually returns for an account id
+        /// absent from the credentials file, rather than an `Err` — must
+        /// never reach `run_reaper_remediation`. Without this check, the
+        /// alert gets acknowledged and then the fix fails, which is the page
+        /// this guard exists to stop from being silently swallowed.
+        #[test]
+        fn a_non_ok_auth_status_issues_zero_acks_and_never_execs() {
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let ctx = AwsContext {
+                mode: Mode::Live,
+                profile: "111111111111".to_string(),
+                account_id: Some("111111111111".to_string()),
+                arn: None,
+                user_id: None,
+                region: "us-east-1".to_string(),
+                auth_status: AuthStatus::Expired,
+            };
+            let exec_calls = std::cell::Cell::new(0);
+            let outcome = remediate_if_authorized(
+                Ok(ctx),
+                &target.account_id,
+                &ops,
+                &cfg,
+                &target,
+                true,
+                |_ctx, _cmd| {
+                    exec_calls.set(exec_calls.get() + 1);
+                    Ok(failing_transcript())
+                },
+            );
+            assert_eq!(exec_calls.get(), 0);
+            assert!(ops.log.borrow().is_empty());
+            assert_eq!(outcome, Some(ec2_manager::reaper::OutcomeCode::Failure));
+        }
+
+        /// A blank `account_id` — an alert with no usable `Account:` tag —
+        /// is refused the same way, even when `build_context_with_profile`
+        /// happened to report `AuthStatus::Ok` for the empty profile it fell
+        /// back to.
+        #[test]
+        fn a_blank_account_id_issues_zero_acks_and_never_execs() {
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let mut target = test_reaper_target();
+            target.account_id = String::new();
+            let ctx = AwsContext {
+                mode: Mode::Live,
+                profile: String::new(),
+                account_id: None,
+                arn: None,
+                user_id: None,
+                region: "us-east-1".to_string(),
+                auth_status: AuthStatus::Missing,
+            };
+            let exec_calls = std::cell::Cell::new(0);
+            let outcome = remediate_if_authorized(
+                Ok(ctx),
+                &target.account_id,
+                &ops,
+                &cfg,
+                &target,
+                false,
+                |_ctx, _cmd| {
+                    exec_calls.set(exec_calls.get() + 1);
+                    Ok(failing_transcript())
+                },
+            );
+            assert_eq!(exec_calls.get(), 0);
+            assert!(ops.log.borrow().is_empty());
+            assert_eq!(outcome, Some(ec2_manager::reaper::OutcomeCode::FailureQuiet));
+        }
+
+        /// The `Err` arm — `build_context_with_profile` genuinely failing —
+        /// gets the identical treatment: zero acks, zero execs.
+        #[test]
+        fn a_context_build_error_issues_zero_acks_and_never_execs() {
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let exec_calls = std::cell::Cell::new(0);
+            let outcome = remediate_if_authorized(
+                Err(ec2_manager::error::AppError::NotFound("no profile".to_string())),
+                &target.account_id,
+                &ops,
+                &cfg,
+                &target,
+                true,
+                |_ctx, _cmd| {
+                    exec_calls.set(exec_calls.get() + 1);
+                    Ok(failing_transcript())
+                },
+            );
+            assert_eq!(exec_calls.get(), 0);
+            assert!(ops.log.borrow().is_empty());
+            assert_eq!(outcome, Some(ec2_manager::reaper::OutcomeCode::Failure));
+        }
+
+        /// The positive case: a satisfied precondition still delegates
+        /// straight through to `run_reaper_remediation` — this guard must
+        /// not block a real, authorised remediation.
+        #[test]
+        fn a_met_precondition_still_acknowledges_and_execs() {
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let ctx = AwsContext {
+                mode: Mode::Live,
+                profile: "111111111111".to_string(),
+                account_id: Some("111111111111".to_string()),
+                arn: None,
+                user_id: None,
+                region: "us-east-1".to_string(),
+                auth_status: AuthStatus::Ok,
+            };
+            let exec_calls = std::cell::Cell::new(0);
+            let outcome = remediate_if_authorized(
+                Ok(ctx),
+                &target.account_id,
+                &ops,
+                &cfg,
+                &target,
+                true,
+                |_ctx, _cmd| {
+                    exec_calls.set(exec_calls.get() + 1);
+                    Ok(failing_transcript())
+                },
+            );
+            assert_eq!(exec_calls.get(), 1);
+            assert_eq!(ops.log.borrow().iter().filter(|c| **c == "ack").count(), 1);
             assert!(outcome.is_some());
         }
 
