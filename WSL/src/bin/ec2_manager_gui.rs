@@ -1970,6 +1970,15 @@ mod gui {
         format!("echo {b64} | base64 -d | bash")
     }
 
+    /// The remediation, wrapped the same way every other remote script here
+    /// is handed over.
+    fn reaper_fix_command() -> String {
+        b64_script_command(&deobf_asset(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/reaper_fix.sh.obf"
+        ))))
+    }
+
     /// Read both bastions' account tables and work out what it would take to
     /// make them agree.
     ///
@@ -5210,6 +5219,11 @@ mod gui {
         /// Background reaper poll thread. `None` when the feature is off for
         /// this user or JSM credentials are not configured.
         reaper: Option<ReaperRuntime>,
+        /// Outcome codes (`RE-F`/`RE-N`/`RE-K`/`RE-C`) waiting on a notifier.
+        /// Nothing reads this yet — wiring it to a send path is a separate,
+        /// later plan. Only the four-character code ever lands here; never
+        /// an instance id, account, environment or product name.
+        pending_notify: Vec<String>,
         /// Build-time gate: whether the automatic `fed up` login runs for the
         /// current OS user (features.json `fed_auth`, which needs both
         /// `enabled` and a named user).
@@ -5619,6 +5633,7 @@ mod gui {
                 alerts_tx,
                 alerts_rx,
                 reaper,
+                pending_notify: Vec::new(),
                 fed_auth_enabled: features
                     .fed_auth_enabled_for(&ec2_manager::features::current_os_user()),
                 fed_auth_cfg: features.fed_auth.clone(),
@@ -10412,8 +10427,8 @@ mod gui {
             }
         }
 
-        /// Drain reaper poll-thread events into the log. Dry-run only —
-        /// nothing here mutates a remote instance.
+        /// Drain reaper poll-thread events into the log (and, for a real
+        /// outcome, the notifier seam).
         fn poll_reaper_events(&mut self) {
             let Some(rt) = &self.reaper else { return };
             // Copy events out first: `self.log_*` needs `&mut self`, which
@@ -10423,8 +10438,11 @@ mod gui {
             for ev in events {
                 match ev {
                     ReaperEvent::Considered { code, instance, on_call } => {
+                        // A projection, not a result: dry run never ran the
+                        // fix, never acknowledged, never contacted the
+                        // instance. Must not be mistaken for a real outcome.
                         self.log_info(format!(
-                            "reaper: would act on {instance} (on_call={on_call}) -> {code}"
+                            "reaper: DRY RUN — would remediate {instance} (on_call={on_call}), projected code {code}"
                         ));
                     }
                     ReaperEvent::Skipped { reason } => {
@@ -10432,6 +10450,13 @@ mod gui {
                     }
                     ReaperEvent::LookupFailed { detail } => {
                         self.log_warn(format!("reaper: lookup failed — {detail}"))
+                    }
+                    ReaperEvent::Outcome { code, instance } => {
+                        self.log_info(format!("reaper: {instance} -> {code}"));
+                        // The notifier is the escalation-notifier spec's job.
+                        // Only `code` crosses the org boundary; `instance`
+                        // must never be passed to it.
+                        self.pending_notify.push(code);
                     }
                 }
             }
@@ -21502,6 +21527,10 @@ mod gui {
         /// The on-call lookup could not be answered. Handling degrades to
         /// off call; the fix still runs.
         LookupFailed { detail: String },
+        /// The armed path ran to a conclusion. `code` is the only thing that
+        /// may ever cross the org boundary; `instance` is for the local log
+        /// only.
+        Outcome { code: String, instance: String },
     }
 
     struct ReaperRuntime {
@@ -21515,18 +21544,112 @@ mod gui {
         start.elapsed().as_millis() as u64
     }
 
-    /// Poll the alert feed and decide what reaper remediation is due.
+    /// What the dry-run path reports: the tier that would fire if this alert
+    /// were real, the fix were attempted, and it told us nothing. Dry run
+    /// never runs the remediation — never acknowledges, never contacts the
+    /// instance — so the only honest inputs to `decide_outcome` are "no
+    /// verdict was established" and "nothing closed".
+    fn dry_run_projection(on_call: bool) -> ec2_manager::reaper::OutcomeCode {
+        ec2_manager::reaper::decide_outcome(
+            on_call,
+            &ec2_manager::reaper::Verdict::Indeterminate(String::new()),
+            false,
+        )
+    }
+
+    /// Run the remediation and decide what it earned.
     ///
-    /// Dry run until Task 11: this logs decisions and touches nothing.
+    /// Order is load-bearing. The acknowledge happens before the fix and only
+    /// on call — acking off call would suppress the real on-call engineer's
+    /// escalation. The last look happens after the acknowledge and *before*
+    /// the first mutating command: once `compose down` has run there is no
+    /// standing down, because that would leave reaper stopped with its
+    /// watchdog off.
+    fn run_reaper_remediation(
+        auth: &ec2_manager::alerts::AlertsAuth,
+        cfg: &ec2_manager::features::ReaperFeature,
+        ctx: &AwsContext,
+        target: &ec2_manager::reaper::Target,
+        on_call: bool,
+    ) -> Option<ec2_manager::reaper::OutcomeCode> {
+        use ec2_manager::alerts;
+        use ec2_manager::reaper::{self, OutcomeCode, Verdict};
+
+        if on_call {
+            if let Err(e) = alerts::acknowledge_alert(auth, &target.alert_id) {
+                // Not fatal: failing to ack costs a duplicate page, whereas
+                // refusing to fix costs the outage.
+                eprintln!("reaper: could not acknowledge {}: {e}", target.instance_id);
+            }
+        }
+
+        // Last look. A sixty-second self-close is real and observed on this
+        // feed. A failed lookup here is logged and the run PROCEEDS — a
+        // lookup failure must not block a real remediation.
+        match alerts::fetch_alert(auth, &target.alert_id) {
+            Ok(a) if reaper::alert_is_closed(&a.status) => {
+                eprintln!("reaper: {} closed before we acted", target.instance_id);
+                return None;
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("reaper: last look failed, proceeding: {e}"),
+        }
+
+        // ---- committed from here: no standing down between `down` and
+        // `up -d` would leave the stack down with its watchdog off. ----
+        let out = match exec_remote_command(
+            &None,
+            ctx,
+            &target.instance_id,
+            &reaper_fix_command(),
+            cfg.send_command_timeout(),
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("reaper: send-command failed on {}: {e}", target.instance_id);
+                String::new()
+            }
+        };
+
+        let verdict = reaper::parse_verdict(&out);
+        eprintln!("reaper: {} verdict {verdict:?}", target.instance_id);
+
+        if let Verdict::Failed(ref why) = verdict {
+            // Don't spend the stage-2 window on a stack already known to be
+            // down.
+            eprintln!("reaper: {} failed: {why}", target.instance_id);
+            return Some(if on_call {
+                OutcomeCode::Failure
+            } else {
+                OutcomeCode::FailureQuiet
+            });
+        }
+
+        // Stage 2: the symptom going away is the real test.
+        let deadline = std::time::Instant::now() + cfg.stage2_window(on_call);
+        let mut closed = false;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            match alerts::fetch_alert(auth, &target.alert_id) {
+                Ok(a) if reaper::alert_is_closed(&a.status) => {
+                    closed = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("reaper: stage-2 poll failed: {e}"),
+            }
+        }
+
+        Some(reaper::decide_outcome(on_call, &verdict, closed))
+    }
+
+    /// Poll the alert feed and decide what reaper remediation is due.
     fn start_reaper_poll(
         auth: ec2_manager::alerts::AlertsAuth,
         cfg: ec2_manager::features::ReaperFeature,
         app_config: ec2_manager::config::AppConfig,
     ) -> ReaperRuntime {
         use ec2_manager::{alerts, oncall, reaper};
-        // Task 11 needs `app_config` (build_context_with_profile); threaded
-        // through now so this signature does not change later.
-        let _ = &app_config;
 
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
@@ -21581,8 +21704,14 @@ mod gui {
                             };
 
                             if cfg.dry_run {
+                                // Read-only projection: never runs the fix,
+                                // never acknowledges, never contacts the
+                                // instance. The code is what would have been
+                                // sent if the fix were attempted and told us
+                                // nothing.
+                                let code = dry_run_projection(on_call);
                                 let _ = tx.send(ReaperEvent::Considered {
-                                    code: "dry-run".to_string(),
+                                    code: code.as_str().to_string(),
                                     instance: target.instance_id.clone(),
                                     on_call,
                                 });
@@ -21593,10 +21722,50 @@ mod gui {
                                 );
                                 continue;
                             }
-                            // Task 11 replaces this branch with the real run.
-                            let _ = tx.send(ReaperEvent::Skipped {
-                                reason: "armed path not implemented".to_string(),
-                            });
+
+                            // Marked handled BEFORE the remediation runs: it
+                            // blocks for up to the whole stage-2 window, and
+                            // marking afterwards would let the next poll pick
+                            // up the same alert again.
+                            state.mark_handled(
+                                &target.alert_id,
+                                &target.instance_id,
+                                now_ms,
+                            );
+
+                            let ctx = match build_context_with_profile(
+                                Mode::Live,
+                                &app_config,
+                                None,
+                                Some(target.account_id.as_str()),
+                            ) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    eprintln!(
+                                        "reaper: no credentials for {}: {e}",
+                                        target.account_id
+                                    );
+                                    let code = if on_call {
+                                        reaper::OutcomeCode::Failure
+                                    } else {
+                                        reaper::OutcomeCode::FailureQuiet
+                                    };
+                                    let _ = tx.send(ReaperEvent::Outcome {
+                                        code: code.as_str().to_string(),
+                                        instance: target.instance_id.clone(),
+                                    });
+                                    continue;
+                                }
+                            };
+
+                            if let Some(code) =
+                                run_reaper_remediation(&auth, &cfg, &ctx, &target, on_call)
+                            {
+                                let _ = tx.send(ReaperEvent::Outcome {
+                                    code: code.as_str().to_string(),
+                                    instance: target.instance_id.clone(),
+                                });
+                            }
                         }
                     }
                     Err(e) => {
@@ -23455,24 +23624,64 @@ mod gui {
             assert!(!f.reaper.enabled);
         }
 
+        /// This is the function `start_reaper_poll`'s dry-run branch actually
+        /// calls — not a hand re-derivation of `decide_outcome` — so this
+        /// test exercises what dry run really reports: the tier that would
+        /// fire if the alert were real and the fix told us nothing.
+        #[test]
+        fn dry_run_projects_the_failure_tier_from_on_call_state_alone() {
+            use ec2_manager::reaper::OutcomeCode;
+            assert_eq!(dry_run_projection(true), OutcomeCode::Failure);
+            assert_eq!(dry_run_projection(false), OutcomeCode::FailureQuiet);
+        }
+
         #[test]
         fn a_dry_run_decision_names_the_instance_but_the_wire_code_does_not() {
-            use ec2_manager::reaper::{decide_outcome, OutcomeCode, Verdict};
+            let code = dry_run_projection(false).as_str().to_string();
             let ev = ReaperEvent::Considered {
-                code: decide_outcome(false, &Verdict::Success, true).as_str().to_string(),
+                code,
                 instance: "i-0abc123def4567890".to_string(),
                 on_call: false,
             };
             match ev {
                 ReaperEvent::Considered { code, instance, .. } => {
-                    assert_eq!(code, "RE-K");
+                    assert_eq!(code, "RE-N");
                     // The instance is fine in the local log line and must never
                     // be part of the code that leaves the org.
                     assert!(!code.contains(&instance));
-                    assert_eq!(OutcomeCode::Ok.as_str(), code);
                 }
                 _ => panic!("wrong variant"),
             }
+        }
+
+        /// Split across several send-commands there is a window between
+        /// `down` and `up -d` where a dropped session leaves reaper stopped
+        /// with its watchdog off.
+        #[test]
+        fn the_remediation_command_is_one_base64_shot() {
+            let cmd = reaper_fix_command();
+            assert!(cmd.starts_with("echo "));
+            assert!(cmd.contains("| base64 -d | bash"));
+            assert_eq!(cmd.matches("base64 -d").count(), 1);
+            // The script itself must not be readable in the binary or the command.
+            assert!(!cmd.contains("compose down"));
+        }
+
+        #[test]
+        fn the_decoded_command_is_the_shipped_script() {
+            use base64::Engine;
+            let cmd = reaper_fix_command();
+            let b64 = cmd
+                .trim_start_matches("echo ")
+                .split(' ')
+                .next()
+                .expect("has a payload");
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .expect("valid base64");
+            let text = String::from_utf8(decoded).expect("utf8");
+            assert!(text.contains("__RE_BEGIN__"));
+            assert!(text.contains("compose up -d"));
         }
 
         /// One candidate means there is no choice to make, so the dialog
