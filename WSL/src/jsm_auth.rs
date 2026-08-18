@@ -3,39 +3,75 @@
 //!
 //! `assets/features.json` is committed, so it is the *last* resort and
 //! ships every value blank. The everyday source is Windows Credential
-//! Manager, holding five separate generic credentials:
+//! Manager, holding five separate generic credentials, each with a matching
+//! environment-variable override (target ↔ env var, one line each):
 //!
-//! - `ec2_manager/jsm`               — username = Atlassian email, password = API token
-//! - `ec2_manager/jsm_cloud_id`      — password = cloud id (username is a placeholder)
-//! - `ec2_manager/jsm_schedule_id`   — password = schedule id (username ignored)
-//! - `ec2_manager/jsm_account_id`    — password = the caller's *Atlassian*
-//!   account id (e.g. `5b10ac8d82e05b22cc7d4ef5`), used only to find
-//!   yourself in the JSM on-call response. Unrelated to any AWS account id
-//!   — elsewhere in this codebase (`Alert.account`, `Target.account_id`)
-//!   `account_id` means an AWS account, so this constant is named
-//!   `ATLASSIAN_ACCOUNT_ID_TARGET` to keep the two from being confused.
-//! - `ec2_manager/opsgenie_api_key`  — password = the Opsgenie API key
-//!   (username ignored). See `opsgenie_api_key` for why this is a
-//!   different authentication scheme, not just another credential.
+//! - `ec2_manager/jsm` ↔ `ATLASSIAN_EMAIL_ENV` / `JIRA_TOKEN_ENV` —
+//!   username = Atlassian email, password = API token
+//! - `ec2_manager/jsm_cloud_id` ↔ `CLOUD_ID_ENV` — password = cloud id
+//!   (username is a placeholder)
+//! - `ec2_manager/jsm_schedule_id` ↔ `SCHEDULE_ID_ENV` — password =
+//!   schedule id (username ignored)
+//! - `ec2_manager/jsm_account_id` ↔ `ATLASSIAN_ACCOUNT_ID_ENV` — password =
+//!   the caller's *Atlassian* account id (e.g. `5b10ac8d82e05b22cc7d4ef5`),
+//!   used only to find yourself in the JSM on-call response. Unrelated to
+//!   any AWS account id — elsewhere in this codebase (`Alert.account`,
+//!   `Target.account_id`) `account_id` means an AWS account, so this
+//!   constant is named `ATLASSIAN_ACCOUNT_ID_TARGET` to keep the two from
+//!   being confused.
+//! - `ec2_manager/opsgenie_api_key` ↔ `OPSGENIE_API_KEY_ENV` — password =
+//!   the Opsgenie API key (username ignored). See `opsgenie_api_key` for
+//!   why this is a different authentication scheme, not just another
+//!   credential.
 //!
 //! Every value resolves environment → credential store → compiled-in
 //! fallback, checked independently per field so one present override never
 //! masks a sibling that still needs to fall through.
+//!
+//! The environment-variable names are exported as constants, not just used
+//! as string literals at each call site, because they are a compatibility
+//! contract with the user's existing shell workflow —
+//! `assets/scripts/alerts_10min.sh` and their own curl commands already
+//! export `CLOUD_ID`, `SCHEDULE_ID` and `MY_ID` — and a later caller (Task 2
+//! supplies `SCHEDULE_ID_ENV`/`ATLASSIAN_ACCOUNT_ID_ENV` itself) mistyping a
+//! literal would fail silently: the value simply never resolves and the
+//! feature reports "not on call" forever, with no error.
 
 use crate::alerts::AlertsAuth;
 use crate::features::AlertsFeature;
 
 /// Credential Manager target for the JSM email/token pair.
 pub const JSM_CREDENTIAL_TARGET: &str = "ec2_manager/jsm";
+/// Environment variable that overrides the stored/JSON Atlassian email.
+pub const ATLASSIAN_EMAIL_ENV: &str = "ATLASSIAN_EMAIL";
+/// Environment variable that overrides the stored/JSON API token.
+pub const JIRA_TOKEN_ENV: &str = "JIRA_TOKEN";
+
 /// Credential Manager target for the cloud id (password field only).
 pub const CLOUD_ID_TARGET: &str = "ec2_manager/jsm_cloud_id";
+/// Environment variable that overrides the stored/JSON cloud id. Matches
+/// the name already used by `assets/scripts/alerts_10min.sh` and the
+/// user's existing curl commands — do not rename.
+pub const CLOUD_ID_ENV: &str = "CLOUD_ID";
+
 /// Credential Manager target for the on-call schedule id (password field only).
 pub const SCHEDULE_ID_TARGET: &str = "ec2_manager/jsm_schedule_id";
+/// Environment variable that overrides the stored schedule id. Same
+/// compatibility contract as `CLOUD_ID_ENV` — do not rename.
+pub const SCHEDULE_ID_ENV: &str = "SCHEDULE_ID";
+
 /// Credential Manager target for the caller's *Atlassian* account id
 /// (password field only) — unrelated to any AWS account id.
 pub const ATLASSIAN_ACCOUNT_ID_TARGET: &str = "ec2_manager/jsm_account_id";
+/// Environment variable that overrides the stored Atlassian account id.
+/// Named `MY_ID` (not `ACCOUNT_ID`) in the user's existing shell workflow —
+/// do not rename.
+pub const ATLASSIAN_ACCOUNT_ID_ENV: &str = "MY_ID";
+
 /// Credential Manager target for the Opsgenie API key (password field only).
 pub const OPSGENIE_API_KEY_TARGET: &str = "ec2_manager/opsgenie_api_key";
+/// Environment variable that overrides the stored Opsgenie API key.
+pub const OPSGENIE_API_KEY_ENV: &str = "OPSGENIE_API_KEY";
 
 /// First non-blank of the candidates, trimmed. Blank-but-set is treated as
 /// absent: `export JIRA_TOKEN=` must not shadow a real stored credential.
@@ -103,9 +139,9 @@ pub fn load_auth(feature: &AlertsFeature) -> AlertsAuth {
         feature,
         crate::wincred::read_generic(JSM_CREDENTIAL_TARGET),
         crate::wincred::read_generic(CLOUD_ID_TARGET).map(|(_user, secret)| secret),
-        std::env::var("ATLASSIAN_EMAIL").ok(),
-        std::env::var("JIRA_TOKEN").ok(),
-        std::env::var("CLOUD_ID").ok(),
+        std::env::var(ATLASSIAN_EMAIL_ENV).ok(),
+        std::env::var(JIRA_TOKEN_ENV).ok(),
+        std::env::var(CLOUD_ID_ENV).ok(),
     )
 }
 
@@ -134,7 +170,7 @@ fn some_unless_blank(v: String) -> Option<String> {
 /// rather than failing — this is an addition to the existing credentials,
 /// never a replacement for them.
 pub fn opsgenie_api_key() -> Option<String> {
-    let v = resolve_id("OPSGENIE_API_KEY", OPSGENIE_API_KEY_TARGET, "");
+    let v = resolve_id(OPSGENIE_API_KEY_ENV, OPSGENIE_API_KEY_TARGET, "");
     some_unless_blank(v)
 }
 
@@ -239,7 +275,7 @@ mod tests {
     // each other or with anything a real run might have set.
 
     #[test]
-    fn resolve_id_the_environment_wins_over_the_fallback() {
+    fn an_id_in_the_environment_wins_over_the_compiled_in_fallback() {
         let var = "TEST_REAPER_ID_A";
         std::env::set_var(var, "env-value");
         let result = resolve_id(var, "ec2_manager/does_not_exist_a", "fallback-value");
@@ -248,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_id_a_blank_environment_variable_does_not_win() {
+    fn a_blank_environment_variable_does_not_win_for_a_bare_id_either() {
         let var = "TEST_REAPER_ID_B";
         std::env::set_var(var, "   ");
         let result = resolve_id(var, "ec2_manager/does_not_exist_b", "fallback-value");
@@ -257,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_id_an_absent_credential_and_blank_env_yields_the_fallback() {
+    fn an_absent_credential_and_an_unset_environment_variable_yield_the_fallback() {
         let var = "TEST_REAPER_ID_C";
         std::env::remove_var(var);
         let result = resolve_id(var, "ec2_manager/does_not_exist_c", "fallback-value");
@@ -265,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_id_an_entirely_unset_value_yields_an_empty_string() {
+    fn an_id_with_nothing_set_and_no_fallback_yields_an_empty_string() {
         let var = "TEST_REAPER_ID_D";
         std::env::remove_var(var);
         let result = resolve_id(var, "ec2_manager/does_not_exist_d", "");
@@ -283,13 +319,13 @@ mod tests {
     // throwaway variable name, the same way the tests above do.
 
     #[test]
-    fn some_unless_blank_treats_whitespace_as_absent() {
+    fn a_blank_or_whitespace_value_resolves_to_none() {
         assert_eq!(some_unless_blank("   ".to_string()), None);
         assert_eq!(some_unless_blank(String::new()), None);
     }
 
     #[test]
-    fn some_unless_blank_keeps_a_real_value() {
+    fn a_present_value_resolves_to_some() {
         assert_eq!(
             some_unless_blank("genie-key-123".to_string()),
             Some("genie-key-123".to_string())
@@ -311,5 +347,22 @@ mod tests {
         let resolved = resolve_id(var, "ec2_manager/does_not_exist_f", "");
         std::env::remove_var(var);
         assert_eq!(some_unless_blank(resolved), Some("genie-key-123".to_string()));
+    }
+
+    // -- environment-variable name constants --------------------------------
+    //
+    // These strings are a compatibility contract with the user's existing
+    // shell workflow (`assets/scripts/alerts_10min.sh` and their own curl
+    // commands already export `CLOUD_ID`, `SCHEDULE_ID` and `MY_ID`), so a
+    // rename here would silently break it.
+
+    #[test]
+    fn the_environment_variable_names_match_the_users_existing_shell_workflow() {
+        assert_eq!(ATLASSIAN_EMAIL_ENV, "ATLASSIAN_EMAIL");
+        assert_eq!(JIRA_TOKEN_ENV, "JIRA_TOKEN");
+        assert_eq!(CLOUD_ID_ENV, "CLOUD_ID");
+        assert_eq!(SCHEDULE_ID_ENV, "SCHEDULE_ID");
+        assert_eq!(ATLASSIAN_ACCOUNT_ID_ENV, "MY_ID");
+        assert_eq!(OPSGENIE_API_KEY_ENV, "OPSGENIE_API_KEY");
     }
 }

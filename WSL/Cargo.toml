@@ -40,8 +40,10 @@ base64 = "0.22"
 # Used by the alerts module (lib) as well as the GUI, so not gui-gated.
 chrono = "0.4"
 
-# Windows Credential Manager (CredReadW) for the JSM email/token pair.
-# Windows-only so the Linux dev build's dependency tree is unchanged.
+# Windows Credential Manager (CredReadW) for the five JSM Ops credentials
+# (email/token pair, cloud id, schedule id, Atlassian account id, Opsgenie
+# API key). Windows-only so the Linux dev build's dependency tree is
+# unchanged.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

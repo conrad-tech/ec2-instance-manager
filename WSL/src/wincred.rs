@@ -4,19 +4,21 @@
 //! /generic:ec2_manager/jsm /user:<email> /pass`, or the Credential Manager
 //! GUI — all use the same target name and the same username/secret shape, so
 //! whichever one wrote the credential, this reads it. They agree on the
-//! target and the (username, secret) shape but not on the blob's text
-//! encoding, so that is sniffed rather than assumed — see `decode_blob`.
+//! target and the (username, secret) shape but not necessarily on the
+//! blob's text encoding — see `decode_blob`.
 //!
 //! `CredReadW` is an ordinary documented Win32 credential API. Nothing here
 //! caches, writes, or enumerates — this app has a CrowdStrike quarantine in
 //! its history and credential *enumeration* is a flagged pattern.
 
-/// Decode a credential blob whose encoding depends on who wrote it.
-///
-/// `cmdkey`, the Credential Manager GUI and our own PowerShell writer all
-/// store UTF-16LE; other tools store UTF-8. Guessing wrong is silent — the
-/// token decodes to garbage and the API answers 401, which looks exactly
-/// like a wrong password.
+/// Decode a credential blob whose encoding depends on who wrote it, and this
+/// code deliberately does not depend on knowing which tool that was. Windows
+/// credential blobs are conventionally UTF-16LE, but the blob is opaque
+/// bytes and nothing enforces that, so this determines it from the bytes
+/// themselves rather than asserting a specific writer's behaviour. Guessing
+/// wrong is silent: the token decodes to garbage and the API answers 401,
+/// which is indistinguishable from a wrong password. Six lines of sniffing
+/// buys immunity from a whole class of undiagnosable misconfiguration.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn decode_blob(bytes: &[u8]) -> String {
     // UTF-16LE ASCII text has a zero as every second byte; UTF-8 never has
@@ -73,6 +75,9 @@ pub fn read_generic(target: &str) -> Option<(String, String)> {
         let user = if cred.UserName.is_null() {
             String::new()
         } else {
+            // SAFETY: relies on the Win32 contract that a non-null
+            // `CREDENTIALW::UserName` is a NUL-terminated UTF-16 string, so
+            // walking forward from it until a zero unit stays in bounds.
             let mut len = 0usize;
             while *cred.UserName.add(len) != 0 {
                 len += 1;
