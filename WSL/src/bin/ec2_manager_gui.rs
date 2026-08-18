@@ -5207,6 +5207,9 @@ mod gui {
         /// Alerts fetch worker → UI.
         alerts_tx: Sender<AlertsFetch>,
         alerts_rx: Receiver<AlertsFetch>,
+        /// Background reaper poll thread. `None` when the feature is off for
+        /// this user or JSM credentials are not configured.
+        reaper: Option<ReaperRuntime>,
         /// Build-time gate: whether the automatic `fed up` login runs for the
         /// current OS user (features.json `fed_auth`, which needs both
         /// `enabled` and a named user).
@@ -5411,6 +5414,44 @@ mod gui {
             // accounts.json region drive the effective region.
             let mut options = options;
             options.region = None;
+
+            // Reaper: background poll thread, dry-run only until Task 11.
+            // Gated the same way as the other feature-flagged workers —
+            // `reaper.allowed_users` is checked against the host OS user,
+            // not any login used inside an embedded terminal.
+            //
+            // Messages are collected here and logged via `app.log_*` once
+            // the app exists below (`self.log_*` needs `&mut self`), the
+            // same deferral the "gates:" summary further down already uses.
+            let mut reaper_startup_log: Vec<(bool, String)> = Vec::new();
+            let reaper = {
+                let user = ec2_manager::features::current_os_user();
+                if features.reaper_enabled_for(&user) {
+                    if features.reaper.has_multiple_users() {
+                        reaper_startup_log.push((
+                            true,
+                            "reaper.allowed_users names more than one user; nothing \
+                             arbitrates two machines remediating the same alert"
+                                .to_string(),
+                        ));
+                    }
+                    let auth = ec2_manager::jsm_auth::load_auth(&features.alerts);
+                    if auth.is_complete() {
+                        Some(start_reaper_poll(
+                            auth,
+                            features.reaper.clone(),
+                            config.clone(),
+                        ))
+                    } else {
+                        reaper_startup_log
+                            .push((false, "reaper: no JSM credentials, staying dark".to_string()));
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
             let mut app = Self {
                 wsl_setup_state,
                 wsl_setup_status: None,
@@ -5577,6 +5618,7 @@ mod gui {
                 alerts_window: None,
                 alerts_tx,
                 alerts_rx,
+                reaper,
                 fed_auth_enabled: features
                     .fed_auth_enabled_for(&ec2_manager::features::current_os_user()),
                 fed_auth_cfg: features.fed_auth.clone(),
@@ -5648,6 +5690,13 @@ mod gui {
                 });
             }
             app.log_info("application started");
+            for (is_warn, msg) in reaper_startup_log {
+                if is_warn {
+                    app.log_warn(msg);
+                } else {
+                    app.log_info(msg);
+                }
+            }
             // The name every `allowed_users` gate is matched against, and what
             // each one decided. Without this a gate that does not match is
             // invisible: the button simply never appears, with nothing to say
@@ -10358,6 +10407,31 @@ mod gui {
                         if let Some(win) = self.alerts_window.as_mut() {
                             win.error = Some(err);
                         }
+                    }
+                }
+            }
+        }
+
+        /// Drain reaper poll-thread events into the log. Dry-run only —
+        /// nothing here mutates a remote instance.
+        fn poll_reaper_events(&mut self) {
+            let Some(rt) = &self.reaper else { return };
+            // Copy events out first: `self.log_*` needs `&mut self`, which
+            // would conflict with the immutable borrow of `rt` (itself
+            // borrowed from `self.reaper`) held by the channel iterator.
+            let events: Vec<ReaperEvent> = rt.rx.try_iter().collect();
+            for ev in events {
+                match ev {
+                    ReaperEvent::Considered { code, instance, on_call } => {
+                        self.log_info(format!(
+                            "reaper: would act on {instance} (on_call={on_call}) -> {code}"
+                        ));
+                    }
+                    ReaperEvent::Skipped { reason } => {
+                        self.log_debug(format!("reaper: skipped — {reason}"))
+                    }
+                    ReaperEvent::LookupFailed { detail } => {
+                        self.log_warn(format!("reaper: lookup failed — {detail}"))
                     }
                 }
             }
@@ -19145,6 +19219,7 @@ mod gui {
                 self.pump_script_runs();
                 self.poll_script_events();
                 self.poll_alerts_events();
+                self.poll_reaper_events();
 
                 if self.wsl_show_password_popup {
                     let mut open = true;
@@ -21413,6 +21488,129 @@ mod gui {
         });
     }
 
+    /// What the reaper poll thread reports back to the UI thread.
+    #[derive(Clone, Debug)]
+    enum ReaperEvent {
+        /// Dry run: this is what would have been done.
+        Considered {
+            code: String,
+            instance: String,
+            on_call: bool,
+        },
+        /// Matched, but not acted on.
+        Skipped { reason: String },
+        /// The on-call lookup could not be answered. Handling degrades to
+        /// off call; the fix still runs.
+        LookupFailed { detail: String },
+    }
+
+    struct ReaperRuntime {
+        rx: std::sync::mpsc::Receiver<ReaperEvent>,
+        _handle: std::thread::JoinHandle<()>,
+    }
+
+    /// Monotonic milliseconds for the cooldown bookkeeping. A wall clock
+    /// would let an NTP step or a DST change reopen a cooldown window.
+    fn monotonic_ms(start: std::time::Instant) -> u64 {
+        start.elapsed().as_millis() as u64
+    }
+
+    /// Poll the alert feed and decide what reaper remediation is due.
+    ///
+    /// Dry run until Task 11: this logs decisions and touches nothing.
+    fn start_reaper_poll(
+        auth: ec2_manager::alerts::AlertsAuth,
+        cfg: ec2_manager::features::ReaperFeature,
+        app_config: ec2_manager::config::AppConfig,
+    ) -> ReaperRuntime {
+        use ec2_manager::{alerts, oncall, reaper};
+        // Task 11 needs `app_config` (build_context_with_profile); threaded
+        // through now so this signature does not change later.
+        let _ = &app_config;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut state = reaper::ReaperState::new();
+            let cooldown_ms = cfg.cooldown().as_millis() as u64;
+
+            loop {
+                let now_ms = monotonic_ms(started);
+                match alerts::fetch_latest(&auth, cfg.alerts_per_poll()) {
+                    Ok(list) => {
+                        for alert in &list {
+                            let Some(target) = reaper::match_alert(alert, &cfg) else {
+                                continue;
+                            };
+                            if reaper::alert_is_closed(&alert.status) {
+                                let _ = tx.send(ReaperEvent::Skipped {
+                                    reason: format!("{} already closed", target.instance_id),
+                                });
+                                continue;
+                            }
+                            if !state.should_act(
+                                &target.alert_id,
+                                &target.instance_id,
+                                now_ms,
+                                cooldown_ms,
+                            ) {
+                                let _ = tx.send(ReaperEvent::Skipped {
+                                    reason: format!(
+                                        "{} handled or in cooldown",
+                                        target.instance_id
+                                    ),
+                                });
+                                continue;
+                            }
+
+                            // A failed lookup degrades to off call: it cannot
+                            // acknowledge (so it cannot silence anyone) and it
+                            // cannot ring a phone.
+                            let on_call = match oncall::is_on_call(
+                                &auth,
+                                &cfg.resolved_schedule_id(),
+                                &cfg.resolved_atlassian_account_id(),
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = tx.send(ReaperEvent::LookupFailed {
+                                        detail: e.to_string(),
+                                    });
+                                    false
+                                }
+                            };
+
+                            if cfg.dry_run {
+                                let _ = tx.send(ReaperEvent::Considered {
+                                    code: "dry-run".to_string(),
+                                    instance: target.instance_id.clone(),
+                                    on_call,
+                                });
+                                state.mark_handled(
+                                    &target.alert_id,
+                                    &target.instance_id,
+                                    now_ms,
+                                );
+                                continue;
+                            }
+                            // Task 11 replaces this branch with the real run.
+                            let _ = tx.send(ReaperEvent::Skipped {
+                                reason: "armed path not implemented".to_string(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ReaperEvent::LookupFailed {
+                            detail: format!("feed: {e}"),
+                        });
+                    }
+                }
+                std::thread::sleep(cfg.poll_interval());
+            }
+        });
+        ReaperRuntime { rx, _handle: handle }
+    }
+
     /// Detects terminal query sequences in PTY output and sends the
     /// expected responses back through the writer.  Without these
     /// responses, programs like CMD and PowerShell hang at startup.
@@ -23248,6 +23446,34 @@ mod gui {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Arming is an explicit edit, never a default.
+        #[test]
+        fn dry_run_is_what_the_shipped_config_does() {
+            let f = ec2_manager::features::load();
+            assert!(f.reaper.dry_run);
+            assert!(!f.reaper.enabled);
+        }
+
+        #[test]
+        fn a_dry_run_decision_names_the_instance_but_the_wire_code_does_not() {
+            use ec2_manager::reaper::{decide_outcome, OutcomeCode, Verdict};
+            let ev = ReaperEvent::Considered {
+                code: decide_outcome(false, &Verdict::Success, true).as_str().to_string(),
+                instance: "i-0abc123def4567890".to_string(),
+                on_call: false,
+            };
+            match ev {
+                ReaperEvent::Considered { code, instance, .. } => {
+                    assert_eq!(code, "RE-K");
+                    // The instance is fine in the local log line and must never
+                    // be part of the code that leaves the org.
+                    assert!(!code.contains(&instance));
+                    assert_eq!(OutcomeCode::Ok.as_str(), code);
+                }
+                _ => panic!("wrong variant"),
+            }
+        }
 
         /// One candidate means there is no choice to make, so the dialog
         /// makes it rather than opening with an empty required field.
