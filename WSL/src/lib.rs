@@ -19,6 +19,7 @@ pub mod obf_core;
 pub mod oncall;
 pub mod probe;
 pub mod profile_choice;
+pub mod reaper;
 pub mod script_env;
 pub mod sim;
 pub mod ssh_config;
