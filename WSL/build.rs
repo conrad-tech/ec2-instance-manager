@@ -111,30 +111,36 @@ fn main() {
 ///
 /// Three things are deliberate:
 ///
-/// - **It fails soft.** No `windres`, an unknown target, a failed run — all
-///   are `cargo:warning=` and carry on. An icon must never break a build.
-/// - **`windres` runs from `OUT_DIR` on bare filenames.** The repo path
-///   contains a space (`/mnt/d/Work Projects/...`) and the mingw tools are
-///   careless about quoting the paths they hand to their own child processes;
-///   that is exactly the `dlltool` failure documented in CLAUDE.md. Copying
-///   the `.ico` next to the generated `.rc` and passing neither a directory
-///   keeps a space out of the command entirely.
+/// - **It fails soft.** No resource compiler, an unknown target, a failed run
+///   — all are `cargo:warning=` and carry on. An icon must never break a
+///   build. Because that makes every failure silent, `build_binaries.sh`
+///   re-checks the produced exe for a `.rsrc` section and *does* fail: dev
+///   builds stay soft, released ones do not.
+/// - **The resource compiler differs per target env.** `windres` emits a
+///   GNU-format `.o` for `*-pc-windows-gnu`; the MSVC linker wants a `.res`
+///   from `rc.exe` (or `llvm-rc`) instead. Both are passed to the linker the
+///   same way, via `rustc-link-arg-bin`.
+/// - **It runs from `OUT_DIR` on bare filenames.** The repo path contains a
+///   space (`/mnt/d/Work Projects/...`) and the mingw tools are careless
+///   about quoting the paths they hand to their own child processes; that is
+///   exactly the `dlltool` failure documented in CLAUDE.md. Copying the
+///   `.ico` next to the generated `.rc` and passing neither a directory keeps
+///   a space out of the command entirely.
 /// - **It targets `ec2_manager_gui` only.** `ec2_manager` is a console tool.
 fn embed_windows_icon() {
     let icon_src = Path::new("assets/app_icon.ico");
     println!("cargo:rerun-if-changed={}", icon_src.display());
     println!("cargo:rerun-if-env-changed=WINDRES");
+    println!("cargo:rerun-if-env-changed=RC");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
-    // The .o windres emits is a GNU-format object; the MSVC linker wants a
-    // .res from rc.exe instead. Skip rather than emit something that will not
-    // link — the runtime icon still covers the window itself.
-    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("gnu") {
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_env != "gnu" && target_env != "msvc" {
         println!(
-            "cargo:warning=app icon not embedded: only the *-pc-windows-gnu \
-             target is supported (needs windres)"
+            "cargo:warning=app icon not embedded: unsupported target env {target_env:?} \
+             (expected gnu or msvc)"
         );
         return;
     }
@@ -156,38 +162,69 @@ fn embed_windows_icon() {
         return;
     }
 
-    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let mut candidates: Vec<String> = Vec::new();
-    if let Ok(explicit) = std::env::var("WINDRES") {
-        candidates.push(explicit);
-    }
-    candidates.push(match arch.as_str() {
-        "x86" => "i686-w64-mingw32-windres".to_string(),
-        _ => "x86_64-w64-mingw32-windres".to_string(),
-    });
-    // Building natively under MSYS2/MinGW, where the tool is unprefixed.
-    candidates.push("windres".to_string());
+    // Which resource compiler to drive, how to call it, and what it produces.
+    // The two differ only here; the run-and-link loop below is shared, so a
+    // change to how the result reaches the linker cannot apply to one target
+    // env and not the other.
+    let (candidates, args, product, hint) = if target_env == "gnu" {
+        let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        let mut candidates: Vec<String> = Vec::new();
+        if let Ok(explicit) = std::env::var("WINDRES") {
+            candidates.push(explicit);
+        }
+        candidates.push(match arch.as_str() {
+            "x86" => "i686-w64-mingw32-windres".to_string(),
+            _ => "x86_64-w64-mingw32-windres".to_string(),
+        });
+        // Building natively under MSYS2/MinGW, where the tool is unprefixed.
+        candidates.push("windres".to_string());
+        (
+            candidates,
+            vec!["-i", "app_icon.rc", "-O", "coff", "-o", "app_icon.o"],
+            "app_icon.o",
+            "Install binutils-mingw-w64, or set WINDRES.",
+        )
+    } else {
+        let mut candidates: Vec<String> = Vec::new();
+        if let Ok(explicit) = std::env::var("RC") {
+            candidates.push(explicit);
+        }
+        // rc.exe ships with the Windows SDK and is on PATH inside a Visual
+        // Studio developer prompt; llvm-rc is the drop-in that is not tied to
+        // one. Neither is given `/nologo` — llvm-rc's handling of it has
+        // varied, and the banner is harmless.
+        candidates.push("rc.exe".to_string());
+        candidates.push("llvm-rc".to_string());
+        (
+            candidates,
+            vec!["/fo", "app_icon.res", "app_icon.rc"],
+            "app_icon.res",
+            "Build from a Visual Studio developer prompt, install llvm-rc, or set RC.",
+        )
+    };
 
-    for windres in &candidates {
-        let result = std::process::Command::new(windres)
+    for tool in &candidates {
+        let result = std::process::Command::new(tool)
             .current_dir(out_dir)
-            .args(["-i", "app_icon.rc", "-O", "coff", "-o", "app_icon.o"])
+            .args(&args)
             .output();
         match result {
             // Not installed under this name — try the next spelling.
             Err(_) => continue,
             Ok(output) if !output.status.success() => {
                 println!(
-                    "cargo:warning=app icon not embedded: {windres} failed ({}): {}",
+                    "cargo:warning=app icon not embedded: {tool} failed ({}): {}",
                     output.status,
                     String::from_utf8_lossy(&output.stderr).trim()
                 );
                 return;
             }
             Ok(_) => {
+                // Both a COFF object and a .res are accepted as plain linker
+                // inputs by their respective linkers.
                 println!(
                     "cargo:rustc-link-arg-bin=ec2_manager_gui={}",
-                    out_dir.join("app_icon.o").display()
+                    out_dir.join(product).display()
                 );
                 return;
             }
@@ -195,8 +232,7 @@ fn embed_windows_icon() {
     }
 
     println!(
-        "cargo:warning=app icon not embedded: no windres found (tried {}). \
-         Install binutils-mingw-w64, or set WINDRES.",
+        "cargo:warning=app icon not embedded: no resource compiler found (tried {}). {hint}",
         candidates.join(", ")
     );
 }

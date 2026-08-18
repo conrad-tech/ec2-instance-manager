@@ -1,5 +1,19 @@
 # CLAUDE.md
 
+> **⚠ This directory is a stale copy. The code that ships is in `WSL/`.**
+>
+> Everything at this level — `Cargo.toml`, `src/`, `assets/`, and this file —
+> was left behind and has drifted months out of date. `src/bin/ec2_manager_gui.rs`
+> here is roughly a third the size of the real one in `WSL/src/bin/`.
+>
+> Building here produces a binary that looks like the app but is missing months
+> of changes, including both app-icon paths — the taskbar shows the generic
+> Windows glyph. A `build.rs` at this level now refuses the build and says so;
+> `ALLOW_STALE_ROOT_BUILD=1` overrides it.
+>
+> **Read `WSL/CLAUDE.md`, not this file.** It is far more current, and the notes
+> below are kept only because deleting them would lose history.
+
 ## Project overview
 
 Rust-only EC2 + SSM instance explorer with CLI (`ec2_manager`) and desktop GUI (`ec2_manager_gui`, egui/eframe). The GUI embeds a terminal for interactive SSM sessions.

@@ -8,3 +8,11 @@ WSL/dist/*
 .claude/settings.json
 .claude/settings.local.json
 
+# The escalation notifier design describes personal infrastructure — a private
+# phone, a personal mailbox and a home Raspberry Pi — not anything the app
+# ships. It stays local. The glob covers the matching plan document too, since
+# the spec → plan workflow generates one under docs/superpowers/plans/.
+WSL/docs/superpowers/**/*escalation-notifier*
+
+WSL/docs/superpowers/specs/2026-08-14-reaper-auto-remediation-design.md
+WSL/docs/superpowers/plans/2026-08-17-reaper-auto-remediation.md

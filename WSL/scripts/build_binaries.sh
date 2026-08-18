@@ -183,6 +183,24 @@ target_output_dir() {
   fi
 }
 
+# Rename with version suffix, e.g. ec2_manager_gui.exe -> ec2_manager_gui_${APP_VERSION}.exe
+# Shared by copy_artifact and verify_windows_icon so the two cannot disagree
+# about which file was just written.
+versioned_name() {
+  local artifact_name="$1"
+
+  if [[ "$artifact_name" == *.exe ]]; then
+    local base="${artifact_name%.exe}"
+    echo "${base}_${APP_VERSION}.exe"
+  elif [[ "$artifact_name" == *.* ]]; then
+    local base="${artifact_name%.*}"
+    local ext="${artifact_name##*.}"
+    echo "${base}_${APP_VERSION}.${ext}"
+  else
+    echo "${artifact_name}_${APP_VERSION}"
+  fi
+}
+
 copy_artifact() {
   local target="$1"
   local artifact_name="$2"
@@ -198,20 +216,77 @@ copy_artifact() {
   out_dir="$(target_output_dir "$target")"
   mkdir -p "$out_dir"
 
-  # Rename with version suffix, e.g. ec2_manager_gui.exe -> ec2_manager_gui_${APP_VERSION}.exe
   local dest_name
-  if [[ "$artifact_name" == *.exe ]]; then
-    local base="${artifact_name%.exe}"
-    dest_name="${base}_${APP_VERSION}.exe"
-  elif [[ "$artifact_name" == *.* ]]; then
-    local base="${artifact_name%.*}"
-    local ext="${artifact_name##*.}"
-    dest_name="${base}_${APP_VERSION}.${ext}"
-  else
-    dest_name="${artifact_name}_${APP_VERSION}"
-  fi
+  dest_name="$(versioned_name "$artifact_name")"
 
   cp "${source_dir}/${artifact_name}" "${out_dir}/${dest_name}"
+}
+
+# Refuse to ship a GUI exe that carries no icon resource.
+#
+# `embed_windows_icon()` in build.rs fails **soft** by design — an icon must
+# not break a developer's build — so every way of losing it is silent: no
+# `windres` on PATH, an MSVC target without `rc.exe`, or (the one that
+# actually happened) building the stale project at the repo root, whose
+# source has no icon code at all. The result is an exe with no `.rsrc`
+# section, which Explorer, the Start menu and a pinned taskbar shortcut all
+# render with the generic executable glyph.
+#
+# A release is the point where that stops being tolerable, so the check is
+# here rather than in build.rs: dev builds stay soft, published ones do not.
+# Set SKIP_ICON_VERIFY=1 to override on a host with no objdump.
+verify_windows_icon() {
+  local exe="$1"
+
+  if [[ "${SKIP_ICON_VERIFY:-}" == "1" ]]; then
+    echo "warning: SKIP_ICON_VERIFY=1 — not checking $(basename "$exe") for an icon resource" >&2
+    return 0
+  fi
+
+  local dumper=""
+  local candidate
+  for candidate in x86_64-w64-mingw32-objdump objdump llvm-objdump; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      dumper="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$dumper" ]]; then
+    echo "error: cannot verify the app icon in $(basename "$exe"): no objdump found" >&2
+    echo "       (tried x86_64-w64-mingw32-objdump, objdump, llvm-objdump)" >&2
+    echo "       Install binutils, or re-run with SKIP_ICON_VERIFY=1 to bypass." >&2
+    exit 1
+  fi
+
+  # The .rsrc size is compared against the source .ico rather than a magic
+  # number: the section is essentially the icon file plus a small directory,
+  # so anything under half its size means the images did not make it in.
+  local ico="${ROOT_DIR}/assets/app_icon.ico"
+  local floor=1024
+  if [[ -f "$ico" ]]; then
+    floor=$(( $(wc -c < "$ico") / 2 ))
+  fi
+
+  local size_hex
+  size_hex="$("$dumper" -h "$exe" 2>/dev/null | awk '$2 == ".rsrc" { print $3; exit }')"
+
+  if [[ -z "$size_hex" ]]; then
+    echo "error: $(basename "$exe") has no .rsrc section — the app icon was not embedded." >&2
+    echo "       Explorer and any pinned shortcut will show the generic exe glyph." >&2
+    echo "       Likely causes: windres/rc.exe missing, an unsupported target, or" >&2
+    echo "       building the stale project at the repo root instead of WSL/." >&2
+    echo "       Re-run the build and check for a 'cargo:warning=app icon not embedded' line." >&2
+    exit 1
+  fi
+
+  local size=$((16#$size_hex))
+  if (( size < floor )); then
+    echo "error: $(basename "$exe") has a .rsrc section of only ${size} bytes (expected >= ${floor})." >&2
+    echo "       The icon resource looks truncated or replaced." >&2
+    exit 1
+  fi
+
+  echo "info: app icon verified in $(basename "$exe") (.rsrc = ${size} bytes)"
 }
 
 copy_windows_runtime_dlls() {
@@ -369,6 +444,7 @@ build_for_target() {
     (cd "$ROOT_DIR" && cargo build --release --features gui --bin "$GUI_APP_NAME")
     if [[ "$target" == *"windows"* ]]; then
       copy_artifact "$target" "${GUI_APP_NAME}.exe"
+      verify_windows_icon "$(target_output_dir "$target")/$(versioned_name "${GUI_APP_NAME}.exe")"
     else
       copy_artifact "$target" "$GUI_APP_NAME"
     fi
@@ -398,6 +474,7 @@ build_for_target() {
   (cd "$ROOT_DIR" && cargo build --release --target "$target" --features gui --bin "$GUI_APP_NAME")
   if [[ "$target" == *"windows"* ]]; then
     copy_artifact "$target" "${GUI_APP_NAME}.exe"
+    verify_windows_icon "$(target_output_dir "$target")/$(versioned_name "${GUI_APP_NAME}.exe")"
     copy_windows_runtime_dlls "$target"
     package_windows_zip
   else

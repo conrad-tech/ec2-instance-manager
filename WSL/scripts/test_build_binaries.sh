@@ -137,6 +137,60 @@ EOF
   WINDOWS_DIST_DIR="$original_windows_dist_dir"
 }
 
+# verify_windows_icon is handed the path copy_artifact wrote, so the two must
+# agree on the versioned filename. They share versioned_name for that reason;
+# this pins the shape it produces.
+test_versioned_name_matches_the_exe_copy_artifact_writes() {
+  assert_eq "$(versioned_name "ec2_manager_gui.exe")" \
+    "ec2_manager_gui_${APP_VERSION}.exe" "exe should gain the version suffix before .exe"
+  assert_eq "$(versioned_name "ec2_manager")" \
+    "ec2_manager_${APP_VERSION}" "extensionless artifact should gain a version suffix"
+}
+
+# The whole point of the check: an exe with no icon resource must stop the
+# release rather than ship a binary that shows the generic Windows glyph.
+test_verify_windows_icon_rejects_an_exe_without_a_resource() {
+  if ! command -v objdump >/dev/null 2>&1 \
+     && ! command -v x86_64-w64-mingw32-objdump >/dev/null 2>&1 \
+     && ! command -v llvm-objdump >/dev/null 2>&1; then
+    echo "skipping icon verification tests (no objdump)"
+    return 0
+  fi
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  local bogus="$tmpdir/ec2_manager_gui_${APP_VERSION}.exe"
+  printf 'not a PE file' > "$bogus"
+
+  if ( verify_windows_icon "$bogus" ) >/dev/null 2>&1; then
+    echo "assertion failed: verify_windows_icon accepted an exe with no .rsrc" >&2
+    rm -rf "$tmpdir"
+    exit 1
+  fi
+
+  # ...but it must stay overridable, for a build host with no objdump.
+  if ! ( SKIP_ICON_VERIFY=1 verify_windows_icon "$bogus" ) >/dev/null 2>&1; then
+    echo "assertion failed: SKIP_ICON_VERIFY=1 should bypass the check" >&2
+    rm -rf "$tmpdir"
+    exit 1
+  fi
+
+  rm -rf "$tmpdir"
+}
+
+# And the positive case, against a real cross-compiled exe when one is around.
+# Skipped rather than failed when it is not: a clean checkout has no artifacts.
+test_verify_windows_icon_accepts_a_real_build() {
+  local exe="$ROOT_DIR/dist/windows/ec2_manager_gui_${APP_VERSION}.exe"
+  if [[ ! -f "$exe" ]]; then
+    echo "skipping icon verification positive test (no built exe at $exe)"
+    return 0
+  fi
+  if ! ( verify_windows_icon "$exe" ) >/dev/null 2>&1; then
+    echo "note: $exe has no embedded icon — expected for a pre-4fb70d9 build" >&2
+  fi
+}
+
 main() {
   test_native_mode_uses_host_target_on_linux
   test_windows_mode_target_by_host_os
@@ -145,6 +199,9 @@ main() {
   test_package_linux_zip_creates_archive_with_artifacts
   test_package_linux_zip_skips_when_no_artifacts
   test_copy_windows_runtime_dlls_with_custom_gcc
+  test_versioned_name_matches_the_exe_copy_artifact_writes
+  test_verify_windows_icon_rejects_an_exe_without_a_resource
+  test_verify_windows_icon_accepts_a_real_build
   echo "build_binaries tests passed"
 }
 

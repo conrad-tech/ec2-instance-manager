@@ -6,6 +6,23 @@ Rust-only EC2 + SSM instance explorer with CLI (`ec2_manager`) and desktop GUI (
 
 ## Working with this repo
 
+**The code that ships is in `WSL/`. The repo root holds a stale copy of the
+same package** — same `name = "ec2_manager"`, its own `Cargo.toml`, its own
+`src/`. It is not a workspace member and nothing builds it on purpose; it was
+simply left behind and drifted. As of 2026-08-14 its
+`src/bin/ec2_manager_gui.rs` is ~350 KB against `WSL/`'s ~1.2 MB, and three
+months older.
+
+Building it produces something that *looks* like the app and quietly is not:
+it has no `build.rs`, no `assets/app_icon.*` and no `with_icon` call, so
+**neither** app-icon path is wired up and the result shows the generic
+Windows glyph on the taskbar. That is how it was found — a "the logo is
+broken" report that was really "this binary came from the wrong directory".
+
+A `build.rs` at the root now `panic!`s with a message pointing at `WSL/`, so
+the mistake is impossible to make silently. `ALLOW_STALE_ROOT_BUILD=1`
+overrides it. Nothing was deleted — the old tree is still there to read.
+
 When the user asks to revert, restore, or reference a prior change (e.g. "change it back", "like it was before"), always check recent git history first (`git log`, `git show <sha>`, `git diff <sha>~..<sha>`) to see what was actually changed before making edits. Also check uncommitted/unpushed changes (`git status`, `git diff`, `git diff --cached`) since the relevant change may not yet be committed.
 
 ## Build commands
@@ -219,13 +236,27 @@ visually. Depending on a fallback meant the icon was a crate default one bump
 away from changing, and the exe had no `.rsrc` section at all, so anything
 reading the file got the generic executable glyph.
 
+- **The resource compiler differs per target env, and both are supported.**
+  `windres` emits a COFF `.o` for `*-pc-windows-gnu`; `rc.exe` (or `llvm-rc`)
+  emits a `.res` for `*-pc-windows-msvc`. Only the tool and its arguments
+  differ — the run-and-link loop is shared, so how the result reaches the
+  linker cannot drift between the two. MSVC was unsupported until 2026-08-14,
+  which mattered because `build_binaries.sh` picks the **MSVC** target on any
+  non-Linux host: a Windows-native build got the window icon and no file
+  icon.
 - **`windres` runs from `OUT_DIR` on bare filenames.** Same hazard as the
   `dlltool` one below: the repo path has a space in it. The `.ico` is copied
   next to the generated `.rc` so no path is ever passed.
-- **The whole step fails soft** — no `windres`, an MSVC target, a bad run — as
-  a `cargo:warning`. An icon must not break a build. The consequence is that a
-  broken `.ico` costs the icon *silently*, which is what
-  `the_windows_icon_resource_carries_the_shell_sizes` is for.
+- **The step still fails soft** — no resource compiler, an unknown target env,
+  a bad run — as a `cargo:warning`. An icon must not break a *developer's*
+  build. **A release is different:** `verify_windows_icon` in
+  `build_binaries.sh` re-reads the exe it just copied and `exit 1`s unless it
+  has a `.rsrc` section of at least half the `.ico`'s size. That is where the
+  hole was — every way of losing the icon is silent, and a `cargo:warning`
+  scrolls past in a build log. `SKIP_ICON_VERIFY=1` overrides it for a host
+  with no `objdump`. Set alongside
+  `the_windows_icon_resource_carries_the_shell_sizes`, which checks the
+  *asset*; this checks the *artifact*.
 - Only `ec2_manager_gui` gets it (`rustc-link-arg-bin`); the CLI is a console
   tool.
 - The `.ico` carries 16/24/32/48/64/128 as DIB and 256 as PNG. 16 is the
