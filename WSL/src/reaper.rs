@@ -280,6 +280,58 @@ pub fn alert_is_closed(status: &str) -> bool {
     status.trim().eq_ignore_ascii_case("closed")
 }
 
+/// What leaves the org. The code is the entire payload — the body is empty.
+///
+/// No instance id, account number, environment or product name. Enough for
+/// the notifier to pick a tier and enough for the user to know what it is
+/// about; the detail stays in the app log and in Jira, on the corporate side
+/// of the line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutcomeCode {
+    /// On call: escalate — calls and messages until acknowledged.
+    Failure,
+    /// Off call: one message, no calls. The official page is already running
+    /// for whoever does hold the pager.
+    FailureQuiet,
+    /// Both stages passed. One quiet message: a box is running with its
+    /// watchdog deliberately left stopped.
+    Ok,
+    /// Daily canary — proof the whole chain is alive.
+    Canary,
+}
+
+impl OutcomeCode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Failure => "RE-F",
+            Self::FailureQuiet => "RE-N",
+            Self::Ok => "RE-K",
+            Self::Canary => "RE-C",
+        }
+    }
+
+    /// True only for the tier that rings a phone.
+    pub fn is_escalation(&self) -> bool {
+        matches!(self, Self::Failure)
+    }
+}
+
+/// Which code this remediation earned.
+///
+/// The alert closing outranks everything: it is the symptom going away, which
+/// is the thing actually being asked about. Otherwise anything short of a
+/// clean success reports failure, at the tier the on-call state selects.
+pub fn decide_outcome(on_call: bool, verdict: &Verdict, closed_in_window: bool) -> OutcomeCode {
+    if closed_in_window && !matches!(verdict, Verdict::Failed(_)) {
+        return OutcomeCode::Ok;
+    }
+    if on_call {
+        OutcomeCode::Failure
+    } else {
+        OutcomeCode::FailureQuiet
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,5 +667,74 @@ mod tests {
         assert!(!alert_is_closed("acked"));
         assert!(!alert_is_closed("acknowledged"));
         assert!(!alert_is_closed(""));
+    }
+
+    #[test]
+    fn a_status_with_surrounding_whitespace_is_still_recognised() {
+        // The status is compared after trimming. Nothing tested that, so
+        // dropping the trim would silently make a closed alert look open —
+        // and an alert that looks open is one this app will remediate.
+        assert!(alert_is_closed(" closed "));
+        assert!(alert_is_closed("closed\n"));
+        assert!(alert_is_closed("\tCLOSED\r\n"));
+        // Whitespace must not turn a non-closed status into a closed one.
+        assert!(!alert_is_closed("  acked  "));
+        assert!(!alert_is_closed("   "));
+    }
+
+    #[test]
+    fn a_fix_that_worked_and_closed_is_the_quiet_success_code() {
+        assert_eq!(decide_outcome(true, &Verdict::Success, true), OutcomeCode::Ok);
+        assert_eq!(decide_outcome(false, &Verdict::Success, true), OutcomeCode::Ok);
+    }
+
+    #[test]
+    fn on_call_failures_escalate_and_off_call_failures_do_not() {
+        let failed = Verdict::Failed("nope".into());
+        assert_eq!(decide_outcome(true, &failed, false), OutcomeCode::Failure);
+        assert_eq!(decide_outcome(false, &failed, false), OutcomeCode::FailureQuiet);
+        assert!(OutcomeCode::Failure.is_escalation());
+        assert!(!OutcomeCode::FailureQuiet.is_escalation());
+        assert!(!OutcomeCode::Ok.is_escalation());
+        assert!(!OutcomeCode::Canary.is_escalation());
+    }
+
+    #[test]
+    fn a_stack_that_came_up_but_whose_alert_never_closed_is_a_failure() {
+        // Stage 2 exists precisely for this: the stack is up and the symptom
+        // is not gone.
+        assert_eq!(decide_outcome(true, &Verdict::Success, false), OutcomeCode::Failure);
+        assert_eq!(decide_outcome(false, &Verdict::Success, false), OutcomeCode::FailureQuiet);
+    }
+
+    #[test]
+    fn indeterminate_is_reported_as_a_failure_never_as_success() {
+        let unknown = Verdict::Indeterminate("cut off".into());
+        assert_eq!(decide_outcome(true, &unknown, false), OutcomeCode::Failure);
+        assert_eq!(decide_outcome(false, &unknown, false), OutcomeCode::FailureQuiet);
+    }
+
+    #[test]
+    fn an_indeterminate_run_whose_alert_closed_is_still_a_success() {
+        // The alert closing is the symptom going away. That outranks our
+        // inability to read the compose output.
+        let unknown = Verdict::Indeterminate("cut off".into());
+        assert_eq!(decide_outcome(true, &unknown, true), OutcomeCode::Ok);
+    }
+
+    #[test]
+    fn the_wire_codes_carry_nothing_identifying() {
+        // The subject is the entire payload. No instance, account, environment,
+        // or product name may appear in it.
+        for c in [OutcomeCode::Failure, OutcomeCode::FailureQuiet, OutcomeCode::Ok, OutcomeCode::Canary] {
+            let s = c.as_str();
+            assert!(s.starts_with("RE-"), "{s}");
+            assert_eq!(s.len(), 4, "{s}");
+            assert!(!s.to_ascii_lowercase().contains("reaper"), "{s}");
+        }
+        assert_eq!(OutcomeCode::Failure.as_str(), "RE-F");
+        assert_eq!(OutcomeCode::FailureQuiet.as_str(), "RE-N");
+        assert_eq!(OutcomeCode::Ok.as_str(), "RE-K");
+        assert_eq!(OutcomeCode::Canary.as_str(), "RE-C");
     }
 }
