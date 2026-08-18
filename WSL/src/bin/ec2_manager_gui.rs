@@ -5429,10 +5429,14 @@ mod gui {
             let mut options = options;
             options.region = None;
 
-            // Reaper: background poll thread, dry-run only until Task 11.
-            // Gated the same way as the other feature-flagged workers —
-            // `reaper.allowed_users` is checked against the host OS user,
-            // not any login used inside an embedded terminal.
+            // Reaper: background poll thread. Armed remediation runs
+            // whenever `reaper.enabled` is true and `reaper.dry_run` is
+            // false — both ship false/true respectively, so this is dark by
+            // default and arming it is a deliberate features.json edit, not
+            // a code change. Gated the same way as the other
+            // feature-flagged workers — `reaper.allowed_users` is checked
+            // against the host OS user, not any login used inside an
+            // embedded terminal.
             //
             // Messages are collected here and logged via `app.log_*` once
             // the app exists below (`self.log_*` needs `&mut self`), the
@@ -23759,22 +23763,28 @@ mod gui {
             assert_eq!(dry_run_projection(false), OutcomeCode::FailureQuiet);
         }
 
+        /// The dry-run code is one of the four wire codes and nothing richer
+        /// — not the instance id, not free text, not anything else that
+        /// would cross the privacy boundary if this path were ever wired to
+        /// a real notifier. `!code.contains(&instance)` alone would pass for
+        /// any code, including one that leaked something else entirely —
+        /// this pins the actual shape instead.
         #[test]
-        fn a_dry_run_decision_names_the_instance_but_the_wire_code_does_not() {
-            let code = dry_run_projection(false).as_str().to_string();
-            let ev = ReaperEvent::Considered {
-                code,
-                instance: "i-0abc123def4567890".to_string(),
-                on_call: false,
-            };
-            match ev {
-                ReaperEvent::Considered { code, instance, .. } => {
-                    assert_eq!(code, "RE-N");
-                    // The instance is fine in the local log line and must never
-                    // be part of the code that leaves the org.
-                    assert!(!code.contains(&instance));
-                }
-                _ => panic!("wrong variant"),
+        fn the_dry_run_wire_code_is_exactly_one_of_the_four_known_codes() {
+            use ec2_manager::reaper::OutcomeCode;
+            for on_call in [true, false] {
+                let code = dry_run_projection(on_call).as_str().to_string();
+                assert_eq!(code.len(), 4, "{code}");
+                assert!(
+                    [
+                        OutcomeCode::Failure.as_str(),
+                        OutcomeCode::FailureQuiet.as_str(),
+                        OutcomeCode::Ok.as_str(),
+                        OutcomeCode::Canary.as_str(),
+                    ]
+                    .contains(&code.as_str()),
+                    "{code}"
+                );
             }
         }
 

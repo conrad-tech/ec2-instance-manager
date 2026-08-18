@@ -32,9 +32,9 @@
 //! as string literals at each call site, because they are a compatibility
 //! contract with the user's existing shell workflow —
 //! `assets/scripts/alerts_10min.sh` and their own curl commands already
-//! export `CLOUD_ID`, `SCHEDULE_ID` and `MY_ID` — and a later caller (Task 2
-//! supplies `SCHEDULE_ID_ENV`/`ATLASSIAN_ACCOUNT_ID_ENV` itself) mistyping a
-//! literal would fail silently: the value simply never resolves and the
+//! export `CLOUD_ID`, `SCHEDULE_ID` and `MY_ID` — and `SCHEDULE_ID_ENV`/
+//! `ATLASSIAN_ACCOUNT_ID_ENV` are consumed by `ReaperFeature::resolved_*`
+//! (`src/features.rs`), so mistyping a literal at either call site would
 //! feature reports "not on call" forever, with no error.
 
 use crate::alerts::AlertsAuth;

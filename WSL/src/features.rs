@@ -1671,5 +1671,16 @@ mod tests {
         assert!(f.reaper.dry_run);
         // features.json is committed. A token here is a token in git.
         assert!(f.alerts.token.trim().is_empty());
+        // The load-bearing gate: a blank *_contains rule matches nothing
+        // (see `contains_ci`), which is what makes shipping the armed code
+        // path safe even with `enabled`/`dry_run` both flipped by hand.
+        // Nothing else in this test actually exercises that guarantee.
+        assert!(f.reaper.alertname_contains.trim().is_empty());
+        assert!(f.reaper.app_contains.trim().is_empty());
+        assert!(f.reaper.message_contains.trim().is_empty());
+        // Both ids ship blank too, so the on-call lookup and any account
+        // scoping stay unresolved until an admin sets them by hand.
+        assert!(f.reaper.schedule_id.trim().is_empty());
+        assert!(f.reaper.atlassian_account_id.trim().is_empty());
     }
 }
