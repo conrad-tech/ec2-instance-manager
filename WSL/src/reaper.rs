@@ -207,6 +207,59 @@ pub fn parse_verdict(output: &str) -> Verdict {
     }
 }
 
+use std::collections::{HashMap, HashSet};
+
+/// What this run of the app has already acted on.
+///
+/// In memory only, deliberately. Which alerts this process has handled is a
+/// fact about this process; persisting it would mean a stale file could
+/// suppress a real remediation, which is the worse failure. A duplicate after
+/// a restart is absorbed by the last-look check whenever the alert has since
+/// closed.
+#[derive(Debug, Default)]
+pub struct ReaperState {
+    handled: HashSet<String>,
+    last_action_ms: HashMap<String, u64>,
+}
+
+impl ReaperState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Two independent rules: an alert is acted on at most once ever, and an
+    /// instance at most once per cooldown window.
+    pub fn should_act(
+        &self,
+        alert_id: &str,
+        instance_id: &str,
+        now_ms: u64,
+        cooldown_ms: u64,
+    ) -> bool {
+        if self.handled.contains(alert_id) {
+            return false;
+        }
+        match self.last_action_ms.get(instance_id) {
+            Some(&last) => now_ms.saturating_sub(last) >= cooldown_ms,
+            None => true,
+        }
+    }
+
+    pub fn mark_handled(&mut self, alert_id: &str, instance_id: &str, now_ms: u64) {
+        self.handled.insert(alert_id.to_string());
+        self.last_action_ms.insert(instance_id.to_string(), now_ms);
+    }
+}
+
+/// The only status that stands a remediation down.
+///
+/// `acked` is a real third value on this tenant, and the on-call path
+/// acknowledges the alert itself before running the fix — so anything
+/// phrased as "not open" would make the app skip its own work.
+pub fn alert_is_closed(status: &str) -> bool {
+    status.trim().eq_ignore_ascii_case("closed")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +489,51 @@ mod tests {
             r#"{"Name":"reaper-api","State":"running"}"#
         );
         assert_eq!(parse_verdict(&out), Verdict::Success);
+    }
+
+    const COOLDOWN: u64 = 30 * 60 * 1000;
+
+    #[test]
+    fn a_fresh_alert_on_a_fresh_instance_is_acted_on() {
+        let s = ReaperState::new();
+        assert!(s.should_act("a1", "i-0abc1234", 0, COOLDOWN));
+    }
+
+    #[test]
+    fn the_same_alert_is_never_acted_on_twice() {
+        let mut s = ReaperState::new();
+        s.mark_handled("a1", "i-0abc1234", 0);
+        assert!(!s.should_act("a1", "i-0abc1234", 0, COOLDOWN));
+        // Still refused long after the instance cooldown has expired: once per
+        // alert is a separate rule from once per instance per window.
+        assert!(!s.should_act("a1", "i-0abc1234", 10 * COOLDOWN, COOLDOWN));
+    }
+
+    #[test]
+    fn a_different_alert_on_the_same_instance_waits_for_the_cooldown() {
+        let mut s = ReaperState::new();
+        s.mark_handled("a1", "i-0abc1234", 0);
+        assert!(!s.should_act("a2", "i-0abc1234", COOLDOWN - 1, COOLDOWN));
+        assert!(s.should_act("a2", "i-0abc1234", COOLDOWN, COOLDOWN));
+    }
+
+    #[test]
+    fn the_cooldown_does_not_suppress_a_different_instance() {
+        let mut s = ReaperState::new();
+        s.mark_handled("a1", "i-0abc1234", 0);
+        assert!(s.should_act("a2", "i-0fff5678", 1, COOLDOWN));
+    }
+
+    #[test]
+    fn only_closed_stands_a_remediation_down() {
+        // `acked` is a real third status on this tenant. A rule written as
+        // `status != "open"` would skip every acknowledged alert — including the
+        // ones this app acknowledges itself.
+        assert!(alert_is_closed("closed"));
+        assert!(alert_is_closed("CLOSED"));
+        assert!(!alert_is_closed("open"));
+        assert!(!alert_is_closed("acked"));
+        assert!(!alert_is_closed("acknowledged"));
+        assert!(!alert_is_closed(""));
     }
 }
