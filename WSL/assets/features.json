@@ -33,6 +33,23 @@
     "token": "",
     "allowed_users": []
   },
+  "_reaper_comment": "Unattended reaper auto-remediation. Ships disabled, dry-run, and with nobody allowed. allowed_users is SINGLE-ENTRY by policy - nothing arbitrates two machines remediating one alert - and '*' is deliberately not honoured here. schedule_id/account_id drive the on-call lookup, which selects handling (ack + 15min + escalate, vs no ack + 10min + one message), never whether the fix runs. The *_contains fields identify a reaper alert; leave blank until a real reaper payload confirms them.",
+  "reaper": {
+    "enabled": false,
+    "dry_run": true,
+    "allowed_users": [],
+    "schedule_id": "",
+    "account_id": "",
+    "alertname_contains": "",
+    "app_contains": "",
+    "message_contains": "",
+    "send_command_timeout_secs": 90,
+    "cooldown_mins": 30,
+    "stage2_on_call_mins": 15,
+    "stage2_off_call_mins": 10,
+    "poll_secs": 30,
+    "fetch_count": 10
+  },
   "_personal_scripts_comment": "\"Add Script\" in the Scripts menu (save your own shell scripts, optionally bound to a hotkey, that paste into the focused connection tab) is available to everyone. This section instead gates the git integration: users on allowed_users are prompted once for a git personal access token, get git's credential store on the remote box populated by Prep Terminal (scoped to git_host, so git clone/pull over HTTPS just work), and receive the hardcoded default_scripts below (e.g. a Ctrl+1 're-clone the repo' script). Users NOT on the list can still create their own scripts and bind Ctrl+1 themselves. Matching: OS username, case-insensitive, [\"*\"] = everyone, [] = nobody (the shipped default). The PAT is cached in the user's local config.ini (base64, not encrypted) — never in this file. default_scripts fields: name, hotkey (e.g. \"Ctrl+1\"), body (the shell script; the credential store makes the clone auth automatically). In a body, {{user}} is replaced with the local OS username (the allowed_users name) before it runs — use it for per-user paths like /home/efs/{{user}}, since the remote $USER is the SSM/root account, not the person running the app.",
   "personal_scripts": {
     "allowed_users": [],

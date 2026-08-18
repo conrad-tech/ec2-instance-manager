@@ -76,6 +76,8 @@ pub struct Features {
     pub access_email: AccessEmailConfig,
     /// Automatic `fed up` credential refresh: who gets it and how it is timed.
     pub fed_auth: FedAuthFeature,
+    /// Unattended reaper remediation: who may run it, and every tunable.
+    pub reaper: ReaperFeature,
 }
 
 /// The `fed_auth` section of `assets/features.json`.
@@ -509,6 +511,175 @@ impl AlertsFeature {
     }
 }
 
+/// The `reaper` section of `assets/features.json`.
+///
+/// Gates the unattended reaper auto-remediation. Being on this list is a
+/// materially larger privilege than `alerts.allowed_users` (which only shows
+/// a read-only window), so it is granted separately and ships empty.
+///
+/// **Single-entry by policy.** Nothing arbitrates two machines remediating
+/// one alert; see `has_multiple_users`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct ReaperFeature {
+    /// Master switch. Off in the shipped file.
+    pub enabled: bool,
+    /// When true (the shipped default) the worker logs what it *would*
+    /// remediate and touches nothing. Arming is a deliberate edit.
+    pub dry_run: bool,
+    /// OS usernames permitted to remediate. `"*"` is deliberately **not**
+    /// honoured here.
+    pub allowed_users: Vec<String>,
+    /// JSM Ops schedule id for the on-call lookup.
+    pub schedule_id: String,
+    /// The **Atlassian** account id to look for in the on-call response.
+    /// Named `account_id` in features.json — unrelated to any AWS account id,
+    /// which is what `account` means everywhere else in this codebase.
+    #[serde(rename = "account_id")]
+    pub atlassian_account_id: String,
+    /// Substring identifying a reaper alert in `extraProperties.alertname`.
+    pub alertname_contains: String,
+    /// Substring identifying a reaper alert in the `App:` tag. Secondary —
+    /// the tag is frequently an unrendered template or absent entirely.
+    pub app_contains: String,
+    /// Substring identifying a reaper alert in `message`. Last resort.
+    pub message_contains: String,
+    /// Timeout for the one remote `send-command`.
+    pub send_command_timeout_secs: u64,
+    /// Minimum gap between two remediations of the same instance.
+    pub cooldown_mins: u64,
+    /// How long to wait for the alert to close, on call.
+    pub stage2_on_call_mins: u64,
+    /// How long to wait for the alert to close, off call.
+    pub stage2_off_call_mins: u64,
+    /// Feed poll interval.
+    pub poll_secs: u64,
+    /// Alerts pulled per poll.
+    pub fetch_count: u32,
+}
+
+impl Default for ReaperFeature {
+    fn default() -> Self {
+        // Not `#[derive(Default)]`: `dry_run` must default to `true` (arming
+        // is opt-in), which a derived Default — false for every bool — would
+        // get backwards. This impl also backs `#[serde(default)]`, so a
+        // features.json that omits `dry_run` still ships safe.
+        Self {
+            enabled: false,
+            dry_run: true,
+            allowed_users: Vec::new(),
+            schedule_id: String::new(),
+            atlassian_account_id: String::new(),
+            alertname_contains: String::new(),
+            app_contains: String::new(),
+            message_contains: String::new(),
+            send_command_timeout_secs: 0,
+            cooldown_mins: 0,
+            stage2_on_call_mins: 0,
+            stage2_off_call_mins: 0,
+            poll_secs: 0,
+            fetch_count: 0,
+        }
+    }
+}
+
+impl ReaperFeature {
+    /// True when `user` may remediate. Unlike every other gate in this file,
+    /// `"*"` does not match: a site-wide wildcard must not silently authorise
+    /// unattended `compose down` on production.
+    pub fn is_allowed_user(&self, user: &str) -> bool {
+        let u = user.trim();
+        if u.is_empty() {
+            return false;
+        }
+        self.allowed_users
+            .iter()
+            .any(|a| a.trim() != "*" && a.trim().eq_ignore_ascii_case(u))
+    }
+
+    /// True when the list names more than one user — the caller logs a
+    /// warning, since the race this creates is invisible in normal operation.
+    pub fn has_multiple_users(&self) -> bool {
+        self.allowed_users
+            .iter()
+            .filter(|a| !a.trim().is_empty())
+            .count()
+            > 1
+    }
+
+    /// The JSM schedule id, resolved environment → Windows Credential
+    /// Manager → features.json. Blank when unconfigured, which the on-call
+    /// lookup reports as an error rather than as "not on call".
+    pub fn resolved_schedule_id(&self) -> String {
+        crate::jsm_auth::resolve_id(
+            crate::jsm_auth::SCHEDULE_ID_ENV,
+            crate::jsm_auth::SCHEDULE_ID_TARGET,
+            &self.schedule_id,
+        )
+    }
+
+    /// The **Atlassian** account id — the identity matched against the JSM
+    /// on-call response. Unrelated to any AWS account id, which is what
+    /// `account` means everywhere else in this codebase.
+    pub fn resolved_atlassian_account_id(&self) -> String {
+        crate::jsm_auth::resolve_id(
+            crate::jsm_auth::ATLASSIAN_ACCOUNT_ID_ENV,
+            crate::jsm_auth::ATLASSIAN_ACCOUNT_ID_TARGET,
+            &self.atlassian_account_id,
+        )
+    }
+
+    /// Effective values for the tunables, so a zero in features.json (or a
+    /// missing section) means "the default" rather than "never wait".
+    pub fn poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(if self.poll_secs == 0 {
+            30
+        } else {
+            self.poll_secs
+        })
+    }
+    pub fn send_command_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(if self.send_command_timeout_secs == 0 {
+            90
+        } else {
+            self.send_command_timeout_secs
+        })
+    }
+    pub fn cooldown(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            60 * if self.cooldown_mins == 0 {
+                30
+            } else {
+                self.cooldown_mins
+            },
+        )
+    }
+    pub fn alerts_per_poll(&self) -> u32 {
+        if self.fetch_count == 0 {
+            10
+        } else {
+            self.fetch_count
+        }
+    }
+    /// Stage-2 window. Longer on call, because there the timeout triggers
+    /// phone calls; off call it is one quiet message and telling the user
+    /// sooner costs nothing.
+    pub fn stage2_window(&self, on_call: bool) -> std::time::Duration {
+        let mins = if on_call {
+            if self.stage2_on_call_mins == 0 {
+                15
+            } else {
+                self.stage2_on_call_mins
+            }
+        } else if self.stage2_off_call_mins == 0 {
+            10
+        } else {
+            self.stage2_off_call_mins
+        };
+        std::time::Duration::from_secs(60 * mins)
+    }
+}
+
 /// The OS username of the person running the app: `USERNAME` on Windows,
 /// `USER` elsewhere. Empty when neither is set.
 pub fn current_os_user() -> String {
@@ -636,6 +807,9 @@ impl Default for Features {
             // Derived Default: `enabled` false and an empty allow-list, which
             // is the fail-closed state this feature must land in.
             fed_auth: FedAuthFeature::default(),
+            // `enabled` false, allow-list empty (fail-closed) and `dry_run`
+            // true (arming is opt-in) — see the hand-written `Default` impl.
+            reaper: ReaperFeature::default(),
         }
     }
 }
@@ -708,6 +882,12 @@ impl Features {
     /// Host the git credential store is scoped to.
     pub fn git_host(&self) -> String {
         self.personal_scripts.host()
+    }
+
+    /// True when `user` may run unattended reaper remediation. Fails closed:
+    /// the feature must be switched on *and* the user named explicitly.
+    pub fn reaper_enabled_for(&self, user: &str) -> bool {
+        self.reaper.enabled && self.reaper.is_allowed_user(user)
     }
 
     /// True when `name` is on the protected never-delete list (case- and
@@ -1438,5 +1618,58 @@ mod tests {
         let f: Features = serde_json::from_str("{}").expect("should parse");
         assert!(!f.alerts_visible_for("bconrad"));
         assert!(!f.alerts_auth().is_complete());
+    }
+
+    #[test]
+    fn reaper_ships_disabled_dry_and_with_nobody_allowed() {
+        let f = Features::default();
+        assert!(!f.reaper.enabled);
+        assert!(f.reaper.dry_run, "dry_run must default on — arming is opt-in");
+        assert!(f.reaper.allowed_users.is_empty());
+        assert!(!f.reaper_enabled_for("anyone"));
+    }
+
+    #[test]
+    fn reaper_needs_enabled_and_the_allow_list_and_a_schedule() {
+        let mut f = Features::default();
+        f.reaper.allowed_users = vec!["bconrad".to_string()];
+        assert!(!f.reaper_enabled_for("bconrad"), "enabled is still false");
+
+        f.reaper.enabled = true;
+        assert!(f.reaper_enabled_for("bconrad"));
+        assert!(f.reaper_enabled_for("BConrad"), "match is case-insensitive");
+        assert!(!f.reaper_enabled_for("someone_else"));
+        assert!(!f.reaper_enabled_for(""), "a missing username fails closed");
+    }
+
+    #[test]
+    fn a_wildcard_does_not_open_reaper_to_everyone() {
+        // Every other allow-list honours "*". This one must not: running
+        // `compose down` on production is not a site-wide default.
+        let mut f = Features::default();
+        f.reaper.enabled = true;
+        f.reaper.allowed_users = vec!["*".to_string()];
+        assert!(!f.reaper_enabled_for("anyone"));
+    }
+
+    #[test]
+    fn more_than_one_allowed_user_is_detectable() {
+        // Nothing arbitrates two machines acting on one alert, so the caller
+        // logs a warning. The list is single-entry by policy.
+        let mut f = Features::default();
+        f.reaper.allowed_users = vec!["a".to_string()];
+        assert!(!f.reaper.has_multiple_users());
+        f.reaper.allowed_users.push("b".to_string());
+        assert!(f.reaper.has_multiple_users());
+    }
+
+    #[test]
+    fn the_shipped_features_json_keeps_reaper_dark_and_secret_free() {
+        let f = load();
+        assert!(!f.reaper.enabled);
+        assert!(f.reaper.allowed_users.is_empty());
+        assert!(f.reaper.dry_run);
+        // features.json is committed. A token here is a token in git.
+        assert!(f.alerts.token.trim().is_empty());
     }
 }
