@@ -71,6 +71,8 @@ pub struct Features {
     pub vault_iam: VaultIamFeature,
     /// "Bastion User Sync" entry in the Scripts menu: who may see it.
     pub user_sync: UserSyncFeature,
+    /// "Send test escalation" action: who may see it.
+    pub on_call_test: OnCallTestFeature,
     /// Outlook "access email" automation config (Windows only). Controls
     /// how the post-create email is encrypted and whether it may auto-send.
     pub access_email: AccessEmailConfig,
@@ -403,6 +405,28 @@ pub struct UserSyncFeature {
 
 impl UserSyncFeature {
     /// True when `user` may see the Bastion User Sync entry.
+    pub fn is_allowed_user(&self, user: &str) -> bool {
+        user_in_list(&self.allowed_users, user)
+    }
+}
+
+/// The "Send test escalation" action, which mails a content-free coded
+/// subject to the configured escalation mailbox.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct OnCallTestFeature {
+    /// OS usernames allowed to see the action (case-insensitive).
+    /// `["*"]` for everyone, an empty list for nobody. Shipped empty.
+    pub allowed_users: Vec<String>,
+}
+
+impl OnCallTestFeature {
+    /// True when `user` may see the test action.
+    ///
+    /// The action itself is also hidden when no recipient is configured — a
+    /// visible control that cannot work invites a click and then explains
+    /// nothing. That check belongs to the caller, which has the credential
+    /// lookup; this gate answers only "is this user allowed".
     pub fn is_allowed_user(&self, user: &str) -> bool {
         user_in_list(&self.allowed_users, user)
     }
@@ -803,6 +827,9 @@ impl Default for Features {
             // Derived Default: an empty allow-list, which is the fail-closed
             // state this feature must land in.
             user_sync: UserSyncFeature::default(),
+            // Derived Default: an empty allow-list, which is the fail-closed
+            // state this feature must land in.
+            on_call_test: OnCallTestFeature::default(),
             access_email: AccessEmailConfig::default(),
             // Derived Default: `enabled` false and an empty allow-list, which
             // is the fail-closed state this feature must land in.
@@ -1139,6 +1166,33 @@ mod tests {
         let f: Features = serde_json::from_str("{}").expect("parses");
         assert!(!f.user_sync_enabled_for("anyone"));
         assert!(!Features::default().user_sync_enabled_for("anyone"));
+    }
+
+    #[test]
+    fn the_on_call_test_gate_follows_the_shared_allow_list_rules() {
+        let nobody = OnCallTestFeature { allowed_users: vec![] };
+        assert!(!nobody.is_allowed_user("brandon"));
+
+        let everyone = OnCallTestFeature { allowed_users: vec!["*".to_string()] };
+        assert!(everyone.is_allowed_user("anyone"));
+
+        let named = OnCallTestFeature {
+            allowed_users: vec!["Brandon".to_string()],
+        };
+        assert!(named.is_allowed_user("brandon"), "match is case-insensitive");
+        assert!(!named.is_allowed_user("someone_else"));
+    }
+
+    #[test]
+    fn the_shipped_on_call_test_gate_is_closed() {
+        // It sends mail out of the org. It ships to nobody, and handing it
+        // out is a deliberate edit plus a rebuild -- same posture as
+        // user_sync and alerts.
+        let shipped = load();
+        assert!(
+            shipped.on_call_test.allowed_users.is_empty(),
+            "on_call_test must ship with an empty allow-list"
+        );
     }
 
     #[test]

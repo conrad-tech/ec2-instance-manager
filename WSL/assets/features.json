@@ -26,6 +26,10 @@
   "user_sync": {
     "allowed_users": []
   },
+  "_on_call_test_comment": "\"Send test escalation\" action. Sends one content-free email to the escalation mailbox so the whole notification chain -- Outlook, the mail path, the mailbox, the Pi daemon, Telegram, the phone -- can be exercised on demand. The subject carries an outcome code and the alert timestamp and NOTHING else: no instance id, no account number, no environment, no product name. The body is empty. The recipient is NOT configured here: it is read from Windows Credential Manager (ec2_manager/escalation_mailbox) or the ESCALATION_MAILBOX environment variable, so a personal address never enters this committed file, and an unconfigured address hides the action rather than defaulting to one. allowed_users lists the OS usernames that see it: [\"*\"] = everyone, [] = nobody (the shipped default). It sends mail out of the org, so it ships closed -- add usernames and rebuild to hand it out.",
+  "on_call_test": {
+    "allowed_users": []
+  },
   "_alerts_comment": "On-call Alerts button (Jira Service Management Operations). cloud_id + email identify the JSM site to query. allowed_users lists the OS usernames (Windows USERNAME / Linux USER, matched case-insensitively) that may see the Alerts button; use [\"*\"] for everyone, [] to hide it from everyone. The button only appears when cloud_id AND email are set AND the user is on the list. DO NOT commit a real API token in 'token' — this file is in git. Leave it empty and have each user set JIRA_TOKEN in their environment; JIRA_TOKEN always overrides this value.",
   "alerts": {
     "cloud_id": "",
