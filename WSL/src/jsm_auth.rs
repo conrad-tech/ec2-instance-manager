@@ -73,6 +73,13 @@ pub const OPSGENIE_API_KEY_TARGET: &str = "ec2_manager/opsgenie_api_key";
 /// Environment variable that overrides the stored Opsgenie API key.
 pub const OPSGENIE_API_KEY_ENV: &str = "OPSGENIE_API_KEY";
 
+/// Credential Manager target for the escalation mailbox address (password
+/// field only). Not a secret, but it must not be committed: it is a personal
+/// address, and it is the point at which data leaves the org.
+pub const ESCALATION_MAILBOX_TARGET: &str = "ec2_manager/escalation_mailbox";
+/// Environment variable that overrides the stored escalation mailbox address.
+pub const ESCALATION_MAILBOX_ENV: &str = "ESCALATION_MAILBOX";
+
 /// First non-blank of the candidates, trimmed. Blank-but-set is treated as
 /// absent: `export JIRA_TOKEN=` must not shadow a real stored credential.
 fn first_non_blank(candidates: [Option<&str>; 3]) -> String {
@@ -172,6 +179,25 @@ fn some_unless_blank(v: String) -> Option<String> {
 pub fn opsgenie_api_key() -> Option<String> {
     let v = resolve_id(OPSGENIE_API_KEY_ENV, OPSGENIE_API_KEY_TARGET, "");
     some_unless_blank(v)
+}
+
+/// The address escalation mail is sent to, if one is configured.
+///
+/// Deliberately has no fallback and no default. An address nobody configured
+/// must never become an address the app invents — this is the destination for
+/// mail that crosses the org boundary, so "unset" has to mean the feature is
+/// unavailable rather than "send it somewhere". Same fail-closed posture as
+/// `allow_delete_user` and the Alerts button.
+///
+/// Stored in Credential Manager rather than `features.json` (committed, so a
+/// personal address would enter the corporate repo) or `config.ini` (plain
+/// text, and it would let any user aim the app at any external address).
+pub fn escalation_mailbox() -> Option<String> {
+    some_unless_blank(resolve_id(
+        ESCALATION_MAILBOX_ENV,
+        ESCALATION_MAILBOX_TARGET,
+        "",
+    ))
 }
 
 #[cfg(test)]
@@ -364,5 +390,28 @@ mod tests {
         assert_eq!(SCHEDULE_ID_ENV, "SCHEDULE_ID");
         assert_eq!(ATLASSIAN_ACCOUNT_ID_ENV, "MY_ID");
         assert_eq!(OPSGENIE_API_KEY_ENV, "OPSGENIE_API_KEY");
+    }
+
+    #[test]
+    fn the_escalation_mailbox_target_and_env_match_what_is_documented() {
+        // These two strings are what the user typed into Credential Manager
+        // with `cmdkey /generic:...` and may have exported. Renaming either
+        // silently disables the feature on a machine that is correctly set
+        // up, so they are pinned here rather than left to a refactor.
+        assert_eq!(ESCALATION_MAILBOX_TARGET, "ec2_manager/escalation_mailbox");
+        assert_eq!(ESCALATION_MAILBOX_ENV, "ESCALATION_MAILBOX");
+    }
+
+    #[test]
+    fn a_blank_mailbox_value_is_absent_not_configured() {
+        // Mirrors the rule the rest of this module uses: `set ESCALATION_MAILBOX=`
+        // must not read as "configured with an empty address", which would
+        // otherwise send escalation mail to nobody and report success.
+        assert!(some_unless_blank(String::new()).is_none());
+        assert!(some_unless_blank("   ".to_string()).is_none());
+        assert_eq!(
+            some_unless_blank("a@b.com".to_string()),
+            Some("a@b.com".to_string())
+        );
     }
 }
