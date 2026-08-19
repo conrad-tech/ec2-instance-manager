@@ -5219,11 +5219,12 @@ mod gui {
         /// Background reaper poll thread. `None` when the feature is off for
         /// this user or JSM credentials are not configured.
         reaper: Option<ReaperRuntime>,
-        /// Outcome codes (`RE-F`/`RE-N`/`RE-K`/`RE-C`) waiting on a notifier.
+        /// Finished remediations waiting on a notifier: the outcome code
+        /// (`RE-F`/`RE-N`/`RE-K`/`RE-C`) and the alert's `createdAt`.
         /// Nothing reads this yet — wiring it to a send path is a separate,
-        /// later plan. Only the four-character code ever lands here; never
-        /// an instance id, account, environment or product name.
-        pending_notify: Vec<String>,
+        /// later plan. Only those two fields ever land here; never an
+        /// instance id, account, environment or product name.
+        pending_notify: Vec<PendingNotify>,
         /// Build-time gate: whether the automatic `fed up` login runs for the
         /// current OS user (features.json `fed_auth`, which needs both
         /// `enabled` and a named user).
@@ -10440,7 +10441,7 @@ mod gui {
             // would conflict with the immutable borrow of `rt` (itself
             // borrowed from `self.reaper`) held by the channel iterator.
             let events: Vec<ReaperEvent> = rt.rx.try_iter().collect();
-            for ev in events {
+            for ev in &events {
                 match ev {
                     ReaperEvent::Considered { code, instance, on_call } => {
                         // A projection, not a result: dry run never ran the
@@ -10456,12 +10457,17 @@ mod gui {
                     ReaperEvent::LookupFailed { detail } => {
                         self.log_warn(format!("reaper: lookup failed — {detail}"))
                     }
-                    ReaperEvent::Outcome { code, instance } => {
-                        self.log_info(format!("reaper: {instance} -> {code}"));
+                    ReaperEvent::Outcome { code, instance, created_at } => {
+                        self.log_info(format!(
+                            "reaper: {instance} -> {code} (alert createdAt {created_at:?})"
+                        ));
                         // The notifier is the escalation-notifier spec's job.
-                        // Only `code` crosses the org boundary; `instance`
-                        // must never be passed to it.
-                        self.pending_notify.push(code);
+                        // Only the code and the alert timestamp cross the org
+                        // boundary; `instance` is logged here and goes no
+                        // further — `notify_from_event` is what drops it.
+                        if let Some(entry) = notify_from_event(ev) {
+                            self.pending_notify.push(entry);
+                        }
                     }
                 }
             }
@@ -21534,14 +21540,76 @@ mod gui {
         LookupFailed { detail: String },
         /// The armed path is done trying, whether that's a completed
         /// remediation or a failure to even start one (e.g. no credentials
-        /// for the target account). `code` is the only thing that may ever
-        /// cross the org boundary; `instance` is for the local log only.
-        Outcome { code: String, instance: String },
+        /// for the target account). `code` and `created_at` are the only
+        /// things that may ever cross the org boundary; `instance` is for
+        /// the local log only.
+        Outcome {
+            code: String,
+            instance: String,
+            /// `createdAt` from the alert that caused this, verbatim as the
+            /// API returned it (RFC 3339, UTC), or blank when the feed sent
+            /// none. Carried because the remediation thread consumes its
+            /// `Target` and drops it — without this the timestamp is gone by
+            /// the time an outcome reaches the notifier seam, and the subject
+            /// could only ever be the bare code.
+            created_at: String,
+        },
     }
 
     struct ReaperRuntime {
         rx: std::sync::mpsc::Receiver<ReaperEvent>,
         _handle: std::thread::JoinHandle<()>,
+    }
+
+    /// One finished remediation waiting on a notifier: exactly what may
+    /// cross the org boundary, and nothing else.
+    ///
+    /// A struct rather than a `(String, String)` so both fields are named at
+    /// every use site — a code and a timestamp are two strings that swap
+    /// silently, and the swap would send a timestamp where the daemon looks
+    /// for a tier code.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct PendingNotify {
+        /// The four-character outcome code, from `OutcomeCode::as_str()`.
+        code: String,
+        /// The alert's `createdAt`, verbatim (RFC 3339, UTC). Blank when the
+        /// feed supplied none, which `escalation_subject` degrades to the
+        /// bare code.
+        created_at: String,
+    }
+
+    /// The event a finished remediation reports back.
+    ///
+    /// Split out of the worker thread so the wire fields can be tested
+    /// without spawning one. This is the point where a `Target` — which
+    /// holds the instance id, the account id and the environment — is
+    /// reduced to what may be sent, so it is where the reduction is worth
+    /// pinning.
+    fn outcome_event(
+        code: ec2_manager::reaper::OutcomeCode,
+        target: &ec2_manager::reaper::Target,
+    ) -> ReaperEvent {
+        ReaperEvent::Outcome {
+            // Never a literal: the code has to stay the vocabulary the
+            // daemon matches on.
+            code: code.as_str().to_string(),
+            instance: target.instance_id.clone(),
+            created_at: target.created_at.clone(),
+        }
+    }
+
+    /// The notifier entry an `Outcome` event earns, or `None` for every
+    /// other event. Split out of `poll_reaper_events` for the same reason:
+    /// this is where `instance` is dropped, and dropping it is the property
+    /// worth a test.
+    fn notify_from_event(ev: &ReaperEvent) -> Option<PendingNotify> {
+        match ev {
+            ReaperEvent::Outcome { code, created_at, .. } => Some(PendingNotify {
+                code: code.clone(),
+                created_at: created_at.clone(),
+            }),
+            _ => None,
+        }
     }
 
     /// Monotonic milliseconds for the cooldown bookkeeping. A wall clock
@@ -21920,10 +21988,7 @@ mod gui {
                                     |ctx, cmd| exec_remote_command(&None, ctx, &iid, cmd, timeout),
                                 );
                                 if let Some(code) = outcome {
-                                    let _ = tx_for_thread.send(ReaperEvent::Outcome {
-                                        code: code.as_str().to_string(),
-                                        instance: target.instance_id.clone(),
-                                    });
+                                    let _ = tx_for_thread.send(outcome_event(code, &target));
                                 }
                             });
                         }
@@ -23899,6 +23964,83 @@ mod gui {
                 environment: "DEV1".to_string(),
                 created_at: "2026-08-19T20:12:09Z".to_string(),
             }
+        }
+
+        /// The whole path a real remediation's outcome takes to the notifier
+        /// seam: `Target` → `ReaperEvent::Outcome` → `pending_notify`.
+        ///
+        /// The remediation runs on its own thread, which takes the `Target`
+        /// by value and drops it, so anything not copied into the event is
+        /// gone by the time an outcome is drained. That is what made the
+        /// timestamp unreachable before: the field existed on `Target` and
+        /// the wire format could still only ever be the bare code.
+        #[test]
+        fn a_remediation_outcome_carries_the_alerts_created_at_to_the_notifier() {
+            use ec2_manager::reaper::OutcomeCode;
+            let target = test_reaper_target();
+            let ev = outcome_event(OutcomeCode::Failure, &target);
+            let entry = notify_from_event(&ev).expect("an Outcome earns a notifier entry");
+            assert_eq!(entry.created_at, target.created_at);
+            assert_eq!(entry.created_at, "2026-08-19T20:12:09Z");
+            // And the code is the enum's, not a literal, so it cannot drift
+            // from the vocabulary the Pi-side daemon matches on.
+            assert_eq!(entry.code, OutcomeCode::Failure.as_str());
+        }
+
+        /// The other half of the same rule: the instance id reaches the log
+        /// and stops there. `escalation_subject` is fed from `pending_notify`,
+        /// so anything that lands in it is a candidate for leaving the org.
+        #[test]
+        fn the_instance_id_reaches_the_event_but_never_the_notifier() {
+            use ec2_manager::reaper::OutcomeCode;
+            let target = test_reaper_target();
+            let ev = outcome_event(OutcomeCode::Failure, &target);
+            match &ev {
+                ReaperEvent::Outcome { instance, .. } => {
+                    assert_eq!(instance, &target.instance_id, "the local log still gets it")
+                }
+                other => panic!("expected an Outcome, got {other:?}"),
+            }
+            let entry = notify_from_event(&ev).expect("an Outcome earns a notifier entry");
+            // Assert against the fields themselves, not a substring scan of a
+            // rendered string: a scan for "i-" would also pass for a struct
+            // that simply spelled the id differently.
+            assert_eq!(entry, PendingNotify {
+                code: OutcomeCode::Failure.as_str().to_string(),
+                created_at: target.created_at.clone(),
+            });
+            // And nothing else off the target came along for the ride.
+            for local_only in [
+                target.instance_id.as_str(),
+                target.account_id.as_str(),
+                target.environment.as_str(),
+                target.alert_id.as_str(),
+            ] {
+                assert!(!entry.code.contains(local_only), "{local_only}");
+                assert!(!entry.created_at.contains(local_only), "{local_only}");
+            }
+        }
+
+        /// Only a finished remediation earns a notifier entry. A dry-run
+        /// projection in particular must not — it never ran the fix, never
+        /// acknowledged and never contacted the instance, so sending on it
+        /// would ring a phone about something that did not happen.
+        #[test]
+        fn no_other_reaper_event_earns_a_notifier_entry() {
+            assert!(notify_from_event(&ReaperEvent::Considered {
+                code: "RE-F".to_string(),
+                instance: "i-0abc123def4567890".to_string(),
+                on_call: true,
+            })
+            .is_none());
+            assert!(notify_from_event(&ReaperEvent::Skipped {
+                reason: "cooldown".to_string()
+            })
+            .is_none());
+            assert!(notify_from_event(&ReaperEvent::LookupFailed {
+                detail: "feed: timeout".to_string()
+            })
+            .is_none());
         }
 
         /// A transcript `parse_verdict` reads as `Verdict::Failed` — the
