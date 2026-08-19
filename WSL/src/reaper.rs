@@ -27,6 +27,10 @@ pub struct Target {
     pub instance_id: String,
     pub account_id: String,
     pub environment: String,
+    /// `createdAt` from the alert, verbatim as the API returned it (RFC 3339,
+    /// UTC). Carried so a remediation can be tied back to the alert that
+    /// caused it when several fire close together.
+    pub created_at: String,
 }
 
 /// `true` when `hay` contains `needle`, case-insensitively. A blank needle
@@ -104,6 +108,7 @@ pub fn match_alert(alert: &Alert, cfg: &ReaperFeature) -> Option<Target> {
         instance_id,
         account_id: alert.account.clone(),
         environment: alert.environment.clone(),
+        created_at: alert.created_at.clone(),
     })
 }
 
@@ -329,6 +334,28 @@ pub fn decide_outcome(on_call: bool, verdict: &Verdict, closed_in_window: bool) 
         OutcomeCode::Failure
     } else {
         OutcomeCode::FailureQuiet
+    }
+}
+
+/// The subject line of an escalation email. This is the entire payload.
+///
+/// `<code> <createdAt>` — the code first, so it stays the head of the
+/// message, and the timestamp exactly as the API returned it (RFC 3339, UTC).
+/// The Pi-side daemon renders it in local time; sending UTC keeps the wire
+/// format unambiguous and machine-parseable.
+///
+/// The body is empty and stays empty. What leaves the org is a code and a
+/// time — no instance id, account number, environment or product name.
+///
+/// A blank timestamp yields the bare code. The feed has been observed serving
+/// unrendered templates and absent tags, and an escalation that arrives
+/// without a timestamp is worth far more than one that does not arrive.
+pub fn escalation_subject(code: OutcomeCode, created_at: &str) -> String {
+    let stamp = created_at.trim();
+    if stamp.is_empty() {
+        code.as_str().to_string()
+    } else {
+        format!("{} {}", code.as_str(), stamp)
     }
 }
 
@@ -912,5 +939,63 @@ mod tests {
             !ps_line.contains("2>&1"),
             "compose ps must not merge stderr into the parsed block: {ps_line}"
         );
+    }
+
+    #[test]
+    fn the_subject_is_the_code_then_the_timestamp() {
+        assert_eq!(
+            escalation_subject(OutcomeCode::Failure, "2026-08-19T20:12:09Z"),
+            "RE-F 2026-08-19T20:12:09Z"
+        );
+    }
+
+    #[test]
+    fn the_subject_takes_the_code_from_the_enum_not_a_literal() {
+        // A literal here could drift from the vocabulary the daemon matches
+        // on. The mail would still send, the daemon would not recognise the
+        // code, and it would escalate it as UNKNOWN -- a failure that looks
+        // exactly like success.
+        for code in [
+            OutcomeCode::Failure,
+            OutcomeCode::FailureQuiet,
+            OutcomeCode::Ok,
+            OutcomeCode::Canary,
+        ] {
+            let subject = escalation_subject(code, "2026-08-19T20:12:09Z");
+            assert!(
+                subject.starts_with(code.as_str()),
+                "{subject} must start with {}",
+                code.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_timestamp_yields_the_bare_code_with_no_trailing_space() {
+        // The feed has been observed serving unrendered templates and absent
+        // tags, so a missing timestamp must degrade to the old behaviour --
+        // never a trailing space, and never a blocked send. An escalation
+        // without a timestamp is worth more than one that does not arrive.
+        assert_eq!(escalation_subject(OutcomeCode::Failure, ""), "RE-F");
+        assert_eq!(escalation_subject(OutcomeCode::Failure, "   "), "RE-F");
+    }
+
+    #[test]
+    fn the_subject_carries_nothing_but_the_code_and_the_time() {
+        let subject = escalation_subject(OutcomeCode::Failure, "2026-08-19T20:12:09Z");
+        for leak in ["i-", "prod", "dev", "1234", "account", "env"] {
+            assert!(
+                !subject.to_ascii_lowercase().contains(leak),
+                "subject {subject} must not contain {leak}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_matched_target_carries_the_alerts_created_at() {
+        let mut a = alert();
+        a.created_at = "2026-08-19T20:12:09Z".to_string();
+        let target = match_alert(&a, &cfg()).expect("should match");
+        assert_eq!(target.created_at, "2026-08-19T20:12:09Z");
     }
 }

@@ -23897,6 +23897,7 @@ mod gui {
                 instance_id: "i-0abc123def4567890".to_string(),
                 account_id: "111111111111".to_string(),
                 environment: "DEV1".to_string(),
+                created_at: "2026-08-19T20:12:09Z".to_string(),
             }
         }
 
