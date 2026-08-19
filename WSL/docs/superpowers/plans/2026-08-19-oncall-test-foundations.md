@@ -470,9 +470,60 @@ history.
 
 - [ ] **Step 3: Assert the copy happens**
 
-In `scripts/test_build_binaries.sh`, beside the existing assertion for
-`send_access_email.ps1`, add the matching assertion for `send_escalation.ps1`.
-Follow the existing assertion's exact style.
+**There is no existing assertion for `send_access_email.ps1` to copy** — the
+Windows script copy is untested today, which is why this step writes a real
+test rather than mirroring one. Follow the shape of
+`test_package_linux_zip_creates_archive_with_artifacts`, which already saves
+and restores a dist-dir global around a call to the function under test.
+
+Add to `scripts/test_build_binaries.sh`, and register it wherever the file
+invokes its `test_*` functions:
+
+```bash
+test_package_windows_zip_ships_both_powershell_scripts() {
+  if ! command -v zip >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1; then
+    echo "skipping windows zip packaging test (zip/unzip not installed)"
+    return 0
+  fi
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  local original_windows_dist_dir="$WINDOWS_DIST_DIR"
+  WINDOWS_DIST_DIR="$tmpdir"
+
+  # Same versioned names copy_artifact writes.
+  touch "$WINDOWS_DIST_DIR/${CLI_APP_NAME}_${APP_VERSION}.exe"
+  touch "$WINDOWS_DIST_DIR/${GUI_APP_NAME}_${APP_VERSION}.exe"
+
+  SKIP_ICON_VERIFY=1 package_windows_zip
+
+  # Both scripts must land beside the exe rather than inside the archive
+  # only: they are run from the file next to the executable, never written
+  # to %TEMP% and run from there, because that is a pattern EDRs quarantine
+  # on sight and this app has a CrowdStrike quarantine in its history.
+  local missing=""
+  [[ -f "$WINDOWS_DIST_DIR/send_access_email.ps1" ]] || missing="$missing send_access_email.ps1"
+  [[ -f "$WINDOWS_DIST_DIR/send_escalation.ps1" ]] || missing="$missing send_escalation.ps1"
+  if [[ -n "$missing" ]]; then
+    echo "assertion failed: not copied beside the exe:$missing" >&2
+    exit 1
+  fi
+
+  rm -rf "$tmpdir"
+  WINDOWS_DIST_DIR="$original_windows_dist_dir"
+}
+```
+
+If `package_windows_zip` turns out to need more setup than this — an icon
+file, a different global name — adapt to what the function actually reads
+rather than forcing the test to match this sketch, and say what you changed
+in your report. `SKIP_ICON_VERIFY=1` is set because `verify_windows_icon`
+re-reads the exe it copied and `exit 1`s unless it has a real `.rsrc`
+section, which a `touch`ed empty file does not.
+
+**If the test proves impractical to write in a reasonable time, stop and
+report it rather than deleting the assertion.** An untested copy step is how
+`config.example.ini` survived in `deploy.sh` after being deleted.
 
 - [ ] **Step 4: Verify**
 
