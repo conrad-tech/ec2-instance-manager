@@ -2896,6 +2896,70 @@ mod gui {
         Some(EmailStatus::Opened { reason })
     }
 
+    /// What `send_escalation.ps1` reported.
+    ///
+    /// A separate type from `EmailStatus` because the two scripts answer
+    /// different questions. `EmailStatus::Opened` — "Outlook is up, finish it
+    /// by hand" — has no meaning here: this script either sends or does not,
+    /// and there is no attachment to hand-address. Sharing one enum would
+    /// mean a variant that is unreachable from one of its two producers.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[allow(dead_code)]
+    enum EscalationStatus {
+        /// The mail went out. Carries the address it actually went to.
+        Sent { address: String },
+        /// The script refused, or the send threw. Carries the reason it
+        /// named — never a bare "something went wrong", which sends the user
+        /// nowhere.
+        Failed { reason: String },
+    }
+
+    /// Read one line of `send_escalation.ps1` output and turn a marker into a
+    /// status. Returns `None` for anything else, so the reader keeps the last
+    /// real marker it saw. The marker format is fixed by the script:
+    ///
+    /// ```text
+    /// SENT address='oncall@example.com'
+    /// FAILED reason='Outlook is not available'
+    /// ```
+    ///
+    /// **A sibling of `parse_email_marker`, not an extension of it.** They
+    /// read two different scripts with two different vocabularies: that one
+    /// has `OPEN` and a dozen recipient-gate flags because it attaches a
+    /// private key, and this one has `FAILED` and a free-text reason.
+    /// Folding them together would give one function whose answer depends on
+    /// which script produced the line, and would force `SENT` to mean the
+    /// same thing in both — which is precisely what the spec forbids, since
+    /// this path must not inherit the access-email gates. They share
+    /// `single_quoted_value`, which is the part that genuinely is common.
+    ///
+    /// The script strips apostrophes and newlines out of a reason before
+    /// printing it, so a value arriving here contains neither. That matters:
+    /// `single_quoted_value` stops at the first `'`, so an unstripped
+    /// apostrophe would silently truncate the reason. The agreement is
+    /// pinned by `the_script_strips_what_the_marker_format_cannot_carry`.
+    ///
+    /// Not yet called from production code — the button that spawns the
+    /// script is the GUI half of this feature and lands next. Parsing is
+    /// pure and testable with no Outlook and no network, so it is built and
+    /// tested here rather than deferred with it.
+    #[allow(dead_code)]
+    fn parse_escalation_marker(line: &str) -> Option<EscalationStatus> {
+        let line = line.trim();
+
+        if let Some(rest) = line.strip_prefix("SENT ") {
+            let address = single_quoted_value(rest, "address=").unwrap_or_default();
+            return Some(EscalationStatus::Sent { address });
+        }
+
+        // Every `FAILED` line is a reason the script went to the trouble of
+        // naming. Returning `None` here — as the access-email parser does,
+        // because it has no `FAILED` to read — discarded all of them.
+        let rest = line.strip_prefix("FAILED ")?;
+        let reason = single_quoted_value(rest, "reason=").unwrap_or_default();
+        Some(EscalationStatus::Failed { reason })
+    }
+
     /// Pull a bare `key=value` (no quotes, space-terminated) out of a marker.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn single_unquoted_value(haystack: &str, key: &str) -> Option<String> {
@@ -25130,6 +25194,122 @@ mod gui {
             assert!(parse_email_marker("Recipient resolved: True").is_none());
             assert!(parse_email_marker("").is_none());
             assert!(parse_email_marker("SENTINEL something").is_none());
+        }
+
+        // -- send_escalation.ps1 markers ---------------------------------
+        //
+        // The escalation script's own vocabulary. `parse_email_marker` reads
+        // `SENT`/`OPEN` and returns None for everything else -- including
+        // every `FAILED` line, which is every reason that script goes to the
+        // trouble of naming. The spec requires a failure to say what went
+        // wrong, so these are parsed by a sibling.
+
+        /// The source of the script the parser has to agree with. Read at
+        /// compile time so the two cannot drift: the file lives in `assets/`
+        /// and the parser lives here.
+        const SEND_ESCALATION_PS1: &str =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/scripts/send_escalation.ps1"));
+
+        #[test]
+        fn a_sent_escalation_marker_carries_the_address_it_went_to() {
+            assert_eq!(
+                parse_escalation_marker("SENT address='oncall@example.com'"),
+                Some(EscalationStatus::Sent {
+                    address: "oncall@example.com".to_string()
+                })
+            );
+        }
+
+        #[test]
+        fn a_failed_escalation_marker_carries_the_reason() {
+            // Every one of these was discarded before: `parse_email_marker`
+            // has no `FAILED` arm, so it returned None and the GUI would have
+            // reported "no marker" for a script that said exactly what was
+            // wrong.
+            for (line, reason) in [
+                (
+                    "FAILED reason='Outlook is not available'",
+                    "Outlook is not available",
+                ),
+                (
+                    "FAILED reason='no recipient configured'",
+                    "no recipient configured",
+                ),
+            ] {
+                assert_eq!(
+                    parse_escalation_marker(line),
+                    Some(EscalationStatus::Failed {
+                        reason: reason.to_string()
+                    }),
+                    "{line}"
+                );
+            }
+        }
+
+        #[test]
+        fn an_escalation_reason_arrives_with_its_apostrophes_already_stripped() {
+            // What the script emits for a COM message like
+            // "Outlook can't complete the operation": it strips the
+            // apostrophe first. That is load-bearing, not cosmetic --
+            // `single_quoted_value` stops at the first `'`, so an unstripped
+            // one would truncate the reason to "Outlook can" and the user
+            // would be told half of it.
+            assert_eq!(
+                parse_escalation_marker("FAILED reason='Outlook cant complete the operation'"),
+                Some(EscalationStatus::Failed {
+                    reason: "Outlook cant complete the operation".to_string()
+                })
+            );
+        }
+
+        #[test]
+        fn an_escalation_reason_arrives_as_one_line() {
+            // A multi-line COM message reaches the script as one, because the
+            // script folds newlines to spaces before printing. The reader is
+            // line-oriented, so a real embedded newline would split the
+            // marker across two reads and lose the closing quote.
+            assert_eq!(
+                parse_escalation_marker(
+                    "FAILED reason='The operation failed. Try again later.'"
+                ),
+                Some(EscalationStatus::Failed {
+                    reason: "The operation failed. Try again later.".to_string()
+                })
+            );
+        }
+
+        /// The parser's two assumptions are the script's two `-replace`
+        /// clauses. They live in different files, so pin them together.
+        #[test]
+        fn the_script_strips_what_the_marker_format_cannot_carry() {
+            let reason_line = SEND_ESCALATION_PS1
+                .lines()
+                .find(|l| l.contains("$reason ="))
+                .expect("the script builds a reason");
+            assert!(
+                reason_line.contains(r#"-replace "'", ''"#),
+                "the reason must have its apostrophes stripped: {reason_line}"
+            );
+            assert!(
+                reason_line.contains("-replace") && reason_line.contains("n\", ' '"),
+                "the reason must have its newlines folded to spaces: {reason_line}"
+            );
+            // And the markers themselves are what the parser looks for.
+            assert!(SEND_ESCALATION_PS1.contains("SENT address='"));
+            assert!(SEND_ESCALATION_PS1.contains("FAILED reason='"));
+        }
+
+        #[test]
+        fn a_line_that_is_not_an_escalation_marker_is_ignored() {
+            for line in [
+                "",
+                "SENTINEL something",
+                "FAILEDreason='x'",
+                "OPEN recipient='John Smith' resolved=True",
+                "At line:1 char:1",
+            ] {
+                assert!(parse_escalation_marker(line).is_none(), "{line}");
+            }
         }
 
         #[test]
