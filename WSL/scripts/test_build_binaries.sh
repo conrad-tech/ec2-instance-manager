@@ -96,7 +96,9 @@ test_package_windows_zip_ships_both_powershell_scripts() {
   touch "$WINDOWS_DIST_DIR/${CLI_APP_NAME}_${APP_VERSION}.exe"
   touch "$WINDOWS_DIST_DIR/${GUI_APP_NAME}_${APP_VERSION}.exe"
 
-  SKIP_ICON_VERIFY=1 package_windows_zip
+  # No SKIP_ICON_VERIFY: package_windows_zip does not call verify_windows_icon,
+  # so setting it here only suggested a coupling that does not exist.
+  package_windows_zip
 
   # Both scripts must land beside the exe rather than inside the archive
   # only: they are run from the file next to the executable, never written
@@ -109,6 +111,35 @@ test_package_windows_zip_ships_both_powershell_scripts() {
     echo "assertion failed: not copied beside the exe:$missing" >&2
     exit 1
   fi
+
+  # ...and they must be IN the archive too, which is a separate fact. The
+  # copies above happen before the `candidates` array is even read, so
+  # dropping a script from that array leaves the dist dir correct and the
+  # distributed zip -- the thing users actually receive -- missing it. The
+  # check above alone passes on that. Assert the listing, and the extracted
+  # tree package_windows_zip unpacks beside the zip.
+  local zip_path="$WINDOWS_DIST_DIR/ec2_manager_windows_${APP_VERSION}.zip"
+  if [[ ! -f "$zip_path" ]]; then
+    echo "assertion failed: windows zip was not created" >&2
+    exit 1
+  fi
+
+  local listing
+  listing="$(unzip -Z1 "$zip_path" | tr '\n' ' ')"
+  local extract_dir="$WINDOWS_DIST_DIR/ec2_manager_windows"
+  for shipped in send_access_email.ps1 send_escalation.ps1 \
+                 "${CLI_APP_NAME}_${APP_VERSION}.exe" \
+                 "${GUI_APP_NAME}_${APP_VERSION}.exe"; do
+    if [[ "$listing" != *"$shipped"* ]]; then
+      echo "assertion failed: windows zip is missing $shipped" >&2
+      echo "  listing: $listing" >&2
+      exit 1
+    fi
+    if [[ ! -f "$extract_dir/$shipped" ]]; then
+      echo "assertion failed: extracted folder is missing $shipped" >&2
+      exit 1
+    fi
+  done
 
   rm -rf "$tmpdir"
   WINDOWS_DIST_DIR="$original_windows_dist_dir"

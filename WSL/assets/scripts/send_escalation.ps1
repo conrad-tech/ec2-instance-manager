@@ -8,9 +8,18 @@
 # Prints exactly one marker line the GUI parses:
 #   SENT address='someone@example.com'
 #   FAILED reason='Outlook is not available'
+#
+# The parameters are deliberately NOT Mandatory, and take "" defaults --
+# the same shape send_access_email.ps1 uses, for the same two reasons.
+# Mandatory would have the binder reject `-To ''` before the guard below
+# could name it, so the guard would be dead code and the GUI would see a
+# PowerShell binder error instead of `FAILED reason='no recipient
+# configured'`. Worse, an OMITTED mandatory parameter makes PowerShell
+# *prompt* for it -- and this is spawned with CREATE_NO_WINDOW and no
+# console, so the prompt is an invisible hang, not a failure.
 param(
-    [Parameter(Mandatory = $true)][string]$To,
-    [Parameter(Mandatory = $true)][string]$Subject
+    [string]$To      = "",   # escalation mailbox; blank is refused below
+    [string]$Subject = ""    # "<CODE> <createdAt>" -- the entire payload
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,8 +34,22 @@ if ([string]::IsNullOrWhiteSpace($To)) {
     exit 1
 }
 
+if ([string]::IsNullOrWhiteSpace($Subject)) {
+    # An empty subject IS an empty payload: the subject is the whole
+    # message, so this would send a blank mail the daemon cannot tier.
+    Write-Marker "FAILED reason='no subject to send'"
+    exit 1
+}
+
 try {
     $outlook = New-Object -ComObject Outlook.Application
+    # GetNamespace("MAPI") is inside the same try on purpose. New-Object
+    # generally succeeds whenever Outlook is merely *installed*; the "no
+    # mail profile" failure only surfaces at the first MAPI call, and out
+    # here it would fall out of the Send() catch below as a raw COM string
+    # instead of the sentence that names the actual problem.
+    # send_access_email.ps1 pairs the two calls for the same reason.
+    $null = $outlook.GetNamespace("MAPI")
 } catch {
     Write-Marker "FAILED reason='Outlook is not available'"
     exit 1

@@ -25299,6 +25299,64 @@ mod gui {
             assert!(SEND_ESCALATION_PS1.contains("FAILED reason='"));
         }
 
+        /// Both guards have to be *reachable* to be worth anything, and one
+        /// PowerShell attribute makes them unreachable.
+        #[test]
+        fn the_escalation_script_can_reach_its_own_guards() {
+            // `Mandatory = $true` has the parameter binder reject `-To ''`
+            // before the script runs, so `FAILED reason='no recipient
+            // configured'` would be dead code -- and an *omitted* mandatory
+            // parameter makes PowerShell prompt, which is an invisible hang
+            // under CREATE_NO_WINDOW rather than a failure the GUI can read.
+            // Comment lines are skipped: the note above the param block
+            // explains why Mandatory is absent, and it says the word.
+            for line in SEND_ESCALATION_PS1
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+            {
+                assert!(
+                    !line.contains("Mandatory"),
+                    "no parameter may be Mandatory, the guards must be able to run: {line}"
+                );
+            }
+            assert!(SEND_ESCALATION_PS1.contains("IsNullOrWhiteSpace($To)"));
+            assert!(SEND_ESCALATION_PS1.contains("IsNullOrWhiteSpace($Subject)"));
+        }
+
+        /// `New-Object -ComObject Outlook.Application` generally succeeds
+        /// whenever Outlook is merely installed. The "no mail profile"
+        /// failure only surfaces at the first MAPI call, so that call has to
+        /// be inside the same `try` — otherwise it falls out of the `Send()`
+        /// catch as a raw COM string instead of the sentence that names the
+        /// problem. `send_access_email.ps1` pairs the two for this reason.
+        #[test]
+        fn the_outlook_availability_check_reaches_a_mapi_call() {
+            let new_object = SEND_ESCALATION_PS1
+                .find("New-Object -ComObject Outlook.Application")
+                .expect("the script creates the Outlook COM object");
+            let mapi = SEND_ESCALATION_PS1
+                .find(r#"GetNamespace("MAPI")"#)
+                .expect("the script must touch MAPI while it can still say why");
+            let catch = SEND_ESCALATION_PS1[new_object..]
+                .find("Outlook is not available")
+                .expect("that block reports unavailability")
+                + new_object;
+            assert!(
+                new_object < mapi && mapi < catch,
+                "the MAPI call must sit between New-Object and its catch"
+            );
+        }
+
+        /// Two EDR constraints, and this app has a CrowdStrike quarantine in
+        /// its history. `-WindowStyle Hidden` is a pattern EDRs quarantine on
+        /// sight; the console is suppressed by `CREATE_NO_WINDOW` on the
+        /// spawn instead, which is an ordinary Win32 flag.
+        #[test]
+        fn the_escalation_script_carries_no_flagged_powershell_switch() {
+            assert!(!SEND_ESCALATION_PS1.contains("WindowStyle"));
+            assert!(!SEND_ESCALATION_PS1.to_ascii_lowercase().contains("$env:temp"));
+        }
+
         #[test]
         fn a_line_that_is_not_an_escalation_marker_is_ignored() {
             for line in [
