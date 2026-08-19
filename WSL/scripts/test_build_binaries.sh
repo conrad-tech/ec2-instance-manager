@@ -81,6 +81,39 @@ test_package_linux_zip_creates_archive_with_artifacts() {
   LINUX_DIST_DIR="$original_linux_dist_dir"
 }
 
+test_package_windows_zip_ships_both_powershell_scripts() {
+  if ! command -v zip >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1; then
+    echo "skipping windows zip packaging test (zip/unzip not installed)"
+    return 0
+  fi
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  local original_windows_dist_dir="$WINDOWS_DIST_DIR"
+  WINDOWS_DIST_DIR="$tmpdir"
+
+  # Same versioned names copy_artifact writes.
+  touch "$WINDOWS_DIST_DIR/${CLI_APP_NAME}_${APP_VERSION}.exe"
+  touch "$WINDOWS_DIST_DIR/${GUI_APP_NAME}_${APP_VERSION}.exe"
+
+  SKIP_ICON_VERIFY=1 package_windows_zip
+
+  # Both scripts must land beside the exe rather than inside the archive
+  # only: they are run from the file next to the executable, never written
+  # to %TEMP% and run from there, because that is a pattern EDRs quarantine
+  # on sight and this app has a CrowdStrike quarantine in its history.
+  local missing=""
+  [[ -f "$WINDOWS_DIST_DIR/send_access_email.ps1" ]] || missing="$missing send_access_email.ps1"
+  [[ -f "$WINDOWS_DIST_DIR/send_escalation.ps1" ]] || missing="$missing send_escalation.ps1"
+  if [[ -n "$missing" ]]; then
+    echo "assertion failed: not copied beside the exe:$missing" >&2
+    exit 1
+  fi
+
+  rm -rf "$tmpdir"
+  WINDOWS_DIST_DIR="$original_windows_dist_dir"
+}
+
 test_package_linux_zip_skips_when_no_artifacts() {
   local tmpdir
   tmpdir="$(mktemp -d)"
@@ -197,6 +230,7 @@ main() {
   test_all_mode_outputs_expected_targets
   test_invalid_mode_fails
   test_package_linux_zip_creates_archive_with_artifacts
+  test_package_windows_zip_ships_both_powershell_scripts
   test_package_linux_zip_skips_when_no_artifacts
   test_copy_windows_runtime_dlls_with_custom_gcc
   test_versioned_name_matches_the_exe_copy_artifact_writes

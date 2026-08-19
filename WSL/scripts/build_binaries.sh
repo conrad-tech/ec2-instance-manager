@@ -348,6 +348,13 @@ package_windows_zip() {
     cp "${ROOT_DIR}/assets/scripts/send_access_email.ps1" \
        "${WINDOWS_DIST_DIR}/send_access_email.ps1"
   fi
+  # Same treatment for the on-call escalation send helper, for the same
+  # reason: it is run from the file beside the exe, never written to %TEMP%
+  # and executed from there, which is a pattern EDRs quarantine on sight.
+  if [[ -f "${ROOT_DIR}/assets/scripts/send_escalation.ps1" ]]; then
+    cp "${ROOT_DIR}/assets/scripts/send_escalation.ps1" \
+       "${WINDOWS_DIST_DIR}/send_escalation.ps1"
+  fi
   # Same treatment for the optional fed sign-in helper, for the same reason.
   if [[ -f "${ROOT_DIR}/assets/scripts/fed_login.ps1" ]]; then
     cp "${ROOT_DIR}/assets/scripts/fed_login.ps1" \
@@ -357,6 +364,7 @@ package_windows_zip() {
     "${WINDOWS_DIST_DIR}/${CLI_APP_NAME}_${APP_VERSION}.exe"
     "${WINDOWS_DIST_DIR}/${GUI_APP_NAME}_${APP_VERSION}.exe"
     "${WINDOWS_DIST_DIR}/send_access_email.ps1"
+    "${WINDOWS_DIST_DIR}/send_escalation.ps1"
     "${WINDOWS_DIST_DIR}/fed_login.ps1"
     "${WINDOWS_DIST_DIR}/WALKTHROUGH.md"
     "${WINDOWS_DIST_DIR}/libgcc_s_seh-1.dll"
