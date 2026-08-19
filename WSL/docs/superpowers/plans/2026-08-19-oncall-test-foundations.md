@@ -42,7 +42,10 @@ scripts/build_binaries.sh            # MODIFIED: copy the new script beside the 
 scripts/test_build_binaries.sh       # MODIFIED: assert that copy happens
 ```
 
-`src/bin/ec2_manager_gui.rs` is **not touched by this plan**.
+`src/bin/ec2_manager_gui.rs` is touched in **exactly one place**: the test
+helper `test_reaper_target()` at around line 23894 constructs a `Target`, so
+Task 3's new field breaks it until that literal gains `created_at`. No
+production GUI code changes.
 
 ---
 
@@ -377,15 +380,31 @@ pub fn escalation_subject(code: OutcomeCode, created_at: &str) -> String {
 }
 ```
 
-- [ ] **Step 4: Run to verify they pass**
+- [ ] **Step 4: Fix the one construction site outside this file**
+
+Adding a field to `Target` breaks every struct literal. There is exactly one
+outside `reaper.rs`: the test helper `test_reaper_target()` at around
+`src/bin/ec2_manager_gui.rs:23894`. Give it a `created_at` — any plausible
+RFC 3339 value; it is a fixture, not an assertion.
+
+This is the only edit this plan makes to the GUI file.
+
+- [ ] **Step 5: Run to verify they pass**
 
 Run: `cargo test --features gui reaper 2>&1 | tail -20`
-Expected: PASS. Fix any other construction sites of `Target` the compiler names.
+Expected: PASS.
 
-- [ ] **Step 5: Commit**
+Then confirm the whole crate still builds, since the field change reaches
+beyond `reaper.rs`:
+
+Run: `cargo build --features gui 2>&1 | tail -5`
+Expected: no errors. If the compiler names another literal, fix it the same
+way and note it in your report — it means this survey missed one.
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/reaper.rs
+git add src/reaper.rs src/bin/ec2_manager_gui.rs
 git commit -m "Carry the alert timestamp into the escalation subject"
 ```
 
