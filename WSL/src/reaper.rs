@@ -337,6 +337,13 @@ pub fn decide_outcome(on_call: bool, verdict: &Verdict, closed_in_window: bool) 
     }
 }
 
+/// The longest timestamp the subject will carry. RFC 3339 at its most verbose
+/// — fractional seconds and a numeric offset — is 35 characters, so this is
+/// generous by design while still being a hard ceiling. It exists so a feed
+/// serving something enormous is rejected before it is parsed, rather than
+/// after.
+const MAX_TIMESTAMP_LEN: usize = 64;
+
 /// The subject line of an escalation email. This is the entire payload.
 ///
 /// `<code> <createdAt>` — the code first, so it stays the head of the
@@ -347,15 +354,29 @@ pub fn decide_outcome(on_call: bool, verdict: &Verdict, closed_in_window: bool) 
 /// The body is empty and stays empty. What leaves the org is a code and a
 /// time — no instance id, account number, environment or product name.
 ///
-/// A blank timestamp yields the bare code. The feed has been observed serving
-/// unrendered templates and absent tags, and an escalation that arrives
-/// without a timestamp is worth far more than one that does not arrive.
+/// **The timestamp is validated here, not at the call site.** Even a correct
+/// caller passes `Target.created_at`, which is `Alert.created_at`, which is
+/// stored verbatim from the API with no validation at all — and this feed has
+/// already been observed serving unrendered `{{…}}` templates in other
+/// fields. Whatever JSM puts there would otherwise leave the org unexamined.
+/// Checking it inside the function means the guarantee holds no matter who
+/// calls it.
+///
+/// Anything that is not RFC 3339 yields the bare code — the same degradation
+/// a blank timestamp already gets, and for the same reason: the feed is not
+/// trustworthy, and an escalation that arrives without a timestamp is worth
+/// far more than one that does not arrive. `DateTime::parse_from_rfc3339` is
+/// the same parser `Alert::created_utc` uses, so "valid here" and "renderable
+/// in the Alerts window" cannot come apart.
 pub fn escalation_subject(code: OutcomeCode, created_at: &str) -> String {
     let stamp = created_at.trim();
-    if stamp.is_empty() {
-        code.as_str().to_string()
-    } else {
+    let usable = !stamp.is_empty()
+        && stamp.len() <= MAX_TIMESTAMP_LEN
+        && chrono::DateTime::parse_from_rfc3339(stamp).is_ok();
+    if usable {
         format!("{} {}", code.as_str(), stamp)
+    } else {
+        code.as_str().to_string()
     }
 }
 
@@ -980,13 +1001,63 @@ mod tests {
         assert_eq!(escalation_subject(OutcomeCode::Failure, "   "), "RE-F");
     }
 
+    // A "the subject leaks no instance id / account / environment" scan used
+    // to live here. It was deleted: `escalation_subject` takes a code and a
+    // timestamp and has no access to any of those, so it is structurally
+    // incapable of emitting them and the assertion could never fail for the
+    // reason it named. It was actively harmful too -- `"1234"` is a substring
+    // of any timestamp at 12:34, so moving the fixture time would have
+    // reported a leak that had not happened. The property belongs at the call
+    // site, where an instance id is actually in scope; the GUI-side
+    // `the_instance_id_reaches_the_event_but_never_the_notifier` is where it
+    // is asserted now.
+
     #[test]
-    fn the_subject_carries_nothing_but_the_code_and_the_time() {
-        let subject = escalation_subject(OutcomeCode::Failure, "2026-08-19T20:12:09Z");
-        for leak in ["i-", "prod", "dev", "1234", "account", "env"] {
-            assert!(
-                !subject.to_ascii_lowercase().contains(leak),
-                "subject {subject} must not contain {leak}"
+    fn a_timestamp_that_is_not_rfc3339_yields_the_bare_code() {
+        // `Alert.created_at` is stored verbatim from the API with no
+        // validation, and this feed has already been caught serving
+        // unrendered templates in other fields. Whatever it puts here would
+        // otherwise leave the org unexamined, so the check lives in the
+        // function rather than in whoever happens to call it.
+        for junk in [
+            "&{%&{% createdAt &}%&}%",
+            "{{createdAt}}",
+            "not a timestamp",
+            "2026-08-19",             // a date is not RFC 3339
+            "20:12:09",               // nor is a time
+            "2026-13-45T99:99:99Z",   // right shape, impossible values
+            "RE-K 2026-08-19T20:12:09Z", // a second code smuggled in
+        ] {
+            assert_eq!(
+                escalation_subject(OutcomeCode::Failure, junk),
+                "RE-F",
+                "{junk:?} must degrade to the bare code"
+            );
+        }
+    }
+
+    #[test]
+    fn an_over_long_timestamp_yields_the_bare_code() {
+        let huge = "2026-08-19T20:12:09Z".repeat(100);
+        assert_eq!(escalation_subject(OutcomeCode::Failure, &huge), "RE-F");
+        // And the ceiling is a real one, not just a side effect of the parse:
+        // a string under the cap that still will not parse is refused too.
+        assert!(huge.len() > MAX_TIMESTAMP_LEN);
+    }
+
+    #[test]
+    fn a_valid_rfc3339_timestamp_still_passes_through_unchanged() {
+        // Every shape JSM has been seen to return: whole seconds, fractional
+        // seconds, and a numeric offset instead of `Z`. None of them may be
+        // reformatted -- the wire value is the API's, verbatim.
+        for stamp in [
+            "2026-08-19T20:12:09Z",
+            "2026-08-19T20:12:09.482Z",
+            "2026-08-19T15:12:09-05:00",
+        ] {
+            assert_eq!(
+                escalation_subject(OutcomeCode::Failure, stamp),
+                format!("RE-F {stamp}")
             );
         }
     }
