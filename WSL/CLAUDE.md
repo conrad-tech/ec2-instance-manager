@@ -698,6 +698,84 @@ definition of "can this connect", and the test walks the same failover order.
   is otherwise unanswerable from the log, and the dialog counts up live so a
   slow connect looks slow rather than hung.
 
+### File browser Upload — who the file ends up owned by
+
+The upload writes through `sudo -n tee`, because the destination is usually a
+directory the person's own account cannot write. That leaves the file owned by
+**root**, which is useless to the user who just uploaded it. So the write now
+chains a `chown` onto itself:
+
+```
+echo '<b64>' | base64 -d | sudo -n tee '<path>' > /dev/null \
+  && { e=$(sudo -n chown '<user>': '<path>' 2>&1) && s=OK || s=FAIL; echo "__CHOWN_${s}__$e"; }
+```
+
+- **"The logged in user" cannot be answered by asking the box.** The file
+  browser runs on its own hidden control channel
+  (`ensure_control_channel`) — a *separate* SSM session that knows nothing
+  about a `sudo su` typed in the visible terminal, so `whoami` there always
+  says `ssm-user`. It is tracked instead from what was typed:
+  `switch_user_target` pushes onto `PtySession.session_user_stack`, and
+  `exit` / `logout` / Ctrl-D-on-an-empty-line pop it. `is_sudo_su_line` was
+  folded into that function — the re-prep trigger and the chown target read
+  the same line, so they cannot disagree about what a switch means.
+- **It is a stack, so nesting unwinds correctly.** `sudo su - john` →
+  `sudo su -` → `exit` lands back on john, not on the SSM login. An `exit`
+  against an empty stack is a no-op — that one is leaving the SSM session
+  itself. `the_tracked_login_follows_a_real_session_line_by_line` walks a
+  whole session asserting the answer after every line.
+- **`su` counts with or without `sudo`.** Once you are root, `su - <user>`
+  is what people actually type; tracking only the `sudo` spelling left the
+  tab believing it was still root and handed the file back to root.
+  `sudo -i` / `sudo -s` count too. `su -c '…'` does not — it runs a command
+  rather than opening a shell to sit in.
+- **Pastes are scanned as well as keystrokes.** `paste_to_connection_tab`
+  writes straight to the PTY writer and never goes through
+  `send_raw_bytes_to_connection_tab`, so a `sudo su - <user>` inside a
+  Scripts-menu body would move the shell with the tab none the wiser.
+  `apply_pasted_lines_to_user_stack` applies the same scan and returns the
+  trailing unterminated fragment to seed `input_line_buf`, so a paste with
+  no final newline is completed by the Enter typed after it.
+- **A `su` that *fails* is still counted**, because nothing local can know
+  it failed — a typo'd or nonexistent account leaves the tab tracking a
+  login it never reached. That does not fail silently: the chown to that
+  name is refused and the yellow note says so, naming it.
+- **An empty stack is not a failure to answer.** It means the tab is still on
+  the login the SSM session opened as — which the control channel *shares* —
+  so the command resolves it remotely with `id -un`. Hardcoding `ssm-user`
+  would only be right by coincidence.
+- **The name is whitelisted, not escaped** (`is_safe_remote_username`). It is
+  scraped from a line a user typed into a terminal and interpolated into a
+  shell command, the same stance `vault_iam` takes with ARNs. A refused name
+  falls back to `id -un`, so the handover still happens.
+- **The group is a bare trailing `:`**, so chown uses the account's own login
+  group. Every account `create_new_user.sh` makes has a private group of its
+  own name (see the uid/gid section), but a `<user>:<user>` spelling would
+  fail outright on an account that does not.
+- **The verdict marker is assembled at runtime** (`__CHOWN_${s}__`), for the
+  reason `vault_iam`'s sentinel is: the shell echoes the command line before
+  running it, so a literal `__CHOWN_OK__` in the command would match the echo
+  and report success no matter what chown did. `parse_chown_marker` checks
+  FAIL first.
+- **The braces are load-bearing.** Flat, the trailing `|| s=FAIL` also catches
+  a *write* that failed and reports it as a refused chown — a verdict about a
+  file that was never there. Grouped, a failed write emits no marker, which
+  reads as ownership *unconfirmed*: the truthful answer, since
+  `exec_remote_command` discards the exit code and nothing here actually knows
+  the write's fate.
+- **A failed chown is a warning, never a failed upload.** The bytes are on the
+  box; calling it a failure sends someone looking for a file that is already
+  there. It surfaces as a yellow line under the Upload button
+  (`FileBrowserState.upload_note`) and a `log_warn`. The expected case is the
+  EFS home mount, where root is squashed to `nobody` and cannot chown at all —
+  the message carries chown's own reason, which is the whole diagnosis.
+- **The Upload button names the account before a file is picked**
+  (`on_hover_text`, plus a weak `as <user>` beside it). The tracked login is
+  scraped, so the user is the only one who can catch it being wrong — and
+  afterwards the file already belongs to someone.
+- The editor's **Save** path is untouched: `tee` truncates rather than
+  recreates, so saving an existing file preserves its owner.
+
 ### Instance search
 
 `filter::searchable_text` is the *whole* haystack for the search box —

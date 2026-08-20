@@ -382,6 +382,18 @@ mod gui {
         /// Set when the most recently submitted line was a `sudo su` form;
         /// the next prompt detected in output triggers re-prep.
         pending_reprep: bool,
+        /// Accounts this tab's shell has switched into via `sudo su`, most
+        /// recent last; popped by `exit` / `logout` / Ctrl-D. Empty means
+        /// the tab is still on the login the SSM session opened as.
+        ///
+        /// This is what "the currently logged in user" means for an upload.
+        /// It cannot be answered by asking the box: the file browser runs on
+        /// its own hidden control channel (`ensure_control_channel`), a
+        /// separate SSM session that knows nothing about a `sudo su` typed
+        /// in the visible terminal. So it is tracked from what was typed,
+        /// which is also why the Upload button names the account it will
+        /// hand the file to before you pick a file.
+        session_user_stack: Vec<String>,
         /// Trimmed text of the cursor-line prompt the last time PREP was
         /// auto-fired. Used to ensure we only re-prep when a *new*
         /// shell prompt appears (e.g., after `sudo su`), not on every
@@ -3868,6 +3880,11 @@ mod gui {
         editor_find_focus: bool,
         /// Scroll the editor to the current match next frame.
         editor_find_scroll: bool,
+        /// Outcome of the last upload into this tab: `(is_warning, text)`.
+        /// It reports who the file was handed to, because that is scraped
+        /// from what was typed in the terminal rather than read off the
+        /// box — the user is the only one who can tell it is wrong.
+        upload_note: Option<(bool, String)>,
     }
 
     impl Default for FileBrowserState {
@@ -3896,6 +3913,7 @@ mod gui {
                 editor_find_current: 0,
                 editor_find_focus: false,
                 editor_find_scroll: false,
+                upload_note: None,
             }
         }
     }
@@ -3938,6 +3956,15 @@ mod gui {
             local_path: String,
             remote_path: String,
             bytes: u64,
+            /// The account the file was handed to, as named in the chown.
+            /// `None` means the tab was still on its SSM login and the
+            /// remote `id -un` named it instead.
+            owner: Option<String>,
+            /// Set when the file landed but the chown did not take. The
+            /// upload still succeeded — the bytes are on the box — so this
+            /// is reported as a warning beside the browser, never as a
+            /// failed upload.
+            chown_error: Option<String>,
         },
         UploadFailed {
             tab_id: u64,
@@ -4615,17 +4642,182 @@ mod gui {
     /// `sudo su`, `sudo su -`, `sudo su - <user>`, `sudo su <user>`,
     /// optionally with extra whitespace. Used to schedule a re-run of the
     /// prep-terminal sequence after the new shell prompt appears.
-    fn is_sudo_su_line(line: &str) -> bool {
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        if tokens.len() < 2 || tokens[0] != "sudo" || tokens[1] != "su" {
-            return false;
+    /// The account a submitted line switches the shell to, or `None` if the
+    /// line does not open a new shell.
+    ///
+    /// Covers `su` in its usual spellings **with or without `sudo`** — once
+    /// you are root, `su - <user>` is what you actually type, and treating
+    /// only the `sudo` form as a switch left the tab believing it was still
+    /// root — plus `sudo -i` / `sudo -s`, which are the other everyday way
+    /// to land on a root shell.
+    ///
+    /// Anything unrecognized is `None`, which leaves the tab on the login it
+    /// already knew about rather than adopting a wrong one.
+    fn switch_user_target(line: &str) -> Option<String> {
+        let all: Vec<&str> = line.split_whitespace().collect();
+        // An optional leading `sudo`, with no options of its own.
+        let tokens: &[&str] = if all.first() == Some(&"sudo") {
+            &all[1..]
+        } else {
+            &all[..]
+        };
+        // `sudo -i` / `sudo -s` open a root shell without going via `su`.
+        if all.first() == Some(&"sudo") && matches!(tokens, ["-i"] | ["-s"]) {
+            return Some("root".to_string());
         }
-        match tokens.len() {
-            2 => true,                                 // sudo su
-            3 => true,                                 // sudo su -   |   sudo su <user>
-            4 => tokens[2] == "-",                     // sudo su - <user>
-            _ => false,
+        if tokens.first() != Some(&"su") {
+            return None;
         }
+        // Strip the login-shell flags, which carry no user of their own.
+        let rest: Vec<&str> = tokens[1..]
+            .iter()
+            .copied()
+            .filter(|t| !matches!(*t, "-" | "-l" | "--login"))
+            .collect();
+        match rest.len() {
+            // `su`, `su -`, `su -l` — root.
+            0 => Some("root".to_string()),
+            // `su <user>`, `su - <user>`, `su -l <user>`.
+            1 if !rest[0].starts_with('-') => Some(rest[0].to_string()),
+            // `su -c '…'` and friends run a command instead of opening a
+            // shell to sit in; not a switch this needs to follow.
+            _ => None,
+        }
+    }
+
+    /// Apply one submitted line to a tab's tracked login stack. Returns
+    /// whether the line opened a new shell — the re-prep trigger.
+    fn apply_submitted_line_to_user_stack(stack: &mut Vec<String>, line: &str) -> bool {
+        if let Some(user) = switch_user_target(line) {
+            stack.push(user);
+            return true;
+        }
+        if is_shell_exit_line(line) {
+            // Popping an already-empty stack is a no-op: that `exit` is
+            // leaving the SSM session itself, not a `su`.
+            stack.pop();
+        }
+        false
+    }
+
+    /// Feed a pasted payload through the same login tracking typed input
+    /// gets, and return the trailing unterminated fragment so it can seed
+    /// `input_line_buf`.
+    ///
+    /// Pastes bypass `send_raw_bytes_to_connection_tab` entirely — the drip
+    /// feed writes straight to the PTY writer — so without this a
+    /// `sudo su - <user>` inside a Scripts-menu body moves the shell with
+    /// the tab none the wiser, and the next upload is handed to whoever the
+    /// tab still thinks it is.
+    fn apply_pasted_lines_to_user_stack(
+        stack: &mut Vec<String>,
+        payload: &[u8],
+    ) -> String {
+        let text = String::from_utf8_lossy(payload);
+        let mut line = String::new();
+        for ch in text.chars() {
+            match ch {
+                '\r' | '\n' => {
+                    apply_submitted_line_to_user_stack(stack, &line);
+                    line.clear();
+                }
+                // Ctrl-C / Ctrl-U abandon the line, as they do when typed.
+                '\u{3}' | '\u{15}' => line.clear(),
+                c if c >= ' ' && c != '\u{7f}' => line.push(c),
+                _ => {}
+            }
+        }
+        // A paste with no trailing newline leaves a line the user has not
+        // submitted yet; hand it back so the Enter they type next completes
+        // it instead of being read against an empty buffer.
+        line
+    }
+
+    /// Whether a submitted line leaves the current shell, handing the tab
+    /// back to whoever ran the `sudo su`. Without this the tracked user
+    /// stays on the account the user just left, and an upload would be
+    /// chowned to someone who is no longer at that prompt.
+    fn is_shell_exit_line(line: &str) -> bool {
+        matches!(line.trim(), "exit" | "logout")
+    }
+
+    /// Whether a username is safe to interpolate into a remote shell
+    /// command. These names are *scraped from what the user typed*, not
+    /// read from the box, so anything outside the portable set is refused
+    /// outright rather than escaped — same stance `vault_iam` takes with
+    /// ARNs. A refused name falls back to `id -un`, which is correct
+    /// rather than merely safe.
+    fn is_safe_remote_username(user: &str) -> bool {
+        !user.is_empty()
+            && user.len() <= 32
+            && !user.starts_with('-')
+            && user
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    }
+
+    /// The command that hands a freshly uploaded file to `owner`. It is
+    /// appended to the upload itself, so giving the file away costs no
+    /// extra SSM round trip.
+    ///
+    /// `owner` is `None` when the tab has not been through a `sudo su` —
+    /// the terminal is then still on the login the SSM session opened as,
+    /// which is the *same* login the control channel running this command
+    /// has, so `id -un` names it exactly. Guessing `ssm-user` would only
+    /// be right by coincidence.
+    ///
+    /// The group is left as a bare trailing `:` so chown uses the user's
+    /// own login group — every account `create_new_user.sh` makes has a
+    /// private group of its own name, but a `<user>:<user>` spelling would
+    /// fail outright on any account that does not.
+    ///
+    /// **The verdict marker is assembled at runtime** (`__CHOWN_${s}__`),
+    /// for the reason `vault_iam`'s sentinel is: the remote shell echoes
+    /// the command line before running it, so a literal `__CHOWN_OK__` in
+    /// the command would match the echo and report success no matter what
+    /// chown actually did.
+    fn chown_upload_command(remote_path: &str, owner: Option<&str>) -> String {
+        let path = shell_single_quote(remote_path);
+        let spec = match owner.filter(|u| is_safe_remote_username(u)) {
+            Some(u) => format!("{}:", shell_single_quote(u)),
+            None => "\"$(id -un)\":".to_string(),
+        };
+        // Braced as one group so the caller's `&&` gates the whole thing.
+        // Flat, the trailing `|| s=FAIL` would also catch a *write* that
+        // failed and report it as a refused chown — a verdict about a file
+        // that was never there. Grouped, a failed write emits no marker at
+        // all, which is read as ownership unconfirmed: the truthful answer,
+        // since `exec_remote_command` discards the exit code and nothing
+        // here actually knows the write's fate.
+        format!(
+            "{{ e=$(sudo -n chown {spec} {path} 2>&1) && s=OK || s=FAIL; \
+             echo \"__CHOWN_${{s}}__$e\"; }}"
+        )
+    }
+
+    /// Read the chown verdict out of the upload command's output.
+    ///
+    /// `Some(None)` — the file was handed over. `Some(Some(msg))` — chown
+    /// ran and refused, with the reason it gave. `None` — no marker came
+    /// back at all, so ownership is simply unknown; that is reported as
+    /// unconfirmed rather than as either outcome, because the bytes did
+    /// land and calling it a failed upload would be a lie.
+    fn parse_chown_marker(output: &str) -> Option<Option<String>> {
+        // FAIL first, as `parse_verdict` does: a run that failed still
+        // has to not read as one that succeeded.
+        if let Some(idx) = output.find("__CHOWN_FAIL__") {
+            let rest = &output[idx + "__CHOWN_FAIL__".len()..];
+            let msg = rest.lines().next().unwrap_or("").trim();
+            return Some(Some(if msg.is_empty() {
+                "chown failed".to_string()
+            } else {
+                msg.to_string()
+            }));
+        }
+        if output.contains("__CHOWN_OK__") {
+            return Some(None);
+        }
+        None
     }
 
     fn search_terms_from_rules(rules: &[SearchRuleInput]) -> (Vec<String>, Vec<String>) {
@@ -15226,14 +15418,21 @@ mod gui {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "uploaded_file".to_string());
             let remote_path = join_path(&remote_dir, &file_name);
+            // Who the tab's terminal is logged in as right now. The write
+            // itself still goes through `sudo -n tee` — the destination is
+            // usually a directory this account cannot write — so the file
+            // arrives owned by root and is handed over immediately after.
+            let owner = self.tab_session_user(tab_id);
 
             std::thread::spawn(move || {
                 let result = if mode == Mode::Sim {
+                    // Sim writes to the local filesystem as the local user,
+                    // so there is nothing to hand over.
                     std::fs::read(&local_path)
                         .and_then(|data| {
                             let bytes = data.len() as u64;
                             std::fs::write(&remote_path, &data)?;
-                            Ok(bytes)
+                            Ok((bytes, None))
                         })
                         .map_err(|e| e.to_string())
                 } else if let Some(ctx) = &context {
@@ -15243,28 +15442,47 @@ mod gui {
                             use base64::Engine;
                             let bytes = data.len() as u64;
                             let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-                            let cmd =
-                                format!("echo '{}' | base64 -d | sudo -n tee {} > /dev/null", b64, remote_path);
-                            exec_remote_command(
+                            // The chown is chained onto the write with `&&`
+                            // so it costs no second round trip, and so a
+                            // write that never landed does not report an
+                            // ownership verdict about a file that isn't
+                            // there.
+                            let cmd = format!(
+                                "echo '{}' | base64 -d | sudo -n tee {} > /dev/null && {}",
+                                b64,
+                                shell_single_quote(&remote_path),
+                                chown_upload_command(&remote_path, owner.as_deref()),
+                            );
+                            let out = exec_remote_command(
                                 &channel,
                                 ctx,
                                 &instance_id,
                                 &cmd,
                                 Duration::from_secs(60),
                             )?;
-                            Ok(bytes)
+                            let chown_error = match parse_chown_marker(&out) {
+                                Some(err) => err,
+                                None => Some(
+                                    "ownership unconfirmed — the remote chown \
+                                     reported nothing"
+                                        .to_string(),
+                                ),
+                            };
+                            Ok((bytes, chown_error))
                         })
                 } else {
                     Err("no AWS context available".to_string())
                 };
 
                 match result {
-                    Ok(bytes) => {
+                    Ok((bytes, chown_error)) => {
                         let _ = tx.send(FileOpEvent::UploadCompleted {
                             tab_id,
                             local_path,
                             remote_path,
                             bytes,
+                            owner,
+                            chown_error,
                         });
                     }
                     Err(error) => {
@@ -15272,6 +15490,22 @@ mod gui {
                     }
                 }
             });
+        }
+
+        /// The account this tab's terminal is currently logged in as, or
+        /// `None` when it is still on the login the SSM session opened as.
+        ///
+        /// `None` is not a failure to answer — the hidden control channel
+        /// shares that same login, so `chown_upload_command` resolves it
+        /// remotely with `id -un`. A name that would not be safe to
+        /// interpolate is dropped to `None` for the same reason: falling
+        /// back to `id -un` is the correct answer, not merely the safe one.
+        fn tab_session_user(&self, tab_id: u64) -> Option<String> {
+            self.pty_sessions
+                .get(&tab_id)
+                .and_then(|s| s.session_user_stack.last())
+                .filter(|u| is_safe_remote_username(u))
+                .cloned()
         }
 
         /// Read a remote file's content into the inline editor.
@@ -15583,12 +15817,42 @@ mod gui {
                         local_path,
                         remote_path,
                         bytes,
+                        owner,
+                        chown_error,
                     } => {
+                        let owner_label = owner
+                            .clone()
+                            .unwrap_or_else(|| "the session login".to_string());
                         self.log_info(format!(
-                            "upload completed tab={tab_id} {local_path} -> {remote_path} ({bytes} bytes)"
+                            "upload completed tab={tab_id} {local_path} -> {remote_path} \
+                             ({bytes} bytes) owner={owner_label}"
                         ));
+                        let note = match &chown_error {
+                            Some(err) => {
+                                // The bytes landed; only the handover did
+                                // not. Say exactly that — reporting it as a
+                                // failed upload would send someone looking
+                                // for a file that is already there.
+                                self.log_warn(format!(
+                                    "upload chown failed tab={tab_id} {remote_path} \
+                                     owner={owner_label}: {err}"
+                                ));
+                                Some((
+                                    true,
+                                    format!(
+                                        "Uploaded, but could not give {remote_path} to \
+                                         {owner_label} — it is still owned by root. {err}"
+                                    ),
+                                ))
+                            }
+                            None => Some((
+                                false,
+                                format!("Uploaded {remote_path} — owner {owner_label}"),
+                            )),
+                        };
                         if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
                             fb.status = FileOpStatus::Idle;
+                            fb.upload_note = note;
                             // Invalidate cache for this directory since a file was added
                             fb.dir_cache.remove(&fb.current_path);
                             let path = fb.current_path.clone();
@@ -15701,6 +15965,16 @@ mod gui {
                 return;
             };
             session.scroll_offset = 0;
+            // A paste never reaches `send_raw_bytes_to_connection_tab` —
+            // the drip feed below writes straight to the PTY writer — so
+            // the login tracking has to be applied here too, or a
+            // `sudo su - <user>` in a Scripts-menu body moves the shell
+            // without the tab noticing and the next upload is chowned to
+            // the wrong account.
+            session.input_line_buf = apply_pasted_lines_to_user_stack(
+                &mut session.session_user_stack,
+                &payload,
+            );
             let writer = Arc::clone(&session.writer);
             let prompt_ready = Arc::clone(&session.prompt_ready);
             let total_len = payload.len();
@@ -15826,10 +16100,15 @@ mod gui {
             session.scroll_offset = 0;
             // Track typed line so we can detect `sudo su` / `sudo su - <user>`
             // and re-trigger prep terminal when the new shell prompt appears.
+            // The same parse feeds `session_user_stack`, which is who an
+            // upload into this tab gets chowned to.
             for &b in payload {
                 match b {
                     b'\r' | b'\n' => {
-                        if is_sudo_su_line(&session.input_line_buf) {
+                        if apply_submitted_line_to_user_stack(
+                            &mut session.session_user_stack,
+                            &session.input_line_buf,
+                        ) {
                             session.pending_reprep = true;
                         }
                         session.input_line_buf.clear();
@@ -15837,6 +16116,12 @@ mod gui {
                     0x03 | 0x15 => {
                         // Ctrl-C / Ctrl-U: line aborted/cleared.
                         session.input_line_buf.clear();
+                    }
+                    0x04 if session.input_line_buf.is_empty() => {
+                        // Ctrl-D on an empty line is EOF — the same exit as
+                        // typing `exit`. On a non-empty line it is not, which
+                        // is why the guard is here.
+                        session.session_user_stack.pop();
                     }
                     0x7f | 0x08 => {
                         session.input_line_buf.pop();
@@ -18337,7 +18622,23 @@ mod gui {
                         }
                     }
                 }
-                if ui.button("Upload").clicked() {
+                // Name the account the file will be given to *before* a
+                // file is picked. The tracked login comes from what was
+                // typed in the terminal, so the user is the only one who
+                // can catch it being wrong — and after the fact the file
+                // already belongs to someone.
+                let upload_owner = self.tab_session_user(tab_id);
+                let owner_hint = match &upload_owner {
+                    Some(u) => format!(
+                        "Upload into {current_path} and give the file to '{u}' \
+                         (the account this tab is logged in as)."
+                    ),
+                    None => format!(
+                        "Upload into {current_path} and give the file to this \
+                         tab's SSM login."
+                    ),
+                };
+                if ui.button("Upload").on_hover_text(owner_hint).clicked() {
                     let mut dialog = rfd::FileDialog::new();
                     if let Some(ref dir) = self.config.default_local_dialog_path {
                         if !dir.is_empty() {
@@ -18352,7 +18653,30 @@ mod gui {
                         );
                     }
                 }
+                if let Some(u) = &upload_owner {
+                    ui.weak(format!("as {u}"));
+                }
             });
+
+            if let Some((warn, text)) = self
+                .file_browsers
+                .get(&tab_id)
+                .and_then(|fb| fb.upload_note.clone())
+            {
+                ui.horizontal(|ui| {
+                    let color = if warn {
+                        egui::Color32::YELLOW
+                    } else {
+                        egui::Color32::LIGHT_GREEN
+                    };
+                    note_label(ui, color, text);
+                    if ui.small_button("\u{2716}").clicked() {
+                        if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                            fb.upload_note = None;
+                        }
+                    }
+                });
+            }
 
             // Handle navigation
             if let Some(path) = navigate_to {
@@ -21527,6 +21851,7 @@ mod gui {
             ps1_auto_sent: false,
             input_line_buf: String::new(),
             pending_reprep: false,
+            session_user_stack: Vec::new(),
             last_prepped_prompt: String::new(),
             paste_write_at: None,
             paste_write_bytes: 0,
@@ -23905,6 +24230,285 @@ mod gui {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Walk a whole session the way a person actually does, asserting
+        /// who the tab thinks it is after every single line. This is the
+        /// question the feature turns on — an upload is handed to whoever
+        /// this says — so it is tested as a sequence, not per-line.
+        #[test]
+        fn the_tracked_login_follows_a_real_session_line_by_line() {
+            let mut stack: Vec<String> = Vec::new();
+            let top = |st: &Vec<String>| {
+                st.last().cloned().unwrap_or_else(|| "<ssm login>".to_string())
+            };
+            let mut run = |st: &mut Vec<String>, line: &str| {
+                apply_submitted_line_to_user_stack(st, line);
+            };
+
+            // Fresh SSM session: nobody switched yet, so the box is asked.
+            assert_eq!(top(&stack), "<ssm login>");
+
+            // sudo su - ec2-user  →  exit  →  back where we started.
+            run(&mut stack, "sudo su - ec2-user");
+            assert_eq!(top(&stack), "ec2-user");
+            run(&mut stack, "exit");
+            assert_eq!(top(&stack), "<ssm login>");
+
+            // Land on root first, then the same round trip returns to root.
+            run(&mut stack, "sudo su -");
+            assert_eq!(top(&stack), "root");
+            run(&mut stack, "sudo su - ec2-user");
+            assert_eq!(top(&stack), "ec2-user");
+            run(&mut stack, "exit");
+            assert_eq!(top(&stack), "root");
+
+            // sudo su - john.smith → exit → sudo su - ec2-user.
+            run(&mut stack, "sudo su - john.smith");
+            assert_eq!(top(&stack), "john.smith");
+            run(&mut stack, "exit");
+            assert_eq!(top(&stack), "root");
+            run(&mut stack, "sudo su - ec2-user");
+            assert_eq!(top(&stack), "ec2-user");
+
+            // Ordinary commands move nothing.
+            run(&mut stack, "cd /var/log && ls -la");
+            run(&mut stack, "sudo systemctl restart nginx");
+            assert_eq!(top(&stack), "ec2-user");
+
+            // Nesting several deep unwinds in the right order.
+            run(&mut stack, "sudo su - john.smith");
+            run(&mut stack, "sudo su -");
+            assert_eq!(top(&stack), "root");
+            run(&mut stack, "logout");
+            assert_eq!(top(&stack), "john.smith");
+            run(&mut stack, "exit");
+            assert_eq!(top(&stack), "ec2-user");
+            run(&mut stack, "exit");
+            assert_eq!(top(&stack), "root");
+            run(&mut stack, "exit");
+            assert_eq!(top(&stack), "<ssm login>");
+
+            // One `exit` too many is leaving the SSM session itself, not a
+            // `su` — it must not underflow into a wrong answer.
+            run(&mut stack, "exit");
+            assert_eq!(top(&stack), "<ssm login>");
+        }
+
+        /// Once you are root, `su - <user>` is what you actually type — the
+        /// `sudo` is redundant and nobody bothers. Tracking only the `sudo`
+        /// spelling left the tab believing it was still root, and the file
+        /// would have been handed to root all over again.
+        #[test]
+        fn su_without_sudo_is_tracked_too() {
+            let mut stack = vec!["root".to_string()];
+            apply_submitted_line_to_user_stack(&mut stack, "su - john.smith");
+            assert_eq!(stack.last().unwrap(), "john.smith");
+            apply_submitted_line_to_user_stack(&mut stack, "exit");
+            assert_eq!(stack.last().unwrap(), "root");
+        }
+
+        /// A pasted script bypasses the typed-input path entirely, so it
+        /// gets the same scan or a Scripts-menu body that switches user
+        /// silently desyncs the tracked login.
+        #[test]
+        fn a_pasted_switch_is_tracked_like_a_typed_one() {
+            let mut stack: Vec<String> = Vec::new();
+            let tail = apply_pasted_lines_to_user_stack(
+                &mut stack,
+                b"sudo su - deploy\rcd /srv\rexit\rsudo su - ec2-user\r",
+            );
+            assert_eq!(stack.last().unwrap(), "ec2-user");
+            assert!(tail.is_empty(), "{tail:?}");
+        }
+
+        /// A paste with no trailing newline leaves a line the user has not
+        /// submitted. It must not count yet, and the fragment is handed
+        /// back so the Enter typed next completes it.
+        #[test]
+        fn an_unterminated_paste_waits_for_the_enter() {
+            let mut stack: Vec<String> = Vec::new();
+            let tail =
+                apply_pasted_lines_to_user_stack(&mut stack, b"echo hi\rsudo su - deploy");
+            assert!(stack.is_empty(), "{stack:?}");
+            assert_eq!(tail, "sudo su - deploy");
+            // ...and finishing it off does land.
+            apply_submitted_line_to_user_stack(&mut stack, &tail);
+            assert_eq!(stack.last().unwrap(), "deploy");
+        }
+
+        /// The re-prep detection and the upload's chown target read the
+        /// same line, so the shapes it accepts are pinned here rather than
+        /// left to the one caller that used to be a bool.
+        #[test]
+        fn sudo_su_names_the_account_the_shell_lands_on() {
+            let t = |l: &str| switch_user_target(l);
+            // A bare `sudo su` (with or without the login dash) is root.
+            assert_eq!(t("sudo su"), Some("root".to_string()));
+            assert_eq!(t("sudo su -"), Some("root".to_string()));
+            // Named, both spellings.
+            assert_eq!(t("sudo su bconrad"), Some("bconrad".to_string()));
+            assert_eq!(t("sudo su - bconrad"), Some("bconrad".to_string()));
+            // Extra whitespace is how people actually type.
+            assert_eq!(t("  sudo   su   -   bconrad  "), Some("bconrad".to_string()));
+            // Not a su at all.
+            assert_eq!(t("ls -la"), None);
+            assert_eq!(t("sudo systemctl restart nginx"), None);
+            assert_eq!(t(""), None);
+            // Login-shell flags carry no user of their own.
+            assert_eq!(t("sudo su -l bconrad"), Some("bconrad".to_string()));
+            assert_eq!(t("su --login bconrad"), Some("bconrad".to_string()));
+            assert_eq!(t("sudo su -l"), Some("root".to_string()));
+            // The other everyday way onto a root shell.
+            assert_eq!(t("sudo -i"), Some("root".to_string()));
+            assert_eq!(t("sudo -s"), Some("root".to_string()));
+            // `su -c '…'` runs a command rather than opening a shell to sit
+            // in, so it is not a switch to follow.
+            assert_eq!(t("su -c 'id' bconrad"), None);
+            // A bare `sudo <cmd>` is not a shell switch.
+            assert_eq!(t("sudo -u bconrad whoami"), None);
+        }
+
+        /// `exit` has to be tracked or the chown target stays on an account
+        /// the user has already left — the file would be handed to someone
+        /// who is not at that prompt.
+        #[test]
+        fn leaving_a_shell_is_recognized() {
+            assert!(is_shell_exit_line("exit"));
+            assert!(is_shell_exit_line("  logout  "));
+            assert!(!is_shell_exit_line("exit 1"));
+            assert!(!is_shell_exit_line("exiting"));
+            assert!(!is_shell_exit_line(""));
+        }
+
+        /// These names come from a line the user typed into a terminal and
+        /// are interpolated into a remote shell command, so the check is a
+        /// whitelist, not an escape.
+        #[test]
+        fn only_a_portable_username_reaches_the_shell() {
+            assert!(is_safe_remote_username("bconrad"));
+            assert!(is_safe_remote_username("test.user"));
+            assert!(is_safe_remote_username("ec2-user"));
+            assert!(is_safe_remote_username("svc_acct2"));
+            assert!(!is_safe_remote_username(""));
+            assert!(!is_safe_remote_username("a b"));
+            assert!(!is_safe_remote_username("me;rm -rf /"));
+            assert!(!is_safe_remote_username("$(whoami)"));
+            assert!(!is_safe_remote_username("`id`"));
+            assert!(!is_safe_remote_username("me'x"));
+            // A leading dash would be read as an option by chown.
+            assert!(!is_safe_remote_username("-R"));
+            assert!(!is_safe_remote_username(&"a".repeat(33)));
+        }
+
+        /// The whole point: an upload must not leave the file owned by the
+        /// root that `tee` wrote it as.
+        #[test]
+        fn the_upload_hands_the_file_to_the_tab_s_login() {
+            let cmd = chown_upload_command("/opt/app/thing.jar", Some("bconrad"));
+            assert!(cmd.contains("sudo -n chown 'bconrad': '/opt/app/thing.jar'"), "{cmd}");
+        }
+
+        /// The group is a bare trailing colon so chown uses the account's
+        /// own login group. Every account `create_new_user.sh` makes has a
+        /// private group of its own name, but spelling it `user:user` would
+        /// fail outright on any account that does not.
+        #[test]
+        fn the_group_follows_the_user_rather_than_being_named() {
+            let cmd = chown_upload_command("/tmp/f", Some("bconrad"));
+            assert!(cmd.contains("'bconrad':"), "{cmd}");
+            assert!(!cmd.contains("bconrad':'bconrad"), "{cmd}");
+        }
+
+        /// No `sudo su` yet means the terminal is still on the login the
+        /// SSM session opened as — and the control channel running this
+        /// command shares it, so the box names it. Guessing `ssm-user`
+        /// would only be right by coincidence.
+        #[test]
+        fn an_untracked_tab_asks_the_box_instead_of_guessing_a_name() {
+            let cmd = chown_upload_command("/tmp/f", None);
+            assert!(cmd.contains("\"$(id -un)\":"), "{cmd}");
+            assert!(!cmd.contains("ssm-user"), "{cmd}");
+        }
+
+        /// A name that failed the whitelist must not silently become part
+        /// of the command, and must not disable the handover either — it
+        /// falls back to the login the channel already has.
+        #[test]
+        fn an_unsafe_username_falls_back_rather_than_being_escaped() {
+            let cmd = chown_upload_command("/tmp/f", Some("me; rm -rf /"));
+            assert!(!cmd.contains("rm -rf"), "{cmd}");
+            assert!(cmd.contains("\"$(id -un)\":"), "{cmd}");
+        }
+
+        /// A path with a space or an apostrophe is a path, not an argument
+        /// list. The write it is chained onto quotes it the same way.
+        #[test]
+        fn the_remote_path_is_quoted() {
+            let cmd = chown_upload_command("/tmp/my file.txt", Some("bconrad"));
+            assert!(cmd.contains("'/tmp/my file.txt'"), "{cmd}");
+            let cmd = chown_upload_command("/tmp/it's.txt", Some("bconrad"));
+            assert!(cmd.contains(r"'/tmp/it'\''s.txt'"), "{cmd}");
+        }
+
+        /// The same trap `vault_iam`'s sentinel avoids: the remote shell
+        /// echoes the command line before running it, so a literal
+        /// `__CHOWN_OK__` inside the command would be matched by the scan
+        /// of the output and report success no matter what chown did.
+        #[test]
+        fn the_verdict_marker_is_not_literal_in_the_command() {
+            let cmd = chown_upload_command("/tmp/f", Some("bconrad"));
+            assert!(!cmd.contains("__CHOWN_OK__"), "{cmd}");
+            assert!(!cmd.contains("__CHOWN_FAIL__"), "{cmd}");
+            assert!(cmd.contains("__CHOWN_${s}__"), "{cmd}");
+            // And the echoed command line is not read as a verdict.
+            assert_eq!(parse_chown_marker(&cmd), None);
+        }
+
+        /// The verdict has to be gated on the write, not merely chained
+        /// after it: flat, a `tee` that failed would fall through to
+        /// `s=FAIL` and report a refused chown on a file that never landed.
+        #[test]
+        fn the_verdict_is_one_group_the_write_can_gate() {
+            let cmd = chown_upload_command("/tmp/f", Some("bconrad"));
+            assert!(cmd.starts_with("{ "), "{cmd}");
+            assert!(cmd.ends_with("; }"), "{cmd}");
+        }
+
+        #[test]
+        fn a_successful_chown_reads_as_handed_over() {
+            assert_eq!(parse_chown_marker("__CHOWN_OK__\n"), Some(None));
+        }
+
+        /// The reason chown gave is the whole diagnosis — on the EFS home
+        /// mount root is squashed to `nobody`, so "Operation not permitted"
+        /// there means something quite different from a missing account.
+        #[test]
+        fn a_failed_chown_carries_the_reason_it_gave() {
+            let out = "__CHOWN_FAIL__chown: changing ownership of '/efs/home/x/f': \
+                       Operation not permitted\n";
+            let verdict = parse_chown_marker(out);
+            assert!(
+                matches!(&verdict, Some(Some(msg)) if msg.contains("Operation not permitted")),
+                "{verdict:?}"
+            );
+        }
+
+        /// FAIL is checked before OK, so output carrying both cannot read
+        /// as a success.
+        #[test]
+        fn a_failure_is_not_masked_by_a_stray_ok() {
+            let out = "__CHOWN_OK__\nlater: __CHOWN_FAIL__denied\n";
+            assert!(matches!(parse_chown_marker(out), Some(Some(_))), "{out}");
+        }
+
+        /// No marker at all is neither outcome. The bytes did land, so
+        /// this must not be reported as a failed upload — only as an
+        /// ownership nobody confirmed.
+        #[test]
+        fn a_missing_marker_is_unknown_not_success() {
+            assert_eq!(parse_chown_marker(""), None);
+            assert_eq!(parse_chown_marker("some unrelated output\n"), None);
+        }
 
         /// Arming is an explicit edit, never a default.
         #[test]
