@@ -472,6 +472,74 @@ mod gui {
             self.anchor = None;
             self.end = None;
         }
+
+        /// True when the user has selected something — anchor and end both
+        /// set, and covering more than the single cell a bare click leaves
+        /// behind. This is the test right-click copy uses to decide
+        /// copy-vs-paste.
+        fn has_real_span(&self) -> bool {
+            self.normalized().is_some_and(|(s, e)| s != e)
+        }
+    }
+
+    /// What a Copy event means for a terminal tab.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TerminalCopyAction {
+        /// Ctrl+Shift+C — copy the terminal's own drag-selection.
+        CopyTerminalSelection,
+        /// Plain Ctrl+C with something highlighted outside the terminal.
+        LeaveToOutsideHighlight,
+        /// Plain Ctrl+C with nothing highlighted — the shell's interrupt.
+        Interrupt,
+    }
+
+    /// egui emits `Event::Copy` for Ctrl+C with or without shift, so the
+    /// modifiers have to be read separately to tell the two apart.
+    fn terminal_copy_action(shift: bool, outside_highlight: bool) -> TerminalCopyAction {
+        if shift {
+            TerminalCopyAction::CopyTerminalSelection
+        } else if outside_highlight {
+            TerminalCopyAction::LeaveToOutsideHighlight
+        } else {
+            TerminalCopyAction::Interrupt
+        }
+    }
+
+    /// True when the user has text highlighted in a widget *outside* the
+    /// terminal — the instance-id summary line above it, say. egui owns that
+    /// selection (its labels are selectable by default) and copies it itself
+    /// on Ctrl+C, so the terminal's only job is to not also send an interrupt.
+    fn outside_highlight_active(ctx: &egui::Context) -> bool {
+        ctx.with_plugin::<egui::text_selection::LabelSelectionState, _>(|s| s.has_selection())
+            .unwrap_or(false)
+    }
+
+    fn clear_outside_highlight(ctx: &egui::Context) {
+        ctx.with_plugin::<egui::text_selection::LabelSelectionState, _>(|s| s.clear_selection());
+    }
+
+    /// Whether this key event drops a highlight made outside the terminal.
+    fn key_event_drops_outside_highlight(
+        event: &egui::Event,
+        has_text: bool,
+        has_key_backspace: bool,
+    ) -> bool {
+        match event {
+            // Both halves of one Ctrl+C press: egui emits `Event::Copy` *and*
+            // `Event::Key{C, ctrl}` for it. Ctrl+C is the key that reads the
+            // highlight, so neither may clear it.
+            egui::Event::Copy | egui::Event::Cut => false,
+            egui::Event::Key { key: egui::Key::C, modifiers, .. }
+                if modifiers.ctrl || modifiers.command =>
+            {
+                false
+            }
+            // Anything else the terminal actually receives is typing. A key
+            // it ignores (Ctrl+Shift+C, a bare modifier) sends no payload and
+            // so leaves the highlight alone.
+            _ => terminal_event_payload_for_terminal(event, has_text, has_key_backspace)
+                .is_some(),
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -16208,6 +16276,7 @@ mod gui {
             });
             let mut sent_etx = false;
             let mut sent_can = false;
+            let mut copied_selection = false;
             let on_alt_screen = self.pty_sessions.get(&tab_id)
                 .map(|s| s.parser.screen().alternate_screen())
                 .unwrap_or(false);
@@ -16250,42 +16319,67 @@ mod gui {
                         }
                     }
                 }
-                // egui emits Event::Copy for Ctrl+C regardless of shift.
-                // We intercept it here so we can check modifiers: plain
-                // Ctrl+C → send ETX (0x03), Ctrl+Shift+C → let egui copy.
+                // egui emits Event::Copy for Ctrl+C with or without shift —
+                // and *only* that event, no Key::C — so the modifiers are
+                // read from ctx separately here.
+                //
+                //   Ctrl+Shift+C          → copy the terminal's own selection
+                //   Ctrl+C, highlight     → egui's copy; send the shell nothing
+                //   Ctrl+C, no highlight  → ETX (0x03), the shell's interrupt
                 if matches!(event, egui::Event::Copy) {
-                    if current_modifiers.shift {
-                        // Ctrl+Shift+C: copy selected terminal text
-                        let sel = self.terminal_selections.get(&tab_id).cloned();
-                        if let Some(sel) = sel {
-                            if let Some((start, end)) = sel.normalized() {
-                                if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
-                                    let text = extract_selection_text(
-                                        &mut session.parser, start, end,
-                                    );
-                                    if !text.is_empty() {
-                                        if let Err(err) = clipboard_set_text_with_retry(&text) {
-                                            self.log_error(format!(
-                                                "Ctrl+Shift+C copy tab={tab_id} set_text failed after retries: {err}"
+                    match terminal_copy_action(
+                        current_modifiers.shift,
+                        outside_highlight_active(ctx),
+                    ) {
+                        TerminalCopyAction::LeaveToOutsideHighlight => {
+                            // egui copied the highlighted label text itself
+                            // during that widget's draw, earlier this frame.
+                            // The only job here is to not also interrupt —
+                            // `copied_selection` covers a Key::C arriving by
+                            // some other route (a backend or keyboard layout
+                            // that emits one alongside the Copy event).
+                            copied_selection = true;
+                            self.log_debug(format!(
+                                "Ctrl+C tab={tab_id} left to the highlight outside the terminal"
+                            ));
+                        }
+                        TerminalCopyAction::CopyTerminalSelection => {
+                            copied_selection = true;
+                            let sel = self.terminal_selections.get(&tab_id).cloned();
+                            if let Some(sel) = sel {
+                                if let Some((start, end)) = sel.normalized() {
+                                    if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
+                                        let text = extract_selection_text(
+                                            &mut session.parser, start, end,
+                                        );
+                                        if !text.is_empty() {
+                                            if let Err(err) = clipboard_set_text_with_retry(&text) {
+                                                self.log_error(format!(
+                                                    "Ctrl+Shift+C copy tab={tab_id} set_text failed after retries: {err}"
+                                                ));
+                                            }
+                                            self.log_debug(format!(
+                                                "copied selection tab={tab_id} abs ({},{})→({},{}) len={}",
+                                                start.abs_row, start.col,
+                                                end.abs_row, end.col, text.len()
                                             ));
                                         }
-                                        self.log_debug(format!(
-                                            "copied selection tab={tab_id} abs ({},{})→({},{}) len={}",
-                                            start.abs_row, start.col, end.abs_row, end.col, text.len()
-                                        ));
                                     }
-                                }
-                                if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
-                                    sel.clear();
+                                    if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
+                                        sel.clear();
+                                    }
                                 }
                             }
                         }
-                    } else if !sent_etx {
-                        self.log_trace(format!(
-                            "terminal input event tab={tab_id} kind=Copy→ETX"
-                        ));
-                        self.send_raw_bytes_to_connection_tab(tab_id, &[0x03]);
-                        sent_etx = true;
+                        TerminalCopyAction::Interrupt => {
+                            if !sent_etx {
+                                self.log_trace(format!(
+                                    "terminal input event tab={tab_id} kind=Copy→ETX"
+                                ));
+                                self.send_raw_bytes_to_connection_tab(tab_id, &[0x03]);
+                                sent_etx = true;
+                            }
+                        }
                     }
                     continue;
                 }
@@ -16305,9 +16399,10 @@ mod gui {
                 if let Some(payload) =
                     terminal_event_payload_for_terminal(&event, has_text, has_key_backspace)
                 {
-                    // Dedup: if we already sent ETX via the Copy path above,
-                    // skip a second ETX from the Key::C arm.
-                    if payload == [0x03] && sent_etx {
+                    // Dedup: if the Copy path above already sent ETX — or
+                    // deliberately copied instead of sending one — skip the
+                    // Key::C arm's ETX.
+                    if payload == [0x03] && (sent_etx || copied_selection) {
                         continue;
                     }
                     if payload == [0x03] {
@@ -16317,6 +16412,12 @@ mod gui {
                         "terminal input event tab={tab_id} kind={}",
                         terminal_event_kind(&event)
                     ));
+                    // Typing into the terminal drops a highlight made
+                    // outside it, so what is highlighted on screen is always
+                    // what Ctrl+C would copy. Ctrl+C itself never clears.
+                    if key_event_drops_outside_highlight(&event, has_text, has_key_backspace) {
+                        clear_outside_highlight(ctx);
+                    }
                     if matches!(event, egui::Event::Paste(_)) {
                         // Route Ctrl+V paste through the chunked drip-feed
                         // path — single-shot writes lose bytes for long
@@ -17910,9 +18011,8 @@ mod gui {
                                 // we never silently fall through to a paste
                                 // when the user clearly intended a copy.
                                 let raw_sel = self.terminal_selections.get(&tab_id).cloned();
-                                let normalized_sel = raw_sel.as_ref().and_then(|s| s.normalized());
-                                let has_real_selection = normalized_sel
-                                    .is_some_and(|(s, e)| s != e);
+                                let has_real_selection =
+                                    raw_sel.as_ref().is_some_and(|s| s.has_real_span());
                                 let session_present = self.pty_sessions.contains_key(&tab_id);
                                 self.log_debug(format!(
                                     "right-click tab={tab_id} has_real_selection={has_real_selection} sel={raw_sel:?} session_present={session_present}"
@@ -28096,6 +28196,109 @@ mod gui {
                 terminal_event_payload_for_terminal(&egui::Event::Cut, false, false),
                 None
             );
+        }
+
+        fn selection(anchor: (usize, u16), end: (usize, u16)) -> TerminalSelection {
+            TerminalSelection {
+                anchor: Some(AbsPos { abs_row: anchor.0, col: anchor.1 }),
+                end: Some(AbsPos { abs_row: end.0, col: end.1 }),
+            }
+        }
+
+        fn key(k: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+            egui::Event::Key {
+                key: k,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }
+        }
+
+        const CTRL: egui::Modifiers = egui::Modifiers {
+            alt: false,
+            ctrl: true,
+            shift: false,
+            mac_cmd: false,
+            command: true,
+        };
+
+        #[test]
+        fn ctrl_c_copies_a_highlight_made_outside_the_terminal() {
+            // Highlight the instance id on the summary line, press Ctrl+C:
+            // egui owns that selection and copies it. The terminal must not
+            // also see an interrupt.
+            assert_eq!(
+                terminal_copy_action(false, true),
+                TerminalCopyAction::LeaveToOutsideHighlight
+            );
+        }
+
+        #[test]
+        fn ctrl_c_with_nothing_highlighted_interrupts() {
+            // Switching to Inventory and back leaves nothing highlighted, so
+            // Ctrl+C is the shell's interrupt again.
+            assert_eq!(
+                terminal_copy_action(false, false),
+                TerminalCopyAction::Interrupt
+            );
+        }
+
+        #[test]
+        fn ctrl_shift_c_copies_the_terminal_s_own_selection() {
+            assert_eq!(
+                terminal_copy_action(true, false),
+                TerminalCopyAction::CopyTerminalSelection
+            );
+        }
+
+        #[test]
+        fn typing_drops_a_highlight_made_outside_the_terminal() {
+            // The highlight on screen must always be the one Ctrl+C would
+            // copy, so typing clears it and the user re-highlights to copy.
+            assert!(key_event_drops_outside_highlight(
+                &egui::Event::Text("a".to_string()),
+                true,
+                false
+            ));
+            assert!(key_event_drops_outside_highlight(
+                &key(egui::Key::Enter, egui::Modifiers::default()),
+                false,
+                false
+            ));
+        }
+
+        #[test]
+        fn ctrl_c_never_drops_the_highlight_it_reads() {
+            // egui emits BOTH events for one Ctrl+C press; neither may clear.
+            assert!(!key_event_drops_outside_highlight(
+                &egui::Event::Copy,
+                false,
+                false
+            ));
+            assert!(!key_event_drops_outside_highlight(
+                &key(egui::Key::C, CTRL),
+                false,
+                false
+            ));
+        }
+
+        #[test]
+        fn a_key_the_terminal_ignores_leaves_the_highlight_alone() {
+            // Ctrl+Shift+C sends the terminal nothing, so it is not typing.
+            let ctrl_shift_c = key(
+                egui::Key::C,
+                egui::Modifiers { shift: true, ..CTRL },
+            );
+            assert!(!key_event_drops_outside_highlight(&ctrl_shift_c, false, false));
+        }
+
+        #[test]
+        fn a_bare_click_is_not_a_real_span() {
+            // A click sets anchor == end. Right-click copy-vs-paste turns on
+            // this distinction: a click is not a selection to copy.
+            assert!(selection((10, 4), (10, 22)).has_real_span());
+            assert!(!selection((10, 4), (10, 4)).has_real_span());
         }
 
         #[test]

@@ -216,6 +216,42 @@ Key functions:
 - `pty_command_for_context()` — spawns `aws` directly with SSM args in live mode
 - `resize_pty_session()` — propagates resize to both vt100 parser and PTY master
 
+#### Ctrl+C — the highlight outside the terminal, or the shell's interrupt
+
+The summary line above the terminal (`Instance: name (i-…)  Private IP: …`) is
+a plain `ui.monospace`, and **egui labels are text-selectable by default**, so
+a user can drag-highlight the instance id there. Highlighting a label does not
+take focus off the terminal — typing still goes to the shell — so the terminal
+was converting that Ctrl+C into an interrupt. `terminal_copy_action` is the one
+place the three cases are decided:
+
+| keys | with | action |
+|---|---|---|
+| Ctrl+Shift+C | — | copy the terminal's **own** drag-selection |
+| Ctrl+C | a highlight outside the terminal | egui's copy; the shell gets nothing |
+| Ctrl+C | nothing highlighted | ETX (0x03), the shell's interrupt |
+
+- **The terminal's own drag-selection deliberately does *not* make Ctrl+C a
+  copy.** Only a highlight *outside* the terminal does. A selection sitting in
+  the scrollback is easy to forget about — leave for the Inventory tab, come
+  back, and a Ctrl+C meant for a runaway command would silently copy instead.
+  Terminal selections copy with Ctrl+Shift+C and right-click, as before.
+- **egui emits `Event::Copy` and nothing else** for Ctrl+C — `egui-winit`'s
+  `is_copy_command` returns early, so no `Key::C` follows, and the event
+  carries no modifiers. Hence reading `ctx.input(|i| i.modifiers)` separately.
+  `copied_selection` still guards the `Key::C` arm for a backend or keyboard
+  layout that does emit one.
+- **"Is something highlighted outside the terminal" is egui's own state** —
+  `LabelSelectionState::has_selection` via `ctx.with_plugin`
+  (`outside_highlight_active`). egui already clears it when the pointer is
+  pressed anywhere that is not a label, so clicking into the terminal drops it.
+- **Typing into the terminal clears that highlight**
+  (`key_event_drops_outside_highlight`), so what is highlighted on screen is
+  always what Ctrl+C would copy — the user re-highlights to copy again, and
+  Ctrl+C goes back to interrupting. **Ctrl+C itself never clears it**: it is
+  the one key that reads the highlight. A key the terminal ignores
+  (Ctrl+Shift+C, a bare modifier) sends no payload and so is not typing.
+
 ### App icon — two places, both needed
 
 The "e" glyph is set **twice**, and the two cover different things. Losing
