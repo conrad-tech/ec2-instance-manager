@@ -10994,10 +10994,14 @@ mod gui {
                 };
                 win.loading = false;
                 if fetch.generation != self.alerts_generation {
-                    // Started before an "Acknowledge all" run finished (the
-                    // run bumps the generation on completion, and triggers
-                    // its own fresh fetch). Applying this one would revert
-                    // whatever the run just acknowledged.
+                    // Stale relative to an "Acknowledge all" run. The run
+                    // bumps the generation twice — once when it starts, which
+                    // invalidates any fetch already in flight, and again on
+                    // completion, before it triggers its own fresh fetch.
+                    // Both bumps matter: without the one at the start, a
+                    // fetch dispatched moments earlier stays valid for the
+                    // whole run, lands mid-run, and reverts rows the run has
+                    // already acknowledged.
                     continue;
                 }
                 if fetch.window_min != win.window_min {
