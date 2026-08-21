@@ -30,20 +30,15 @@
   "on_call_test": {
     "allowed_users": []
   },
-  "_alerts_comment": "On-call Alerts button (Jira Service Management Operations). cloud_id + email identify the JSM site to query. allowed_users lists the OS usernames (Windows USERNAME / Linux USER, matched case-insensitively) that may see the Alerts button; use [\"*\"] for everyone, [] to hide it from everyone. The button only appears when cloud_id AND email are set AND the user is on the list. DO NOT commit a real API token in 'token' — this file is in git. Leave it empty and have each user set JIRA_TOKEN in their environment; JIRA_TOKEN always overrides this value.",
+  "_alerts_comment": "On-call Alerts button (Jira Service Management Operations). The Atlassian cloud id, email and API token are NEVER stored here -- this file is committed to git. They resolve environment -> Windows Credential Manager only (see src/jsm_auth.rs): cmdkey /generic:ec2_manager/jsm /user:<atlassian email> /pass:<API token> (or scripts/store_jsm_credential.ps1), and cmdkey /generic:ec2_manager/jsm_cloud_id /user:x /pass:<cloud id>; the matching environment-variable overrides are ATLASSIAN_EMAIL, JIRA_TOKEN and CLOUD_ID. allowed_users lists the OS usernames (Windows USERNAME / Linux USER, matched case-insensitively) that may see the Alerts button; use [\"*\"] for everyone, [] to hide it from everyone. The button only appears when a complete set of credentials resolves AND the user is on the list.",
   "alerts": {
-    "cloud_id": "",
-    "email": "",
-    "token": "",
     "allowed_users": []
   },
-  "_reaper_comment": "Unattended reaper auto-remediation. Ships disabled, dry-run, and with nobody allowed. allowed_users is SINGLE-ENTRY by policy - nothing arbitrates two machines remediating one alert - and '*' is deliberately not honoured here. schedule_id/account_id drive the on-call lookup, which selects handling (ack + 15min + escalate, vs no ack + 10min + one message), never whether the fix runs. The *_contains fields identify a reaper alert; leave blank until a real reaper payload confirms them.",
+  "_reaper_comment": "Unattended reaper auto-remediation. Ships disabled, dry-run, and with nobody allowed. allowed_users is SINGLE-ENTRY by policy - nothing arbitrates two machines remediating one alert - and '*' is deliberately not honoured here. The JSM schedule id and the caller's Atlassian account id drive the on-call lookup, which selects handling (ack + 15min + escalate, vs no ack + 10min + one message), never whether the fix runs -- like the alerts credentials above, NEITHER lives in this file: they resolve environment -> Windows Credential Manager only (targets ec2_manager/jsm_schedule_id and ec2_manager/jsm_account_id; env overrides SCHEDULE_ID and MY_ID). The *_contains fields identify a reaper alert; leave blank until a real reaper payload confirms them.",
   "reaper": {
     "enabled": false,
     "dry_run": true,
     "allowed_users": [],
-    "schedule_id": "",
-    "account_id": "",
     "alertname_contains": "",
     "app_contains": "",
     "message_contains": "",
@@ -66,7 +61,7 @@
       }
     ]
   },
-  "_access_email_comment": "Post-create Outlook access email (Windows only). Discover the encrypt_* values with scripts/outlook_verification.ps1 (or test_headless_encrypt.ps1), then paste them here. Headless encryption needs all three: encrypt_permission (the MailItem.Permission value it reported, e.g. 3), encrypt_permission_service (1 = olWindows), and encrypt_template_guid (the tenant RMS/IRM template GUID, same for everyone in your org - keep the braces). encrypt_smime_flag is only used when there is no template GUID (1 = S/MIME encrypt). encrypt_sendkeys is the QAT Encrypt shortcut for the visible fallback path (Alt+6 = '%6'). Set enabled=false to turn the feature off. auto_run makes the app run the script itself as soon as a create finishes with a saved PEM; set it to false to leave the 'Send Email Command' menu as the only route. email_domains lists your organization's MAIL domains (e.g. [\"xyz.com\",\"old-xyz.com\"]): a recipient that resolves outside all of them is never mailed unattended, which stops a stale local Contacts entry or autocomplete cache hit from receiving the PEM. Staff often have mail on more than one domain, and this is unrelated to the Windows/AD domain the machine is joined to. A single string or a comma-separated string also works. Leave it empty to skip that check. email_local_format checks the SHAPE of the resolved address against the username, catching an in-domain address that belongs to a different person with a similar name (the domain check cannot): 'flast' means first initial + surname with an optional number, so john.smith accepts jsmith@ or jsmith2@ but not johnsmith@. Leave it empty to skip.",
+  "_access_email_comment": "Post-create Outlook access email (Windows only). Discover the encrypt_* values with scripts/outlook_verification.ps1 (or test_headless_encrypt.ps1), then paste them here. Headless encryption needs all three: encrypt_permission (the MailItem.Permission value it reported, e.g. 3), encrypt_permission_service (1 = olWindows), and encrypt_template_guid (the tenant RMS/IRM template GUID, same for everyone in your org - keep the braces). encrypt_smime_flag is only used when there is no template GUID (1 = S/MIME encrypt). encrypt_sendkeys is the QAT Encrypt shortcut for the visible fallback path (Alt+6 = '%6'). Set enabled=false to turn the feature off. auto_run makes the app run the script itself as soon as a create finishes with a saved PEM; set it to false to leave the 'Send Email Command' menu as the only route. email_domains lists your organization's MAIL domains (e.g. [\"xyz.com\",\"old-xyz.com\"]): a recipient that resolves outside all of them is never mailed unattended, which stops a stale local Contacts entry or autocomplete cache hit from receiving the PEM. Staff often have mail on more than one domain, and this is unrelated to the Windows/AD domain the machine is joined to. A single string or a comma-separated string also works. Leave it empty to skip that check. email_local_suffixes lists markers the local part may ALSO carry, e.g. [\".cw\"] so test.user matches tuser@ and tuser.cw@ - accepted alongside the bare form, never instead of it, and probed as well as checked (tuser, tuser.cw, tuser2, tuser2.cw ...). Taken literally, so \"-contractor\" or \"_ext\" work too; a single string or comma-separated string also works. Leave it empty for the plain stem-plus-number shape. email_local_format checks the SHAPE of the resolved address against the username, catching an in-domain address that belongs to a different person with a similar name (the domain check cannot): 'flast' means first initial + surname with an optional number, so john.smith accepts jsmith@ or jsmith2@ but not johnsmith@. Leave it empty to skip.",
   "access_email": {
     "enabled": true,
     "auto_run": true,
@@ -75,6 +70,9 @@
       "test2.com"
     ],
     "email_local_format": "flast",
+    "email_local_suffixes": [
+      ".cw"
+    ],
     "email_local_max_suffix": 20,
     "encrypt_template_guid": "{00000000-0000-0000-0000-000000000000}",
     "encrypt_permission": 3,

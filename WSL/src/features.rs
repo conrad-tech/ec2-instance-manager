@@ -37,6 +37,21 @@ where
         .collect())
 }
 
+/// Same as [`string_or_list`], but lower-cases every entry.
+///
+/// For values compared against an email address, which is case-insensitive:
+/// the address is lower-cased before the comparison, so a `".CW"` written in
+/// features.json would otherwise become a suffix that can never match.
+fn string_or_list_lower<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(string_or_list(deserializer)?
+        .into_iter()
+        .map(|s| s.to_lowercase())
+        .collect())
+}
+
 /// Compiled-in feature flags from `assets/features.json`, obfuscated at build
 /// time (see [`crate::obf_core`]) so the gate config, bastion filters and Jira
 /// alert settings do not sit in the binary as readable JSON. `build.rs` writes
@@ -498,21 +513,14 @@ impl PersonalScriptsFeature {
 
 /// The `alerts` section of `assets/features.json`.
 ///
-/// `cloud_id` / `email` identify the Jira Service Management site to query.
-/// The token is deliberately **not** expected to live in this file (it is
-/// checked into git) — leave it empty and set `JIRA_TOKEN` in the environment;
-/// see [`AlertsFeature::token`].
+/// Only the allow-list lives here. The cloud id, email and API token are
+/// deliberately **not** fields of this struct — this file is committed, and
+/// none of the five JSM/Opsgenie credential values may ever live in it. They
+/// resolve environment → Windows Credential Manager via `jsm_auth::load_auth`
+/// (see that module for the target/env-var pairs).
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct AlertsFeature {
-    /// Atlassian cloud id for the JSM site (the UUID in the API path).
-    pub cloud_id: String,
-    /// Atlassian account email used for API basic auth.
-    pub email: String,
-    /// API token. Prefer leaving this empty and exporting `JIRA_TOKEN`:
-    /// features.json is committed, so a token here is a token in git.
-    /// A non-empty value is used only when `JIRA_TOKEN` is unset.
-    pub token: String,
     /// OS usernames allowed to see the Alerts button (case-insensitive).
     /// `["*"]` shows it to everyone; an empty list hides it from everyone.
     pub allowed_users: Vec<String>,
@@ -522,16 +530,6 @@ impl AlertsFeature {
     /// True when `user` may see the Alerts button.
     pub fn is_allowed_user(&self, user: &str) -> bool {
         user_in_list(&self.allowed_users, user)
-    }
-
-    /// The API token actually used: `JIRA_TOKEN` wins over features.json so a
-    /// user can supply their own without a rebuild.
-    pub fn resolved_token(&self) -> String {
-        std::env::var("JIRA_TOKEN")
-            .ok()
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| self.token.trim().to_string())
     }
 }
 
@@ -543,6 +541,12 @@ impl AlertsFeature {
 ///
 /// **Single-entry by policy.** Nothing arbitrates two machines remediating
 /// one alert; see `has_multiple_users`.
+///
+/// The JSM schedule id and the caller's Atlassian account id are **not**
+/// fields here — this file is committed, and those two identifiers resolve
+/// environment → Windows Credential Manager only, via
+/// [`Self::resolved_schedule_id`] / [`Self::resolved_atlassian_account_id`]
+/// (see `jsm_auth`).
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct ReaperFeature {
@@ -554,13 +558,6 @@ pub struct ReaperFeature {
     /// OS usernames permitted to remediate. `"*"` is deliberately **not**
     /// honoured here.
     pub allowed_users: Vec<String>,
-    /// JSM Ops schedule id for the on-call lookup.
-    pub schedule_id: String,
-    /// The **Atlassian** account id to look for in the on-call response.
-    /// Named `account_id` in features.json — unrelated to any AWS account id,
-    /// which is what `account` means everywhere else in this codebase.
-    #[serde(rename = "account_id")]
-    pub atlassian_account_id: String,
     /// Substring identifying a reaper alert in `extraProperties.alertname`.
     pub alertname_contains: String,
     /// Substring identifying a reaper alert in the `App:` tag. Secondary —
@@ -592,8 +589,6 @@ impl Default for ReaperFeature {
             enabled: false,
             dry_run: true,
             allowed_users: Vec::new(),
-            schedule_id: String::new(),
-            atlassian_account_id: String::new(),
             alertname_contains: String::new(),
             app_contains: String::new(),
             message_contains: String::new(),
@@ -632,24 +627,27 @@ impl ReaperFeature {
     }
 
     /// The JSM schedule id, resolved environment → Windows Credential
-    /// Manager → features.json. Blank when unconfigured, which the on-call
+    /// Manager, and stopping there — `assets/features.json` is committed, so
+    /// it is never a source. Blank when unconfigured, which the on-call
     /// lookup reports as an error rather than as "not on call".
     pub fn resolved_schedule_id(&self) -> String {
         crate::jsm_auth::resolve_id(
             crate::jsm_auth::SCHEDULE_ID_ENV,
             crate::jsm_auth::SCHEDULE_ID_TARGET,
-            &self.schedule_id,
+            "",
         )
     }
 
     /// The **Atlassian** account id — the identity matched against the JSM
     /// on-call response. Unrelated to any AWS account id, which is what
-    /// `account` means everywhere else in this codebase.
+    /// `account` means everywhere else in this codebase. Same
+    /// environment-then-Credential-Manager-only resolution as
+    /// [`Self::resolved_schedule_id`].
     pub fn resolved_atlassian_account_id(&self) -> String {
         crate::jsm_auth::resolve_id(
             crate::jsm_auth::ATLASSIAN_ACCOUNT_ID_ENV,
             crate::jsm_auth::ATLASSIAN_ACCOUNT_ID_TARGET,
-            &self.atlassian_account_id,
+            "",
         )
     }
 
@@ -751,6 +749,21 @@ pub struct AccessEmailConfig {
     /// This catches what the domain check cannot: an in-domain address that
     /// simply belongs to a different person with a similar name.
     pub email_local_format: String,
+    /// Optional local-part markers accepted *alongside* the bare stem, e.g.
+    /// `[".cw"]` so `test.user` matches `tuser@` **and** `tuser.cw@`.
+    ///
+    /// Sites that mark a class of staff in the address itself (contractors,
+    /// contingent workers) would otherwise fail the shape check and never
+    /// send. The list is also probed: `expected_email_locals` emits the bare
+    /// and the suffixed form at each numeric rank, so the mailbox is *found*
+    /// by address rather than falling back to display-name resolution.
+    ///
+    /// Taken literally rather than assuming a dot, so `-contractor` or `_ext`
+    /// work without a code change. Accepts a JSON array, a single string, or a
+    /// comma-separated string. Empty leaves the check exactly as it was: the
+    /// stem plus an optional number.
+    #[serde(deserialize_with = "string_or_list_lower")]
+    pub email_local_suffixes: Vec<String>,
     /// Highest numeric suffix to probe when looking for the mailbox, e.g. 20
     /// tries `jsmith`, `jsmith2` … `jsmith20`. People who share a surname get a
     /// number, and there is no way to know in advance which one — so the script
@@ -786,6 +799,7 @@ impl Default for AccessEmailConfig {
             auto_run: true,
             email_domains: Vec::new(),
             email_local_format: String::new(),
+            email_local_suffixes: Vec::new(),
             email_local_max_suffix: 20,
             encrypt_template_guid: String::new(),
             encrypt_permission: 0,
@@ -842,22 +856,30 @@ impl Default for Features {
 }
 
 impl Features {
-    /// Auth for the alerts API, with the token resolved from the environment
-    /// when set. Check `is_complete()` before using.
+    /// Auth for the alerts API, resolved environment → Windows Credential
+    /// Manager (see `jsm_auth::load_auth`) — never from this struct, since
+    /// none of the five JSM/Opsgenie credential values may live in the
+    /// committed `assets/features.json`. Check `is_complete()` before using.
+    ///
+    /// **Do not call this per frame.** It is a `CredReadW` per field. Resolve
+    /// it once (e.g. at startup) and cache the result — see how the GUI
+    /// stores the answer once into `App::alerts_auth` and reuses it for both
+    /// `alerts_visible_for` and every later alerts-API call.
     pub fn alerts_auth(&self) -> crate::alerts::AlertsAuth {
-        crate::alerts::AlertsAuth {
-            email: self.alerts.email.trim().to_string(),
-            token: self.alerts.resolved_token(),
-            cloud_id: self.alerts.cloud_id.trim().to_string(),
-        }
+        crate::jsm_auth::load_auth()
     }
 
-    /// True when the Alerts button should be shown to `user` — the site is
-    /// configured *and* the user is on the allow-list. Fails closed.
-    pub fn alerts_visible_for(&self, user: &str) -> bool {
-        !self.alerts.cloud_id.trim().is_empty()
-            && !self.alerts.email.trim().is_empty()
-            && self.alerts.is_allowed_user(user)
+    /// True when the Alerts button should be shown to `user` — a complete
+    /// set of credentials resolved *and* the user is on the allow-list.
+    /// Fails closed.
+    ///
+    /// `auth` is a parameter, not a lookup, for the same reason
+    /// `on_call_test_visible_for` takes `mailbox` as one: resolving it reads
+    /// the Windows registry, so the caller resolves it once (see
+    /// `Self::alerts_auth`) and passes the answer in rather than this being
+    /// re-resolved on every call.
+    pub fn alerts_visible_for(&self, user: &str, auth: &crate::alerts::AlertsAuth) -> bool {
+        auth.is_complete() && self.alerts.is_allowed_user(user)
     }
 
     /// True when `user` gets the git integration — the PAT prompt on launch,
@@ -1014,6 +1036,37 @@ mod tests {
     }
 
     #[test]
+    fn access_email_local_suffixes_default_to_empty() {
+        // Empty is the shape the check has always had: bare stem plus an
+        // optional number, nothing else.
+        assert!(AccessEmailConfig::default().email_local_suffixes.is_empty());
+    }
+
+    #[test]
+    fn access_email_local_suffixes_accept_a_list() {
+        let cfg: AccessEmailConfig =
+            serde_json::from_str(r#"{"email_local_suffixes":[".cw",".ctr"]}"#).expect("parses");
+        assert_eq!(cfg.email_local_suffixes, vec![".cw", ".ctr"]);
+    }
+
+    #[test]
+    fn a_comma_separated_suffix_string_is_split() {
+        let cfg: AccessEmailConfig =
+            serde_json::from_str(r#"{"email_local_suffixes":".cw, .ctr"}"#).expect("parses");
+        assert_eq!(cfg.email_local_suffixes, vec![".cw", ".ctr"]);
+    }
+
+    #[test]
+    fn suffixes_are_lower_cased_and_blanks_dropped() {
+        // The address they are matched against is compared in lower case, so a
+        // ".CW" written in features.json must not become a suffix nothing can
+        // match. A blank entry would match everything, which is worse.
+        let cfg: AccessEmailConfig =
+            serde_json::from_str(r#"{"email_local_suffixes":[".CW","","  "]}"#).expect("parses");
+        assert_eq!(cfg.email_local_suffixes, vec![".cw"]);
+    }
+
+    #[test]
     fn access_email_auto_run_defaults_on_and_can_be_disabled() {
         assert!(AccessEmailConfig::default().auto_run);
         let cfg: AccessEmailConfig =
@@ -1071,40 +1124,54 @@ mod tests {
     }
 
     fn alerts_features(allowed: &str) -> Features {
-        serde_json::from_str(&format!(
-            r#"{{"alerts":{{"cloud_id":"cid","email":"a@b.c","allowed_users":{allowed}}}}}"#
-        ))
-        .expect("should parse")
+        serde_json::from_str(&format!(r#"{{"alerts":{{"allowed_users":{allowed}}}}}"#))
+            .expect("should parse")
+    }
+
+    /// A fully resolved auth, as if Windows Credential Manager (or the
+    /// environment) had every field set. Built by hand rather than through
+    /// `jsm_auth::load_auth`, which touches the real registry/environment
+    /// and would make these tests flaky on a machine that happens to have
+    /// `JIRA_TOKEN` etc. exported for real use.
+    fn complete_alerts_auth() -> crate::alerts::AlertsAuth {
+        crate::alerts::AlertsAuth {
+            email: "a@b.c".to_string(),
+            token: "tok".to_string(),
+            cloud_id: "cid".to_string(),
+        }
     }
 
     #[test]
     fn alerts_hidden_when_user_not_on_allow_list() {
         let f = alerts_features(r#"["bconrad"]"#);
-        assert!(f.alerts_visible_for("bconrad"));
-        assert!(f.alerts_visible_for("BConrad")); // case-insensitive
-        assert!(!f.alerts_visible_for("someone.else"));
-        assert!(!f.alerts_visible_for("")); // unknown user → hidden
+        let auth = complete_alerts_auth();
+        assert!(f.alerts_visible_for("bconrad", &auth));
+        assert!(f.alerts_visible_for("BConrad", &auth)); // case-insensitive
+        assert!(!f.alerts_visible_for("someone.else", &auth));
+        assert!(!f.alerts_visible_for("", &auth)); // unknown user → hidden
     }
 
     #[test]
     fn alerts_wildcard_shows_to_everyone() {
         let f = alerts_features(r#"["*"]"#);
-        assert!(f.alerts_visible_for("anyone"));
+        assert!(f.alerts_visible_for("anyone", &complete_alerts_auth()));
     }
 
     #[test]
     fn alerts_empty_allow_list_hides_from_everyone() {
         let f = alerts_features("[]");
-        assert!(!f.alerts_visible_for("bconrad"));
+        assert!(!f.alerts_visible_for("bconrad", &complete_alerts_auth()));
     }
 
     #[test]
-    fn alerts_hidden_when_site_not_configured() {
-        // On the allow-list, but no cloud_id/email compiled in → nothing to
-        // query, so no button.
+    fn alerts_hidden_when_credentials_do_not_resolve() {
+        // On the allow-list, but nothing resolved from Credential Manager or
+        // the environment → nothing to query, so no button. This is the
+        // replacement for the old "no cloud_id/email compiled in" case: those
+        // fields no longer exist in features.json at all.
         let f: Features =
             serde_json::from_str(r#"{"alerts":{"allowed_users":["*"]}}"#).expect("should parse");
-        assert!(!f.alerts_visible_for("bconrad"));
+        assert!(!f.alerts_visible_for("bconrad", &crate::alerts::AlertsAuth::default()));
     }
 
     fn vault_iam_features(allowed: &str) -> Features {
@@ -1741,9 +1808,13 @@ mod tests {
 
     #[test]
     fn alerts_missing_section_defaults_off() {
+        // A missing `alerts` section means an empty allow-list, which hides
+        // the button regardless of what credentials happen to resolve — this
+        // asserts the allow-list gate specifically, with a deliberately
+        // complete auth, so it can't pass for the wrong reason (see
+        // `alerts_hidden_when_credentials_do_not_resolve` for that half).
         let f: Features = serde_json::from_str("{}").expect("should parse");
-        assert!(!f.alerts_visible_for("bconrad"));
-        assert!(!f.alerts_auth().is_complete());
+        assert!(!f.alerts_visible_for("bconrad", &complete_alerts_auth()));
     }
 
     #[test]
@@ -1795,8 +1866,6 @@ mod tests {
         assert!(!f.reaper.enabled);
         assert!(f.reaper.allowed_users.is_empty());
         assert!(f.reaper.dry_run);
-        // features.json is committed. A token here is a token in git.
-        assert!(f.alerts.token.trim().is_empty());
         // The load-bearing gate: a blank *_contains rule matches nothing
         // (see `contains_ci`), which is what makes shipping the armed code
         // path safe even with `enabled`/`dry_run` both flipped by hand.
@@ -1804,9 +1873,53 @@ mod tests {
         assert!(f.reaper.alertname_contains.trim().is_empty());
         assert!(f.reaper.app_contains.trim().is_empty());
         assert!(f.reaper.message_contains.trim().is_empty());
-        // Both ids ship blank too, so the on-call lookup and any account
-        // scoping stay unresolved until an admin sets them by hand.
-        assert!(f.reaper.schedule_id.trim().is_empty());
-        assert!(f.reaper.atlassian_account_id.trim().is_empty());
+        // The JSM schedule id, Atlassian account id, cloud id, email and API
+        // token are no longer fields anywhere in `Features` at all — see
+        // `the_shipped_features_json_carries_no_jsm_or_opsgenie_credential_key`
+        // below, which pins that they cannot even be *present* in the JSON.
+    }
+
+    #[test]
+    fn the_shipped_features_json_carries_no_jsm_or_opsgenie_credential_key() {
+        // The five JSM/Opsgenie values (Atlassian email, API token, cloud id,
+        // schedule id, account id) must be resolvable ONLY from Windows
+        // Credential Manager / the environment (see `jsm_auth`) — never from
+        // this committed file. Walked structurally over the parsed JSON
+        // rather than grepped as text, so a key nested anywhere still fails
+        // the build, and so this cannot be fooled by the same words
+        // appearing in plain English inside the `_alerts_comment` /
+        // `_reaper_comment` strings (which they deliberately still do, to
+        // point an admin at Credential Manager).
+        let value: serde_json::Value = serde_json::from_str(&bundled_features())
+            .expect("assets/features.json parses as JSON");
+
+        fn walk(v: &serde_json::Value, forbidden: &[&str], found: &mut Vec<String>) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    for (k, val) in map {
+                        if forbidden.contains(&k.as_str()) {
+                            found.push(k.clone());
+                        }
+                        walk(val, forbidden, found);
+                    }
+                }
+                serde_json::Value::Array(arr) => {
+                    for item in arr {
+                        walk(item, forbidden, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let forbidden = ["cloud_id", "email", "token", "schedule_id", "account_id"];
+        let mut found = Vec::new();
+        walk(&value, &forbidden, &mut found);
+        assert!(
+            found.is_empty(),
+            "assets/features.json must not carry any of {forbidden:?} as a JSON key \
+             (all five JSM/Opsgenie values live in Windows Credential Manager only); \
+             found: {found:?}"
+        );
     }
 }

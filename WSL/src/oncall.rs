@@ -45,7 +45,9 @@ pub fn is_on_call(auth: &AlertsAuth, schedule_id: &str, account_id: &str) -> Res
     }
     if schedule_id.trim().is_empty() || account_id.trim().is_empty() {
         return Err(AppError::InvalidArgument(
-            "on-call: schedule_id and account_id must be set in features.json".to_string(),
+            "on-call: schedule_id and account_id must be resolvable (Windows Credential \
+             Manager, or SCHEDULE_ID/MY_ID in the environment)"
+                .to_string(),
         ));
     }
     let body = crate::alerts::fetch_on_calls(auth, schedule_id.trim())?;

@@ -1,10 +1,13 @@
 //! Where the JSM Ops credentials and tenant identifiers come from, and in
 //! what order.
 //!
-//! `assets/features.json` is committed, so it is the *last* resort and
-//! ships every value blank. The everyday source is Windows Credential
-//! Manager, holding five separate generic credentials, each with a matching
-//! environment-variable override (target ↔ env var, one line each):
+//! `assets/features.json` is committed, so **none of these five values may
+//! ever live there** — there is no JSON fallback, on purpose. Every value
+//! resolves environment → Windows Credential Manager, and stops: an
+//! unconfigured machine gets an incomplete/blank result rather than a
+//! compiled-in secret. Windows Credential Manager holds five separate
+//! generic credentials, each with a matching environment-variable override
+//! (target ↔ env var, one line each):
 //!
 //! - `ec2_manager/jsm` ↔ `ATLASSIAN_EMAIL_ENV` / `JIRA_TOKEN_ENV` —
 //!   username = Atlassian email, password = API token
@@ -38,7 +41,6 @@
 //! feature reports "not on call" forever, with no error.
 
 use crate::alerts::AlertsAuth;
-use crate::features::AlertsFeature;
 
 /// Credential Manager target for the JSM email/token pair.
 pub const JSM_CREDENTIAL_TARGET: &str = "ec2_manager/jsm";
@@ -82,7 +84,11 @@ pub const ESCALATION_MAILBOX_ENV: &str = "ESCALATION_MAILBOX";
 
 /// First non-blank of the candidates, trimmed. Blank-but-set is treated as
 /// absent: `export JIRA_TOKEN=` must not shadow a real stored credential.
-fn first_non_blank(candidates: [Option<&str>; 3]) -> String {
+///
+/// Generic over the candidate count so both the two-source (environment,
+/// credential store) and three-source (environment, credential store,
+/// compiled-in fallback) call sites in this module share one implementation.
+fn first_non_blank<const N: usize>(candidates: [Option<&str>; N]) -> String {
     candidates
         .into_iter()
         .flatten()
@@ -92,11 +98,12 @@ fn first_non_blank(candidates: [Option<&str>; 3]) -> String {
         .to_string()
 }
 
-/// Resolve the auth pair and cloud id from all three sources. Pure: every
-/// input is passed in, so precedence is testable without touching the
-/// environment or the Windows API.
+/// Resolve the auth pair and cloud id from environment and Windows
+/// Credential Manager — **and stop there**. There is no third,
+/// `assets/features.json` source: that file is committed, so none of these
+/// values may ever live in it. Pure: every input is passed in, so precedence
+/// is testable without touching the environment or the Windows API.
 pub fn resolve_auth(
-    feature: &AlertsFeature,
     stored: Option<(String, String)>,
     stored_cloud_id: Option<String>,
     env_email: Option<String>,
@@ -108,21 +115,9 @@ pub fn resolve_auth(
         None => (None, None),
     };
     AlertsAuth {
-        email: first_non_blank([
-            env_email.as_deref(),
-            stored_email.as_deref(),
-            Some(&feature.email),
-        ]),
-        token: first_non_blank([
-            env_token.as_deref(),
-            stored_token.as_deref(),
-            Some(&feature.token),
-        ]),
-        cloud_id: first_non_blank([
-            env_cloud_id.as_deref(),
-            stored_cloud_id.as_deref(),
-            Some(&feature.cloud_id),
-        ]),
+        email: first_non_blank([env_email.as_deref(), stored_email.as_deref()]),
+        token: first_non_blank([env_token.as_deref(), stored_token.as_deref()]),
+        cloud_id: first_non_blank([env_cloud_id.as_deref(), stored_cloud_id.as_deref()]),
     }
 }
 
@@ -140,10 +135,11 @@ pub fn resolve_id(env_var: &str, cred_target: &str, fallback: &str) -> String {
     first_non_blank([from_env.as_deref(), from_cred.as_deref(), Some(fallback)])
 }
 
-/// `resolve_auth` wired to the real environment and credential store.
-pub fn load_auth(feature: &AlertsFeature) -> AlertsAuth {
+/// `resolve_auth` wired to the real environment and credential store. No
+/// `Features`/`AlertsFeature` parameter — there is nothing left in
+/// `assets/features.json` for this to read.
+pub fn load_auth() -> AlertsAuth {
     resolve_auth(
-        feature,
         crate::wincred::read_generic(JSM_CREDENTIAL_TARGET),
         crate::wincred::read_generic(CLOUD_ID_TARGET).map(|(_user, secret)| secret),
         std::env::var(ATLASSIAN_EMAIL_ENV).ok(),
@@ -232,21 +228,10 @@ pub fn escalation_mailbox() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::features::AlertsFeature;
-
-    fn feature() -> AlertsFeature {
-        AlertsFeature {
-            cloud_id: "cloud-from-json".to_string(),
-            email: "json@example.com".to_string(),
-            token: "json-token".to_string(),
-            allowed_users: vec![],
-        }
-    }
 
     #[test]
-    fn the_environment_beats_the_credential_store_and_the_json() {
+    fn the_environment_beats_the_credential_store() {
         let auth = resolve_auth(
-            &feature(),
             Some(("stored@example.com".into(), "stored-token".into())),
             Some("stored-cloud".into()),
             Some("env@example.com".into()),
@@ -259,9 +244,8 @@ mod tests {
     }
 
     #[test]
-    fn the_credential_store_beats_the_json() {
+    fn resolve_auth_uses_the_credential_store_when_the_environment_is_unset() {
         let auth = resolve_auth(
-            &feature(),
             Some(("stored@example.com".into(), "stored-token".into())),
             Some("stored-cloud".into()),
             None,
@@ -274,11 +258,16 @@ mod tests {
     }
 
     #[test]
-    fn the_json_is_the_last_resort() {
-        let auth = resolve_auth(&feature(), None, None, None, None, None);
-        assert_eq!(auth.email, "json@example.com");
-        assert_eq!(auth.token, "json-token");
-        assert_eq!(auth.cloud_id, "cloud-from-json");
+    fn there_is_no_third_source_beyond_environment_and_the_credential_store() {
+        // assets/features.json is committed, so it must never be a fallback
+        // for these five values. With both sources absent there is nothing
+        // left to resolve to -- unlike the old JSON-fallback behavior, this
+        // must come back blank, not some compiled-in default.
+        let auth = resolve_auth(None, None, None, None, None);
+        assert_eq!(auth.email, "");
+        assert_eq!(auth.token, "");
+        assert_eq!(auth.cloud_id, "");
+        assert!(!auth.is_complete());
     }
 
     #[test]
@@ -287,7 +276,6 @@ mod tests {
         // credential store. Resolving as a pair would silently pick up the
         // wrong email here.
         let auth = resolve_auth(
-            &feature(),
             Some(("stored@example.com".into(), "stored-token".into())),
             None,
             None,
@@ -296,7 +284,7 @@ mod tests {
         );
         assert_eq!(auth.email, "stored@example.com");
         assert_eq!(auth.token, "env-token");
-        assert_eq!(auth.cloud_id, "cloud-from-json");
+        assert_eq!(auth.cloud_id, "");
     }
 
     #[test]
@@ -304,7 +292,6 @@ mod tests {
         // `export JIRA_TOKEN=` is a set-but-empty variable and must not
         // shadow a real stored credential.
         let auth = resolve_auth(
-            &feature(),
             Some(("stored@example.com".into(), "stored-token".into())),
             Some("stored-cloud".into()),
             Some("   ".into()),
@@ -318,8 +305,7 @@ mod tests {
 
     #[test]
     fn everything_blank_yields_an_incomplete_auth() {
-        let empty = AlertsFeature::default();
-        let auth = resolve_auth(&empty, None, None, None, None, None);
+        let auth = resolve_auth(None, None, None, None, None);
         assert!(!auth.is_complete());
     }
 

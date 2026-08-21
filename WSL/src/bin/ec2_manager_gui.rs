@@ -3154,11 +3154,12 @@ mod gui {
         };
         format!(
             "access email config: enabled={} auto_run={} domains=[{}] local_format='{}' \
-             max_suffix={} template_guid={}",
+             suffixes=[{}] max_suffix={} template_guid={}",
             cfg.enabled,
             cfg.auto_run,
             domains,
             cfg.email_local_format,
+            cfg.email_local_suffixes.join(", "),
             cfg.email_local_max_suffix,
             if template_guid_is_placeholder(&cfg.encrypt_template_guid) {
                 "PLACEHOLDER - this build will never send"
@@ -3181,8 +3182,9 @@ mod gui {
             .any(|c| !matches!(c, '{' | '}' | '-' | '0') && !c.is_whitespace())
     }
 
-    /// Every local part worth probing for this user: the bare stem first, then
-    /// the numbered variants up to `max_suffix`.
+    /// Every local part worth probing for this user: at each rank the bare
+    /// form followed by each configured suffix, for the stem and then the
+    /// numbered variants up to `max_suffix`.
     ///
     /// Most people are `jsmith`; a minority carry a number because someone
     /// already had the surname. Probing `jsmith`, `jsmith2`… lets the script
@@ -3190,16 +3192,35 @@ mod gui {
     /// of by display name, which does not. That matters because an Entra-only
     /// machine has no directory to search for duplicates.
     ///
+    /// `suffixes` (`access_email.email_local_suffixes`) are markers some orgs
+    /// put in the address itself — `.cw` for a contingent worker — carried
+    /// *alongside* the bare form rather than instead of it, since one
+    /// directory holds both kinds of user. They apply at every rank: a `.cw`
+    /// user can share a surname just as anyone else can. An empty list yields
+    /// exactly the pre-suffix behaviour.
+    ///
     /// Empty when no stem can be derived, so the caller falls back rather than
-    /// probing nonsense.
+    /// probing nonsense — a suffix extends a stem, it is never a stem itself.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    fn expected_email_locals(username: &str, format: &str, max_suffix: u32) -> Vec<String> {
+    fn expected_email_locals(
+        username: &str,
+        format: &str,
+        max_suffix: u32,
+        suffixes: &[String],
+    ) -> Vec<String> {
         let Some(stem) = expected_email_local(username, format) else {
             return Vec::new();
         };
-        let mut out = vec![stem.clone()];
-        for n in 2..=max_suffix {
-            out.push(format!("{stem}{n}"));
+        let ranks =
+            std::iter::once(stem.clone()).chain((2..=max_suffix).map(|n| format!("{stem}{n}")));
+        let mut out = Vec::new();
+        for rank in ranks {
+            // Bare form first at each rank: it is the common case, and the
+            // probe log reads in the order the addresses were tried.
+            out.push(rank.clone());
+            for suffix in suffixes {
+                out.push(format!("{rank}{suffix}"));
+            }
         }
         out
     }
@@ -3630,6 +3651,12 @@ mod gui {
                 "-ExpectedLocal",
                 expected_email_local(username, &cfg.email_local_format).unwrap_or_default(),
             ),
+            // Markers the address may also carry (".cw"). The script builds its
+            // shape regex from these, so they must travel with the candidates
+            // below: a suffix probed but not accepted would find the mailbox
+            // and then reject it. Comma-separated, and always passed — an
+            // omitted flag leaves the parameter at the script's own default.
+            ("-LocalSuffixes", cfg.email_local_suffixes.join(",")),
             // Addresses to probe. Resolving an address is unambiguous where
             // resolving a display name is not, so this is the primary way the
             // mailbox is found on a machine with no directory to search.
@@ -3639,6 +3666,7 @@ mod gui {
                     username,
                     &cfg.email_local_format,
                     cfg.email_local_max_suffix,
+                    &cfg.email_local_suffixes,
                 )
                 .join(","),
             ),
@@ -5811,6 +5839,15 @@ mod gui {
             // the app exists below (`self.log_*` needs `&mut self`), the
             // same deferral the "gates:" summary further down already uses.
             let mut reaper_startup_log: Vec<(bool, String)> = Vec::new();
+
+            // Resolved exactly ONCE at startup — never per frame. Each field
+            // is a `CredReadW` against Windows Credential Manager
+            // (`jsm_auth::load_auth`), and both the reaper gate below and the
+            // Alerts button's `alerts_enabled`/`alerts_auth` fields need the
+            // same answer, so this single call is shared by all three rather
+            // than each re-reading the registry on its own.
+            let resolved_alerts_auth = features.alerts_auth();
+
             let reaper = {
                 let user = ec2_manager::features::current_os_user();
                 if features.reaper_enabled_for(&user) {
@@ -5822,10 +5859,9 @@ mod gui {
                                 .to_string(),
                         ));
                     }
-                    let auth = ec2_manager::jsm_auth::load_auth(&features.alerts);
-                    if auth.is_complete() {
+                    if resolved_alerts_auth.is_complete() {
                         Some(start_reaper_poll(
-                            auth,
+                            resolved_alerts_auth.clone(),
                             features.reaper.clone(),
                             config.clone(),
                             options.mode.clone(),
@@ -6001,9 +6037,11 @@ mod gui {
                 pat_dialog,
                 hotkey_consumed_frame: false,
                 last_git_failure_prompt: None,
-                alerts_enabled: features
-                    .alerts_visible_for(&ec2_manager::features::current_os_user()),
-                alerts_auth: features.alerts_auth(),
+                alerts_enabled: features.alerts_visible_for(
+                    &ec2_manager::features::current_os_user(),
+                    &resolved_alerts_auth,
+                ),
+                alerts_auth: resolved_alerts_auth,
                 alerts_window: None,
                 alerts_tx,
                 alerts_rx,
@@ -20656,7 +20694,7 @@ mod gui {
                                 } else {
                                     // Site is configured but no token — the
                                     // usual case is JIRA_TOKEN not exported.
-                                    let msg = "Alerts: no API token. Set JIRA_TOKEN in your environment (or alerts.token in features.json) and restart.";
+                                    let msg = "Alerts: no API token. Set JIRA_TOKEN in your environment, or store it in Windows Credential Manager (ec2_manager/jsm), and restart.";
                                     self.log_error(msg);
                                     self.set_script_status(msg, ScriptState::Failed);
                                 }
@@ -24547,20 +24585,30 @@ mod gui {
         /// failing closed the way `allow_delete_user` does.
         #[test]
         fn the_jira_alerts_checkbox_uses_the_alerts_allow_list() {
-            let cfg = |allowed: &str, cloud: &str| -> ec2_manager::features::Features {
-                serde_json::from_str(&format!(
-                    r#"{{"alerts":{{"cloud_id":"{cloud}","email":"a@b.c",                       "allowed_users":{allowed}}}}}"#
-                ))
-                .expect("features json")
+            // cloud_id/email/token are no longer features.json fields at all
+            // (see jsm_auth) — the resolved auth is passed in directly, the
+            // way `Features::alerts_visible_for` now requires, rather than
+            // built from JSON.
+            let cfg = |allowed: &str| -> ec2_manager::features::Features {
+                serde_json::from_str(&format!(r#"{{"alerts":{{"allowed_users":{allowed}}}}}"#))
+                    .expect("features json")
             };
-            assert!(cfg(r#"["bconrad"]"#, "cid").alerts_visible_for("bconrad"));
-            assert!(cfg(r#"["*"]"#, "cid").alerts_visible_for("anyone"));
+            let complete = ec2_manager::alerts::AlertsAuth {
+                email: "a@b.c".to_string(),
+                token: "tok".to_string(),
+                cloud_id: "cid".to_string(),
+            };
+            let incomplete = ec2_manager::alerts::AlertsAuth::default();
+
+            assert!(cfg(r#"["bconrad"]"#).alerts_visible_for("bconrad", &complete));
+            assert!(cfg(r#"["*"]"#).alerts_visible_for("anyone", &complete));
             // Off the list.
-            assert!(!cfg(r#"["someone"]"#, "cid").alerts_visible_for("bconrad"));
+            assert!(!cfg(r#"["someone"]"#).alerts_visible_for("bconrad", &complete));
             // Shipped default is nobody.
-            assert!(!cfg("[]", "cid").alerts_visible_for("bconrad"));
-            // Configured-but-unreachable site hides it as well.
-            assert!(!cfg(r#"["*"]"#, "").alerts_visible_for("bconrad"));
+            assert!(!cfg("[]").alerts_visible_for("bconrad", &complete));
+            // Allow-listed but nothing resolved from Credential Manager /
+            // the environment hides it as well.
+            assert!(!cfg(r#"["*"]"#).alerts_visible_for("bconrad", &incomplete));
         }
 
         /// Walk a whole session the way a person actually does, asserting
@@ -25802,6 +25850,7 @@ mod gui {
                 auto_run: true,
                 email_domains: vec!["xyz.com".to_string()],
                 email_local_format: "flast".to_string(),
+                email_local_suffixes: Vec::new(),
                 email_local_max_suffix: 5,
                 encrypt_template_guid: "{abc}".to_string(),
                 encrypt_permission: 3,
@@ -25861,23 +25910,68 @@ mod gui {
             // shared the surname. Probing the range finds them without needing
             // a directory to search.
             assert_eq!(
-                expected_email_locals("test.user", "flast", 5),
+                expected_email_locals("test.user", "flast", 5, &[]),
                 vec!["tuser", "tuser2", "tuser3", "tuser4", "tuser5"]
             );
         }
 
         #[test]
         fn a_max_suffix_below_two_probes_only_the_bare_stem() {
-            assert_eq!(expected_email_locals("test.user", "flast", 0), vec!["tuser"]);
-            assert_eq!(expected_email_locals("test.user", "flast", 1), vec!["tuser"]);
+            assert_eq!(expected_email_locals("test.user", "flast", 0, &[]), vec!["tuser"]);
+            assert_eq!(expected_email_locals("test.user", "flast", 1, &[]), vec!["tuser"]);
+        }
+
+        #[test]
+        fn a_suffix_is_probed_alongside_the_bare_form_at_every_rank() {
+            // A site that marks contractors in the address itself has both
+            // shapes in one directory, so both must be looked for -- and at
+            // every numeric rank, since a .cw user can share a surname too.
+            assert_eq!(
+                expected_email_locals("test.user", "flast", 3, &[".cw".to_string()]),
+                vec!["tuser", "tuser.cw", "tuser2", "tuser2.cw", "tuser3", "tuser3.cw"]
+            );
+        }
+
+        #[test]
+        fn several_suffixes_are_probed_in_configured_order() {
+            assert_eq!(
+                expected_email_locals("test.user", "flast", 2, &[".cw".to_string(), "-ext".to_string()]),
+                vec!["tuser", "tuser.cw", "tuser-ext", "tuser2", "tuser2.cw", "tuser2-ext"]
+            );
+        }
+
+        #[test]
+        fn a_suffix_is_taken_literally_rather_than_assuming_a_dot() {
+            // "-contractor" and "_ext" are as real as ".cw"; prepending a dot
+            // would silently probe an address the org does not have.
+            assert_eq!(
+                expected_email_locals("test.user", "flast", 0, &["_ext".to_string()]),
+                vec!["tuser", "tuser_ext"]
+            );
+        }
+
+        #[test]
+        fn no_suffixes_probes_exactly_what_it_always_did() {
+            // The empty list is the upgrade path: an existing features.json
+            // has no such key, and its behaviour must not shift.
+            assert_eq!(
+                expected_email_locals("test.user", "flast", 3, &[]),
+                vec!["tuser", "tuser2", "tuser3"]
+            );
+        }
+
+        #[test]
+        fn a_suffix_without_a_derivable_stem_still_probes_nothing() {
+            // Suffixes extend a stem; they are not a stem of their own.
+            assert!(expected_email_locals("jsmith", "flast", 5, &[".cw".to_string()]).is_empty());
         }
 
         #[test]
         fn no_derivable_stem_means_nothing_to_probe() {
             // Without a stem there is no address to guess, so the caller must
             // fall back rather than probe garbage.
-            assert!(expected_email_locals("jsmith", "flast", 5).is_empty());
-            assert!(expected_email_locals("test.user", "", 5).is_empty());
+            assert!(expected_email_locals("jsmith", "flast", 5, &[]).is_empty());
+            assert!(expected_email_locals("test.user", "", 5, &[]).is_empty());
         }
 
         #[test]
@@ -26380,6 +26474,46 @@ mod gui {
             );
             let expected_format = format!("-LocalFormat '{}'", cfg.email_local_format);
             assert!(cmd.wsl.contains(&expected_format), "{}", cmd.wsl);
+            let expected_suffixes =
+                format!("-LocalSuffixes '{}'", cfg.email_local_suffixes.join(","));
+            assert!(
+                cmd.wsl.contains(&expected_suffixes),
+                "shipped suffixes {:?} did not reach the command: {}",
+                cfg.email_local_suffixes,
+                cmd.wsl
+            );
+        }
+
+        #[test]
+        fn the_suffixes_reach_the_command_and_the_candidate_list() {
+            // The script builds its shape regex from -LocalSuffixes and probes
+            // -Candidates; a suffix reaching one but not the other would find
+            // a mailbox it then rejects, or reject one it never looked for.
+            let mut cfg = access_email_cfg(true);
+            cfg.email_local_suffixes = vec![".cw".to_string()];
+            let cmd = build_email_command(&cfg, "test.user", "DEV1", "i-1", "i-2", "/p.pem")
+                .expect("enabled config builds a command");
+            assert!(cmd.wsl.contains("-LocalSuffixes '.cw'"), "{}", cmd.wsl);
+            assert!(cmd.powershell.contains("-LocalSuffixes '.cw'"), "{}", cmd.powershell);
+            assert!(cmd.wsl.contains("tuser.cw"), "{}", cmd.wsl);
+        }
+
+        #[test]
+        fn several_suffixes_are_passed_as_one_comma_separated_argument() {
+            let mut cfg = access_email_cfg(true);
+            cfg.email_local_suffixes = vec![".cw".to_string(), "-ext".to_string()];
+            let cmd = build_email_command(&cfg, "test.user", "DEV1", "i-1", "i-2", "/p.pem")
+                .expect("enabled config builds a command");
+            assert!(cmd.wsl.contains("-LocalSuffixes '.cw,-ext'"), "{}", cmd.wsl);
+        }
+
+        #[test]
+        fn no_suffixes_still_passes_the_flag_empty() {
+            // The script reads it unconditionally; omitting the flag entirely
+            // would leave the parameter at whatever a stale copy defaults to.
+            let cmd = build_email_command(&access_email_cfg(true), "test.user", "DEV1", "i-1", "i-2", "/p.pem")
+                .expect("enabled config builds a command");
+            assert!(cmd.wsl.contains("-LocalSuffixes ''"), "{}", cmd.wsl);
         }
 
         #[test]

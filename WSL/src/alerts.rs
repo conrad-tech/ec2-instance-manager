@@ -35,9 +35,10 @@ const PAGE_SIZE: u32 = 50;
 /// Stop walking the feed after this many pages, however wide the window.
 const MAX_PAGES: u32 = 20;
 
-/// Credentials + site for the alerts API. Sourced from `assets/features.json`
-/// (see `features::Features::alerts`), with the token overridable at runtime
-/// via the `JIRA_TOKEN` environment variable.
+/// Credentials + site for the alerts API. Resolved environment → Windows
+/// Credential Manager (see `jsm_auth::load_auth`) — never from
+/// `assets/features.json`, which is committed and must never carry any of
+/// these values.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AlertsAuth {
     pub email: String,
