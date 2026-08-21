@@ -1140,6 +1140,9 @@ mod gui {
         last_fetch: Option<Instant>,
         /// Local-time clock reading of the last successful fetch.
         fetched_at: Option<chrono::DateTime<chrono::Local>>,
+        /// An "Acknowledge all" run is in flight — disables the button so a
+        /// second click can't start a second, overlapping run.
+        ack_all_running: bool,
     }
 
     impl AlertsWindow {
@@ -1152,6 +1155,7 @@ mod gui {
                 loading: false,
                 last_fetch: None,
                 fetched_at: None,
+                ack_all_running: false,
             }
         }
     }
@@ -1162,6 +1166,20 @@ mod gui {
         /// since changed away from is dropped.
         window_min: i64,
         result: std::result::Result<Vec<alerts::Alert>, String>,
+    }
+
+    /// "Acknowledge all" worker → UI. One `Result` per alert as its POST
+    /// lands, so rows update progressively; one final `Done` once the whole
+    /// (sequential, single-thread) run finishes.
+    enum AckAllEvent {
+        Result {
+            id: String,
+            outcome: std::result::Result<(), String>,
+        },
+        Done {
+            total: usize,
+            failed: usize,
+        },
     }
 
     /// Result of the delete pre-flight active-session check.
@@ -2795,6 +2813,23 @@ mod gui {
             ));
         }
         out
+    }
+
+    /// Ids of the rows an "Acknowledge all" run would act on: open, and not
+    /// already acknowledged.
+    ///
+    /// `status` and `acknowledged` are independent fields — this tenant's
+    /// feed uses a third status, `acked`, alongside `open`/`closed`, and an
+    /// `acked`-status row can still have `acknowledged: false`. Eligibility
+    /// is therefore `!acknowledged && !alert_is_closed(status)`, using
+    /// `reaper::alert_is_closed` as the single definition of "closed" rather
+    /// than a second copy of that rule.
+    fn acknowledgeable_ids(rows: &[alerts::Alert]) -> Vec<String> {
+        rows.iter()
+            .filter(|a| !a.id.trim().is_empty())
+            .filter(|a| !a.acknowledged && !ec2_manager::reaper::alert_is_closed(&a.status))
+            .map(|a| a.id.clone())
+            .collect()
     }
 
     /// Slow-flashing color (~0.7 Hz alpha pulse) for the Scripts status
@@ -5646,6 +5681,13 @@ mod gui {
         /// Alerts fetch worker → UI.
         alerts_tx: Sender<AlertsFetch>,
         alerts_rx: Receiver<AlertsFetch>,
+        /// Ids awaiting confirmation for an "Acknowledge all" run, captured
+        /// at the moment the button was clicked. `Some` shows the confirm
+        /// dialog; cleared on confirm or cancel.
+        pending_ack_all: Option<Vec<String>>,
+        /// "Acknowledge all" worker → UI.
+        ack_all_tx: Sender<AckAllEvent>,
+        ack_all_rx: Receiver<AckAllEvent>,
         /// Background reaper poll thread. `None` when the feature is off for
         /// this user or JSM credentials are not configured.
         reaper: Option<ReaperRuntime>,
@@ -5792,6 +5834,7 @@ mod gui {
             let (verify_tx, verify_rx) = mpsc::channel();
             let (preflight_tx, preflight_rx) = mpsc::channel();
             let (alerts_tx, alerts_rx) = mpsc::channel();
+            let (ack_all_tx, ack_all_rx) = mpsc::channel();
             let (probe_tx, probe_rx) = mpsc::channel();
             let (email_tx, email_rx) = mpsc::channel();
             let (user_sync_tx, user_sync_rx) = mpsc::channel();
@@ -6082,6 +6125,9 @@ mod gui {
                 alerts_window: None,
                 alerts_tx,
                 alerts_rx,
+                pending_ack_all: None,
+                ack_all_tx,
+                ack_all_rx,
                 reaper,
                 pending_notify: Vec::new(),
                 fed_auth_enabled: features
@@ -10877,6 +10923,107 @@ mod gui {
             }
         }
 
+        /// Kick off a background "Acknowledge all" run for `ids`. One thread,
+        /// acknowledging sequentially — firing every POST at once would risk
+        /// rate-limiting and turn one failure into a pile of racing errors.
+        /// No-op while a run is already in flight or `ids` is empty.
+        fn start_ack_all(&mut self, ids: Vec<String>) {
+            let Some(win) = self.alerts_window.as_mut() else {
+                return;
+            };
+            if win.ack_all_running || ids.is_empty() {
+                return;
+            }
+            win.ack_all_running = true;
+            let auth = self.alerts_auth.clone();
+            let tx = self.ack_all_tx.clone();
+            std::thread::spawn(move || {
+                let total = ids.len();
+                let mut failed = 0usize;
+                for id in ids {
+                    let outcome = alerts::acknowledge_alert(&auth, &id).map_err(|e| e.to_string());
+                    if outcome.is_err() {
+                        failed += 1;
+                    }
+                    if tx.send(AckAllEvent::Result { id, outcome }).is_err() {
+                        return; // UI gone; no point finishing the run's report
+                    }
+                }
+                let _ = tx.send(AckAllEvent::Done { total, failed });
+            });
+        }
+
+        /// Drain "Acknowledge all" worker events: flip each successfully
+        /// acked row live, log each failure as it lands, and summarize
+        /// honestly once the run completes.
+        fn poll_ack_all_events(&mut self) {
+            while let Ok(ev) = self.ack_all_rx.try_recv() {
+                match ev {
+                    AckAllEvent::Result { id, outcome } => match outcome {
+                        Ok(()) => {
+                            if let Some(win) = self.alerts_window.as_mut() {
+                                if let Some(row) = win.rows.iter_mut().find(|a| a.id == id) {
+                                    row.acknowledged = true;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            self.log_error(format!("alerts: failed to acknowledge {id}: {err}"));
+                        }
+                    },
+                    AckAllEvent::Done { total, failed } => {
+                        if let Some(win) = self.alerts_window.as_mut() {
+                            win.ack_all_running = false;
+                            // Partial failure only — a clean run leaves no
+                            // banner, and a blanket "done"/"failed" would
+                            // misreport whichever alerts landed the other way.
+                            if failed > 0 {
+                                let ok = total - failed;
+                                win.error =
+                                    Some(format!("acknowledged {ok} of {total}, {failed} failed"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Render the "Acknowledge N open alerts?" confirmation, shown before
+        /// an "Acknowledge all" run starts. Mirrors
+        /// `render_script_delete_confirm`'s Confirm/Cancel modal shape.
+        fn render_ack_all_confirm(&mut self, ctx: &egui::Context) {
+            let Some(ids) = self.pending_ack_all.clone() else {
+                return;
+            };
+            let count = ids.len();
+            let mut window_open = true;
+            let mut do_confirm = false;
+            let mut do_cancel = false;
+            egui::Window::new("Acknowledge Alerts")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("Acknowledge {count} open alerts?"));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Confirm").clicked() {
+                            do_confirm = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+            if do_confirm {
+                self.start_ack_all(ids);
+            }
+            if do_confirm || do_cancel || !window_open {
+                self.pending_ack_all = None;
+            }
+        }
+
         /// Drain reaper poll-thread events into the log (and, for a real
         /// outcome, the notifier seam).
         fn poll_reaper_events(&mut self) {
@@ -10932,6 +11079,7 @@ mod gui {
                 (win.window_min, win.auto_refresh)
             };
             let mut copy_text: Option<String> = None;
+            let mut ack_all_ids: Option<Vec<String>> = None;
 
             egui::Window::new("On-Call Alerts")
                 .open(&mut open)
@@ -10983,6 +11131,19 @@ mod gui {
                         }
                         if ui.button("Copy").clicked() {
                             copy_text = Some(alerts_as_text(&rows));
+                        }
+                        let ack_ids = acknowledgeable_ids(&rows);
+                        if ui
+                            .add_enabled(
+                                !ack_ids.is_empty() && !win.ack_all_running,
+                                egui::Button::new(format!(
+                                    "Acknowledge all ({})",
+                                    ack_ids.len()
+                                )),
+                            )
+                            .clicked()
+                        {
+                            ack_all_ids = Some(ack_ids);
                         }
                     });
 
@@ -11070,6 +11231,9 @@ mod gui {
             if let Some(text) = copy_text {
                 ctx.copy_text(text);
                 self.log_info("alerts: copied table to clipboard");
+            }
+            if let Some(ids) = ack_all_ids {
+                self.pending_ack_all = Some(ids);
             }
 
             if !open {
@@ -20076,9 +20240,11 @@ mod gui {
                 self.render_pat_dialog(ctx);
                 self.render_script_result_popup(ctx);
                 self.render_alerts_window(ctx);
+                self.render_ack_all_confirm(ctx);
                 self.pump_script_runs();
                 self.poll_script_events();
                 self.poll_alerts_events();
+                self.poll_ack_all_events();
                 self.poll_reaper_events();
 
                 if self.wsl_show_password_popup {
@@ -27676,6 +27842,60 @@ mod gui {
             assert!(lines[1].contains("Dev"));
             assert!(lines[1].contains("unack"));
             assert!(lines[2].contains("ack"));
+        }
+
+        fn alert_with(id: &str, status: &str, acknowledged: bool) -> alerts::Alert {
+            alerts::Alert {
+                id: id.into(),
+                status: status.into(),
+                acknowledged,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn an_open_unacknowledged_alert_is_included() {
+            let rows = vec![alert_with("a1", "open", false)];
+            assert_eq!(acknowledgeable_ids(&rows), vec!["a1".to_string()]);
+        }
+
+        #[test]
+        fn an_already_acknowledged_alert_is_excluded() {
+            let rows = vec![alert_with("a1", "open", true)];
+            assert!(acknowledgeable_ids(&rows).is_empty());
+        }
+
+        #[test]
+        fn a_closed_alert_is_excluded_even_when_unacknowledged() {
+            let rows = vec![alert_with("a1", "closed", false)];
+            assert!(acknowledgeable_ids(&rows).is_empty());
+        }
+
+        #[test]
+        fn an_acked_status_alert_that_is_not_acknowledged_is_included() {
+            // `status` and `acknowledged` are independent fields on this
+            // tenant's feed — an `acked`-status row can still carry
+            // `acknowledged: false`.
+            let rows = vec![alert_with("a1", "acked", false)];
+            assert_eq!(acknowledgeable_ids(&rows), vec!["a1".to_string()]);
+        }
+
+        #[test]
+        fn closed_status_matching_is_case_insensitive_and_trims() {
+            let rows = vec![alert_with("a1", " CLOSED ", false)];
+            assert!(acknowledgeable_ids(&rows).is_empty());
+        }
+
+        #[test]
+        fn an_alert_with_an_empty_id_is_excluded() {
+            let rows = vec![alert_with("", "open", false)];
+            assert!(acknowledgeable_ids(&rows).is_empty());
+        }
+
+        #[test]
+        fn an_empty_row_set_yields_an_empty_vec() {
+            let rows: Vec<alerts::Alert> = Vec::new();
+            assert!(acknowledgeable_ids(&rows).is_empty());
         }
 
         #[test]
