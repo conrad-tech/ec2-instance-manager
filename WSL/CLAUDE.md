@@ -303,6 +303,36 @@ like `allow_delete_user`.
 `assets/scripts/alerts_10min.sh` is the standalone bash equivalent (curl + jq,
 same tag parsing, same local-time conversion) for terminal use.
 
+#### The Jira Alerts API trace (Logs tab)
+
+The Logs tab carries a **Jira Alerts** checkbox that shows the last 5 calls to
+the on-call alerts API — endpoint with query, ok/failure detail, duration and
+response size, newest first.
+
+- **Recorded at `curl_request`**, the single chokepoint every alerts call goes
+  through (`fetch_recent`'s paging, `fetch_latest`, `fetch_alert`,
+  `acknowledge_alert`, `fetch_on_calls`). Adding an endpoint traces it for free;
+  bypassing that function is what would make a call invisible.
+- **Only the newest call keeps its response body.** Recording a call drops the
+  previous one's, so at most one is ever resident — a page is up to 50 alerts
+  and the app does not control how large that is, so holding five would be
+  unbounded in practice. Older rows keep `bytes`, which is then the only thing
+  left saying how much came back.
+- **A failed call is recorded *with* its body.** `--fail-with-body` leaves the
+  API's own explanation on stdout, and that is the thing worth reading.
+- **Nothing here can carry the token.** Credentials reach curl on stdin via
+  `-K -`, never argv or the query, which is what makes the URL safe to render
+  and to copy. `the_trace_line_cannot_carry_the_api_token` pins it, so a change
+  that moved credentials into the query fails a test rather than putting them
+  on screen.
+- **Gated by `alerts_visible_for`** — the same gate as the Alerts button, so
+  being off `alerts.allowed_users` (or an unconfigured site) hides the
+  checkbox. `render_alerts_api_trace` re-checks it rather than trusting the
+  checkbox state alone.
+- The trace lives in a process-wide `OnceLock<Mutex<VecDeque<_>>>`, so its
+  test is deliberately **one** test — split up, the cases would race under the
+  parallel runner and pass or fail by scheduling.
+
 ### Open in VS Code (right-click) — how the wrong login sneaks back in
 
 `src/ssh_config.rs` writes a managed Host block into the quarantined

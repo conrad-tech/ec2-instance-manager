@@ -2618,6 +2618,45 @@ mod gui {
         }
     }
 
+    /// A byte count at a glance. The trace shows a response size on every
+    /// row, including the older ones whose body has been dropped — that is
+    /// the only thing left saying how much came back.
+    fn human_bytes(n: usize) -> String {
+        const KB: usize = 1024;
+        const MB: usize = KB * 1024;
+        if n >= MB {
+            format!("{:.1} MB", n as f64 / MB as f64)
+        } else if n >= KB {
+            format!("{:.1} KB", n as f64 / KB as f64)
+        } else {
+            format!("{n} B")
+        }
+    }
+
+    /// The one-line summary for a recorded alerts API call, in local time.
+    ///
+    /// The URL is included verbatim: credentials reach curl on stdin via
+    /// `-K -`, so neither the endpoint nor the query can carry the token.
+    /// That property is what makes this safe to render and to copy.
+    fn api_call_summary(call: &ec2_manager::alerts::ApiCall) -> String {
+        let when = call
+            .at
+            .with_timezone(&chrono::Local)
+            .format("%H:%M:%S")
+            .to_string();
+        let outcome = match &call.error {
+            Some(err) => format!("FAILED - {err}"),
+            None => "ok".to_string(),
+        };
+        format!(
+            "{when}  {}  {}  -  {outcome}  -  {} ms  -  {}",
+            call.method,
+            call.url,
+            call.duration_ms,
+            human_bytes(call.bytes),
+        )
+    }
+
     /// Short label for the local timezone offset, e.g. "UTC-05:00" — shown in
     /// the Time column header so it's unambiguous which clock is in use.
     fn local_tz_label() -> String {
@@ -5223,6 +5262,11 @@ mod gui {
         /// Free-text filter for the log panel (Ctrl+F). Applies on top of the
         /// level checkboxes and narrows Copy All to what is on screen.
         log_search: String,
+        /// Whether the Logs tab is showing the Jira Alerts API trace. Gated
+        /// by `alerts_enabled`, so a user off the allow-list never sees the
+        /// checkbox — and the flag being stuck on from a previous build
+        /// still renders nothing (`render_alerts_api_trace` re-checks).
+        log_show_alerts_api: bool,
         /// Set for one frame by Ctrl+F so the search box takes focus.
         log_search_focus: bool,
         terminals: Vec<TerminalOption>,
@@ -5777,6 +5821,7 @@ mod gui {
                     LogFilters::default()
                 },
                 log_search: String::new(),
+                log_show_alerts_api: false,
                 log_search_focus: false,
                 terminals,
                 selected_terminal_id,
@@ -19267,6 +19312,98 @@ mod gui {
             });
         }
 
+        /// The **Jira Alerts** trace: the last five calls to the on-call
+        /// alerts API, newest first.
+        ///
+        /// Re-checks `alerts_enabled` rather than trusting the checkbox
+        /// alone — the flag is plain state and a user who lost access
+        /// between builds must not keep a trace the gate no longer allows.
+        fn render_alerts_api_trace(&mut self, ui: &mut egui::Ui) {
+            if !self.alerts_enabled || !self.log_show_alerts_api {
+                return;
+            }
+            let calls = ec2_manager::alerts::recent_api_calls();
+            ui.horizontal(|ui| {
+                ui.strong(format!(
+                    "Jira Alerts API - last {} call(s), newest first",
+                    calls.len()
+                ));
+                ui.label(format!("({})", local_tz_label()));
+                if ui.button("Clear").clicked() {
+                    ec2_manager::alerts::clear_api_calls();
+                }
+            });
+            if calls.is_empty() {
+                // An empty trace is not a fault: nothing has been fetched
+                // yet. Say which, or it reads as the trace being broken.
+                note_label(
+                    ui,
+                    egui::Color32::GRAY,
+                    "No calls recorded yet - open the Alerts window, or wait \
+                     for the next 10s poll.",
+                );
+                ui.separator();
+                return;
+            }
+            for (idx, call) in calls.iter().enumerate() {
+                let summary = api_call_summary(call);
+                ui.horizontal(|ui| {
+                    // Through `note_label`, not `colored_label`: a
+                    // status-coloured label has to carry the light-theme
+                    // weight or it renders thin and near-invisible on a
+                    // light panel. `status_coloured_labels_all_carry_the_\
+                    // light_theme_weight` enforces it.
+                    let (color, mark) = if call.error.is_some() {
+                        (egui::Color32::LIGHT_RED, "✖")
+                    } else {
+                        (egui::Color32::LIGHT_GREEN, "✔")
+                    };
+                    note_label(ui, color, mark);
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&summary).monospace())
+                            .wrap(),
+                    );
+                });
+                match &call.body {
+                    // Only the newest call still holds its response — a new
+                    // call drops the previous one's body, so this collapses
+                    // to at most one body on screen however many rows there
+                    // are.
+                    Some(body) => {
+                        egui::CollapsingHeader::new(format!(
+                            "Response ({})",
+                            human_bytes(body.len())
+                        ))
+                        .id_salt(("alerts_api_body", idx))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            if ui.button("Copy response").clicked() {
+                                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                    let _ = clipboard.set_text(body);
+                                }
+                            }
+                            egui::ScrollArea::vertical()
+                                .max_height(220.0)
+                                .id_salt(("alerts_api_body_scroll", idx))
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut body.as_str())
+                                            .font(egui::TextStyle::Monospace)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                });
+                        });
+                    }
+                    None => {
+                        ui.weak(
+                            "   response not kept - only the newest call holds one",
+                        );
+                    }
+                }
+            }
+            ui.separator();
+        }
+
         fn render_log_panel(&mut self, ui: &mut egui::Ui) {
             ui.horizontal(|ui| {
                 ui.label("Application log");
@@ -19285,6 +19422,18 @@ mod gui {
                 if ui.button("High").clicked() {
                     self.log_filters.set_verbosity_high();
                 }
+                // Same gate as the Alerts button itself (`alerts_visible_for`
+                // — on the allow-list *and* the site configured), so a user
+                // who cannot reach the feed is not offered a trace of it.
+                if self.alerts_enabled {
+                    ui.separator();
+                    ui.checkbox(&mut self.log_show_alerts_api, "Jira Alerts")
+                        .on_hover_text(
+                            "Show the last 5 calls to the Jira on-call alerts API. \
+                             The newest one keeps its full response; older rows are \
+                             metadata only.",
+                        );
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.checkbox(&mut self.log_filters.trace, "TRACE");
                     ui.checkbox(&mut self.log_filters.debug, "DEBUG");
@@ -19294,6 +19443,8 @@ mod gui {
                 });
             });
             ui.separator();
+
+            self.render_alerts_api_trace(ui);
 
             // Ctrl+F focuses the search box. Only bound while the Log tab is
             // showing, so it cannot swallow Ctrl+F (0x06) meant for a terminal.
@@ -24230,6 +24381,87 @@ mod gui {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn trace_call(err: Option<&str>) -> ec2_manager::alerts::ApiCall {
+            ec2_manager::alerts::ApiCall {
+                at: chrono::Utc::now(),
+                method: "GET",
+                url: "https://api.atlassian.com/jsm/ops/api/cid/v1/alerts?\
+                      sort=createdAt&order=desc&size=50&offset=0"
+                    .to_string(),
+                error: err.map(|e| e.to_string()),
+                duration_ms: 412,
+                bytes: 18_842,
+                body: None,
+            }
+        }
+
+        /// The summary answers the three questions the trace exists for:
+        /// was it called, was it slow, and did it fail.
+        #[test]
+        fn the_api_trace_line_carries_endpoint_timing_and_outcome() {
+            let line = api_call_summary(&trace_call(None));
+            assert!(line.contains("GET"), "{line}");
+            assert!(line.contains("/v1/alerts"), "{line}");
+            assert!(line.contains("offset=0"), "{line}");
+            assert!(line.contains("ok"), "{line}");
+            assert!(line.contains("412 ms"), "{line}");
+            assert!(line.contains("18.4 KB"), "{line}");
+        }
+
+        /// A failure has to say *why* on the row itself — "it failed" with
+        /// the reason a collapsed section away is what sends people to the
+        /// app log instead.
+        #[test]
+        fn a_failed_call_names_its_reason_on_the_row() {
+            let line = api_call_summary(&trace_call(Some("HTTP 401 Unauthorized")));
+            assert!(line.contains("FAILED"), "{line}");
+            assert!(line.contains("HTTP 401 Unauthorized"), "{line}");
+            assert!(!line.contains("  ok  "), "{line}");
+        }
+
+        /// The token reaches curl on stdin via `-K -`, never argv or the
+        /// query — which is exactly what makes the URL safe to render and
+        /// to copy out of this panel. Pin it: a future change that moved
+        /// credentials into the query would put them on screen.
+        #[test]
+        fn the_trace_line_cannot_carry_the_api_token() {
+            let line = api_call_summary(&trace_call(None));
+            for leak in ["token", "user =", "@", "password", "Basic"] {
+                assert!(!line.contains(leak), "{leak:?} in {line}");
+            }
+        }
+
+        #[test]
+        fn byte_sizes_are_readable_at_every_scale() {
+            assert_eq!(human_bytes(0), "0 B");
+            assert_eq!(human_bytes(512), "512 B");
+            assert_eq!(human_bytes(1024), "1.0 KB");
+            assert_eq!(human_bytes(18_842), "18.4 KB");
+            assert_eq!(human_bytes(3 * 1024 * 1024), "3.0 MB");
+        }
+
+        /// The checkbox rides the same gate as the Alerts button itself, so
+        /// a user off the allow-list is never offered a trace of a feed
+        /// they cannot reach — and an unconfigured site hides it too,
+        /// failing closed the way `allow_delete_user` does.
+        #[test]
+        fn the_jira_alerts_checkbox_uses_the_alerts_allow_list() {
+            let cfg = |allowed: &str, cloud: &str| -> ec2_manager::features::Features {
+                serde_json::from_str(&format!(
+                    r#"{{"alerts":{{"cloud_id":"{cloud}","email":"a@b.c",                       "allowed_users":{allowed}}}}}"#
+                ))
+                .expect("features json")
+            };
+            assert!(cfg(r#"["bconrad"]"#, "cid").alerts_visible_for("bconrad"));
+            assert!(cfg(r#"["*"]"#, "cid").alerts_visible_for("anyone"));
+            // Off the list.
+            assert!(!cfg(r#"["someone"]"#, "cid").alerts_visible_for("bconrad"));
+            // Shipped default is nobody.
+            assert!(!cfg("[]", "cid").alerts_visible_for("bconrad"));
+            // Configured-but-unreachable site hides it as well.
+            assert!(!cfg(r#"["*"]"#, "").alerts_visible_for("bconrad"));
+        }
 
         /// Walk a whole session the way a person actually does, asserting
         /// who the tab thinks it is after every single line. This is the
