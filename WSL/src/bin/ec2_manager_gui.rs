@@ -1174,26 +1174,66 @@ mod gui {
         window_min: i64,
         /// The alerts generation this fetch was started under (see
         /// `App::alerts_generation`). An "Acknowledge all" run bumps the
-        /// generation when it finishes; a fetch that was already in flight
-        /// when the run started carries the older number and is dropped on
-        /// arrival — landing after the run would revert rows it just
-        /// acknowledged.
+        /// generation **twice**: once in `start_ack_all`, the instant the
+        /// run begins (so a fetch already in flight at that moment is
+        /// immediately stale rather than staying valid for the whole run),
+        /// and again in the `Done` handler before it issues its own
+        /// reconciling fetch. A fetch stamped with an older generation is
+        /// dropped on arrival — landing during or after the run would
+        /// revert rows it already acknowledged.
         generation: u64,
         result: std::result::Result<Vec<alerts::Alert>, String>,
     }
 
     /// "Acknowledge all" worker → UI. One `Result` per alert as its POST
     /// lands, so rows update progressively; one final `Done` once the whole
-    /// (sequential, single-thread) run finishes.
+    /// (sequential, single-thread) run finishes — always sent by
+    /// `AckAllDone`'s `Drop`, never by hand, so it arrives on every exit
+    /// path out of the worker thread including a panic unwinding through it.
     enum AckAllEvent {
         Result {
             id: String,
             outcome: std::result::Result<(), String>,
         },
         Done {
+            /// Ids the run was asked to acknowledge — fixed at the start.
             total: usize,
+            /// POSTs that succeeded before the worker exited.
+            ok: usize,
+            /// POSTs that failed before the worker exited.
             failed: usize,
         },
+    }
+
+    /// Owns the running tallies for one "Acknowledge all" worker and reports
+    /// them via `Drop`, not via an explicit send at the end of the loop.
+    ///
+    /// `ack_all_running` — set when the run starts — gates the
+    /// Acknowledge-all button, the Refresh button, AND auto-refresh (see
+    /// `start_alerts_fetch`). `Done` is the only thing that clears it. A
+    /// worker that returned early or panicked without sending `Done` by hand
+    /// would leave that flag stuck at `true` forever, permanently disabling
+    /// the whole Alerts window with no recovery short of restarting the app.
+    /// Cargo.toml does not set `panic = "abort"` for this crate, so `Drop`
+    /// still runs while a panic unwinds through the thread — which is what
+    /// makes this guard, rather than an explicit send, the thing that
+    /// actually closes every exit path (normal completion, the early
+    /// `return` on a dead channel, and an unexpected panic alike).
+    struct AckAllDone {
+        tx: Sender<AckAllEvent>,
+        total: usize,
+        ok: usize,
+        failed: usize,
+    }
+
+    impl Drop for AckAllDone {
+        fn drop(&mut self) {
+            let _ = self.tx.send(AckAllEvent::Done {
+                total: self.total,
+                ok: self.ok,
+                failed: self.failed,
+            });
+        }
     }
 
     /// Result of the delete pre-flight active-session check.
@@ -5713,13 +5753,22 @@ mod gui {
         /// clear the *second* run's flag). The window reads this; it does
         /// not own it.
         ack_all_running: bool,
-        /// Bumped each time an "Acknowledge all" run finishes. Every alerts
-        /// fetch is stamped with the generation it started under
-        /// (`AlertsFetch::generation`); a result whose stamp predates the
-        /// current generation is dropped rather than applied, so a fetch
-        /// issued before a run's acknowledgements landed can't overwrite
-        /// them on arrival. Also drives "pause fetching while a run is in
-        /// flight" via `start_alerts_fetch`.
+        /// Bumped both when an "Acknowledge all" run *starts*
+        /// (`start_ack_all`) and when it *finishes* (the `Done` handler in
+        /// `poll_ack_all_events`). Every alerts fetch is stamped with the
+        /// generation it started under (`AlertsFetch::generation`); a result
+        /// whose stamp predates the current generation is dropped rather
+        /// than applied. The start-of-run bump is the one that matters most:
+        /// `start_alerts_fetch` refuses to start a *new* fetch while a run is
+        /// in flight, but a fetch already in flight when the run began is
+        /// unaffected by that guard — without bumping here too, such a fetch
+        /// would still carry a matching generation for the run's entire
+        /// (sequential, POST-per-alert, potentially many seconds long)
+        /// duration and could land mid-run with pre-run data, reverting rows
+        /// the run had already acknowledged. The end-of-run bump then covers
+        /// the reconciling fetch `Done` triggers, and is applied *before*
+        /// that fetch is started so it captures the new generation rather
+        /// than being stale on arrival by its own check.
         alerts_generation: u64,
         /// Background reaper poll thread. `None` when the feature is off for
         /// this user or JSM credentials are not configured.
@@ -10986,6 +11035,14 @@ mod gui {
                 return;
             }
             self.ack_all_running = true;
+            // See `alerts_generation`'s doc comment: this is the bump that
+            // matters most. A fetch already in flight at this instant is not
+            // stopped by `start_alerts_fetch`'s "don't start one while a run
+            // is running" guard — it's already running — so without this it
+            // would still carry a matching generation for the run's entire
+            // (sequential, potentially many-second) duration and could land
+            // mid-run, reverting rows already acknowledged.
+            self.alerts_generation = self.alerts_generation.wrapping_add(1);
             if let Some(win) = self.alerts_window.as_mut() {
                 // A new run's outcome replaces whatever the last one said.
                 win.ack_summary = None;
@@ -10993,18 +11050,28 @@ mod gui {
             let auth = self.alerts_auth.clone();
             let tx = self.ack_all_tx.clone();
             std::thread::spawn(move || {
-                let total = ids.len();
-                let mut failed = 0usize;
+                // Reports `Done` via `Drop`, not an explicit send at the end
+                // of the loop — see `AckAllDone`'s doc comment for why: it's
+                // what keeps `ack_all_running` from sticking at `true`
+                // forever (and the whole window inert with it) if this
+                // thread returns early or panics instead of finishing
+                // normally.
+                let mut done = AckAllDone {
+                    tx: tx.clone(),
+                    total: ids.len(),
+                    ok: 0,
+                    failed: 0,
+                };
                 for id in ids {
                     let outcome = alerts::acknowledge_alert(&auth, &id).map_err(|e| e.to_string());
-                    if outcome.is_err() {
-                        failed += 1;
+                    match &outcome {
+                        Ok(()) => done.ok += 1,
+                        Err(_) => done.failed += 1,
                     }
                     if tx.send(AckAllEvent::Result { id, outcome }).is_err() {
-                        return; // UI gone; no point finishing the run's report
+                        return; // UI gone; `done`'s Drop still reports Done
                     }
                 }
-                let _ = tx.send(AckAllEvent::Done { total, failed });
             });
         }
 
@@ -11026,27 +11093,61 @@ mod gui {
                             self.log_error(format!("alerts: failed to acknowledge {id}: {err}"));
                         }
                     },
-                    AckAllEvent::Done { total, failed } => {
+                    AckAllEvent::Done { total, ok, failed } => {
                         self.ack_all_running = false;
                         // A fetch issued while the run was in flight (or just
                         // before it started) may still land with pre-run
                         // data; bumping the generation here makes
                         // `poll_alerts_events` drop it instead of reverting
-                        // what this run just acknowledged.
+                        // what this run just acknowledged. Done *before* the
+                        // reconciling `start_alerts_fetch()` call below, so
+                        // that fetch is stamped with the new generation
+                        // rather than being stale by its own check the
+                        // instant it lands.
                         self.alerts_generation = self.alerts_generation.wrapping_add(1);
+                        // `ok == total` is the only clean-success case. If
+                        // the worker exited early (dead channel, or a panic
+                        // caught by `AckAllDone`'s Drop), `ok + failed` can
+                        // be less than `total` — ids never attempted — which
+                        // must not be reported as if nothing went wrong.
+                        let unattempted = total.saturating_sub(ok + failed);
+                        let clean_success = ok == total;
+                        // Logged unconditionally — not only inside the `if
+                        // let Some(win)` below — so a fully successful run
+                        // with the Alerts window closed still leaves a
+                        // record. The user confirmed a bulk, no-undo action;
+                        // silence must never be the only trace of it.
+                        if clean_success {
+                            self.log_info(format!(
+                                "alerts: acknowledge-all finished — acknowledged {total} alert(s)"
+                            ));
+                        } else {
+                            let mut msg = format!(
+                                "alerts: acknowledge-all finished — {ok} of {total} succeeded, {failed} failed"
+                            );
+                            if unattempted > 0 {
+                                msg.push_str(&format!(
+                                    ", {unattempted} never attempted (worker exited early)"
+                                ));
+                            }
+                            self.log_error(msg);
+                        }
                         if let Some(win) = self.alerts_window.as_mut() {
-                            win.ack_summary = Some(if failed > 0 {
-                                // Partial failure, named honestly — never a
-                                // blanket success or failure.
-                                let ok = total - failed;
-                                format!("acknowledged {ok} of {total}, {failed} failed")
-                            } else {
+                            win.ack_summary = Some(if clean_success {
                                 // An explicit success line, not just the
                                 // absence of an error — otherwise a stale
                                 // fetch-failure banner sitting in `win.error`
                                 // from an earlier Refresh would read as if
                                 // this run had failed.
                                 format!("acknowledged {total} alert(s)")
+                            } else {
+                                // Partial failure, named honestly — never a
+                                // blanket success or failure.
+                                let mut s = format!("acknowledged {ok} of {total}, {failed} failed");
+                                if unattempted > 0 {
+                                    s.push_str(&format!(", {unattempted} never attempted"));
+                                }
+                                s
                             });
                         }
                         // Reconcile with the API now that the run is done,
@@ -28074,6 +28175,35 @@ mod gui {
                     "open-2".to_string(),
                 ]
             );
+        }
+
+        #[test]
+        fn ack_all_done_guard_reports_its_tallies_on_drop() {
+            // `AckAllDone` is what keeps `ack_all_running` from sticking at
+            // `true` forever if the worker thread exits early or panics —
+            // its `Drop` is the only thing that sends `Done`. This pins that
+            // the tallies held at the moment of drop are exactly what's
+            // reported, without needing to spin up a real worker thread.
+            let (tx, rx) = mpsc::channel();
+            {
+                let mut done = AckAllDone {
+                    tx,
+                    total: 5,
+                    ok: 0,
+                    failed: 0,
+                };
+                done.ok += 2;
+                done.failed += 1;
+                // Dropped here, having "completed" only 3 of 5 — the shape
+                // of a worker that returned early or unwound from a panic
+                // partway through the loop.
+            }
+            match rx.recv().expect("Drop must send Done") {
+                AckAllEvent::Done { total, ok, failed } => {
+                    assert_eq!((total, ok, failed), (5, 2, 1));
+                }
+                AckAllEvent::Result { .. } => panic!("expected Done, got Result"),
+            }
         }
 
         #[test]
