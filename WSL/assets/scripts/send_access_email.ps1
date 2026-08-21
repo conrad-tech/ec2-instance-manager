@@ -21,8 +21,9 @@
 #     recipient resolved, so a draft that opens is already encrypted rather
 #     than depending on the Alt+6 keystroke landing.
 #   * Check the address SHAPE against the username (-LocalFormat /
-#     -ExpectedLocal). The domain check cannot catch an in-domain address that
-#     belongs to a different person with a similar name; this can.
+#     -ExpectedLocal, plus any -LocalSuffixes such as ".cw"). The domain check
+#     cannot catch an in-domain address that belongs to a different person with
+#     a similar name; this can.
 #   * Send headless ONLY when resolved AND in-domain AND name-shaped AND
 #     encryption confirmed.
 #   * Otherwise clear the To field, open the draft, apply the QAT Encrypt
@@ -44,6 +45,8 @@ param(
     [string]$LocalFormat     = "",   # non-empty turns the name-shape check on
     [string]$ExpectedLocal   = "",   # stem the address must be, e.g. "jsmith"
     [string]$Candidates      = "",   # comma-separated locals to probe: jsmith,jsmith2,...
+    [string]$LocalSuffixes   = "",   # comma-separated markers the local part may
+                                     #   also carry, e.g. ".cw" -> jsmith.cw
     [switch]$Quiet,                  # suppress message boxes (GUI shows status)
     [string]$TemplateGuid      = "",   # RMS/IRM template GUID (tenant-specific)
     [int]   $Permission        = 0,    # MailItem.Permission value to set (0=skip)
@@ -343,6 +346,14 @@ if ($resolved) {
 # compare against the account's PRIMARY address, which can legitimately differ
 # from the alias we resolved (tuser3@ resolving to test.user@), and reject a
 # correct recipient.
+#
+# -LocalSuffixes are markers some organizations put in the address itself (a
+# contingent worker as jsmith.cw@). They are accepted ALONGSIDE the bare form,
+# never instead of it: one directory holds both kinds of user, and the app
+# probes both shapes for the same reason. Empty leaves the pattern exactly as
+# it was, the stem plus an optional number.
+$suffixList = @($LocalSuffixes -split ',' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
+
 $localOk = $true
 if ($LocalFormat -and -not $localOkOverride) {
     $localOk = $false
@@ -352,7 +363,14 @@ if ($LocalFormat -and -not $localOkOverride) {
         Write-Output "WARN could not derive an expected address for '$Username' (LocalFormat='$LocalFormat')"
     } elseif ($smtp -like "*@*") {
         $localPart = ($smtp -split '@')[0]
-        $localOk = $localPart.Trim().ToLower() -match ('^' + [regex]::Escape($ExpectedLocal.Trim().ToLower()) + '\d*$')
+        # Escaped, because a suffix is free text from features.json and '.' is
+        # a regex wildcard - an unescaped ".cw" would accept "Xcw" as well.
+        $suffixAlt = ""
+        if ($suffixList.Count -gt 0) {
+            $suffixAlt = '(' + (($suffixList | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')?'
+        }
+        $pattern = '^' + [regex]::Escape($ExpectedLocal.Trim().ToLower()) + '\d*' + $suffixAlt + '$'
+        $localOk = $localPart.Trim().ToLower() -match $pattern
     }
 }
 

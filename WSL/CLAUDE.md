@@ -150,6 +150,25 @@ command per terminal.
   format catches an *in-domain* address belonging to a different person with a
   similar name — `test.user` must resolve to `tuser@`/`tuser2@`, not
   `testuser@`. Blank disables either check.
+- **`email_local_suffixes` widens the shape without weakening it.** Some staff
+  carry a marker in the address itself — a contingent worker as `tuser.cw@` —
+  and the plain `flast` rule rejected them, so every such create opened a draft
+  instead of sending. Configured suffixes are accepted *alongside* the bare
+  form (`^tuser\d*(\.cw)?$`), never instead of it: one directory holds both
+  kinds of user. They are **also probed** — `expected_email_locals` emits the
+  bare and the suffixed form at every numeric rank — because the shape check
+  and the probe must agree, or the mailbox is found by an address the check
+  then rejects. Values are taken literally (no dot is assumed) and escaped into
+  the regex, since `.` is a wildcard and `".cw"` unescaped would accept
+  `tuserXcw@`. Blank restores exactly the old behaviour.
+  - **The probe list doubles per suffix**, and its ordering (`tuser`,
+    `tuser.cw`, `tuser2`, `tuser2.cw`…) is what the probe log reads back.
+  - **A person with two *separate* mailboxes — `tuser@` and `tuser.cw@` with
+    different primary SMTP addresses — is now `PROBE ambiguous`** and gets a
+    draft rather than an unattended send. That is the correct answer (nothing
+    here can say which is theirs), but it is a new way for someone who sent
+    fine before to stop sending. Aliases on one mailbox still collapse, since
+    the probe dedupes by `PrimarySmtpAddress`.
 - **Two EDR constraints in the spawn are load-bearing.** The script is run from
   the file **next to the exe** — never written to `%TEMP%` and run from there —
   and `-WindowStyle Hidden` is not used. Both are patterns EDRs quarantine on
@@ -326,15 +345,27 @@ Two things that are easy to get wrong:
   (`-K -`), never argv, so the API token never appears in the process list.
   `curl.exe` ships with Windows 10 1803+.
 
-Config lives in the `alerts` section of `assets/features.json` (compiled in):
-`cloud_id` + `email` identify the site, and `allowed_users` is the list of OS
-usernames that see the button (`["*"]` = everyone, `[]` = nobody; the shipped
-default is `[]`, so the button is hidden until an admin opts users in). The
-button also stays hidden when `cloud_id`/`email` are blank — it fails closed,
-like `allow_delete_user`.
+The `alerts` section of `assets/features.json` (compiled in) carries only
+`allowed_users` — the list of OS usernames that see the button (`["*"]` =
+everyone, `[]` = nobody; the shipped default is `[]`, so the button is hidden
+until an admin opts users in). The Atlassian cloud id, email and API token are
+**not** fields there and must never become fields there — that file is
+committed, so none of the five JSM/Opsgenie values (cloud id, email, token,
+JSM schedule id, Atlassian account id — plus the Opsgenie API key) may live in
+it. They resolve environment → Windows Credential Manager only, via
+`src/jsm_auth.rs` (`load_auth`, `resolve_id`); see `scripts/store_jsm_credential.ps1`
+or the `cmdkey` one-liners in its header to store them. The button also stays
+hidden when that resolution comes back incomplete — it fails closed, like
+`allow_delete_user`. `Features::alerts_visible_for` takes the resolved
+`AlertsAuth` as a parameter rather than looking it up itself, because
+resolving it is a `CredReadW` per field; the GUI resolves it once at startup
+(`resolved_alerts_auth` in `App::new`) and reuses that one value for the
+button gate, the reaper startup gate, and every later alerts-API call — never
+per frame.
 
-**Do not put a real token in features.json** — that file is committed. Leave
-`token` empty and have each user export `JIRA_TOKEN`, which always overrides it.
+`JIRA_TOKEN` (and `ATLASSIAN_EMAIL`, `CLOUD_ID`, `SCHEDULE_ID`, `MY_ID`,
+`OPSGENIE_API_KEY`) in the environment always overrides whatever is stored in
+Credential Manager.
 
 `assets/scripts/alerts_10min.sh` is the standalone bash equivalent (curl + jq,
 same tag parsing, same local-time conversion) for terminal use.
