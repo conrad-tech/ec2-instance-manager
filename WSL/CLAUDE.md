@@ -870,6 +870,18 @@ echo '<b64>' | base64 -d | sudo -n tee '<path>' > /dev/null \
   (`on_hover_text`, plus a weak `as <user>` beside it). The tracked login is
   scraped, so the user is the only one who can catch it being wrong — and
   afterwards the file already belongs to someone.
+- **`--parameters` is JSON, never the CLI's shorthand** (`ssm_parameters_arg`).
+  Shorthand `commands=["…"]` ends a value at the first unescaped double
+  quote, so *this* command — which has them in both forms, the
+  `echo "__CHOWN_${s}__$e"` marker and the `"$(id -un)":` owner fallback —
+  was rejected by argument validation before a byte was sent:
+  `Error parsing parameter '--parameters': Expected: ',', received: '_'`.
+  It stayed hidden from feb303e (2026-08-20) until a real upload hit it
+  on 2026-08-21, because the file browser
+  normally runs on the control channel; `ssm_send_command` is only the
+  fallback for when that session is unusable, so uploads worked until the
+  day one fell back. Any new command sent this way inherits the fix, and
+  `send_command_parameters_survive_a_command_with_double_quotes` pins it.
 - The editor's **Save** path is untouched: `tee` truncates rather than
   recreates, so saving an existing file preserves its owner.
 

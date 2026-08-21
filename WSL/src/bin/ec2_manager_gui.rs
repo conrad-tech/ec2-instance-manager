@@ -24902,6 +24902,24 @@ mod gui {
         cmd
     }
 
+    /// The `--parameters` argument for a one-shot `AWS-RunShellScript`.
+    ///
+    /// **JSON, not the CLI's shorthand `commands=["…"]`.** Shorthand ends a
+    /// value at the first unescaped double quote, so any command containing
+    /// one is rejected by argument validation before a byte is sent:
+    /// `Error parsing parameter '--parameters': Expected: ',', received: '_'`.
+    /// The file-browser upload carries quotes in both of its forms — the
+    /// runtime-assembled `echo "__CHOWN_${s}__$e"` verdict marker, and the
+    /// `"$(id -un)":` owner fallback — so every upload down this path failed.
+    /// It went unseen because the file browser normally runs on the control
+    /// channel; this is only the fallback when that session is unusable.
+    ///
+    /// The argument reaches `aws` through `Command::args`, never a shell, so
+    /// JSON's own quoting is the only quoting involved.
+    fn ssm_parameters_arg(command: &str) -> String {
+        serde_json::json!({ "commands": [command] }).to_string()
+    }
+
     fn ssm_send_command(
         profile: &str,
         region: &str,
@@ -24921,7 +24939,7 @@ mod gui {
                 "--document-name",
                 "AWS-RunShellScript",
                 "--parameters",
-                &format!("commands=[\"{command}\"]"),
+                &ssm_parameters_arg(command),
                 "--query",
                 "Command.CommandId",
                 "--output",
@@ -25316,6 +25334,39 @@ mod gui {
 
         /// The same trap `vault_iam`'s sentinel avoids: the remote shell
         /// echoes the command line before running it, so a literal
+        /// The upload command carries double quotes, and shorthand
+        /// `commands=["…"]` cannot: the first inner quote ends the string and
+        /// the CLI rejects the rest as a parse error before anything is sent.
+        #[test]
+        fn send_command_parameters_survive_a_command_with_double_quotes() {
+            let command = chown_upload_command("/home/ec2-user/123.txt", Some("bconrad"));
+            assert!(command.contains('"'), "the command under test needs quotes: {command}");
+            let arg = ssm_parameters_arg(&command);
+            let parsed: serde_json::Value =
+                serde_json::from_str(&arg).expect("the parameters argument must be valid JSON");
+            assert_eq!(parsed["commands"][0], serde_json::Value::String(command));
+        }
+
+        /// The other branch has quotes too — an upload from a tab that never
+        /// ran `sudo su` resolves the owner remotely with `"$(id -un)":`.
+        #[test]
+        fn the_unnamed_owner_command_round_trips_as_well() {
+            let command = chown_upload_command("/efs/home/x/f.txt", None);
+            let arg = ssm_parameters_arg(&command);
+            let parsed: serde_json::Value = serde_json::from_str(&arg).expect("valid JSON");
+            assert_eq!(parsed["commands"][0], serde_json::Value::String(command));
+        }
+
+        /// Nothing in a shell command may reach the CLI unescaped: a
+        /// backslash, a newline and a brace all break shorthand quoting too.
+        #[test]
+        fn awkward_shell_characters_round_trip_through_the_parameters_argument() {
+            let command = "printf '%s\\n' \"a,b\" && { echo \"{}\"; }";
+            let arg = ssm_parameters_arg(command);
+            let parsed: serde_json::Value = serde_json::from_str(&arg).expect("valid JSON");
+            assert_eq!(parsed["commands"][0], serde_json::Value::String(command.to_string()));
+        }
+
         /// `__CHOWN_OK__` inside the command would be matched by the scan
         /// of the output and report success no matter what chown did.
         #[test]
