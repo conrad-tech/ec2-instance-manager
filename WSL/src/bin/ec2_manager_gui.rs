@@ -1140,9 +1140,16 @@ mod gui {
         last_fetch: Option<Instant>,
         /// Local-time clock reading of the last successful fetch.
         fetched_at: Option<chrono::DateTime<chrono::Local>>,
-        /// An "Acknowledge all" run is in flight — disables the button so a
-        /// second click can't start a second, overlapping run.
-        ack_all_running: bool,
+        /// Outcome line of the last "Acknowledge all" run — deliberately its
+        /// own field, never touched by a fetch. `error` and `ack_summary`
+        /// come from two independent async writers (a routine refresh and an
+        /// ack-all run); folding the ack outcome into `error` let a fetch
+        /// that lands seconds later silently erase a partial-failure banner
+        /// under the shipped default (auto-refresh on, 10s). Cleared only
+        /// when a new run starts. Rendered separately from `error` so a
+        /// fetch failure and a partial acknowledge are never confused for
+        /// one another.
+        ack_summary: Option<String>,
     }
 
     impl AlertsWindow {
@@ -1155,7 +1162,7 @@ mod gui {
                 loading: false,
                 last_fetch: None,
                 fetched_at: None,
-                ack_all_running: false,
+                ack_summary: None,
             }
         }
     }
@@ -1165,6 +1172,13 @@ mod gui {
         /// The window the fetch was for. A result for a window the user has
         /// since changed away from is dropped.
         window_min: i64,
+        /// The alerts generation this fetch was started under (see
+        /// `App::alerts_generation`). An "Acknowledge all" run bumps the
+        /// generation when it finishes; a fetch that was already in flight
+        /// when the run started carries the older number and is dropped on
+        /// arrival — landing after the run would revert rows it just
+        /// acknowledged.
+        generation: u64,
         result: std::result::Result<Vec<alerts::Alert>, String>,
     }
 
@@ -5683,11 +5697,30 @@ mod gui {
         alerts_rx: Receiver<AlertsFetch>,
         /// Ids awaiting confirmation for an "Acknowledge all" run, captured
         /// at the moment the button was clicked. `Some` shows the confirm
-        /// dialog; cleared on confirm or cancel.
+        /// dialog; cleared on confirm or cancel. App-level (not on
+        /// `AlertsWindow`) so a confirmed run still fires even if the Alerts
+        /// window has since been closed — a confirmed action must never
+        /// silently do nothing.
         pending_ack_all: Option<Vec<String>>,
         /// "Acknowledge all" worker → UI.
         ack_all_tx: Sender<AckAllEvent>,
         ack_all_rx: Receiver<AckAllEvent>,
+        /// An "Acknowledge all" run is in flight. App-level, not on
+        /// `AlertsWindow`: the worker thread and its channel outlive the
+        /// window (closing and reopening the Alerts window would otherwise
+        /// construct a fresh `AlertsWindow` with this flag reset to false,
+        /// letting a second run start — and letting the first run's `Done`
+        /// clear the *second* run's flag). The window reads this; it does
+        /// not own it.
+        ack_all_running: bool,
+        /// Bumped each time an "Acknowledge all" run finishes. Every alerts
+        /// fetch is stamped with the generation it started under
+        /// (`AlertsFetch::generation`); a result whose stamp predates the
+        /// current generation is dropped rather than applied, so a fetch
+        /// issued before a run's acknowledgements landed can't overwrite
+        /// them on arrival. Also drives "pause fetching while a run is in
+        /// flight" via `start_alerts_fetch`.
+        alerts_generation: u64,
         /// Background reaper poll thread. `None` when the feature is off for
         /// this user or JSM credentials are not configured.
         reaper: Option<ReaperRuntime>,
@@ -6128,6 +6161,8 @@ mod gui {
                 pending_ack_all: None,
                 ack_all_tx,
                 ack_all_rx,
+                ack_all_running: false,
+                alerts_generation: 0,
                 reaper,
                 pending_notify: Vec::new(),
                 fed_auth_enabled: features
@@ -10875,8 +10910,14 @@ mod gui {
         }
 
         /// Kick off a background alerts fetch for the window's current
-        /// lookback. No-op while one is already in flight.
+        /// lookback. No-op while one is already in flight, or while an
+        /// "Acknowledge all" run is — a fetch issued mid-run can land after
+        /// the run finishes and stomp the rows it just acknowledged, and one
+        /// issued during the run races the run's own reconciling fetch.
         fn start_alerts_fetch(&mut self) {
+            if self.ack_all_running {
+                return;
+            }
             let Some(win) = self.alerts_window.as_mut() else {
                 return;
             };
@@ -10886,12 +10927,13 @@ mod gui {
             win.loading = true;
             win.last_fetch = Some(Instant::now());
             let window_min = win.window_min;
+            let generation = self.alerts_generation;
             let auth = self.alerts_auth.clone();
             let tx = self.alerts_tx.clone();
             std::thread::spawn(move || {
                 let result = alerts::fetch_recent(&auth, window_min)
                     .map_err(|e| e.to_string());
-                let _ = tx.send(AlertsFetch { window_min, result });
+                let _ = tx.send(AlertsFetch { window_min, generation, result });
             });
         }
 
@@ -10902,6 +10944,13 @@ mod gui {
                     continue; // window closed while the fetch was in flight
                 };
                 win.loading = false;
+                if fetch.generation != self.alerts_generation {
+                    // Started before an "Acknowledge all" run finished (the
+                    // run bumps the generation on completion, and triggers
+                    // its own fresh fetch). Applying this one would revert
+                    // whatever the run just acknowledged.
+                    continue;
+                }
                 if fetch.window_min != win.window_min {
                     // The user changed the lookback mid-flight; this result is
                     // for the old window. A fresh fetch is already queued.
@@ -10927,14 +10976,20 @@ mod gui {
         /// acknowledging sequentially — firing every POST at once would risk
         /// rate-limiting and turn one failure into a pile of racing errors.
         /// No-op while a run is already in flight or `ids` is empty.
+        ///
+        /// Deliberately does not require the Alerts window to be open: `ids`
+        /// was already captured when the user confirmed, so a window closed
+        /// between confirming and this call must not turn a confirmed action
+        /// into a silent no-op.
         fn start_ack_all(&mut self, ids: Vec<String>) {
-            let Some(win) = self.alerts_window.as_mut() else {
-                return;
-            };
-            if win.ack_all_running || ids.is_empty() {
+            if self.ack_all_running || ids.is_empty() {
                 return;
             }
-            win.ack_all_running = true;
+            self.ack_all_running = true;
+            if let Some(win) = self.alerts_window.as_mut() {
+                // A new run's outcome replaces whatever the last one said.
+                win.ack_summary = None;
+            }
             let auth = self.alerts_auth.clone();
             let tx = self.ack_all_tx.clone();
             std::thread::spawn(move || {
@@ -10972,25 +11027,43 @@ mod gui {
                         }
                     },
                     AckAllEvent::Done { total, failed } => {
+                        self.ack_all_running = false;
+                        // A fetch issued while the run was in flight (or just
+                        // before it started) may still land with pre-run
+                        // data; bumping the generation here makes
+                        // `poll_alerts_events` drop it instead of reverting
+                        // what this run just acknowledged.
+                        self.alerts_generation = self.alerts_generation.wrapping_add(1);
                         if let Some(win) = self.alerts_window.as_mut() {
-                            win.ack_all_running = false;
-                            // Partial failure only — a clean run leaves no
-                            // banner, and a blanket "done"/"failed" would
-                            // misreport whichever alerts landed the other way.
-                            if failed > 0 {
+                            win.ack_summary = Some(if failed > 0 {
+                                // Partial failure, named honestly — never a
+                                // blanket success or failure.
                                 let ok = total - failed;
-                                win.error =
-                                    Some(format!("acknowledged {ok} of {total}, {failed} failed"));
-                            }
+                                format!("acknowledged {ok} of {total}, {failed} failed")
+                            } else {
+                                // An explicit success line, not just the
+                                // absence of an error — otherwise a stale
+                                // fetch-failure banner sitting in `win.error`
+                                // from an earlier Refresh would read as if
+                                // this run had failed.
+                                format!("acknowledged {total} alert(s)")
+                            });
                         }
+                        // Reconcile with the API now that the run is done,
+                        // rather than waiting up to ALERTS_REFRESH_EVERY.
+                        self.start_alerts_fetch();
                     }
                 }
             }
         }
 
-        /// Render the "Acknowledge N open alerts?" confirmation, shown before
-        /// an "Acknowledge all" run starts. Mirrors
+        /// Render the "Acknowledge N unacknowledged alerts?" confirmation,
+        /// shown before an "Acknowledge all" run starts. Mirrors
         /// `render_script_delete_confirm`'s Confirm/Cancel modal shape.
+        ///
+        /// Gated only on `pending_ack_all`, not on the Alerts window being
+        /// open — `start_ack_all` no longer needs the window either, so a
+        /// confirm here always runs the action it names.
         fn render_ack_all_confirm(&mut self, ctx: &egui::Context) {
             let Some(ids) = self.pending_ack_all.clone() else {
                 return;
@@ -11005,7 +11078,12 @@ mod gui {
                 .open(&mut window_open)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.label(format!("Acknowledge {count} open alerts?"));
+                    // "unacknowledged", not "open": eligibility deliberately
+                    // includes an `acked`-status row whose `acknowledged`
+                    // flag is false (see `acknowledgeable_ids`), and this is
+                    // the one moment a no-undo bulk action is named before it
+                    // runs — it has to say what it actually selects.
+                    ui.label(format!("Acknowledge {count} unacknowledged alert(s)?"));
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         if ui.button("Confirm").clicked() {
@@ -11074,9 +11152,11 @@ mod gui {
             let mut refresh_now = false;
             // Copy out the bits the closure needs so it can borrow `self`
             // mutably for logging without fighting the window borrow.
-            let (mut window_min, mut auto_refresh) = {
+            // `ack_all_running` lives on `self`, not `AlertsWindow` (see its
+            // doc comment), so it's copied out here alongside the rest.
+            let (mut window_min, mut auto_refresh, ack_all_running) = {
                 let win = self.alerts_window.as_ref().expect("checked above");
-                (win.window_min, win.auto_refresh)
+                (win.window_min, win.auto_refresh, self.ack_all_running)
             };
             let mut copy_text: Option<String> = None;
             let mut ack_all_ids: Option<Vec<String>> = None;
@@ -11090,6 +11170,7 @@ mod gui {
                     let win = self.alerts_window.as_ref().expect("checked above");
                     let loading = win.loading;
                     let error = win.error.clone();
+                    let ack_summary = win.ack_summary.clone();
                     let fetched_at = win.fetched_at;
                     let rows = win.rows.clone();
 
@@ -11114,7 +11195,10 @@ mod gui {
                                 }
                             });
                         if ui
-                            .add_enabled(!loading, egui::Button::new("Refresh"))
+                            .add_enabled(
+                                !loading && !ack_all_running,
+                                egui::Button::new("Refresh"),
+                            )
                             .clicked()
                         {
                             refresh_now = true;
@@ -11135,7 +11219,7 @@ mod gui {
                         let ack_ids = acknowledgeable_ids(&rows);
                         if ui
                             .add_enabled(
-                                !ack_ids.is_empty() && !win.ack_all_running,
+                                !ack_ids.is_empty() && !ack_all_running,
                                 egui::Button::new(format!(
                                     "Acknowledge all ({})",
                                     ack_ids.len()
@@ -11147,8 +11231,19 @@ mod gui {
                         }
                     });
 
+                    // Rendered as two distinct lines on purpose: a fetch
+                    // failure and an acknowledge outcome are different
+                    // problems with two independent async writers behind
+                    // them, and folding one into the other is how a
+                    // partial-failure banner used to get silently erased by
+                    // the next auto-refresh. `ack_summary` color is
+                    // deliberately not red, so it never reads as an error
+                    // even when it's reporting a partial failure.
                     if let Some(err) = &error {
                         note_label(ui, egui::Color32::from_rgb(220, 60, 60), err);
+                    }
+                    if let Some(summary) = &ack_summary {
+                        note_label(ui, egui::Color32::from_rgb(70, 130, 200), summary);
                     }
                     ui.separator();
 
@@ -27947,6 +28042,38 @@ mod gui {
         fn an_empty_row_set_yields_an_empty_vec() {
             let rows: Vec<alerts::Alert> = Vec::new();
             assert!(acknowledgeable_ids(&rows).is_empty());
+        }
+
+        #[test]
+        fn an_acked_status_alert_that_is_also_acknowledged_is_excluded() {
+            // Cases above pin `status` and `acknowledged` independently;
+            // this pins their interaction — the `acknowledged` flag still
+            // wins even for the tenant's third `acked` status.
+            let rows = vec![alert_with("a1", "acked", true)];
+            assert!(acknowledgeable_ids(&rows).is_empty());
+        }
+
+        #[test]
+        fn a_mixed_list_returns_exactly_the_eligible_ids_in_order() {
+            // This is a bulk feature; a mixed input is the realistic case,
+            // and single-row tests wouldn't catch an aggregation bug (e.g.
+            // stopping at the first exclusion, or losing order).
+            let rows = vec![
+                alert_with("open-1", "open", false),      // eligible
+                alert_with("acked-already", "open", true), // excluded: acked
+                alert_with("closed-1", "closed", false),  // excluded: closed
+                alert_with("acked-status", "acked", false), // eligible
+                alert_with("", "open", false),            // excluded: no id
+                alert_with("open-2", "open", false),      // eligible
+            ];
+            assert_eq!(
+                acknowledgeable_ids(&rows),
+                vec![
+                    "open-1".to_string(),
+                    "acked-status".to_string(),
+                    "open-2".to_string(),
+                ]
+            );
         }
 
         #[test]
