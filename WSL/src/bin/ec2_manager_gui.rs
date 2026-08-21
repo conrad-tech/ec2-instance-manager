@@ -139,6 +139,30 @@ mod gui {
         attach_time: String,
     }
 
+    /// A security group attached to the instance shown on the Details tab,
+    /// with its rules already flattened for display.
+    #[derive(Clone, Debug)]
+    struct SecurityGroupInfo {
+        group_id: String,
+        group_name: String,
+        description: String,
+        inbound: Vec<SgRule>,
+        outbound: Vec<SgRule>,
+    }
+
+    /// One rule *as a row*: the API models a permission as a protocol and port
+    /// range with a list of sources, and the console renders one line per
+    /// source. So does this — a rule showing only the first CIDR would hide
+    /// who else can reach the box, which is the question the panel answers.
+    #[derive(Clone, Debug)]
+    struct SgRule {
+        protocol: String,
+        ports: String,
+        /// CIDR, `sg-… (name)`, or a prefix list id. "Destination" for egress.
+        source: String,
+        description: String,
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MainTab {
         Inventory,
@@ -335,6 +359,12 @@ mod gui {
         VolumeResult {
             volumes: std::result::Result<Vec<VolumeInfo>, String>,
             iam_role: Option<String>,
+        },
+        /// Deliberately separate from `VolumeResult`: the two are different
+        /// API calls needing different IAM permissions, and an account that
+        /// can read one but not the other must still see what it can.
+        SecurityGroupResult {
+            groups: std::result::Result<Vec<SecurityGroupInfo>, String>,
         },
     }
 
@@ -5346,6 +5376,10 @@ mod gui {
         detail_volumes_error: Option<String>,
         /// IAM role fetched for the Details tab
         detail_iam_role: Option<String>,
+        /// Security groups fetched for the Details tab
+        detail_security_groups: Vec<SecurityGroupInfo>,
+        detail_security_groups_loading: bool,
+        detail_security_groups_error: Option<String>,
         local_port: u16,
         remote_port: u16,
 
@@ -5909,6 +5943,9 @@ mod gui {
                 detail_volumes_loading: false,
                 detail_volumes_error: None,
                 detail_iam_role: None,
+                detail_security_groups: Vec::new(),
+                detail_security_groups_loading: false,
+                detail_security_groups_error: None,
                 local_port: 2222,
                 remote_port: 22,
                 message: String::new(),
@@ -14542,6 +14579,19 @@ mod gui {
                             }
                         }
                     }
+                    ProcEvent::SecurityGroupResult { groups } => {
+                        self.detail_security_groups_loading = false;
+                        match groups {
+                            Ok(sgs) => {
+                                self.log_info(format!("fetched {} security group(s)", sgs.len()));
+                                self.detail_security_groups = sgs;
+                            }
+                            Err(err) => {
+                                self.log_error(format!("security group fetch failed: {err}"));
+                                self.detail_security_groups_error = Some(err);
+                            }
+                        }
+                    }
                 }
                 events_processed += 1;
                 if events_processed >= MAX_EVENTS_PER_FRAME {
@@ -17085,6 +17135,9 @@ mod gui {
                                     self.detail_volumes_error = None;
                                     self.detail_volumes_loading = true;
                                     self.detail_iam_role = None;
+                                    self.detail_security_groups.clear();
+                                    self.detail_security_groups_error = None;
+                                    self.detail_security_groups_loading = true;
                                     self.main_tab = MainTab::Details;
                                     // Fetch volumes in background
                                     let context = self.profile_inventory_cache.iter()
@@ -17095,9 +17148,24 @@ mod gui {
                                         let tx = self.proc_tx.clone();
                                         std::thread::spawn(move || {
                                             let result = fetch_volumes(&ctx.profile, &ctx.region, &iid);
-                                            let iam = fetch_iam_role(&ctx.profile, &ctx.region, &iid);
+                                            let (iam, sg_ids) =
+                                                fetch_instance_extras(&ctx.profile, &ctx.region, &iid);
+                                            // Volumes first: they are the cheaper
+                                            // call and the panel fills top-down.
                                             let _ = tx.send(ProcEvent::VolumeResult { volumes: result, iam_role: iam });
+                                            let groups =
+                                                fetch_security_groups(&ctx.profile, &ctx.region, &sg_ids);
+                                            let _ = tx.send(ProcEvent::SecurityGroupResult { groups });
                                         });
+                                    } else {
+                                        // No account context for this instance, so
+                                        // nothing will ever post a result: say so
+                                        // rather than spin forever.
+                                        self.detail_volumes_loading = false;
+                                        self.detail_security_groups_loading = false;
+                                        let err = "no AWS context for this instance".to_string();
+                                        self.detail_volumes_error = Some(err.clone());
+                                        self.detail_security_groups_error = Some(err);
                                     }
                                     ui.close();
                                 }
@@ -19325,6 +19393,31 @@ mod gui {
                                 vol.volume_id, vol.size_gb, vol.volume_type, vol.device, vol.state, format_aws_time_local(&vol.attach_time)));
                         }
                     }
+                    if !self.detail_security_groups.is_empty() {
+                        text.push_str("\nSecurity Groups:\n");
+                        for sg in &self.detail_security_groups {
+                            text.push_str(&format!("  {} ({})", sg.group_name, sg.group_id));
+                            if !sg.description.is_empty() {
+                                text.push_str(&format!(" - {}", sg.description));
+                            }
+                            text.push('\n');
+                            for (label, rules) in
+                                [("Inbound", &sg.inbound), ("Outbound", &sg.outbound)]
+                            {
+                                if rules.is_empty() {
+                                    text.push_str(&format!("    {label}: none\n"));
+                                    continue;
+                                }
+                                text.push_str(&format!("    {label}:\n"));
+                                for rule in rules {
+                                    text.push_str(&format!(
+                                        "      {} | {} | {} | {}\n",
+                                        rule.protocol, rule.ports, rule.source, rule.description
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     if !instance.tags.is_empty() {
                         text.push_str("\nTags:\n");
                         let mut tags: Vec<_> = instance.tags.iter().collect();
@@ -19426,6 +19519,60 @@ mod gui {
                                 ui.end_row();
                             }
                         });
+                }
+
+                // Security Groups section
+                ui.add_space(12.0);
+                ui.heading("Security Groups");
+                ui.separator();
+                if self.detail_security_groups_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Fetching security groups...");
+                    });
+                } else if let Some(err) = &self.detail_security_groups_error {
+                    note_label(ui, egui::Color32::RED, format!("Error: {err}"));
+                } else if self.detail_security_groups.is_empty() {
+                    ui.label("No security groups found");
+                } else {
+                    for sg in &self.detail_security_groups {
+                        ui.add_space(6.0);
+                        ui.strong(format!("{} ({})", sg.group_name, sg.group_id));
+                        if !sg.description.is_empty() {
+                            ui.weak(&sg.description);
+                        }
+                        // Ingress and egress read the same way, so they are
+                        // drawn the same way; only the source column's name
+                        // differs, since a destination is not a source.
+                        for (label, rules, peer) in [
+                            ("Inbound", &sg.inbound, "Source"),
+                            ("Outbound", &sg.outbound, "Destination"),
+                        ] {
+                            ui.label(label);
+                            if rules.is_empty() {
+                                ui.weak("    none");
+                                continue;
+                            }
+                            egui::Grid::new(format!("sg_rules_{}_{label}", sg.group_id))
+                                .num_columns(4)
+                                .spacing([12.0, 4.0])
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    ui.strong("Protocol");
+                                    ui.strong("Ports");
+                                    ui.strong(peer);
+                                    ui.strong("Description");
+                                    ui.end_row();
+                                    for rule in rules {
+                                        ui.label(&rule.protocol);
+                                        ui.label(&rule.ports);
+                                        ui.label(&rule.source);
+                                        ui.label(&rule.description);
+                                        ui.end_row();
+                                    }
+                                });
+                        }
+                    }
                 }
 
                 if !instance.tags.is_empty() {
@@ -24383,27 +24530,198 @@ mod gui {
         Ok(result)
     }
 
-    fn fetch_iam_role(profile: &str, region: &str, instance_id: &str) -> Option<String> {
-        let output = aws_command()
+    /// Flatten a `describe-security-groups` response into what the Details
+    /// tab renders.
+    ///
+    /// Anything unexpected yields an empty list rather than an error: this is
+    /// one section of a panel, and "None found" is recoverable where a panic
+    /// takes the app with it.
+    fn parse_security_groups(raw: &serde_json::Value) -> Vec<SecurityGroupInfo> {
+        let Some(groups) = raw.get("SecurityGroups").and_then(|g| g.as_array()) else {
+            return Vec::new();
+        };
+        let mut out: Vec<SecurityGroupInfo> = groups
+            .iter()
+            .map(|g| SecurityGroupInfo {
+                group_id: json_str(g, "GroupId").unwrap_or_else(|| "-".to_string()),
+                group_name: json_str(g, "GroupName").unwrap_or_else(|| "-".to_string()),
+                description: json_str(g, "Description").unwrap_or_default(),
+                inbound: sg_rules(g.get("IpPermissions")),
+                outbound: sg_rules(g.get("IpPermissionsEgress")),
+            })
+            .collect();
+        // The API's order is not stable between calls, and a panel whose
+        // sections reshuffle between visits is hard to read.
+        out.sort_by(|a, b| {
+            a.group_name
+                .to_ascii_lowercase()
+                .cmp(&b.group_name.to_ascii_lowercase())
+                .then_with(|| a.group_id.cmp(&b.group_id))
+        });
+        out
+    }
+
+    /// Every source of every permission, as one row each.
+    fn sg_rules(permissions: Option<&serde_json::Value>) -> Vec<SgRule> {
+        let Some(permissions) = permissions.and_then(|p| p.as_array()) else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for perm in permissions {
+            let protocol = sg_protocol(perm.get("IpProtocol").and_then(|p| p.as_str()));
+            let ports = sg_ports(perm);
+            let mut push = |source: String, description: Option<String>| {
+                rows.push(SgRule {
+                    protocol: protocol.clone(),
+                    ports: ports.clone(),
+                    source,
+                    description: description
+                        .filter(|d| !d.trim().is_empty())
+                        .unwrap_or_else(|| "-".to_string()),
+                });
+            };
+            for entry in json_array(perm, "IpRanges") {
+                if let Some(cidr) = json_str(entry, "CidrIp") {
+                    push(cidr, json_str(entry, "Description"));
+                }
+            }
+            for entry in json_array(perm, "Ipv6Ranges") {
+                if let Some(cidr) = json_str(entry, "CidrIpv6") {
+                    push(cidr, json_str(entry, "Description"));
+                }
+            }
+            for entry in json_array(perm, "UserIdGroupPairs") {
+                if let Some(id) = json_str(entry, "GroupId") {
+                    // A peer in another account comes back without a name.
+                    let label = match json_str(entry, "GroupName") {
+                        Some(name) if !name.trim().is_empty() => format!("{id} ({name})"),
+                        _ => id,
+                    };
+                    push(label, json_str(entry, "Description"));
+                }
+            }
+            for entry in json_array(perm, "PrefixListIds") {
+                if let Some(id) = json_str(entry, "PrefixListId") {
+                    push(id, json_str(entry, "Description"));
+                }
+            }
+        }
+        rows
+    }
+
+    /// `"-1"` is how the API spells "every protocol"; it must not reach the
+    /// screen as `-1`.
+    fn sg_protocol(raw: Option<&str>) -> String {
+        match raw.map(str::trim) {
+            None | Some("") | Some("-1") => "All".to_string(),
+            Some(p) => p.to_ascii_uppercase(),
+        }
+    }
+
+    /// A single port, a range, or "All" — an all-protocols rule carries no
+    /// ports at all, and a `-1` port is the same thing said differently.
+    fn sg_ports(perm: &serde_json::Value) -> String {
+        let from = perm.get("FromPort").and_then(|p| p.as_i64());
+        let to = perm.get("ToPort").and_then(|p| p.as_i64());
+        match (from, to) {
+            (Some(f), Some(t)) if f == -1 || t == -1 => "All".to_string(),
+            (Some(f), Some(t)) if f == t => f.to_string(),
+            (Some(f), Some(t)) => format!("{f}-{t}"),
+            _ => "All".to_string(),
+        }
+    }
+
+    fn json_str(value: &serde_json::Value, key: &str) -> Option<String> {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
+    fn json_array<'a>(value: &'a serde_json::Value, key: &str) -> &'a [serde_json::Value] {
+        value
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The IAM role name and the attached security group ids, from one
+    /// `describe-instances` call — the two Details-tab facts that live on the
+    /// instance rather than on a resource of their own.
+    fn parse_instance_extras(raw: &serde_json::Value) -> (Option<String>, Vec<String>) {
+        let role = json_str(raw, "Iam")
+            .filter(|arn| !arn.is_empty() && arn != "None")
+            // arn:aws:iam::123:instance-profile/MyRole -> MyRole
+            .and_then(|arn| arn.rsplit('/').next().map(|s| s.to_string()))
+            .filter(|name| !name.is_empty());
+        let groups = json_array(raw, "Sgs")
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        (role, groups)
+    }
+
+    /// The IAM role and the attached security group ids, in one call.
+    ///
+    /// These were two separate `describe-instances` runs for a while; they
+    /// answer the same query on the same instance, so they are one.
+    fn fetch_instance_extras(
+        profile: &str,
+        region: &str,
+        instance_id: &str,
+    ) -> (Option<String>, Vec<String>) {
+        let Ok(output) = aws_command()
             .args([
                 "ec2", "describe-instances",
                 "--profile", profile,
                 "--region", region,
                 "--instance-ids", instance_id,
-                "--query", "Reservations[0].Instances[0].IamInstanceProfile.Arn",
-                "--output", "text",
+                "--query", "Reservations[0].Instances[0].{Iam:IamInstanceProfile.Arn,Sgs:SecurityGroups[].GroupId}",
+                "--output", "json",
             ])
             .output()
-            .ok()?;
+        else {
+            return (None, Vec::new());
+        };
         if !output.status.success() {
-            return None;
+            return (None, Vec::new());
         }
-        let arn = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if arn.is_empty() || arn == "None" {
-            return None;
+        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+            return (None, Vec::new());
+        };
+        parse_instance_extras(&parsed)
+    }
+
+    /// The rules of the groups attached to the instance.
+    ///
+    /// No `--query`: the response is flattened in `parse_security_groups`,
+    /// where it can be tested without AWS. An instance with no groups makes
+    /// no call at all — `--group-ids` with nothing after it is an error.
+    fn fetch_security_groups(
+        profile: &str,
+        region: &str,
+        group_ids: &[String],
+    ) -> std::result::Result<Vec<SecurityGroupInfo>, String> {
+        if group_ids.is_empty() {
+            return Ok(Vec::new());
         }
-        // Extract role name from ARN: arn:aws:iam::123:instance-profile/MyRole -> MyRole
-        arn.rsplit('/').next().map(|s| s.to_string())
+        let output = aws_command()
+            .args(["ec2", "describe-security-groups", "--profile", profile, "--region", region])
+            .arg("--group-ids")
+            .args(group_ids)
+            .args(["--output", "json"])
+            .output()
+            .map_err(|e| format!("describe-security-groups failed: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("describe-security-groups error: {}", stderr.trim()));
+        }
+
+        let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|e| format!("JSON parse error: {e}"))?;
+        Ok(parse_security_groups(&parsed))
     }
 
     fn aws_command() -> std::process::Command {
@@ -29150,6 +29468,200 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let (row, col) = pixel_to_grid_cell(egui::pos2(9999.0, 9999.0), rect, cell_w, cell_h, rows, cols);
             assert_eq!(row, rows - 1);
             assert_eq!(col, cols - 1);
+        }
+
+        // --- Security groups on the Details tab ---------------------------
+
+        /// One group, one ingress rule, one egress rule -- the shape every
+        /// test below varies from.
+        fn sg_response() -> serde_json::Value {
+            serde_json::json!({
+                "SecurityGroups": [{
+                    "GroupId": "sg-01ab",
+                    "GroupName": "bastion-sg",
+                    "Description": "Bastion host access",
+                    "IpPermissions": [{
+                        "IpProtocol": "tcp",
+                        "FromPort": 22,
+                        "ToPort": 22,
+                        "IpRanges": [{"CidrIp": "10.0.0.0/8", "Description": "ssh from corp"}],
+                        "Ipv6Ranges": [],
+                        "PrefixListIds": [],
+                        "UserIdGroupPairs": []
+                    }],
+                    "IpPermissionsEgress": [{
+                        "IpProtocol": "-1",
+                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                        "Ipv6Ranges": [],
+                        "PrefixListIds": [],
+                        "UserIdGroupPairs": []
+                    }]
+                }]
+            })
+        }
+
+        #[test]
+        fn a_security_group_carries_its_name_id_and_description() {
+            let groups = parse_security_groups(&sg_response());
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].group_id, "sg-01ab");
+            assert_eq!(groups[0].group_name, "bastion-sg");
+            assert_eq!(groups[0].description, "Bastion host access");
+        }
+
+        #[test]
+        fn an_ingress_rule_reads_protocol_ports_source_and_description() {
+            let groups = parse_security_groups(&sg_response());
+            let rule = &groups[0].inbound[0];
+            assert_eq!(rule.protocol, "TCP");
+            assert_eq!(rule.ports, "22");
+            assert_eq!(rule.source, "10.0.0.0/8");
+            assert_eq!(rule.description, "ssh from corp");
+        }
+
+        #[test]
+        fn egress_rules_land_in_outbound_not_inbound() {
+            let groups = parse_security_groups(&sg_response());
+            assert_eq!(groups[0].inbound.len(), 1);
+            assert_eq!(groups[0].outbound.len(), 1);
+            assert_eq!(groups[0].outbound[0].source, "0.0.0.0/0");
+        }
+
+        #[test]
+        fn the_all_protocol_and_an_absent_port_range_read_as_all() {
+            // "-1" is how the API spells "every protocol", and such a rule
+            // carries no ports at all. "-1"/"-1" must not reach the screen.
+            let groups = parse_security_groups(&sg_response());
+            let egress = &groups[0].outbound[0];
+            assert_eq!(egress.protocol, "All");
+            assert_eq!(egress.ports, "All");
+        }
+
+        #[test]
+        fn a_port_range_is_shown_as_a_range_and_a_single_port_is_not() {
+            let raw = serde_json::json!({"SecurityGroups": [{
+                "GroupId": "sg-1", "GroupName": "g", "Description": "",
+                "IpPermissions": [
+                    {"IpProtocol": "tcp", "FromPort": 8000, "ToPort": 8080,
+                     "IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+                    {"IpProtocol": "udp", "FromPort": 53, "ToPort": 53,
+                     "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
+                ],
+                "IpPermissionsEgress": []
+            }]});
+            let groups = parse_security_groups(&raw);
+            assert_eq!(groups[0].inbound[0].ports, "8000-8080");
+            assert_eq!(groups[0].inbound[1].protocol, "UDP");
+            assert_eq!(groups[0].inbound[1].ports, "53");
+        }
+
+        #[test]
+        fn one_permission_with_several_sources_becomes_one_row_each() {
+            // The console lists a rule per source, and so must this: a rule
+            // showing only the first CIDR would hide who else can reach the
+            // box, which is the question the panel exists to answer.
+            let raw = serde_json::json!({"SecurityGroups": [{
+                "GroupId": "sg-1", "GroupName": "g", "Description": "",
+                "IpPermissions": [{
+                    "IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+                    "IpRanges": [{"CidrIp": "10.0.0.0/8"}, {"CidrIp": "192.168.0.0/16"}],
+                    "Ipv6Ranges": [{"CidrIpv6": "::/0"}],
+                    "UserIdGroupPairs": [{"GroupId": "sg-09cd", "GroupName": "alb-sg"}],
+                    "PrefixListIds": [{"PrefixListId": "pl-123", "Description": "s3"}]
+                }],
+                "IpPermissionsEgress": []
+            }]});
+            let sources: Vec<String> = parse_security_groups(&raw)[0]
+                .inbound
+                .iter()
+                .map(|r| r.source.clone())
+                .collect();
+            assert_eq!(
+                sources,
+                vec!["10.0.0.0/8", "192.168.0.0/16", "::/0", "sg-09cd (alb-sg)", "pl-123"]
+            );
+        }
+
+        #[test]
+        fn a_referenced_group_without_a_name_shows_the_bare_id() {
+            // A peer in another account comes back with no GroupName; the id
+            // is still the answer, and "sg-09cd ()" would not be.
+            let raw = serde_json::json!({"SecurityGroups": [{
+                "GroupId": "sg-1", "GroupName": "g", "Description": "",
+                "IpPermissions": [{
+                    "IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432,
+                    "UserIdGroupPairs": [{"GroupId": "sg-09cd"}]
+                }],
+                "IpPermissionsEgress": []
+            }]});
+            assert_eq!(parse_security_groups(&raw)[0].inbound[0].source, "sg-09cd");
+        }
+
+        #[test]
+        fn a_rule_without_a_description_shows_a_dash() {
+            let groups = parse_security_groups(&sg_response());
+            assert_eq!(groups[0].outbound[0].description, "-");
+        }
+
+        #[test]
+        fn a_permission_with_no_sources_at_all_yields_no_rows() {
+            // Such a permission exists in the API but grants nothing; a row
+            // with an empty source column would read as "open to anything".
+            let raw = serde_json::json!({"SecurityGroups": [{
+                "GroupId": "sg-1", "GroupName": "g", "Description": "",
+                "IpPermissions": [{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22}],
+                "IpPermissionsEgress": []
+            }]});
+            assert!(parse_security_groups(&raw)[0].inbound.is_empty());
+        }
+
+        #[test]
+        fn groups_are_sorted_by_name_so_the_order_does_not_move() {
+            // The API's order is not stable between calls, and a panel whose
+            // sections reshuffle between visits is hard to read.
+            let raw = serde_json::json!({"SecurityGroups": [
+                {"GroupId": "sg-2", "GroupName": "web-sg", "Description": ""},
+                {"GroupId": "sg-1", "GroupName": "app-sg", "Description": ""},
+                {"GroupId": "sg-3", "GroupName": "Bastion-sg", "Description": ""}
+            ]});
+            let names: Vec<String> = parse_security_groups(&raw)
+                .iter()
+                .map(|g| g.group_name.clone())
+                .collect();
+            assert_eq!(names, vec!["app-sg", "Bastion-sg", "web-sg"]);
+        }
+
+        #[test]
+        fn a_response_that_is_not_what_we_expect_yields_no_groups() {
+            // A panel section that says "None found" is recoverable; one that
+            // panics takes the app with it.
+            assert!(parse_security_groups(&serde_json::json!({})).is_empty());
+            assert!(parse_security_groups(&serde_json::json!([])).is_empty());
+            assert!(parse_security_groups(&serde_json::json!({"SecurityGroups": "nope"})).is_empty());
+        }
+
+        #[test]
+        fn instance_extras_carry_the_role_name_and_the_attached_group_ids() {
+            let raw = serde_json::json!({
+                "Iam": "arn:aws:iam::123456789012:instance-profile/BastionRole",
+                "Sgs": ["sg-01ab", "sg-02ef"]
+            });
+            let (role, groups) = parse_instance_extras(&raw);
+            assert_eq!(role.as_deref(), Some("BastionRole"));
+            assert_eq!(groups, vec!["sg-01ab", "sg-02ef"]);
+        }
+
+        #[test]
+        fn an_instance_with_no_profile_and_no_groups_reports_neither() {
+            let (role, groups) = parse_instance_extras(&serde_json::json!({
+                "Iam": serde_json::Value::Null,
+                "Sgs": []
+            }));
+            assert!(role.is_none());
+            assert!(groups.is_empty());
+            let (role, groups) = parse_instance_extras(&serde_json::json!({}));
+            assert!(role.is_none());
+            assert!(groups.is_empty());
         }
     }
 }

@@ -873,6 +873,43 @@ echo '<b64>' | base64 -d | sudo -n tee '<path>' > /dev/null \
 - The editor's **Save** path is untouched: `tee` truncates rather than
   recreates, so saving an existing file preserves its owner.
 
+### The Details tab: volumes, IAM role, security groups
+
+"See Details" spawns one worker thread that makes three `aws` calls and posts
+results back as they arrive, so the panel fills top-down rather than after the
+slowest one.
+
+- **Volumes and security groups are separate `ProcEvent`s** (`VolumeResult`,
+  `SecurityGroupResult`). They are different APIs needing different IAM
+  permissions — `ec2:DescribeSecurityGroups` is commonly granted where
+  `ec2:DescribeVolumes` is not — so one failing must not blank the other.
+- **The IAM role and the group ids come from one `describe-instances`**
+  (`fetch_instance_extras`). They were two calls on the same instance for a
+  while; they answer the same query, so they are one.
+- **`Instance` carries no security groups**, and adding them would mean an
+  extra call per instance across the whole inventory. That is why the Details
+  tab fetches them and why `filter::searchable_text` cannot match on them.
+- **A rule is rendered per *source*, not per permission.** The API models a
+  permission as one protocol/port range with a list of sources; the console
+  lists a line each, and so does `sg_rules`. Showing only the first CIDR would
+  hide who else can reach the box, which is the question the panel answers.
+  Sources are `IpRanges`, `Ipv6Ranges`, `UserIdGroupPairs` (rendered
+  `sg-… (name)`, or the bare id for a peer in another account, which comes
+  back nameless) and `PrefixListIds`.
+  A permission carrying **no** sources yields no rows — a row with an empty
+  source column reads as "open to anything".
+- **`"-1"` is the API's spelling of "every protocol"** and such a rule has no
+  ports at all; both surface as `All`. A `-1` port means the same thing.
+- **Parsing is a pure function over the JSON** (`parse_security_groups`), so
+  the call uses no `--query` and the flattening is unit-tested without AWS.
+  `fetch_volumes` predates that split and still parses inline, untested.
+- **An unexpected response yields no groups, never an error.** This is one
+  section of a panel; "None found" is recoverable where a panic is not.
+- **Groups are sorted by name**: the API's order is not stable between calls,
+  and sections that reshuffle between visits are hard to read.
+- **An instance with no groups makes no second call** — `--group-ids` with
+  nothing after it is an error, not an empty result.
+
 ### Instance search
 
 `filter::searchable_text` is the *whole* haystack for the search box —
