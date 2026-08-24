@@ -112,6 +112,36 @@ pub fn matching_tags(instance: &Instance, terms: &[String]) -> Vec<(String, Stri
         .collect()
 }
 
+/// Split a `Key: value` search term into its tag key and the lowercased
+/// value it looks for. `None` for anything that is not one — a plain term,
+/// or a colon with nothing on one side of it.
+///
+/// Both the tag filter and the Match Tag column read a term through this,
+/// so the column cannot end up reporting a different match than the filter
+/// made.
+pub fn parse_tag_term(term: &str) -> Option<(String, String)> {
+    let (key, value) = term.trim().split_once(':')?;
+    let key = key.trim();
+    let value = value.trim().to_ascii_lowercase();
+    if key.is_empty() || value.is_empty() {
+        return None;
+    }
+    Some((key.to_string(), value))
+}
+
+/// The tags on `instance` that a `Key: value` term matches — the key
+/// case-insensitively, the value as a substring — returned as the instance
+/// spells them, which is what the Match Tag column has to show. Empty means
+/// the term does not match this instance.
+pub fn tag_term_matches(instance: &Instance, key: &str, value: &str) -> Vec<(String, String)> {
+    instance
+        .tags
+        .iter()
+        .filter(|(k, v)| k.eq_ignore_ascii_case(key) && v.to_ascii_lowercase().contains(value))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 fn build_matcher(raw: &str) -> SearchMatcher {
     let query = raw.trim().to_ascii_lowercase();
     if query.is_empty() {
@@ -549,6 +579,40 @@ mod tests {
         let by_key = matching_tags(&instance, &vec!["team".to_string()]);
         assert_eq!(by_key.len(), 1);
         assert_eq!(by_key[0].1, "cwfm-admin");
+    }
+
+    /// The tag filter and the Match Tag column must agree on what a
+    /// `Key: value` term means, so both read it through this one parse.
+    #[test]
+    fn parse_tag_term_splits_key_and_value() {
+        assert_eq!(
+            parse_tag_term("Application: Reaper"),
+            Some(("Application".to_string(), "reaper".to_string()))
+        );
+        assert_eq!(parse_tag_term("reaper"), None);
+        assert_eq!(parse_tag_term(": reaper"), None);
+        assert_eq!(parse_tag_term("Application:"), None);
+    }
+
+    /// The column reports the tag as the instance spells it, not as the
+    /// user typed it: the key matches case-insensitively and the value is
+    /// a substring, so neither is the tag's own text.
+    #[test]
+    fn tag_term_matches_reports_the_tag_in_its_own_casing() {
+        let mut instance = Instance::new("i-1".to_string(), "running".to_string());
+        instance
+            .tags
+            .insert("Application".to_string(), "Reaper-v2".to_string());
+        instance
+            .tags
+            .insert("Team".to_string(), "platform".to_string());
+
+        assert_eq!(
+            tag_term_matches(&instance, "application", "reaper"),
+            vec![("Application".to_string(), "Reaper-v2".to_string())]
+        );
+        assert!(tag_term_matches(&instance, "application", "scavenger").is_empty());
+        assert!(tag_term_matches(&instance, "service", "reaper").is_empty());
     }
 
     #[test]
