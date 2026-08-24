@@ -14,22 +14,30 @@ set -u
 
 echo "__RE_BEGIN__"
 
+# Listed BEFORE the directory guard, deliberately.
+#
+# `docker ps -a` does not care where the compose file lives, and the moment
+# the guard trips is exactly the moment someone needs to know what is
+# actually running on the box -- an unexplained `__RE_NODIR__` with nothing
+# beside it is the least useful thing this can report. It is a read, so
+# there is nothing to justify gating it behind a check for our directory.
+#
+# Capped and marked exactly as reaper_fix.sh does it, so one parser reads
+# both. See that script for why the cap is there.
+echo "__RE_DOCKER_BEGIN__ probe"
+docker ps -a 2>&1 | head -c 4000
+echo
+echo "__RE_DOCKER_END__"
+
 # Same guard, same marker, same reason as the fix: on a box that is not ours
-# this reports and stops.
-if [ ! -d /opt/reaper ]; then
+# this reports and stops. Everything below needs the compose project.
+if [ ! -d /opt/cassandra-reaper ]; then
   echo "__RE_NODIR__"
   echo "__RE_END__"
   exit 0
 fi
 
-cd /opt/reaper || { echo "__RE_NODIR__"; echo "__RE_END__"; exit 0; }
-
-# The listing, capped and marked exactly as reaper_fix.sh does it, so one
-# parser reads both. See that script for why the cap is there.
-echo "__RE_DOCKER_BEGIN__ probe"
-docker ps -a 2>&1 | head -c 4000
-echo
-echo "__RE_DOCKER_END__"
+cd /opt/cassandra-reaper || { echo "__RE_NODIR__"; echo "__RE_END__"; exit 0; }
 
 # Read-only: `is-active` reports, it does not start or stop anything. Worth
 # having because the fix deliberately leaves the watchdog stopped, so a box

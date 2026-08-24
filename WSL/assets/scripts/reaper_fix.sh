@@ -36,19 +36,22 @@ snapshot() {
 
 echo "__RE_BEGIN__"
 
+# Before anything is changed, and before the guard below: the listing is a
+# read, it does not depend on where the compose file lives, and a run that
+# reports only `__RE_NODIR__` leaves whoever reads it with no idea what was
+# on the box. The guard is there to stop this script *changing* anything on
+# a machine that is not ours, and nothing below this line changes anything.
+snapshot before-fix
+
 # Checked before anything is changed. On the wrong box this must be a no-op,
 # not a box left with its self-healing switched off.
-if [ ! -d /opt/reaper ]; then
+if [ ! -d /opt/cassandra-reaper ]; then
   echo "__RE_NODIR__"
   echo "__RE_END__"
   exit 0
 fi
 
-cd /opt/reaper || { echo "__RE_NODIR__"; echo "__RE_END__"; exit 0; }
-
-# Before anything is changed, and after the guard above: on a box with no
-# /opt/reaper nothing is touched and nothing is reported about it.
-snapshot before-fix
+cd /opt/cassandra-reaper || { echo "__RE_NODIR__"; echo "__RE_END__"; exit 0; }
 
 # Left stopped on purpose. The watchdog would race the restart, and a box
 # running without it is the reason a *successful* fix is still reported.

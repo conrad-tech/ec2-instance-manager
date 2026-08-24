@@ -341,6 +341,15 @@ fn describe(members: &[TargetMember]) -> String {
         .join(", ")
 }
 
+/// Where the reaper stack lives on the box.
+///
+/// Named once here because it appears in two shell scripts and in the
+/// messages this module and the GUI produce about them — the same
+/// file-pairing hazard `secondary_mirror_step_matches_its_wait` exists for,
+/// and `the_scripts_and_the_parser_name_one_reaper_directory` is what keeps
+/// the four in step.
+pub const REAPER_DIR: &str = "/opt/cassandra-reaper";
+
 pub const RE_BEGIN: &str = "__RE_BEGIN__";
 pub const RE_END: &str = "__RE_END__";
 pub const RE_NODIR: &str = "__RE_NODIR__";
@@ -442,7 +451,7 @@ pub fn parse_verdict(output: &str) -> Verdict {
         );
     }
     if output.contains(RE_NODIR) {
-        return Verdict::Failed("/opt/reaper is not present on this instance".to_string());
+        return Verdict::Failed(format!("{REAPER_DIR} is not present on this instance"));
     }
 
     // Exactly one of each, or the block's boundaries are not trustworthy.
@@ -1164,7 +1173,7 @@ mod tests {
     fn a_missing_directory_is_a_failure_not_a_success() {
         let out = format!("{RE_BEGIN}\n{RE_NODIR}\n{RE_END}\n");
         match parse_verdict(&out) {
-            Verdict::Failed(why) => assert!(why.contains("/opt/reaper"), "got {why}"),
+            Verdict::Failed(why) => assert!(why.contains(REAPER_DIR), "got {why}"),
             other => panic!("expected Failed, got {other:?}"),
         }
     }
@@ -1371,14 +1380,6 @@ mod tests {
     }
 
     #[test]
-    fn the_script_checks_the_directory_before_stopping_the_watchdog() {
-        // Wrong box: a no-op must not leave self-healing switched off.
-        let dir_check = REAPER_FIX_SH.find("-d /opt/reaper").expect("has the check");
-        let wd_stop = REAPER_FIX_SH.find("stop reaper-watchdog").expect("stops the watchdog");
-        assert!(dir_check < wd_stop, "the directory check must come first");
-    }
-
-    #[test]
     fn the_script_never_enables_errexit_in_any_form() {
         // Any spelling of exit-on-error -- `-e`, `-o errexit`, or a combined
         // short form like `-eu`/`-ue` -- would exit on a failing `down` and
@@ -1515,6 +1516,26 @@ mod tests {
     const REAPER_PROBE_SH: &str = include_str!("../assets/scripts/reaper_probe.sh");
 
     #[test]
+    fn the_scripts_and_the_parser_name_one_reaper_directory() {
+        // The stack lives at /opt/cassandra-reaper. It was /opt/reaper in
+        // both scripts and three messages, which meant every run reported
+        // NODIR and changed nothing -- a wrong directory here fails silently
+        // and looks exactly like a box that is not ours.
+        for (name, body) in [
+            ("reaper_fix.sh", REAPER_FIX_SH),
+            ("reaper_probe.sh", REAPER_PROBE_SH),
+        ] {
+            assert!(body.contains(REAPER_DIR), "{name} does not use {REAPER_DIR}");
+            // Substring-safe: "/opt/cassandra-reaper" does not contain
+            // "/opt/reaper", so this catches a half-applied rename.
+            assert!(
+                !body.contains("/opt/reaper"),
+                "{name} still refers to the old /opt/reaper"
+            );
+        }
+    }
+
+    #[test]
     fn the_probe_script_changes_nothing_on_the_box() {
         // The contract of that file. It is pointed at production from a
         // button labelled "test", so a mutating line added here would run
@@ -1573,10 +1594,40 @@ mod tests {
     }
 
     #[test]
-    fn the_probe_checks_the_directory_before_reading_anything() {
-        let dir_check = REAPER_PROBE_SH.find("-d /opt/reaper").expect("has the check");
-        let listing = REAPER_PROBE_SH.find("docker ps -a").expect("lists containers");
-        assert!(dir_check < listing, "the directory check must come first");
+    fn both_scripts_list_the_containers_before_the_directory_guard() {
+        // The guard exists to stop the *fix* changing anything on a box that
+        // is not ours. A listing changes nothing, and the moment the guard
+        // trips is exactly the moment someone needs to know what is running
+        // there -- a bare `__RE_NODIR__` with nothing beside it is the least
+        // useful thing either script can report, which is how this was
+        // found: a real box with three containers reported none.
+        for (name, body) in [
+            ("reaper_fix.sh", REAPER_FIX_SH),
+            ("reaper_probe.sh", REAPER_PROBE_SH),
+        ] {
+            let guard = body
+                .find(&format!("-d {REAPER_DIR}"))
+                .unwrap_or_else(|| panic!("{name} has the directory check"));
+            let listing = body
+                .find("docker ps -a")
+                .unwrap_or_else(|| panic!("{name} lists containers"));
+            assert!(listing < guard, "{name} lists containers after the guard");
+        }
+    }
+
+    #[test]
+    fn the_fix_still_checks_the_directory_before_it_changes_anything() {
+        // The half of the guard's job that is load-bearing: the listing may
+        // move above it, the watchdog stop and the compose commands may not.
+        let guard = REAPER_FIX_SH
+            .find(&format!("-d {REAPER_DIR}"))
+            .expect("has the check");
+        for changing in ["stop reaper-watchdog", "compose down", "compose up -d"] {
+            let at = REAPER_FIX_SH
+                .find(changing)
+                .unwrap_or_else(|| panic!("the fix runs {changing}"));
+            assert!(guard < at, "{changing} runs before the directory check");
+        }
     }
 
     #[test]

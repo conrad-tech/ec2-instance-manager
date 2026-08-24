@@ -517,6 +517,18 @@ rounds of guessing. Each now says so:
   actionable". The second is a WARN naming the alert id. That is the case
   above, and it must never be silent again.
 
+#### The reaper stack lives at `/opt/cassandra-reaper`
+
+`reaper::REAPER_DIR`, named once and used by both scripts and by every
+message either this module or the GUI produces about them. It was `/opt/reaper`
+in all four, which is a failure that hides itself completely: the guard trips,
+the script reports `__RE_NODIR__`, and both a real remediation and the probe
+say "not one of our boxes" — indistinguishable from the truth.
+`the_scripts_and_the_parser_name_one_reaper_directory` checks both scripts use
+the constant *and* that neither still says `/opt/reaper`, which is
+substring-safe since `/opt/cassandra-reaper` does not contain it, so a
+half-applied rename fails.
+
 #### Test Alert Match (Alerts window)
 
 An alert id in, the whole decision out, without taking anything down to see
@@ -529,7 +541,7 @@ are expected. The log lines still say `reaper probe:`, which is accurate about
 what actually ran.
 
 `reaper_probe.sh` is `reaper_fix.sh` with every command that *changes*
-something removed: the `/opt/reaper` guard, `docker ps -a`, `systemctl
+something removed: the `/opt/cassandra-reaper` guard, `docker ps -a`, `systemctl
 is-active reaper-watchdog`, `docker compose ps --format json`. Same markers,
 so one parser reads both.
 
@@ -539,6 +551,15 @@ so one parser reads both.
   from a button labelled "test"; a mutating line added later would run
   unannounced. The scan skips comments deliberately — the file's header names
   the commands it must never run, and that sentence is worth keeping.
+- **The container listing runs *before* the directory guard**, in both the
+  probe and the fix. The guard exists to stop the fix *changing* anything on a
+  box that is not ours; a listing changes nothing, and the moment the guard
+  trips is exactly when someone needs to know what is running there. Found the
+  hard way: a real box with three containers reported a bare `__RE_NODIR__`
+  and nothing else. `both_scripts_list_the_containers_before_the_directory_guard`
+  pins the new order and `the_fix_still_checks_the_directory_before_it_changes_anything`
+  pins the half that is load-bearing — the watchdog stop and the compose
+  commands stay behind the guard.
 - **`systemctl is-active`, never `status`.** It reports and nothing else. Worth
   having because the fix leaves the watchdog stopped on purpose, so a box found
   with it inactive is the trace of an earlier remediation rather than a fault.

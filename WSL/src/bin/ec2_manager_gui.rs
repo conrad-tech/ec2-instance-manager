@@ -2361,7 +2361,7 @@ mod gui {
     /// What a probe transcript says about the box right now.
     ///
     /// One line per fact, and only facts the transcript actually carries: no
-    /// `/opt/reaper`, the watchdog's state, and each compose service with
+    /// `/opt/cassandra-reaper`, the watchdog's state, and each compose service with
     /// whether it is up. Deliberately **not** `parse_verdict` — that answers
     /// "did the fix work" and words its failure as `not running after
     /// restart`, a restart the probe never performed.
@@ -2374,8 +2374,9 @@ mod gui {
 
         if output.contains(reaper::RE_NODIR) {
             return vec![format!(
-                "reaper probe: {instance} has no /opt/reaper — a remediation would \
-                 report NODIR and change nothing"
+                "reaper probe: {instance} has no {} — a remediation would report \
+                 NODIR and change nothing",
+                reaper::REAPER_DIR
             )];
         }
 
@@ -2737,7 +2738,7 @@ mod gui {
     /// are the runs where "was anything running on that box a minute later"
     /// is most worth asking, so none of them suppress the snapshots.
     /// `__RE_NODIR__` is the single exclusion and the honest one: the script
-    /// found no `/opt/reaper`, changed nothing, and there is nothing to watch
+    /// found no `/opt/cassandra-reaper`, changed nothing, and there is nothing to watch
     /// settle.
     ///
     /// A function rather than an inline check because the alternative — an
@@ -23726,7 +23727,7 @@ mod gui {
             LogLevel::Info,
             format!(
                 "reaper: {instance} — {stage} transcript ({} line(s))",
-                body.len()
+                body.iter().filter(|l| !l.trim().is_empty()).count()
             ),
         )];
 
@@ -23753,9 +23754,14 @@ mod gui {
             ));
         }
 
+        // Blank lines are dropped: `log_from` renders an empty message as
+        // `<empty>`, so a transcript's trailing newline became a log line
+        // reading `<empty>` — noise that looks like something went missing.
         out.extend(
             body.iter()
-                .map(|l| (LogLevel::Info, format!("    {}", l.trim_end()))),
+                .map(|l| l.trim_end())
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| (LogLevel::Info, format!("    {l}"))),
         );
         out
     }
@@ -23987,7 +23993,7 @@ mod gui {
     /// `__RE_NODIR__`, a failed send-command included: "did anything answer
     /// on that box a minute later" is most worth knowing exactly when the
     /// first attempt did not come back. `__RE_NODIR__` is the one exclusion,
-    /// and it is the honest one — the script found no `/opt/reaper`, changed
+    /// and it is the honest one — the script found no `/opt/cassandra-reaper`, changed
     /// nothing, and there is nothing to watch settle.
     ///
     /// Every narration line goes to `tx` rather than to stderr, so the run is
@@ -27001,6 +27007,26 @@ mod gui {
         }
 
         #[test]
+        fn a_blank_transcript_line_is_dropped_rather_than_logged_as_empty() {
+            // `log_from` renders an empty message as `<empty>`, so a
+            // transcript's trailing newline used to become a log line
+            // reading `<empty>` — which looks like something went missing.
+            let out = "__RE_BEGIN__\n\n__RE_NODIR__\n   \n__RE_END__\n";
+            let lines = reaper_transcript_lines("i-0abc", "probe", out);
+            let bodies: Vec<&String> = lines
+                .iter()
+                .map(|(_, l)| l)
+                .filter(|l| l.starts_with("    "))
+                .collect();
+            assert_eq!(bodies.len(), 3, "{lines:#?}");
+            assert!(bodies.iter().all(|l| !l.trim().is_empty()), "{bodies:?}");
+            // And the count in the header is what was rendered, not what
+            // arrived — a header promising four lines above three is its own
+            // small lie.
+            assert!(lines[0].1.contains("3 line(s)"), "{:?}", lines[0].1);
+        }
+
+        #[test]
         fn a_box_with_no_containers_says_so_rather_than_saying_nothing() {
             let out = "__RE_DOCKER_BEGIN__ +1m\n\
                        CONTAINER ID   IMAGE   COMMAND   STATUS   NAMES\n\
@@ -27512,7 +27538,10 @@ mod gui {
             // has said it is not on one of our boxes.
             let lines = reaper_probe_state_lines("i-0abc", "__RE_BEGIN__\n__RE_NODIR__\n__RE_END__\n");
             assert_eq!(lines.len(), 1);
-            assert!(lines[0].contains("no /opt/reaper"), "{lines:?}");
+            assert!(
+                lines[0].contains(ec2_manager::reaper::REAPER_DIR),
+                "{lines:?}"
+            );
         }
 
         #[test]
