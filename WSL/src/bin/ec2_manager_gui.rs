@@ -2289,6 +2289,75 @@ mod gui {
         reaper::sole_target_instance(&members)
     }
 
+    /// `s`, trimmed, cut to `max` characters with the full length named.
+    ///
+    /// Alert bodies run to kilobytes and each of these becomes one log line.
+    /// The length is reported because "it was cut" and "that is all there
+    /// was" are different answers when the question is why a field did not
+    /// match.
+    fn clip_for_log(s: &str, max: usize) -> String {
+        let s = s.trim();
+        let n = s.chars().count();
+        if n <= max {
+            return s.to_string();
+        }
+        format!("{}… ({n} chars total)", s.chars().take(max).collect::<String>())
+    }
+
+    /// Everything the subject matcher reads, as log lines.
+    ///
+    /// Emitted when an alert is one of ours but names neither an instance id
+    /// nor a target group. Without it that failure reports only that nothing
+    /// was found, never *what was there instead* — which is the only thing
+    /// that answers it, and is exactly what went missing when an alert that
+    /// had resolved before stopped resolving.
+    ///
+    /// `find_instance_id` and `find_target_group` read the named keys in
+    /// `INSTANCE_ID_KEYS`/`TARGET_GROUP_KEYS`, then the description, then the
+    /// message — so all of those are dumped, along with every other
+    /// extra-properties key, since a template edit moving the value into a
+    /// key nobody reads by name is the likeliest cause.
+    fn reaper_subject_evidence(alert: &ec2_manager::alerts::Alert) -> Vec<String> {
+        const VALUE_MAX: usize = 400;
+        const KEYS_MAX: usize = 40;
+
+        let mut out = vec![
+            format!(
+                "reaper probe: nothing matched in description={:?}",
+                clip_for_log(&alert.description, VALUE_MAX)
+            ),
+            format!(
+                "reaper probe: nothing matched in message={:?}",
+                clip_for_log(&alert.message, VALUE_MAX)
+            ),
+        ];
+
+        let mut keys: Vec<&String> = alert.extra.keys().collect();
+        keys.sort();
+        if keys.is_empty() {
+            out.push("reaper probe: the alert carries no extraProperties at all".to_string());
+        }
+        for key in keys.iter().take(KEYS_MAX) {
+            let value = alert.extra.get(*key).map(String::as_str).unwrap_or("");
+            // The feed carries a literal `{{extraProperties}}` key holding a
+            // flattened copy of the whole map. The matcher never reads it —
+            // see `match_alert` — so it is labelled rather than left to look
+            // like a field that was considered and rejected.
+            let note = if key.contains("{{") { " (unrendered template, never matched against)" } else { "" };
+            out.push(format!(
+                "reaper probe: extraProperties[{key}]={:?}{note}",
+                clip_for_log(value, VALUE_MAX)
+            ));
+        }
+        if keys.len() > KEYS_MAX {
+            out.push(format!(
+                "reaper probe: … and {} more extraProperties key(s) not listed",
+                keys.len() - KEYS_MAX
+            ));
+        }
+        out
+    }
+
     /// What a probe transcript says about the box right now.
     ///
     /// One line per fact, and only facts the transcript actually carries: no
@@ -2408,7 +2477,16 @@ mod gui {
             );
             note(
                 LogLevel::Info,
-                format!("reaper probe: message {:?}", alert.message),
+                format!("reaper probe: message {:?}", clip_for_log(&alert.message, 400)),
+            );
+            // The description is where a target group usually lives, so it is
+            // reported every run rather than only when something fails.
+            note(
+                LogLevel::Info,
+                format!(
+                    "reaper probe: description {:?}",
+                    clip_for_log(&alert.description, 400)
+                ),
             );
 
             if !reaper::identifies(&alert, &cfg) {
@@ -2440,6 +2518,12 @@ mod gui {
                         alert.id
                     ),
                 );
+                // What was there instead. Reporting only that nothing matched
+                // leaves the one question this tool exists to answer
+                // unanswered.
+                for line in reaper_subject_evidence(&alert) {
+                    note(LogLevel::Warn, line);
+                }
                 return;
             };
             note(
@@ -27308,6 +27392,61 @@ mod gui {
             );
             assert_eq!(outcome, Some(ec2_manager::reaper::OutcomeCode::Failure));
             assert_eq!(begun.get(), 1, "a failed fix is still worth watching settle");
+        }
+
+        #[test]
+        fn a_failed_match_reports_every_field_it_actually_looked_at() {
+            // The failure this exists for: an alert that resolved yesterday
+            // stops resolving, and "nothing matched" on its own cannot say
+            // why. What was there instead is the whole answer.
+            let mut alert = ec2_manager::alerts::Alert {
+                id: "alert-1".to_string(),
+                message: "reaper is unhappy".to_string(),
+                description: "no resource here".to_string(),
+                ..Default::default()
+            };
+            alert
+                .extra
+                .insert("Resource".to_string(), "some-load-balancer".to_string());
+            alert.extra.insert(
+                "{{extraProperties}}".to_string(),
+                "a flattened copy of everything".to_string(),
+            );
+
+            let lines = reaper_subject_evidence(&alert);
+            let text = lines.join("\n");
+            assert!(text.contains("description=\"no resource here\""), "{text}");
+            assert!(text.contains("message=\"reaper is unhappy\""), "{text}");
+            assert!(
+                text.contains("extraProperties[Resource]=\"some-load-balancer\""),
+                "{text}"
+            );
+            // The flattened copy is shown but labelled: the matcher never
+            // reads it, and without the label it looks like a field that was
+            // considered and rejected.
+            assert!(text.contains("never matched against"), "{text}");
+        }
+
+        #[test]
+        fn an_alert_with_no_extra_properties_says_that_rather_than_listing_none() {
+            let alert = ec2_manager::alerts::Alert {
+                id: "alert-1".to_string(),
+                ..Default::default()
+            };
+            let text = reaper_subject_evidence(&alert).join("\n");
+            assert!(text.contains("no extraProperties at all"), "{text}");
+        }
+
+        #[test]
+        fn a_long_field_is_clipped_and_says_how_long_it_really_was() {
+            // "it was cut" and "that is all there was" are different answers
+            // when the question is why a field did not match.
+            let long = "x".repeat(500);
+            let clipped = clip_for_log(&long, 400);
+            assert!(clipped.contains("500 chars total"), "{clipped}");
+            assert!(clipped.chars().count() < 450, "{clipped}");
+            // Short values are untouched, and trimmed.
+            assert_eq!(clip_for_log("  targetgroup/x/1  ", 400), "targetgroup/x/1");
         }
 
         #[test]
