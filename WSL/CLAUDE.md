@@ -457,6 +457,86 @@ that changed; these are evidence for the human who reads the run afterwards.
   ten minutes. `applied_transcript()` exists for this: a fix that ran, carrying
   both listings, whose stack did not come back — so it returns before stage 2.
 
+#### The alert names a target group, not an instance
+
+`match_alert` required an `i-…` and returned `None` without a word when it
+found none. The real reaper alert carries `Resource ID:
+targetgroup/<name>/<id>` and no instance id anywhere, so **every** reaper
+alert was silently declined — the feature looked dead and the log was empty.
+
+- **`match_alert` returns a `Subject`, not a `Target`.** `Subject::Instance`
+  or `Subject::TargetGroup`, so `src/reaper.rs` stays pure — alerts in,
+  decisions out, no AWS — and the one network hop lives in the GUI.
+  `AlertMatch::into_target` closes the gap once the instance is known, which
+  keeps `Target` meaning exactly what it always did: *we know the box*.
+- **An instance id wins wherever the alert has one.** Resolving a target group
+  is a network hop and one more chance to be wrong; it is the fallback, never
+  the preference.
+- **`find_target_group` treats `-` as a word character**, unlike
+  `find_instance_id`. Target group names are full of hyphens, and stopping at
+  the first one looks up a name that does not exist. It matches the bare
+  resource id and the tail of a full ARN, since they are the same token.
+- **The ARN is looked up, never constructed.** `describe-target-groups
+  --names` then `describe-target-health --target-group-arn`. Building
+  `arn:aws:elasticloadbalancing:<region>:<account>:<resource>` by hand would
+  bake in the partition and an account id taken from an alert *tag*, and a
+  wrong ARN does not fail loudly — it finds nothing, which reads exactly like
+  an empty target group.
+- **Two instance targets are refused, not arbitrated** (`sole_target_instance`).
+  Nothing here can say which one the alert was about, and picking wrong runs
+  `compose down` on somebody else's box. Refusing costs a remediation a human
+  then does by hand — with the page still live, because nothing was
+  acknowledged. An IP-type target group is refused with that as the stated
+  reason.
+- **Resolution happens before the cooldown check but after `already_handled`**,
+  which is why `ReaperState` gained that method: an alert this process has
+  already acted on must not cost two ELB calls on every 30s poll for the rest
+  of the run.
+- **Live mode only.** Sim fakes `auth_status: Ok`, so resolving there would
+  make real ELB calls out of the mode whose promise is that it does not.
+- **A resolution failure does not mark the alert handled**, so a transient AWS
+  error is retried next poll. What stops the log filling is
+  `report_reaper_reason_change`, which reports a reason once per alert and
+  again only when it *changes* — the same pattern, and the same reasoning, as
+  `poll_port_tunnels`.
+
+#### Why the reaper feature could look dead with an empty log
+
+Three different states all wrote nothing, and telling them apart took five
+rounds of guessing. Each now says so:
+
+- **The gate.** `reaper_enabled_for` false was a bare `else { None }`. Startup
+  now logs `reaper: off — reaper.enabled is false in this build` or
+  `reaper: off — os_user 'x' is not on reaper.allowed_users`, and `reaper=` is
+  on the `gates:` line beside `alerts=`.
+- **Armed and idle.** A poll that matches nothing wrote nothing, so a running
+  thread and a thread that never started were indistinguishable. There is now
+  a DEBUG heartbeat per poll: `reaper: polled 10 alert(s), 0 matched`.
+- **Identified but unusable.** `identifies` is split out of `match_alert` so
+  the caller can tell "not a reaper alert" from "a reaper alert naming nothing
+  actionable". The second is a WARN naming the alert id. That is the case
+  above, and it must never be silent again.
+
+#### Test reaper match (Alerts window)
+
+An alert id in, the whole decision out, without taking reaper down to see it:
+fetch the alert, run `identifies` / `match_alert`, resolve the subject through
+the same `resolve_reaper_target` the poll thread uses, report the projection.
+Results land in the log under On-Call → Reaper Down.
+
+- **It never acknowledges, never sends an SSM command, never reaches a
+  notifier** — and that holds regardless of `dry_run`, which it does not
+  consult. `dry_run` decides what the *poll thread* does with a real alert;
+  this is a question, not a run. The read-only ELB calls behind a target group
+  are the only thing it touches in AWS.
+- **Gated on `reaper.allowed_users` without `reaper.enabled`.** Gating it on
+  the feature being armed would withhold the tool from the only situation it
+  exists for — getting the rules right *before* arming.
+- **Its own channel** (`reaper_probe_tx/rx`), because `ReaperRuntime`'s exists
+  only when the feature is armed. `poll_reaper_events` drains both.
+- A closed alert is reported and the projection continues, since a probe run
+  after the fact is the normal case.
+
 #### The Logs tab's On-Call filter
 
 Right of the **Jira Alerts** checkbox, an **On-Call** dropdown with one

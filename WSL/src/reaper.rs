@@ -72,6 +72,129 @@ pub fn find_instance_id(text: &str) -> Option<String> {
     None
 }
 
+/// Extra-properties keys checked for a target group, in order, when the
+/// alert names no instance. Same rule as [`INSTANCE_ID_KEYS`]: read by name,
+/// never by scanning the whole map.
+const TARGET_GROUP_KEYS: [&str; 4] =
+    ["TargetGroup", "TargetGroupArn", "ResourceId", "Resource"];
+
+/// The first `targetgroup/<name>/<id>` in `text`, or `None`.
+///
+/// Hand-written for the same reason [`find_instance_id`] is: no regex
+/// dependency for a dozen lines. Matches both spellings the feed uses — the
+/// bare resource id (`Resource ID: targetgroup/x-reaper-tg/1a2b…`) and the
+/// tail of a full ARN (`arn:aws:elasticloadbalancing:…:targetgroup/x/1a2b`) —
+/// because they are the same token and the ARN prefix carries nothing the
+/// lookup needs.
+///
+/// The returned string is the resource id, `targetgroup/<name>/<id>`. Use
+/// [`target_group_name`] to get the name the ELB API takes.
+pub fn find_target_group(text: &str) -> Option<String> {
+    const TAG: &str = "targetgroup/";
+    let b = text.as_bytes();
+    // `-` counts as a word character here, unlike in `find_instance_id`:
+    // target group names are full of them, and a name ending mid-token would
+    // be looked up and not found.
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'-';
+
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(TAG) {
+        let at = from + rel;
+        // Must start a token: `mytargetgroup/x/y` is not one of ours. A `:`
+        // or `/` before it is fine -- that is the ARN spelling.
+        let standalone = at == 0 || !is_word(b[at - 1]);
+        if standalone {
+            let name_start = at + TAG.len();
+            let mut i = name_start;
+            while i < b.len() && is_word(b[i]) {
+                i += 1;
+            }
+            let name_end = i;
+            if name_end > name_start && i < b.len() && b[i] == b'/' {
+                let id_start = i + 1;
+                let mut j = id_start;
+                while j < b.len() && is_word(b[j]) {
+                    j += 1;
+                }
+                if j > id_start {
+                    return Some(text[at..j].to_string());
+                }
+            }
+        }
+        from = at + TAG.len();
+    }
+    None
+}
+
+/// The name segment of a `targetgroup/<name>/<id>` resource id — what
+/// `elbv2 describe-target-groups --names` takes.
+pub fn target_group_name(resource: &str) -> Option<&str> {
+    resource.strip_prefix("targetgroup/")?.split('/').next().filter(|n| !n.is_empty())
+}
+
+/// What a matched alert points at.
+///
+/// An alert either names the box outright or names the target group it sits
+/// behind. Only the second needs AWS to resolve, which is why this is a
+/// separate type from [`Target`]: everything in this module stays pure, and
+/// the one network hop lives in the caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Subject {
+    Instance(String),
+    /// The `targetgroup/<name>/<id>` resource id, verbatim.
+    TargetGroup(String),
+}
+
+impl Subject {
+    /// What to call this in a log line before it has been resolved — the
+    /// instance id, or the target group resource id.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Instance(s) | Self::TargetGroup(s) => s,
+        }
+    }
+}
+
+/// A matched alert, before the subject has been resolved to an instance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlertMatch {
+    pub alert_id: String,
+    pub subject: Subject,
+    pub account_id: String,
+    pub environment: String,
+    pub created_at: String,
+}
+
+impl AlertMatch {
+    /// The [`Target`] this match becomes once its instance is known.
+    ///
+    /// Takes the id rather than reading it off the match, because for a
+    /// `TargetGroup` subject only the caller — which made the ELB call — can
+    /// supply it.
+    pub fn into_target(self, instance_id: String) -> Target {
+        Target {
+            alert_id: self.alert_id,
+            instance_id,
+            account_id: self.account_id,
+            environment: self.environment,
+            created_at: self.created_at,
+        }
+    }
+}
+
+/// Is this alert one of ours at all?
+///
+/// Split out of [`match_alert`] so a caller can tell "not a reaper alert"
+/// from "a reaper alert naming nothing we can act on" — both of which
+/// `match_alert` reports as `None`, and the second of which must never be
+/// silent: it means the remediation is declining the alerts it exists for.
+pub fn identifies(alert: &Alert, cfg: &ReaperFeature) -> bool {
+    let alertname = alert.extra.get("alertname").map(String::as_str).unwrap_or("");
+    contains_ci(alertname, &cfg.alertname_contains)
+        || contains_ci(&alert.app, &cfg.app_contains)
+        || contains_ci(&alert.message, &cfg.message_contains)
+}
+
 /// Is this alert one of ours, and if so what does it point at?
 ///
 /// Identification prefers `extraProperties.alertname`, then the `App:` tag,
@@ -85,31 +208,137 @@ pub fn find_instance_id(text: &str) -> Option<String> {
 /// `{{extraProperties}}` key holding a flattened copy of that whole map, and
 /// matching against it would fire on alerts that merely mention this app
 /// inside an unrendered template.
-pub fn match_alert(alert: &Alert, cfg: &ReaperFeature) -> Option<Target> {
-    let alertname = alert.extra.get("alertname").map(String::as_str).unwrap_or("");
-    let identified = contains_ci(alertname, &cfg.alertname_contains)
-        || contains_ci(&alert.app, &cfg.app_contains)
-        || contains_ci(&alert.message, &cfg.message_contains);
-    if !identified {
+pub fn match_alert(alert: &Alert, cfg: &ReaperFeature) -> Option<AlertMatch> {
+    if !identifies(alert, cfg) {
         return None;
     }
 
-    let instance_id = INSTANCE_ID_KEYS
+    let instance = INSTANCE_ID_KEYS
         .iter()
         .filter_map(|k| alert.extra.get(*k))
         .find_map(|v| find_instance_id(v))
         .or_else(|| {
             // Free text, in the order a human would read it.
             find_instance_id(&alert.description).or_else(|| find_instance_id(&alert.message))
-        })?;
+        });
 
-    Some(Target {
+    // An instance id wins wherever the alert carries one. Resolving a target
+    // group is a network hop and one more chance to be wrong, so it is the
+    // fallback, never the preference.
+    let subject = match instance {
+        Some(id) => Subject::Instance(id),
+        None => Subject::TargetGroup(
+            TARGET_GROUP_KEYS
+                .iter()
+                .filter_map(|k| alert.extra.get(*k))
+                .find_map(|v| find_target_group(v))
+                .or_else(|| {
+                    find_target_group(&alert.description)
+                        .or_else(|| find_target_group(&alert.message))
+                })?,
+        ),
+    };
+
+    Some(AlertMatch {
         alert_id: alert.id.clone(),
-        instance_id,
+        subject,
         account_id: alert.account.clone(),
         environment: alert.environment.clone(),
         created_at: alert.created_at.clone(),
     })
+}
+
+/// One target registered in a target group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetMember {
+    pub id: String,
+    /// `healthy`, `unhealthy`, `draining`… Carried for the log line: which
+    /// targets were unhealthy is the first thing a human asks when a
+    /// resolution comes back with the wrong count.
+    pub health: String,
+}
+
+/// Every target in an `elbv2 describe-target-health` response.
+///
+/// A pure function over the JSON, so the call needs no `--query` and the
+/// flattening is unit-tested without AWS — the same split
+/// `parse_security_groups` uses.
+pub fn parse_target_health(json: &str) -> Vec<TargetMember> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(items) = v.get("TargetHealthDescriptions").and_then(|d| d.as_array()) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|d| {
+            let id = d.get("Target")?.get("Id")?.as_str()?.to_string();
+            let health = d
+                .get("TargetHealth")
+                .and_then(|h| h.get("State"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            Some(TargetMember { id, health })
+        })
+        .collect()
+}
+
+/// The ARN in an `elbv2 describe-target-groups` response.
+///
+/// The first entry: the call is made with `--names <one name>`, so a second
+/// entry would mean the API answered a question that was not asked.
+pub fn parse_target_group_arn(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    Some(
+        v.get("TargetGroups")?
+            .as_array()?
+            .first()?
+            .get("TargetGroupArn")?
+            .as_str()?
+            .to_string(),
+    )
+}
+
+/// The one instance a target group holds, or why there isn't one.
+///
+/// **More than one is refused, not arbitrated.** Reaper's target group holds
+/// a single box; if that ever stops being true, nothing here can say which
+/// one the alert was about, and picking wrong means `compose down` on
+/// somebody else's box. Refusing costs a remediation that a human then does
+/// by hand — with the page still live, because nothing was acknowledged.
+pub fn sole_target_instance(members: &[TargetMember]) -> std::result::Result<String, String> {
+    if members.is_empty() {
+        return Err("the target group has no registered targets".to_string());
+    }
+    let instances: Vec<&TargetMember> = members
+        .iter()
+        .filter(|m| find_instance_id(&m.id).as_deref() == Some(m.id.as_str()))
+        .collect();
+    match instances.len() {
+        // Every target is something other than an instance: an IP-type
+        // target group. Nothing here can turn an address into the box behind
+        // it, and guessing is not an option when the next step is `down`.
+        0 => Err(format!(
+            "the target group registers no instance targets (found {}) —              an IP-type target group cannot be resolved to an instance",
+            describe(members)
+        )),
+        1 => Ok(instances[0].id.clone()),
+        n => Err(format!(
+            "{n} instance targets registered ({}) — refusing to choose between them",
+            describe(members)
+        )),
+    }
+}
+
+/// `id (health), id (health)` — for the one log line a refusal gets.
+fn describe(members: &[TargetMember]) -> String {
+    members
+        .iter()
+        .map(|m| format!("{} ({})", m.id, m.health))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub const RE_BEGIN: &str = "__RE_BEGIN__";
@@ -268,6 +497,16 @@ impl ReaperState {
             Some(&last) => now_ms.saturating_sub(last) >= cooldown_ms,
             None => true,
         }
+    }
+
+    /// Has this exact alert already been acted on by this process?
+    ///
+    /// The alert half of [`Self::should_act`], on its own, so a caller can
+    /// skip an already-handled alert **before** paying for the AWS calls that
+    /// resolve its target group. `should_act` still re-checks it, so the two
+    /// cannot come apart.
+    pub fn already_handled(&self, alert_id: &str) -> bool {
+        self.handled.contains(alert_id)
     }
 
     pub fn mark_handled(&mut self, alert_id: &str, instance_id: &str, now_ms: u64) {
@@ -500,7 +739,7 @@ mod tests {
     fn a_matching_alert_yields_the_full_target() {
         let t = match_alert(&alert(), &cfg()).expect("matches");
         assert_eq!(t.alert_id, "alert-1");
-        assert_eq!(t.instance_id, "i-0abc123def4567890");
+        assert_eq!(t.subject, Subject::Instance("i-0abc123def4567890".to_string()));
         assert_eq!(t.account_id, "123456789012");
         assert_eq!(t.environment, "DEV1");
     }
@@ -589,7 +828,194 @@ mod tests {
         let mut a = alert();
         a.extra.insert("InstanceId".to_string(), "i-0fff1111222233334".to_string());
         let t = match_alert(&a, &cfg()).expect("matches");
-        assert_eq!(t.instance_id, "i-0fff1111222233334");
+        assert_eq!(t.subject, Subject::Instance("i-0fff1111222233334".to_string()));
+    }
+
+    #[test]
+    fn an_alert_naming_only_a_target_group_still_matches() {
+        // The case that made this necessary: the reaper alert carries the
+        // load balancer target group and no instance id anywhere, so the
+        // matcher used to return None and log nothing at all.
+        let mut a = alert();
+        a.description =
+            "Resource ID: targetgroup/prod-reaper-tg/1a2b3c4d5e6f7890".to_string();
+        a.message = "reaper target unhealthy".to_string();
+        let m = match_alert(&a, &cfg()).expect("matches");
+        assert_eq!(
+            m.subject,
+            Subject::TargetGroup("targetgroup/prod-reaper-tg/1a2b3c4d5e6f7890".to_string())
+        );
+        // Everything else off the alert is carried exactly as before.
+        assert_eq!(m.alert_id, "alert-1");
+        assert_eq!(m.account_id, "123456789012");
+        assert_eq!(m.environment, "DEV1");
+    }
+
+    #[test]
+    fn an_instance_id_beats_a_target_group_wherever_both_appear() {
+        // Resolving a target group is a network hop and one more chance to
+        // be wrong. It is the fallback, never the preference.
+        let mut a = alert();
+        a.description = "i-0abc123def4567890 behind \
+                         targetgroup/prod-reaper-tg/1a2b3c4d"
+            .to_string();
+        assert_eq!(
+            match_alert(&a, &cfg()).expect("matches").subject,
+            Subject::Instance("i-0abc123def4567890".to_string())
+        );
+    }
+
+    #[test]
+    fn the_target_group_is_read_from_extra_properties_in_preference() {
+        let mut a = alert();
+        a.description = "targetgroup/from-free-text/1111".to_string();
+        a.message = "reaper".to_string();
+        a.extra.insert(
+            "ResourceId".to_string(),
+            "targetgroup/from-a-named-key/2222".to_string(),
+        );
+        assert_eq!(
+            match_alert(&a, &cfg()).expect("matches").subject,
+            Subject::TargetGroup("targetgroup/from-a-named-key/2222".to_string())
+        );
+    }
+
+    #[test]
+    fn a_target_group_is_found_in_a_bare_id_and_in_an_arn() {
+        // The feed uses both spellings for the same thing, and the ARN
+        // prefix carries nothing the ELB lookup needs.
+        assert_eq!(
+            find_target_group("Resource ID: targetgroup/x-reaper-tg/1a2b3c4d5e6f7890"),
+            Some("targetgroup/x-reaper-tg/1a2b3c4d5e6f7890".to_string())
+        );
+        assert_eq!(
+            find_target_group(
+                "arn:aws:elasticloadbalancing:us-east-1:123456789012:\
+                 targetgroup/x-reaper-tg/1a2b3c4d5e6f7890"
+            ),
+            Some("targetgroup/x-reaper-tg/1a2b3c4d5e6f7890".to_string())
+        );
+        // Hyphens are part of the name -- stopping at the first one would
+        // look up a target group that does not exist.
+        assert_eq!(
+            target_group_name("targetgroup/x-reaper-tg/1a2b"),
+            Some("x-reaper-tg")
+        );
+    }
+
+    #[test]
+    fn a_target_group_must_be_a_whole_token_and_carry_both_segments() {
+        // `mytargetgroup/…` is somebody else's word.
+        assert_eq!(find_target_group("mytargetgroup/x/1"), None);
+        // Name but no id, or id but no name: not a resource id.
+        assert_eq!(find_target_group("targetgroup/only-a-name"), None);
+        assert_eq!(find_target_group("targetgroup//1a2b"), None);
+        assert_eq!(find_target_group("targetgroup/"), None);
+        assert_eq!(find_target_group("nothing here"), None);
+        assert_eq!(target_group_name("i-0abc123def4567890"), None);
+    }
+
+    #[test]
+    fn an_alert_of_ours_naming_nothing_actionable_is_identified_but_unmatched() {
+        // The pair a caller needs to tell "not a reaper alert" from "a reaper
+        // alert we cannot act on". The second must never be silent -- it
+        // means the remediation is declining the alerts it exists for.
+        let mut a = alert();
+        a.description = "something is wrong".to_string();
+        a.message = "reaper is unhappy".to_string();
+        assert!(identifies(&a, &cfg()));
+        assert!(match_alert(&a, &cfg()).is_none());
+
+        // And an alert that is not ours is neither.
+        let mut other = alert();
+        other.description = "i-0abc123def4567890".to_string();
+        other.message = "disk full".to_string();
+        other.app = "billing".to_string();
+        other.extra.insert("alertname".to_string(), "disk-usage".to_string());
+        assert!(!identifies(&other, &cfg()));
+        assert!(match_alert(&other, &cfg()).is_none());
+    }
+
+    fn health_json(pairs: &[(&str, &str)]) -> String {
+        let items: Vec<String> = pairs
+            .iter()
+            .map(|(id, state)| {
+                format!(
+                    "{{\"Target\":{{\"Id\":\"{id}\",\"Port\":443}},\
+                      \"TargetHealth\":{{\"State\":\"{state}\"}}}}"
+                )
+            })
+            .collect();
+        format!("{{\"TargetHealthDescriptions\":[{}]}}", items.join(","))
+    }
+
+    #[test]
+    fn one_registered_instance_is_the_box_the_alert_meant() {
+        let members = parse_target_health(&health_json(&[("i-0abc123def4567890", "unhealthy")]));
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].health, "unhealthy");
+        assert_eq!(
+            sole_target_instance(&members),
+            Ok("i-0abc123def4567890".to_string())
+        );
+    }
+
+    #[test]
+    fn two_registered_instances_are_refused_rather_than_arbitrated() {
+        // Nothing here can say which one the alert was about, and picking
+        // wrong runs `compose down` on somebody else's box.
+        let members = parse_target_health(&health_json(&[
+            ("i-0abc123def4567890", "unhealthy"),
+            ("i-0fff1111222233334", "healthy"),
+        ]));
+        let err = sole_target_instance(&members).expect_err("refuses");
+        assert!(err.contains("refusing to choose"), "{err}");
+        // Both are named, with their health: the first question a human asks.
+        assert!(err.contains("i-0abc123def4567890 (unhealthy)"), "{err}");
+        assert!(err.contains("i-0fff1111222233334 (healthy)"), "{err}");
+    }
+
+    #[test]
+    fn an_ip_type_target_group_is_refused_with_that_as_the_reason() {
+        // An address cannot be turned into the box behind it here, and
+        // guessing is not an option when the next step is `compose down`.
+        let members = parse_target_health(&health_json(&[("10.1.2.3", "healthy")]));
+        let err = sole_target_instance(&members).expect_err("refuses");
+        assert!(err.contains("IP-type"), "{err}");
+        assert!(err.contains("10.1.2.3"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_target_group_says_so_rather_than_reporting_a_parse_failure() {
+        let members = parse_target_health(&health_json(&[]));
+        assert!(members.is_empty());
+        assert!(sole_target_instance(&members)
+            .expect_err("refuses")
+            .contains("no registered targets"));
+    }
+
+    #[test]
+    fn unreadable_elb_output_yields_no_targets_and_is_then_refused() {
+        // Never a panic and never a guess: an unreadable response means the
+        // membership was not established, which reads the same as empty.
+        for junk in ["", "not json", "{}", "{\"TargetHealthDescriptions\":{}}"] {
+            assert!(parse_target_health(junk).is_empty(), "{junk}");
+        }
+        assert!(sole_target_instance(&[]).is_err());
+    }
+
+    #[test]
+    fn the_target_group_arn_is_read_from_the_describe_response() {
+        let json = "{\"TargetGroups\":[{\"TargetGroupName\":\"x-reaper-tg\",\
+                    \"TargetGroupArn\":\"arn:aws:elasticloadbalancing:us-east-1:1:\
+                    targetgroup/x-reaper-tg/1a2b\"}]}";
+        assert_eq!(
+            parse_target_group_arn(json).as_deref(),
+            Some("arn:aws:elasticloadbalancing:us-east-1:1:targetgroup/x-reaper-tg/1a2b")
+        );
+        for junk in ["", "not json", "{}", "{\"TargetGroups\":[]}"] {
+            assert_eq!(parse_target_group_arn(junk), None, "{junk}");
+        }
     }
 
     #[test]

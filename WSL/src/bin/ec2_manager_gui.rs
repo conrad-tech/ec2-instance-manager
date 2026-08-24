@@ -35,7 +35,9 @@ mod gui {
     use ec2_manager::connection_tabs::ConnectionTabs;
     use ec2_manager::diagnostics::run_diagnostics;
     use ec2_manager::error::{AppError, Result};
-    use ec2_manager::filter::{apply_filters, matching_tags, Filters};
+    use ec2_manager::filter::{
+        apply_filters, matching_tags, parse_tag_term, tag_term_matches, Filters,
+    };
     use ec2_manager::gui_cli::{gui_help_text, parse_gui_args, GuiOptions};
     use ec2_manager::inventory::load_inventory;
     use ec2_manager::models::{
@@ -2220,6 +2222,313 @@ mod gui {
             env!("OUT_DIR"),
             "/reaper_fix.sh.obf"
         ))))
+    }
+
+    /// One `aws` call returning JSON, for the reaper's target-group lookups.
+    ///
+    /// Spelled out here rather than through `run_aws_cli` for the same reason
+    /// `fetch_instance_extras` is: `aws_command()` carries `CREATE_NO_WINDOW`,
+    /// and these run on a background thread where a console flashing up would
+    /// be the only visible sign the app is doing anything.
+    fn reaper_aws_json(
+        profile: &str,
+        region: &str,
+        args: &[&str],
+    ) -> std::result::Result<String, String> {
+        let out = aws_command()
+            .args(args)
+            .args(["--profile", profile, "--region", region, "--output", "json"])
+            .output()
+            .map_err(|e| format!("could not run aws: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let err = err.trim();
+            // Truncated: an AWS error can be a paragraph, and this ends up on
+            // one log line.
+            let err: String = err.chars().take(300).collect();
+            return Err(format!("aws {} failed: {err}", args.join(" ")));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+
+    /// Turn what an alert points at into the instance to remediate.
+    ///
+    /// An `Instance` subject is returned as-is and costs nothing. A
+    /// `TargetGroup` costs two read-only ELB calls: the name to its ARN, then
+    /// the ARN to its registered targets.
+    ///
+    /// **The ARN is looked up, never constructed.** Building
+    /// `arn:aws:elasticloadbalancing:<region>:<account>:<resource>` by hand
+    /// would bake in the partition and an account id taken from an alert tag,
+    /// and a wrong ARN here does not fail loudly — it finds nothing, which
+    /// reads exactly like an empty target group.
+    fn resolve_reaper_subject(
+        profile: &str,
+        region: &str,
+        subject: &ec2_manager::reaper::Subject,
+    ) -> std::result::Result<String, String> {
+        use ec2_manager::reaper::{self, Subject};
+
+        let resource = match subject {
+            Subject::Instance(id) => return Ok(id.clone()),
+            Subject::TargetGroup(r) => r,
+        };
+        let name = reaper::target_group_name(resource)
+            .ok_or_else(|| format!("{resource} is not a target group resource id"))?;
+        let arn = reaper::parse_target_group_arn(&reaper_aws_json(
+            profile,
+            region,
+            &["elbv2", "describe-target-groups", "--names", name],
+        )?)
+        .ok_or_else(|| format!("no target group named {name} in {region}"))?;
+        let members = reaper::parse_target_health(&reaper_aws_json(
+            profile,
+            region,
+            &["elbv2", "describe-target-health", "--target-group-arn", &arn],
+        )?);
+        reaper::sole_target_instance(&members)
+    }
+
+    /// Run the whole reaper decision against one alert id and report every
+    /// step, without touching anything.
+    ///
+    /// The point is to answer "would this alert be remediated, and on which
+    /// box" **without** taking reaper down to find out. It fetches the alert,
+    /// runs the same `identifies`/`match_alert` the poll thread runs,
+    /// resolves the subject through the same `resolve_reaper_target`, and
+    /// reports the projection.
+    ///
+    /// It never acknowledges, never sends an SSM command and never reaches a
+    /// notifier — and that is true regardless of `dry_run`, which it does not
+    /// consult. `dry_run` decides what the *poll thread* does with a real
+    /// alert; this is a question, not a run, so there is nothing for it to
+    /// gate. The read-only ELB calls behind a target group are the only thing
+    /// this touches in AWS.
+    ///
+    /// Its own thread, because `fetch_alert`, the on-call lookup and the ELB
+    /// calls are all network and the UI is immediate mode.
+    fn start_reaper_probe(
+        auth: ec2_manager::alerts::AlertsAuth,
+        cfg: ec2_manager::features::ReaperFeature,
+        app_config: ec2_manager::config::AppConfig,
+        mode: Mode,
+        alert_id: String,
+        tx: Sender<ReaperEvent>,
+    ) {
+        use ec2_manager::{alerts, oncall, reaper};
+
+        std::thread::spawn(move || {
+            let note = |level: LogLevel, message: String| {
+                let _ = tx.send(ReaperEvent::Note { level, message });
+            };
+            note(
+                LogLevel::Info,
+                format!("reaper probe: fetching alert {alert_id}"),
+            );
+
+            let alert = match alerts::fetch_alert(&auth, &alert_id) {
+                Ok(a) => a,
+                Err(e) => {
+                    note(
+                        LogLevel::Error,
+                        format!("reaper probe: could not fetch alert {alert_id} — {e}"),
+                    );
+                    return;
+                }
+            };
+
+            // The fields the matcher actually reads, spelled out, so a rule
+            // that does not fire can be compared against what it was given
+            // rather than guessed at.
+            note(
+                LogLevel::Info,
+                format!(
+                    "reaper probe: alert {} status={:?} alertname={:?} app={:?} \
+                     account={:?} env={:?}",
+                    alert.id,
+                    alert.status,
+                    alert.extra.get("alertname").map(String::as_str).unwrap_or(""),
+                    alert.app,
+                    alert.account,
+                    alert.environment,
+                ),
+            );
+            note(
+                LogLevel::Info,
+                format!("reaper probe: message {:?}", alert.message),
+            );
+
+            if !reaper::identifies(&alert, &cfg) {
+                note(
+                    LogLevel::Warn,
+                    format!(
+                        "reaper probe: alert {} does not match any reaper rule \
+                         (alertname~{:?} app~{:?} message~{:?}) — a real poll would \
+                         pass over it",
+                        alert.id,
+                        cfg.alertname_contains,
+                        cfg.app_contains,
+                        cfg.message_contains,
+                    ),
+                );
+                return;
+            }
+            note(
+                LogLevel::Info,
+                format!("reaper probe: alert {} matches the reaper rules", alert.id),
+            );
+
+            let Some(m) = reaper::match_alert(&alert, &cfg) else {
+                note(
+                    LogLevel::Warn,
+                    format!(
+                        "reaper probe: alert {} names neither an instance id nor a \
+                         target group — a real poll would have nothing to act on",
+                        alert.id
+                    ),
+                );
+                return;
+            };
+            note(
+                LogLevel::Info,
+                match &m.subject {
+                    reaper::Subject::Instance(id) => {
+                        format!("reaper probe: the alert names instance {id}")
+                    }
+                    reaper::Subject::TargetGroup(tg) => {
+                        format!("reaper probe: the alert names target group {tg}")
+                    }
+                },
+            );
+
+            let instance = match resolve_reaper_target(&mode, &app_config, &m) {
+                Ok(id) => id,
+                Err(why) => {
+                    note(
+                        LogLevel::Error,
+                        format!("reaper probe: could not resolve to one instance — {why}"),
+                    );
+                    return;
+                }
+            };
+            note(
+                LogLevel::Info,
+                format!("reaper probe: resolves to instance {instance}"),
+            );
+
+            // Reported, not returned on: a closed alert is exactly what a
+            // probe run after the fact looks at, and the rest of the
+            // projection is still worth seeing.
+            if reaper::alert_is_closed(&alert.status) {
+                note(
+                    LogLevel::Info,
+                    format!(
+                        "reaper probe: alert {} is closed — a real poll would stand down here",
+                        alert.id
+                    ),
+                );
+            }
+
+            let on_call = match oncall::is_on_call(
+                &auth,
+                &cfg.resolved_schedule_id(),
+                &cfg.resolved_atlassian_account_id(),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    note(
+                        LogLevel::Warn,
+                        format!("reaper probe: on-call lookup failed ({e}) — treating as off call"),
+                    );
+                    false
+                }
+            };
+
+            note(
+                LogLevel::Info,
+                format!(
+                    "reaper probe: would remediate {instance} (on_call={on_call}), projected \
+                     code {} — nothing was acknowledged, sent or changed",
+                    dry_run_projection(on_call).as_str()
+                ),
+            );
+        });
+    }
+
+    /// Resolve a matched alert's subject to the instance to remediate,
+    /// building the account context only when one is actually needed.
+    ///
+    /// An alert naming its own instance costs nothing at all — no context, no
+    /// AWS call — which keeps the common path exactly as cheap as it was.
+    ///
+    /// **Live mode only.** Sim fakes `auth_status: Ok` and reuses whatever
+    /// profile the account id resolved to, so resolving there would make real
+    /// ELB calls out of a mode whose whole promise is that it does not touch
+    /// AWS. Refusing is the honest answer: in Sim a target-group alert simply
+    /// cannot be resolved, and the log says so.
+    fn resolve_reaper_target(
+        mode: &Mode,
+        app_config: &ec2_manager::config::AppConfig,
+        m: &ec2_manager::reaper::AlertMatch,
+    ) -> std::result::Result<String, String> {
+        use ec2_manager::reaper::Subject;
+
+        if let Subject::Instance(id) = &m.subject {
+            return Ok(id.clone());
+        }
+        if *mode != Mode::Live {
+            return Err(format!(
+                "app is running in {} mode, not live — a target group is resolved \
+                 with real ELB calls and those only run in Live mode",
+                mode.as_str()
+            ));
+        }
+        if m.account_id.trim().is_empty() {
+            return Err("the alert carries no Account tag, so there is no profile to \
+                        look the target group up with"
+                .to_string());
+        }
+        let ctx = build_context_with_profile(
+            mode.clone(),
+            app_config,
+            None,
+            Some(m.account_id.as_str()),
+        )
+        .map_err(|e| format!("no credentials for account {}: {e}", m.account_id))?;
+        if ctx.auth_status != AuthStatus::Ok {
+            return Err(format!(
+                "account {} is not authorised (auth_status={})",
+                m.account_id, ctx.auth_status
+            ));
+        }
+        resolve_reaper_subject(&ctx.profile, &ctx.region, &m.subject)
+    }
+
+    /// Report `reason` for `key` only when it is not what was reported last
+    /// time, and return whether anything was sent.
+    ///
+    /// The poll runs every 30s and a target group that cannot be resolved
+    /// stays unresolvable, so an unconditional warning would be hundreds of
+    /// identical lines an hour — in the one view a human opens to find out
+    /// what went wrong. Same pattern, and the same reasoning, as
+    /// `poll_port_tunnels` logging only when a reason *changes*.
+    ///
+    /// The alert is deliberately **not** marked handled on a failure like
+    /// this, so a transient AWS error is retried on the next poll rather than
+    /// dropping the remediation for the life of the process.
+    fn report_reaper_reason_change(
+        seen: &mut HashMap<String, String>,
+        key: &str,
+        level: LogLevel,
+        reason: String,
+        tx: &Sender<ReaperEvent>,
+    ) -> bool {
+        if seen.get(key).map(String::as_str) == Some(reason.as_str()) {
+            return false;
+        }
+        seen.insert(key.to_string(), reason.clone());
+        let _ = tx.send(ReaperEvent::Note { level, message: reason });
+        true
     }
 
     /// Whether the +1m/+5m snapshots are due, given what the fix's run said.
@@ -5259,6 +5568,38 @@ mod gui {
         (includes, excludes)
     }
 
+    /// The tags on `instance` that the search actually matched — what the
+    /// Match Tag column shows and what its sort orders by.
+    ///
+    /// It reads the rules rather than the terms from
+    /// `search_terms_from_rules`, because that function drops every
+    /// `Key: value` term on purpose (they are matched as tags, not as text).
+    /// Feeding the column from it left the column blank for exactly the
+    /// searches that are *about* a tag. Exclude rules contribute nothing:
+    /// they say what must not be there.
+    fn matched_tag_pairs(instance: &Instance, rules: &[SearchRuleInput]) -> Vec<(String, String)> {
+        let mut matched: Vec<(String, String)> = Vec::new();
+        let mut plain_terms: Vec<String> = Vec::new();
+
+        for rule in rules {
+            let term = rule.term.trim();
+            if term.is_empty() || rule.kind != SearchRuleKind::Include {
+                continue;
+            }
+            match parse_tag_term(term) {
+                Some((key, value)) => matched.extend(tag_term_matches(instance, &key, &value)),
+                None => plain_terms.push(term.to_string()),
+            }
+        }
+
+        matched.extend(matching_tags(instance, &plain_terms));
+
+        // Two rules can name one tag; the column lists tags, not rules.
+        let mut seen = std::collections::HashSet::new();
+        matched.retain(|pair| seen.insert(pair.clone()));
+        matched
+    }
+
     fn rules_from_search_terms(includes: &[String], excludes: &[String]) -> Vec<SearchRuleInput> {
         let mut rules = Vec::new();
 
@@ -5896,6 +6237,24 @@ mod gui {
         alerts_enabled: bool,
         /// Jira site + credentials for the alerts API (features.json).
         alerts_auth: alerts::AlertsAuth,
+        /// The compiled-in reaper config, kept so the "Test reaper match"
+        /// probe can run the same matcher the poll thread runs — including
+        /// when the feature itself is off, which is exactly when someone is
+        /// trying to get the rules right.
+        reaper_cfg: ec2_manager::features::ReaperFeature,
+        /// Whether that probe is offered. `reaper.allowed_users` **without**
+        /// `reaper.enabled`: it reads an alert and makes read-only ELB calls,
+        /// never acknowledges and never touches an instance, so gating it on
+        /// the feature being armed would withhold the tool from the only
+        /// situation it is for.
+        reaper_probe_enabled: bool,
+        /// The alert id typed into that box.
+        reaper_probe_id: String,
+        /// The probe's own channel. Not the `ReaperRuntime` one: that exists
+        /// only when the feature is armed, and the probe has to work when it
+        /// is not.
+        reaper_probe_tx: Sender<ReaperEvent>,
+        reaper_probe_rx: Receiver<ReaperEvent>,
         /// Alerts window state; `None` while the window is closed.
         alerts_window: Option<AlertsWindow>,
         /// Alerts fetch worker → UI.
@@ -6088,6 +6447,7 @@ mod gui {
             let (user_sync_tx, user_sync_rx) = mpsc::channel();
             let (create_pre_tx, create_pre_rx) = mpsc::channel();
             let (fed_tx, fed_rx) = mpsc::channel();
+            let (reaper_probe_tx, reaper_probe_rx) = mpsc::channel();
             let features = ec2_manager::features::load();
             #[cfg(target_os = "windows")]
             let (ui_tx, ui_rx) = mpsc::channel();
@@ -6175,6 +6535,24 @@ mod gui {
 
             let reaper = {
                 let user = ec2_manager::features::current_os_user();
+                // Say what the gate decided, always. The `else` below used to
+                // be bare, so a feature that was off and a feature that was
+                // on and matching nothing both wrote nothing at all — and
+                // "nothing in the log" is the state someone actually has to
+                // diagnose from.
+                if !features.reaper.enabled {
+                    reaper_startup_log.push((
+                        false,
+                        "reaper: off — reaper.enabled is false in this build".to_string(),
+                    ));
+                } else if !features.reaper.is_allowed_user(&user) {
+                    reaper_startup_log.push((
+                        false,
+                        format!(
+                            "reaper: off — os_user '{user}' is not on reaper.allowed_users                              (note '*' is deliberately not honoured for reaper)"
+                        ),
+                    ));
+                }
                 if features.reaper_enabled_for(&user) {
                     if features.reaper.has_multiple_users() {
                         reaper_startup_log.push((
@@ -6185,6 +6563,18 @@ mod gui {
                         ));
                     }
                     if resolved_alerts_auth.is_complete() {
+                        reaper_startup_log.push((
+                            false,
+                            format!(
+                                "reaper: armed (dry_run={}), polling every {}s over the {}                                  newest alert(s), matching alertname~{:?} app~{:?}                                  message~{:?}",
+                                features.reaper.dry_run,
+                                features.reaper.poll_interval().as_secs(),
+                                features.reaper.alerts_per_poll(),
+                                features.reaper.alertname_contains,
+                                features.reaper.app_contains,
+                                features.reaper.message_contains,
+                            ),
+                        ));
                         Some(start_reaper_poll(
                             resolved_alerts_auth.clone(),
                             features.reaper.clone(),
@@ -6370,6 +6760,14 @@ mod gui {
                     &ec2_manager::features::current_os_user(),
                     &resolved_alerts_auth,
                 ),
+                reaper_cfg: features.reaper.clone(),
+                reaper_probe_enabled: features
+                    .reaper
+                    .is_allowed_user(&ec2_manager::features::current_os_user())
+                    && resolved_alerts_auth.is_complete(),
+                reaper_probe_id: String::new(),
+                reaper_probe_tx,
+                reaper_probe_rx,
                 alerts_auth: resolved_alerts_auth,
                 alerts_window: None,
                 alerts_tx,
@@ -6469,12 +6867,13 @@ mod gui {
             // login inside an embedded WSL/SSM terminal, which is a child
             // process started later and never consulted here.
             app.log_info(format!(
-                "gates: os_user='{}' (from {}) — git_scripts={} alerts={} \
+                "gates: os_user='{}' (from {}) — git_scripts={} alerts={} reaper={} \
                  vault_iam={} vault_iam_delete={} fed_auth={} fed_auto_sign_in={}",
                 if os_user.is_empty() { "(unset!)" } else { &os_user },
                 if cfg!(target_os = "windows") { "%USERNAME%" } else { "$USER" },
                 app.git_scripts_enabled,
                 app.alerts_enabled,
+                features.reaper_enabled_for(&os_user),
                 features.vault_iam_enabled_for(&os_user),
                 features.vault_iam_delete_enabled_for(&os_user),
                 app.fed_auth_enabled,
@@ -7743,38 +8142,26 @@ mod gui {
                 if term.is_empty() {
                     continue;
                 }
-                if let Some((key, value)) = term.split_once(':') {
-                    let key = key.trim();
-                    let value = value.trim().to_ascii_lowercase();
-                    if !key.is_empty() && !value.is_empty() {
-                        match rule.kind {
-                            SearchRuleKind::Include => {
-                                tag_includes.push((key.to_string(), value));
-                            }
-                            SearchRuleKind::Exclude => {
-                                tag_excludes.push((key.to_string(), value));
-                            }
-                        }
+                if let Some((key, value)) = parse_tag_term(term) {
+                    match rule.kind {
+                        SearchRuleKind::Include => tag_includes.push((key, value)),
+                        SearchRuleKind::Exclude => tag_excludes.push((key, value)),
                     }
                 }
             }
 
             if !tag_includes.is_empty() || !tag_excludes.is_empty() {
                 self.filtered.retain(|instance| {
-                    // All tag includes must match
-                    let includes_ok = tag_includes.iter().all(|(tag_key, pattern)| {
-                        instance.tags.iter().any(|(k, v)| {
-                            k.eq_ignore_ascii_case(tag_key)
-                                && v.to_ascii_lowercase().contains(pattern.as_str())
-                        })
-                    });
+                    // All tag includes must match. `tag_term_matches` is the
+                    // same test the Match Tag column reports through, so the
+                    // column cannot name a tag the filter did not match on.
+                    let includes_ok = tag_includes
+                        .iter()
+                        .all(|(k, v)| !tag_term_matches(instance, k, v).is_empty());
                     // No tag excludes may match
-                    let excludes_ok = !tag_excludes.iter().any(|(tag_key, pattern)| {
-                        instance.tags.iter().any(|(k, v)| {
-                            k.eq_ignore_ascii_case(tag_key)
-                                && v.to_ascii_lowercase().contains(pattern.as_str())
-                        })
-                    });
+                    let excludes_ok = !tag_excludes
+                        .iter()
+                        .any(|(k, v)| !tag_term_matches(instance, k, v).is_empty());
                     includes_ok && excludes_ok
                 });
             }
@@ -11395,11 +11782,21 @@ mod gui {
         /// Drain reaper poll-thread events into the log (and, for a real
         /// outcome, the notifier seam).
         fn poll_reaper_events(&mut self) {
-            let Some(rt) = &self.reaper else { return };
             // Copy events out first: `self.log_*` needs `&mut self`, which
             // would conflict with the immutable borrow of `rt` (itself
             // borrowed from `self.reaper`) held by the channel iterator.
-            let events: Vec<ReaperEvent> = rt.rx.try_iter().collect();
+            //
+            // The probe's channel is drained unconditionally — it exists
+            // whether or not the feature is armed, which is the whole point
+            // of it — and its events render identically, so both sources
+            // land in the log under On-Call -> Reaper Down.
+            let mut events: Vec<ReaperEvent> = self.reaper_probe_rx.try_iter().collect();
+            if let Some(rt) = &self.reaper {
+                events.extend(rt.rx.try_iter());
+            }
+            if events.is_empty() {
+                return;
+            }
             for ev in &events {
                 match ev {
                     ReaperEvent::Considered { code, instance, on_call } => {
@@ -11458,6 +11855,10 @@ mod gui {
             };
             let mut copy_text: Option<String> = None;
             let mut ack_all_ids: Option<Vec<String>> = None;
+            // Carried out of the window closure for the same reason the two
+            // above are: spawning needs `&self` fields the closure is already
+            // borrowing mutably.
+            let mut probe_alert_id: Option<String> = None;
 
             egui::Window::new("On-Call Alerts")
                 .open(&mut open)
@@ -11528,6 +11929,39 @@ mod gui {
                             ack_all_ids = Some(ack_ids);
                         }
                     });
+
+                    // Answer "would this alert be remediated, and on which
+                    // box" without taking reaper down to find out. Read-only:
+                    // it fetches the alert, resolves its target group and
+                    // reports the projection, and never acknowledges or
+                    // contacts an instance.
+                    if self.reaper_probe_enabled {
+                        ui.horizontal(|ui| {
+                            ui.label("Reaper:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.reaper_probe_id)
+                                    .hint_text("alert id")
+                                    .desired_width(300.0),
+                            );
+                            let id = self.reaper_probe_id.trim().to_string();
+                            if ui
+                                .add_enabled(
+                                    !id.is_empty(),
+                                    egui::Button::new("Test reaper match"),
+                                )
+                                .on_hover_text(
+                                    "Run the reaper matcher against this alert and report \
+                                     every step in the log (On-Call -> Reaper Down). \
+                                     Resolves a target group to its instance with read-only \
+                                     ELB calls. Never acknowledges, never contacts the box.",
+                                )
+                                .clicked()
+                            {
+                                probe_alert_id = Some(id);
+                            }
+                            ui.weak("results appear in the Logs tab");
+                        });
+                    }
 
                     // Rendered as two distinct lines on purpose: a fetch
                     // failure and an acknowledge outcome are different
@@ -11627,6 +12061,20 @@ mod gui {
             }
             if let Some(ids) = ack_all_ids {
                 self.pending_ack_all = Some(ids);
+            }
+            if let Some(id) = probe_alert_id {
+                self.log_reaper(
+                    LogLevel::Info,
+                    format!("reaper probe: requested for alert {id}"),
+                );
+                start_reaper_probe(
+                    self.alerts_auth.clone(),
+                    self.reaper_cfg.clone(),
+                    self.config.clone(),
+                    self.options.mode.clone(),
+                    id,
+                    self.reaper_probe_tx.clone(),
+                );
             }
 
             if !open {
@@ -17341,7 +17789,9 @@ mod gui {
                         let mut pending_add_to_saved_filter: Option<(String, String, String)> = None;
                         let mut pending_remove_from_saved_filter: Option<(String, Instance, String)> =
                             None;
-                        let (include_terms, _) = search_terms_from_rules(&self.search_rules);
+                        // The Match Tag column and its sort read the rules
+                        // themselves, so a `Key: value` tag rule reaches them.
+                        let search_rules = self.search_rules.clone();
 
                         // Sort filtered instances if a sort column is selected.
                         if let Some(sort_col) = self.sort_column {
@@ -17390,8 +17840,8 @@ mod gui {
                                     }
                                     SortColumn::MatchTag => {
                                         // Sort by first matching tag value
-                                        let ta = matching_tags(a, &include_terms);
-                                        let tb = matching_tags(b, &include_terms);
+                                        let ta = matched_tag_pairs(a, &search_rules);
+                                        let tb = matched_tag_pairs(b, &search_rules);
                                         let va = ta.first().map(|(_, v)| v.as_str()).unwrap_or("");
                                         let vb = tb.first().map(|(_, v)| v.as_str()).unwrap_or("");
                                         va.to_ascii_lowercase().cmp(&vb.to_ascii_lowercase())
@@ -17573,11 +18023,8 @@ mod gui {
                             row_double_clicked |= resp_env.double_clicked();
                             row_hovered |= resp_env.hovered();
 
-                            let matched_tag_text = if include_terms.is_empty() {
-                                String::new()
-                            } else {
-                                let tags = matching_tags(instance, &include_terms);
-                                let text = tags
+                            let matched_tag_text = {
+                                let text = matched_tag_pairs(instance, &search_rules)
                                     .into_iter()
                                     .map(|(k, v)| format!("{k}={v}"))
                                     .collect::<Vec<String>>()
@@ -23504,21 +23951,102 @@ mod gui {
             let started = std::time::Instant::now();
             let mut state = reaper::ReaperState::new();
             let cooldown_ms = cfg.cooldown().as_millis() as u64;
+            // Last reason reported per alert, so a permanently unresolvable
+            // one is said once rather than every 30s. See
+            // `report_reaper_reason_change`.
+            let mut reported: HashMap<String, String> = HashMap::new();
 
             loop {
                 let now_ms = monotonic_ms(started);
                 match alerts::fetch_latest(&auth, cfg.alerts_per_poll()) {
                     Ok(list) => {
+                        let mut identified_count = 0usize;
                         for alert in &list {
-                            let Some(target) = reaper::match_alert(alert, &cfg) else {
+                            // Asked separately from `match_alert` so that "not
+                            // a reaper alert" and "a reaper alert naming
+                            // nothing we can act on" -- both `None` -- can be
+                            // told apart. The second is the failure that hid
+                            // a target-group-only alert for weeks: the
+                            // matcher declined it and said nothing.
+                            let identified = reaper::identifies(alert, &cfg);
+                            if identified {
+                                identified_count += 1;
+                            }
+                            let Some(m) = reaper::match_alert(alert, &cfg) else {
+                                if identified {
+                                    report_reaper_reason_change(
+                                        &mut reported,
+                                        &alert.id,
+                                        LogLevel::Warn,
+                                        format!(
+                                            "reaper: alert {} matches the reaper rules but \
+                                             names neither an instance id nor a target group \
+                                             — nothing to act on",
+                                            alert.id
+                                        ),
+                                        &tx,
+                                    );
+                                }
                                 continue;
                             };
                             if reaper::alert_is_closed(&alert.status) {
                                 let _ = tx.send(ReaperEvent::Skipped {
-                                    reason: format!("{} already closed", target.instance_id),
+                                    reason: format!("{} already closed", m.subject.label()),
                                 });
                                 continue;
                             }
+                            // Before the resolution below, not after: an
+                            // alert this process has already acted on must
+                            // not cost two ELB calls on every poll for the
+                            // rest of the run.
+                            if state.already_handled(&m.alert_id) {
+                                let _ = tx.send(ReaperEvent::Skipped {
+                                    reason: format!("{} already handled", m.subject.label()),
+                                });
+                                continue;
+                            }
+
+                            // The one network hop this module does not do
+                            // itself. Free for an alert that names its
+                            // instance; two read-only ELB calls for one that
+                            // names a target group.
+                            let instance_id = match resolve_reaper_target(
+                                &mode,
+                                &app_config,
+                                &m,
+                            ) {
+                                Ok(id) => id,
+                                Err(why) => {
+                                    report_reaper_reason_change(
+                                        &mut reported,
+                                        &m.alert_id,
+                                        LogLevel::Warn,
+                                        format!(
+                                            "reaper: alert {} names {} and it could not be \
+                                             resolved to one instance — {why}",
+                                            m.alert_id,
+                                            m.subject.label()
+                                        ),
+                                        &tx,
+                                    );
+                                    continue;
+                                }
+                            };
+                            if let reaper::Subject::TargetGroup(tg) = &m.subject {
+                                report_reaper_reason_change(
+                                    &mut reported,
+                                    &m.alert_id,
+                                    LogLevel::Info,
+                                    format!(
+                                        "reaper: alert {} names {tg}, which resolves to \
+                                         {instance_id}",
+                                        m.alert_id
+                                    ),
+                                    &tx,
+                                );
+                            }
+                            let target = m.into_target(instance_id);
+
                             if !state.should_act(
                                 &target.alert_id,
                                 &target.instance_id,
@@ -23635,6 +24163,18 @@ mod gui {
                                 }
                             });
                         }
+                        // The heartbeat. Without it a poll thread that is
+                        // running and matching nothing is indistinguishable
+                        // from one that never started — both write nothing —
+                        // and telling those apart took five rounds once.
+                        let _ = tx.send(ReaperEvent::Note {
+                            level: LogLevel::Debug,
+                            message: format!(
+                                "reaper: polled {} alert(s), {identified_count} matched the \
+                                 reaper rules",
+                                list.len()
+                            ),
+                        });
                     }
                     Err(e) => {
                         let _ = tx.send(ReaperEvent::LookupFailed {
@@ -26640,6 +27180,108 @@ mod gui {
             assert_eq!(begun.get(), 1, "a failed fix is still worth watching settle");
         }
 
+        fn test_alert_match(subject: ec2_manager::reaper::Subject) -> ec2_manager::reaper::AlertMatch {
+            ec2_manager::reaper::AlertMatch {
+                alert_id: "alert-1".to_string(),
+                subject,
+                account_id: "111111111111".to_string(),
+                environment: "DEV1".to_string(),
+                created_at: "2026-08-19T20:12:09Z".to_string(),
+            }
+        }
+
+        #[test]
+        fn an_alert_that_names_its_instance_costs_no_aws_call_at_all() {
+            // The common path has to stay exactly as cheap as it was: no
+            // context built, no ELB call, no mode check. This test would hang
+            // or fail on a machine with no `aws` if any of that changed.
+            use ec2_manager::reaper::Subject;
+            let m = test_alert_match(Subject::Instance("i-0abc123def4567890".to_string()));
+            for mode in [Mode::Live, Mode::Sim] {
+                assert_eq!(
+                    resolve_reaper_target(&mode, &AppConfig::default(), &m),
+                    Ok("i-0abc123def4567890".to_string()),
+                    "{mode:?}"
+                );
+            }
+            // And the lower-level call agrees, with a profile and region that
+            // could not possibly work.
+            assert_eq!(
+                resolve_reaper_subject("", "", &m.subject),
+                Ok("i-0abc123def4567890".to_string())
+            );
+        }
+
+        #[test]
+        fn a_target_group_is_never_resolved_out_of_sim_mode() {
+            // Sim fakes `auth_status: Ok`, so without this check the resolver
+            // would make real ELB calls out of the one mode whose promise is
+            // that it does not touch AWS.
+            use ec2_manager::reaper::Subject;
+            let m = test_alert_match(Subject::TargetGroup(
+                "targetgroup/x-reaper-tg/1a2b".to_string(),
+            ));
+            let err = resolve_reaper_target(&Mode::Sim, &AppConfig::default(), &m)
+                .expect_err("refuses");
+            assert!(err.contains("Sim") || err.contains("sim"), "{err}");
+            assert!(err.contains("Live mode"), "{err}");
+        }
+
+        #[test]
+        fn a_target_group_alert_with_no_account_tag_is_refused_before_any_lookup() {
+            use ec2_manager::reaper::Subject;
+            let mut m = test_alert_match(Subject::TargetGroup(
+                "targetgroup/x-reaper-tg/1a2b".to_string(),
+            ));
+            m.account_id = "   ".to_string();
+            let err = resolve_reaper_target(&Mode::Live, &AppConfig::default(), &m)
+                .expect_err("refuses");
+            assert!(err.contains("no Account tag"), "{err}");
+        }
+
+        #[test]
+        fn a_reason_is_reported_once_and_again_only_when_it_changes() {
+            // The poll runs every 30s and an unresolvable target group stays
+            // unresolvable, so without this the one view a human opens to
+            // find out what went wrong fills with the same line.
+            let (tx, rx) = mpsc::channel();
+            let mut seen = HashMap::new();
+            let say = |seen: &mut HashMap<String, String>, reason: &str| {
+                report_reaper_reason_change(
+                    seen,
+                    "alert-1",
+                    LogLevel::Warn,
+                    reason.to_string(),
+                    &tx,
+                )
+            };
+            assert!(say(&mut seen, "cannot resolve"), "first time is reported");
+            assert!(!say(&mut seen, "cannot resolve"), "repeat is not");
+            assert!(!say(&mut seen, "cannot resolve"), "still not");
+            assert!(say(&mut seen, "now two targets"), "a new reason is");
+            assert!(say(&mut seen, "cannot resolve"), "and so is changing back");
+
+            // A different alert is tracked separately — one noisy alert must
+            // not mask another's first report.
+            assert!(report_reaper_reason_change(
+                &mut seen,
+                "alert-2",
+                LogLevel::Warn,
+                "cannot resolve".to_string(),
+                &tx,
+            ));
+
+            drop(tx);
+            let sent: Vec<String> = rx
+                .into_iter()
+                .filter_map(|e| match e {
+                    ReaperEvent::Note { message, .. } => Some(message),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(sent.len(), 4, "{sent:#?}");
+        }
+
         #[test]
         fn only_a_box_without_opt_reaper_is_excused_the_follow_up_snapshots() {
             // A send-command that never answered is the case this matters
@@ -29451,6 +30093,76 @@ mod gui {
             let (includes, excludes) = search_terms_from_rules(&rules);
             assert_eq!(includes, vec!["orders"]);
             assert_eq!(excludes, vec!["legacy"]);
+        }
+
+        fn tagged(id: &str, pairs: &[(&str, &str)]) -> Instance {
+            let mut instance = Instance::new(id.to_string(), "running".to_string());
+            for (k, v) in pairs {
+                instance.tags.insert(k.to_string(), v.to_string());
+            }
+            instance
+        }
+
+        /// The Match Tag column was blank whenever the search used the
+        /// `Key: value` tag syntax — the column was fed by
+        /// `search_terms_from_rules`, which drops those terms on purpose so
+        /// the generic search never sees them. The rows filtered correctly
+        /// and the column said nothing about why.
+        #[test]
+        fn matched_tag_pairs_reports_a_tag_rule_match() {
+            let instance = tagged("i-1", &[("Application", "reaper")]);
+            let rules = vec![SearchRuleInput {
+                kind: SearchRuleKind::Include,
+                term: "Application: reaper".to_string(),
+            }];
+
+            assert_eq!(
+                matched_tag_pairs(&instance, &rules),
+                vec![("Application".to_string(), "reaper".to_string())]
+            );
+        }
+
+        /// An exclude rule says what must *not* be on the instance, so it
+        /// has nothing to contribute to a column about what matched.
+        #[test]
+        fn matched_tag_pairs_ignores_exclude_rules() {
+            let instance = tagged("i-1", &[("Application", "reaper")]);
+            let rules = vec![SearchRuleInput {
+                kind: SearchRuleKind::Exclude,
+                term: "Application: reaper".to_string(),
+            }];
+
+            assert!(matched_tag_pairs(&instance, &rules).is_empty());
+        }
+
+        /// A search mixing the two forms reports both, and a tag that both
+        /// terms hit is reported once — the column is a list of tags, not a
+        /// list of rules.
+        #[test]
+        fn matched_tag_pairs_combines_both_forms_without_repeating_a_tag() {
+            let instance = tagged("i-1", &[("Application", "reaper"), ("Team", "platform")]);
+            let rules = vec![
+                SearchRuleInput {
+                    kind: SearchRuleKind::Include,
+                    term: "Application: reaper".to_string(),
+                },
+                SearchRuleInput {
+                    kind: SearchRuleKind::Include,
+                    term: "reaper".to_string(),
+                },
+                SearchRuleInput {
+                    kind: SearchRuleKind::Include,
+                    term: "platform".to_string(),
+                },
+            ];
+
+            assert_eq!(
+                matched_tag_pairs(&instance, &rules),
+                vec![
+                    ("Application".to_string(), "reaper".to_string()),
+                    ("Team".to_string(), "platform".to_string()),
+                ]
+            );
         }
 
         #[test]
