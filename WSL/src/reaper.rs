@@ -380,6 +380,94 @@ pub fn escalation_subject(code: OutcomeCode, created_at: &str) -> String {
     }
 }
 
+/// Delimiters around a `docker ps -a` listing. Emitted by `reaper_fix.sh`
+/// (before the fix and straight after it) and by `reaper_docker_ps.sh` (the
+/// +1m and +5m follow-ups), so one parser reads all four.
+///
+/// Deliberately **not** a superstring of [`RE_PS_BEGIN`]: `parse_verdict`
+/// requires that marker to appear exactly once and treats any other count as
+/// untrustworthy, so a snapshot marker that also matched it would make every
+/// remediation unreadable. `snapshots_do_not_disturb_the_verdict` pins that.
+pub const RE_DOCKER_BEGIN: &str = "__RE_DOCKER_BEGIN__";
+pub const RE_DOCKER_END: &str = "__RE_DOCKER_END__";
+
+/// One `docker ps -a` listing recovered from a remote transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DockerSnapshot {
+    /// The word after the begin marker — `before-fix`, `after-fix`, `+1m`,
+    /// `+5m`. Blank when the script emitted none.
+    pub label: String,
+    /// The listing itself, one entry per line, blank lines dropped. Empty
+    /// when `docker ps -a` printed nothing at all, which is itself the
+    /// answer to "were there any containers" and is reported as such rather
+    /// than being mistaken for a missing snapshot.
+    pub lines: Vec<String>,
+}
+
+impl DockerSnapshot {
+    /// The header line `docker ps -a` prints before any container. Present
+    /// even when nothing is running, so its presence alone does not mean the
+    /// box had containers.
+    fn is_header(line: &str) -> bool {
+        line.starts_with("CONTAINER ID")
+    }
+
+    /// How many containers were listed, header excluded. `None` when the
+    /// listing is not in a shape this can count (no header — e.g. docker
+    /// itself errored), so a caller reports what came back rather than
+    /// claiming a count it did not establish.
+    pub fn container_count(&self) -> Option<usize> {
+        if self.lines.first().map(|l| Self::is_header(l)) == Some(true) {
+            Some(self.lines.len() - 1)
+        } else {
+            None
+        }
+    }
+}
+
+/// Pull every `docker ps -a` block out of a remote transcript, in the order
+/// the box printed them.
+///
+/// Tolerant on purpose — this is evidence for a human, never a verdict.
+/// An unterminated block (the invocation was cut off mid-listing) still
+/// yields what did arrive, because a truncated listing is more useful than
+/// no listing, and the missing end marker is not information the reader
+/// needs a second time.
+pub fn parse_docker_snapshots(output: &str) -> Vec<DockerSnapshot> {
+    let mut out = Vec::new();
+    let mut current: Option<DockerSnapshot> = None;
+    for line in output.lines() {
+        let trimmed = line.trim_end();
+        if let Some(rest) = trimmed.trim_start().strip_prefix(RE_DOCKER_BEGIN) {
+            // A begin inside a block ends the previous one: whatever it
+            // collected is still the truth about that moment.
+            if let Some(prev) = current.take() {
+                out.push(prev);
+            }
+            current = Some(DockerSnapshot {
+                label: rest.trim().to_string(),
+                lines: Vec::new(),
+            });
+            continue;
+        }
+        if trimmed.trim_start().starts_with(RE_DOCKER_END) {
+            if let Some(done) = current.take() {
+                out.push(done);
+            }
+            continue;
+        }
+        if let Some(snap) = current.as_mut() {
+            if !trimmed.trim().is_empty() {
+                snap.lines.push(trimmed.to_string());
+            }
+        }
+    }
+    if let Some(unterminated) = current.take() {
+        out.push(unterminated);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,6 +985,181 @@ mod tests {
     #[test]
     fn the_script_asks_compose_for_json() {
         assert!(REAPER_FIX_SH.contains("compose ps --format json"));
+    }
+
+    /// The +1m/+5m follow-ups. Same file-pairing hazard as `REAPER_FIX_SH`
+    /// above: the markers this asserts on are read by
+    /// `parse_docker_snapshots`, which lives here.
+    const REAPER_DOCKER_PS_SH: &str =
+        include_str!("../assets/scripts/reaper_docker_ps.sh");
+
+    #[test]
+    fn both_scripts_actually_run_docker_ps_a() {
+        // The whole point of the snapshots. `-a` specifically: without it an
+        // exited container -- the interesting case -- is not listed at all,
+        // and the log would report "no containers" about a box full of dead
+        // ones.
+        for (name, body) in [
+            ("reaper_fix.sh", REAPER_FIX_SH),
+            ("reaper_docker_ps.sh", REAPER_DOCKER_PS_SH),
+        ] {
+            assert!(body.contains("docker ps -a"), "{name} never runs docker ps -a");
+            for line in body.lines() {
+                let l = line.trim();
+                if l.starts_with('#') {
+                    continue;
+                }
+                if l.contains("docker ps") {
+                    assert!(l.contains("docker ps -a"), "{name}: docker ps without -a: {l}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn both_scripts_wrap_the_listing_in_the_markers_the_parser_reads() {
+        for (name, body) in [
+            ("reaper_fix.sh", REAPER_FIX_SH),
+            ("reaper_docker_ps.sh", REAPER_DOCKER_PS_SH),
+        ] {
+            for m in [RE_DOCKER_BEGIN, RE_DOCKER_END] {
+                assert!(body.contains(m), "{name} never emits {m}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_script_snapshots_docker_before_any_fix_and_again_after_it() {
+        // "Before it runs any fixes" means before the watchdog is stopped --
+        // that is the first thing on the box this script changes.
+        let pre = REAPER_FIX_SH.find("snapshot before-fix").expect("pre-fix snapshot");
+        let wd = REAPER_FIX_SH.find("stop reaper-watchdog").expect("stops the watchdog");
+        let up = REAPER_FIX_SH.find("compose up -d").expect("brings the stack up");
+        let post = REAPER_FIX_SH.find("snapshot after-fix").expect("post-fix snapshot");
+        // The *echo*, not the marker: both scripts also name it in a comment
+        // explaining why the snapshot markers must not collide with it.
+        let verdict = REAPER_FIX_SH
+            .find(&format!("echo \"{RE_PS_BEGIN}\""))
+            .expect("verdict block");
+        assert!(pre < wd, "the first snapshot must precede the first change");
+        assert!(up < post, "the second snapshot must follow the restart");
+        assert!(post < verdict, "the snapshot belongs above the verdict block");
+    }
+
+    #[test]
+    fn the_follow_up_script_changes_nothing_on_the_box() {
+        // It runs minutes after a remediation that may have failed, and on a
+        // box someone may already be working on. Evidence only.
+        for verb in [
+            "compose down", "compose up", "compose restart", "docker rm",
+            "docker kill", "docker stop", "docker start", "systemctl",
+        ] {
+            assert!(
+                !REAPER_DOCKER_PS_SH.contains(verb),
+                "the follow-up must not run {verb}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_scripts_cap_the_listing_so_the_verdict_block_survives() {
+        // `get-command-invocation` truncates StandardOutputContent at 24KB
+        // and the verdict block is last, so an unbounded `docker ps -a` on a
+        // busy box would turn a working fix into Indeterminate.
+        for (name, body) in [
+            ("reaper_fix.sh", REAPER_FIX_SH),
+            ("reaper_docker_ps.sh", REAPER_DOCKER_PS_SH),
+        ] {
+            for line in body.lines() {
+                let l = line.trim();
+                if l.starts_with('#') || !l.contains("docker ps -a") {
+                    continue;
+                }
+                assert!(l.contains("head -c"), "{name}: uncapped listing: {l}");
+            }
+        }
+    }
+
+    fn snapshot_block(label: &str, body: &str) -> String {
+        format!("{RE_DOCKER_BEGIN} {label}\n{body}\n{RE_DOCKER_END}\n")
+    }
+
+    #[test]
+    fn snapshots_do_not_disturb_the_verdict() {
+        // `parse_verdict` demands exactly one `__RE_PS_BEGIN__`/`__RE_PS_END__`.
+        // If the snapshot markers were ever renamed to a superstring of those,
+        // every remediation would come back Indeterminate -- with the fix
+        // having run. This is the test that catches that rename.
+        let out = format!(
+            "{RE_BEGIN}\n{}__RE_WD_STOPPED__\n__RE_DOWN_OK__\n__RE_UP_OK__\n{}\
+             {RE_PS_BEGIN}\n{{\"Name\":\"reaper\",\"State\":\"running\"}}\n{RE_PS_END}\n{RE_END}\n",
+            snapshot_block("before-fix", "CONTAINER ID   IMAGE\nabc123   reaper:latest"),
+            snapshot_block("after-fix", "CONTAINER ID   IMAGE\nabc123   reaper:latest"),
+        );
+        assert_eq!(parse_verdict(&out), Verdict::Success);
+        assert_eq!(out.matches(RE_PS_BEGIN).count(), 1);
+        assert_eq!(out.matches(RE_PS_END).count(), 1);
+    }
+
+    #[test]
+    fn every_snapshot_is_recovered_in_the_order_the_box_printed_them() {
+        let out = format!(
+            "{RE_BEGIN}\n{}noise\n{}{RE_END}\n",
+            snapshot_block("before-fix", "CONTAINER ID   IMAGE   STATUS\nabc   reaper   Exited (0)"),
+            snapshot_block("+5m", "CONTAINER ID   IMAGE   STATUS\nabc   reaper   Up 5 minutes"),
+        );
+        let snaps = parse_docker_snapshots(&out);
+        assert_eq!(snaps.len(), 2);
+        assert_eq!(snaps[0].label, "before-fix");
+        assert_eq!(snaps[1].label, "+5m");
+        // The listing is carried verbatim -- this is evidence a human reads.
+        assert_eq!(snaps[0].lines[1], "abc   reaper   Exited (0)");
+        assert_eq!(snaps[0].container_count(), Some(1));
+        assert_eq!(snaps[1].container_count(), Some(1));
+        // Text outside the markers is not part of any snapshot.
+        assert!(!snaps.iter().any(|s| s.lines.iter().any(|l| l == "noise")));
+    }
+
+    #[test]
+    fn a_box_with_no_containers_is_reported_as_none_not_as_no_snapshot() {
+        // `docker ps -a` prints its header and nothing else. That is an
+        // answer -- "there were no containers" -- and must not read the same
+        // as a snapshot that never arrived.
+        let snaps = parse_docker_snapshots(&snapshot_block(
+            "before-fix",
+            "CONTAINER ID   IMAGE   COMMAND   STATUS   NAMES",
+        ));
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].container_count(), Some(0));
+    }
+
+    #[test]
+    fn a_listing_docker_could_not_produce_is_not_counted() {
+        // No header: docker itself failed (daemon down, permissions). Its
+        // message is kept, but nothing here claims to know a container count.
+        let snaps = parse_docker_snapshots(&snapshot_block(
+            "+1m",
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock.",
+        ));
+        assert_eq!(snaps[0].container_count(), None);
+        assert_eq!(snaps[0].lines.len(), 1);
+    }
+
+    #[test]
+    fn a_snapshot_cut_off_mid_listing_still_yields_what_arrived() {
+        // The invocation timed out partway through. A truncated listing beats
+        // no listing.
+        let out = format!("{RE_DOCKER_BEGIN} +5m\nCONTAINER ID   IMAGE\nabc   reaper\n");
+        let snaps = parse_docker_snapshots(&out);
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].label, "+5m");
+        assert_eq!(snaps[0].lines.len(), 2);
+    }
+
+    #[test]
+    fn a_transcript_with_no_snapshots_yields_none() {
+        assert!(parse_docker_snapshots(&format!("{RE_BEGIN}\n{RE_END}\n")).is_empty());
+        assert!(parse_docker_snapshots("").is_empty());
     }
 
     /// `ssm_wait_for_command`'s deadline and `send_command_timeout_secs` live

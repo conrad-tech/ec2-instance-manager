@@ -400,6 +400,87 @@ response size, newest first.
   test is deliberately **one** test — split up, the cases would race under the
   parallel runner and pass or fail by scheduling.
 
+#### Reaper remediation: the four `docker ps -a` snapshots
+
+A remediation now photographs the box four times — before anything is touched,
+straight after `up -d`, then again at **+1m** and **+5m** — and the whole thing
+lands in the log. The verdict is still read from `compose ps` and nothing about
+that changed; these are evidence for the human who reads the run afterwards.
+
+- **The first two live in `reaper_fix.sh`** (its `snapshot` helper), the last
+  two in `reaper_docker_ps.sh`, sent as their own `send-command`s by
+  `spawn_reaper_snapshots`. **They cannot be one script.** The fix runs under
+  `send_command_timeout` (90s shipped), so sleeping five minutes inside it
+  would cut the invocation off before the `compose ps` block was ever read and
+  turn every remediation into `Indeterminate` — with the fix having run.
+- **Nor can they block `run_reaper_remediation`.** That would hold a failed
+  fix's escalation back by five minutes, which is the one cost an on-call path
+  must not pay for a diagnostic. So the follow-ups are a detached thread and
+  the verdict is decided on exactly the schedule it always was.
+- **`-a`, not a bare `ps`.** An exited container is the interesting case, and
+  it is the one a bare `docker ps` does not list at all — the log would say
+  "no containers" about a box full of dead ones.
+- **Both listings are capped at 4000 bytes** (`head -c`).
+  `get-command-invocation` truncates StandardOutputContent at 24KB and the
+  verdict block is at the *end* of the fix's output, so an unbounded listing on
+  a busy box pushes the one machine-read block off the cap.
+- **The snapshot markers are deliberately not a superstring of
+  `__RE_PS_BEGIN__`.** `parse_verdict` requires that marker exactly once and
+  calls any other count untrustworthy, so a rename that made them collide would
+  make every run unreadable. `snapshots_do_not_disturb_the_verdict` pins it.
+- **The follow-ups run on every outcome except `__RE_NODIR__`**
+  (`reaper_follow_ups_due`) — a failed `up -d` and a send-command that never
+  answered included, because "did anything answer on that box a minute later"
+  is most worth asking exactly then. `__RE_NODIR__` is the honest exclusion:
+  nothing was touched, so there is nothing to watch settle.
+- **The label reaches the follow-up script as a prepended shell assignment**
+  (`RE_SNAP_LABEL='+1m'`), because the body is handed over base64'd on bash's
+  stdin and there is no argv to put it in. It is always one of the literals in
+  `REAPER_SNAPSHOT_DELAYS`, never user text.
+- **The narration moved off stderr.** `run_reaper_remediation` used to
+  `eprintln!` the ack, the last look and the verdict, so the only account of an
+  unattended `compose down`/`up -d` on production went somewhere nobody reads.
+  It now sends `ReaperEvent::Note` / `ReaperEvent::Transcript` and
+  `poll_reaper_events` logs them. The transcript is reported **before** the
+  verdict — a conclusion that arrives ahead of its evidence reads as a
+  conclusion with nothing behind it.
+- **`reaper_transcript_lines` emits one log entry per line**, not one entry
+  holding a blob, so the level filters, the Find box and `MAX_LOG_LINES` behave
+  as they do for every other line. It prints a count per listing *and* the
+  output verbatim: the count is the same before and after a restart, and only
+  the STATUS column says one was `Exited (137)` and the other is `Up 2 seconds`.
+  A listing with no `CONTAINER ID` header is reported as **no readable
+  listing**, never as zero containers — "docker would not answer" and "there
+  was nothing there" are different diagnoses.
+- **A test using a `Verdict::Success` transcript will hang the suite.** Success
+  enters the stage-2 loop, which sleeps 30s per poll for a window defaulting to
+  ten minutes. `applied_transcript()` exists for this: a fix that ran, carrying
+  both listings, whose stack did not come back — so it returns before stage 2.
+
+#### The Logs tab's On-Call filter
+
+Right of the **Jira Alerts** checkbox, an **On-Call** dropdown with one
+checkbox per on-call script (today: **Reaper Down**). Ticking one narrows the
+log to that script's lines; nothing ticked is the whole log, exactly as before.
+
+- **`LogEntry.source` is what it filters on**, not a substring scan of the
+  message. Only the on-call scripts are distinguished — `LogSource` is not a
+  general-purpose subsystem tag.
+- **Nothing ticked must stay "everything".** A dropdown nobody opens must not
+  remove anything from view, so `OnCallFilters::includes` returns `true` for
+  every source when the selection is empty rather than matching nothing.
+- **The closed button says when it is filtering** (`On-Call: Reaper Down`).
+  The popup shuts as soon as it is used, and without this the only evidence
+  that most of the log is hidden is the log being short — which reads as the
+  app having stopped logging.
+- **The level checkboxes still apply**, ANDed with the selection: both filters
+  are on screen and independent, and one predicate feeds the count line, the
+  view and Copy All.
+- **The Jira Alerts trace is not affected by the selection.** An alerts call
+  and the remediation it triggered are the same story; hiding one while reading
+  the other is the opposite of what the dropdown is for.
+- Gated by `alerts_enabled`, the same gate as the checkbox beside it.
+
 ### Open in VS Code (right-click) — how the wrong login sneaks back in
 
 `src/ssh_config.rs` writes a managed Host block into the quarantined

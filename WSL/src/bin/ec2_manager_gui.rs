@@ -278,6 +278,23 @@ mod gui {
         }
     }
 
+    /// Which part of the app a log line came from.
+    ///
+    /// Only the on-call scripts are distinguished. Everything else is `App` —
+    /// this is not a general-purpose subsystem tag, it exists so the Logs
+    /// tab's **On-Call** dropdown can show one script's run on its own. A
+    /// remediation writes a `docker ps -a` listing four times over six
+    /// minutes, interleaved with whatever else the app happened to be doing,
+    /// and reading that out of the full log is the problem this solves.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LogSource {
+        App,
+        /// The reaper-down remediation: the poll thread, the fix transcript,
+        /// the follow-up snapshots, and the startup lines about whether the
+        /// feature came up at all.
+        ReaperDown,
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct LogEntry {
         level: LogLevel,
@@ -285,6 +302,50 @@ mod gui {
         /// Wall-clock timestamp in the local machine timezone, captured when
         /// logged (e.g. "2026-07-02 16:20:33 CDT").
         time: String,
+        /// Which subsystem wrote this. `App` for everything that is not an
+        /// on-call script — see [`LogSource`].
+        source: LogSource,
+    }
+
+    /// The Logs tab's **On-Call** dropdown: one checkbox per on-call script.
+    ///
+    /// Nothing checked means no source filter at all, i.e. exactly today's
+    /// log — including the reaper lines. Checking a box narrows the view to
+    /// that script and nothing else. It is deliberately *not* a "hide the
+    /// reaper" switch: the default has to stay the full log, or a user who
+    /// never opens this dropdown loses lines they used to see.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct OnCallFilters {
+        reaper_down: bool,
+    }
+
+    impl OnCallFilters {
+        /// True when at least one script is selected. With none selected the
+        /// filter is off entirely rather than matching nothing.
+        fn any(self) -> bool {
+            self.reaper_down
+        }
+
+        fn includes(self, source: LogSource) -> bool {
+            if !self.any() {
+                return true;
+            }
+            match source {
+                LogSource::ReaperDown => self.reaper_down,
+                LogSource::App => false,
+            }
+        }
+
+        /// What the closed dropdown reads. A filter narrowing the whole log
+        /// must not be invisible once the popup shuts — that is how someone
+        /// concludes the app has stopped logging.
+        fn label(self) -> &'static str {
+            if self.reaper_down {
+                "On-Call: Reaper Down"
+            } else {
+                "On-Call"
+            }
+        }
     }
 
     #[derive(Clone, Debug)]
@@ -2159,6 +2220,108 @@ mod gui {
             env!("OUT_DIR"),
             "/reaper_fix.sh.obf"
         ))))
+    }
+
+    /// Whether the +1m/+5m snapshots are due, given what the fix's run said.
+    ///
+    /// Everything except `__RE_NODIR__`. A failed `up -d`, an unreadable
+    /// verdict block, even a send-command that never answered at all — those
+    /// are the runs where "was anything running on that box a minute later"
+    /// is most worth asking, so none of them suppress the snapshots.
+    /// `__RE_NODIR__` is the single exclusion and the honest one: the script
+    /// found no `/opt/reaper`, changed nothing, and there is nothing to watch
+    /// settle.
+    ///
+    /// A function rather than an inline check because the alternative — an
+    /// end-to-end test of the empty-transcript case — cannot be written
+    /// cheaply: an empty transcript parses as `Indeterminate`, which does
+    /// *not* short-circuit, so such a test sits in the stage-2 loop for the
+    /// whole ten-minute window.
+    fn reaper_follow_ups_due(fix_output: &str) -> bool {
+        !fix_output.contains(ec2_manager::reaper::RE_NODIR)
+    }
+
+    /// When the follow-up `docker ps -a` snapshots run, measured from the
+    /// moment the fix command returned, with the label each carries.
+    ///
+    /// Cumulative, not gaps: the thread below sleeps the difference. Written
+    /// this way because these are the times a human asked for — "one minute
+    /// after and five minutes after" — and a table of gaps (60, 240) reads as
+    /// neither.
+    const REAPER_SNAPSHOT_DELAYS: [(u64, &str); 2] = [(60, "+1m"), (300, "+5m")];
+
+    /// One follow-up `docker ps -a`, labelled so the transcript says which of
+    /// the two it is.
+    ///
+    /// The label is prepended as a shell assignment rather than passed as an
+    /// argument, because the script is handed over base64'd as a single
+    /// `bash` stdin — there is no argv to put it in. It is always one of the
+    /// literals in [`REAPER_SNAPSHOT_DELAYS`], never user text, so there is
+    /// nothing here to escape.
+    fn reaper_snapshot_command(label: &str) -> String {
+        let script = deobf_asset(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/reaper_docker_ps.sh.obf"
+        )));
+        b64_script_command(&format!("RE_SNAP_LABEL='{label}'\n{script}"))
+    }
+
+    /// Start the +1m and +5m `docker ps -a` snapshots on their own thread.
+    ///
+    /// **Detached, and deliberately not part of the fix.** They cannot live
+    /// inside `reaper_fix.sh`: that runs under `send_command_timeout` (90s
+    /// shipped), so sleeping five minutes in it would have the invocation cut
+    /// off before the `compose ps` verdict block was read, and every
+    /// remediation would come back Indeterminate. Nor can they block
+    /// `run_reaper_remediation`: that would hold a failed fix's escalation
+    /// back by five minutes, which is the one cost an on-call path must not
+    /// pay for a diagnostic.
+    ///
+    /// So this returns immediately and the snapshots land in the log whenever
+    /// they arrive, alongside a verdict that was decided on the usual
+    /// schedule. Dropped rather than joined, like every other worker here: on
+    /// app close the process exits and takes any pending snapshot with it,
+    /// which costs a log line and nothing else — nothing on the box depends
+    /// on these running.
+    fn spawn_reaper_snapshots(
+        instance: String,
+        ctx: AwsContext,
+        timeout: Duration,
+        tx: Sender<ReaperEvent>,
+    ) {
+        std::thread::spawn(move || {
+            let mut elapsed = 0u64;
+            for (at, label) in REAPER_SNAPSHOT_DELAYS {
+                std::thread::sleep(Duration::from_secs(at.saturating_sub(elapsed)));
+                elapsed = at;
+                let ev = match exec_remote_command(
+                    &None,
+                    &ctx,
+                    &instance,
+                    &reaper_snapshot_command(label),
+                    timeout,
+                ) {
+                    Ok(out) => ReaperEvent::Transcript {
+                        instance: instance.clone(),
+                        stage: label.to_string(),
+                        output: out,
+                    },
+                    // Reported, never retried. A snapshot is evidence; a box
+                    // that cannot be reached at +1m is itself the evidence.
+                    Err(e) => ReaperEvent::Note {
+                        level: LogLevel::Warn,
+                        message: format!(
+                            "reaper: {instance} docker ps -a ({label}) could not be run: {e}"
+                        ),
+                    },
+                };
+                if tx.send(ev).is_err() {
+                    // The UI is gone; nothing is listening and the remaining
+                    // sleep would only hold a dead thread open.
+                    break;
+                }
+            }
+        });
     }
 
     /// Read both bastions' account tables and work out what it would take to
@@ -5486,6 +5649,9 @@ mod gui {
         /// checkbox — and the flag being stuck on from a previous build
         /// still renders nothing (`render_alerts_api_trace` re-checks).
         log_show_alerts_api: bool,
+        /// Which on-call scripts the Logs tab is narrowed to. All false — the
+        /// default — means no narrowing at all.
+        oncall_filters: OnCallFilters,
         /// Set for one frame by Ctrl+F so the search box takes focus.
         log_search_focus: bool,
         terminals: Vec<TerminalOption>,
@@ -6088,6 +6254,7 @@ mod gui {
                 },
                 log_search: String::new(),
                 log_show_alerts_api: false,
+                oncall_filters: OnCallFilters::default(),
                 log_search_focus: false,
                 terminals,
                 selected_terminal_id,
@@ -6286,11 +6453,11 @@ mod gui {
             }
             app.log_info("application started");
             for (is_warn, msg) in reaper_startup_log {
-                if is_warn {
-                    app.log_warn(msg);
-                } else {
-                    app.log_info(msg);
-                }
+                // Tagged like the rest of the remediation's output: "the
+                // feature never came up" is the first thing to look for under
+                // On-Call -> Reaper Down when nothing else is there.
+                let level = if is_warn { LogLevel::Warn } else { LogLevel::Info };
+                app.log_reaper(level, msg);
             }
             // The name every `allowed_users` gate is matched against, and what
             // each one decided. Without this a gate that does not match is
@@ -7066,16 +7233,34 @@ mod gui {
         }
 
         fn log(&mut self, level: LogLevel, message: impl Into<String>) {
+            self.log_from(LogSource::App, level, message);
+        }
+
+        /// The one place a log line is made. Everything else routes here so
+        /// the trim, the timestamp and the cap cannot differ between an app
+        /// line and an on-call script's line.
+        fn log_from(
+            &mut self,
+            source: LogSource,
+            level: LogLevel,
+            message: impl Into<String>,
+        ) {
             let mut message = message.into();
             if message.trim().is_empty() {
                 message = "<empty>".to_string();
             }
             let time = local_timestamp_now();
-            self.logs.push_back(LogEntry { level, message, time });
+            self.logs.push_back(LogEntry { level, message, time, source });
             if self.logs.len() > Self::MAX_LOG_LINES {
                 let overflow = self.logs.len() - Self::MAX_LOG_LINES;
                 self.logs.drain(0..overflow);
             }
+        }
+
+        /// A line from the reaper-down remediation, tagged so the On-Call
+        /// dropdown can show that script on its own.
+        fn log_reaper(&mut self, level: LogLevel, message: impl Into<String>) {
+            self.log_from(LogSource::ReaperDown, level, message);
         }
 
         fn log_error(&mut self, message: impl Into<String>) {
@@ -11221,18 +11406,26 @@ mod gui {
                         // A projection, not a result: dry run never ran the
                         // fix, never acknowledged, never contacted the
                         // instance. Must not be mistaken for a real outcome.
-                        self.log_info(format!(
+                        self.log_reaper(LogLevel::Info, format!(
                             "reaper: DRY RUN — would remediate {instance} (on_call={on_call}), projected code {code}"
                         ));
                     }
                     ReaperEvent::Skipped { reason } => {
-                        self.log_debug(format!("reaper: skipped — {reason}"))
+                        self.log_reaper(LogLevel::Debug, format!("reaper: skipped — {reason}"))
                     }
                     ReaperEvent::LookupFailed { detail } => {
-                        self.log_warn(format!("reaper: lookup failed — {detail}"))
+                        self.log_reaper(LogLevel::Warn, format!("reaper: lookup failed — {detail}"))
+                    }
+                    ReaperEvent::Note { level, message } => {
+                        self.log_reaper(*level, message.clone())
+                    }
+                    ReaperEvent::Transcript { instance, stage, output } => {
+                        for (level, line) in reaper_transcript_lines(instance, stage, output) {
+                            self.log_reaper(level, line);
+                        }
                     }
                     ReaperEvent::Outcome { code, instance, created_at } => {
-                        self.log_info(format!(
+                        self.log_reaper(LogLevel::Info, format!(
                             "reaper: {instance} -> {code} (alert createdAt {created_at:?})"
                         ));
                         // The notifier is the escalation-notifier spec's job.
@@ -20053,6 +20246,48 @@ mod gui {
             ui.separator();
         }
 
+        /// The **On-Call** dropdown, right of the Jira Alerts checkbox: one
+        /// row per on-call script, each with its checkbox on the right.
+        ///
+        /// Gated with `alerts_enabled`, the same gate as the checkbox beside
+        /// it — a user who cannot reach the on-call feed has no on-call
+        /// script output to narrow to.
+        ///
+        /// The Jira Alerts trace is deliberately *not* touched by this
+        /// selection: an alerts call and the remediation it triggered are the
+        /// same story, and hiding one while reading the other is the opposite
+        /// of what this dropdown is for.
+        fn render_oncall_log_filter(&mut self, ui: &mut egui::Ui) {
+            ui.separator();
+            egui::ComboBox::from_id_salt("oncall_log_filter")
+                .selected_text(self.oncall_filters.label())
+                // Wide enough for the longest label this can carry, so the
+                // closed button does not truncate the very thing it exists to
+                // say, and so the popup has room to put a checkbox in a
+                // column rather than against the text.
+                .width(170.0)
+                .show_ui(ui, |ui| {
+                    // Label left, checkbox right — the popup is sized to its
+                    // widest row, so the checkbox lands in a column rather
+                    // than against the text.
+                    ui.horizontal(|ui| {
+                        ui.label("Reaper Down");
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.checkbox(&mut self.oncall_filters.reaper_down, "");
+                            },
+                        );
+                    });
+                })
+                .response
+                .on_hover_text(
+                    "Narrow the log to one on-call script's run. Nothing ticked \
+                     shows the whole log, as before. The Jira Alerts trace shows \
+                     either way.",
+                );
+        }
+
         fn render_log_panel(&mut self, ui: &mut egui::Ui) {
             ui.horizontal(|ui| {
                 ui.label("Application log");
@@ -20082,6 +20317,7 @@ mod gui {
                              The newest one keeps its full response; older rows are \
                              metadata only.",
                         );
+                    self.render_oncall_log_filter(ui);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.checkbox(&mut self.log_filters.trace, "TRACE");
@@ -20124,10 +20360,14 @@ mod gui {
             // see is exactly what gets copied.
             let rendered = |e: &LogEntry| format!("[{}] [{}] {}", e.time, e.level.as_str(), e.message);
             let search = self.log_search.clone();
+            let oncall = self.oncall_filters;
             let visible: Vec<String> = self
                 .logs
                 .iter()
-                .filter(|e| self.log_filters.includes(e.level))
+                // The On-Call selection and the level checkboxes are
+                // independent and both on screen, so both apply. The count
+                // line, the view and Copy All all read this one predicate.
+                .filter(|e| oncall.includes(e.source) && self.log_filters.includes(e.level))
                 .map(&rendered)
                 .filter(|line| log_line_matches(line, &search))
                 .collect();
@@ -22726,6 +22966,26 @@ mod gui {
         },
         /// Matched, but not acted on.
         Skipped { reason: String },
+        /// A line of narration from a remediation in flight — the ack, the
+        /// last look, the verdict, a stage-2 poll that failed.
+        ///
+        /// These used to be `eprintln!`s, which meant the only account of a
+        /// six-minute unattended `compose down`/`up -d` on production went to
+        /// a stderr nobody reads. They belong in the log, next to the
+        /// `docker ps -a` listings they explain.
+        Note { level: LogLevel, message: String },
+        /// The stdout of one remote run, verbatim.
+        ///
+        /// `stage` names which run it was: `fix` for the remediation itself
+        /// (whose transcript carries the before-fix and after-fix listings),
+        /// then `+1m` and `+5m` for the two follow-ups. The whole transcript
+        /// is carried rather than a summary — what a human needs from a
+        /// failed remediation is the output, not our reading of it.
+        Transcript {
+            instance: String,
+            stage: String,
+            output: String,
+        },
         /// The on-call lookup could not be answered. Handling degrades to
         /// off call; the fix still runs.
         LookupFailed { detail: String },
@@ -22767,6 +23027,76 @@ mod gui {
         /// feed supplied none, which `escalation_subject` degrades to the
         /// bare code.
         created_at: String,
+    }
+
+    /// Turn one remote transcript into the log lines it earns.
+    ///
+    /// A header, then one summary line per `docker ps -a` listing found in
+    /// it, then the transcript verbatim, indented. Verbatim is the point: the
+    /// summary says how many containers were listed, but what a human needs
+    /// off a box that would not come back up is the output itself — the
+    /// STATUS column, the exit codes, whatever docker complained about.
+    ///
+    /// One entry per line rather than one entry holding a blob, so the level
+    /// filters, the Find box and `MAX_LOG_LINES` all behave the way they do
+    /// for every other line in the log.
+    ///
+    /// Pure, and returns the lines instead of logging them, so what a
+    /// transcript renders as can be asserted without an `Ec2GuiApp`.
+    fn reaper_transcript_lines(
+        instance: &str,
+        stage: &str,
+        output: &str,
+    ) -> Vec<(LogLevel, String)> {
+        use ec2_manager::reaper;
+
+        let body: Vec<&str> = output.lines().collect();
+        if body.iter().all(|l| l.trim().is_empty()) {
+            // Not a formatting edge case: an empty transcript is what a
+            // timed-out or refused send-command leaves behind, and saying so
+            // is more use than printing an empty block.
+            return vec![(
+                LogLevel::Warn,
+                format!("reaper: {instance} — {stage} run returned no output"),
+            )];
+        }
+
+        let mut out = vec![(
+            LogLevel::Info,
+            format!(
+                "reaper: {instance} — {stage} transcript ({} line(s))",
+                body.len()
+            ),
+        )];
+
+        let snapshots = reaper::parse_docker_snapshots(output);
+        if snapshots.is_empty() {
+            out.push((
+                LogLevel::Warn,
+                format!("reaper: {instance} — no docker ps -a listing in this transcript"),
+            ));
+        }
+        for snap in &snapshots {
+            let label = if snap.label.is_empty() { stage } else { &snap.label };
+            let summary = match snap.container_count() {
+                Some(0) => "no containers".to_string(),
+                Some(n) => format!("{n} container(s)"),
+                // No header line: docker itself did not produce a listing
+                // (daemon down, permission denied). Its own words are in the
+                // verbatim block below; nothing here claims a count.
+                None => format!("no readable listing ({} line(s))", snap.lines.len()),
+            };
+            out.push((
+                LogLevel::Info,
+                format!("reaper: {instance} — docker ps -a [{label}]: {summary}"),
+            ));
+        }
+
+        out.extend(
+            body.iter()
+                .map(|l| (LogLevel::Info, format!("    {}", l.trim_end()))),
+        );
+        out
     }
 
     /// The event a finished remediation reports back.
@@ -22905,6 +23235,7 @@ mod gui {
     /// `&AwsContext` only once the precondition has passed — this keeps the
     /// function testable against `FakeAlertOps` with a hand-built
     /// `AwsContext`, no AWS, SSM or network involved.
+    #[allow(clippy::too_many_arguments)]
     fn remediate_if_authorized(
         ctx_result: ec2_manager::error::Result<AwsContext>,
         account_id: &str,
@@ -22912,8 +23243,13 @@ mod gui {
         cfg: &ec2_manager::features::ReaperFeature,
         target: &ec2_manager::reaper::Target,
         on_call: bool,
+        tx: &Sender<ReaperEvent>,
         exec: impl FnOnce(&AwsContext, &str) -> std::result::Result<String, String>,
+        begin_follow_ups: impl FnOnce(&AwsContext),
     ) -> Option<ec2_manager::reaper::OutcomeCode> {
+        let note = |level: LogLevel, message: String| {
+            let _ = tx.send(ReaperEvent::Note { level, message });
+        };
         let ctx = match ctx_result {
             Ok(c) if remediation_precondition_met(account_id, c.auth_status, &c.mode) => c,
             Ok(c) if c.mode != Mode::Live => {
@@ -22921,29 +23257,51 @@ mod gui {
                 // logged at warn: someone who armed the feature and then
                 // launched in Sim needs to see *why* nothing happened, not
                 // have it look like the poll thread silently did nothing.
-                eprintln!(
-                    "reaper: warn: refusing to remediate {} — app is running in {} mode, \
-                     not live; armed reaper remediation only runs in Live mode — \
-                     acknowledge withheld",
-                    target.instance_id,
-                    c.mode.as_str()
+                note(
+                    LogLevel::Warn,
+                    format!(
+                        "reaper: refusing to remediate {} — app is running in {} mode, \
+                         not live; armed reaper remediation only runs in Live mode — \
+                         acknowledge withheld",
+                        target.instance_id,
+                        c.mode.as_str()
+                    ),
                 );
                 return Some(reaper_failure_tier(on_call));
             }
             Ok(c) => {
-                eprintln!(
-                    "reaper: refusing to remediate {} — account={account_id:?} \
-                     auth_status={} — acknowledge withheld",
-                    target.instance_id, c.auth_status
+                note(
+                    LogLevel::Warn,
+                    format!(
+                        "reaper: refusing to remediate {} — account={account_id:?} \
+                         auth_status={} — acknowledge withheld",
+                        target.instance_id, c.auth_status
+                    ),
                 );
                 return Some(reaper_failure_tier(on_call));
             }
             Err(e) => {
-                eprintln!("reaper: no credentials for {account_id}: {e}");
+                note(
+                    LogLevel::Warn,
+                    format!("reaper: no credentials for {account_id}: {e}"),
+                );
                 return Some(reaper_failure_tier(on_call));
             }
         };
-        run_reaper_remediation(ops, cfg, target, on_call, |cmd| exec(&ctx, cmd))
+        // Cloned rather than borrowed: the fix's own closure below takes
+        // `&ctx` for the length of the call, and the follow-ups need a
+        // context that outlives it — they run on a thread of their own for
+        // the next five minutes.
+        let ctx_for_follow_ups = ctx.clone();
+        run_reaper_remediation(
+            ops,
+            cfg,
+            target,
+            on_call,
+            tx,
+            |cmd| exec(&ctx, cmd),
+            move || begin_follow_ups(&ctx_for_follow_ups),
+        )
     }
 
     /// Run the remediation and decide what it earned.
@@ -22959,20 +23317,56 @@ mod gui {
     /// `AwsContext` + `exec_remote_command` call so a test can substitute a
     /// canned transcript with no AWS, no SSM and no network. It is called at
     /// most once (`FnOnce`) — this function never retries the fix itself.
+    ///
+    /// `begin_follow_ups` starts the +1m/+5m `docker ps -a` snapshots. It is
+    /// called from here, rather than by the caller after this returns,
+    /// because here is the only place that knows both *when* the fix
+    /// finished — the delays are measured from that moment — and whether
+    /// there was a fix at all. It runs on **every** transcript except
+    /// `__RE_NODIR__`, a failed send-command included: "did anything answer
+    /// on that box a minute later" is most worth knowing exactly when the
+    /// first attempt did not come back. `__RE_NODIR__` is the one exclusion,
+    /// and it is the honest one — the script found no `/opt/reaper`, changed
+    /// nothing, and there is nothing to watch settle.
+    ///
+    /// Every narration line goes to `tx` rather than to stderr, so the run is
+    /// readable in the Logs tab under **On-Call → Reaper Down**.
     fn run_reaper_remediation(
         ops: &impl AlertOps,
         cfg: &ec2_manager::features::ReaperFeature,
         target: &ec2_manager::reaper::Target,
         on_call: bool,
+        tx: &Sender<ReaperEvent>,
         exec: impl FnOnce(&str) -> std::result::Result<String, String>,
+        begin_follow_ups: impl FnOnce(),
     ) -> Option<ec2_manager::reaper::OutcomeCode> {
         use ec2_manager::reaper::{self, Verdict};
+
+        let note = |level: LogLevel, message: String| {
+            let _ = tx.send(ReaperEvent::Note { level, message });
+        };
+
+        note(
+            LogLevel::Info,
+            format!(
+                "reaper: remediating {} (alert {}, on_call={on_call})",
+                target.instance_id, target.alert_id
+            ),
+        );
 
         if on_call {
             if let Err(e) = ops.ack(&target.alert_id) {
                 // Not fatal: failing to ack costs a duplicate page, whereas
                 // refusing to fix costs the outage.
-                eprintln!("reaper: could not acknowledge {}: {e}", target.instance_id);
+                note(
+                    LogLevel::Warn,
+                    format!("reaper: could not acknowledge {}: {e}", target.instance_id),
+                );
+            } else {
+                note(
+                    LogLevel::Info,
+                    format!("reaper: acknowledged alert {}", target.alert_id),
+                );
             }
         }
 
@@ -22981,11 +23375,20 @@ mod gui {
         // lookup failure must not block a real remediation.
         match ops.fetch(&target.alert_id) {
             Ok(a) if reaper::alert_is_closed(&a.status) => {
-                eprintln!("reaper: {} closed before we acted", target.instance_id);
+                note(
+                    LogLevel::Info,
+                    format!(
+                        "reaper: {} closed before we acted — standing down, nothing was run",
+                        target.instance_id
+                    ),
+                );
                 return None;
             }
             Ok(_) => {}
-            Err(e) => eprintln!("reaper: last look failed, proceeding: {e}"),
+            Err(e) => note(
+                LogLevel::Warn,
+                format!("reaper: last look failed, proceeding: {e}"),
+            ),
         }
 
         // ---- committed from here: no standing down between `down` and
@@ -22993,18 +23396,41 @@ mod gui {
         let out = match exec(&reaper_fix_command()) {
             Ok(o) => o,
             Err(e) => {
-                eprintln!("reaper: send-command failed on {}: {e}", target.instance_id);
+                note(
+                    LogLevel::Error,
+                    format!("reaper: send-command failed on {}: {e}", target.instance_id),
+                );
                 String::new()
             }
         };
 
+        // The transcript before the verdict, always: it carries the
+        // before-fix and after-fix `docker ps -a` listings, and it is what a
+        // human needs whichever way the verdict goes.
+        let _ = tx.send(ReaperEvent::Transcript {
+            instance: target.instance_id.clone(),
+            stage: "fix".to_string(),
+            output: out.clone(),
+        });
+
+        if reaper_follow_ups_due(&out) {
+            begin_follow_ups();
+        }
+
         let verdict = reaper::parse_verdict(&out);
-        eprintln!("reaper: {} verdict {verdict:?}", target.instance_id);
+        note(
+            LogLevel::Info,
+            format!("reaper: {} verdict {verdict:?}", target.instance_id),
+        );
 
         if let Verdict::Failed(ref why) = verdict {
             // Don't spend the stage-2 window on a stack already known to be
-            // down.
-            eprintln!("reaper: {} failed: {why}", target.instance_id);
+            // down. The follow-up snapshots are already running on their own
+            // thread and are unaffected by this return.
+            note(
+                LogLevel::Error,
+                format!("reaper: {} failed: {why}", target.instance_id),
+            );
             return Some(reaper_failure_tier(on_call));
         }
 
@@ -23019,10 +23445,20 @@ mod gui {
                     break;
                 }
                 Ok(_) => {}
-                Err(e) => eprintln!("reaper: stage-2 poll failed: {e}"),
+                Err(e) => note(
+                    LogLevel::Warn,
+                    format!("reaper: stage-2 poll failed: {e}"),
+                ),
             }
         }
 
+        note(
+            LogLevel::Info,
+            format!(
+                "reaper: {} stage 2 finished, alert closed={closed}",
+                target.instance_id
+            ),
+        );
         Some(reaper::decide_outcome(on_call, &verdict, closed))
     }
 
@@ -23169,6 +23605,8 @@ mod gui {
                                 let ops = JsmAlertOps { auth: &auth_for_thread };
                                 let timeout = cfg_for_thread.send_command_timeout();
                                 let iid = target.instance_id.clone();
+                                let snap_iid = target.instance_id.clone();
+                                let snap_tx = tx_for_thread.clone();
                                 let outcome = remediate_if_authorized(
                                     ctx_result,
                                     &target.account_id,
@@ -23176,7 +23614,21 @@ mod gui {
                                     &cfg_for_thread,
                                     &target,
                                     on_call,
+                                    &tx_for_thread,
                                     |ctx, cmd| exec_remote_command(&None, ctx, &iid, cmd, timeout),
+                                    // Its own thread and its own context
+                                    // clone: this call returns at once and
+                                    // the snapshots go on arriving for the
+                                    // next five minutes, whatever the
+                                    // verdict below turns out to be.
+                                    move |ctx| {
+                                        spawn_reaper_snapshots(
+                                            snap_iid,
+                                            ctx.clone(),
+                                            timeout,
+                                            snap_tx,
+                                        )
+                                    },
                                 );
                                 if let Some(code) = outcome {
                                     let _ = tx_for_thread.send(outcome_event(code, &target));
@@ -25699,6 +26151,149 @@ mod gui {
             assert!(text.contains("compose up -d"));
         }
 
+        #[test]
+        fn the_follow_up_snapshot_command_is_one_base64_shot_carrying_its_label() {
+            for (_, label) in REAPER_SNAPSHOT_DELAYS {
+                let cmd = reaper_snapshot_command(label);
+                assert!(cmd.starts_with("echo "));
+                assert!(cmd.contains("| base64 -d | bash"));
+                assert_eq!(cmd.matches("base64 -d").count(), 1);
+                // Handed over encoded, like every other script here — the
+                // body must not be readable in the command line.
+                assert!(!cmd.contains("docker ps"));
+            }
+        }
+
+        #[test]
+        fn the_decoded_follow_up_runs_docker_ps_a_under_the_label_it_was_asked_for() {
+            use base64::Engine;
+            for (_, label) in REAPER_SNAPSHOT_DELAYS {
+                let cmd = reaper_snapshot_command(label);
+                let b64 = cmd
+                    .trim_start_matches("echo ")
+                    .split(' ')
+                    .next()
+                    .expect("has a payload");
+                let text = String::from_utf8(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .expect("valid base64"),
+                )
+                .expect("utf8");
+                // The label reaches the script as a shell assignment: there
+                // is no argv to pass it in, the whole thing arrives on stdin.
+                assert!(
+                    text.starts_with(&format!("RE_SNAP_LABEL='{label}'")),
+                    "label not prepended for {label}"
+                );
+                assert!(text.contains("docker ps -a"), "{label} never runs docker ps -a");
+                assert!(text.contains("__RE_DOCKER_BEGIN__"));
+            }
+        }
+
+        #[test]
+        fn the_follow_up_snapshots_land_at_one_and_five_minutes() {
+            // The times a human asked for. Measured from the fix returning,
+            // and cumulative — the thread sleeps the difference — so 300 is
+            // five minutes after the fix, not six.
+            assert_eq!(REAPER_SNAPSHOT_DELAYS, [(60, "+1m"), (300, "+5m")]);
+        }
+
+        /// The transcript of a real remediation: both listings the script
+        /// takes, the step markers between them, and the verdict block.
+        fn fix_transcript_with_snapshots() -> String {
+            use ec2_manager::reaper::{RE_BEGIN, RE_END, RE_PS_BEGIN, RE_PS_END};
+            format!(
+                "{RE_BEGIN}\n\
+                 __RE_DOCKER_BEGIN__ before-fix\n\
+                 CONTAINER ID   IMAGE          STATUS\n\
+                 abc123         reaper:latest  Exited (137) 2 minutes ago\n\
+                 __RE_DOCKER_END__\n\
+                 __RE_WD_STOPPED__\n__RE_DOWN_OK__\n__RE_UP_OK__\n\
+                 __RE_DOCKER_BEGIN__ after-fix\n\
+                 CONTAINER ID   IMAGE          STATUS\n\
+                 abc123         reaper:latest  Up 2 seconds\n\
+                 __RE_DOCKER_END__\n\
+                 {RE_PS_BEGIN}\n\
+                 {{\"Name\":\"reaper\",\"State\":\"running\"}}\n\
+                 {RE_PS_END}\n{RE_END}\n"
+            )
+        }
+
+        #[test]
+        fn a_fix_transcript_logs_both_listings_and_the_output_verbatim() {
+            let lines = reaper_transcript_lines("i-0abc", "fix", &fix_transcript_with_snapshots());
+            let text: Vec<&str> = lines.iter().map(|(_, l)| l.as_str()).collect();
+
+            // One summary line per listing, in the order the box printed them.
+            let summaries: Vec<&&str> = text
+                .iter()
+                .filter(|l| l.contains("docker ps -a ["))
+                .collect();
+            assert_eq!(summaries.len(), 2, "{text:#?}");
+            assert!(summaries[0].contains("[before-fix]: 1 container(s)"), "{summaries:?}");
+            assert!(summaries[1].contains("[after-fix]: 1 container(s)"), "{summaries:?}");
+
+            // And the transcript itself, verbatim. The STATUS column is the
+            // whole point — "1 container" is the same count before and after,
+            // and only the output says one was dead and one is up.
+            assert!(text.iter().any(|l| l.contains("Exited (137) 2 minutes ago")));
+            assert!(text.iter().any(|l| l.contains("Up 2 seconds")));
+            // Including the step markers between the two listings, so the log
+            // shows everything that ran and not just its endpoints.
+            for marker in ["__RE_WD_STOPPED__", "__RE_DOWN_OK__", "__RE_UP_OK__"] {
+                assert!(text.iter().any(|l| l.contains(marker)), "missing {marker}");
+            }
+        }
+
+        #[test]
+        fn a_box_with_no_containers_says_so_rather_than_saying_nothing() {
+            let out = "__RE_DOCKER_BEGIN__ +1m\n\
+                       CONTAINER ID   IMAGE   COMMAND   STATUS   NAMES\n\
+                       __RE_DOCKER_END__\n";
+            let lines = reaper_transcript_lines("i-0abc", "+1m", out);
+            assert!(
+                lines.iter().any(|(_, l)| l.contains("[+1m]: no containers")),
+                "{lines:#?}"
+            );
+        }
+
+        #[test]
+        fn a_docker_that_could_not_list_is_not_reported_as_zero_containers() {
+            // "no containers" and "docker would not answer" are different
+            // diagnoses and must not render the same.
+            let out = "__RE_DOCKER_BEGIN__ +5m\n\
+                       Cannot connect to the Docker daemon at unix:///var/run/docker.sock.\n\
+                       __RE_DOCKER_END__\n";
+            let lines = reaper_transcript_lines("i-0abc", "+5m", out);
+            let text: Vec<&str> = lines.iter().map(|(_, l)| l.as_str()).collect();
+            assert!(text.iter().any(|l| l.contains("no readable listing")), "{text:#?}");
+            assert!(!text.iter().any(|l| l.contains("no containers")), "{text:#?}");
+            assert!(text.iter().any(|l| l.contains("Cannot connect to the Docker daemon")));
+        }
+
+        #[test]
+        fn a_transcript_with_no_listing_is_flagged_and_an_empty_one_is_a_warning() {
+            // A run that came back without a listing is a hole in the record,
+            // not a run with nothing to say.
+            let missing = reaper_transcript_lines("i-0abc", "+1m", "some other output\n");
+            assert!(
+                missing
+                    .iter()
+                    .any(|(lv, l)| *lv == LogLevel::Warn && l.contains("no docker ps -a listing")),
+                "{missing:#?}"
+            );
+
+            // And nothing at all is what a timed-out or refused send-command
+            // leaves; saying so beats printing an empty block.
+            for empty in ["", "   \n\n"] {
+                let lines = reaper_transcript_lines("i-0abc", "fix", empty);
+                assert_eq!(lines.len(), 1, "{lines:#?}");
+                assert_eq!(lines[0].0, LogLevel::Warn);
+                assert!(lines[0].1.contains("returned no output"));
+            }
+        }
+
         /// Test double for `AlertOps`. Records every call (in order) so a
         /// test can assert both count and ordering — the thing the pure
         /// decision functions (`parse_verdict`, `decide_outcome`,
@@ -25737,6 +26332,17 @@ mod gui {
                     Err(e) => Err(e.to_string()),
                 }
             }
+        }
+
+        /// A narration sink for tests that are not about the narration.
+        ///
+        /// The receiver is dropped straight away, which is safe here for the
+        /// reason every send site states in code: a closed channel means the
+        /// UI is gone, and it is always ignored rather than propagated. Tests
+        /// that *do* assert on what was reported build a real channel and
+        /// keep the receiver.
+        fn null_reaper_tx() -> Sender<ReaperEvent> {
+            mpsc::channel().0
         }
 
         fn test_reaper_target() -> ec2_manager::reaper::Target {
@@ -25845,9 +26451,9 @@ mod gui {
             };
             let cfg = ec2_manager::features::ReaperFeature::default();
             let target = test_reaper_target();
-            let _ = run_reaper_remediation(&ops, &cfg, &target, false, |_| {
+            let _ = run_reaper_remediation(&ops, &cfg, &target, false, &null_reaper_tx(), |_| {
                 Ok(failing_transcript())
-            });
+            }, || {});
             assert!(!ops.log.borrow().contains(&"ack"));
         }
 
@@ -25865,9 +26471,9 @@ mod gui {
             };
             let cfg = ec2_manager::features::ReaperFeature::default();
             let target = test_reaper_target();
-            let _ = run_reaper_remediation(&ops, &cfg, &target, false, |_| {
+            let _ = run_reaper_remediation(&ops, &cfg, &target, false, &null_reaper_tx(), |_| {
                 Ok(failing_transcript())
-            });
+            }, || {});
             assert_eq!(ops.log.borrow().iter().filter(|c| **c == "ack").count(), 0);
         }
 
@@ -25880,9 +26486,9 @@ mod gui {
             };
             let cfg = ec2_manager::features::ReaperFeature::default();
             let target = test_reaper_target();
-            let _ = run_reaper_remediation(&ops, &cfg, &target, true, |_| {
+            let _ = run_reaper_remediation(&ops, &cfg, &target, true, &null_reaper_tx(), |_| {
                 Ok(failing_transcript())
-            });
+            }, || {});
             let log = ops.log.borrow();
             assert_eq!(log.iter().filter(|c| **c == "ack").count(), 1);
             assert_eq!(log.first(), Some(&"ack"));
@@ -25899,10 +26505,10 @@ mod gui {
             let cfg = ec2_manager::features::ReaperFeature::default();
             let target = test_reaper_target();
             let exec_calls = std::cell::Cell::new(0);
-            let outcome = run_reaper_remediation(&ops, &cfg, &target, true, |_| {
+            let outcome = run_reaper_remediation(&ops, &cfg, &target, true, &null_reaper_tx(), |_| {
                 exec_calls.set(exec_calls.get() + 1);
                 Ok(failing_transcript())
-            });
+            }, || {});
             assert_eq!(exec_calls.get(), 0);
             assert!(outcome.is_none());
         }
@@ -25916,9 +26522,9 @@ mod gui {
             };
             let cfg = ec2_manager::features::ReaperFeature::default();
             let target = test_reaper_target();
-            let outcome = run_reaper_remediation(&ops, &cfg, &target, true, |_| {
+            let outcome = run_reaper_remediation(&ops, &cfg, &target, true, &null_reaper_tx(), |_| {
                 Ok(failing_transcript())
-            });
+            }, || {});
             // Exactly one fetch: the last look. A stage-2 poll would be a
             // second one, and `Verdict::Failed` must return before that
             // loop is ever entered.
@@ -25936,10 +26542,10 @@ mod gui {
             let cfg = ec2_manager::features::ReaperFeature::default();
             let target = test_reaper_target();
             let exec_calls = std::cell::Cell::new(0);
-            let outcome = run_reaper_remediation(&ops, &cfg, &target, true, |_| {
+            let outcome = run_reaper_remediation(&ops, &cfg, &target, true, &null_reaper_tx(), |_| {
                 exec_calls.set(exec_calls.get() + 1);
                 Ok(failing_transcript())
-            });
+            }, || {});
             assert_eq!(exec_calls.get(), 1);
             assert!(outcome.is_some());
         }
@@ -25954,12 +26560,237 @@ mod gui {
             let cfg = ec2_manager::features::ReaperFeature::default();
             let target = test_reaper_target();
             let exec_calls = std::cell::Cell::new(0);
-            let outcome = run_reaper_remediation(&ops, &cfg, &target, false, |_| {
+            let outcome = run_reaper_remediation(&ops, &cfg, &target, false, &null_reaper_tx(), |_| {
                 exec_calls.set(exec_calls.get() + 1);
                 Ok(failing_transcript())
-            });
+            }, || {});
             assert_eq!(exec_calls.get(), 1);
             assert!(outcome.is_some());
+        }
+
+        /// A transcript from a fix that **ran** — both `docker ps -a`
+        /// listings, every step marker — and whose stack did not come back,
+        /// so `parse_verdict` reads it as `Failed`.
+        ///
+        /// Failed on purpose, and it is not a detail: `Verdict::Success`
+        /// enters the stage-2 loop, which sleeps 30s per poll for a window
+        /// that defaults to *ten minutes* off call. Every test below is about
+        /// what happens around the fix, not about stage 2, so they all use a
+        /// transcript that returns before that loop. `failing_transcript`
+        /// above returns even earlier (`RE_NODIR`), but that one says the fix
+        /// never ran at all — which is the one case that must **not** start
+        /// the follow-up snapshots, so it cannot double as this.
+        fn applied_transcript() -> String {
+            use ec2_manager::reaper::{RE_PS_BEGIN, RE_PS_END};
+            let full = fix_transcript_with_snapshots();
+            let (before, _) = full.split_once(RE_PS_BEGIN).expect("has a verdict block");
+            format!(
+                "{before}{RE_PS_BEGIN}\n\
+                 {{\"Name\":\"reaper\",\"State\":\"exited\"}}\n{RE_PS_END}\n__RE_END__\n"
+            )
+        }
+
+        #[test]
+        fn the_follow_up_snapshots_begin_once_the_fix_has_run() {
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let begun = std::cell::Cell::new(0);
+            let _ = run_reaper_remediation(
+                &ops,
+                &cfg,
+                &target,
+                false,
+                &null_reaper_tx(),
+                |_| Ok(applied_transcript()),
+                || begun.set(begun.get() + 1),
+            );
+            assert_eq!(begun.get(), 1);
+        }
+
+        #[test]
+        fn a_failed_fix_still_starts_the_follow_up_snapshots() {
+            // The case they matter most in. A stack that did not come back is
+            // exactly when "was anything running a minute later" is worth
+            // asking, and the early return on `Verdict::Failed` must not take
+            // the snapshots with it.
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let down = applied_transcript();
+            let begun = std::cell::Cell::new(0);
+            let outcome = run_reaper_remediation(
+                &ops,
+                &cfg,
+                &target,
+                true,
+                &null_reaper_tx(),
+                |_| Ok(down),
+                || begun.set(begun.get() + 1),
+            );
+            assert_eq!(outcome, Some(ec2_manager::reaper::OutcomeCode::Failure));
+            assert_eq!(begun.get(), 1, "a failed fix is still worth watching settle");
+        }
+
+        #[test]
+        fn only_a_box_without_opt_reaper_is_excused_the_follow_up_snapshots() {
+            // A send-command that never answered is the case this matters
+            // for: whether anything responds a minute later is the only thing
+            // separating a slow invocation from an unreachable instance. It
+            // is checked here rather than through `run_reaper_remediation`
+            // because an empty transcript parses as `Indeterminate`, which
+            // does not short-circuit -- such a test would sit in the stage-2
+            // loop for ten minutes.
+            assert!(reaper_follow_ups_due(""), "a run that said nothing");
+            assert!(reaper_follow_ups_due(&applied_transcript()), "a fix that ran");
+            assert!(
+                reaper_follow_ups_due("__RE_BEGIN__\n__RE_UP_FAIL__\n__RE_END__\n"),
+                "a fix that failed"
+            );
+            assert!(
+                !reaper_follow_ups_due(&failing_transcript()),
+                "__RE_NODIR__: nothing was touched, so there is nothing to watch"
+            );
+        }
+
+        #[test]
+        fn a_box_with_no_opt_reaper_gets_no_follow_up_snapshots() {
+            // The script changed nothing and said so. There is nothing to
+            // watch settle, and two more send-commands to a box that was
+            // never ours would be noise.
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let begun = std::cell::Cell::new(0);
+            let _ = run_reaper_remediation(
+                &ops,
+                &cfg,
+                &target,
+                false,
+                &null_reaper_tx(),
+                |_| Ok(failing_transcript()),
+                || begun.set(begun.get() + 1),
+            );
+            assert_eq!(begun.get(), 0);
+        }
+
+        #[test]
+        fn an_alert_closed_at_the_last_look_starts_nothing_at_all() {
+            // Nothing ran, so there is nothing to snapshot.
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("closed"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let begun = std::cell::Cell::new(0);
+            let outcome = run_reaper_remediation(
+                &ops,
+                &cfg,
+                &target,
+                true,
+                &null_reaper_tx(),
+                |_| Ok(applied_transcript()),
+                || begun.set(begun.get() + 1),
+            );
+            assert!(outcome.is_none());
+            assert_eq!(begun.get(), 0);
+        }
+
+        #[test]
+        fn the_whole_run_is_narrated_to_the_log_not_to_stderr() {
+            // Before this, the only account of an unattended `compose down` /
+            // `up -d` on production went to a stderr nobody reads.
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let (tx, rx) = mpsc::channel();
+            let _ = run_reaper_remediation(
+                &ops,
+                &cfg,
+                &target,
+                true,
+                &tx,
+                |_| Ok(applied_transcript()),
+                || {},
+            );
+            drop(tx);
+            let events: Vec<ReaperEvent> = rx.into_iter().collect();
+
+            let notes: Vec<&String> = events
+                .iter()
+                .filter_map(|e| match e {
+                    ReaperEvent::Note { message, .. } => Some(message),
+                    _ => None,
+                })
+                .collect();
+            assert!(notes.iter().any(|m| m.contains("acknowledged")), "{notes:#?}");
+            assert!(notes.iter().any(|m| m.contains("verdict")), "{notes:#?}");
+
+            // And the transcript itself crossed, tagged as the fix run.
+            let transcripts: Vec<(&String, &String)> = events
+                .iter()
+                .filter_map(|e| match e {
+                    ReaperEvent::Transcript { stage, output, .. } => Some((stage, output)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(transcripts.len(), 1);
+            assert_eq!(transcripts[0].0, "fix");
+            assert!(transcripts[0].1.contains("__RE_DOCKER_BEGIN__ before-fix"));
+            assert!(transcripts[0].1.contains("__RE_DOCKER_BEGIN__ after-fix"));
+        }
+
+        #[test]
+        fn a_transcript_is_reported_before_the_verdict_is_decided() {
+            // Ordering, not content: a verdict that arrives before the
+            // evidence reads in the log as a conclusion with nothing behind
+            // it, and on a failed fix the evidence is the whole point.
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let (tx, rx) = mpsc::channel();
+            let _ = run_reaper_remediation(
+                &ops,
+                &cfg,
+                &target,
+                false,
+                &tx,
+                |_| Ok(applied_transcript()),
+                || {},
+            );
+            drop(tx);
+            let events: Vec<ReaperEvent> = rx.into_iter().collect();
+            let transcript_at = events
+                .iter()
+                .position(|e| matches!(e, ReaperEvent::Transcript { .. }))
+                .expect("the transcript is reported");
+            let verdict_at = events
+                .iter()
+                .position(|e| matches!(e, ReaperEvent::Note { message, .. } if message.contains("verdict")))
+                .expect("the verdict is reported");
+            assert!(transcript_at < verdict_at, "{events:#?}");
         }
 
         /// A context whose `auth_status` is not `Ok` — the shape
@@ -25994,10 +26825,12 @@ mod gui {
                 &cfg,
                 &target,
                 true,
+                &null_reaper_tx(),
                 |_ctx, _cmd| {
                     exec_calls.set(exec_calls.get() + 1);
                     Ok(failing_transcript())
                 },
+                |_ctx| {},
             );
             assert_eq!(exec_calls.get(), 0);
             assert!(ops.log.borrow().is_empty());
@@ -26035,10 +26868,12 @@ mod gui {
                 &cfg,
                 &target,
                 false,
+                &null_reaper_tx(),
                 |_ctx, _cmd| {
                     exec_calls.set(exec_calls.get() + 1);
                     Ok(failing_transcript())
                 },
+                |_ctx| {},
             );
             assert_eq!(exec_calls.get(), 0);
             assert!(ops.log.borrow().is_empty());
@@ -26064,10 +26899,12 @@ mod gui {
                 &cfg,
                 &target,
                 true,
+                &null_reaper_tx(),
                 |_ctx, _cmd| {
                     exec_calls.set(exec_calls.get() + 1);
                     Ok(failing_transcript())
                 },
+                |_ctx| {},
             );
             assert_eq!(exec_calls.get(), 0);
             assert!(ops.log.borrow().is_empty());
@@ -26103,10 +26940,12 @@ mod gui {
                 &cfg,
                 &target,
                 true,
+                &null_reaper_tx(),
                 |_ctx, _cmd| {
                     exec_calls.set(exec_calls.get() + 1);
                     Ok(failing_transcript())
                 },
+                |_ctx| {},
             );
             assert_eq!(exec_calls.get(), 1);
             assert_eq!(ops.log.borrow().iter().filter(|c| **c == "ack").count(), 1);
@@ -26149,10 +26988,12 @@ mod gui {
                 &cfg,
                 &target,
                 true,
+                &null_reaper_tx(),
                 |_ctx, _cmd| {
                     exec_calls.set(exec_calls.get() + 1);
                     Ok(failing_transcript())
                 },
+                |_ctx| {},
             );
             assert_eq!(exec_calls.get(), 0);
             assert!(ops.log.borrow().is_empty());
@@ -28847,6 +29688,80 @@ mod gui {
             filters.set_verbosity_high();
             assert!(filters.includes(LogLevel::Debug));
             assert!(filters.includes(LogLevel::Trace));
+        }
+
+        #[test]
+        fn nothing_ticked_in_on_call_shows_the_whole_log() {
+            // The default has to stay today's log, reaper lines included.
+            // A dropdown nobody opens must not remove anything from view.
+            let none = OnCallFilters::default();
+            assert!(!none.any());
+            assert!(none.includes(LogSource::App));
+            assert!(none.includes(LogSource::ReaperDown));
+            assert_eq!(none.label(), "On-Call");
+        }
+
+        #[test]
+        fn ticking_reaper_down_narrows_the_log_to_that_script() {
+            let only_reaper = OnCallFilters { reaper_down: true };
+            assert!(only_reaper.any());
+            assert!(only_reaper.includes(LogSource::ReaperDown));
+            assert!(!only_reaper.includes(LogSource::App));
+        }
+
+        #[test]
+        fn a_narrowed_log_says_so_on_the_closed_dropdown() {
+            // The popup shuts as soon as it is used, so without this the only
+            // evidence that most of the log is being hidden is the log being
+            // short — which reads as the app having stopped logging.
+            assert_eq!(OnCallFilters { reaper_down: true }.label(), "On-Call: Reaper Down");
+        }
+
+        #[test]
+        fn the_reaper_script_s_lines_are_tagged_and_everything_else_is_not() {
+            let mut app = Ec2GuiApp::new(GuiOptions {
+                mode: Mode::Sim,
+                region: None,
+                dry_run: true,
+                debug: false,
+                wsl_auto_setup: false,
+            });
+            app.logs.clear();
+            app.log_info("an ordinary app line");
+            app.log_reaper(LogLevel::Info, "reaper: i-0abc — fix transcript");
+
+            let sources: Vec<LogSource> = app.logs.iter().map(|e| e.source).collect();
+            assert_eq!(sources, vec![LogSource::App, LogSource::ReaperDown]);
+
+            // And that tag is what the dropdown filters on — asserted through
+            // the same predicate the panel uses, not a reimplementation of it.
+            let only_reaper = OnCallFilters { reaper_down: true };
+            let kept: Vec<&str> = app
+                .logs
+                .iter()
+                .filter(|e| only_reaper.includes(e.source))
+                .map(|e| e.message.as_str())
+                .collect();
+            assert_eq!(kept, vec!["reaper: i-0abc — fix transcript"]);
+        }
+
+        #[test]
+        fn the_level_checkboxes_still_apply_inside_a_narrowed_log() {
+            // The two filters are independent and both on screen. A DEBUG
+            // reaper line with DEBUG unticked stays hidden, the same as any
+            // other DEBUG line.
+            let only_reaper = OnCallFilters { reaper_down: true };
+            let mut levels = LogFilters::default();
+            levels.set_verbosity_low();
+            assert!(!levels.includes(LogLevel::Debug));
+            let hidden_by_level = LogEntry {
+                level: LogLevel::Debug,
+                message: "reaper: skipped — cooldown".to_string(),
+                time: String::new(),
+                source: LogSource::ReaperDown,
+            };
+            assert!(only_reaper.includes(hidden_by_level.source));
+            assert!(!levels.includes(hidden_by_level.level));
         }
 
         #[test]

@@ -268,6 +268,7 @@ fn emit_obfuscated_assets() {
         ("sudoers_grant.sh.obf", "assets/scripts/sudoers_grant.sh"),
         ("user_sync_dump.sh.obf", "assets/scripts/user_sync_dump.sh"),
         ("reaper_fix.sh.obf", "assets/scripts/reaper_fix.sh"),
+        ("reaper_docker_ps.sh.obf", "assets/scripts/reaper_docker_ps.sh"),
     ];
 
     for (out_name, src) in assets {

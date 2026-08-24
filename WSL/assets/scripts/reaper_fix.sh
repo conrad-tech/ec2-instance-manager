@@ -14,6 +14,26 @@
 # moment later.
 set -u
 
+# `docker ps -a` before anything is touched and again once the stack is back,
+# so a human reading the log can see what was actually on the box rather than
+# inferring it from the outcome. `-a` on purpose: an exited container is the
+# interesting case, and `compose ps` below only speaks for this project.
+#
+# Capped at 4000 bytes each. `get-command-invocation` truncates
+# StandardOutputContent at 24KB and the verdict block is at the *end* of this
+# output, so an unbounded listing on a busy box would push the one
+# machine-read block off the cap and turn a working fix into Indeterminate.
+#
+# The markers are deliberately not a superstring of `__RE_PS_BEGIN__`:
+# `parse_verdict` requires that marker to appear exactly once, and a snapshot
+# block that also matched it would make every run unreadable.
+snapshot() {
+  echo "__RE_DOCKER_BEGIN__ $1"
+  docker ps -a 2>&1 | head -c 4000
+  echo
+  echo "__RE_DOCKER_END__"
+}
+
 echo "__RE_BEGIN__"
 
 # Checked before anything is changed. On the wrong box this must be a no-op,
@@ -25,6 +45,10 @@ if [ ! -d /opt/reaper ]; then
 fi
 
 cd /opt/reaper || { echo "__RE_NODIR__"; echo "__RE_END__"; exit 0; }
+
+# Before anything is changed, and after the guard above: on a box with no
+# /opt/reaper nothing is touched and nothing is reported about it.
+snapshot before-fix
 
 # Left stopped on purpose. The watchdog would race the restart, and a box
 # running without it is the reason a *successful* fix is still reported.
@@ -50,6 +74,12 @@ if timeout 30 docker compose up -d; then
 else
   echo "__RE_UP_FAIL__"
 fi
+
+# Straight after the restart. Two more follow at +1m and +5m, sent as their
+# own commands by the app -- they cannot live here, since this whole script
+# runs under a 90s send-command timeout and sleeping through them would kill
+# the verdict block below.
+snapshot after-fix
 
 # The authority for the verdict. Everything above is context for a human
 # reading the log.
