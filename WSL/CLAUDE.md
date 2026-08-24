@@ -517,12 +517,46 @@ rounds of guessing. Each now says so:
   actionable". The second is a WARN naming the alert id. That is the case
   above, and it must never be silent again.
 
-#### Test reaper match (Alerts window)
+#### Test Alert Match (Alerts window)
 
-An alert id in, the whole decision out, without taking reaper down to see it:
-fetch the alert, run `identifies` / `match_alert`, resolve the subject through
-the same `resolve_reaper_target` the poll thread uses, report the projection.
-Results land in the log under On-Call → Reaper Down.
+An alert id in, the whole decision out, without taking anything down to see
+it: fetch the alert, run `identifies` / `match_alert`, resolve the subject,
+**read the box itself**, report the projection. Results land in the log under
+On-Call → Reaper Down.
+
+Named for the alert, not for reaper — the matcher is reaper's today and more
+are expected. The log lines still say `reaper probe:`, which is accurate about
+what actually ran.
+
+`reaper_probe.sh` is `reaper_fix.sh` with every command that *changes*
+something removed: the `/opt/reaper` guard, `docker ps -a`, `systemctl
+is-active reaper-watchdog`, `docker compose ps --format json`. Same markers,
+so one parser reads both.
+
+- **That it changes nothing is a test, not a review note.**
+  `the_probe_script_changes_nothing_on_the_box` scans the executable lines for
+  every mutating verb and for any redirection. This is pointed at production
+  from a button labelled "test"; a mutating line added later would run
+  unannounced. The scan skips comments deliberately — the file's header names
+  the commands it must never run, and that sentence is worth keeping.
+- **`systemctl is-active`, never `status`.** It reports and nothing else. Worth
+  having because the fix leaves the watchdog stopped on purpose, so a box found
+  with it inactive is the trace of an earlier remediation rather than a fault.
+- **The state summary is `compose_services`, not `parse_verdict`.** The verdict
+  answers "did the fix work" and words its failure as `not running after
+  restart` — a restart the probe never performed, and a sentence in the log
+  describing something that did not happen. `compose_services` also *skips* an
+  unreadable line rather than degrading to `Indeterminate`: nothing acts on
+  this, it is one line for a human, and the transcript is logged verbatim
+  beside it.
+- **`reaper_account_context` is shared** with `resolve_reaper_target`, so the
+  Live-mode, blank-account, credentials and auth checks happen in one order in
+  one place. The probe builds the context itself because it needs it twice —
+  to resolve the target group, then to send the read-only command to whatever
+  that resolved to.
+- **A box that cannot be read is a warning, not an abort.** The projection
+  below it is still worth reporting, and "the box could not be reached" is
+  itself an answer about whether a remediation would get anywhere.
 
 - **It never acknowledges, never sends an SSM command, never reaches a
   notifier** — and that holds regardless of `dry_run`, which it does not

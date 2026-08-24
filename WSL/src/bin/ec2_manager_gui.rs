@@ -2289,6 +2289,59 @@ mod gui {
         reaper::sole_target_instance(&members)
     }
 
+    /// What a probe transcript says about the box right now.
+    ///
+    /// One line per fact, and only facts the transcript actually carries: no
+    /// `/opt/reaper`, the watchdog's state, and each compose service with
+    /// whether it is up. Deliberately **not** `parse_verdict` — that answers
+    /// "did the fix work" and words its failure as `not running after
+    /// restart`, a restart the probe never performed.
+    ///
+    /// The docker listing is not summarised here: the transcript is sent as
+    /// a `Transcript` event, and `reaper_transcript_lines` already counts and
+    /// prints it.
+    fn reaper_probe_state_lines(instance: &str, output: &str) -> Vec<String> {
+        use ec2_manager::reaper;
+
+        if output.contains(reaper::RE_NODIR) {
+            return vec![format!(
+                "reaper probe: {instance} has no /opt/reaper — a remediation would \
+                 report NODIR and change nothing"
+            )];
+        }
+
+        let mut out = Vec::new();
+        if let Some(state) = output
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("__RE_WD_STATE__"))
+        {
+            let state = state.trim();
+            // The fix leaves the watchdog stopped on purpose, so a box found
+            // with it inactive is the trace of an earlier remediation rather
+            // than a fault.
+            out.push(format!("reaper probe: {instance} reaper-watchdog is {state}"));
+        }
+
+        let services = reaper::compose_services(output);
+        if services.is_empty() {
+            out.push(format!(
+                "reaper probe: {instance} compose ps listed no services"
+            ));
+        } else {
+            let rendered: Vec<String> = services
+                .iter()
+                .map(|(name, up)| format!("{name} ({})", if *up { "running" } else { "not running" }))
+                .collect();
+            let down = services.iter().filter(|(_, up)| !up).count();
+            out.push(format!(
+                "reaper probe: {instance} compose ps — {} service(s), {down} not running: {}",
+                services.len(),
+                rendered.join(", ")
+            ));
+        }
+        out
+    }
+
     /// Run the whole reaper decision against one alert id and report every
     /// step, without touching anything.
     ///
@@ -2401,7 +2454,18 @@ mod gui {
                 },
             );
 
-            let instance = match resolve_reaper_target(&mode, &app_config, &m) {
+            // The context is built here rather than left to
+            // `resolve_reaper_target`, because the probe needs it twice: to
+            // resolve the target group, and then to send its read-only
+            // command to whatever that resolved to.
+            let ctx = match reaper_account_context(&mode, &app_config, &m.account_id) {
+                Ok(c) => c,
+                Err(why) => {
+                    note(LogLevel::Error, format!("reaper probe: {why}"));
+                    return;
+                }
+            };
+            let instance = match resolve_reaper_subject(&ctx.profile, &ctx.region, &m.subject) {
                 Ok(id) => id,
                 Err(why) => {
                     note(
@@ -2415,6 +2479,41 @@ mod gui {
                 LogLevel::Info,
                 format!("reaper probe: resolves to instance {instance}"),
             );
+
+            // Read the box itself. Everything in `reaper_probe.sh` is a
+            // read -- it is `reaper_fix.sh` with every command that changes
+            // something removed -- so this is safe to point at production
+            // from a button labelled "test", which is the only reason it is
+            // done at all.
+            note(
+                LogLevel::Info,
+                format!("reaper probe: reading {instance} (read-only, nothing is changed)"),
+            );
+            match exec_remote_command(
+                &None,
+                &ctx,
+                &instance,
+                &reaper_probe_command(),
+                cfg.send_command_timeout(),
+            ) {
+                Ok(out) => {
+                    let _ = tx.send(ReaperEvent::Transcript {
+                        instance: instance.clone(),
+                        stage: "probe".to_string(),
+                        output: out.clone(),
+                    });
+                    for line in reaper_probe_state_lines(&instance, &out) {
+                        note(LogLevel::Info, line);
+                    }
+                }
+                // Not fatal: the projection below is still worth reporting,
+                // and "the box could not be reached" is itself an answer
+                // about whether a remediation would get anywhere.
+                Err(e) => note(
+                    LogLevel::Warn,
+                    format!("reaper probe: could not read {instance} — {e}"),
+                ),
+            }
 
             // Reported, not returned on: a closed alert is exactly what a
             // probe run after the fact looks at, and the rest of the
@@ -2476,32 +2575,48 @@ mod gui {
         if let Subject::Instance(id) = &m.subject {
             return Ok(id.clone());
         }
+        let ctx = reaper_account_context(mode, app_config, &m.account_id)?;
+        resolve_reaper_subject(&ctx.profile, &ctx.region, &m.subject)
+    }
+
+    /// An authorised context for the account an alert names, or why there
+    /// isn't one.
+    ///
+    /// Split out because two callers need the same four checks in the same
+    /// order — `resolve_reaper_target` for its ELB calls, and the probe,
+    /// which also needs the context itself to send its read-only command.
+    ///
+    /// **Live mode only.** Sim fakes `auth_status: Ok` and reuses whatever
+    /// profile the account id resolved to, so anything downstream of here
+    /// would make real AWS calls out of the mode whose whole promise is that
+    /// it does not.
+    fn reaper_account_context(
+        mode: &Mode,
+        app_config: &ec2_manager::config::AppConfig,
+        account_id: &str,
+    ) -> std::result::Result<AwsContext, String> {
         if *mode != Mode::Live {
             return Err(format!(
-                "app is running in {} mode, not live — a target group is resolved \
-                 with real ELB calls and those only run in Live mode",
+                "app is running in {} mode, not live — this needs real AWS calls \
+                 and those only run in Live mode",
                 mode.as_str()
             ));
         }
-        if m.account_id.trim().is_empty() {
+        if account_id.trim().is_empty() {
             return Err("the alert carries no Account tag, so there is no profile to \
-                        look the target group up with"
+                        work with"
                 .to_string());
         }
-        let ctx = build_context_with_profile(
-            mode.clone(),
-            app_config,
-            None,
-            Some(m.account_id.as_str()),
-        )
-        .map_err(|e| format!("no credentials for account {}: {e}", m.account_id))?;
+        let ctx =
+            build_context_with_profile(mode.clone(), app_config, None, Some(account_id))
+                .map_err(|e| format!("no credentials for account {account_id}: {e}"))?;
         if ctx.auth_status != AuthStatus::Ok {
             return Err(format!(
-                "account {} is not authorised (auth_status={})",
-                m.account_id, ctx.auth_status
+                "account {account_id} is not authorised (auth_status={})",
+                ctx.auth_status
             ));
         }
-        resolve_reaper_subject(&ctx.profile, &ctx.region, &m.subject)
+        Ok(ctx)
     }
 
     /// Report `reason` for `key` only when it is not what was reported last
@@ -2573,6 +2688,18 @@ mod gui {
             "/reaper_docker_ps.sh.obf"
         )));
         b64_script_command(&format!("RE_SNAP_LABEL='{label}'\n{script}"))
+    }
+
+    /// The read-only half of the remediation: what `reaper_fix.sh` *looks*
+    /// at, with everything it changes removed.
+    ///
+    /// Sent by the Test Alert Match probe against the instance an alert
+    /// resolves to. Handed over the same way every other script here is.
+    fn reaper_probe_command() -> String {
+        b64_script_command(&deobf_asset(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/reaper_probe.sh.obf"
+        ))))
     }
 
     /// Start the +1m and +5m `docker ps -a` snapshots on their own thread.
@@ -11930,14 +12057,13 @@ mod gui {
                         }
                     });
 
-                    // Answer "would this alert be remediated, and on which
-                    // box" without taking reaper down to find out. Read-only:
-                    // it fetches the alert, resolves its target group and
-                    // reports the projection, and never acknowledges or
-                    // contacts an instance.
+                    // Answer "would this alert be acted on, and on which
+                    // box" without taking anything down to find out. Named
+                    // for the alert rather than for reaper: the matcher is
+                    // reaper's today, and more are expected.
                     if self.reaper_probe_enabled {
                         ui.horizontal(|ui| {
-                            ui.label("Reaper:");
+                            ui.label("Alert ID:");
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.reaper_probe_id)
                                     .hint_text("alert id")
@@ -11947,13 +12073,17 @@ mod gui {
                             if ui
                                 .add_enabled(
                                     !id.is_empty(),
-                                    egui::Button::new("Test reaper match"),
+                                    egui::Button::new("Test Alert Match"),
                                 )
                                 .on_hover_text(
-                                    "Run the reaper matcher against this alert and report \
-                                     every step in the log (On-Call -> Reaper Down). \
-                                     Resolves a target group to its instance with read-only \
-                                     ELB calls. Never acknowledges, never contacts the box.",
+                                    "Run the matcher against this alert and report every \
+                                     step in the log (On-Call -> Reaper Down): the fields \
+                                     it read, the instance a target group resolves to, and \
+                                     what it found on that box.\n\n\
+                                     Read-only throughout. It runs the parts of the fix \
+                                     that only look — docker ps -a, compose ps, the \
+                                     watchdog's state — and never acknowledges, restarts \
+                                     or changes anything.",
                                 )
                                 .clicked()
                             {
@@ -27178,6 +27308,79 @@ mod gui {
             );
             assert_eq!(outcome, Some(ec2_manager::reaper::OutcomeCode::Failure));
             assert_eq!(begun.get(), 1, "a failed fix is still worth watching settle");
+        }
+
+        #[test]
+        fn the_probe_command_is_one_base64_shot_that_does_not_leak_its_body() {
+            let cmd = reaper_probe_command();
+            assert!(cmd.starts_with("echo "));
+            assert!(cmd.contains("| base64 -d | bash"));
+            assert_eq!(cmd.matches("base64 -d").count(), 1);
+            assert!(!cmd.contains("docker ps"));
+            // And it is not the fix by mistake -- the two are built the same
+            // way from different assets, so this is worth pinning.
+            assert_ne!(cmd, reaper_fix_command());
+        }
+
+        #[test]
+        fn the_decoded_probe_is_the_read_only_script_and_not_the_fix() {
+            use base64::Engine;
+            let cmd = reaper_probe_command();
+            let b64 = cmd
+                .trim_start_matches("echo ")
+                .split(' ')
+                .next()
+                .expect("has a payload");
+            let text = String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .expect("valid base64"),
+            )
+            .expect("utf8");
+            assert!(text.contains("docker ps -a"));
+            assert!(text.contains("compose ps --format json"));
+            assert!(text.contains("systemctl is-active reaper-watchdog"));
+            // That it changes nothing is checked against the asset itself,
+            // by `the_probe_script_changes_nothing_on_the_box` in
+            // src/reaper.rs -- which excludes the file's comments, since the
+            // header names the commands it must never run. Repeating a
+            // weaker version of that scan here would only be a second place
+            // to get it wrong.
+        }
+
+        #[test]
+        fn the_probe_reports_the_state_of_the_box_without_claiming_a_restart() {
+            let out = "__RE_BEGIN__\n\
+                       __RE_WD_STATE__ inactive\n\
+                       __RE_PS_BEGIN__\n\
+                       {\"Name\":\"reaper\",\"State\":\"running\"}\n\
+                       {\"Name\":\"reaper-db\",\"State\":\"exited\"}\n\
+                       __RE_PS_END__\n__RE_END__\n";
+            let lines = reaper_probe_state_lines("i-0abc", out);
+            let text = lines.join("\n");
+            assert!(text.contains("reaper-watchdog is inactive"), "{text}");
+            assert!(text.contains("2 service(s), 1 not running"), "{text}");
+            assert!(text.contains("reaper (running)"), "{text}");
+            assert!(text.contains("reaper-db (not running)"), "{text}");
+            // The probe restarted nothing, so nothing it prints may say it
+            // did -- that is `parse_verdict`'s wording, not this one's.
+            assert!(!text.contains("after restart"), "{text}");
+        }
+
+        #[test]
+        fn a_box_without_opt_reaper_is_the_only_thing_the_probe_reports() {
+            // Nothing else in the transcript is meaningful once the script
+            // has said it is not on one of our boxes.
+            let lines = reaper_probe_state_lines("i-0abc", "__RE_BEGIN__\n__RE_NODIR__\n__RE_END__\n");
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].contains("no /opt/reaper"), "{lines:?}");
+        }
+
+        #[test]
+        fn a_probe_that_read_nothing_back_says_so_rather_than_inventing_a_state() {
+            let lines = reaper_probe_state_lines("i-0abc", "");
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].contains("listed no services"), "{lines:?}");
         }
 
         fn test_alert_match(subject: ec2_manager::reaper::Subject) -> ec2_manager::reaper::AlertMatch {

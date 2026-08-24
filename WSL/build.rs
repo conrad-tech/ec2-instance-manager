@@ -269,6 +269,7 @@ fn emit_obfuscated_assets() {
         ("user_sync_dump.sh.obf", "assets/scripts/user_sync_dump.sh"),
         ("reaper_fix.sh.obf", "assets/scripts/reaper_fix.sh"),
         ("reaper_docker_ps.sh.obf", "assets/scripts/reaper_docker_ps.sh"),
+        ("reaper_probe.sh.obf", "assets/scripts/reaper_probe.sh"),
     ];
 
     for (out_name, src) in assets {

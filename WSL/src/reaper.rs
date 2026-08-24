@@ -382,6 +382,49 @@ fn record_name(v: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// The text between the `compose ps` markers, or `None`.
+///
+/// Shared by [`parse_verdict`] and [`compose_services`] so the two cannot
+/// come to read different halves of the same transcript.
+fn compose_ps_block(output: &str) -> Option<&str> {
+    output
+        .split_once(RE_PS_BEGIN)
+        .and_then(|(_, rest)| rest.split_once(RE_PS_END))
+        .map(|(inner, _)| inner)
+}
+
+/// Every compose service in a transcript's `compose ps` block, with whether
+/// it is running.
+///
+/// For reading the state of a box *now*, which is what the read-only probe
+/// does. Deliberately not [`parse_verdict`]: that answers "did the fix
+/// work", and phrases its failure as `not running after restart` — a restart
+/// the probe never performed. Reporting a probe through it would put a
+/// sentence in the log describing something that did not happen.
+///
+/// An unreadable line is skipped rather than poisoning the list. The
+/// stakes are different here too: `parse_verdict` degrades to
+/// `Indeterminate` because acting on partial evidence could report a box as
+/// fixed when it is not. Nothing acts on this — it is one log line for a
+/// human, and the transcript it came from is logged verbatim beside it.
+pub fn compose_services(output: &str) -> Vec<(String, bool)> {
+    let Some(block) = compose_ps_block(output) else {
+        return Vec::new();
+    };
+    let mut records: Vec<serde_json::Value> = Vec::new();
+    for line in block.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(serde_json::Value::Array(items)) => records.extend(items),
+            Ok(v) => records.push(v),
+            Err(_) => {}
+        }
+    }
+    records
+        .iter()
+        .map(|r| (record_name(r), record_is_running(r)))
+        .collect()
+}
+
 /// Decide what the remote output proves.
 ///
 /// `compose ps` is the authority, not the per-step markers: a 30s `timeout`
@@ -414,11 +457,7 @@ pub fn parse_verdict(output: &str) -> Verdict {
         ));
     }
 
-    let Some(block) = output
-        .split_once(RE_PS_BEGIN)
-        .and_then(|(_, rest)| rest.split_once(RE_PS_END))
-        .map(|(inner, _)| inner)
-    else {
+    let Some(block) = compose_ps_block(output) else {
         return Verdict::Indeterminate("no compose ps block in the output".to_string());
     };
 
@@ -1470,6 +1509,118 @@ mod tests {
         assert!(pre < wd, "the first snapshot must precede the first change");
         assert!(up < post, "the second snapshot must follow the restart");
         assert!(post < verdict, "the snapshot belongs above the verdict block");
+    }
+
+    /// The read-only half of the fix, run by Test Alert Match.
+    const REAPER_PROBE_SH: &str = include_str!("../assets/scripts/reaper_probe.sh");
+
+    #[test]
+    fn the_probe_script_changes_nothing_on_the_box() {
+        // The contract of that file. It is pointed at production from a
+        // button labelled "test", so a mutating line added here would run
+        // unannounced -- this is the check that stops it, not review.
+        // Comments are excluded, and on purpose: the file's own header
+        // names the commands it must never run, and that sentence is worth
+        // keeping. Only what the shell would execute is scanned.
+        let body: String = REAPER_PROBE_SH
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for verb in [
+            "compose down",
+            "compose up",
+            "compose restart",
+            "compose stop",
+            "compose start",
+            "docker rm",
+            "docker kill",
+            "docker stop",
+            "docker start",
+            "docker restart",
+            "systemctl stop",
+            "systemctl start",
+            "systemctl restart",
+            "systemctl disable",
+            "systemctl enable",
+        ] {
+            assert!(!body.contains(verb), "the probe must not run {verb}");
+        }
+        // No redirection into a file either: `>` would write to the box.
+        // `2>&1` and `> /dev/null` are not that, so they are allowed by name.
+        for line in REAPER_PROBE_SH.lines() {
+            let l = line.trim();
+            if l.starts_with('#') {
+                continue;
+            }
+            let stripped = l.replace("2>&1", "").replace("> /dev/null", "");
+            assert!(!stripped.contains('>'), "the probe must not redirect: {l}");
+        }
+    }
+
+    #[test]
+    fn the_probe_script_reads_what_the_fix_reads() {
+        // Same markers as reaper_fix.sh, so one parser reads both -- and the
+        // reads themselves, since a probe that looked at nothing would still
+        // pass the test above.
+        for m in [RE_BEGIN, RE_END, RE_NODIR, RE_PS_BEGIN, RE_PS_END, RE_DOCKER_BEGIN, RE_DOCKER_END] {
+            assert!(REAPER_PROBE_SH.contains(m), "the probe never emits {m}");
+        }
+        assert!(REAPER_PROBE_SH.contains("docker ps -a"));
+        assert!(REAPER_PROBE_SH.contains("compose ps --format json"));
+        // `is-active` reports; it is the read-only spelling.
+        assert!(REAPER_PROBE_SH.contains("systemctl is-active reaper-watchdog"));
+    }
+
+    #[test]
+    fn the_probe_checks_the_directory_before_reading_anything() {
+        let dir_check = REAPER_PROBE_SH.find("-d /opt/reaper").expect("has the check");
+        let listing = REAPER_PROBE_SH.find("docker ps -a").expect("lists containers");
+        assert!(dir_check < listing, "the directory check must come first");
+    }
+
+    #[test]
+    fn compose_services_reads_the_state_without_the_language_of_a_restart() {
+        // `parse_verdict` says "not running after restart", which is a
+        // sentence about something the probe never did.
+        let out = format!(
+            "{RE_BEGIN}\n{RE_PS_BEGIN}\n\
+             {{\"Name\":\"reaper\",\"State\":\"running\"}}\n\
+             {{\"Name\":\"reaper-db\",\"State\":\"exited\"}}\n\
+             {RE_PS_END}\n{RE_END}\n"
+        );
+        assert_eq!(
+            compose_services(&out),
+            vec![
+                ("reaper".to_string(), true),
+                ("reaper-db".to_string(), false),
+            ]
+        );
+        // The "Up 3 seconds" spelling counts as running here too, exactly as
+        // it does for the verdict.
+        let status_form = format!(
+            "{RE_PS_BEGIN}\n{{\"Name\":\"x\",\"Status\":\"Up 3 seconds\"}}\n{RE_PS_END}"
+        );
+        assert_eq!(compose_services(&status_form), vec![("x".to_string(), true)]);
+    }
+
+    #[test]
+    fn compose_services_yields_nothing_when_there_is_no_block_to_read() {
+        // One log line for a human, never a panic and never a guess.
+        for junk in ["", "no markers here", "__RE_PS_BEGIN__ unterminated"] {
+            assert!(compose_services(junk).is_empty(), "{junk}");
+        }
+        // An unreadable line is skipped rather than poisoning the list --
+        // unlike `parse_verdict`, which must refuse to judge on partial
+        // evidence because something acts on its answer.
+        let mixed = format!(
+            "{RE_PS_BEGIN}\nnot json\n{{\"Name\":\"x\",\"State\":\"running\"}}\n{RE_PS_END}"
+        );
+        assert_eq!(compose_services(&mixed), vec![("x".to_string(), true)]);
+        assert!(matches!(
+            parse_verdict(&format!("{RE_BEGIN}\n{mixed}\n{RE_END}")),
+            Verdict::Indeterminate(_)
+        ));
     }
 
     #[test]
