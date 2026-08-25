@@ -11,6 +11,10 @@ use std::path::Path;
 // encryption) threat model.
 include!("src/obf_core.rs");
 
+// Shared with the library (as the `forwards_check` module, where its tests
+// live) so the build-time check and the schema it checks cannot drift.
+include!("src/forwards_check.rs");
+
 fn main() {
     // Validate the file the binary actually embeds via
     // `include_str!("../assets/accounts.json")` from `src/`, i.e.
@@ -96,6 +100,7 @@ fn main() {
     }
 
     validate_features();
+    validate_forwards();
     emit_obfuscated_assets();
     embed_windows_icon();
 }
@@ -339,4 +344,65 @@ fn validate_features() {
             missing.join(", ")
         );
     }
+}
+
+/// Validate `assets/forwards.json` at compile time, and **fail the build when
+/// it declares no port forwards at all**.
+///
+/// The runtime parser is deliberately fail-soft — a malformed file yields no
+/// forwards rather than an error, so a bad config can never block a VS Code
+/// launch — which means every mistake in that file is silent. An empty
+/// `environments` block, a stray comma and a `"port": "8443"` written as a
+/// string all produce the same thing: a Port Forwards window with nothing in
+/// it, ports the app never binds, and not one word saying why. Nothing on the
+/// running side can tell those apart from "this site has no forwards", so the
+/// question is asked here instead, where it can be shouted about.
+///
+/// `ALLOW_NO_FORWARDS=1` allows a build with nothing declared, for a developer
+/// who has no endpoints to put in. It does **not** excuse a file that is
+/// wrong: every shape problem is fatal either way.
+fn validate_forwards() {
+    // The file bundled through OUT_DIR by `emit_obfuscated_assets` and read
+    // back by `forwards::bundled()`, i.e. `<manifest_dir>/assets/forwards.json`.
+    let path = Path::new("assets/forwards.json");
+    println!("cargo:rerun-if-changed={}", path.display());
+    println!("cargo:rerun-if-env-changed={ALLOW_NO_FORWARDS_ENV}");
+
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(err) => panic!("Build failed: could not read {}: {err}", path.display()),
+    };
+
+    let require_forwards = std::env::var_os(ALLOW_NO_FORWARDS_ENV).is_none();
+    let problems = check_forwards_json(&raw, require_forwards);
+    if problems.is_empty() {
+        return;
+    }
+
+    let listed = problems
+        .iter()
+        .map(|p| format!("  - {p}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    panic!(
+        "\nBuild failed: {} does not declare usable port forwards:\n{listed}\n\n\
+         Every environment the app should forward for needs an entry under \
+         `environments`,\nkeyed by that instance's MMODAL_ENV tag. Copy a block out of \
+         `_example_environments`\nin that file and edit it:\n\n  \
+         \"environments\": {{\n    \
+         \"DEV1\": [\n      \
+         {{ \"ip\": \"127.200.10.1\", \"host\": \"uweb01.dev1.example.net\" }},\n      \
+         {{ \"ip\": \"127.200.10.2\", \"host\": \"admin01.dev1.example.net\", \"port\": 8443 }}\n    \
+         ]\n  }}\n\n  \
+         ip    loopback address bound on this machine; each environment needs its own\n        \
+         addresses, since every environment's tunnel runs at once.\n  \
+         host  remote DNS name, resolved on the bastion.\n  \
+         port  optional — omit it and the port comes from port_rules / default_port.\n\n\
+         This is checked here because it cannot be noticed later: a malformed or empty\n\
+         forwards.json yields NO forwards at runtime rather than an error, so the app\n\
+         comes up looking healthy with an empty Port Forwards window.\n\n\
+         Set {ALLOW_NO_FORWARDS_ENV}=1 to build with no forwards declared, or build with\n\
+         `./scripts/build_binaries.sh test`, which sets it for you.\n",
+        path.display()
+    );
 }

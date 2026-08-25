@@ -27,6 +27,10 @@ When the user asks to revert, restore, or reference a prior change (e.g. "change
 
 ## Build commands
 
+**A build with no port forwards declared fails**, so the commands below need
+`ALLOW_NO_FORWARDS=1` in a tree whose `assets/forwards.json` still ships the
+empty `environments` block (see "The forwards.json build check" below).
+
 ```bash
 # Development build (library + CLI)
 cargo build
@@ -45,6 +49,7 @@ cargo clippy --features gui
 ./scripts/build_binaries.sh         # or: ./scripts/build_binaries.sh all
 ./scripts/build_binaries.sh linux   # Linux only
 ./scripts/build_binaries.sh windows # Windows cross-compile only
+./scripts/build_binaries.sh test    # host-native dev build, forwards check bypassed
 ```
 
 ## Build status
@@ -880,6 +885,41 @@ Environments key on the `MMODAL_ENV` tag, like everything else.
   arrives switched on rather than silently absent.
 - `ServerAliveInterval 30` is in every managed block: an SSM tunnel carrying
   an idle forward gets dropped without keepalives.
+
+#### The forwards.json build check
+
+**`build.rs` fails the build when `assets/forwards.json` declares no port
+forwards**, and names what is wrong. `validate_forwards` runs
+`forwards_check::check_forwards_json`, a file `include!`d by build.rs *and*
+compiled into the library — which is where its tests live, since a build
+script's own `#[cfg(test)]` code is never run.
+
+- **It exists because the runtime is fail-soft on purpose.** `ForwardsConfig::parse`
+  yields no forwards rather than an error, so a bad config can never block a VS
+  Code launch. The price is that every mistake in that file is silent: a stray
+  comma, `"port": "8443"` written as a string, `"Port"` capitalised (serde drops
+  an unknown key without a word), or an `environments` block nobody filled in
+  all produce one indistinguishable result — an empty Port Forwards window,
+  ports the app never binds, and nothing said. Nothing on the running side can
+  tell that apart from a site that genuinely has no forwards, so the question
+  moved to the one place that can still shout.
+- **It checks shape as well as emptiness**: unknown keys at every level (`_`
+  prefixed ones are documentation — `_comment` and `_example_environments` are
+  load-bearing prose), an `ip` that is not an IP address, a `host` carrying
+  whitespace or a `:port`, and any port that is not a number in 1–65535.
+  A quoted port matters more than it looks: serde fails the *whole file* on it,
+  so one typo takes every other environment down with it.
+- **`ALLOW_NO_FORWARDS=1` bypasses the empty case only.** Shape errors stay
+  fatal either way — the variable is for a developer with no endpoints to
+  declare, not for a file that is wrong. `./scripts/build_binaries.sh test` is
+  that mode as a build target: host-native, the variable exported for you, and
+  three warning lines plus a tagged completion message, because what it
+  produces is indistinguishable from a real build until someone opens Port
+  Forwards and finds it empty. Do not release one.
+- **The shipped file declares nothing**, so this tree needs the bypass until
+  real environments are filled in. `the_bundled_forwards_file_passes_the_build_time_check`
+  runs the same check with `require_forwards: false`, so the shipped file's
+  *shape* is still guarded by the test suite.
 
 ### Background port-forward tunnels
 

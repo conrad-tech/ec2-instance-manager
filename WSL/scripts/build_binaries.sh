@@ -51,7 +51,7 @@ HOST_TRIPLE=""
 
 usage() {
   cat <<USAGE
-Usage: $0 [native|all|linux|windows] [--with-walkthrough]
+Usage: $0 [native|all|linux|windows|test] [--with-walkthrough]
 
 Build release binaries for Pop!_OS (linux) and Windows.
 
@@ -64,6 +64,15 @@ Modes:
   all      Build linux + windows binaries (best on Linux host)
   linux    Build Linux binaries
   windows  Build Windows binaries
+  test     Host-native development build that BYPASSES the forwards check.
+           assets/forwards.json normally has to declare at least one port
+           forward or the build fails (a file that declares none yields no
+           forwards at runtime instead of an error, so nothing downstream can
+           tell that apart from a site that has none). This mode sets
+           ALLOW_NO_FORWARDS=1 so an unconfigured tree still builds for
+           development. Do not release what it produces: it forwards nothing.
+           The same variable works with plain cargo, e.g.
+           ALLOW_NO_FORWARDS=1 cargo test --features gui
 
 Options:
   --with-walkthrough
@@ -497,7 +506,7 @@ resolve_targets() {
   local host_triple="$3"
 
   case "$mode" in
-    native)
+    native|test)
       echo "$host_triple"
       ;;
     linux)
@@ -563,6 +572,18 @@ main() {
   local os
   os="$(uname -s)"
 
+  # `test` is the development escape hatch for the forwards check in build.rs:
+  # it lets a tree whose assets/forwards.json declares no port forwards build
+  # anyway. Announced twice, loudly, because the resulting binary is
+  # indistinguishable from a real one until someone opens Port Forwards and
+  # finds it empty — which is the exact failure the check exists to prevent.
+  if [[ "$mode" == "test" ]]; then
+    export ALLOW_NO_FORWARDS=1
+    echo "warning: test build — forwards check bypassed (ALLOW_NO_FORWARDS=1)."
+    echo "warning: any environment missing from assets/forwards.json forwards nothing."
+    echo "warning: do not release a test build."
+  fi
+
   if [[ "$mode" == "all" && "$os" != "Linux" ]]; then
     echo "warning: on non-Linux hosts, full linux+windows cross-build may require extra toolchains."
   fi
@@ -578,7 +599,11 @@ main() {
     build_for_target "$target"
   done
 
-  echo "info: build complete"
+  if [[ "$mode" == "test" ]]; then
+    echo "info: build complete (TEST BUILD — forwards check bypassed, do not release)"
+  else
+    echo "info: build complete"
+  fi
   echo "info: linux artifacts:   $LINUX_DIST_DIR"
   echo "info: windows artifacts: $WINDOWS_DIST_DIR"
   echo

@@ -255,11 +255,49 @@ test_verify_windows_icon_accepts_a_real_build() {
   fi
 }
 
+# `test` is the development bypass for the forwards check in build.rs. It
+# builds host-native like `native`; what makes it a distinct mode is
+# ALLOW_NO_FORWARDS=1, which main() exports. Both halves are asserted here
+# because a mode that silently stopped bypassing would fail every dev build,
+# and one that silently stopped being announced would ship forwarding nothing.
+test_test_mode_builds_host_native() {
+  local got
+  got="$(resolve_targets test Linux aarch64-unknown-linux-gnu)"
+  assert_eq "$got" "aarch64-unknown-linux-gnu" "test mode should build the host target"
+}
+
+test_test_mode_is_documented_and_names_the_bypass() {
+  local text
+  text="$(usage 2>&1)"
+  if [[ "$text" != *"|test]"* ]]; then
+    echo "assertion failed: usage should offer the test mode" >&2
+    exit 1
+  fi
+  if [[ "$text" != *"ALLOW_NO_FORWARDS=1"* ]]; then
+    echo "assertion failed: usage should name the variable the mode sets" >&2
+    exit 1
+  fi
+}
+
+test_only_test_mode_sets_the_forwards_bypass() {
+  if ! grep -q 'if \[\[ "$mode" == "test" \]\]; then' "$ROOT_DIR/scripts/build_binaries.sh"; then
+    echo "assertion failed: the bypass should be guarded on the test mode" >&2
+    exit 1
+  fi
+  # Exported nowhere else: a release build must never carry it.
+  local exports
+  exports="$(grep -c 'export ALLOW_NO_FORWARDS=1' "$ROOT_DIR/scripts/build_binaries.sh")"
+  assert_eq "$exports" "1" "ALLOW_NO_FORWARDS should be exported in exactly one place"
+}
+
 main() {
   test_native_mode_uses_host_target_on_linux
   test_windows_mode_target_by_host_os
   test_all_mode_outputs_expected_targets
   test_invalid_mode_fails
+  test_test_mode_builds_host_native
+  test_test_mode_is_documented_and_names_the_bypass
+  test_only_test_mode_sets_the_forwards_bypass
   test_package_linux_zip_creates_archive_with_artifacts
   test_package_windows_zip_ships_both_powershell_scripts
   test_package_linux_zip_skips_when_no_artifacts

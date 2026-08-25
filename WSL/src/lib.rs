@@ -11,6 +11,7 @@ pub mod fed_auth;
 pub mod features;
 pub mod filter;
 pub mod forwards;
+pub mod forwards_check;
 pub mod gui_cli;
 pub mod inventory;
 pub mod jsm_auth;

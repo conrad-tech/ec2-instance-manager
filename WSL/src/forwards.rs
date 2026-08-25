@@ -1058,6 +1058,19 @@ mod tests {
         assert!(collisions(&cfg).is_empty());
     }
 
+    /// The shipped file must stay *shaped* correctly whatever it declares:
+    /// `build.rs` runs this same check and fails the build on it, so a
+    /// mistake caught here is one nobody has to diagnose from an empty Port
+    /// Forwards window. `require_forwards` is false because the file ships
+    /// with no environments filled in; the build enforces that half, and
+    /// `ALLOW_NO_FORWARDS=1` (the `test` mode of build_binaries.sh) is how a
+    /// development build opts out of it.
+    #[test]
+    fn the_bundled_forwards_file_passes_the_build_time_check() {
+        let problems = crate::forwards_check::check_forwards_json(&bundled_forwards(), false);
+        assert!(problems.is_empty(), "assets/forwards.json: {problems:#?}");
+    }
+
     #[test]
     fn bundled_forwards_parses() {
         let cfg = ForwardsConfig::bundled();
