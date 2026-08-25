@@ -43,7 +43,7 @@
     "app_contains": "",
     "message_contains": "",
     "send_command_timeout_secs": 90,
-    "cooldown_mins": 30,
+    "cooldown_mins": 2,
     "stage2_on_call_mins": 15,
     "stage2_off_call_mins": 10,
     "poll_secs": 30,

@@ -567,7 +567,10 @@ pub struct ReaperFeature {
     pub message_contains: String,
     /// Timeout for the one remote `send-command`.
     pub send_command_timeout_secs: u64,
-    /// Minimum gap between two remediations of the same instance.
+    /// Minimum gap between two remediations of the same `(fix, instance)`.
+    ///
+    /// Also the window in which a further alert for that pair is treated as
+    /// another report of the same incident: acknowledged, but not acted on.
     pub cooldown_mins: u64,
     /// How long to wait for the alert to close, on call.
     pub stage2_on_call_mins: u64,
@@ -667,10 +670,17 @@ impl ReaperFeature {
             self.send_command_timeout_secs
         })
     }
+    /// Two minutes by default.
+    ///
+    /// It is the window in which a further alert for the same
+    /// `(fix, instance)` counts as another report of the incident already
+    /// being worked — acknowledged, not acted on. Two alerts a minute apart
+    /// are one outage; a fresh one several minutes later is a fresh problem
+    /// and gets a fresh fix.
     pub fn cooldown(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
             60 * if self.cooldown_mins == 0 {
-                30
+                2
             } else {
                 self.cooldown_mins
             },

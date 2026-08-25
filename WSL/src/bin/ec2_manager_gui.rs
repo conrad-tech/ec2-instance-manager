@@ -24893,21 +24893,10 @@ mod gui {
                             }
                             let target = m.into_target(instance_id);
 
-                            if !state.should_act(
-                                &target.alert_id,
-                                &target.instance_id,
-                                now_ms,
-                                cooldown_ms,
-                            ) {
-                                let _ = tx.send(ReaperEvent::Skipped {
-                                    reason: format!(
-                                        "{} handled or in cooldown",
-                                        target.instance_id
-                                    ),
-                                });
-                                continue;
-                            }
-
+                            // Above the duplicate check, not below it: a
+                            // duplicate still has to be acknowledged, and
+                            // acknowledging is on-call-only.
+                            //
                             // A failed lookup degrades to off call: it cannot
                             // acknowledge (so it cannot silence anyone) and it
                             // cannot ring a phone.
@@ -24925,6 +24914,85 @@ mod gui {
                                 }
                             };
 
+                            match state.decide(
+                                &target.alert_id,
+                                target.fix,
+                                &target.instance_id,
+                                now_ms,
+                                cooldown_ms,
+                            ) {
+                                reaper::ActDecision::Act => {}
+                                reaper::ActDecision::AlreadyHandled => {
+                                    let _ = tx.send(ReaperEvent::Skipped {
+                                        reason: format!(
+                                            "{} already handled",
+                                            target.instance_id
+                                        ),
+                                    });
+                                    continue;
+                                }
+                                // Another report of an incident already being
+                                // worked. Acknowledge it so it stops ringing,
+                                // and run nothing: the first alert owns the
+                                // remediation and carries the escalation.
+                                reaper::ActDecision::Duplicate { owner, since_ms } => {
+                                    if on_call {
+                                        match alerts::acknowledge_alert(
+                                            &auth,
+                                            &target.alert_id,
+                                        ) {
+                                            Ok(()) => {
+                                                let _ = tx.send(ReaperEvent::Note {
+                                                    level: LogLevel::Info,
+                                                    message: format!(
+                                                        "reaper: acknowledged {} — a \
+                                                         duplicate of {owner} on {}, \
+                                                         which started {}s ago; not \
+                                                         re-running the fix",
+                                                        target.alert_id,
+                                                        target.instance_id,
+                                                        since_ms / 1000,
+                                                    ),
+                                                });
+                                            }
+                                            Err(e) => {
+                                                let _ = tx.send(ReaperEvent::Note {
+                                                    level: LogLevel::Warn,
+                                                    message: format!(
+                                                        "reaper: could not acknowledge \
+                                                         duplicate {}: {e}",
+                                                        target.alert_id
+                                                    ),
+                                                });
+                                            }
+                                        }
+                                    } else {
+                                        // Off call the ack is withheld, as it
+                                        // is everywhere else here: silencing
+                                        // a page nobody has taken is the one
+                                        // thing this must not do.
+                                        let _ = tx.send(ReaperEvent::Note {
+                                            level: LogLevel::Info,
+                                            message: format!(
+                                                "reaper: {} is a duplicate of {owner} on \
+                                                 {} ({}s ago) — not re-running, and off \
+                                                 call so not acknowledging",
+                                                target.alert_id,
+                                                target.instance_id,
+                                                since_ms / 1000,
+                                            ),
+                                        });
+                                    }
+                                    // Never reconsidered, and deliberately
+                                    // does not touch the incident: the first
+                                    // alert still owns it, and a trickle of
+                                    // duplicates must not push its window
+                                    // forward and suppress the fix for ever.
+                                    state.mark_duplicate(&target.alert_id);
+                                    continue;
+                                }
+                            }
+
                             if cfg.dry_run {
                                 // Read-only projection: never runs the fix,
                                 // never acknowledges, never contacts the
@@ -24939,6 +25007,7 @@ mod gui {
                                 });
                                 state.mark_handled(
                                     &target.alert_id,
+                                    target.fix,
                                     &target.instance_id,
                                     now_ms,
                                 );
@@ -24953,6 +25022,7 @@ mod gui {
                             // while the first is still in flight.
                             state.mark_handled(
                                 &target.alert_id,
+                                target.fix,
                                 &target.instance_id,
                                 now_ms,
                             );
@@ -27801,6 +27871,7 @@ mod gui {
         fn test_reaper_target() -> ec2_manager::reaper::Target {
             ec2_manager::reaper::Target {
                 alert_id: "alert-1".to_string(),
+                fix: ec2_manager::reaper::FixKind::Reaper,
                 instance_id: "i-0abc123def4567890".to_string(),
                 account_id: "111111111111".to_string(),
                 environment: "DEV1".to_string(),
@@ -28406,6 +28477,7 @@ mod gui {
         fn test_alert_match(subject: ec2_manager::reaper::Subject) -> ec2_manager::reaper::AlertMatch {
             ec2_manager::reaper::AlertMatch {
                 alert_id: "alert-1".to_string(),
+                fix: ec2_manager::reaper::FixKind::Reaper,
                 subject,
                 account_id: "111111111111".to_string(),
                 environment: "DEV1".to_string(),

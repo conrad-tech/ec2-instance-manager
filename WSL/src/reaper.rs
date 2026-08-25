@@ -24,6 +24,9 @@ const JUNK_EXTRA_KEY: &str = "{{extraProperties}}";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
     pub alert_id: String,
+    /// Which remediation this calls for. Half of the duplicate-suppression
+    /// key; see [`FixKind`].
+    pub fix: FixKind,
     pub instance_id: String,
     pub account_id: String,
     pub environment: String,
@@ -132,6 +135,26 @@ pub fn target_group_name(resource: &str) -> Option<&str> {
     resource.strip_prefix("targetgroup/")?.split('/').next().filter(|n| !n.is_empty())
 }
 
+/// Which remediation a matched alert calls for.
+///
+/// One today. It exists as a value rather than being left implied because
+/// duplicate suppression is keyed on `(fix, instance)` — "do not re-run
+/// *this* fix on *this* box". With the fix implied, a second script added
+/// later would silently inherit the first's suppression and never run on a
+/// box the first had just touched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FixKind {
+    Reaper,
+}
+
+impl FixKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reaper => "reaper",
+        }
+    }
+}
+
 /// What a matched alert points at.
 ///
 /// An alert either names the box outright or names the target group it sits
@@ -159,6 +182,7 @@ impl Subject {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AlertMatch {
     pub alert_id: String,
+    pub fix: FixKind,
     pub subject: Subject,
     pub account_id: String,
     pub environment: String,
@@ -174,6 +198,7 @@ impl AlertMatch {
     pub fn into_target(self, instance_id: String) -> Target {
         Target {
             alert_id: self.alert_id,
+            fix: self.fix,
             instance_id,
             account_id: self.account_id,
             environment: self.environment,
@@ -241,6 +266,9 @@ pub fn match_alert(alert: &Alert, cfg: &ReaperFeature) -> Option<AlertMatch> {
 
     Some(AlertMatch {
         alert_id: alert.id.clone(),
+        // One rule, so one fix. When there are several this is whichever
+        // rule matched, and the suppression below separates them for free.
+        fix: FixKind::Reaper,
         subject,
         account_id: alert.account.clone(),
         environment: alert.environment.clone(),
@@ -656,7 +684,29 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Default)]
 pub struct ReaperState {
     handled: HashSet<String>,
-    last_action_ms: HashMap<String, u64>,
+    /// Per `(fix, instance)`: the alert that started the incident, and when.
+    incidents: HashMap<String, (String, u64)>,
+}
+
+/// What to do with a matched alert, given what this process has already done.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActDecision {
+    /// Nothing has run for this fix on this box lately. This alert starts the
+    /// incident and owns it.
+    Act,
+    /// This exact alert has already been acted on. It was acknowledged when
+    /// it was acted on, so there is nothing left to do for it.
+    AlreadyHandled,
+    /// The same fix started on this box for `owner`, `since_ms` ago. This is
+    /// another report of that incident.
+    ///
+    /// **Acknowledge it, and run nothing.** A second alert for a fix already
+    /// in flight is not a second problem: re-running would take the stack
+    /// down underneath a remediation that is still working, and starting a
+    /// second escalation would page twice for one outage. Leaving it
+    /// unacknowledged is what made duplicates keep ringing — the suppression
+    /// used to happen before the acknowledge and skipped both.
+    Duplicate { owner: String, since_ms: u64 },
 }
 
 impl ReaperState {
@@ -664,37 +714,79 @@ impl ReaperState {
         Self::default()
     }
 
-    /// Two independent rules: an alert is acted on at most once ever, and an
-    /// instance at most once per cooldown window.
-    pub fn should_act(
+    /// `(fix, instance)` — the thing a remediation is *about*.
+    ///
+    /// Keyed on the fix as well as the box because two scripts on one
+    /// instance are two independent problems; keying on the instance alone
+    /// would let the first script's run silence the second's alerts.
+    fn incident_key(fix: FixKind, instance_id: &str) -> String {
+        format!("{}/{instance_id}", fix.as_str())
+    }
+
+    /// What should happen to this alert.
+    pub fn decide(
         &self,
         alert_id: &str,
+        fix: FixKind,
         instance_id: &str,
         now_ms: u64,
-        cooldown_ms: u64,
-    ) -> bool {
+        window_ms: u64,
+    ) -> ActDecision {
         if self.handled.contains(alert_id) {
-            return false;
+            return ActDecision::AlreadyHandled;
         }
-        match self.last_action_ms.get(instance_id) {
-            Some(&last) => now_ms.saturating_sub(last) >= cooldown_ms,
-            None => true,
+        match self.incidents.get(&Self::incident_key(fix, instance_id)) {
+            Some((owner, at)) => {
+                let since_ms = now_ms.saturating_sub(*at);
+                if since_ms < window_ms {
+                    ActDecision::Duplicate {
+                        owner: owner.clone(),
+                        since_ms,
+                    }
+                } else {
+                    ActDecision::Act
+                }
+            }
+            None => ActDecision::Act,
         }
     }
 
     /// Has this exact alert already been acted on by this process?
     ///
-    /// The alert half of [`Self::should_act`], on its own, so a caller can
-    /// skip an already-handled alert **before** paying for the AWS calls that
-    /// resolve its target group. `should_act` still re-checks it, so the two
+    /// The alert half of [`Self::decide`], on its own, so a caller can skip
+    /// an already-handled alert **before** paying for the AWS calls that
+    /// resolve its target group. `decide` still re-checks it, so the two
     /// cannot come apart.
     pub fn already_handled(&self, alert_id: &str) -> bool {
         self.handled.contains(alert_id)
     }
 
-    pub fn mark_handled(&mut self, alert_id: &str, instance_id: &str, now_ms: u64) {
+    /// Record that `alert_id` started a remediation of `fix` on
+    /// `instance_id`.
+    ///
+    /// The incident's owner is only set once per window: a duplicate
+    /// acknowledged inside it must not push the window forward, or a steady
+    /// trickle of duplicates would suppress the fix indefinitely.
+    pub fn mark_handled(
+        &mut self,
+        alert_id: &str,
+        fix: FixKind,
+        instance_id: &str,
+        now_ms: u64,
+    ) {
         self.handled.insert(alert_id.to_string());
-        self.last_action_ms.insert(instance_id.to_string(), now_ms);
+        self.incidents
+            .insert(Self::incident_key(fix, instance_id), (alert_id.to_string(), now_ms));
+    }
+
+    /// Record that `alert_id` was acknowledged as a duplicate.
+    ///
+    /// It joins `handled` so it is never reconsidered, but deliberately does
+    /// **not** touch the incident: the first alert still owns it, still
+    /// carries the escalation, and its window still expires when it was
+    /// always going to.
+    pub fn mark_duplicate(&mut self, alert_id: &str) {
+        self.handled.insert(alert_id.to_string());
     }
 }
 
@@ -1406,37 +1498,115 @@ mod tests {
         assert!(matches!(parse_verdict(&out), Verdict::Indeterminate(_)));
     }
 
-    const COOLDOWN: u64 = 30 * 60 * 1000;
+    /// The shipped window: two minutes.
+    const WINDOW: u64 = 2 * 60 * 1000;
+    const BOX: &str = "i-0abc1234";
+    const FIX: FixKind = FixKind::Reaper;
 
     #[test]
-    fn a_fresh_alert_on_a_fresh_instance_is_acted_on() {
+    fn a_fresh_alert_on_a_fresh_instance_starts_the_incident() {
         let s = ReaperState::new();
-        assert!(s.should_act("a1", "i-0abc1234", 0, COOLDOWN));
+        assert_eq!(s.decide("a1", FIX, BOX, 0, WINDOW), ActDecision::Act);
     }
 
     #[test]
     fn the_same_alert_is_never_acted_on_twice() {
         let mut s = ReaperState::new();
-        s.mark_handled("a1", "i-0abc1234", 0);
-        assert!(!s.should_act("a1", "i-0abc1234", 0, COOLDOWN));
-        // Still refused long after the instance cooldown has expired: once per
-        // alert is a separate rule from once per instance per window.
-        assert!(!s.should_act("a1", "i-0abc1234", 10 * COOLDOWN, COOLDOWN));
+        s.mark_handled("a1", FIX, BOX, 0);
+        assert_eq!(
+            s.decide("a1", FIX, BOX, 0, WINDOW),
+            ActDecision::AlreadyHandled
+        );
+        // Still refused long after the window has expired: once per alert is
+        // a separate rule from once per (fix, instance) per window.
+        assert_eq!(
+            s.decide("a1", FIX, BOX, 100 * WINDOW, WINDOW),
+            ActDecision::AlreadyHandled
+        );
     }
 
     #[test]
-    fn a_different_alert_on_the_same_instance_waits_for_the_cooldown() {
+    fn a_second_alert_inside_the_window_is_a_duplicate_of_the_first() {
+        // Two reaper alerts a minute apart are one outage. The second is
+        // acknowledged and nothing is re-run: the first alert owns the
+        // remediation and carries the escalation.
         let mut s = ReaperState::new();
-        s.mark_handled("a1", "i-0abc1234", 0);
-        assert!(!s.should_act("a2", "i-0abc1234", COOLDOWN - 1, COOLDOWN));
-        assert!(s.should_act("a2", "i-0abc1234", COOLDOWN, COOLDOWN));
+        s.mark_handled("a1", FIX, BOX, 0);
+        assert_eq!(
+            s.decide("a2", FIX, BOX, 60_000, WINDOW),
+            ActDecision::Duplicate {
+                owner: "a1".to_string(),
+                since_ms: 60_000
+            }
+        );
     }
 
     #[test]
-    fn the_cooldown_does_not_suppress_a_different_instance() {
+    fn an_alert_past_the_window_is_a_fresh_problem() {
         let mut s = ReaperState::new();
-        s.mark_handled("a1", "i-0abc1234", 0);
-        assert!(s.should_act("a2", "i-0fff5678", 1, COOLDOWN));
+        s.mark_handled("a1", FIX, BOX, 0);
+        assert!(matches!(
+            s.decide("a2", FIX, BOX, WINDOW - 1, WINDOW),
+            ActDecision::Duplicate { .. }
+        ));
+        assert_eq!(s.decide("a2", FIX, BOX, WINDOW, WINDOW), ActDecision::Act);
+    }
+
+    #[test]
+    fn acknowledging_duplicates_never_pushes_the_window_forward() {
+        // The failure this guards against: a steady trickle of duplicates,
+        // each one extending the suppression, so the fix is never re-run for
+        // an outage that is genuinely still going.
+        let mut s = ReaperState::new();
+        s.mark_handled("a1", FIX, BOX, 0);
+        for (i, id) in ["a2", "a3", "a4"].iter().enumerate() {
+            let at = (i as u64 + 1) * 30_000;
+            assert!(matches!(
+                s.decide(id, FIX, BOX, at, WINDOW),
+                ActDecision::Duplicate { .. }
+            ));
+            s.mark_duplicate(id);
+        }
+        // The window still expires when the *first* alert's did.
+        assert_eq!(s.decide("a5", FIX, BOX, WINDOW, WINDOW), ActDecision::Act);
+    }
+
+    #[test]
+    fn a_duplicate_that_was_acknowledged_is_never_reconsidered() {
+        let mut s = ReaperState::new();
+        s.mark_handled("a1", FIX, BOX, 0);
+        s.mark_duplicate("a2");
+        assert_eq!(
+            s.decide("a2", FIX, BOX, 100 * WINDOW, WINDOW),
+            ActDecision::AlreadyHandled
+        );
+    }
+
+    #[test]
+    fn the_window_does_not_suppress_a_different_instance() {
+        let mut s = ReaperState::new();
+        s.mark_handled("a1", FIX, BOX, 0);
+        assert_eq!(
+            s.decide("a2", FIX, "i-0fff5678", 1, WINDOW),
+            ActDecision::Act
+        );
+    }
+
+    #[test]
+    fn the_key_is_the_fix_as_well_as_the_box() {
+        // With one fix this cannot be observed; it is asserted so that adding
+        // a second script does not silently inherit the first's suppression
+        // and refuse to run on a box the first has just touched.
+        let key_a = ReaperState::incident_key(FixKind::Reaper, BOX);
+        assert!(key_a.starts_with(FixKind::Reaper.as_str()));
+        assert!(key_a.ends_with(BOX));
+        for fix in [FixKind::Reaper] {
+            assert_ne!(
+                ReaperState::incident_key(fix, BOX),
+                ReaperState::incident_key(fix, "i-0fff5678"),
+                "one fix on two boxes must not share a key"
+            );
+        }
     }
 
     #[test]

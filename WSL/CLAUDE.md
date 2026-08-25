@@ -552,6 +552,43 @@ fetching with a second path to keep correct.
 already handled — so a settled alert never costs a call. A failed read leaves
 the alert unhandled, so the next poll tries again.
 
+#### Duplicate alerts: the first one owns the incident
+
+Two reaper alerts a minute apart are one outage. The first starts the fix and
+carries the escalation; every later alert for the same thing is
+**acknowledged and otherwise ignored**.
+
+- **The suppression used to skip the acknowledge too.** The cooldown check sat
+  above it, so a duplicate was dropped without being acked and kept ringing —
+  observed as two alerts a minute apart where only the first was
+  acknowledged. The on-call lookup now happens **before** the decision,
+  because the duplicate branch needs it.
+- **The key is `(fix, instance)`, not the instance** (`ReaperState::incident_key`).
+  Keyed on the box alone, the first script's run would silence a second
+  script's alerts on the same box — which is why `FixKind` is a value on
+  `AlertMatch`/`Target` rather than being left implied. There is one variant
+  today; the point is that adding the second does not require finding this
+  code again.
+- **`ActDecision` replaces a bool**, because "do not act" now has two
+  meanings that must not share a branch: `AlreadyHandled` (this exact alert,
+  already acted on and already acked — do nothing) and `Duplicate` (another
+  report of a live incident — **acknowledge**, run nothing).
+- **Off call the acknowledge is still withheld.** Same rule as everywhere else
+  here: silencing a page nobody has taken is the one thing this must not do.
+- **`mark_duplicate` deliberately does not touch the incident.** It adds the
+  alert to `handled` so it is never reconsidered, and leaves the owner and the
+  timestamp alone. Refreshing them would let a steady trickle of duplicates
+  extend the suppression indefinitely and never re-run the fix for an outage
+  that is genuinely still going.
+- **The escalation is unchanged and belongs to the first alert.** Duplicates
+  emit no `Outcome`, so they cannot start a second stage-2 watch or page twice
+  for one outage. If reaper is still down, the first alert's remediation
+  escalates exactly as it would have.
+- **The window is `cooldown_mins`, now defaulting to 2.** It already meant
+  "minimum gap between two remediations of the same thing"; re-keying it is
+  what makes that sentence true. Two alerts a minute apart are one outage; a
+  fresh one several minutes later is a fresh problem and gets a fresh fix.
+
 #### Run Remediation, Re-run Alert Check, and Override
 
 Two buttons beside Test Alert Match, same `reaper.allowed_users` gate.
