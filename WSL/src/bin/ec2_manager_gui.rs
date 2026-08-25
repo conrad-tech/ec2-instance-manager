@@ -9,7 +9,7 @@ fn main() {
 
 #[cfg(feature = "gui")]
 mod gui {
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::fs;
     use std::io::{Read, Write};
 
@@ -2412,6 +2412,261 @@ mod gui {
         out
     }
 
+    /// What the health pre-check decided, and the line that says so.
+    ///
+    /// Returns `true` when the fix should run. Split out so the rule can be
+    /// asserted without AWS: everything it needs is the probe transcript.
+    ///
+    /// The stack is judged, not the alert. An alert stays open long after the
+    /// box behind it recovers — that is the whole reason this exists — so
+    /// "should I take this stack down and back up" can only be answered by
+    /// what is running right now.
+    fn reaper_health_verdict(
+        instance: &str,
+        transcript: &str,
+    ) -> (bool, LogLevel, String) {
+        use ec2_manager::reaper::{format_uptime, stack_health, StackHealth};
+
+        match stack_health(transcript) {
+            StackHealth::Down(why) => (
+                true,
+                LogLevel::Warn,
+                format!("reaper: {instance} is not healthy — {why}; remediating"),
+            ),
+            StackHealth::Restarting { name, seconds } => (
+                true,
+                LogLevel::Warn,
+                format!(
+                    "reaper: {instance} has {name} up only {} — treating it as stuck \
+                     restarting; remediating",
+                    format_uptime(seconds)
+                ),
+            ),
+            StackHealth::Steady(ups) => {
+                let listed: Vec<String> = ups
+                    .iter()
+                    .map(|u| format!("{} up {}", u.name, format_uptime(u.seconds)))
+                    .collect();
+                (
+                    false,
+                    LogLevel::Info,
+                    format!(
+                        "reaper: {instance} is currently up and running ({}) — not \
+                         remediating. Tick Override to run the fix anyway.",
+                        listed.join(", ")
+                    ),
+                )
+            }
+            // Not an answer, so it is not treated as one. The person asked
+            // for this run; refusing it on evidence we do not have would be
+            // the worse call.
+            StackHealth::Unknown(why) => (
+                true,
+                LogLevel::Warn,
+                format!(
+                    "reaper: could not tell whether {instance} is healthy — {why}; \
+                     remediating, since this run was asked for"
+                ),
+            ),
+        }
+    }
+
+    /// Run the real remediation for one alert id, on demand.
+    ///
+    /// The same sequence the poll drives — read the alert in full, match it,
+    /// resolve the subject, acknowledge if on call, run the fix, watch for
+    /// the alert to close — reached from a button instead of from a match.
+    /// It deliberately ignores `ReaperState`: a human asking for this has
+    /// overruled the cooldown and the already-handled flag, which is the
+    /// whole point of the button.
+    ///
+    /// What it does **not** ignore is [`ReaperInFlight`]. If the poll is
+    /// already remediating this alert, this refuses — two `compose down` /
+    /// `up -d` racing on one box is worse than a button that says no.
+    ///
+    /// Its own thread: this blocks for the whole stage-2 window, up to about
+    /// seventeen minutes.
+    #[allow(clippy::too_many_arguments)]
+    fn start_reaper_remediation(
+        auth: ec2_manager::alerts::AlertsAuth,
+        cfg: ec2_manager::features::ReaperFeature,
+        app_config: ec2_manager::config::AppConfig,
+        mode: Mode,
+        alert_id: String,
+        override_health: bool,
+        in_flight: ReaperInFlight,
+        tx: Sender<ReaperEvent>,
+    ) {
+        use ec2_manager::{oncall, reaper};
+
+        std::thread::spawn(move || {
+            let note = |level: LogLevel, message: String| {
+                let _ = tx.send(ReaperEvent::Note { level, message });
+            };
+
+            let Some(claim) = claim_in_flight(&in_flight, &alert_id) else {
+                note(
+                    LogLevel::Warn,
+                    format!(
+                        "reaper: a remediation for alert {alert_id} is already running — \
+                         not starting a second one"
+                    ),
+                );
+                return;
+            };
+            let _claim = claim;
+
+            note(
+                LogLevel::Warn,
+                format!("reaper: manual remediation requested for alert {alert_id}"),
+            );
+
+            let Some(full) = fetch_alert_in_full(&auth, &alert_id, &tx) else {
+                return;
+            };
+            if !reaper::identifies(&full, &cfg) {
+                note(
+                    LogLevel::Error,
+                    format!(
+                        "reaper: alert {alert_id} does not match any reaper rule — \
+                         refusing to remediate"
+                    ),
+                );
+                return;
+            }
+            let Some(m) = reaper::match_alert(&full, &cfg) else {
+                note(
+                    LogLevel::Error,
+                    format!(
+                        "reaper: alert {alert_id} names neither an instance id nor a \
+                         target group — nothing to remediate"
+                    ),
+                );
+                for line in reaper_subject_evidence(&full) {
+                    note(LogLevel::Warn, line);
+                }
+                return;
+            };
+
+            // Reported, not refused. The button exists for the case the poll
+            // would not act on, and an alert that closed while the stack is
+            // still down is one of them.
+            if reaper::alert_is_closed(&full.status) {
+                note(
+                    LogLevel::Warn,
+                    format!(
+                        "reaper: alert {alert_id} is already closed — remediating anyway, \
+                         because this was asked for"
+                    ),
+                );
+            }
+
+            let on_call = match oncall::is_on_call(
+                &auth,
+                &cfg.resolved_schedule_id(),
+                &cfg.resolved_atlassian_account_id(),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    note(
+                        LogLevel::Warn,
+                        format!("reaper: on-call lookup failed ({e}) — treating as off call"),
+                    );
+                    false
+                }
+            };
+
+            let ctx_result = build_context_with_profile(
+                mode.clone(),
+                &app_config,
+                None,
+                Some(m.account_id.as_str()),
+            );
+            let instance_id = match resolve_reaper_target(&mode, &app_config, &m) {
+                Ok(id) => id,
+                Err(why) => {
+                    note(
+                        LogLevel::Error,
+                        format!(
+                            "reaper: alert {alert_id} names {} and it could not be resolved \
+                             to one instance — {why}",
+                            m.subject.label()
+                        ),
+                    );
+                    return;
+                }
+            };
+            let account_id = m.account_id.clone();
+            let target = m.into_target(instance_id);
+
+            // Read the box before touching it, unless Override says not to.
+            // An alert stays open long after the stack behind it recovers,
+            // so the alert cannot answer "does this still need fixing" —
+            // only the box can.
+            if override_health {
+                note(
+                    LogLevel::Warn,
+                    format!(
+                        "reaper: Override is ticked — remediating {} without checking                          whether it is already healthy",
+                        target.instance_id
+                    ),
+                );
+            } else {
+                let ctx = match reaper_account_context(&mode, &app_config, &account_id) {
+                    Ok(c) => c,
+                    Err(why) => {
+                        note(LogLevel::Error, format!("reaper: {why}"));
+                        return;
+                    }
+                };
+                let transcript = exec_remote_command(
+                    &None,
+                    &ctx,
+                    &target.instance_id,
+                    &reaper_probe_command(),
+                    cfg.send_command_timeout(),
+                )
+                .unwrap_or_default();
+                let _ = tx.send(ReaperEvent::Transcript {
+                    instance: target.instance_id.clone(),
+                    stage: "health check".to_string(),
+                    output: transcript.clone(),
+                });
+                let (needs_fix, level, line) =
+                    reaper_health_verdict(&target.instance_id, &transcript);
+                note(level, line);
+                if !needs_fix {
+                    return;
+                }
+            }
+
+            let ops = JsmAlertOps { auth: &auth };
+            let timeout = cfg.send_command_timeout();
+            let iid = target.instance_id.clone();
+            let snap_iid = target.instance_id.clone();
+            let snap_tx = tx.clone();
+            let outcome = remediate_if_authorized(
+                ctx_result,
+                &account_id,
+                &ops,
+                &cfg,
+                &target,
+                on_call,
+                // Open, closed, acknowledged or not: a run asked for by hand
+                // proceeds. That is the button's whole purpose.
+                ClosedAlert::Remediate,
+                &tx,
+                |ctx, cmd| exec_remote_command(&None, ctx, &iid, cmd, timeout),
+                move |ctx| {
+                    spawn_reaper_snapshots(snap_iid, ctx.clone(), timeout, snap_tx)
+                },
+            );
+            if let Some(code) = outcome {
+                let _ = tx.send(outcome_event(code, &target));
+            }
+        });
+    }
+
     /// Run the whole reaper decision against one alert id and report every
     /// step, without touching anything.
     ///
@@ -2702,6 +2957,51 @@ mod gui {
             ));
         }
         Ok(ctx)
+    }
+
+    /// Read one alert in full, by id.
+    ///
+    /// **Every alert the poll might act on is read this way**, never matched
+    /// straight off the feed's list. The list view omits `description` —
+    /// `Alert::description` says so in its own doc comment — and these
+    /// alerts name their target group *only* there:
+    ///
+    /// ```text
+    /// Resource ID: targetgroup/<name>/<id>
+    /// ```
+    ///
+    /// So the poll, reading the list, saw an alert that matched the reaper
+    /// rules and named nothing actionable, while the probe, reading
+    /// `/alerts/{id}`, saw the target group and resolved it. Same matcher,
+    /// same alert, different payload. Matching the list first and falling
+    /// back would work, but these alerts are shaped the same every time and
+    /// a fallback that fires on every single alert is just a slower way of
+    /// always fetching — with a second code path to keep correct.
+    ///
+    /// The cost is one call per open, unhandled, matching alert per poll.
+    /// The cheap checks that the list *can* answer — closed, already handled
+    /// — deliberately run first, so a settled alert costs nothing.
+    ///
+    /// A failed read is reported and the alert is left unhandled, so the
+    /// next poll tries again.
+    fn fetch_alert_in_full(
+        auth: &ec2_manager::alerts::AlertsAuth,
+        alert_id: &str,
+        tx: &Sender<ReaperEvent>,
+    ) -> Option<ec2_manager::alerts::Alert> {
+        match ec2_manager::alerts::fetch_alert(auth, alert_id) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                let _ = tx.send(ReaperEvent::Note {
+                    level: LogLevel::Warn,
+                    message: format!(
+                        "reaper: could not read alert {alert_id} in full — {e}; \
+                         will try again next poll"
+                    ),
+                });
+                None
+            }
+        }
     }
 
     /// Report `reason` for `key` only when it is not what was reported last
@@ -6467,6 +6767,19 @@ mod gui {
         /// is not.
         reaper_probe_tx: Sender<ReaperEvent>,
         reaper_probe_rx: Receiver<ReaperEvent>,
+        /// Wakes the poll thread for "Re-run Alert Check".
+        reaper_nudge: ReaperNudgeHandle,
+        /// Alert ids with a remediation in flight, shared with the poll
+        /// thread so a manual run and an automatic one cannot collide.
+        reaper_in_flight: ReaperInFlight,
+        /// Alert id awaiting the Run Remediation confirmation, if any, with
+        /// the Override state as it stood when the button was pressed —
+        /// captured then rather than read at confirm time, so toggling the
+        /// box while the dialog is open cannot change what was agreed to.
+        pending_run_remediation: Option<(String, bool)>,
+        /// Run Remediation's Override tick: skip the "is it already healthy"
+        /// check and remediate regardless.
+        reaper_override: bool,
         /// Alerts window state; `None` while the window is closed.
         alerts_window: Option<AlertsWindow>,
         /// Alerts fetch worker → UI.
@@ -6660,6 +6973,12 @@ mod gui {
             let (create_pre_tx, create_pre_rx) = mpsc::channel();
             let (fed_tx, fed_rx) = mpsc::channel();
             let (reaper_probe_tx, reaper_probe_rx) = mpsc::channel();
+            // Created here rather than inside `start_reaper_poll`, because
+            // the Run Remediation button needs the in-flight set whether or
+            // not the poll thread was ever started.
+            let reaper_nudge: ReaperNudgeHandle =
+                Arc::new((Mutex::new(ReaperNudge::default()), Condvar::new()));
+            let reaper_in_flight: ReaperInFlight = Arc::new(Mutex::new(HashSet::new()));
             let features = ec2_manager::features::load();
             #[cfg(target_os = "windows")]
             let (ui_tx, ui_rx) = mpsc::channel();
@@ -6792,6 +7111,8 @@ mod gui {
                             features.reaper.clone(),
                             config.clone(),
                             options.mode.clone(),
+                            Arc::clone(&reaper_nudge),
+                            Arc::clone(&reaper_in_flight),
                         ))
                     } else {
                         reaper_startup_log
@@ -6980,6 +7301,10 @@ mod gui {
                 reaper_probe_id: String::new(),
                 reaper_probe_tx,
                 reaper_probe_rx,
+                reaper_nudge,
+                reaper_in_flight,
+                pending_run_remediation: None,
+                reaper_override: false,
                 alerts_auth: resolved_alerts_auth,
                 alerts_window: None,
                 alerts_tx,
@@ -11991,6 +12316,102 @@ mod gui {
             }
         }
 
+        /// Render the Run Remediation confirmation.
+        ///
+        /// The one place a person is told, before it happens, that this stops
+        /// a watchdog and takes a stack down and back up on a production box.
+        /// It can only name the **alert**, not the instance: which box the
+        /// alert resolves to is two AWS calls away and is not known until the
+        /// run starts. Test Alert Match is how you learn that first, and the
+        /// dialog says so.
+        ///
+        /// Mirrors `render_ack_all_confirm`'s Confirm/Cancel shape.
+        fn render_run_remediation_confirm(&mut self, ctx: &egui::Context) {
+            let Some((alert_id, override_health)) = self.pending_run_remediation.clone()
+            else {
+                return;
+            };
+            let mut window_open = true;
+            let mut do_confirm = false;
+            let mut do_cancel = false;
+            egui::Window::new("Run Remediation")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("Remediate the instance this alert resolves to?");
+                    ui.add_space(4.0);
+                    ui.monospace(&alert_id);
+                    ui.add_space(6.0);
+                    ui.label("On that instance this will run:");
+                    ui.monospace("systemctl stop reaper-watchdog");
+                    ui.monospace("docker compose down");
+                    ui.monospace("docker compose up -d");
+                    ui.add_space(6.0);
+                    // Both are real consequences a person can be surprised
+                    // by: the watchdog is deliberately never restarted, and
+                    // acknowledging silences whoever is actually on call.
+                    ui.label(
+                        "The watchdog is left stopped afterwards, by design. \
+                         If you are on call the alert is acknowledged first.",
+                    );
+                    ui.label(
+                        "Which instance that is has not been resolved yet — \
+                         use Test Alert Match first if you want to see it.",
+                    );
+                    ui.add_space(4.0);
+                    // The tick changes what this does, so it is restated here
+                    // rather than left on a checkbox behind the dialog.
+                    if override_health {
+                        note_label(
+                            ui,
+                            egui::Color32::from_rgb(200, 140, 40),
+                            "Override is ticked: the stack will be taken down and back \
+                             up even if it has already recovered.",
+                        );
+                    } else {
+                        ui.label(
+                            "The box is read first — if the stack is up and has been \
+                             for more than a minute, nothing is changed.",
+                        );
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Confirm").clicked() {
+                            do_confirm = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+            if do_confirm {
+                // At warn, and before anything runs: this is the record that
+                // a person asked for it, and which alert they asked about.
+                self.log_reaper(
+                    LogLevel::Warn,
+                    format!(
+                        "reaper: Run Remediation confirmed for alert {alert_id} \
+                         (override={override_health})"
+                    ),
+                );
+                start_reaper_remediation(
+                    self.alerts_auth.clone(),
+                    self.reaper_cfg.clone(),
+                    self.config.clone(),
+                    self.options.mode.clone(),
+                    alert_id,
+                    override_health,
+                    Arc::clone(&self.reaper_in_flight),
+                    self.reaper_probe_tx.clone(),
+                );
+            }
+            if do_confirm || do_cancel || !window_open {
+                self.pending_run_remediation = None;
+            }
+        }
+
         /// Drain reaper poll-thread events into the log (and, for a real
         /// outcome, the notifier seam).
         fn poll_reaper_events(&mut self) {
@@ -12071,6 +12492,8 @@ mod gui {
             // above are: spawning needs `&self` fields the closure is already
             // borrowing mutably.
             let mut probe_alert_id: Option<String> = None;
+            let mut confirm_remediation_id: Option<(String, bool)> = None;
+            let mut rerun_alert_check = false;
 
             egui::Window::new("On-Call Alerts")
                 .open(&mut open)
@@ -12172,7 +12595,73 @@ mod gui {
                                 )
                                 .clicked()
                             {
-                                probe_alert_id = Some(id);
+                                probe_alert_id = Some(id.clone());
+                            }
+
+                            // The real thing. Disabled under dry run rather
+                            // than quietly doing nothing: dry_run means this
+                            // build cannot change anything, and a button that
+                            // silently honoured that would read as broken.
+                            let dry = self.reaper_cfg.dry_run;
+                            let run = ui.add_enabled(
+                                !id.is_empty() && !dry,
+                                egui::Button::new("Run Remediation"),
+                            );
+                            let run = if dry {
+                                run.on_disabled_hover_text(
+                                    "reaper.dry_run is true in this build, so nothing can \
+                                     be remediated. Set it to false and rebuild.",
+                                )
+                            } else {
+                                run.on_hover_text(
+                                    "Remediate this alert now, as if it had just come in: \
+                                     acknowledge (only if you are on call), stop the \
+                                     watchdog, compose down, compose up -d, then watch for \
+                                     the alert to close.\n\n\
+                                     Works on an open, closed, acknowledged or \
+                                     unacknowledged alert, and ignores the cooldown and \
+                                     whatever this session has already handled.",
+                                )
+                            };
+                            if run.clicked() {
+                                confirm_remediation_id =
+                                    Some((id.clone(), self.reaper_override));
+                            }
+                            ui.checkbox(&mut self.reaper_override, "Override")
+                                .on_hover_text(
+                                    "Unticked, Run Remediation reads the box first and \
+                                     skips the fix if the stack is already up and has \
+                                     been for more than a minute — a container up for \
+                                     less than that is treated as stuck restarting.\n\n\
+                                     Ticked, it remediates regardless of whether the \
+                                     stack has already recovered.",
+                                );
+
+                            // Makes the poll behave as though it has never
+                            // seen anything: history and cooldowns dropped,
+                            // a pass run immediately.
+                            let armed = self.reaper.is_some();
+                            let recheck = ui.add_enabled(
+                                armed,
+                                egui::Button::new("Re-run Alert Check"),
+                            );
+                            let recheck = if armed {
+                                recheck.on_hover_text(
+                                    "Run the alert check again now, as a live setup would \
+                                     on its next poll — forgetting what this session has \
+                                     already handled and every cooldown, so an open alert \
+                                     waiting to be resolved is picked up as if it had just \
+                                     arrived.",
+                                )
+                            } else {
+                                recheck.on_disabled_hover_text(
+                                    "The reaper poll is not running in this build \
+                                     (reaper.enabled is false, or you are not on \
+                                     reaper.allowed_users).",
+                                )
+                            };
+                            if recheck.clicked() {
+                                rerun_alert_check = true;
                             }
                             ui.weak("results appear in the Logs tab");
                         });
@@ -12276,6 +12765,16 @@ mod gui {
             }
             if let Some(ids) = ack_all_ids {
                 self.pending_ack_all = Some(ids);
+            }
+            if rerun_alert_check {
+                self.log_reaper(
+                    LogLevel::Info,
+                    "reaper: re-run of the alert check requested".to_string(),
+                );
+                nudge_reaper_poll(&self.reaper_nudge, true);
+            }
+            if let Some(pending) = confirm_remediation_id {
+                self.pending_run_remediation = Some(pending);
             }
             if let Some(id) = probe_alert_id {
                 self.log_reaper(
@@ -21343,6 +21842,7 @@ mod gui {
                 self.render_script_result_popup(ctx);
                 self.render_alerts_window(ctx);
                 self.render_ack_all_confirm(ctx);
+                self.render_run_remediation_confirm(ctx);
                 self.pump_script_runs();
                 self.poll_script_events();
                 self.poll_alerts_events();
@@ -23669,6 +24169,91 @@ mod gui {
         },
     }
 
+    /// What a remediation does when the alert has closed since it was matched.
+    ///
+    /// An enum and not a second `bool`, because it would sit next to
+    /// `on_call` at every call site and two adjacent booleans swap silently —
+    /// the same reason `PendingNotify` is a struct rather than a pair of
+    /// strings. Here a swap would mean acknowledging when off call and
+    /// standing down when asked to act.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ClosedAlert {
+        /// Stand down. The poll's behaviour: a sixty-second self-close is
+        /// real and observed on this feed, and remediating an alert that
+        /// resolved itself is a `compose down` nobody asked for.
+        StandDown,
+        /// Remediate anyway. The Run Remediation button's behaviour: a
+        /// person asking for it has already decided, and "the alert closed
+        /// but the stack is still down" is one of the cases the button
+        /// exists for.
+        Remediate,
+    }
+
+    /// Alert ids with a remediation in flight.
+    ///
+    /// Shared by the poll thread and the Run Remediation button.
+    /// `ReaperState` cannot serve here — it is owned by the poll thread and
+    /// the button runs on its own — and without this a press and the next
+    /// poll can each spawn a fix for the same alert, putting two
+    /// `compose down`/`up -d` on one box at once. That race is the exact
+    /// thing `mark_handled`-before-spawn exists to prevent inside the poll;
+    /// this extends the same guarantee across the two callers.
+    type ReaperInFlight = Arc<Mutex<HashSet<String>>>;
+
+    /// Holds an alert id in [`ReaperInFlight`] for as long as the
+    /// remediation runs, and releases it on `Drop` — including when the
+    /// thread unwinds, which a manual `remove` at the end would miss.
+    struct InFlightGuard {
+        set: ReaperInFlight,
+        alert_id: String,
+    }
+
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            if let Ok(mut held) = self.set.lock() {
+                held.remove(self.alert_id.as_str());
+            }
+        }
+    }
+
+    /// Claim `alert_id`, or `None` if a remediation for it is already running.
+    fn claim_in_flight(set: &ReaperInFlight, alert_id: &str) -> Option<InFlightGuard> {
+        let mut held = set.lock().ok()?;
+        if !held.insert(alert_id.to_string()) {
+            return None;
+        }
+        Some(InFlightGuard {
+            set: Arc::clone(set),
+            alert_id: alert_id.to_string(),
+        })
+    }
+
+    /// What the UI can ask the poll thread to do out of band.
+    ///
+    /// The thread waits on the condvar for its poll interval rather than
+    /// sleeping, so a press takes effect at once instead of up to 30s later.
+    #[derive(Debug, Default)]
+    struct ReaperNudge {
+        /// Run a pass now.
+        now: bool,
+        /// Forget what this process has already handled, so an alert it has
+        /// acted on — or is holding in cooldown — is considered again. This
+        /// is what makes a re-run behave like the alert has just arrived.
+        forget: bool,
+    }
+
+    type ReaperNudgeHandle = Arc<(Mutex<ReaperNudge>, Condvar)>;
+
+    /// Ask the poll thread to run now, optionally forgetting its history.
+    fn nudge_reaper_poll(handle: &ReaperNudgeHandle, forget: bool) {
+        let (lock, cv) = &**handle;
+        if let Ok(mut n) = lock.lock() {
+            n.now = true;
+            n.forget |= forget;
+            cv.notify_all();
+        }
+    }
+
     struct ReaperRuntime {
         rx: std::sync::mpsc::Receiver<ReaperEvent>,
         _handle: std::thread::JoinHandle<()>,
@@ -23910,6 +24495,7 @@ mod gui {
         cfg: &ec2_manager::features::ReaperFeature,
         target: &ec2_manager::reaper::Target,
         on_call: bool,
+        on_closed: ClosedAlert,
         tx: &Sender<ReaperEvent>,
         exec: impl FnOnce(&AwsContext, &str) -> std::result::Result<String, String>,
         begin_follow_ups: impl FnOnce(&AwsContext),
@@ -23965,6 +24551,7 @@ mod gui {
             cfg,
             target,
             on_call,
+            on_closed,
             tx,
             |cmd| exec(&ctx, cmd),
             move || begin_follow_ups(&ctx_for_follow_ups),
@@ -23998,11 +24585,13 @@ mod gui {
     ///
     /// Every narration line goes to `tx` rather than to stderr, so the run is
     /// readable in the Logs tab under **On-Call → Reaper Down**.
+    #[allow(clippy::too_many_arguments)]
     fn run_reaper_remediation(
         ops: &impl AlertOps,
         cfg: &ec2_manager::features::ReaperFeature,
         target: &ec2_manager::reaper::Target,
         on_call: bool,
+        on_closed: ClosedAlert,
         tx: &Sender<ReaperEvent>,
         exec: impl FnOnce(&str) -> std::result::Result<String, String>,
         begin_follow_ups: impl FnOnce(),
@@ -24042,14 +24631,25 @@ mod gui {
         // lookup failure must not block a real remediation.
         match ops.fetch(&target.alert_id) {
             Ok(a) if reaper::alert_is_closed(&a.status) => {
+                if on_closed == ClosedAlert::StandDown {
+                    note(
+                        LogLevel::Info,
+                        format!(
+                            "reaper: {} closed before we acted — standing down, nothing \
+                             was run",
+                            target.instance_id
+                        ),
+                    );
+                    return None;
+                }
                 note(
-                    LogLevel::Info,
+                    LogLevel::Warn,
                     format!(
-                        "reaper: {} closed before we acted — standing down, nothing was run",
+                        "reaper: {} is closed — remediating anyway, because this run was \
+                         asked for",
                         target.instance_id
                     ),
                 );
-                return None;
             }
             Ok(_) => {}
             Err(e) => note(
@@ -24163,6 +24763,8 @@ mod gui {
         cfg: ec2_manager::features::ReaperFeature,
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
+        nudge: ReaperNudgeHandle,
+        in_flight: ReaperInFlight,
     ) -> ReaperRuntime {
         use ec2_manager::{alerts, oncall, reaper};
 
@@ -24189,42 +24791,66 @@ mod gui {
                             // a target-group-only alert for weeks: the
                             // matcher declined it and said nothing.
                             let identified = reaper::identifies(alert, &cfg);
-                            if identified {
-                                identified_count += 1;
+                            if !identified {
+                                continue;
                             }
-                            let Some(m) = reaper::match_alert(alert, &cfg) else {
-                                if identified {
-                                    report_reaper_reason_change(
-                                        &mut reported,
-                                        &alert.id,
-                                        LogLevel::Warn,
-                                        format!(
-                                            "reaper: alert {} matches the reaper rules but \
-                                             names neither an instance id nor a target group \
-                                             — nothing to act on",
-                                            alert.id
-                                        ),
-                                        &tx,
-                                    );
+                            identified_count += 1;
+
+                            // The three checks the *list* payload can answer
+                            // come first, so a settled alert never costs a
+                            // full read. Everything past here is about an
+                            // alert we may actually act on.
+                            if reaper::alert_is_closed(&alert.status) {
+                                let _ = tx.send(ReaperEvent::Skipped {
+                                    reason: format!("{} already closed", alert.id),
+                                });
+                                continue;
+                            }
+                            if state.already_handled(&alert.id) {
+                                let _ = tx.send(ReaperEvent::Skipped {
+                                    reason: format!("{} already handled", alert.id),
+                                });
+                                continue;
+                            }
+
+                            // Always read in full, never matched off the
+                            // list: the list omits `description`, and that is
+                            // the only place these alerts name their target
+                            // group. See `fetch_alert_in_full`.
+                            let Some(full) = fetch_alert_in_full(&auth, &alert.id, &tx)
+                            else {
+                                continue;
+                            };
+
+                            let Some(m) = reaper::match_alert(&full, &cfg) else {
+                                if report_reaper_reason_change(
+                                    &mut reported,
+                                    &alert.id,
+                                    LogLevel::Warn,
+                                    format!(
+                                        "reaper: alert {} matches the reaper rules but the \
+                                         full alert names neither an instance id nor a \
+                                         target group — nothing to act on",
+                                        alert.id
+                                    ),
+                                    &tx,
+                                ) {
+                                    // Only alongside a reason that was
+                                    // actually reported, so this stays one
+                                    // dump per alert rather than one per
+                                    // poll. What was there instead is the
+                                    // whole answer to why nothing matched —
+                                    // and it is the *full* alert that is
+                                    // dumped, since that is what was judged.
+                                    for line in reaper_subject_evidence(&full) {
+                                        let _ = tx.send(ReaperEvent::Note {
+                                            level: LogLevel::Warn,
+                                            message: line,
+                                        });
+                                    }
                                 }
                                 continue;
                             };
-                            if reaper::alert_is_closed(&alert.status) {
-                                let _ = tx.send(ReaperEvent::Skipped {
-                                    reason: format!("{} already closed", m.subject.label()),
-                                });
-                                continue;
-                            }
-                            // Before the resolution below, not after: an
-                            // alert this process has already acted on must
-                            // not cost two ELB calls on every poll for the
-                            // rest of the run.
-                            if state.already_handled(&m.alert_id) {
-                                let _ = tx.send(ReaperEvent::Skipped {
-                                    reason: format!("{} already handled", m.subject.label()),
-                                });
-                                continue;
-                            }
 
                             // The one network hop this module does not do
                             // itself. Free for an alert that names its
@@ -24336,12 +24962,31 @@ mod gui {
                             // rather than clones. `auth`/`cfg`/`app_config`
                             // are needed again on the next iteration and the
                             // next poll, so those are cloned, not moved.
+                            // Claimed here, before the spawn, for the same
+                            // reason `mark_handled` is: the claim has to be
+                            // taken by the thread that decides, or two
+                            // callers can both pass the check. `None` means
+                            // the Run Remediation button is already on it.
+                            let Some(claim) = claim_in_flight(&in_flight, &target.alert_id)
+                            else {
+                                let _ = tx.send(ReaperEvent::Skipped {
+                                    reason: format!(
+                                        "{} already being remediated",
+                                        target.instance_id
+                                    ),
+                                });
+                                continue;
+                            };
+
                             let auth_for_thread = auth.clone();
                             let cfg_for_thread = cfg.clone();
                             let app_config_for_thread = app_config.clone();
                             let mode_for_thread = mode.clone();
                             let tx_for_thread = tx.clone();
                             std::thread::spawn(move || {
+                                // Released when this thread ends, however it
+                                // ends.
+                                let _claim = claim;
                                 let target = target;
                                 let ctx_result = build_context_with_profile(
                                     mode_for_thread,
@@ -24362,6 +25007,9 @@ mod gui {
                                     &cfg_for_thread,
                                     &target,
                                     on_call,
+                                    // A self-close between the match and now
+                                    // means the symptom went away on its own.
+                                    ClosedAlert::StandDown,
                                     &tx_for_thread,
                                     |ctx, cmd| exec_remote_command(&None, ctx, &iid, cmd, timeout),
                                     // Its own thread and its own context
@@ -24402,7 +25050,32 @@ mod gui {
                         });
                     }
                 }
-                std::thread::sleep(cfg.poll_interval());
+                // Waited on rather than slept, so "Re-run Alert Check"
+                // takes effect at once instead of up to a poll interval
+                // later. A spurious wakeup just polls early, which is
+                // harmless.
+                let (lock, cv) = &*nudge;
+                if let Ok(mut n) = lock.lock() {
+                    if !n.now {
+                        let (guard, _) = cv
+                            .wait_timeout(n, cfg.poll_interval())
+                            .unwrap_or_else(|e| e.into_inner());
+                        n = guard;
+                    }
+                    n.now = false;
+                    if std::mem::take(&mut n.forget) {
+                        // Everything this process has acted on, and every
+                        // cooldown, dropped — so the next pass treats an open
+                        // alert exactly as it would a new one.
+                        state = reaper::ReaperState::new();
+                        let _ = tx.send(ReaperEvent::Note {
+                            level: LogLevel::Info,
+                            message: "reaper: re-run requested — forgetting handled \
+                                      alerts and cooldowns, checking now"
+                                .to_string(),
+                        });
+                    }
+                }
             }
         });
         ReaperRuntime { rx, _handle: handle }
@@ -27231,7 +27904,7 @@ mod gui {
             };
             let cfg = ec2_manager::features::ReaperFeature::default();
             let target = test_reaper_target();
-            let _ = run_reaper_remediation(&ops, &cfg, &target, false, &null_reaper_tx(), |_| {
+            let _ = run_reaper_remediation(&ops, &cfg, &target, false, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 Ok(failing_transcript())
             }, || {});
             assert!(!ops.log.borrow().contains(&"ack"));
@@ -27251,7 +27924,7 @@ mod gui {
             };
             let cfg = ec2_manager::features::ReaperFeature::default();
             let target = test_reaper_target();
-            let _ = run_reaper_remediation(&ops, &cfg, &target, false, &null_reaper_tx(), |_| {
+            let _ = run_reaper_remediation(&ops, &cfg, &target, false, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 Ok(failing_transcript())
             }, || {});
             assert_eq!(ops.log.borrow().iter().filter(|c| **c == "ack").count(), 0);
@@ -27266,7 +27939,7 @@ mod gui {
             };
             let cfg = ec2_manager::features::ReaperFeature::default();
             let target = test_reaper_target();
-            let _ = run_reaper_remediation(&ops, &cfg, &target, true, &null_reaper_tx(), |_| {
+            let _ = run_reaper_remediation(&ops, &cfg, &target, true, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 Ok(failing_transcript())
             }, || {});
             let log = ops.log.borrow();
@@ -27285,7 +27958,7 @@ mod gui {
             let cfg = ec2_manager::features::ReaperFeature::default();
             let target = test_reaper_target();
             let exec_calls = std::cell::Cell::new(0);
-            let outcome = run_reaper_remediation(&ops, &cfg, &target, true, &null_reaper_tx(), |_| {
+            let outcome = run_reaper_remediation(&ops, &cfg, &target, true, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 exec_calls.set(exec_calls.get() + 1);
                 Ok(failing_transcript())
             }, || {});
@@ -27302,7 +27975,7 @@ mod gui {
             };
             let cfg = ec2_manager::features::ReaperFeature::default();
             let target = test_reaper_target();
-            let outcome = run_reaper_remediation(&ops, &cfg, &target, true, &null_reaper_tx(), |_| {
+            let outcome = run_reaper_remediation(&ops, &cfg, &target, true, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 Ok(failing_transcript())
             }, || {});
             // Exactly one fetch: the last look. A stage-2 poll would be a
@@ -27322,7 +27995,7 @@ mod gui {
             let cfg = ec2_manager::features::ReaperFeature::default();
             let target = test_reaper_target();
             let exec_calls = std::cell::Cell::new(0);
-            let outcome = run_reaper_remediation(&ops, &cfg, &target, true, &null_reaper_tx(), |_| {
+            let outcome = run_reaper_remediation(&ops, &cfg, &target, true, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 exec_calls.set(exec_calls.get() + 1);
                 Ok(failing_transcript())
             }, || {});
@@ -27340,7 +28013,7 @@ mod gui {
             let cfg = ec2_manager::features::ReaperFeature::default();
             let target = test_reaper_target();
             let exec_calls = std::cell::Cell::new(0);
-            let outcome = run_reaper_remediation(&ops, &cfg, &target, false, &null_reaper_tx(), |_| {
+            let outcome = run_reaper_remediation(&ops, &cfg, &target, false, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 exec_calls.set(exec_calls.get() + 1);
                 Ok(failing_transcript())
             }, || {});
@@ -27385,6 +28058,7 @@ mod gui {
                 &cfg,
                 &target,
                 false,
+                ClosedAlert::StandDown,
                 &null_reaper_tx(),
                 |_| Ok(applied_transcript()),
                 || begun.set(begun.get() + 1),
@@ -27412,6 +28086,7 @@ mod gui {
                 &cfg,
                 &target,
                 true,
+                ClosedAlert::StandDown,
                 &null_reaper_tx(),
                 |_| Ok(down),
                 || begun.set(begun.get() + 1),
@@ -27473,6 +28148,183 @@ mod gui {
             assert!(clipped.chars().count() < 450, "{clipped}");
             // Short values are untouched, and trimmed.
             assert_eq!(clip_for_log("  targetgroup/x/1  ", 400), "targetgroup/x/1");
+        }
+
+        /// A probe transcript: compose services, then container uptimes.
+        fn health_transcript(services: &[(&str, &str)], ups: &[(&str, u64)]) -> String {
+            let rows: String = services
+                .iter()
+                .map(|(n, st)| format!("{{\"Name\":\"{n}\",\"State\":\"{st}\"}}\n"))
+                .collect();
+            let times: String = ups
+                .iter()
+                .map(|(n, s)| format!("__RE_UPTIME__ {n} {s}\n"))
+                .collect();
+            format!("__RE_BEGIN__\n__RE_PS_BEGIN__\n{rows}__RE_PS_END__\n{times}__RE_END__\n")
+        }
+
+        #[test]
+        fn a_stack_already_up_for_more_than_a_minute_is_left_alone() {
+            // The real listing: reaper up 8 minutes, cassandra up 33 hours.
+            let (needs_fix, level, line) = reaper_health_verdict(
+                "i-0abc",
+                &health_transcript(
+                    &[("cassandra-reaper", "running"), ("cassandra", "running")],
+                    &[("cassandra-reaper", 480), ("cassandra", 118800)],
+                ),
+            );
+            assert!(!needs_fix, "{line}");
+            assert_eq!(level, LogLevel::Info);
+            // It has to say what it saw and how to overrule it.
+            assert!(line.contains("currently up and running"), "{line}");
+            assert!(line.contains("cassandra-reaper up 8m"), "{line}");
+            assert!(line.contains("cassandra up 1d 9h"), "{line}");
+            assert!(line.contains("Override"), "{line}");
+        }
+
+        #[test]
+        fn a_container_up_under_a_minute_is_fixed_as_a_restart_loop() {
+            let (needs_fix, level, line) = reaper_health_verdict(
+                "i-0abc",
+                &health_transcript(
+                    &[("cassandra-reaper", "running"), ("cassandra", "running")],
+                    &[("cassandra-reaper", 12), ("cassandra", 118800)],
+                ),
+            );
+            assert!(needs_fix, "{line}");
+            assert_eq!(level, LogLevel::Warn);
+            assert!(line.contains("stuck restarting"), "{line}");
+            assert!(line.contains("up only 12s"), "{line}");
+        }
+
+        #[test]
+        fn a_dead_service_is_fixed_however_long_the_others_have_run() {
+            let (needs_fix, _, line) = reaper_health_verdict(
+                "i-0abc",
+                &health_transcript(
+                    &[("cassandra-reaper", "exited"), ("cassandra", "running")],
+                    &[("cassandra", 118800)],
+                ),
+            );
+            assert!(needs_fix, "{line}");
+            assert!(line.contains("cassandra-reaper"), "{line}");
+        }
+
+        #[test]
+        fn a_health_check_that_could_not_tell_still_runs_the_fix() {
+            // The person asked for this run. Refusing it on evidence we do
+            // not have is the worse call — and the line says which it was.
+            for transcript in ["", "__RE_BEGIN__\n__RE_NODIR__\n__RE_END__\n"] {
+                let (needs_fix, level, line) = reaper_health_verdict("i-0abc", transcript);
+                assert!(needs_fix, "{line}");
+                assert_eq!(level, LogLevel::Warn);
+                assert!(line.contains("could not tell"), "{line}");
+            }
+        }
+
+        #[test]
+        fn a_closed_alert_stands_the_poll_down_but_not_a_run_asked_for_by_hand() {
+            // The poll must not remediate an alert that resolved itself — a
+            // sixty-second self-close is real on this feed. The button must,
+            // because "closed but the stack is still down" is one of the
+            // cases it exists for.
+            let ops = || FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("closed"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+
+            let polled = ops();
+            let exec_calls = std::cell::Cell::new(0);
+            let outcome = run_reaper_remediation(
+                &polled,
+                &cfg,
+                &target,
+                true,
+                ClosedAlert::StandDown,
+                &null_reaper_tx(),
+                |_| {
+                    exec_calls.set(exec_calls.get() + 1);
+                    Ok(applied_transcript())
+                },
+                || {},
+            );
+            assert_eq!(exec_calls.get(), 0, "the poll must stand down");
+            assert!(outcome.is_none());
+
+            let asked = ops();
+            let exec_calls = std::cell::Cell::new(0);
+            let outcome = run_reaper_remediation(
+                &asked,
+                &cfg,
+                &target,
+                true,
+                ClosedAlert::Remediate,
+                &null_reaper_tx(),
+                |_| {
+                    exec_calls.set(exec_calls.get() + 1);
+                    Ok(applied_transcript())
+                },
+                || {},
+            );
+            assert_eq!(exec_calls.get(), 1, "an asked-for run proceeds");
+            assert!(outcome.is_some());
+        }
+
+        #[test]
+        fn one_alert_cannot_be_remediated_twice_at_once() {
+            // The poll and the Run Remediation button each spawn their own
+            // thread. Without this, a press and the next poll put two
+            // `compose down`/`up -d` on one box at the same time.
+            let set: ReaperInFlight = Arc::new(Mutex::new(HashSet::new()));
+            let first = claim_in_flight(&set, "alert-1").expect("first claim wins");
+            assert!(
+                claim_in_flight(&set, "alert-1").is_none(),
+                "a second claim on the same alert must be refused"
+            );
+            // A different alert is unaffected — one box being fixed must not
+            // block another.
+            let other = claim_in_flight(&set, "alert-2").expect("a different alert is free");
+
+            drop(first);
+            let again = claim_in_flight(&set, "alert-1");
+            assert!(again.is_some(), "the claim is released when the run ends");
+
+            drop(other);
+            drop(again);
+            assert!(set.lock().expect("not poisoned").is_empty());
+        }
+
+        #[test]
+        fn a_re_run_asks_the_poll_to_forget_and_check_now() {
+            // "As if the alert had just arrived": the handled set and every
+            // cooldown dropped, and a pass immediately rather than up to a
+            // poll interval later.
+            let handle: ReaperNudgeHandle =
+                Arc::new((Mutex::new(ReaperNudge::default()), Condvar::new()));
+            {
+                let n = handle.0.lock().expect("not poisoned");
+                assert!(!n.now && !n.forget, "nothing asked for yet");
+            }
+            nudge_reaper_poll(&handle, true);
+            let n = handle.0.lock().expect("not poisoned");
+            assert!(n.now, "the poll is asked to run now");
+            assert!(n.forget, "and to forget what it has handled");
+        }
+
+        #[test]
+        fn a_plain_nudge_does_not_clear_the_history() {
+            // `forget` is the destructive half — it makes an alert already
+            // acted on eligible again — so it is never implied by asking for
+            // an early poll.
+            let handle: ReaperNudgeHandle =
+                Arc::new((Mutex::new(ReaperNudge::default()), Condvar::new()));
+            nudge_reaper_poll(&handle, false);
+            let n = handle.0.lock().expect("not poisoned");
+            assert!(n.now);
+            assert!(!n.forget);
         }
 
         #[test]
@@ -27692,6 +28544,7 @@ mod gui {
                 &cfg,
                 &target,
                 false,
+                ClosedAlert::StandDown,
                 &null_reaper_tx(),
                 |_| Ok(failing_transcript()),
                 || begun.set(begun.get() + 1),
@@ -27715,6 +28568,7 @@ mod gui {
                 &cfg,
                 &target,
                 true,
+                ClosedAlert::StandDown,
                 &null_reaper_tx(),
                 |_| Ok(applied_transcript()),
                 || begun.set(begun.get() + 1),
@@ -27740,6 +28594,7 @@ mod gui {
                 &cfg,
                 &target,
                 true,
+                ClosedAlert::StandDown,
                 &tx,
                 |_| Ok(applied_transcript()),
                 || {},
@@ -27789,6 +28644,7 @@ mod gui {
                 &cfg,
                 &target,
                 false,
+                ClosedAlert::StandDown,
                 &tx,
                 |_| Ok(applied_transcript()),
                 || {},
@@ -27838,6 +28694,7 @@ mod gui {
                 &cfg,
                 &target,
                 true,
+                ClosedAlert::StandDown,
                 &null_reaper_tx(),
                 |_ctx, _cmd| {
                     exec_calls.set(exec_calls.get() + 1);
@@ -27881,6 +28738,7 @@ mod gui {
                 &cfg,
                 &target,
                 false,
+                ClosedAlert::StandDown,
                 &null_reaper_tx(),
                 |_ctx, _cmd| {
                     exec_calls.set(exec_calls.get() + 1);
@@ -27912,6 +28770,7 @@ mod gui {
                 &cfg,
                 &target,
                 true,
+                ClosedAlert::StandDown,
                 &null_reaper_tx(),
                 |_ctx, _cmd| {
                     exec_calls.set(exec_calls.get() + 1);
@@ -27953,6 +28812,7 @@ mod gui {
                 &cfg,
                 &target,
                 true,
+                ClosedAlert::StandDown,
                 &null_reaper_tx(),
                 |_ctx, _cmd| {
                     exec_calls.set(exec_calls.get() + 1);
@@ -28001,6 +28861,7 @@ mod gui {
                 &cfg,
                 &target,
                 true,
+                ClosedAlert::StandDown,
                 &null_reaper_tx(),
                 |_ctx, _cmd| {
                     exec_calls.set(exec_calls.get() + 1);

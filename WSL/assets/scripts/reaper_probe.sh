@@ -29,6 +29,26 @@ docker ps -a 2>&1 | head -c 4000
 echo
 echo "__RE_DOCKER_END__"
 
+# Exact uptimes, one line per running container.
+#
+# `docker ps` reports "Up 8 minutes", "Up About a minute", "Up 33 hours
+# (healthy)" -- humanised text with special cases, and the difference between
+# "About a minute" and 45 seconds is exactly what the caller has to decide
+# on. `docker inspect` gives the real start time, so the arithmetic is done
+# here against the box's own clock and what crosses is a plain count of
+# seconds.
+#
+# Reads only: `docker ps -q` and `docker inspect` change nothing. A container
+# that disappears between the two is skipped rather than failing the run.
+__now=$(date -u +%s)
+for __c in $(docker ps -q 2>/dev/null); do
+  __started=$(docker inspect -f '{{.State.StartedAt}}' "$__c" 2>/dev/null) || continue
+  __name=$(docker inspect -f '{{.Name}}' "$__c" 2>/dev/null | sed 's#^/##')
+  __begin=$(date -u -d "$__started" +%s 2>/dev/null) || continue
+  [ -n "$__name" ] || __name="$__c"
+  echo "__RE_UPTIME__ $__name $((__now - __begin))"
+done
+
 # Same guard, same marker, same reason as the fix: on a box that is not ours
 # this reports and stops. Everything below needs the compose project.
 if [ ! -d /opt/cassandra-reaper ]; then

@@ -391,6 +391,141 @@ fn record_name(v: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// Prefix of one container-uptime line from `reaper_probe.sh`:
+/// `__RE_UPTIME__ <name> <seconds>`.
+pub const RE_UPTIME: &str = "__RE_UPTIME__";
+
+/// How long one running container has been up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerUptime {
+    pub name: String,
+    pub seconds: u64,
+}
+
+/// A container that restarted within this many seconds is treated as stuck
+/// in a restart loop rather than healthy.
+///
+/// The boundary is inclusive — exactly sixty seconds counts as restarting.
+/// The two errors are not symmetric: calling a looping stack healthy leaves
+/// an outage in place, while calling a just-recovered stack broken costs one
+/// more restart of something that was already restarting.
+pub const RESTART_WINDOW_SECS: u64 = 60;
+
+/// Every `__RE_UPTIME__` line in a probe transcript.
+///
+/// The script does the arithmetic against the box's own clock, so what
+/// arrives is a plain count of seconds — no parsing of docker's humanised
+/// `Up About a minute`, whose special cases sit exactly on the boundary this
+/// is used to decide.
+pub fn parse_container_uptimes(output: &str) -> Vec<ContainerUptime> {
+    output
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix(RE_UPTIME))
+        .filter_map(|rest| {
+            let rest = rest.trim();
+            // Split from the right: a container name cannot contain a space,
+            // but splitting from the left would break if one ever did.
+            let (name, secs) = rest.rsplit_once(char::is_whitespace)?;
+            Some(ContainerUptime {
+                name: name.trim().to_string(),
+                seconds: secs.trim().parse().ok()?,
+            })
+        })
+        .filter(|u| !u.name.is_empty())
+        .collect()
+}
+
+/// What a probe transcript says about whether the stack needs fixing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StackHealth {
+    /// A compose service is not running, or nothing is running at all. The
+    /// clearest case for a fix.
+    Down(String),
+    /// Everything is running, but something came up within
+    /// [`RESTART_WINDOW_SECS`] — the shape of a container being restarted in
+    /// a loop, which reads as "up" at any instant you happen to look.
+    Restarting { name: String, seconds: u64 },
+    /// Everything has been up longer than the window.
+    Steady(Vec<ContainerUptime>),
+    /// The transcript did not say. Never treated as either healthy or
+    /// broken: the caller decides what to do without an answer, and saying
+    /// "I could not tell" is the honest report.
+    Unknown(String),
+}
+
+/// Decide whether a box that a person is about to remediate actually needs it.
+///
+/// Ordered deliberately: a service that is *not running* outranks any uptime,
+/// because a stack with one dead service is broken however long the others
+/// have been up.
+pub fn stack_health(output: &str) -> StackHealth {
+    if output.contains(RE_NODIR) {
+        return StackHealth::Unknown(format!("{REAPER_DIR} is not present on this instance"));
+    }
+
+    let services = compose_services(output);
+    let uptimes = parse_container_uptimes(output);
+
+    if services.is_empty() && uptimes.is_empty() {
+        return StackHealth::Unknown(
+            "the probe reported no compose services and no running containers".to_string(),
+        );
+    }
+
+    let down: Vec<&str> = services
+        .iter()
+        .filter(|(_, up)| !up)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !down.is_empty() {
+        return StackHealth::Down(format!("not running: {}", down.join(", ")));
+    }
+    if uptimes.is_empty() {
+        return StackHealth::Unknown(
+            "compose reported every service up, but no container uptimes came back"
+                .to_string(),
+        );
+    }
+
+    // The youngest container decides. One container looping is enough to
+    // make the stack unwell, however long its siblings have been up.
+    let youngest = uptimes
+        .iter()
+        .min_by_key(|u| u.seconds)
+        .expect("checked non-empty");
+    if youngest.seconds <= RESTART_WINDOW_SECS {
+        return StackHealth::Restarting {
+            name: youngest.name.clone(),
+            seconds: youngest.seconds,
+        };
+    }
+    StackHealth::Steady(uptimes)
+}
+
+/// A duration in seconds as a short human string: `45s`, `8m`, `33h`, `2d 3h`.
+///
+/// Coarse on purpose — this ends up in a sentence saying how long something
+/// has been up, where `33h` reads better than `33h 12m 04s`.
+pub fn format_uptime(seconds: u64) -> String {
+    const MIN: u64 = 60;
+    const HOUR: u64 = 60 * MIN;
+    const DAY: u64 = 24 * HOUR;
+    match seconds {
+        s if s < MIN => format!("{s}s"),
+        s if s < HOUR => format!("{}m", s / MIN),
+        s if s < DAY => format!("{}h", s / HOUR),
+        s => {
+            let days = s / DAY;
+            let hours = (s % DAY) / HOUR;
+            if hours == 0 {
+                format!("{days}d")
+            } else {
+                format!("{days}d {hours}h")
+            }
+        }
+    }
+}
+
 /// The text between the `compose ps` markers, or `None`.
 ///
 /// Shared by [`parse_verdict`] and [`compose_services`] so the two cannot
@@ -961,6 +1096,44 @@ mod tests {
         assert_eq!(find_target_group("targetgroup/"), None);
         assert_eq!(find_target_group("nothing here"), None);
         assert_eq!(target_group_name("i-0abc123def4567890"), None);
+    }
+
+    #[test]
+    fn the_target_group_is_found_in_a_real_cloudwatch_alarm_description() {
+        // The actual body this feed sends, shape and all. It is the *only*
+        // place the target group appears -- the message carries the alarm
+        // name and no resource id -- which is why an alert served without a
+        // description names nothing actionable.
+        let mut a = alert();
+        a.message = "[Target Group]: prod-Reaper-UnHealthyHostCount-Critical".to_string();
+        a.description = "*** ALARM INFO ***\n\
+             Alert: Reaper-UnHealthyHostCount-Critical\n\
+             Description: UnHealthyHostCount > 0 for 15+ minutes on \
+             targetgroup/prod-reaper-tg/17bb79ec89f6d7d9\n\n\
+             *** RESOURCE INFO ***\n\
+             Resource Type: Target Group\n\
+             Resource Name: UnHealthyHostCount\n\
+             Resource ID: targetgroup/prod-reaper-tg/17bb79ec89f6d7d9\n\n\
+             *** ACCOUNT INFO ***\n\
+             Account: 830301468378\n\
+             Environment: \n\
+             Region: us-east-1\n"
+            .to_string();
+
+        assert!(identifies(&a, &cfg()));
+        assert_eq!(
+            match_alert(&a, &cfg()).expect("matches").subject,
+            Subject::TargetGroup("targetgroup/prod-reaper-tg/17bb79ec89f6d7d9".to_string())
+        );
+
+        // And with the description gone -- which is exactly what the feed's
+        // list view sends -- the same alert names nothing. That difference,
+        // not the acknowledgement, is why the poll and the probe disagreed
+        // about one alert id.
+        let mut listed = a.clone();
+        listed.description = String::new();
+        assert!(identifies(&listed, &cfg()));
+        assert!(match_alert(&listed, &cfg()).is_none());
     }
 
     #[test]
@@ -1574,7 +1747,10 @@ mod tests {
             if l.starts_with('#') {
                 continue;
             }
-            let stripped = l.replace("2>&1", "").replace("> /dev/null", "");
+            let stripped = l
+                .replace("2>&1", "")
+                .replace("2>/dev/null", "")
+                .replace("> /dev/null", "");
             assert!(!stripped.contains('>'), "the probe must not redirect: {l}");
         }
     }
@@ -1628,6 +1804,142 @@ mod tests {
                 .unwrap_or_else(|| panic!("the fix runs {changing}"));
             assert!(guard < at, "{changing} runs before the directory check");
         }
+    }
+
+    fn uptime_block(pairs: &[(&str, u64)]) -> String {
+        pairs
+            .iter()
+            .map(|(n, s)| format!("{RE_UPTIME} {n} {s}\n"))
+            .collect()
+    }
+
+    fn ps_block(services: &[(&str, &str)]) -> String {
+        let rows: String = services
+            .iter()
+            .map(|(n, state)| format!("{{\"Name\":\"{n}\",\"State\":\"{state}\"}}\n"))
+            .collect();
+        format!("{RE_PS_BEGIN}\n{rows}{RE_PS_END}\n")
+    }
+
+    #[test]
+    fn the_probe_reports_exact_uptimes_rather_than_dockers_prose() {
+        // "Up About a minute" is a real docker string and it sits exactly on
+        // the boundary this decides, which is why the seconds are computed on
+        // the box.
+        assert!(REAPER_PROBE_SH.contains(RE_UPTIME));
+        assert!(REAPER_PROBE_SH.contains("State.StartedAt"));
+        let out = uptime_block(&[("cassandra-reaper", 480), ("cassandra", 118800)]);
+        assert_eq!(
+            parse_container_uptimes(&out),
+            vec![
+                ContainerUptime { name: "cassandra-reaper".into(), seconds: 480 },
+                ContainerUptime { name: "cassandra".into(), seconds: 118800 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stack_up_for_more_than_a_minute_is_steady() {
+        // The real listing: reaper up 8 minutes, cassandra up 33 hours.
+        let out = format!(
+            "{}{}",
+            ps_block(&[("cassandra-reaper", "running"), ("cassandra", "running")]),
+            uptime_block(&[("cassandra-reaper", 480), ("cassandra", 118800)]),
+        );
+        match stack_health(&out) {
+            StackHealth::Steady(ups) => assert_eq!(ups.len(), 2),
+            other => panic!("expected Steady, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_container_that_just_came_up_reads_as_stuck_restarting() {
+        // Everything is "running" at the instant you look, which is exactly
+        // how a restart loop presents. The youngest container decides.
+        let out = format!(
+            "{}{}",
+            ps_block(&[("cassandra-reaper", "running"), ("cassandra", "running")]),
+            uptime_block(&[("cassandra-reaper", 12), ("cassandra", 118800)]),
+        );
+        assert_eq!(
+            stack_health(&out),
+            StackHealth::Restarting { name: "cassandra-reaper".into(), seconds: 12 }
+        );
+    }
+
+    #[test]
+    fn the_restart_window_is_inclusive_at_exactly_a_minute() {
+        // The two errors are not symmetric: calling a looping stack healthy
+        // leaves an outage in place, while calling a just-recovered stack
+        // broken costs one more restart of something already restarting.
+        let at = |secs| {
+            let out = format!(
+                "{}{}",
+                ps_block(&[("reaper", "running")]),
+                uptime_block(&[("reaper", secs)]),
+            );
+            stack_health(&out)
+        };
+        assert!(matches!(at(RESTART_WINDOW_SECS), StackHealth::Restarting { .. }));
+        assert!(matches!(at(RESTART_WINDOW_SECS + 1), StackHealth::Steady(_)));
+    }
+
+    #[test]
+    fn a_service_that_is_not_running_outranks_every_uptime() {
+        // A stack with one dead service is broken however long the others
+        // have been up.
+        let out = format!(
+            "{}{}",
+            ps_block(&[("cassandra-reaper", "exited"), ("cassandra", "running")]),
+            uptime_block(&[("cassandra", 118800)]),
+        );
+        match stack_health(&out) {
+            StackHealth::Down(why) => assert!(why.contains("cassandra-reaper"), "{why}"),
+            other => panic!("expected Down, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_transcript_that_does_not_say_is_unknown_not_healthy() {
+        // Never treated as either. "I could not tell" is the honest report,
+        // and the caller decides what to do without an answer.
+        assert!(matches!(stack_health(""), StackHealth::Unknown(_)));
+        assert!(matches!(
+            stack_health(&format!("{RE_BEGIN}\n{RE_NODIR}\n{RE_END}\n")),
+            StackHealth::Unknown(_)
+        ));
+        // Compose says everything is up but no uptimes came back: that is a
+        // gap in the evidence, not a healthy box.
+        assert!(matches!(
+            stack_health(&ps_block(&[("reaper", "running")])),
+            StackHealth::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn a_malformed_uptime_line_is_skipped_rather_than_counted_as_zero() {
+        // Zero seconds would read as "just restarted" and trigger a fix.
+        let out = format!(
+            "{RE_UPTIME} broken\n{RE_UPTIME} name notanumber\n{RE_UPTIME}   \n{}",
+            uptime_block(&[("good", 900)]),
+        );
+        assert_eq!(
+            parse_container_uptimes(&out),
+            vec![ContainerUptime { name: "good".into(), seconds: 900 }]
+        );
+    }
+
+    #[test]
+    fn uptimes_render_short_enough_to_sit_in_a_sentence() {
+        assert_eq!(format_uptime(45), "45s");
+        assert_eq!(format_uptime(60), "1m");
+        assert_eq!(format_uptime(480), "8m");
+        assert_eq!(format_uptime(82800), "23h");
+        assert_eq!(format_uptime(86400), "1d");
+        assert_eq!(format_uptime(97200), "1d 3h");
+        // Docker would call this "Up 33 hours"; past a day this rolls over,
+        // which reads better in a sentence and is the same instant.
+        assert_eq!(format_uptime(118800), "1d 9h");
     }
 
     #[test]

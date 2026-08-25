@@ -529,6 +529,92 @@ the constant *and* that neither still says `/opt/reaper`, which is
 substring-safe since `/opt/cassandra-reaper` does not contain it, so a
 half-applied rename fails.
 
+#### The poll always reads the alert in full
+
+`fetch_latest` (the list) **omits `description`**, and these alerts name their
+target group *only* there:
+
+```
+Resource ID: targetgroup/<name>/<id>
+```
+
+So the poll declined every reaper alert while Test Alert Match — which reads
+`/alerts/{id}` — resolved the same alert id fine. Same matcher, different
+payload. `Alert::description` warns about this in its own doc comment.
+
+Every alert the poll might act on is now read in full by id
+(`fetch_alert_in_full`), never matched off the list. Matching the list first
+and falling back would work, but these alerts are shaped the same every time,
+so a fallback that fires on every single alert is a slower way of always
+fetching with a second path to keep correct.
+
+**The three checks the list *can* answer run first** — identified, closed,
+already handled — so a settled alert never costs a call. A failed read leaves
+the alert unhandled, so the next poll tries again.
+
+#### Run Remediation, Re-run Alert Check, and Override
+
+Two buttons beside Test Alert Match, same `reaper.allowed_users` gate.
+
+**Run Remediation** treats the alert as if it had just arrived, whatever state
+it is in — open, closed, acknowledged or not — and ignores the cooldown and
+whatever this session has already handled, because a person asking for it has
+overruled both.
+
+- **A closed alert is a caller's choice, not a constant.**
+  `run_reaper_remediation`'s last look aborts on a closed alert, which is right
+  for the poll (a sixty-second self-close is real on this feed) and wrong for a
+  button. It takes a `ClosedAlert` — an enum, not a second `bool`, because it
+  sits next to `on_call` at every call site and two adjacent booleans swap
+  silently.
+- **Disabled under `dry_run`**, with hover text saying why. A button that
+  silently honoured dry run would read as broken.
+- **The confirmation names the alert, lists the three commands, and says the
+  watchdog is left stopped and that being on call means acknowledging first.**
+  It cannot name the instance: resolution is two AWS calls away and happens
+  after the click. It says so, and points at Test Alert Match.
+
+**Override** (beside it) skips the health pre-check.
+
+- **Unticked, the box is read before it is touched** — the same read-only probe
+  script — and the fix is skipped when the stack is already up. An alert stays
+  open long after the box behind it recovers, so the alert cannot answer "does
+  this still need fixing"; only the box can.
+- **The rule is `stack_health`:** a compose service not running outranks any
+  uptime; otherwise the *youngest* container decides, since one container
+  looping is enough to make the stack unwell. At or under
+  `RESTART_WINDOW_SECS` (60) it is treated as stuck restarting and fixed; above
+  it the run stops and reports `currently up and running (cassandra-reaper up
+  8m, cassandra up 1d 9h)`.
+- **The boundary is inclusive on purpose.** The two errors are not symmetric:
+  calling a looping stack healthy leaves an outage in place, while calling a
+  just-recovered stack broken costs one more restart of something that was
+  already restarting.
+- **`Unknown` is never read as healthy.** A transcript that did not say gets
+  the fix, saying which it was — the person asked for the run, and refusing on
+  evidence we do not have is the worse call.
+- **Uptimes are computed on the box, not parsed from `docker ps`.** That column
+  is prose — `Up 8 minutes`, `Up 33 hours (healthy)`, and `Up About a minute`,
+  which sits exactly on the boundary this decides. `reaper_probe.sh` emits
+  `__RE_UPTIME__ <name> <seconds>` from `docker inspect .State.StartedAt`
+  against the box's own clock. Still read-only.
+- The tick is captured **when the button is pressed**, not read at confirm
+  time, so toggling it while the dialog is open cannot change what was agreed
+  to. The dialog restates which mode it will run in.
+
+**Re-run Alert Check** makes the poll forget every handled alert and every
+cooldown and run a pass immediately, so an open alert is picked up as if it had
+just arrived. The poll thread now **waits on a condvar** rather than sleeping,
+so this lands at once instead of up to a poll interval later. `forget` is never
+implied by asking for an early poll — it is the destructive half.
+
+**One alert cannot be remediated twice at once.** The poll and the button each
+spawn their own thread, so `ReaperState` cannot arbitrate between them —
+it is owned by the poll. `ReaperInFlight` is a shared set of alert ids with a
+`Drop` guard, claimed *before* the spawn for the same reason `mark_handled` is.
+Without it a press and the next poll can put two `compose down`/`up -d` on one
+box at once.
+
 #### Test Alert Match (Alerts window)
 
 An alert id in, the whole decision out, without taking anything down to see
