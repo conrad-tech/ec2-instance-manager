@@ -56,6 +56,10 @@ const MAX_RESULTS: u32 = 50;
 pub const DEFAULT_JQL: &str =
     "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC";
 
+/// Comments fetched per ticket. A thread longer than this is rare, and the
+/// window scrolls.
+const MAX_COMMENTS: u32 = 100;
+
 /// Environment override for the Jira site. Layered above the `features.json`
 /// value so a domain need not be committed to git to be used.
 pub const JIRA_BASE_URL_ENV: &str = "JIRA_BASE_URL";
@@ -64,13 +68,13 @@ pub const JIRA_BASE_URL_ENV: &str = "JIRA_BASE_URL";
 /// columns and a search that drags every custom field on every ticket is
 /// slower for nothing.
 const LIST_FIELDS: &[&str] =
-    &["summary", "status", "issuetype", "priority", "updated", "project"];
+    &["summary", "status", "issuetype", "priority", "updated", "project", "duedate"];
 
 /// Fields the ticket view needs. `description` is here and absent from
 /// [`LIST_FIELDS`] on purpose — it is the largest field on most tickets and
 /// the list never shows it.
-const ISSUE_FIELDS: &str =
-    "summary,description,status,issuetype,priority,assignee,reporter,created,updated,labels";
+const ISSUE_FIELDS: &str = "summary,description,status,issuetype,priority,assignee,\
+     reporter,created,updated,labels,duedate";
 
 /// Where the Jira issue API is, and what to authenticate to it with.
 ///
@@ -254,6 +258,10 @@ pub struct IssueRow {
     pub project: String,
     /// `updated` exactly as the API returned it. Rendered in local time.
     pub updated: String,
+    /// `duedate` — a **date**, `2026-09-01`, with no time and no timezone.
+    /// Empty when the ticket has none. See [`due_label`] for why it must
+    /// never go through [`local_time`].
+    pub due: String,
 }
 
 /// One ticket, as the detail window shows it.
@@ -273,6 +281,8 @@ pub struct Issue {
     pub reporter: String,
     pub created: String,
     pub updated: String,
+    /// See [`IssueRow::due`].
+    pub due: String,
     pub labels: Vec<String>,
 }
 
@@ -287,6 +297,100 @@ pub struct Transition {
     /// The status the ticket lands in. Shown as hover text so a button
     /// named "Done" that actually moves to "Closed" says so.
     pub to_status: String,
+    /// The **required** fields on this transition's screen.
+    ///
+    /// Jira transitions can carry a screen — a change request whose Close
+    /// asks for a comment, an ordinary ticket whose Close asks for a
+    /// Resolution — and posting the bare `{"transition":{"id":…}}` at one of
+    /// those is rejected with a 400 saying nothing the caller anticipated.
+    /// There is no two-phase API: the screen cannot be "opened" and then
+    /// submitted, so everything must go in one POST. Knowing the screen up
+    /// front is what lets the app *ask* first and then send once.
+    ///
+    /// Optional fields are deliberately dropped. This is a ticket viewer
+    /// reproducing a required prompt, not a general issue editor.
+    pub fields: Vec<ScreenField>,
+}
+
+impl Transition {
+    /// True when this move needs a prompt rather than a single click.
+    pub fn needs_prompt(&self) -> bool {
+        !self.fields.is_empty()
+    }
+
+    /// Required fields this window cannot render, by display name. Non-empty
+    /// means the move has to be made in the browser — a user picker or a
+    /// cascading select is a different feature from a ticket viewer, and
+    /// guessing at one would post the wrong value to a live ticket.
+    pub fn unsupported(&self) -> Vec<&str> {
+        self.fields
+            .iter()
+            .filter(|f| matches!(f.kind, FieldKind::Unsupported(_)))
+            .map(|f| f.name.as_str())
+            .collect()
+    }
+}
+
+/// One required field on a transition screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScreenField {
+    /// The API's key — `resolution`, `comment`, `customfield_10042`. This is
+    /// what the payload is built against.
+    pub key: String,
+    /// The label Jira shows. A custom field's key names nothing, so this is
+    /// what the prompt is captioned with.
+    pub name: String,
+    pub kind: FieldKind,
+}
+
+/// How a screen field is rendered, and how its value is sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FieldKind {
+    /// The comment box. Sent under `update.comment`, not `fields` — that is
+    /// the shape Jira accepts.
+    Comment,
+    /// A dropdown. **Options come from Jira**, never a hardcoded list: a
+    /// Resolution's choices are per-project, so a built-in list would be
+    /// right on one project and wrong on the next.
+    Select {
+        options: Vec<FieldOption>,
+        /// The field takes a list, so the chosen option is wrapped in one.
+        array: bool,
+    },
+    /// A free-text field.
+    Text { multiline: bool },
+    /// A numeric field.
+    Number,
+    /// A type this window does not render, carrying the schema type so the
+    /// message can say what it was.
+    Unsupported(String),
+}
+
+/// One choice in a [`FieldKind::Select`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldOption {
+    pub id: String,
+    pub label: String,
+}
+
+/// A value the user supplied for a screen field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FieldInput {
+    /// Typed text — a comment body, or a text/number field.
+    Text(String),
+    /// The id of a chosen [`FieldOption`].
+    Option(String),
+}
+
+/// One comment on a ticket.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Comment {
+    pub author: String,
+    /// As the API returned it. Rendered in local time.
+    pub created: String,
+    /// Flattened by [`description_text`] — comment bodies are ADF on v3,
+    /// exactly like the description.
+    pub body: String,
 }
 
 fn require_complete(site: &JiraSite) -> Result<()> {
@@ -385,6 +489,7 @@ pub fn parse_issue_list(body: &str) -> Result<Vec<IssueRow>> {
             priority: field_str(i, &["fields", "priority", "name"]),
             project: field_str(i, &["fields", "project", "key"]),
             updated: field_str(i, &["fields", "updated"]),
+            due: field_str(i, &["fields", "duedate"]),
         })
         .collect())
 }
@@ -427,6 +532,7 @@ pub fn parse_issue(body: &str) -> Result<Issue> {
         reporter: field_str(&v, &["fields", "reporter", "displayName"]),
         created: field_str(&v, &["fields", "created"]),
         updated: field_str(&v, &["fields", "updated"]),
+        due: field_str(&v, &["fields", "duedate"]),
         labels,
     })
 }
@@ -447,13 +553,170 @@ pub fn parse_transitions(body: &str) -> Result<Vec<Transition>> {
     };
     Ok(list
         .iter()
-        .map(|t| Transition {
-            id: field_str(t, &["id"]),
-            name: field_str(t, &["name"]),
-            to_status: field_str(t, &["to", "name"]),
+        .map(|t| {
+            // `fields` is only present when the request asked for
+            // `expand=transitions.fields`. Absent, every transition looks
+            // unconstrained — which is the old behaviour and the reason a
+            // required-comment Close came back as a bare 400.
+            Transition {
+                id: field_str(t, &["id"]),
+                name: field_str(t, &["name"]),
+                to_status: field_str(t, &["to", "name"]),
+                fields: screen_fields(t),
+            }
         })
         .filter(|t| !t.id.is_empty())
         .collect())
+}
+
+/// The required fields on one transition's screen, in the order Jira lists
+/// them with `comment` last — a comment reads as the closing note under
+/// whatever else the screen asks for, which is how Jira's own dialog is laid
+/// out.
+fn screen_fields(t: &Value) -> Vec<ScreenField> {
+    let Some(fields) = t.get("fields").and_then(Value::as_object) else {
+        // Only present when the request asked for
+        // `expand=transitions.fields`. Absent, every transition looks
+        // unconstrained — which is the old behaviour, and the reason a
+        // required-comment Close came back as a bare 400.
+        return Vec::new();
+    };
+    let mut out: Vec<ScreenField> = fields
+        .iter()
+        .filter(|(_, spec)| spec.get("required").and_then(Value::as_bool).unwrap_or(false))
+        .map(|(key, spec)| {
+            let label = field_str(spec, &["name"]);
+            ScreenField {
+                key: key.clone(),
+                name: if label.is_empty() { key.clone() } else { label },
+                kind: field_kind(key, spec),
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        let rank = |f: &ScreenField| u8::from(matches!(f.kind, FieldKind::Comment));
+        rank(a).cmp(&rank(b)).then_with(|| a.name.cmp(&b.name))
+    });
+    out
+}
+
+/// Decide how one screen field is rendered.
+///
+/// `allowedValues` is the strongest signal and is checked first: whatever the
+/// schema calls it, a field that ships its own list of choices is a dropdown,
+/// and that covers Resolution, priority and every custom select without
+/// naming any of them here.
+fn field_kind(key: &str, spec: &Value) -> FieldKind {
+    if key == "comment" {
+        return FieldKind::Comment;
+    }
+    let schema_type = field_str(spec, &["schema", "type"]);
+    if let Some(values) = spec.get("allowedValues").and_then(Value::as_array) {
+        let options: Vec<FieldOption> = values
+            .iter()
+            .filter_map(|v| {
+                let id = field_str(v, &["id"]);
+                if id.is_empty() {
+                    return None;
+                }
+                // `name` for a system field, `value` for a custom select.
+                let label = [
+                    field_str(v, &["name"]),
+                    field_str(v, &["value"]),
+                    id.clone(),
+                ]
+                .into_iter()
+                .find(|s| !s.is_empty())
+                .unwrap_or_default();
+                Some(FieldOption { id, label })
+            })
+            .collect();
+        if !options.is_empty() {
+            return FieldKind::Select { options, array: schema_type == "array" };
+        }
+    }
+    match schema_type.as_str() {
+        "string" => FieldKind::Text { multiline: key == "description" },
+        "number" => FieldKind::Number,
+        // A user picker, a date, a cascading select, an array with no
+        // allowedValues. Guessing at any of these posts a wrong value to a
+        // live ticket, so they are named and refused instead.
+        other => FieldKind::Unsupported(other.to_string()),
+    }
+}
+
+/// Parse a `/comment` response, oldest first — the order a thread reads in,
+/// and the order Jira itself returns.
+pub fn parse_comments(body: &str) -> Result<Vec<Comment>> {
+    let v: Value = serde_json::from_str(body)
+        .map_err(|e| AppError::InvalidArgument(format!("jira: could not parse comments: {e}")))?;
+    let Some(list) = v.get("comments").and_then(Value::as_array) else {
+        return Err(AppError::InvalidArgument(
+            "jira: response carried no 'comments' list".to_string(),
+        ));
+    };
+    Ok(list
+        .iter()
+        .map(|c| Comment {
+            author: field_str(c, &["author", "displayName"]),
+            created: field_str(c, &["created"]),
+            body: c.get("body").map(description_text).unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// Turn typed text into an ADF document for a comment body.
+///
+/// The inverse of [`description_text`], and required rather than optional:
+/// v3 rejects a plain string here.
+///
+/// **A blank line starts a new paragraph; a single newline is a soft break
+/// inside one.** That is what Jira's own editor does with Enter and
+/// Shift+Enter, and it is what makes the round trip faithful — mapping every
+/// newline to a paragraph turns each line break the author typed into a blank
+/// line, so the posted comment is visibly not what they wrote.
+/// `a_typed_comment_round_trips_through_adf` pins it.
+///
+/// **Built with `serde_json`, never string formatting.** This is arbitrary
+/// user text going into a JSON request body; a quote, a backslash or a
+/// newline written into a hand-built string would break out of it.
+/// `a_comment_body_cannot_break_out_of_its_json` pins that.
+pub fn comment_adf(text: &str) -> Value {
+    let normalized = text.replace("\r\n", "\n");
+    let paragraphs: Vec<Value> = normalized
+        .split("\n\n")
+        .map(|para| {
+            let mut content: Vec<Value> = Vec::new();
+            for (i, line) in para.split('\n').enumerate() {
+                if i > 0 {
+                    content.push(serde_json::json!({ "type": "hardBreak" }));
+                }
+                if !line.is_empty() {
+                    content.push(serde_json::json!({ "type": "text", "text": line }));
+                }
+            }
+            if content.is_empty() {
+                // An empty paragraph is how ADF spells a blank line; a
+                // paragraph carrying an empty text node is rejected.
+                serde_json::json!({ "type": "paragraph" })
+            } else {
+                serde_json::json!({ "type": "paragraph", "content": content })
+            }
+        })
+        .collect();
+    serde_json::json!({ "type": "doc", "version": 1, "content": paragraphs })
+}
+
+/// Reject a comment that would post nothing. Whitespace-only is the case
+/// that matters: it passes an `is_empty` check and posts a blank comment
+/// everyone on the ticket gets notified about.
+fn require_comment_text(text: &str) -> Result<()> {
+    if text.trim().is_empty() {
+        return Err(AppError::InvalidArgument(
+            "jira: a comment needs some text".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Jira timestamps in local time, e.g. `2026-08-26 10:12 AM`.
@@ -527,25 +790,236 @@ pub fn fetch_transitions(site: &JiraSite, key: &str) -> Result<Vec<Transition>> 
     require_complete(site)?;
     validate_issue_key(key)?;
     let url = format!("{}/issue/{}/transitions", site.api_base, key.trim());
-    let body = atlassian_http::request(&site.auth.email, &site.auth.token, &url, &[], None)?;
+    // Without this expand the response says nothing about each transition's
+    // screen, so a Close that requires a comment looks identical to one that
+    // does not — and the move is attempted and rejected with a 400.
+    let body = atlassian_http::request(
+        &site.auth.email,
+        &site.auth.token,
+        &url,
+        &[("expand", "transitions.fields".to_string())],
+        None,
+    )?;
     parse_transitions(&body)
 }
 
-/// Move a ticket. The only call in this module that changes anything.
-pub fn do_transition(site: &JiraSite, key: &str, transition_id: &str) -> Result<()> {
+/// A ticket's comment thread, oldest first.
+pub fn fetch_comments(site: &JiraSite, key: &str) -> Result<Vec<Comment>> {
     require_complete(site)?;
     validate_issue_key(key)?;
+    let url = format!("{}/issue/{}/comment", site.api_base, key.trim());
+    let body = atlassian_http::request(
+        &site.auth.email,
+        &site.auth.token,
+        &url,
+        &[("maxResults", MAX_COMMENTS.to_string())],
+        None,
+    )?;
+    parse_comments(&body)
+}
+
+/// Post a comment.
+pub fn add_comment(site: &JiraSite, key: &str, text: &str) -> Result<()> {
+    require_complete(site)?;
+    validate_issue_key(key)?;
+    require_comment_text(text)?;
+    let url = format!("{}/issue/{}/comment", site.api_base, key.trim());
+    let payload = serde_json::json!({ "body": comment_adf(text) }).to_string();
+    atlassian_http::request(&site.auth.email, &site.auth.token, &url, &[], Some(&payload))?;
+    Ok(())
+}
+
+/// Build the transition POST body from a screen and the values supplied for
+/// it.
+///
+/// Pure, and separate from [`do_transition`], because this is where a wrong
+/// answer is a wrong write to a live ticket — the two shapes are not
+/// interchangeable and Jira accepts only one of each:
+///
+/// - **a comment goes under `update.comment[].add.body`**, never in `fields`;
+/// - **everything else goes in `fields`**, an option as `{"id": …}` and an
+///   array-typed one as `[{"id": …}]`.
+///
+/// Every required field must have a non-blank value, checked here rather than
+/// left to the server: a 400 from Jira arrives after the click, names the
+/// field in its own words, and is exactly the experience this prompt exists
+/// to replace.
+pub fn transition_payload(
+    transition_id: &str,
+    fields: &[ScreenField],
+    inputs: &[(String, FieldInput)],
+) -> Result<Value> {
     validate_transition_id(transition_id)?;
+    let mut payload = serde_json::json!({ "transition": { "id": transition_id.trim() } });
+    let mut set_fields = serde_json::Map::new();
+    let mut update = serde_json::Map::new();
+
+    for field in fields {
+        let supplied = inputs.iter().find(|(k, _)| k == &field.key).map(|(_, v)| v);
+        let missing = || {
+            AppError::InvalidArgument(format!("jira: '{}' is required", field.name))
+        };
+        match &field.kind {
+            FieldKind::Unsupported(kind) => {
+                return Err(AppError::InvalidArgument(format!(
+                    "jira: '{}' is a required {kind} field, which this window cannot \
+                     set — make this change in Jira",
+                    field.name
+                )));
+            }
+            FieldKind::Comment => {
+                let FieldInput::Text(text) = supplied.ok_or_else(missing)? else {
+                    return Err(missing());
+                };
+                require_comment_text(text)?;
+                update.insert(
+                    "comment".to_string(),
+                    serde_json::json!([{ "add": { "body": comment_adf(text) } }]),
+                );
+            }
+            FieldKind::Select { options, array } => {
+                let FieldInput::Option(id) = supplied.ok_or_else(missing)? else {
+                    return Err(missing());
+                };
+                // The id has to be one Jira offered. A free-typed id would be
+                // a silent wrong write — Jira accepts any id that exists,
+                // including one belonging to another field's option.
+                if !options.iter().any(|o| &o.id == id) {
+                    return Err(AppError::InvalidArgument(format!(
+                        "jira: '{}' is not one of the options for '{}'",
+                        id, field.name
+                    )));
+                }
+                let one = serde_json::json!({ "id": id });
+                set_fields.insert(
+                    field.key.clone(),
+                    if *array { serde_json::json!([one]) } else { one },
+                );
+            }
+            FieldKind::Text { .. } => {
+                let FieldInput::Text(text) = supplied.ok_or_else(missing)? else {
+                    return Err(missing());
+                };
+                if text.trim().is_empty() {
+                    return Err(missing());
+                }
+                set_fields.insert(field.key.clone(), Value::String(text.clone()));
+            }
+            FieldKind::Number => {
+                let FieldInput::Text(text) = supplied.ok_or_else(missing)? else {
+                    return Err(missing());
+                };
+                let n: f64 = text.trim().parse().map_err(|_| {
+                    AppError::InvalidArgument(format!(
+                        "jira: '{}' must be a number, got '{}'",
+                        field.name,
+                        text.trim()
+                    ))
+                })?;
+                set_fields.insert(
+                    field.key.clone(),
+                    serde_json::Number::from_f64(n).map(Value::Number).ok_or_else(|| {
+                        AppError::InvalidArgument(format!(
+                            "jira: '{}' is not a finite number",
+                            field.name
+                        ))
+                    })?,
+                );
+            }
+        }
+    }
+
+    if !set_fields.is_empty() {
+        payload["fields"] = Value::Object(set_fields);
+    }
+    if !update.is_empty() {
+        payload["update"] = Value::Object(update);
+    }
+    Ok(payload)
+}
+
+/// Move a ticket, filling in whatever its screen requires.
+///
+/// The only call in this module that changes anything. `fields` is the
+/// transition's own screen (from [`fetch_transitions`]) and `inputs` are the
+/// values collected for it; a transition with no screen passes both empty and
+/// posts exactly what it always did.
+pub fn do_transition(
+    site: &JiraSite,
+    key: &str,
+    transition_id: &str,
+    fields: &[ScreenField],
+    inputs: &[(String, FieldInput)],
+) -> Result<()> {
+    require_complete(site)?;
+    validate_issue_key(key)?;
+    let payload = transition_payload(transition_id, fields, inputs)?;
     let url = format!("{}/issue/{}/transitions", site.api_base, key.trim());
-    let payload = format!(r#"{{"transition":{{"id":"{}"}}}}"#, transition_id.trim());
     atlassian_http::request(
         &site.auth.email,
         &site.auth.token,
         &url,
         &[],
-        Some(&payload),
+        Some(&payload.to_string()),
     )?;
     Ok(())
+}
+
+/// How a due date stands relative to today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DueState {
+    /// No due date on the ticket.
+    None,
+    /// Due later.
+    Future,
+    /// Due today.
+    Today,
+    /// Past its date and not finished.
+    Overdue,
+}
+
+/// Classify a due date.
+///
+/// `today` is a parameter rather than read from the clock so the boundaries
+/// are testable without freezing time.
+///
+/// **A ticket in the `done` category is never overdue**, whatever its date
+/// says: it is finished, not late, and colouring a closed ticket red is
+/// noise on the one row that needs no attention.
+pub fn due_state(due: &str, status_category: &str, today: chrono::NaiveDate) -> DueState {
+    let Some(date) = parse_due(due) else {
+        return DueState::None;
+    };
+    if status_category.trim().eq_ignore_ascii_case("done") {
+        return DueState::Future;
+    }
+    match date.cmp(&today) {
+        std::cmp::Ordering::Less => DueState::Overdue,
+        std::cmp::Ordering::Equal => DueState::Today,
+        std::cmp::Ordering::Greater => DueState::Future,
+    }
+}
+
+/// A due date for display.
+///
+/// **Never routed through [`local_time`].** `duedate` is a bare date with no
+/// time and no offset; converting it as though it were an instant shifts the
+/// day for anyone not on UTC, so a ticket due the 1st reads as the 31st for
+/// half the world. It is rendered as the calendar date Jira stated, and an
+/// unparseable value is shown verbatim rather than blanked.
+pub fn due_label(due: &str) -> String {
+    match parse_due(due) {
+        Some(d) => d.format("%Y-%m-%d").to_string(),
+        None => due.trim().to_string(),
+    }
+}
+
+fn parse_due(due: &str) -> Option<chrono::NaiveDate> {
+    let due = due.trim();
+    if due.is_empty() {
+        return None;
+    }
+    chrono::NaiveDate::parse_from_str(due, "%Y-%m-%d").ok()
 }
 
 #[cfg(test)]
@@ -777,6 +1251,176 @@ mod tests {
       ]
     }"#;
 
+    /// A transitions response with `expand=transitions.fields`, carrying the
+    /// two screens that actually occur here: a change request whose Close
+    /// wants a comment, and an ordinary ticket whose Close wants a
+    /// Resolution.
+    const SCREENS_SAMPLE: &str = r#"{
+      "transitions": [
+        { "id": "41", "name": "Close", "to": { "name": "Closed" },
+          "fields": {
+            "comment": { "required": true, "name": "Comment",
+                         "schema": { "type": "string", "system": "comment" } },
+            "resolution": { "required": true, "name": "Resolution",
+                            "schema": { "type": "resolution" },
+                            "allowedValues": [
+                              { "id": "10000", "name": "Done" },
+                              { "id": "10001", "name": "Task Completed" } ] },
+            "assignee": { "required": false, "name": "Assignee",
+                          "schema": { "type": "user" } } } },
+        { "id": "51", "name": "Escalate", "to": { "name": "Escalated" },
+          "fields": {
+            "customfield_10042": { "required": true, "name": "Approver",
+                                   "schema": { "type": "user" } } } },
+        { "id": "61", "name": "Reopen", "to": { "name": "To Do" }, "fields": {} }
+      ]
+    }"#;
+
+    fn screen_for(name: &str) -> Transition {
+        parse_transitions(SCREENS_SAMPLE)
+            .expect("parses")
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("no transition named {name}"))
+    }
+
+    #[test]
+    fn a_transition_screen_is_read_so_the_prompt_can_be_built() {
+        let close = screen_for("Close");
+        assert!(close.needs_prompt());
+        // Optional fields are dropped -- this reproduces a required prompt,
+        // it is not a general issue editor.
+        assert_eq!(close.fields.len(), 2, "assignee is optional: {:?}", close.fields);
+
+        // The dropdown's options come from Jira, never a hardcoded list: a
+        // Resolution's choices are per-project.
+        let res = close.fields.iter().find(|f| f.key == "resolution").expect("resolution");
+        assert_eq!(res.name, "Resolution");
+        match &res.kind {
+            FieldKind::Select { options, array } => {
+                assert!(!array);
+                assert_eq!(options.len(), 2);
+                assert!(options.iter().any(|o| o.label == "Task Completed" && o.id == "10001"));
+            }
+            other => panic!("resolution should be a dropdown, got {other:?}"),
+        }
+
+        // The comment is its own kind: it goes to `update`, not `fields`.
+        let c = close.fields.iter().find(|f| f.key == "comment").expect("comment");
+        assert_eq!(c.kind, FieldKind::Comment);
+        // ...and it sorts last, the way Jira's own dialog reads.
+        assert_eq!(close.fields.last().expect("some").key, "comment");
+        assert!(close.unsupported().is_empty());
+    }
+
+    #[test]
+    fn a_transition_with_no_screen_still_needs_no_prompt() {
+        let reopen = screen_for("Reopen");
+        assert!(!reopen.needs_prompt());
+        // And a response fetched without the expand looks the same, which is
+        // the pre-existing behaviour rather than a claim that no screen
+        // exists.
+        for tr in parse_transitions(TRANSITIONS_SAMPLE).expect("parses") {
+            assert!(!tr.needs_prompt());
+        }
+    }
+
+    #[test]
+    fn a_field_this_window_cannot_render_is_named_not_guessed_at() {
+        // Guessing at a user picker posts a wrong value to a live ticket.
+        let esc = screen_for("Escalate");
+        assert_eq!(esc.unsupported(), vec!["Approver"]);
+        let err = transition_payload("51", &esc.fields, &[])
+            .expect_err("must refuse rather than post");
+        let msg = err.to_string();
+        assert!(msg.contains("Approver"), "names the field: {msg}");
+        assert!(msg.contains("in Jira"), "says where to do it instead: {msg}");
+    }
+
+    #[test]
+    fn the_close_payload_puts_the_comment_and_the_resolution_in_the_right_places() {
+        // The two are NOT interchangeable: a comment in `fields` is rejected,
+        // and a resolution in `update` does not set anything.
+        let close = screen_for("Close");
+        let payload = transition_payload(
+            "41",
+            &close.fields,
+            &[
+                ("resolution".to_string(), FieldInput::Option("10001".to_string())),
+                ("comment".to_string(), FieldInput::Text("closing this out".to_string())),
+            ],
+        )
+        .expect("should build");
+
+        assert_eq!(payload["transition"]["id"], "41");
+        assert_eq!(payload["fields"]["resolution"]["id"], "10001");
+        assert!(payload["fields"].get("comment").is_none(), "comment must not be a field");
+
+        let body = &payload["update"]["comment"][0]["add"]["body"];
+        assert_eq!(body["type"], "doc");
+        assert_eq!(body["content"][0]["content"][0]["text"], "closing this out");
+    }
+
+    #[test]
+    fn a_missing_required_value_is_refused_here_not_by_a_400() {
+        // A 400 arrives after the click, in Jira's words, and is exactly the
+        // experience this prompt exists to replace.
+        let close = screen_for("Close");
+        let only_comment =
+            [("comment".to_string(), FieldInput::Text("note".to_string()))];
+        let err = transition_payload("41", &close.fields, &only_comment)
+            .expect_err("resolution is missing");
+        assert!(err.to_string().contains("Resolution"), "{err}");
+
+        // Whitespace passes an is_empty check and posts a blank comment that
+        // notifies everyone on the ticket.
+        let blank_comment = [
+            ("resolution".to_string(), FieldInput::Option("10001".to_string())),
+            ("comment".to_string(), FieldInput::Text("   ".to_string())),
+        ];
+        assert!(transition_payload("41", &close.fields, &blank_comment).is_err());
+    }
+
+    #[test]
+    fn an_option_id_must_be_one_jira_actually_offered() {
+        // Jira accepts any id that exists, including one belonging to a
+        // different field's options -- so a wrong id is a silent wrong write.
+        let close = screen_for("Close");
+        let bogus = [
+            ("resolution".to_string(), FieldInput::Option("99999".to_string())),
+            ("comment".to_string(), FieldInput::Text("x".to_string())),
+        ];
+        assert!(transition_payload("41", &close.fields, &bogus).is_err());
+    }
+
+    #[test]
+    fn a_transition_with_no_screen_posts_exactly_what_it_always_did() {
+        let payload = transition_payload("11", &[], &[]).expect("should build");
+        assert_eq!(payload["transition"]["id"], "11");
+        assert!(payload.get("fields").is_none());
+        assert!(payload.get("update").is_none());
+    }
+
+    #[test]
+    fn an_array_valued_dropdown_is_wrapped_in_a_list() {
+        let fields = [ScreenField {
+            key: "components".to_string(),
+            name: "Components".to_string(),
+            kind: FieldKind::Select {
+                options: vec![FieldOption { id: "1".to_string(), label: "api".to_string() }],
+                array: true,
+            },
+        }];
+        let payload = transition_payload(
+            "11",
+            &fields,
+            &[("components".to_string(), FieldInput::Option("1".to_string()))],
+        )
+        .expect("should build");
+        assert!(payload["fields"]["components"].is_array(), "{payload}");
+        assert_eq!(payload["fields"]["components"][0]["id"], "1");
+    }
+
     #[test]
     fn transitions_parse_and_an_entry_with_no_id_is_dropped() {
         let ts = parse_transitions(TRANSITIONS_SAMPLE).expect("should parse");
@@ -796,6 +1440,111 @@ mod tests {
             .expect("empty is valid")
             .is_empty());
         assert!(parse_transitions(r#"{"nope":1}"#).is_err());
+    }
+
+    #[test]
+    fn a_comment_body_cannot_break_out_of_its_json() {
+        // Arbitrary user text goes into a JSON request body. Built by hand
+        // with format!, every one of these would escape the string it was
+        // written into -- which is why `comment_adf` uses serde_json.
+        for nasty in [
+            r#"he said "close it" and left"#,
+            r#"path C:\temp\x"#,
+            "{\"type\":\"doc\"} nice try",
+            "line one\nline two",
+            "trailing backslash \\",
+        ] {
+            let payload = serde_json::json!({ "body": comment_adf(nasty) }).to_string();
+            // It is valid JSON...
+            let back: Value = serde_json::from_str(&payload).expect("valid json");
+            // ...and the text survives byte for byte, rather than being
+            // mangled or truncated at a quote.
+            assert_eq!(description_text(&back["body"]), nasty.replace("\r\n", "\n"));
+        }
+    }
+
+    #[test]
+    fn a_typed_comment_round_trips_through_adf() {
+        // `comment_adf` is the inverse of `description_text`; if they
+        // disagree, what you typed is not what the ticket shows.
+        let typed = "First line.\n\nAfter a blank line.";
+        let adf = comment_adf(typed);
+        assert_eq!(adf["type"], "doc");
+        assert_eq!(adf["version"], 1);
+        assert_eq!(description_text(&adf), typed);
+        // A blank line is a paragraph boundary...
+        assert_eq!(adf["content"].as_array().expect("array").len(), 2);
+
+        // ...and a single newline is a soft break INSIDE one, the way
+        // Shift+Enter behaves in Jira's editor. Mapping it to a paragraph
+        // instead turns every typed line break into a blank line, so the
+        // posted comment is visibly not what was written.
+        let soft = comment_adf("line one\nline two");
+        assert_eq!(soft["content"].as_array().expect("array").len(), 1);
+        assert_eq!(soft["content"][0]["content"][1]["type"], "hardBreak");
+        assert_eq!(description_text(&soft), "line one\nline two");
+    }
+
+    #[test]
+    fn a_blank_comment_is_refused_before_it_is_posted() {
+        // Whitespace passes an is_empty check and posts a blank comment that
+        // notifies everyone watching the ticket.
+        for blank in ["", "   ", "\n\n", "\t"] {
+            assert!(require_comment_text(blank).is_err(), "{blank:?} must be refused");
+        }
+        assert!(require_comment_text("ok").is_ok());
+    }
+
+    const COMMENTS_SAMPLE: &str = r#"{
+      "comments": [
+        { "author": { "displayName": "A Person" },
+          "created": "2026-08-25T09:00:00.000+0100",
+          "body": { "type": "doc", "version": 1, "content": [
+            { "type": "paragraph", "content": [{"type":"text","text":"first"}] } ] } },
+        { "author": null,
+          "created": "2026-08-26T10:30:00.000+0100",
+          "body": "a v2-style string body" }
+      ]
+    }"#;
+
+    #[test]
+    fn comments_parse_oldest_first_whichever_way_the_body_arrives() {
+        let cs = parse_comments(COMMENTS_SAMPLE).expect("parses");
+        assert_eq!(cs.len(), 2);
+        assert_eq!(cs[0].author, "A Person");
+        assert_eq!(cs[0].body, "first");
+        // A deleted or app-authored comment can carry no author; that is not
+        // a parse failure.
+        assert_eq!(cs[1].author, "");
+        assert_eq!(cs[1].body, "a v2-style string body");
+        assert!(parse_comments(r#"{"comments":[]}"#).expect("empty is valid").is_empty());
+        assert!(parse_comments(r#"{"nope":1}"#).is_err());
+    }
+
+    #[test]
+    fn a_due_date_is_never_shifted_by_a_timezone() {
+        // `duedate` is a bare calendar date. Converting it as an instant
+        // moves a ticket due the 1st to the 31st for anyone west of UTC --
+        // and the app is used across timezones.
+        assert_eq!(due_label("2026-09-01"), "2026-09-01");
+        // Blank stays blank; anything unexpected is shown verbatim rather
+        // than silently dropped.
+        assert_eq!(due_label(""), "");
+        assert_eq!(due_label("not a date"), "not a date");
+    }
+
+    #[test]
+    fn overdue_is_relative_to_today_and_only_while_the_ticket_is_open() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 26).expect("valid");
+        assert_eq!(due_state("2026-08-25", "indeterminate", today), DueState::Overdue);
+        assert_eq!(due_state("2026-08-26", "indeterminate", today), DueState::Today);
+        assert_eq!(due_state("2026-08-27", "indeterminate", today), DueState::Future);
+        assert_eq!(due_state("", "indeterminate", today), DueState::None);
+
+        // A closed ticket past its date is finished, not late. Colouring the
+        // one row needing no attention red is noise.
+        assert_eq!(due_state("2026-01-01", "done", today), DueState::Future);
+        assert_eq!(due_state("2026-01-01", "DONE", today), DueState::Future);
     }
 
     #[test]
@@ -819,7 +1568,9 @@ mod tests {
         assert!(search_my_issues(&blank).is_err());
         assert!(fetch_issue(&blank, "OPS-1").is_err());
         assert!(fetch_transitions(&blank, "OPS-1").is_err());
-        assert!(do_transition(&blank, "OPS-1", "11").is_err());
+        assert!(fetch_comments(&blank, "OPS-1").is_err());
+        assert!(add_comment(&blank, "OPS-1", "hi").is_err());
+        assert!(do_transition(&blank, "OPS-1", "11", &[], &[]).is_err());
     }
 
     /// The ADF a real v3 description arrives as. Getting this wrong renders

@@ -181,12 +181,26 @@ pub fn request(
     let duration_ms = started.elapsed().as_millis() as u64;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            stderr.trim().to_string()
+        // Both halves, and the **body first**. `--fail-with-body` exists so
+        // the API's own explanation survives an HTTP error, and for Jira that
+        // body is the entire diagnosis — `{"errors":{"comment":"Comment is
+        // required."}}` says exactly what to do, where curl's own line only
+        // ever says `(22) The requested URL returned error: 400`.
+        //
+        // This used to prefer stderr whenever it was non-empty, which is
+        // always: curl writes that line every time. So the useful half was
+        // discarded on every failed call and a required-field rejection
+        // reached the user as a bare 400. The status still matters, so
+        // curl's line is kept after it rather than dropped.
+        let detail = match (stdout.trim(), stderr.trim()) {
+            ("", e) => e.to_string(),
+            (b, "") => b.to_string(),
+            (b, e) => format!("{b} ({e})"),
         };
-        let detail: String = detail.chars().take(300).collect();
+        // Raised from 300 with the body now included: a Jira error object
+        // with several field messages runs past the old cap, and truncating
+        // mid-object hides the one field that was actually wrong.
+        let detail: String = detail.chars().take(600).collect();
         // `--fail-with-body` means the response body is still on stdout for
         // an HTTP error, so a failed call keeps it — that body is usually
         // the API's own explanation and is the whole point of looking.
@@ -280,6 +294,37 @@ mod tests {
         // Clear drops the held body too, not just the rows.
         clear_api_calls();
         assert!(recent_api_calls().is_empty());
+    }
+
+    /// The failure detail must carry the response **body**, not just curl's
+    /// own line. curl writes `(22) The requested URL returned error: 400`
+    /// on stderr for every HTTP error, so preferring stderr-when-non-empty
+    /// discarded the API's explanation every single time — a Jira
+    /// required-field rejection reached the user as a bare 400 with nothing
+    /// to act on.
+    #[test]
+    fn the_failure_detail_keeps_the_api_explanation_and_the_status() {
+        // Mirrors the real shape: this is the branch logic from `request`,
+        // which cannot be called here without a network.
+        let detail = |stdout: &str, stderr: &str| -> String {
+            match (stdout.trim(), stderr.trim()) {
+                ("", e) => e.to_string(),
+                (b, "") => b.to_string(),
+                (b, e) => format!("{b} ({e})"),
+            }
+        };
+        let body = r#"{"errorMessages":[],"errors":{"comment":"Comment is required."}}"#;
+        let curl = "curl: (22) The requested URL returned error: 400";
+
+        let both = detail(body, curl);
+        assert!(both.contains("Comment is required."), "body must survive: {both}");
+        assert!(both.contains("400"), "the status must survive too: {both}");
+        // The body leads — it is the half that says what to do.
+        assert!(both.starts_with('{'), "{both}");
+
+        // Either one alone is still reported.
+        assert_eq!(detail("", curl), curl);
+        assert_eq!(detail(body, ""), body);
     }
 
     /// A failed call is the one you most want to look at, so it is recorded

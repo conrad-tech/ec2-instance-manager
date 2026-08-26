@@ -1339,6 +1339,89 @@ mod gui {
         in_flight: Option<String>,
         /// Outcome of the last transition, shown in the window.
         note: Option<std::result::Result<String, String>>,
+        /// The comment thread, oldest first.
+        comments: Vec<ec2_manager::jira::Comment>,
+        /// The comments fetch failed. Its own field for the same reason
+        /// `transitions_error` is: a thread that would not load must leave
+        /// the ticket readable.
+        comments_error: Option<String>,
+        /// What is typed in the comment box. **Kept on a failed post** —
+        /// losing what someone wrote is the worst outcome here.
+        comment_draft: String,
+        /// A comment POST is in flight; the button disables so a comment
+        /// everyone on the ticket gets notified about cannot be double-sent.
+        comment_in_flight: bool,
+        /// Outcome of the last comment post.
+        comment_note: Option<std::result::Result<String, String>>,
+        /// The transition screen being filled in, if any.
+        pending_transition: Option<PendingTransition>,
+    }
+
+    /// A transition that cannot be a single click, because its screen has
+    /// required fields.
+    ///
+    /// There is no two-phase transition API — the screen cannot be opened and
+    /// then submitted — so this collects the answers locally and the move
+    /// goes out as one POST.
+    struct PendingTransition {
+        id: String,
+        name: String,
+        /// The screen, from Jira.
+        fields: Vec<ec2_manager::jira::ScreenField>,
+        /// One value per field, same order.
+        values: Vec<ec2_manager::jira::FieldInput>,
+        /// Why the last submit was refused, if it was.
+        error: Option<String>,
+    }
+
+    impl PendingTransition {
+        fn new(tr: &ec2_manager::jira::Transition) -> Self {
+            use ec2_manager::jira::{FieldInput, FieldKind};
+            // Deliberately unset rather than pre-picked. A Resolution
+            // defaulted to whatever Jira happened to list first is one click
+            // from being wrong on a live ticket, and "it was already filled
+            // in" is exactly how that goes unnoticed.
+            let values = tr
+                .fields
+                .iter()
+                .map(|f| match f.kind {
+                    FieldKind::Select { .. } => FieldInput::Option(String::new()),
+                    _ => FieldInput::Text(String::new()),
+                })
+                .collect();
+            Self {
+                id: tr.id.clone(),
+                name: tr.name.clone(),
+                fields: tr.fields.clone(),
+                values,
+                error: None,
+            }
+        }
+
+        /// True when this prompt has anything to ask.
+        #[cfg(test)]
+        fn needs_prompt_fields(&self) -> bool {
+            !self.fields.is_empty()
+        }
+
+        /// Every required field answered. The submit stays disabled until
+        /// then, so the prompt refuses locally rather than by 400.
+        fn is_complete(&self) -> bool {
+            use ec2_manager::jira::FieldInput;
+            self.values.iter().all(|v| match v {
+                FieldInput::Text(s) => !s.trim().is_empty(),
+                FieldInput::Option(id) => !id.is_empty(),
+            })
+        }
+
+        /// Paired up for `jira::do_transition`.
+        fn inputs(&self) -> Vec<(String, ec2_manager::jira::FieldInput)> {
+            self.fields
+                .iter()
+                .zip(self.values.iter())
+                .map(|(f, v)| (f.key.clone(), v.clone()))
+                .collect()
+        }
     }
 
     impl TicketWindow {
@@ -1352,6 +1435,12 @@ mod gui {
                 loading: true,
                 in_flight: None,
                 note: None,
+                comments: Vec::new(),
+                comments_error: None,
+                comment_draft: String::new(),
+                comment_in_flight: false,
+                comment_note: None,
+                pending_transition: None,
             }
         }
     }
@@ -1379,6 +1468,16 @@ mod gui {
         Transitions {
             key: String,
             result: std::result::Result<Vec<ec2_manager::jira::Transition>, String>,
+        },
+        /// One ticket's comment thread.
+        Comments {
+            key: String,
+            result: std::result::Result<Vec<ec2_manager::jira::Comment>, String>,
+        },
+        /// A comment was posted (or was not).
+        Commented {
+            key: String,
+            result: std::result::Result<(), String>,
         },
         /// A transition was applied (or was not).
         Transitioned {
@@ -4186,6 +4285,95 @@ mod gui {
             "new" => egui::Color32::from_rgb(150, 150, 160),
             // An unknown category is not coloured as anything in particular.
             _ => egui::Color32::GRAY,
+        }
+    }
+
+    /// Colour for a due date, or `None` to render it plainly.
+    ///
+    /// Only two states are coloured: a date that has passed and a date that
+    /// is today. Colouring a future date too would leave nothing uncoloured
+    /// and so nothing standing out, which is the whole point.
+    fn due_color(state: ec2_manager::jira::DueState) -> Option<egui::Color32> {
+        use ec2_manager::jira::DueState;
+        match state {
+            DueState::Overdue => Some(egui::Color32::from_rgb(220, 90, 90)),
+            DueState::Today => Some(egui::Color32::from_rgb(220, 160, 60)),
+            DueState::Future | DueState::None => None,
+        }
+    }
+
+    /// One required field on a transition screen.
+    ///
+    /// A dropdown's options are whatever Jira listed for *this* transition on
+    /// *this* project — never a built-in list, which would be right on one
+    /// project and wrong on the next.
+    fn render_screen_field(
+        ui: &mut egui::Ui,
+        key: &str,
+        index: usize,
+        field: &ec2_manager::jira::ScreenField,
+        value: &mut ec2_manager::jira::FieldInput,
+    ) {
+        use ec2_manager::jira::{FieldInput, FieldKind};
+        match (&field.kind, value) {
+            (FieldKind::Select { options, .. }, FieldInput::Option(chosen)) => {
+                let label = options
+                    .iter()
+                    .find(|o| &o.id == chosen)
+                    .map(|o| o.label.as_str())
+                    // Deliberately unset to begin with: a Resolution
+                    // pre-filled to whatever Jira listed first is one click
+                    // from being wrong on a live ticket.
+                    .unwrap_or("Select…");
+                egui::ComboBox::from_id_salt(("jira_field", key, index))
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        for opt in options {
+                            if ui
+                                .selectable_label(chosen == &opt.id, &opt.label)
+                                .clicked()
+                            {
+                                *chosen = opt.id.clone();
+                                ui.close();
+                            }
+                        }
+                    });
+            }
+            (FieldKind::Comment, FieldInput::Text(text)) => {
+                ui.add(
+                    egui::TextEdit::multiline(text)
+                        .desired_rows(3)
+                        .desired_width(360.0),
+                );
+            }
+            (FieldKind::Text { multiline }, FieldInput::Text(text)) => {
+                if *multiline {
+                    ui.add(
+                        egui::TextEdit::multiline(text)
+                            .desired_rows(3)
+                            .desired_width(360.0),
+                    );
+                } else {
+                    ui.add(egui::TextEdit::singleline(text).desired_width(360.0));
+                }
+            }
+            (FieldKind::Number, FieldInput::Text(text)) => {
+                ui.add(
+                    egui::TextEdit::singleline(text)
+                        .hint_text("a number")
+                        .desired_width(160.0),
+                );
+            }
+            // Unsupported never reaches here — its transition's button is
+            // disabled — and a kind/value mismatch is a construction bug, so
+            // say so rather than draw a control that sets nothing.
+            (kind, _) => {
+                note_label(
+                    ui,
+                    egui::Color32::from_rgb(220, 160, 60),
+                    format!("cannot edit this field here ({kind:?})"),
+                );
+            }
         }
     }
 
@@ -12649,7 +12837,13 @@ mod gui {
                 let _ = tx.send(JiraEvent::Issue { key: key.clone(), result: issue });
                 let transitions =
                     ec2_manager::jira::fetch_transitions(&site, &key).map_err(|e| e.to_string());
-                let _ = tx.send(JiraEvent::Transitions { key, result: transitions });
+                let _ = tx.send(JiraEvent::Transitions {
+                    key: key.clone(),
+                    result: transitions,
+                });
+                let comments =
+                    ec2_manager::jira::fetch_comments(&site, &key).map_err(|e| e.to_string());
+                let _ = tx.send(JiraEvent::Comments { key, result: comments });
             });
         }
 
@@ -12659,7 +12853,14 @@ mod gui {
         /// is reversible from the very same button row. What guards it
         /// instead is `in_flight`, which disables the row for the duration so
         /// a double-click cannot fire two moves.
-        fn start_jira_transition(&mut self, key: &str, id: &str, name: &str) {
+        fn start_jira_transition(
+            &mut self,
+            key: &str,
+            id: &str,
+            name: &str,
+            fields: Vec<ec2_manager::jira::ScreenField>,
+            inputs: Vec<(String, ec2_manager::jira::FieldInput)>,
+        ) {
             let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key) else {
                 return;
             };
@@ -12669,13 +12870,50 @@ mod gui {
             win.in_flight = Some(id.to_string());
             win.note = None;
             let (key, id, name) = (key.to_string(), id.to_string(), name.to_string());
-            self.log_info(format!("jira: {key} — applying transition '{name}' (id {id})"));
+            // The field *names* are logged, never their values: a transition
+            // comment is free text about a live ticket and the app log gets
+            // pasted into tickets.
+            let filled: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+            if filled.is_empty() {
+                self.log_info(format!("jira: {key} — applying transition '{name}' (id {id})"));
+            } else {
+                self.log_info(format!(
+                    "jira: {key} — applying transition '{name}' (id {id}) with {}",
+                    filled.join(", ")
+                ));
+            }
             let site = self.jira_site.clone();
             let tx = self.jira_tx.clone();
             std::thread::spawn(move || {
-                let result = ec2_manager::jira::do_transition(&site, &key, &id)
-                    .map_err(|e| e.to_string());
+                let result =
+                    ec2_manager::jira::do_transition(&site, &key, &id, &fields, &inputs)
+                        .map_err(|e| e.to_string());
                 let _ = tx.send(JiraEvent::Transitioned { key, name, result });
+            });
+        }
+
+        /// Post the ticket window's typed comment.
+        fn start_jira_comment(&mut self, key: &str) {
+            let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key) else {
+                return;
+            };
+            if win.comment_in_flight || win.comment_draft.trim().is_empty() {
+                return;
+            }
+            win.comment_in_flight = true;
+            win.comment_note = None;
+            // The draft is NOT cleared here. It is cleared when the post is
+            // known to have landed — clearing on send loses what someone
+            // wrote the moment the network does not cooperate.
+            let text = win.comment_draft.clone();
+            let key = key.to_string();
+            self.log_info(format!("jira: {key} — posting a comment"));
+            let site = self.jira_site.clone();
+            let tx = self.jira_tx.clone();
+            std::thread::spawn(move || {
+                let result = ec2_manager::jira::add_comment(&site, &key, &text)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(JiraEvent::Commented { key, result });
             });
         }
 
@@ -12748,6 +12986,54 @@ mod gui {
                             }
                         }
                     }
+                    JiraEvent::Comments { key, result } => {
+                        let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key)
+                        else {
+                            continue;
+                        };
+                        match result {
+                            Ok(list) => {
+                                win.comments = list;
+                                win.comments_error = None;
+                            }
+                            Err(err) => {
+                                // A warning: the ticket reads fine without
+                                // its thread.
+                                self.log_warn(format!("jira: {key}: comments: {err}"));
+                                if let Some(win) =
+                                    self.jira_tickets.iter_mut().find(|w| w.key == key)
+                                {
+                                    win.comments.clear();
+                                    win.comments_error = Some(err);
+                                }
+                            }
+                        }
+                    }
+                    JiraEvent::Commented { key, result } => {
+                        let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key)
+                        else {
+                            continue;
+                        };
+                        win.comment_in_flight = false;
+                        match result {
+                            Ok(()) => {
+                                // Only now is the draft safe to drop.
+                                win.comment_draft.clear();
+                                win.comment_note = Some(Ok("Comment posted".to_string()));
+                                self.log_info(format!("jira: {key} — comment posted"));
+                                reload.push(key);
+                            }
+                            Err(err) => {
+                                self.log_error(format!("jira: {key} — comment failed: {err}"));
+                                if let Some(win) =
+                                    self.jira_tickets.iter_mut().find(|w| w.key == key)
+                                {
+                                    // The draft stays exactly where it was.
+                                    win.comment_note = Some(Err(err));
+                                }
+                            }
+                        }
+                    }
                     JiraEvent::Transitioned { key, name, result } => {
                         let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key)
                         else {
@@ -12756,6 +13042,7 @@ mod gui {
                         win.in_flight = None;
                         match result {
                             Ok(()) => {
+                                win.pending_transition = None;
                                 win.note = Some(Ok(format!("Applied '{name}'")));
                                 self.log_info(format!("jira: {key} — '{name}' applied"));
                                 // The status just changed, and so did the set
@@ -13310,11 +13597,14 @@ mod gui {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             egui::Grid::new("jira_grid")
-                                .num_columns(6)
+                                .num_columns(7)
                                 .striped(true)
                                 .spacing([12.0, 6.0])
                                 .show(ui, |ui| {
-                                    for h in ["Key", "Type", "Pri", "Status", "Summary"] {
+                                    // Read once per frame, not per row.
+                                    let today = chrono::Local::now().date_naive();
+                                    for h in ["Key", "Type", "Pri", "Status", "Due", "Summary"]
+                                    {
                                         ui.strong(h);
                                     }
                                     ui.strong(format!("Updated ({})", local_tz_label()));
@@ -13346,6 +13636,23 @@ mod gui {
                                             jira_status_color(&row.status_category),
                                             dash_if_blank(&row.status),
                                         );
+                                        // A due date is what a list gets
+                                        // scanned for, so it is a column and
+                                        // it is coloured.
+                                        let due_state = ec2_manager::jira::due_state(
+                                            &row.due,
+                                            &row.status_category,
+                                            today,
+                                        );
+                                        let due = ec2_manager::jira::due_label(&row.due);
+                                        match due_color(due_state) {
+                                            Some(c) => {
+                                                note_label(ui, c, dash_if_blank(&due));
+                                            }
+                                            None => {
+                                                ui.label(dash_if_blank(&due));
+                                            }
+                                        }
                                         ui.label(&row.summary);
                                         ui.label(ec2_manager::jira::local_time(&row.updated));
                                         ui.end_row();
@@ -13428,8 +13735,16 @@ mod gui {
             // Actions are collected and applied after the loop: the render
             // borrows `self.jira_tickets`, and both of these need `&mut self`.
             let mut closed: Vec<String> = Vec::new();
-            let mut transition: Option<(String, String, String)> = None;
+            #[allow(clippy::type_complexity)]
+            let mut transition: Option<(
+                String,
+                String,
+                String,
+                Vec<ec2_manager::jira::ScreenField>,
+                Vec<(String, ec2_manager::jira::FieldInput)>,
+            )> = None;
             let mut reload: Option<String> = None;
+            let mut comment_for: Option<String> = None;
 
             for idx in 0..self.jira_tickets.len() {
                 let (key, issue, transitions, error, transitions_error, loading, in_flight, note) = {
@@ -13445,6 +13760,23 @@ mod gui {
                         w.note.clone(),
                     )
                 };
+                let (comments, comments_error, comment_in_flight, comment_note) = {
+                    let w = &self.jira_tickets[idx];
+                    (
+                        w.comments.clone(),
+                        w.comments_error.clone(),
+                        w.comment_in_flight,
+                        w.comment_note.clone(),
+                    )
+                };
+                // Edited in place by the widgets, written back after the
+                // window closes -- the closure already borrows `self`.
+                let mut draft = self.jira_tickets[idx].comment_draft.clone();
+                let mut pending = self.jira_tickets[idx].pending_transition.take();
+                let mut post_comment = false;
+                let mut submit_pending = false;
+                let mut cancel_pending = false;
+                let mut open_prompt: Option<ec2_manager::jira::Transition> = None;
                 let title = match &issue {
                     Some(i) if !i.summary.is_empty() => {
                         format!("{}  ·  {}", key, truncate_middle(&i.summary, 60))
@@ -13496,16 +13828,21 @@ mod gui {
                             .num_columns(2)
                             .spacing([14.0, 4.0])
                             .show(ui, |ui| {
-                                let mut field = |label: &str, value: &str| {
+                                // Written out rather than driven by a closure
+                                // over `ui`: the Due row needs to colour its
+                                // own value, and a closure holding `ui`
+                                // mutably leaves no way to do that in place.
+                                let field = |ui: &mut egui::Ui, label: &str, value: &str| {
                                     ui.weak(label);
                                     ui.label(dash_if_blank(value));
                                     ui.end_row();
                                 };
-                                field("Type", &issue.issue_type);
-                                field("Priority", &issue.priority);
+                                field(ui, "Type", &issue.issue_type);
+                                field(ui, "Priority", &issue.priority);
                                 // An unassigned ticket is an ordinary state,
                                 // and saying so beats an empty cell.
                                 field(
+                                    ui,
                                     "Assignee",
                                     if issue.assignee.is_empty() {
                                         "Unassigned"
@@ -13513,11 +13850,31 @@ mod gui {
                                         &issue.assignee
                                     },
                                 );
-                                field("Reporter", &issue.reporter);
-                                field("Created", &ec2_manager::jira::local_time(&issue.created));
-                                field("Updated", &ec2_manager::jira::local_time(&issue.updated));
+                                field(ui, "Reporter", &issue.reporter);
+                                // Due sits with the dates, and is coloured
+                                // rather than plain: a date you have to
+                                // compare against today yourself is not much
+                                // use at a glance.
+                                ui.weak("Due");
+                                let due_state = ec2_manager::jira::due_state(
+                                    &issue.due,
+                                    &issue.status_category,
+                                    chrono::Local::now().date_naive(),
+                                );
+                                let due = ec2_manager::jira::due_label(&issue.due);
+                                match due_color(due_state) {
+                                    Some(c) => {
+                                        note_label(ui, c, dash_if_blank(&due));
+                                    }
+                                    None => {
+                                        ui.label(dash_if_blank(&due));
+                                    }
+                                }
+                                ui.end_row();
+                                field(ui, "Created", &ec2_manager::jira::local_time(&issue.created));
+                                field(ui, "Updated", &ec2_manager::jira::local_time(&issue.updated));
                                 if !issue.labels.is_empty() {
-                                    field("Labels", &issue.labels.join(", "));
+                                    field(ui, "Labels", &issue.labels.join(", "));
                                 }
                             });
 
@@ -13560,11 +13917,36 @@ mod gui {
                         ui.horizontal_wrapped(|ui| {
                             for tr in &transitions {
                                 let busy = in_flight.is_some();
+                                // A move needing a field this window cannot
+                                // render is disabled and says which -- better
+                                // than a click that can only end in a 400.
+                                let blocked = tr.unsupported();
                                 let btn = ui.add_enabled(
-                                    !busy,
-                                    egui::Button::new(&tr.name),
+                                    !busy && blocked.is_empty(),
+                                    egui::Button::new(if tr.needs_prompt() {
+                                        // The ellipsis is the usual signal
+                                        // that a control asks before acting.
+                                        format!("{}…", tr.name)
+                                    } else {
+                                        tr.name.clone()
+                                    }),
                                 );
-                                let btn = if tr.to_status.is_empty() {
+                                let btn = if !blocked.is_empty() {
+                                    btn.on_hover_text(format!(
+                                        "'{}' needs {} — a field this window cannot set. \
+                                         Make this change in Jira.",
+                                        tr.name,
+                                        blocked.join(", ")
+                                    ))
+                                } else if tr.needs_prompt() {
+                                    let asks: Vec<&str> =
+                                        tr.fields.iter().map(|f| f.name.as_str()).collect();
+                                    btn.on_hover_text(format!(
+                                        "Moves {key} to {} — asks for {} first",
+                                        if tr.to_status.is_empty() { "another status" } else { &tr.to_status },
+                                        asks.join(", ")
+                                    ))
+                                } else if tr.to_status.is_empty() {
                                     btn
                                 } else {
                                     // A button named "Done" that actually
@@ -13572,8 +13954,17 @@ mod gui {
                                     btn.on_hover_text(format!("Moves {key} to {}", tr.to_status))
                                 };
                                 if btn.clicked() {
-                                    transition =
-                                        Some((key.clone(), tr.id.clone(), tr.name.clone()));
+                                    if tr.needs_prompt() {
+                                        open_prompt = Some(tr.clone());
+                                    } else {
+                                        transition = Some((
+                                            key.clone(),
+                                            tr.id.clone(),
+                                            tr.name.clone(),
+                                            Vec::new(),
+                                            Vec::new(),
+                                        ));
+                                    }
                                 }
                             }
                             if in_flight.is_some() {
@@ -13600,15 +13991,172 @@ mod gui {
                             }
                             None => {}
                         }
+
+                        // The transition screen, when the move needs one.
+                        // Inline rather than a second window: it belongs to
+                        // this ticket, and a floating dialog over a floating
+                        // ticket window is a stack nobody asked for.
+                        if let Some(pt) = pending.as_mut() {
+                            ui.add_space(6.0);
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.strong(format!("{} — Jira asks for:", pt.name));
+                                let mut grid_fields =
+                                    pt.fields.iter().zip(pt.values.iter_mut()).enumerate();
+                                egui::Grid::new(("jira_prompt", key.as_str()))
+                                    .num_columns(2)
+                                    .spacing([12.0, 6.0])
+                                    .show(ui, |ui| {
+                                        for (i, (field, value)) in &mut grid_fields {
+                                            ui.weak(&field.name);
+                                            render_screen_field(ui, &key, i, field, value);
+                                            ui.end_row();
+                                        }
+                                    });
+                                if let Some(err) = &pt.error {
+                                    note_label(
+                                        ui,
+                                        egui::Color32::from_rgb(220, 90, 90),
+                                        err.as_str(),
+                                    );
+                                }
+                                ui.horizontal(|ui| {
+                                    // Disabled until every required field is
+                                    // answered, so the prompt refuses here
+                                    // rather than by a 400 after the click.
+                                    if ui
+                                        .add_enabled(
+                                            pt.is_complete() && in_flight.is_none(),
+                                            egui::Button::new(&pt.name),
+                                        )
+                                        .clicked()
+                                    {
+                                        submit_pending = true;
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        cancel_pending = true;
+                                    }
+                                    if !pt.is_complete() {
+                                        ui.weak("every field above is required");
+                                    }
+                                });
+                            });
+                        }
+
+                        // --- comments ---
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.horizontal_wrapped(|ui| {
+                            ui.strong("Comments");
+                            if let Some(err) = &comments_error {
+                                note_label(
+                                    ui,
+                                    egui::Color32::from_rgb(220, 160, 60),
+                                    format!("could not load the thread: {err}"),
+                                );
+                            } else if comments.is_empty() {
+                                ui.weak("none yet");
+                            } else {
+                                ui.weak(format!("{}", comments.len()));
+                            }
+                        });
+                        if !comments.is_empty() {
+                            egui::ScrollArea::vertical()
+                                .id_salt(("jira_comments", key.as_str()))
+                                .max_height(200.0)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for c in &comments {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.strong(if c.author.is_empty() {
+                                                "(unknown)"
+                                            } else {
+                                                &c.author
+                                            });
+                                            ui.weak(ec2_manager::jira::local_time(&c.created));
+                                        });
+                                        ui.add(egui::Label::new(&c.body).wrap());
+                                        ui.separator();
+                                    }
+                                });
+                        }
+                        ui.add(
+                            egui::TextEdit::multiline(&mut draft)
+                                .hint_text("Add a comment…")
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.horizontal(|ui| {
+                            // Only the button posts. Enter inserts a newline:
+                            // a comment is visible to the whole team and must
+                            // not be one stray keystroke away.
+                            if ui
+                                .add_enabled(
+                                    !comment_in_flight && !draft.trim().is_empty(),
+                                    egui::Button::new("Comment"),
+                                )
+                                .on_hover_text("Post this comment to the ticket.")
+                                .clicked()
+                            {
+                                post_comment = true;
+                            }
+                            if comment_in_flight {
+                                ui.spinner();
+                            }
+                            match &comment_note {
+                                Some(Ok(msg)) => {
+                                    note_label(
+                                        ui,
+                                        egui::Color32::from_rgb(90, 190, 110),
+                                        msg.as_str(),
+                                    );
+                                }
+                                Some(Err(err)) => {
+                                    note_label(
+                                        ui,
+                                        egui::Color32::from_rgb(220, 90, 90),
+                                        format!("Not posted: {err}"),
+                                    );
+                                }
+                                None => {}
+                            }
+                        });
                     });
+                if let Some(tr) = open_prompt {
+                    pending = Some(PendingTransition::new(&tr));
+                }
+                if cancel_pending {
+                    pending = None;
+                }
+                if let Some(pt) = pending.as_ref() {
+                    if submit_pending {
+                        transition = Some((
+                            key.clone(),
+                            pt.id.clone(),
+                            pt.name.clone(),
+                            pt.fields.clone(),
+                            pt.inputs(),
+                        ));
+                    }
+                }
+                {
+                    let w = &mut self.jira_tickets[idx];
+                    w.comment_draft = draft;
+                    w.pending_transition = pending;
+                }
+                if post_comment {
+                    comment_for = Some(key.clone());
+                }
                 if !open {
                     closed.push(key);
                 }
             }
 
             self.jira_tickets.retain(|w| !closed.contains(&w.key));
-            if let Some((key, id, name)) = transition {
-                self.start_jira_transition(&key, &id, &name);
+            if let Some(key) = comment_for {
+                self.start_jira_comment(&key);
+            }
+            if let Some((key, id, name, fields, inputs)) = transition {
+                self.start_jira_transition(&key, &id, &name, fields, inputs);
             }
             if let Some(key) = reload {
                 self.start_jira_ticket_load(&key);
@@ -34954,6 +35502,71 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             {
                 assert!(!report.contains('@'), "no address should appear: {report}");
             }
+        }
+
+        #[test]
+        fn only_an_overdue_or_due_today_date_is_coloured() {
+            use ec2_manager::jira::DueState;
+            // Colouring a future date too would leave nothing uncoloured,
+            // and so nothing standing out.
+            assert!(due_color(DueState::Future).is_none());
+            assert!(due_color(DueState::None).is_none());
+            let overdue = due_color(DueState::Overdue).expect("overdue is coloured");
+            let today = due_color(DueState::Today).expect("today is coloured");
+            assert_ne!(overdue, today, "the two states must be distinguishable");
+        }
+
+        #[test]
+        fn a_transition_prompt_starts_unanswered_and_gates_its_own_submit() {
+            use ec2_manager::jira::{FieldInput, FieldKind, FieldOption, ScreenField, Transition};
+            let tr = Transition {
+                id: "41".to_string(),
+                name: "Close".to_string(),
+                to_status: "Closed".to_string(),
+                fields: vec![
+                    ScreenField {
+                        key: "resolution".to_string(),
+                        name: "Resolution".to_string(),
+                        kind: FieldKind::Select {
+                            options: vec![FieldOption {
+                                id: "10001".to_string(),
+                                label: "Task Completed".to_string(),
+                            }],
+                            array: false,
+                        },
+                    },
+                    ScreenField {
+                        key: "comment".to_string(),
+                        name: "Comment".to_string(),
+                        kind: FieldKind::Comment,
+                    },
+                ],
+            };
+            let mut pt = PendingTransition::new(&tr);
+            assert!(pt.needs_prompt_fields());
+
+            // Nothing is pre-picked. A Resolution defaulted to whatever Jira
+            // listed first is one click from being wrong on a live ticket,
+            // and "it was already filled in" is how that goes unnoticed.
+            assert_eq!(pt.values[0], FieldInput::Option(String::new()));
+            assert!(!pt.is_complete(), "an unanswered prompt must not submit");
+
+            pt.values[0] = FieldInput::Option("10001".to_string());
+            assert!(!pt.is_complete(), "the comment is still blank");
+            // Whitespace is not an answer -- it would post a blank comment
+            // that notifies everyone on the ticket.
+            pt.values[1] = FieldInput::Text("   ".to_string());
+            assert!(!pt.is_complete());
+
+            pt.values[1] = FieldInput::Text("done".to_string());
+            assert!(pt.is_complete());
+
+            // And it pairs back up with its own field keys, in order.
+            let inputs = pt.inputs();
+            assert_eq!(inputs[0].0, "resolution");
+            assert_eq!(inputs[1].0, "comment");
+            // The payload builder is the backstop; this must agree with it.
+            assert!(ec2_manager::jira::transition_payload("41", &pt.fields, &inputs).is_ok());
         }
 
         #[test]

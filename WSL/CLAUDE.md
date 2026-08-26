@@ -1061,6 +1061,73 @@ window, and a search box opens any ticket by key.
   key))` — *not* the title, which gains the summary the moment the fetch lands
   and would move the window if it were the id. Clicking a ticket that is
   already open calls `ctx.move_to_top` rather than opening a second.
+- **A transition with a screen asks first, then sends once.** Jira
+  transitions can carry required fields — a change request whose Close wants
+  a comment, an ordinary ticket whose Close wants a Resolution — and posting
+  the bare `{"transition":{"id":…}}` at one of those is rejected with a 400
+  that names nothing the caller anticipated. **There is no two-phase
+  transition API**: the screen cannot be opened and then submitted, so
+  `expand=transitions.fields` reads it up front, the window renders a prompt,
+  and the answers go out in one POST. A transition with no required fields
+  stays a single click.
+  - **A comment goes under `update.comment[].add.body`; everything else goes
+    in `fields`.** The two are not interchangeable — a comment in `fields` is
+    rejected, and a resolution in `update` sets nothing.
+    `transition_payload` is pure and separate from `do_transition` because a
+    wrong answer here is a wrong write to a live ticket.
+  - **A dropdown's options come from Jira, never a built-in list.** A
+    Resolution's choices are per-project; a hardcoded list would be right on
+    one project and wrong on the next. `field_kind` keys on `allowedValues`
+    rather than on the schema type, which covers Resolution, priority and
+    every custom select without naming any of them.
+  - **A chosen option id must be one Jira offered.** Jira accepts any id that
+    exists, including one belonging to a different field's options, so an
+    unchecked id is a silent wrong write.
+  - **Nothing is pre-selected.** A Resolution defaulted to whatever Jira
+    listed first is one click from being wrong, and "it was already filled
+    in" is how that goes unnoticed. The submit stays disabled until every
+    field is answered, so the prompt refuses locally instead of by 400.
+  - **A required field this window cannot render disables the button and
+    names the field** — user pickers, dates, cascading selects. Guessing at
+    one posts a wrong value to a live ticket; a general Jira form renderer is
+    a different feature from a ticket viewer.
+  - Optional screen fields are dropped. This reproduces a *required* prompt.
+- **Comments read and post; `comment_adf` is the load-bearing half.** v3
+  rejects a plain string body, so typed text has to be built into an ADF
+  document — the inverse of `description_text`, and tested as a round trip
+  because if the two disagree, what you typed is not what the ticket shows.
+  - **A blank line is a paragraph; a single newline is a `hardBreak`.** That
+    is what Enter and Shift+Enter do in Jira's own editor. Mapping every
+    newline to a paragraph — which the first version did — turns each line
+    break the author typed into a blank line, and the round-trip test is what
+    caught it.
+  - **Built with `serde_json`, never `format!`.** This is arbitrary user text
+    going into a JSON request body; a quote or a backslash written into a
+    hand-built string breaks out of it.
+    `a_comment_body_cannot_break_out_of_its_json` pins that.
+  - **A failed post keeps the draft**, and the draft is cleared only once the
+    post is known to have landed. Losing what someone wrote is the worst
+    outcome here.
+  - **Only the button posts; Enter inserts a newline.** A comment is visible
+    to the whole team and must not be one stray keystroke away. The button
+    disables while in flight so it cannot be double-sent.
+  - The thread is fetched on its own event, like transitions, so a thread
+    that will not load leaves the ticket readable.
+- **The due date is a calendar date and is never timezone-converted.**
+  `duedate` has no time and no offset; putting it through `local_time` shifts
+  the day for anyone not on UTC, so a ticket due the 1st reads as the 31st.
+  `due_label` renders the date Jira stated and shows an unparseable value
+  verbatim. `due_state` takes `today` as a parameter so the boundaries are
+  testable without freezing a clock, and **a ticket in the `done` category is
+  never overdue** — it is finished, not late, and colouring the one row
+  needing no attention red is noise. Only overdue and due-today are coloured;
+  colouring future dates too would leave nothing standing out.
+- **A failed call now carries the API's own explanation.** `atlassian_http`
+  preferred stderr whenever it was non-empty, and curl writes
+  `(22) The requested URL returned error: 400` there every time — so the
+  `--fail-with-body` payload, which for Jira says exactly which field was
+  required, was discarded on every failed call. The body leads the detail
+  now, with curl's status after it.
 - **A transition has no confirmation dialog** — it is your own ticket and the
   move is reversible from the same button row. What guards it is `in_flight`,
   which disables the row so a double-click cannot fire two moves. On success
