@@ -1155,12 +1155,15 @@ window, and a search box opens any ticket by key.
     silently do nothing. Without the move the caret stays where the `@` was
     and the next keystroke lands inside the name just inserted.
   - **No glyphs from Unicode's Arrows block (U+2190–U+21FF) in any UI
-    string.** egui's default font has none of them, so `↻` on a button and
-    `↑↓` in a hint both rendered as empty boxes. Spell them: `Reload`,
-    `Up/Down`. `·`, `—` and `…` are fine and already used throughout.
-    (Pre-existing strings elsewhere still carry `→` and `↔` — several log
-    lines and the create-user result popup — and show boxes for the same
-    reason.)
+    string** — write `->`. egui's default font carries none of them, so every
+    one renders as an empty box. `·`, `—` and `…` are fine and used widely.
+    `no_ui_string_uses_a_glyph_the_default_font_cannot_draw` scans this file
+    and fails naming the line, because this shipped three separate times
+    before it was pinned: `↻` on the ticket reload button, `↑↓` in the
+    mention hint, and `→` between the two ends of every row in the **Port
+    Forwards** window — that last one found by a user *after* the first two
+    were fixed. Comments are skipped: they are never rendered, and the prose
+    in that file uses `→` freely.
   - **The dropdown renders inline, not as a floating `Area`.** A popup inside
     a window inside a scroll area is where egui z-order and clipping bugs
     live, and this window has already cost one layout bug.

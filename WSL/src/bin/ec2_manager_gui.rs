@@ -11068,7 +11068,7 @@ mod gui {
                             for fwd in &row.forwards {
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "{}:{} → {}:{}",
+                                        "{}:{} -> {}:{}",
                                         fwd.ip,
                                         fwd.local_port,
                                         fwd.host,
@@ -11307,7 +11307,7 @@ mod gui {
                 // Delete and Vault IAM. Re-aiming those silently would be
                 // nasty.
                 self.log_warn(format!(
-                    "tunnel {}: primary bastion changed {previous} → {} (also used \
+                    "tunnel {}: primary bastion changed {previous} -> {} (also used \
                      by the Scripts dialogs)",
                     dlg.label, dlg.primary_id
                 ));
@@ -12142,7 +12142,7 @@ mod gui {
                                         ui.checkbox(
                                             enabled,
                                             format!(
-                                                "{}:{} → {}:{}",
+                                                "{}:{} -> {}:{}",
                                                 fwd.ip,
                                                 fwd.local_port,
                                                 fwd.host,
@@ -17661,7 +17661,7 @@ mod gui {
                         let did = if restored { "restored" } else { "created" };
                         if p2s && s2p {
                             let mut msg = format!(
-                                "User '{username}' {did}. All tests passed (primary↔secondary SSH OK)."
+                                "User '{username}' {did}. All tests passed (primary and secondary SSH OK)."
                             );
                             if pem_path.is_none() {
                                 if let Some(err) = &error {
@@ -17929,7 +17929,7 @@ mod gui {
                         truncate(&step, 70)
                     };
                     let _ = log_tx.send(format!(
-                        "[{label}] step {}/{} → {shown}",
+                        "[{label}] step {}/{} -> {shown}",
                         i + 1,
                         total
                     ));
@@ -20258,7 +20258,7 @@ mod gui {
                                                 ));
                                             }
                                             self.log_debug(format!(
-                                                "copied selection tab={tab_id} abs ({},{})→({},{}) len={}",
+                                                "copied selection tab={tab_id} abs ({},{})->({},{}) len={}",
                                                 start.abs_row, start.col,
                                                 end.abs_row, end.col, text.len()
                                             ));
@@ -20273,7 +20273,7 @@ mod gui {
                         TerminalCopyAction::Interrupt => {
                             if !sent_etx {
                                 self.log_trace(format!(
-                                    "terminal input event tab={tab_id} kind=Copy→ETX"
+                                    "terminal input event tab={tab_id} kind=Copy->ETX"
                                 ));
                                 self.send_raw_bytes_to_connection_tab(tab_id, &[0x03]);
                                 sent_etx = true;
@@ -20288,7 +20288,7 @@ mod gui {
                 if matches!(event, egui::Event::Cut) {
                     if !current_modifiers.shift && !sent_can {
                         self.log_trace(format!(
-                            "terminal input event tab={tab_id} kind=Cut→CAN"
+                            "terminal input event tab={tab_id} kind=Cut->CAN"
                         ));
                         self.send_raw_bytes_to_connection_tab(tab_id, &[0x18]);
                         sent_can = true;
@@ -21961,7 +21961,7 @@ mod gui {
                                                 .map(|c| if c.is_control() { '.' } else { c })
                                                 .collect();
                                             self.log_debug(format!(
-                                                "right-click copy tab={tab_id} coords=(abs {}/{} → {}/{}) vr={} raw_len={} preview={preview:?}",
+                                                "right-click copy tab={tab_id} coords=(abs {}/{} -> {}/{}) vr={} raw_len={} preview={preview:?}",
                                                 start.abs_row, start.col,
                                                 end.abs_row, end.col,
                                                 vr,
@@ -32706,7 +32706,7 @@ mod gui {
                 "An error occurred (ExpiredToken) when calling the StartSession operation",
             ] {
                 let reason = ssm_session_failure(out).expect("expiry is fatal");
-                assert!(reason.contains("expired"), "{out} → {reason}");
+                assert!(reason.contains("expired"), "{out} -> {reason}");
             }
         }
 
@@ -35871,6 +35871,38 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             {
                 assert!(!report.contains('@'), "no address should appear: {report}");
             }
+        }
+
+        /// egui's default font carries no glyphs from Unicode's **Arrows**
+        /// block, so every one of them renders as an empty box. This shipped
+        /// three times before it was pinned: `↻` on the ticket reload button,
+        /// `↑↓` in the mention hint, and `→` between the two ends of every
+        /// row in the Port Forwards window — the last of which a user hit
+        /// after the first two were fixed.
+        ///
+        /// Comments are skipped: they are never rendered, and the prose in
+        /// this file uses `→` freely and should keep being able to. Only
+        /// line comments exist here, so `lstrip().starts_with("//")` is a
+        /// complete test for one.
+        ///
+        /// Write `->`, not `→`. `·`, `—` and `…` are fine and used widely.
+        #[test]
+        fn no_ui_string_uses_a_glyph_the_default_font_cannot_draw() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let mut offenders: Vec<String> = Vec::new();
+            for (n, line) in src.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if let Some(bad) = line.chars().find(|c| ('\u{2190}'..='\u{21FF}').contains(c)) {
+                    offenders.push(format!("line {}: {bad:?} in {}", n + 1, line.trim()));
+                }
+            }
+            assert!(
+                offenders.is_empty(),
+                "arrow glyphs render as empty boxes; write -> instead:\n{}",
+                offenders.join("\n")
+            );
         }
 
         #[test]
