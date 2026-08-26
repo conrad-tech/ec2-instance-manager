@@ -13794,332 +13794,334 @@ mod gui {
                     .resizable(true)
                     .default_size([620.0, 520.0])
                     .show(ctx, |ui| {
-                        if loading && issue.is_none() {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(format!("Loading {key}…"));
-                            });
-                            return;
-                        }
-                        if let Some(err) = &error {
-                            note_label(
-                                ui,
-                                egui::Color32::from_rgb(220, 90, 90),
-                                format!("Could not read {key}: {err}"),
-                            );
-                            return;
-                        }
-                        let Some(issue) = &issue else {
-                            return;
-                        };
-
-                        ui.horizontal_wrapped(|ui| {
-                            ui.heading(&issue.key);
-                            note_label(
-                                ui,
-                                jira_status_color(&issue.status_category),
-                                egui::RichText::new(dash_if_blank(&issue.status)).strong(),
-                            );
-                        });
-                        ui.label(egui::RichText::new(&issue.summary).size(16.0));
-                        ui.add_space(6.0);
-
-                        egui::Grid::new(("jira_fields", key.as_str()))
-                            .num_columns(2)
-                            .spacing([14.0, 4.0])
-                            .show(ui, |ui| {
-                                // Written out rather than driven by a closure
-                                // over `ui`: the Due row needs to colour its
-                                // own value, and a closure holding `ui`
-                                // mutably leaves no way to do that in place.
-                                let field = |ui: &mut egui::Ui, label: &str, value: &str| {
-                                    ui.weak(label);
-                                    ui.label(dash_if_blank(value));
-                                    ui.end_row();
-                                };
-                                field(ui, "Type", &issue.issue_type);
-                                field(ui, "Priority", &issue.priority);
-                                // An unassigned ticket is an ordinary state,
-                                // and saying so beats an empty cell.
-                                field(
-                                    ui,
-                                    "Assignee",
-                                    if issue.assignee.is_empty() {
-                                        "Unassigned"
-                                    } else {
-                                        &issue.assignee
-                                    },
-                                );
-                                field(ui, "Reporter", &issue.reporter);
-                                // Due sits with the dates, and is coloured
-                                // rather than plain: a date you have to
-                                // compare against today yourself is not much
-                                // use at a glance.
-                                ui.weak("Due");
-                                let due_state = ec2_manager::jira::due_state(
-                                    &issue.due,
-                                    &issue.status_category,
-                                    chrono::Local::now().date_naive(),
-                                );
-                                let due = ec2_manager::jira::due_label(&issue.due);
-                                match due_color(due_state) {
-                                    Some(c) => {
-                                        note_label(ui, c, dash_if_blank(&due));
-                                    }
-                                    None => {
-                                        ui.label(dash_if_blank(&due));
-                                    }
-                                }
-                                ui.end_row();
-                                field(ui, "Created", &ec2_manager::jira::local_time(&issue.created));
-                                field(ui, "Updated", &ec2_manager::jira::local_time(&issue.updated));
-                                if !issue.labels.is_empty() {
-                                    field(ui, "Labels", &issue.labels.join(", "));
-                                }
-                            });
-
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.strong("Description");
+                        // ONE scroll area, wrapping the whole body.
+                        //
+                        // Without it everything past the window's bottom edge
+                        // is clipped and unreachable — which is exactly what
+                        // happened to the comment box once a thread loaded
+                        // and pushed it down. Nothing inside this may set its
+                        // own fixed height: an inner `max_height` combined
+                        // with `auto_shrink([false, false])` occupies that
+                        // many pixels *always*, so the window acquires a
+                        // content floor it cannot shrink past and snaps back
+                        // out of any attempt to resize it smaller.
                         egui::ScrollArea::vertical()
-                            .id_salt(("jira_desc", key.as_str()))
-                            .max_height(240.0)
+                            .id_salt(("jira_ticket_body", key.as_str()))
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
+                                if loading && issue.is_none() {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(format!("Loading {key}…"));
+                                    });
+                                    return;
+                                }
+                                if let Some(err) = &error {
+                                    note_label(
+                                        ui,
+                                        egui::Color32::from_rgb(220, 90, 90),
+                                        format!("Could not read {key}: {err}"),
+                                    );
+                                    return;
+                                }
+                                let Some(issue) = &issue else {
+                                    return;
+                                };
+
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.heading(&issue.key);
+                                    note_label(
+                                        ui,
+                                        jira_status_color(&issue.status_category),
+                                        egui::RichText::new(dash_if_blank(&issue.status)).strong(),
+                                    );
+                                });
+                                ui.label(egui::RichText::new(&issue.summary).size(16.0));
+                                ui.add_space(6.0);
+
+                                egui::Grid::new(("jira_fields", key.as_str()))
+                                    .num_columns(2)
+                                    .spacing([14.0, 4.0])
+                                    .show(ui, |ui| {
+                                        // Written out rather than driven by a closure
+                                        // over `ui`: the Due row needs to colour its
+                                        // own value, and a closure holding `ui`
+                                        // mutably leaves no way to do that in place.
+                                        let field = |ui: &mut egui::Ui, label: &str, value: &str| {
+                                            ui.weak(label);
+                                            ui.label(dash_if_blank(value));
+                                            ui.end_row();
+                                        };
+                                        field(ui, "Type", &issue.issue_type);
+                                        field(ui, "Priority", &issue.priority);
+                                        // An unassigned ticket is an ordinary state,
+                                        // and saying so beats an empty cell.
+                                        field(
+                                            ui,
+                                            "Assignee",
+                                            if issue.assignee.is_empty() {
+                                                "Unassigned"
+                                            } else {
+                                                &issue.assignee
+                                            },
+                                        );
+                                        field(ui, "Reporter", &issue.reporter);
+                                        // Due sits with the dates, and is coloured
+                                        // rather than plain: a date you have to
+                                        // compare against today yourself is not much
+                                        // use at a glance.
+                                        ui.weak("Due");
+                                        let due_state = ec2_manager::jira::due_state(
+                                            &issue.due,
+                                            &issue.status_category,
+                                            chrono::Local::now().date_naive(),
+                                        );
+                                        let due = ec2_manager::jira::due_label(&issue.due);
+                                        match due_color(due_state) {
+                                            Some(c) => {
+                                                note_label(ui, c, dash_if_blank(&due));
+                                            }
+                                            None => {
+                                                ui.label(dash_if_blank(&due));
+                                            }
+                                        }
+                                        ui.end_row();
+                                        field(ui, "Created", &ec2_manager::jira::local_time(&issue.created));
+                                        field(ui, "Updated", &ec2_manager::jira::local_time(&issue.updated));
+                                        if !issue.labels.is_empty() {
+                                            field(ui, "Labels", &issue.labels.join(", "));
+                                        }
+                                    });
+
+                                ui.add_space(8.0);
+                                ui.separator();
+                                ui.strong("Description");
                                 if issue.description.is_empty() {
                                     ui.weak("(no description)");
                                 } else {
-                                    // Plain text, straight from API v2 -- see
-                                    // the note in src/jira.rs on why this is
-                                    // not ADF.
-                                    ui.add(
-                                        egui::Label::new(&issue.description).wrap(),
-                                    );
+                                    // Flattened to plain text by `jira::description_text`
+                                    // — see that function on ADF. Rendered inline: the
+                                    // window's one scroll area handles a long one, and a
+                                    // nested scroll would reserve its height whether the
+                                    // description needed it or not.
+                                    ui.add(egui::Label::new(&issue.description).wrap());
                                 }
-                            });
 
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.horizontal_wrapped(|ui| {
-                            ui.strong("Actions");
-                            if let Some(err) = &transitions_error {
-                                // The ticket above is still fully readable;
-                                // only the buttons are missing.
-                                note_label(
-                                    ui,
-                                    egui::Color32::from_rgb(220, 160, 60),
-                                    format!("could not load actions: {err}"),
-                                );
-                            } else if transitions.is_empty() {
-                                ui.weak("this ticket's workflow offers no moves from here");
-                            }
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            for tr in &transitions {
-                                let busy = in_flight.is_some();
-                                // A move needing a field this window cannot
-                                // render is disabled and says which -- better
-                                // than a click that can only end in a 400.
-                                let blocked = tr.unsupported();
-                                let btn = ui.add_enabled(
-                                    !busy && blocked.is_empty(),
-                                    egui::Button::new(if tr.needs_prompt() {
-                                        // The ellipsis is the usual signal
-                                        // that a control asks before acting.
-                                        format!("{}…", tr.name)
-                                    } else {
-                                        tr.name.clone()
-                                    }),
-                                );
-                                let btn = if !blocked.is_empty() {
-                                    btn.on_hover_text(format!(
-                                        "'{}' needs {} — a field this window cannot set. \
-                                         Make this change in Jira.",
-                                        tr.name,
-                                        blocked.join(", ")
-                                    ))
-                                } else if tr.needs_prompt() {
-                                    let asks: Vec<&str> =
-                                        tr.fields.iter().map(|f| f.name.as_str()).collect();
-                                    btn.on_hover_text(format!(
-                                        "Moves {key} to {} — asks for {} first",
-                                        if tr.to_status.is_empty() { "another status" } else { &tr.to_status },
-                                        asks.join(", ")
-                                    ))
-                                } else if tr.to_status.is_empty() {
-                                    btn
-                                } else {
-                                    // A button named "Done" that actually
-                                    // moves the ticket to "Closed" says so.
-                                    btn.on_hover_text(format!("Moves {key} to {}", tr.to_status))
-                                };
-                                if btn.clicked() {
-                                    if tr.needs_prompt() {
-                                        open_prompt = Some(tr.clone());
-                                    } else {
-                                        transition = Some((
-                                            key.clone(),
-                                            tr.id.clone(),
-                                            tr.name.clone(),
-                                            Vec::new(),
-                                            Vec::new(),
-                                        ));
+                                ui.add_space(8.0);
+                                ui.separator();
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.strong("Actions");
+                                    if let Some(err) = &transitions_error {
+                                        // The ticket above is still fully readable;
+                                        // only the buttons are missing.
+                                        note_label(
+                                            ui,
+                                            egui::Color32::from_rgb(220, 160, 60),
+                                            format!("could not load actions: {err}"),
+                                        );
+                                    } else if transitions.is_empty() {
+                                        ui.weak("this ticket's workflow offers no moves from here");
                                     }
-                                }
-                            }
-                            if in_flight.is_some() {
-                                ui.spinner();
-                            }
-                            if ui
-                                .add_enabled(!loading, egui::Button::new("↻"))
-                                .on_hover_text("Re-read this ticket")
-                                .clicked()
-                            {
-                                reload = Some(key.clone());
-                            }
-                        });
-                        match &note {
-                            Some(Ok(msg)) => {
-                                note_label(ui, egui::Color32::from_rgb(90, 190, 110), msg.as_str());
-                            }
-                            Some(Err(err)) => {
-                                note_label(
-                                    ui,
-                                    egui::Color32::from_rgb(220, 90, 90),
-                                    format!("Failed: {err}"),
-                                );
-                            }
-                            None => {}
-                        }
-
-                        // The transition screen, when the move needs one.
-                        // Inline rather than a second window: it belongs to
-                        // this ticket, and a floating dialog over a floating
-                        // ticket window is a stack nobody asked for.
-                        if let Some(pt) = pending.as_mut() {
-                            ui.add_space(6.0);
-                            egui::Frame::group(ui.style()).show(ui, |ui| {
-                                ui.strong(format!("{} — Jira asks for:", pt.name));
-                                let mut grid_fields =
-                                    pt.fields.iter().zip(pt.values.iter_mut()).enumerate();
-                                egui::Grid::new(("jira_prompt", key.as_str()))
-                                    .num_columns(2)
-                                    .spacing([12.0, 6.0])
-                                    .show(ui, |ui| {
-                                        for (i, (field, value)) in &mut grid_fields {
-                                            ui.weak(&field.name);
-                                            render_screen_field(ui, &key, i, field, value);
-                                            ui.end_row();
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    for tr in &transitions {
+                                        let busy = in_flight.is_some();
+                                        // A move needing a field this window cannot
+                                        // render is disabled and says which -- better
+                                        // than a click that can only end in a 400.
+                                        let blocked = tr.unsupported();
+                                        let btn = ui.add_enabled(
+                                            !busy && blocked.is_empty(),
+                                            egui::Button::new(if tr.needs_prompt() {
+                                                // The ellipsis is the usual signal
+                                                // that a control asks before acting.
+                                                format!("{}…", tr.name)
+                                            } else {
+                                                tr.name.clone()
+                                            }),
+                                        );
+                                        let btn = if !blocked.is_empty() {
+                                            btn.on_hover_text(format!(
+                                                "'{}' needs {} — a field this window cannot set. \
+                                                 Make this change in Jira.",
+                                                tr.name,
+                                                blocked.join(", ")
+                                            ))
+                                        } else if tr.needs_prompt() {
+                                            let asks: Vec<&str> =
+                                                tr.fields.iter().map(|f| f.name.as_str()).collect();
+                                            btn.on_hover_text(format!(
+                                                "Moves {key} to {} — asks for {} first",
+                                                if tr.to_status.is_empty() { "another status" } else { &tr.to_status },
+                                                asks.join(", ")
+                                            ))
+                                        } else if tr.to_status.is_empty() {
+                                            btn
+                                        } else {
+                                            // A button named "Done" that actually
+                                            // moves the ticket to "Closed" says so.
+                                            btn.on_hover_text(format!("Moves {key} to {}", tr.to_status))
+                                        };
+                                        if btn.clicked() {
+                                            if tr.needs_prompt() {
+                                                open_prompt = Some(tr.clone());
+                                            } else {
+                                                transition = Some((
+                                                    key.clone(),
+                                                    tr.id.clone(),
+                                                    tr.name.clone(),
+                                                    Vec::new(),
+                                                    Vec::new(),
+                                                ));
+                                            }
                                         }
-                                    });
-                                if let Some(err) = &pt.error {
-                                    note_label(
-                                        ui,
-                                        egui::Color32::from_rgb(220, 90, 90),
-                                        err.as_str(),
-                                    );
-                                }
-                                ui.horizontal(|ui| {
-                                    // Disabled until every required field is
-                                    // answered, so the prompt refuses here
-                                    // rather than by a 400 after the click.
+                                    }
+                                    if in_flight.is_some() {
+                                        ui.spinner();
+                                    }
                                     if ui
-                                        .add_enabled(
-                                            pt.is_complete() && in_flight.is_none(),
-                                            egui::Button::new(&pt.name),
-                                        )
+                                        .add_enabled(!loading, egui::Button::new("↻"))
+                                        .on_hover_text("Re-read this ticket")
                                         .clicked()
                                     {
-                                        submit_pending = true;
+                                        reload = Some(key.clone());
                                     }
-                                    if ui.button("Cancel").clicked() {
-                                        cancel_pending = true;
+                                });
+                                match &note {
+                                    Some(Ok(msg)) => {
+                                        note_label(ui, egui::Color32::from_rgb(90, 190, 110), msg.as_str());
                                     }
-                                    if !pt.is_complete() {
-                                        ui.weak("every field above is required");
+                                    Some(Err(err)) => {
+                                        note_label(
+                                            ui,
+                                            egui::Color32::from_rgb(220, 90, 90),
+                                            format!("Failed: {err}"),
+                                        );
+                                    }
+                                    None => {}
+                                }
+
+                                // The transition screen, when the move needs one.
+                                // Inline rather than a second window: it belongs to
+                                // this ticket, and a floating dialog over a floating
+                                // ticket window is a stack nobody asked for.
+                                if let Some(pt) = pending.as_mut() {
+                                    ui.add_space(6.0);
+                                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                                        ui.strong(format!("{} — Jira asks for:", pt.name));
+                                        let mut grid_fields =
+                                            pt.fields.iter().zip(pt.values.iter_mut()).enumerate();
+                                        egui::Grid::new(("jira_prompt", key.as_str()))
+                                            .num_columns(2)
+                                            .spacing([12.0, 6.0])
+                                            .show(ui, |ui| {
+                                                for (i, (field, value)) in &mut grid_fields {
+                                                    ui.weak(&field.name);
+                                                    render_screen_field(ui, &key, i, field, value);
+                                                    ui.end_row();
+                                                }
+                                            });
+                                        if let Some(err) = &pt.error {
+                                            note_label(
+                                                ui,
+                                                egui::Color32::from_rgb(220, 90, 90),
+                                                err.as_str(),
+                                            );
+                                        }
+                                        ui.horizontal(|ui| {
+                                            // Disabled until every required field is
+                                            // answered, so the prompt refuses here
+                                            // rather than by a 400 after the click.
+                                            if ui
+                                                .add_enabled(
+                                                    pt.is_complete() && in_flight.is_none(),
+                                                    egui::Button::new(&pt.name),
+                                                )
+                                                .clicked()
+                                            {
+                                                submit_pending = true;
+                                            }
+                                            if ui.button("Cancel").clicked() {
+                                                cancel_pending = true;
+                                            }
+                                            if !pt.is_complete() {
+                                                ui.weak("every field above is required");
+                                            }
+                                        });
+                                    });
+                                }
+
+                                // --- comments ---
+                                ui.add_space(8.0);
+                                ui.separator();
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.strong("Comments");
+                                    if let Some(err) = &comments_error {
+                                        note_label(
+                                            ui,
+                                            egui::Color32::from_rgb(220, 160, 60),
+                                            format!("could not load the thread: {err}"),
+                                        );
+                                    } else if comments.is_empty() {
+                                        ui.weak("none yet");
+                                    } else {
+                                        ui.weak(format!("{}", comments.len()));
+                                    }
+                                });
+                                for c in &comments {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.strong(if c.author.is_empty() {
+                                            "(unknown)"
+                                        } else {
+                                            &c.author
+                                        });
+                                        ui.weak(ec2_manager::jira::local_time(&c.created));
+                                    });
+                                    ui.add(egui::Label::new(&c.body).wrap());
+                                    ui.separator();
+                                }
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut draft)
+                                        .hint_text("Add a comment…")
+                                        .desired_rows(2)
+                                        .desired_width(f32::INFINITY),
+                                );
+                                ui.horizontal(|ui| {
+                                    // Only the button posts. Enter inserts a newline:
+                                    // a comment is visible to the whole team and must
+                                    // not be one stray keystroke away.
+                                    if ui
+                                        .add_enabled(
+                                            !comment_in_flight && !draft.trim().is_empty(),
+                                            egui::Button::new("Comment"),
+                                        )
+                                        .on_hover_text("Post this comment to the ticket.")
+                                        .clicked()
+                                    {
+                                        post_comment = true;
+                                    }
+                                    if comment_in_flight {
+                                        ui.spinner();
+                                    }
+                                    match &comment_note {
+                                        Some(Ok(msg)) => {
+                                            note_label(
+                                                ui,
+                                                egui::Color32::from_rgb(90, 190, 110),
+                                                msg.as_str(),
+                                            );
+                                        }
+                                        Some(Err(err)) => {
+                                            note_label(
+                                                ui,
+                                                egui::Color32::from_rgb(220, 90, 90),
+                                                format!("Not posted: {err}"),
+                                            );
+                                        }
+                                        None => {}
                                     }
                                 });
                             });
-                        }
-
-                        // --- comments ---
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui.horizontal_wrapped(|ui| {
-                            ui.strong("Comments");
-                            if let Some(err) = &comments_error {
-                                note_label(
-                                    ui,
-                                    egui::Color32::from_rgb(220, 160, 60),
-                                    format!("could not load the thread: {err}"),
-                                );
-                            } else if comments.is_empty() {
-                                ui.weak("none yet");
-                            } else {
-                                ui.weak(format!("{}", comments.len()));
-                            }
-                        });
-                        if !comments.is_empty() {
-                            egui::ScrollArea::vertical()
-                                .id_salt(("jira_comments", key.as_str()))
-                                .max_height(200.0)
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    for c in &comments {
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.strong(if c.author.is_empty() {
-                                                "(unknown)"
-                                            } else {
-                                                &c.author
-                                            });
-                                            ui.weak(ec2_manager::jira::local_time(&c.created));
-                                        });
-                                        ui.add(egui::Label::new(&c.body).wrap());
-                                        ui.separator();
-                                    }
-                                });
-                        }
-                        ui.add(
-                            egui::TextEdit::multiline(&mut draft)
-                                .hint_text("Add a comment…")
-                                .desired_rows(2)
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.horizontal(|ui| {
-                            // Only the button posts. Enter inserts a newline:
-                            // a comment is visible to the whole team and must
-                            // not be one stray keystroke away.
-                            if ui
-                                .add_enabled(
-                                    !comment_in_flight && !draft.trim().is_empty(),
-                                    egui::Button::new("Comment"),
-                                )
-                                .on_hover_text("Post this comment to the ticket.")
-                                .clicked()
-                            {
-                                post_comment = true;
-                            }
-                            if comment_in_flight {
-                                ui.spinner();
-                            }
-                            match &comment_note {
-                                Some(Ok(msg)) => {
-                                    note_label(
-                                        ui,
-                                        egui::Color32::from_rgb(90, 190, 110),
-                                        msg.as_str(),
-                                    );
-                                }
-                                Some(Err(err)) => {
-                                    note_label(
-                                        ui,
-                                        egui::Color32::from_rgb(220, 90, 90),
-                                        format!("Not posted: {err}"),
-                                    );
-                                }
-                                None => {}
-                            }
-                        });
                     });
                 if let Some(tr) = open_prompt {
                     pending = Some(PendingTransition::new(&tr));

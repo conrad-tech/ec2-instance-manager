@@ -1057,6 +1057,23 @@ window, and a search box opens any ticket by key.
   have four independent async writers, and `AlertsWindow` already carries the
   scar of merging two — `ack_summary` is separate from `error` because a
   routine fetch landing seconds later erased a partial-failure banner.
+- **The ticket window has exactly ONE scroll area, and nothing inside it may
+  set a fixed height.** Both halves are load-bearing, and getting either
+  wrong produced the same bug:
+  - Without an outer `ScrollArea` wrapping the whole body, everything past
+    the window's bottom edge is **clipped and unreachable** — there is no way
+    to scroll to it. That is what happened to the comment box: it was visible
+    until a comment thread loaded, then pushed off the bottom for good.
+  - An inner `ScrollArea` with `max_height(N)` **and**
+    `auto_shrink([false, false])` occupies exactly N pixels *always*, empty or
+    not. A 240px description plus a 200px thread reserved 440px before the
+    header, the fields or the buttons — and since an `egui::Window` sizes to
+    its content, that gave the window a floor it could not shrink past, so
+    dragging it smaller **snapped straight back**. The two symptoms looked
+    unrelated and were one cause.
+  - So the description and the comment thread render **inline**. A long one
+    scrolls with everything else, which is also what a reader expects: one
+    scrollbar, not three.
 - **One window per ticket, keyed on the ticket key.** `egui::Id::new(("jira_ticket",
   key))` — *not* the title, which gains the summary the moment the fetch lands
   and would move the window if it were the id. Clicking a ticket that is
