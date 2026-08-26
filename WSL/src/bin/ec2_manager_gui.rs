@@ -1353,8 +1353,34 @@ mod gui {
         comment_in_flight: bool,
         /// Outcome of the last comment post.
         comment_note: Option<std::result::Result<String, String>>,
+        /// The `@` dropdown, while one is open.
+        mention: Option<MentionPopup>,
+        /// `("@John Smith", accountId)` for every name **picked** from that
+        /// dropdown. `comment_adf_with_mentions` turns exactly these into
+        /// real mention nodes; anything typed by hand stays text, because
+        /// without an account id there is nobody to tag.
+        picked_mentions: Vec<(String, String)>,
         /// The transition screen being filled in, if any.
         pending_transition: Option<PendingTransition>,
+    }
+
+    /// The `@` mention dropdown for one ticket's comment box.
+    struct MentionPopup {
+        /// Character index of the `@` in the draft, so the picked name can
+        /// replace the token that was typed.
+        at: usize,
+        /// What has been typed after the `@`.
+        token: String,
+        /// Directory results for [`Self::queried`]. The ticket's own people
+        /// are merged in at render time and need no request.
+        directory: Vec<ec2_manager::jira::User>,
+        /// The token `directory` was fetched for, so the same query is not
+        /// re-sent on every frame or every keystroke that does not change it.
+        queried: Option<String>,
+        /// Highlighted row. Starts at 0 — the reporter — so `@` then Enter
+        /// picks them, which is the common case.
+        selected: usize,
+        loading: bool,
     }
 
     /// A transition that cannot be a single click, because its screen has
@@ -1440,6 +1466,8 @@ mod gui {
                 comment_draft: String::new(),
                 comment_in_flight: false,
                 comment_note: None,
+                mention: None,
+                picked_mentions: Vec::new(),
                 pending_transition: None,
             }
         }
@@ -1473,6 +1501,14 @@ mod gui {
         Comments {
             key: String,
             result: std::result::Result<Vec<ec2_manager::jira::Comment>, String>,
+        },
+        /// Directory results for one `@` query.
+        Users {
+            key: String,
+            /// The token searched for; a result for a token the user has
+            /// since typed past is dropped.
+            query: String,
+            result: std::result::Result<Vec<ec2_manager::jira::User>, String>,
         },
         /// A comment was posted (or was not).
         Commented {
@@ -4288,7 +4324,61 @@ mod gui {
         }
     }
 
-    /// Colour for a due date, or `None` to render it plainly.
+    /// The `@token` being typed immediately before the caret, if any.
+    ///
+    /// Returns `(char index of the '@', the token after it)`. The `@` must
+    /// start a word — otherwise every email address in a comment would open
+    /// the dropdown — and the token must carry no whitespace, so the popup
+    /// closes once the name is finished rather than swallowing the sentence.
+    fn mention_token_at(text: &str, caret: usize) -> Option<(usize, String)> {
+        let chars: Vec<char> = text.chars().collect();
+        let caret = caret.min(chars.len());
+        let mut i = caret;
+        while i > 0 {
+            let c = chars[i - 1];
+            if c == '@' {
+                // Must start a word: `some@example.com` is not a mention.
+                if i >= 2 && !chars[i - 2].is_whitespace() {
+                    return None;
+                }
+                let token: String = chars[i..caret].iter().collect();
+                return Some((i - 1, token));
+            }
+            if c.is_whitespace() {
+                return None;
+            }
+            i -= 1;
+        }
+        None
+    }
+
+    /// Replace the `@token` at `at` with the chosen name, and report the
+    /// caret position that should follow it.
+    ///
+    /// A trailing space is added so the sentence carries on naturally, and
+    /// so the popup closes — the token rule stops at whitespace. It is
+    /// **not** added when one is already there: picking a name mid-sentence
+    /// is the ordinary case, and appending unconditionally double-spaces it.
+    fn apply_mention_pick(
+        draft: &str,
+        at: usize,
+        token_len: usize,
+        display_name: &str,
+    ) -> (String, usize, String) {
+        let chars: Vec<char> = draft.chars().collect();
+        let end = (at + 1 + token_len).min(chars.len());
+        let label = format!("@{display_name}");
+        let head: String = chars[..at.min(chars.len())].iter().collect();
+        let tail: String = chars[end..].iter().collect();
+        // Only add the space when there is not already one there. Appending
+        // unconditionally leaves a double space whenever a name is picked
+        // mid-sentence, which is the ordinary case.
+        let gap = if tail.starts_with(char::is_whitespace) { "" } else { " " };
+        let caret = at + label.chars().count() + gap.chars().count();
+        (format!("{head}{label}{gap}{tail}"), caret, label)
+    }
+
+    /// Colour for a due date, or `None` to render it plainly.    /// Colour for a due date, or `None` to render it plainly.
     ///
     /// Only two states are coloured: a date that has passed and a date that
     /// is today. Colouring a future date too would leave nothing uncoloured
@@ -12892,6 +12982,32 @@ mod gui {
             });
         }
 
+        /// Look up names for an open `@` dropdown.
+        ///
+        /// Only called once three characters are typed — below that the
+        /// ticket's own people answer it and no request is made at all.
+        fn start_jira_user_search(&mut self, key: &str, query: &str) {
+            let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key) else {
+                return;
+            };
+            let Some(popup) = win.mention.as_mut() else {
+                return;
+            };
+            if popup.queried.as_deref() == Some(query) {
+                return; // same token; the results already on screen answer it
+            }
+            popup.queried = Some(query.to_string());
+            popup.loading = true;
+            let (key, query) = (key.to_string(), query.to_string());
+            let site = self.jira_site.clone();
+            let tx = self.jira_tx.clone();
+            std::thread::spawn(move || {
+                let result = ec2_manager::jira::search_users(&site, &query)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(JiraEvent::Users { key, query, result });
+            });
+        }
+
         /// Post the ticket window's typed comment.
         fn start_jira_comment(&mut self, key: &str) {
             let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key) else {
@@ -12906,12 +13022,13 @@ mod gui {
             // known to have landed — clearing on send loses what someone
             // wrote the moment the network does not cooperate.
             let text = win.comment_draft.clone();
+            let mentions = win.picked_mentions.clone();
             let key = key.to_string();
             self.log_info(format!("jira: {key} — posting a comment"));
             let site = self.jira_site.clone();
             let tx = self.jira_tx.clone();
             std::thread::spawn(move || {
-                let result = ec2_manager::jira::add_comment(&site, &key, &text)
+                let result = ec2_manager::jira::add_comment(&site, &key, &text, &mentions)
                     .map_err(|e| e.to_string());
                 let _ = tx.send(JiraEvent::Commented { key, result });
             });
@@ -13009,6 +13126,29 @@ mod gui {
                             }
                         }
                     }
+                    JiraEvent::Users { key, query, result } => {
+                        let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key)
+                        else {
+                            continue;
+                        };
+                        let Some(popup) = win.mention.as_mut() else {
+                            continue; // the dropdown closed while this ran
+                        };
+                        if popup.queried.as_deref() != Some(query.as_str()) {
+                            continue; // typed past it; this answer is stale
+                        }
+                        popup.loading = false;
+                        match result {
+                            Ok(users) => popup.directory = users,
+                            Err(err) => {
+                                // The ticket's own people still answer the
+                                // dropdown, so this is a warning, not a
+                                // failure that closes it.
+                                popup.directory.clear();
+                                self.log_warn(format!("jira: {key}: user search: {err}"));
+                            }
+                        }
+                    }
                     JiraEvent::Commented { key, result } => {
                         let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key)
                         else {
@@ -13017,8 +13157,10 @@ mod gui {
                         win.comment_in_flight = false;
                         match result {
                             Ok(()) => {
-                                // Only now is the draft safe to drop.
+                                // Only now is the draft safe to drop, and
+                                // the picks belong to that draft.
                                 win.comment_draft.clear();
+                                win.picked_mentions.clear();
                                 win.comment_note = Some(Ok("Comment posted".to_string()));
                                 self.log_info(format!("jira: {key} — comment posted"));
                                 reload.push(key);
@@ -13772,6 +13914,31 @@ mod gui {
                 // Edited in place by the widgets, written back after the
                 // window closes -- the closure already borrows `self`.
                 let mut draft = self.jira_tickets[idx].comment_draft.clone();
+                // The dropdown's contents, resolved here so the render is a
+                // plain list: the ticket's own people (reporter, commenters,
+                // assignee) ranked above whatever the directory returned.
+                let mention_view = self.jira_tickets[idx].mention.as_ref().map(|m| {
+                    let w = &self.jira_tickets[idx];
+                    let people = match w.issue.as_ref() {
+                        Some(i) => ec2_manager::jira::ticket_participants(i, &w.comments),
+                        None => Vec::new(),
+                    };
+                    (
+                        m.selected,
+                        m.loading,
+                        ec2_manager::jira::mention_candidates(
+                            &m.token,
+                            &people,
+                            &m.directory,
+                            ec2_manager::jira::MENTION_LIMIT,
+                        ),
+                    )
+                });
+                // Carried out of the closure: acting on them needs `&mut self`.
+                let mut mention_pick: Option<usize> = None;
+                let mut mention_move: i32 = 0;
+                let mut mention_close = false;
+                let mut mention_caret: Option<usize> = None;
                 let mut pending = self.jira_tickets[idx].pending_transition.take();
                 let mut post_comment = false;
                 let mut submit_pending = false;
@@ -13932,13 +14099,12 @@ mod gui {
                                         let blocked = tr.unsupported();
                                         let btn = ui.add_enabled(
                                             !busy && blocked.is_empty(),
-                                            egui::Button::new(if tr.needs_prompt() {
-                                                // The ellipsis is the usual signal
-                                                // that a control asks before acting.
-                                                format!("{}…", tr.name)
-                                            } else {
-                                                tr.name.clone()
-                                            }),
+                                            // Jira's own name for the move,
+                                            // verbatim. No ellipsis is appended
+                                            // for a transition that prompts — the
+                                            // hover text already says what it will
+                                            // ask for.
+                                            egui::Button::new(tr.name.clone()),
                                         );
                                         let btn = if !blocked.is_empty() {
                                             btn.on_hover_text(format!(
@@ -14080,12 +14246,72 @@ mod gui {
                                     ui.add(egui::Label::new(&c.body).wrap());
                                     ui.separator();
                                 }
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut draft)
-                                        .hint_text("Add a comment…")
-                                        .desired_rows(2)
-                                        .desired_width(f32::INFINITY),
-                                );
+                                // Keys are consumed BEFORE the text box is built, so while
+                                // the dropdown is open Enter picks a name instead of
+                                // inserting a newline. A widget only sees events still in
+                                // the queue when it is added.
+                                let popup_open = mention_view
+                                    .as_ref()
+                                    .map(|(_, _, rows)| !rows.is_empty())
+                                    .unwrap_or(false);
+                                if popup_open {
+                                    ui.input_mut(|i| {
+                                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                                            mention_move = 1;
+                                        }
+                                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                                            mention_move = -1;
+                                        }
+                                        if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                                            || i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                                        {
+                                            if let Some((sel, _, _)) = &mention_view {
+                                                mention_pick = Some(*sel);
+                                            }
+                                        }
+                                        if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                                            mention_close = true;
+                                        }
+                                    });
+                                }
+                                let edit = egui::TextEdit::multiline(&mut draft)
+                                    .hint_text("Add a comment… (@ to mention)")
+                                    .desired_rows(2)
+                                    .desired_width(f32::INFINITY)
+                                    .id_salt(("jira_comment_box", key.as_str()))
+                                    .show(ui);
+                                // The caret is what says whether an `@` is being typed
+                                // right now, and where it starts.
+                                if edit.response.has_focus() {
+                                    mention_caret = edit.cursor_range.map(|r| r.primary.index);
+                                } else if edit.response.lost_focus() {
+                                    mention_close = true;
+                                }
+                                if let Some((selected, loading, rows)) = &mention_view {
+                                    if !rows.is_empty() {
+                                        // Inline, not a floating Area: a popup inside a
+                                        // window inside a scroll area is where egui
+                                        // z-order and clipping bugs live, and this window
+                                        // has already cost one layout bug.
+                                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                                            for (i, u) in rows.iter().enumerate() {
+                                                if ui
+                                                    .selectable_label(i == *selected, &u.display_name)
+                                                    .clicked()
+                                                {
+                                                    mention_pick = Some(i);
+                                                }
+                                            }
+                                            if *loading {
+                                                ui.horizontal(|ui| {
+                                                    ui.spinner();
+                                                    ui.weak("searching…");
+                                                });
+                                            }
+                                            ui.weak("↑↓ to choose, Enter to insert, Esc to dismiss");
+                                        });
+                                    }
+                                }
                                 ui.horizontal(|ui| {
                                     // Only the button posts. Enter inserts a newline:
                                     // a comment is visible to the whole team and must
@@ -14140,10 +14366,100 @@ mod gui {
                         ));
                     }
                 }
+                // --- the @ dropdown: open / move / pick / close ---
+                let mut search_for: Option<String> = None;
                 {
                     let w = &mut self.jira_tickets[idx];
+
+                    if let (Some(i), Some((_, _, rows))) = (mention_pick, &mention_view) {
+                        if let (Some(user), Some(popup)) = (rows.get(i), w.mention.as_ref()) {
+                            let (next, caret, label) = apply_mention_pick(
+                                &draft,
+                                popup.at,
+                                popup.token.chars().count(),
+                                &user.display_name,
+                            );
+                            draft = next;
+                            // Record the pick. This pairing is the whole
+                            // difference between a real tag and the literal
+                            // text that typing a name by hand produces.
+                            if !w
+                                .picked_mentions
+                                .iter()
+                                .any(|(l, id)| l == &label && id == &user.account_id)
+                            {
+                                w.picked_mentions
+                                    .push((label, user.account_id.clone()));
+                            }
+                            mention_caret = Some(caret);
+                            w.mention = None;
+                        }
+                    } else if mention_close {
+                        w.mention = None;
+                    } else if let Some(caret) = mention_caret {
+                        match mention_token_at(&draft, caret) {
+                            Some((at, token)) => {
+                                let popup = w.mention.get_or_insert(MentionPopup {
+                                    at,
+                                    token: token.clone(),
+                                    directory: Vec::new(),
+                                    queried: None,
+                                    // The reporter is row 0, so `@` then
+                                    // Enter picks them -- the common case.
+                                    selected: 0,
+                                    loading: false,
+                                });
+                                if popup.at != at || popup.token != token {
+                                    popup.at = at;
+                                    popup.token = token.clone();
+                                    // A different token; the highlight goes
+                                    // back to the top rather than pointing at
+                                    // whatever row that index now holds.
+                                    popup.selected = 0;
+                                }
+                                if mention_move != 0 {
+                                    if let Some((_, _, rows)) = &mention_view {
+                                        if !rows.is_empty() {
+                                            let len = rows.len() as i32;
+                                            let next =
+                                                (popup.selected as i32 + mention_move + len)
+                                                    % len;
+                                            popup.selected = next as usize;
+                                        }
+                                    }
+                                }
+                                if ec2_manager::jira::should_search_users(&token) {
+                                    search_for = Some(token);
+                                } else {
+                                    // Below the threshold the ticket's own
+                                    // people answer it, and any results from
+                                    // a longer token are no longer about what
+                                    // is on screen.
+                                    popup.directory.clear();
+                                    popup.queried = None;
+                                }
+                            }
+                            None => w.mention = None,
+                        }
+                    }
+
                     w.comment_draft = draft;
                     w.pending_transition = pending;
+                }
+                // Move the caret past the name just inserted, or the next
+                // keystroke lands where the `@` was.
+                if let Some(caret) = mention_caret.filter(|_| mention_pick.is_some()) {
+                    let id = egui::Id::new(("jira_comment_box", key.as_str()));
+                    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+                        let ccursor = egui::text::CCursor::new(caret);
+                        state
+                            .cursor
+                            .set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
+                        egui::TextEdit::store_state(ctx, id, state);
+                    }
+                }
+                if let Some(query) = search_for {
+                    self.start_jira_user_search(&key, &query);
                 }
                 if post_comment {
                     comment_for = Some(key.clone());
@@ -35504,6 +35820,52 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             {
                 assert!(!report.contains('@'), "no address should appear: {report}");
             }
+        }
+
+        #[test]
+        fn an_at_opens_the_dropdown_only_where_a_mention_could_start() {
+            // Caret is a char index, so these are counted in chars.
+            assert_eq!(mention_token_at("@", 1), Some((0, String::new())));
+            assert_eq!(mention_token_at("hi @jo", 6), Some((3, "jo".to_string())));
+            assert_eq!(
+                mention_token_at("hi @John and", 8),
+                Some((3, "John".to_string()))
+            );
+
+            // An email address is not a mention -- otherwise every address
+            // typed into a comment would open the dropdown.
+            assert_eq!(mention_token_at("some@example.com", 16), None);
+            // The token stops at whitespace, so the popup closes once the
+            // name is finished instead of swallowing the sentence.
+            assert_eq!(mention_token_at("@John Smith any", 14), None);
+            // Nothing being typed, nothing to offer.
+            assert_eq!(mention_token_at("plain words", 11), None);
+            assert_eq!(mention_token_at("", 0), None);
+            // A caret past the end must clamp rather than panic.
+            assert_eq!(mention_token_at("@jo", 99), Some((0, "jo".to_string())));
+        }
+
+        #[test]
+        fn picking_a_name_replaces_the_token_and_leaves_the_caret_after_it() {
+            let (text, caret, label) = apply_mention_pick("hi @jo", 3, 2, "John Smith");
+            assert_eq!(text, "hi @John Smith ");
+            assert_eq!(label, "@John Smith");
+            // Past the inserted name and its trailing space, so the next
+            // keystroke does not land back where the `@` was.
+            assert_eq!(caret, "hi @John Smith ".chars().count());
+            // The trailing space also closes the dropdown, since the token
+            // rule stops at whitespace.
+            assert_eq!(mention_token_at(&text, caret), None);
+
+            // Mid-sentence: only the token is replaced, the tail survives,
+            // and the space already there is not doubled.
+            let (text, caret, _) = apply_mention_pick("@jo any update?", 0, 2, "John Smith");
+            assert_eq!(text, "@John Smith any update?");
+            assert_eq!(caret, "@John Smith".chars().count());
+
+            // A bare `@` with nothing typed after it.
+            let (text, _, _) = apply_mention_pick("@", 0, 0, "John Smith");
+            assert_eq!(text, "@John Smith ");
         }
 
         #[test]

@@ -278,7 +278,9 @@ pub struct Issue {
     pub priority: String,
     /// Display name, or empty for an unassigned ticket.
     pub assignee: String,
+    pub assignee_id: String,
     pub reporter: String,
+    pub reporter_id: String,
     pub created: String,
     pub updated: String,
     /// See [`IssueRow::due`].
@@ -386,11 +388,139 @@ pub enum FieldInput {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Comment {
     pub author: String,
+    /// The author's Atlassian account id. Kept so mention ranking works on
+    /// identity rather than spelling — two people sharing a display name is
+    /// the exact case ranking exists for.
+    pub author_id: String,
     /// As the API returned it. Rendered in local time.
     pub created: String,
     /// Flattened by [`description_text`] — comment bodies are ADF on v3,
     /// exactly like the description.
     pub body: String,
+}
+
+/// Characters that must be typed after `@` before the directory is queried.
+///
+/// Below this the dropdown offers the ticket's own people, which needs no
+/// request at all and is very often the answer — the reporter especially.
+pub const MENTION_SEARCH_MIN: usize = 3;
+
+/// How many names the mention dropdown offers.
+pub const MENTION_LIMIT: usize = 5;
+
+/// A person who can be mentioned.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct User {
+    /// The Atlassian account id — what a mention node actually carries. A
+    /// mention without it is just text, which is what typing a name by hand
+    /// produces.
+    pub account_id: String,
+    pub display_name: String,
+}
+
+/// True once the typed token is long enough to be worth a directory query.
+pub fn should_search_users(token: &str) -> bool {
+    token.chars().count() >= MENTION_SEARCH_MIN
+}
+
+/// The people already on this ticket, most likely first: **reporter, then
+/// whoever has commented (most recent first), then the assignee**.
+///
+/// Reporter leads deliberately — an `@` in a comment is usually answering the
+/// person who raised the ticket. Commenters come next because someone who has
+/// spoken on the ticket is more likely to be the one being answered than an
+/// assignee who may never have said anything (and is frequently you).
+///
+/// Deduped by account id, so a reporter who has also commented appears once,
+/// at the rank they first earned. Anyone without an account id is dropped:
+/// they cannot be mentioned at all.
+pub fn ticket_participants(issue: &Issue, comments: &[Comment]) -> Vec<User> {
+    let mut out: Vec<User> = Vec::new();
+    let push = |id: &str, name: &str, out: &mut Vec<User>| {
+        if id.trim().is_empty() || out.iter().any(|u| u.account_id == id) {
+            return;
+        }
+        out.push(User {
+            account_id: id.to_string(),
+            display_name: name.to_string(),
+        });
+    };
+    push(&issue.reporter_id, &issue.reporter, &mut out);
+    for c in comments.iter().rev() {
+        push(&c.author_id, &c.author, &mut out);
+    }
+    push(&issue.assignee_id, &issue.assignee, &mut out);
+    out
+}
+
+/// The dropdown's contents for what has been typed after `@`.
+///
+/// Pure, so the ordering is pinned by a test rather than by the order of two
+/// loops inside a render function. Participants always outrank directory
+/// results — a John who reported the ticket is far more likely to be the John
+/// meant than a John who merely exists.
+pub fn mention_candidates(
+    token: &str,
+    participants: &[User],
+    directory: &[User],
+    limit: usize,
+) -> Vec<User> {
+    let mut out: Vec<User> = participants
+        .iter()
+        .filter(|u| matches_token(&u.display_name, token))
+        .cloned()
+        .collect();
+    for u in directory {
+        if out.len() >= limit {
+            break;
+        }
+        if u.account_id.trim().is_empty() || out.iter().any(|p| p.account_id == u.account_id) {
+            continue;
+        }
+        out.push(u.clone());
+    }
+    out.truncate(limit);
+    out
+}
+
+/// Whether a display name matches what has been typed so far.
+///
+/// Matched per **word**, not just from the start, so `@smith` finds
+/// "John Smith" — a surname is what people type at least as often as a first
+/// name, and a whole-string `starts_with` would find nobody.
+fn matches_token(display_name: &str, token: &str) -> bool {
+    let token = token.trim();
+    if token.is_empty() {
+        return true;
+    }
+    let token = token.to_lowercase();
+    let name = display_name.to_lowercase();
+    name.starts_with(&token) || name.split_whitespace().any(|w| w.starts_with(&token))
+}
+
+/// Parse a `/user/search` response.
+pub fn parse_users(body: &str) -> Result<Vec<User>> {
+    let v: Value = serde_json::from_str(body)
+        .map_err(|e| AppError::InvalidArgument(format!("jira: could not parse users: {e}")))?;
+    let Some(list) = v.as_array() else {
+        return Err(AppError::InvalidArgument(
+            "jira: user search did not return a list".to_string(),
+        ));
+    };
+    Ok(list
+        .iter()
+        .filter(|u| {
+            // A deactivated account cannot be notified, and an `app` account
+            // is a bot — offering either wastes a slot in a list of five.
+            u.get("active").and_then(Value::as_bool).unwrap_or(true)
+                && field_str(u, &["accountType"]) != "app"
+        })
+        .map(|u| User {
+            account_id: field_str(u, &["accountId"]),
+            display_name: field_str(u, &["displayName"]),
+        })
+        .filter(|u| !u.account_id.is_empty() && !u.display_name.is_empty())
+        .collect())
 }
 
 fn require_complete(site: &JiraSite) -> Result<()> {
@@ -529,7 +659,9 @@ pub fn parse_issue(body: &str) -> Result<Issue> {
         issue_type: field_str(&v, &["fields", "issuetype", "name"]),
         priority: field_str(&v, &["fields", "priority", "name"]),
         assignee: field_str(&v, &["fields", "assignee", "displayName"]),
+        assignee_id: field_str(&v, &["fields", "assignee", "accountId"]),
         reporter: field_str(&v, &["fields", "reporter", "displayName"]),
+        reporter_id: field_str(&v, &["fields", "reporter", "accountId"]),
         created: field_str(&v, &["fields", "created"]),
         updated: field_str(&v, &["fields", "updated"]),
         due: field_str(&v, &["fields", "duedate"]),
@@ -659,6 +791,7 @@ pub fn parse_comments(body: &str) -> Result<Vec<Comment>> {
         .iter()
         .map(|c| Comment {
             author: field_str(c, &["author", "displayName"]),
+            author_id: field_str(c, &["author", "accountId"]),
             created: field_str(c, &["created"]),
             body: c.get("body").map(description_text).unwrap_or_default(),
         })
@@ -682,6 +815,23 @@ pub fn parse_comments(body: &str) -> Result<Vec<Comment>> {
 /// newline written into a hand-built string would break out of it.
 /// `a_comment_body_cannot_break_out_of_its_json` pins that.
 pub fn comment_adf(text: &str) -> Value {
+    comment_adf_with_mentions(text, &[])
+}
+
+/// As [`comment_adf`], but turning known `@Display Name` runs into real
+/// mention nodes.
+///
+/// `mentions` pairs the exact text that was inserted (`"@John Smith"`) with
+/// the account id behind it, recorded when the name was **picked from the
+/// dropdown**. Text nobody picked stays text: without an account id there is
+/// nothing to tag, and guessing at one would notify a person the app never
+/// resolved. That is the whole reason typing `@John Smith` by hand did
+/// nothing before this existed.
+pub fn comment_adf_with_mentions(text: &str, mentions: &[(String, String)]) -> Value {
+    // Longest first, so "@John Smithson" is not eaten by "@John Smith".
+    let mut ordered: Vec<&(String, String)> = mentions.iter().collect();
+    ordered.sort_by_key(|(label, _)| std::cmp::Reverse(label.chars().count()));
+
     let normalized = text.replace("\r\n", "\n");
     let paragraphs: Vec<Value> = normalized
         .split("\n\n")
@@ -691,9 +841,7 @@ pub fn comment_adf(text: &str) -> Value {
                 if i > 0 {
                     content.push(serde_json::json!({ "type": "hardBreak" }));
                 }
-                if !line.is_empty() {
-                    content.push(serde_json::json!({ "type": "text", "text": line }));
-                }
+                content.extend(inline_nodes(line, &ordered));
             }
             if content.is_empty() {
                 // An empty paragraph is how ADF spells a blank line; a
@@ -705,6 +853,41 @@ pub fn comment_adf(text: &str) -> Value {
         })
         .collect();
     serde_json::json!({ "type": "doc", "version": 1, "content": paragraphs })
+}
+
+/// One line split into text and mention nodes.
+fn inline_nodes(line: &str, mentions: &[&(String, String)]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    let mut buf = String::new();
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let rest: String = chars[i..].iter().collect();
+        let hit = mentions
+            .iter()
+            .find(|(label, id)| !id.is_empty() && rest.starts_with(label.as_str()));
+        match hit {
+            Some((label, id)) => {
+                if !buf.is_empty() {
+                    out.push(serde_json::json!({ "type": "text", "text": buf }));
+                    buf = String::new();
+                }
+                out.push(serde_json::json!({
+                    "type": "mention",
+                    "attrs": { "id": id, "text": label },
+                }));
+                i += label.chars().count();
+            }
+            None => {
+                buf.push(chars[i]);
+                i += 1;
+            }
+        }
+    }
+    if !buf.is_empty() {
+        out.push(serde_json::json!({ "type": "text", "text": buf }));
+    }
+    out
 }
 
 /// Reject a comment that would post nothing. Whitespace-only is the case
@@ -803,6 +986,27 @@ pub fn fetch_transitions(site: &JiraSite, key: &str) -> Result<Vec<Transition>> 
     parse_transitions(&body)
 }
 
+/// Search Jira's own user directory — the same list its mention autocomplete
+/// draws from.
+///
+/// Only called once [`should_search_users`] is satisfied; below that the
+/// dropdown shows the ticket's own people and makes no request.
+pub fn search_users(site: &JiraSite, query: &str) -> Result<Vec<User>> {
+    require_complete(site)?;
+    let url = format!("{}/user/search", site.api_base);
+    let body = atlassian_http::request(
+        &site.auth.email,
+        &site.auth.token,
+        &url,
+        &[
+            ("query", query.trim().to_string()),
+            ("maxResults", "10".to_string()),
+        ],
+        None,
+    )?;
+    parse_users(&body)
+}
+
 /// A ticket's comment thread, oldest first.
 pub fn fetch_comments(site: &JiraSite, key: &str) -> Result<Vec<Comment>> {
     require_complete(site)?;
@@ -819,12 +1023,18 @@ pub fn fetch_comments(site: &JiraSite, key: &str) -> Result<Vec<Comment>> {
 }
 
 /// Post a comment.
-pub fn add_comment(site: &JiraSite, key: &str, text: &str) -> Result<()> {
+pub fn add_comment(
+    site: &JiraSite,
+    key: &str,
+    text: &str,
+    mentions: &[(String, String)],
+) -> Result<()> {
     require_complete(site)?;
     validate_issue_key(key)?;
     require_comment_text(text)?;
     let url = format!("{}/issue/{}/comment", site.api_base, key.trim());
-    let payload = serde_json::json!({ "body": comment_adf(text) }).to_string();
+    let payload =
+        serde_json::json!({ "body": comment_adf_with_mentions(text, mentions) }).to_string();
     atlassian_http::request(&site.auth.email, &site.auth.token, &url, &[], Some(&payload))?;
     Ok(())
 }
@@ -1485,6 +1695,134 @@ mod tests {
         assert_eq!(description_text(&soft), "line one\nline two");
     }
 
+    fn user(id: &str, name: &str) -> User {
+        User { account_id: id.to_string(), display_name: name.to_string() }
+    }
+
+    #[test]
+    fn a_picked_name_becomes_a_real_mention_and_a_typed_one_does_not() {
+        // Typing "@John Smith" by hand produced literal text, because a
+        // mention node carries an ACCOUNT ID and nothing had resolved one.
+        // That is the bug; this is the fix, and its boundary.
+        let picked = [("@John Smith".to_string(), "acc-1".to_string())];
+        let adf = comment_adf_with_mentions("@John Smith any update?", &picked);
+        let nodes = adf["content"][0]["content"].as_array().expect("inline nodes");
+        assert_eq!(nodes[0]["type"], "mention");
+        assert_eq!(nodes[0]["attrs"]["id"], "acc-1");
+        assert_eq!(nodes[0]["attrs"]["text"], "@John Smith");
+        assert_eq!(nodes[1]["type"], "text");
+        assert_eq!(nodes[1]["text"], " any update?");
+
+        // A name nobody picked stays text. Without an account id there is
+        // nothing to tag, and inventing one notifies a person the app never
+        // resolved.
+        let unpicked = comment_adf_with_mentions("@Jane Doe any update?", &picked);
+        let only = unpicked["content"][0]["content"].as_array().expect("nodes");
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0]["type"], "text");
+    }
+
+    #[test]
+    fn a_longer_name_is_not_eaten_by_a_shorter_one_it_starts_with() {
+        // Both are on the ticket and both were picked; matching in map order
+        // would tag John Smith and leave "son" as stray text.
+        let picked = [
+            ("@John Smith".to_string(), "acc-1".to_string()),
+            ("@John Smithson".to_string(), "acc-2".to_string()),
+        ];
+        let adf = comment_adf_with_mentions("@John Smithson please look", &picked);
+        let nodes = adf["content"][0]["content"].as_array().expect("nodes");
+        assert_eq!(nodes[0]["attrs"]["id"], "acc-2");
+        assert_eq!(nodes[1]["text"], " please look");
+    }
+
+    #[test]
+    fn a_mention_survives_the_round_trip_back_to_text() {
+        // `description_text` renders a mention as its own label, so what is
+        // posted reads back as what was typed.
+        let picked = [("@John Smith".to_string(), "acc-1".to_string())];
+        let adf = comment_adf_with_mentions("hi @John Smith\nsecond line", &picked);
+        assert_eq!(description_text(&adf), "hi @John Smith\nsecond line");
+    }
+
+    #[test]
+    fn the_dropdown_offers_the_ticket_s_own_people_before_the_directory() {
+        let mut issue = Issue { ..Default::default() };
+        issue.reporter = "John Reporter".to_string();
+        issue.reporter_id = "acc-rep".to_string();
+        issue.assignee = "Ann Assignee".to_string();
+        issue.assignee_id = "acc-asg".to_string();
+        let comments = vec![
+            Comment { author: "Old Commenter".to_string(),
+                      author_id: "acc-old".to_string(), ..Default::default() },
+            Comment { author: "John Commenter".to_string(),
+                      author_id: "acc-new".to_string(), ..Default::default() },
+        ];
+
+        // Bare `@` -- reporter, then commenters most recent first, then the
+        // assignee. No request is made for this at all.
+        let people = ticket_participants(&issue, &comments);
+        let ids: Vec<&str> = people.iter().map(|u| u.account_id.as_str()).collect();
+        assert_eq!(ids, vec!["acc-rep", "acc-new", "acc-old", "acc-asg"]);
+
+        // Someone filling two roles appears once, at the rank they first
+        // earned -- a reporter who has also commented is still the reporter.
+        let dual = vec![Comment {
+            author: "John Reporter".to_string(),
+            author_id: "acc-rep".to_string(),
+            ..Default::default()
+        }];
+        let once = ticket_participants(&issue, &dual);
+        let ids: Vec<&str> = once.iter().map(|u| u.account_id.as_str()).collect();
+        assert_eq!(ids, vec!["acc-rep", "acc-asg"]);
+
+        // Typing narrows them, still without a request.
+        let johns = mention_candidates("john", &people, &[], MENTION_LIMIT);
+        let ids: Vec<&str> = johns.iter().map(|u| u.account_id.as_str()).collect();
+        assert_eq!(ids, vec!["acc-rep", "acc-new"], "reporter leads");
+
+        // With directory results, participants still outrank them, and a
+        // participant the directory also returned is not listed twice.
+        let directory = vec![user("acc-far", "John Faraway"), user("acc-rep", "John Reporter")];
+        let merged = mention_candidates("john", &people, &directory, MENTION_LIMIT);
+        let ids: Vec<&str> = merged.iter().map(|u| u.account_id.as_str()).collect();
+        assert_eq!(ids, vec!["acc-rep", "acc-new", "acc-far"]);
+        assert!(merged.len() <= MENTION_LIMIT);
+    }
+
+    #[test]
+    fn a_surname_matches_too_and_the_directory_waits_for_three_letters() {
+        let people = vec![user("acc-1", "John Smith")];
+        // A surname is typed at least as often as a first name; a
+        // whole-string starts_with would find nobody.
+        assert_eq!(mention_candidates("smi", &people, &[], 5).len(), 1);
+        assert_eq!(mention_candidates("SMITH", &people, &[], 5).len(), 1);
+        assert!(mention_candidates("zz", &people, &[], 5).is_empty());
+
+        // Below three characters the ticket's own people answer it, so no
+        // request is made.
+        assert!(!should_search_users(""));
+        assert!(!should_search_users("jo"));
+        assert!(should_search_users("joh"));
+    }
+
+    #[test]
+    fn the_user_search_drops_accounts_that_cannot_be_mentioned() {
+        let body = r#"[
+          { "accountId": "acc-1", "displayName": "John Smith", "active": true },
+          { "accountId": "acc-2", "displayName": "Gone Away", "active": false },
+          { "accountId": "acc-3", "displayName": "Automation", "active": true,
+            "accountType": "app" },
+          { "accountId": "", "displayName": "No id", "active": true }
+        ]"#;
+        let users = parse_users(body).expect("parses");
+        // A deactivated account cannot be notified and a bot wastes one of
+        // five slots.
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].account_id, "acc-1");
+        assert!(parse_users(r#"{"not":"a list"}"#).is_err());
+    }
+
     #[test]
     fn a_blank_comment_is_refused_before_it_is_posted() {
         // Whitespace passes an is_empty check and posts a blank comment that
@@ -1569,7 +1907,7 @@ mod tests {
         assert!(fetch_issue(&blank, "OPS-1").is_err());
         assert!(fetch_transitions(&blank, "OPS-1").is_err());
         assert!(fetch_comments(&blank, "OPS-1").is_err());
-        assert!(add_comment(&blank, "OPS-1", "hi").is_err());
+        assert!(add_comment(&blank, "OPS-1", "hi", &[]).is_err());
         assert!(do_transition(&blank, "OPS-1", "11", &[], &[]).is_err());
     }
 

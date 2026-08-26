@@ -1109,6 +1109,44 @@ window, and a search box opens any ticket by key.
     one posts a wrong value to a live ticket; a general Jira form renderer is
     a different feature from a ticket viewer.
   - Optional screen fields are dropped. This reproduces a *required* prompt.
+- **`@` mentions are picked, never guessed.** Typing `@John Smith` by hand
+  posts literal text and tags nobody — a Jira mention is a distinct ADF node
+  carrying an **account id**, and nothing about typed text supplies one. So
+  the comment box has an `@` dropdown, and only a name **picked** from it
+  becomes a real mention.
+  - **`picked_mentions` pairs the inserted text with the account id**, and
+    `comment_adf_with_mentions` converts exactly those. Anything typed by
+    hand stays text: without an account id there is nobody to tag, and
+    resolving a typed name loosely would notify the wrong person — the same
+    hazard the access-email work already has a scar from.
+  - **Ranking is `ticket_participants`: reporter, then commenters (most
+    recent first), then assignee**, deduped by account id so someone filling
+    two roles appears once at the rank they first earned. An `@` in a comment
+    usually answers whoever raised the ticket; an assignee is often you and
+    may never have said anything.
+  - **A bare `@` costs no request.** It lists the ticket's own people
+    immediately, and the reporter is row 0 — so `@` then Enter, which is the
+    common case, is two keystrokes. The directory is only queried once
+    `MENTION_SEARCH_MIN` (3) characters are typed; below that the same local
+    list is filtered.
+  - **Matching is per word**, so `@smith` finds "John Smith". A surname is
+    typed at least as often as a first name, and a whole-string
+    `starts_with` would find nobody.
+  - **Keys are consumed *before* the text box is built** — a widget only sees
+    events still in the queue when it is added — so Enter picks a name while
+    the dropdown is open and inserts a newline when it is not.
+  - **The `@` must start a word**, or every email address typed into a
+    comment would open the dropdown; and the token stops at whitespace, so
+    the popup closes when the name ends rather than swallowing the sentence.
+  - **Longest label wins when one mention's text prefixes another's**
+    ("@John Smith" vs "@John Smithson"), or the shorter would be tagged and
+    the remainder left as stray text.
+  - **The dropdown renders inline, not as a floating `Area`.** A popup inside
+    a window inside a scroll area is where egui z-order and clipping bugs
+    live, and this window has already cost one layout bug.
+  - A deactivated account or an `app` (bot) account is dropped from the
+    results: neither is worth one of five slots, and a deactivated one cannot
+    be notified at all.
 - **Comments read and post; `comment_adf` is the load-bearing half.** v3
   rejects a plain string body, so typed text has to be built into an ADF
   document — the inverse of `description_text`, and tested as a round trip
