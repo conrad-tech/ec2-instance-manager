@@ -56,6 +56,56 @@ const MAX_RESULTS: u32 = 50;
 pub const DEFAULT_JQL: &str =
     "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC";
 
+/// How far back the closed list looks, unless the user says otherwise.
+pub const DEFAULT_CLOSED_DAYS: u32 = 30;
+
+/// Which half of the ticket list is being shown. The two are exclusive —
+/// mixing open and closed work in one list is the thing the toggle exists to
+/// avoid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TicketScope {
+    Open,
+    Closed,
+}
+
+/// A day count typed into the "Past Days" box, if it is usable.
+///
+/// **Whitelisted, not escaped**: this is interpolated straight into a JQL
+/// clause, the same stance `validate_issue_key` takes with a URL path. The
+/// upper bound is a decade — beyond that the 50-row cap decides the result
+/// anyway, and a number long enough to matter is a typo.
+pub fn parse_days(input: &str) -> Option<u32> {
+    let input = input.trim();
+    if input.is_empty() || !input.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    match input.parse::<u32>() {
+        Ok(n) if (1..=3650).contains(&n) => Some(n),
+        _ => None,
+    }
+}
+
+/// The JQL for one scope.
+///
+/// Pure, so the closed-window clause is pinned by a test rather than by
+/// reading a `format!` inside a fetch.
+///
+/// **The closed window is not simply `resolved >= -Nd`.** `resolved` is null
+/// on any ticket closed without a resolution — ordinary in workflows that do
+/// not use them — so that clause alone drops those tickets from the list
+/// entirely rather than merely mis-ordering them. The `IS EMPTY` arm catches
+/// them by `updated`, which is always populated.
+pub fn scope_jql(scope: TicketScope, days: u32) -> String {
+    match scope {
+        TicketScope::Open => DEFAULT_JQL.to_string(),
+        TicketScope::Closed => format!(
+            "assignee = currentUser() AND statusCategory = Done \
+             AND (resolved >= -{days}d OR (resolved IS EMPTY AND updated >= -{days}d)) \
+             ORDER BY resolved DESC, updated DESC"
+        ),
+    }
+}
+
 /// Comments fetched per ticket. A thread longer than this is rare, and the
 /// window scrolls.
 const MAX_COMMENTS: u32 = 100;
@@ -68,13 +118,23 @@ pub const JIRA_BASE_URL_ENV: &str = "JIRA_BASE_URL";
 /// columns and a search that drags every custom field on every ticket is
 /// slower for nothing.
 const LIST_FIELDS: &[&str] =
-    &["summary", "status", "issuetype", "priority", "updated", "project", "duedate"];
+    &[
+        "summary",
+        "status",
+        "issuetype",
+        "priority",
+        "updated",
+        "project",
+        "duedate",
+        "resolutiondate",
+        "statuscategorychangedate",
+    ];
 
 /// Fields the ticket view needs. `description` is here and absent from
 /// [`LIST_FIELDS`] on purpose — it is the largest field on most tickets and
 /// the list never shows it.
 const ISSUE_FIELDS: &str = "summary,description,status,issuetype,priority,assignee,\
-     reporter,created,updated,labels,duedate";
+     reporter,created,updated,labels,duedate,resolutiondate,statuscategorychangedate";
 
 /// Where the Jira issue API is, and what to authenticate to it with.
 ///
@@ -262,6 +322,9 @@ pub struct IssueRow {
     /// Empty when the ticket has none. See [`due_label`] for why it must
     /// never go through [`local_time`].
     pub due: String,
+    /// When the ticket was closed, empty while it is open. See
+    /// [`closed_stamp`] — there is no single Jira field for this.
+    pub closed: String,
 }
 
 /// One ticket, as the detail window shows it.
@@ -285,6 +348,8 @@ pub struct Issue {
     pub updated: String,
     /// See [`IssueRow::due`].
     pub due: String,
+    /// See [`IssueRow::closed`].
+    pub closed: String,
     pub labels: Vec<String>,
 }
 
@@ -620,6 +685,7 @@ pub fn parse_issue_list(body: &str) -> Result<Vec<IssueRow>> {
             project: field_str(i, &["fields", "project", "key"]),
             updated: field_str(i, &["fields", "updated"]),
             due: field_str(i, &["fields", "duedate"]),
+            closed: closed_stamp(i),
         })
         .collect())
 }
@@ -665,6 +731,7 @@ pub fn parse_issue(body: &str) -> Result<Issue> {
         created: field_str(&v, &["fields", "created"]),
         updated: field_str(&v, &["fields", "updated"]),
         due: field_str(&v, &["fields", "duedate"]),
+        closed: closed_stamp(&v),
         labels,
     })
 }
@@ -902,6 +969,22 @@ fn require_comment_text(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// When a ticket was closed.
+///
+/// **Jira has no single field for this.** `resolutiondate` is the right
+/// answer where a workflow sets a resolution, and is null where it does not —
+/// which is ordinary, not broken. `statuscategorychangedate` is when the
+/// ticket last entered its current status category, so for a closed ticket it
+/// is when it closed. Preferring the first and falling back to the second is
+/// correct for both kinds of project; either alone is wrong for one of them.
+fn closed_stamp(issue: &Value) -> String {
+    let resolved = field_str(issue, &["fields", "resolutiondate"]);
+    if !resolved.is_empty() {
+        return resolved;
+    }
+    field_str(issue, &["fields", "statuscategorychangedate"])
+}
+
 /// Jira timestamps in local time, e.g. `2026-08-26 10:12 AM`.
 ///
 /// Jira writes the offset without a colon (`+0100`), which
@@ -930,11 +1013,15 @@ pub fn local_time(ts: &str) -> String {
 ///
 /// `POST`, not `GET`: it is the form proven against a real tenant, and it
 /// keeps a JQL clause out of a URL that gets logged and rendered.
-pub fn search_my_issues(site: &JiraSite) -> Result<Vec<IssueRow>> {
+pub fn search_my_issues(
+    site: &JiraSite,
+    scope: TicketScope,
+    days: u32,
+) -> Result<Vec<IssueRow>> {
     require_complete(site)?;
     let url = format!("{}/search/jql", site.api_base);
     let payload = serde_json::json!({
-        "jql": DEFAULT_JQL,
+        "jql": scope_jql(scope, days),
         "fields": LIST_FIELDS,
         "maxResults": MAX_RESULTS,
     })
@@ -1903,7 +1990,7 @@ mod tests {
     #[test]
     fn an_incomplete_site_is_refused_before_any_request_is_made() {
         let blank = JiraSite::new(AlertsAuth::default(), "", None);
-        assert!(search_my_issues(&blank).is_err());
+        assert!(search_my_issues(&blank, TicketScope::Open, 30).is_err());
         assert!(fetch_issue(&blank, "OPS-1").is_err());
         assert!(fetch_transitions(&blank, "OPS-1").is_err());
         assert!(fetch_comments(&blank, "OPS-1").is_err());
@@ -1981,8 +2068,73 @@ mod tests {
     /// lets this work on a machine that has never been told who you are.
     #[test]
     fn the_default_jql_resolves_the_user_server_side() {
-        assert!(DEFAULT_JQL.contains("currentUser()"));
+        // Neither scope may need an account id: `currentUser()` is what lets
+        // this work on a machine that has never been told who you are.
+        for jql in [
+            scope_jql(TicketScope::Open, 30),
+            scope_jql(TicketScope::Closed, 30),
+        ] {
+            assert!(jql.contains("currentUser()"), "{jql}");
+            assert!(!jql.contains("accountId"), "{jql}");
+        }
         assert!(DEFAULT_JQL.contains("statusCategory != Done"));
-        assert!(!DEFAULT_JQL.contains("accountId"));
+    }
+
+    #[test]
+    fn the_two_scopes_are_exclusive_and_the_window_only_applies_to_closed() {
+        let open = scope_jql(TicketScope::Open, 30);
+        let closed = scope_jql(TicketScope::Closed, 30);
+        assert!(open.contains("statusCategory != Done"));
+        assert!(closed.contains("statusCategory = Done"));
+        // An open ticket has no closed date, so the window is meaningless
+        // there and must not narrow the list.
+        assert!(!open.contains("-30d"));
+        assert!(closed.contains("-30d"));
+        assert_eq!(open, scope_jql(TicketScope::Open, 90), "days must not affect open");
+        assert!(scope_jql(TicketScope::Closed, 90).contains("-90d"));
+    }
+
+    #[test]
+    fn the_closed_window_does_not_drop_tickets_closed_without_a_resolution() {
+        // `resolved` is null on those, so `resolved >= -30d` alone removes
+        // them from the list entirely rather than mis-ordering them --
+        // ordinary in any workflow that does not set resolutions.
+        let closed = scope_jql(TicketScope::Closed, 30);
+        assert!(closed.contains("resolved IS EMPTY"), "{closed}");
+        assert!(closed.contains("updated >= -30d"), "{closed}");
+        // And the ordering falls back for the same reason.
+        assert!(closed.contains("ORDER BY resolved DESC, updated DESC"), "{closed}");
+    }
+
+    #[test]
+    fn the_day_count_is_whitelisted_because_it_lands_in_a_jql_clause() {
+        assert_eq!(parse_days("30"), Some(30));
+        assert_eq!(parse_days(" 7 "), Some(7));
+        assert_eq!(parse_days("3650"), Some(3650));
+        // Interpolated straight into JQL, so anything that is not a plain
+        // number is refused rather than escaped.
+        for bad in ["", "  ", "-1", "0", "30d", "3651", "1e3", "30 OR x", "abc", "٣٠"] {
+            assert!(parse_days(bad).is_none(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn the_closed_date_falls_back_when_there_is_no_resolution() {
+        // Preferring resolutiondate is right where a workflow sets one...
+        let with = r#"{"key":"OPS-1","fields":{
+            "resolutiondate":"2026-08-20T10:00:00.000+0100",
+            "statuscategorychangedate":"2026-08-21T11:00:00.000+0100"}}"#;
+        assert_eq!(parse_issue(with).expect("parses").closed, "2026-08-20T10:00:00.000+0100");
+
+        // ...and falling back is right where it does not, which is ordinary
+        // rather than broken. Either field alone is wrong for one of them.
+        let without = r#"{"key":"OPS-2","fields":{
+            "resolutiondate":null,
+            "statuscategorychangedate":"2026-08-21T11:00:00.000+0100"}}"#;
+        assert_eq!(parse_issue(without).expect("parses").closed, "2026-08-21T11:00:00.000+0100");
+
+        // An open ticket has neither.
+        let open = r#"{"key":"OPS-3","fields":{"summary":"s"}}"#;
+        assert_eq!(parse_issue(open).expect("parses").closed, "");
     }
 }

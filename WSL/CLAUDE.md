@@ -1211,6 +1211,36 @@ window, and a search box opens any ticket by key.
   which disables the row so a double-click cannot fire two moves. On success
   the ticket **and** the list are re-read: the status changed, and so did the
   set of legal next moves.
+- **Opened / Closed are exclusive, and Opened is the launch state.** Mixing
+  finished and outstanding work in one list is what the toggle exists to
+  avoid, so it is a `TicketScope`, not two checkboxes. Session state, never
+  persisted — a window left on Closed months ago must not be what greets you.
+  Switching scope clears the rows before refetching: the rows on screen belong
+  to the other list, and showing them under the new heading misreports them.
+- **Closed looks back a day window, default 30, editable in the header.**
+  `parse_days` **whitelists** the input (1–3650) because it is interpolated
+  straight into a JQL clause — the same stance `validate_issue_key` takes with
+  a URL path. `applied_days` moves only on Go/Enter, so the rows on screen are
+  always labelled with the window that actually produced them rather than with
+  whatever is half-typed in the box.
+- **The closed window is not simply `resolved >= -Nd`.** `resolved` is null on
+  any ticket closed *without* a resolution — ordinary in workflows that do not
+  use them — so that clause alone drops those tickets from the list entirely
+  rather than mis-ordering them. The real clause ORs in
+  `resolved IS EMPTY AND updated >= -Nd`, and the sort falls back the same way
+  (`ORDER BY resolved DESC, updated DESC`).
+- **There is no single Jira field for "when was this closed".**
+  `closed_stamp` prefers `resolutiondate` and falls back to
+  `statuscategorychangedate` (when the ticket last entered its current status
+  category, which for a closed ticket is when it closed). Either alone is
+  wrong for one kind of project.
+- **The Due column swaps for Closed in the closed view**, rather than an
+  eighth column being added. A due date on a finished ticket is dead weight
+  exactly where the closed date is wanted, and `due_state` already refuses to
+  call a done ticket overdue.
+- **The empty closed list names the window it searched** — otherwise "no
+  tickets" reads as "you have closed nothing, ever" rather than "nothing in
+  the last 30 days".
 - **Auto-refresh is five minutes, not ten seconds.** An unacknowledged page is
   time-critical; a ticket list is not. It runs only while the window is open,
   the `loading` flag makes a tick that lands mid-search a skip rather than a

@@ -1291,6 +1291,18 @@ mod gui {
         last_fetch: Option<Instant>,
         /// Local-time clock reading of the last successful search.
         fetched_at: Option<chrono::DateTime<chrono::Local>>,
+        /// Which half of the list is shown. Open on launch, and session
+        /// state — never persisted, so a window left on Closed months ago
+        /// cannot be what greets you.
+        scope: ec2_manager::jira::TicketScope,
+        /// The "Past Days" box, as typed. Only used by the Closed scope.
+        closed_days: String,
+        /// The day window the rows on screen were actually fetched for, so
+        /// editing the box does not silently re-label results it did not
+        /// produce. Only Go / Enter moves it.
+        applied_days: u32,
+        /// Why the typed day count was refused, shown beside the box.
+        days_error: Option<String>,
         /// The search box. Holds a ticket key to open directly.
         search: String,
         /// Why the typed search could not be used, shown under the box. Not
@@ -1307,6 +1319,10 @@ mod gui {
                 error: None,
                 loading: false,
                 auto_refresh: true,
+                scope: ec2_manager::jira::TicketScope::Open,
+                closed_days: ec2_manager::jira::DEFAULT_CLOSED_DAYS.to_string(),
+                applied_days: ec2_manager::jira::DEFAULT_CLOSED_DAYS,
+                days_error: None,
                 last_fetch: None,
                 fetched_at: None,
                 search: String::new(),
@@ -12884,11 +12900,14 @@ mod gui {
             }
             win.loading = true;
             win.last_fetch = Some(Instant::now());
+            // Captured now, not read on the worker: the user can switch scope
+            // or edit the window while this is in flight.
+            let (scope, days) = (win.scope, win.applied_days);
             let site = self.jira_site.clone();
             let tx = self.jira_tx.clone();
             std::thread::spawn(move || {
-                let result =
-                    ec2_manager::jira::search_my_issues(&site).map_err(|e| e.to_string());
+                let result = ec2_manager::jira::search_my_issues(&site, scope, days)
+                    .map_err(|e| e.to_string());
                 let _ = tx.send(JiraEvent::List(result));
             });
         }
@@ -13667,6 +13686,12 @@ mod gui {
                 let w = self.jira_window.as_ref().expect("checked above");
                 (w.auto_refresh, w.search.clone(), w.loading, w.last_fetch)
             };
+            let (mut scope, mut closed_days, applied_days) = {
+                let w = self.jira_window.as_ref().expect("checked above");
+                (w.scope, w.closed_days.clone(), w.applied_days)
+            };
+            let scope_was = scope;
+            let mut apply_days = false;
 
             egui::Window::new("Jira Tickets")
                 .open(&mut open)
@@ -13674,12 +13699,40 @@ mod gui {
                 .resizable(true)
                 .default_size([940.0, 460.0])
                 .show(ctx, |ui| {
-                    let (rows, error, search_error, fetched_at) = {
+                    let (rows, error, search_error, fetched_at, days_error) = {
                         let w = self.jira_window.as_ref().expect("checked above");
-                        (w.rows.clone(), w.error.clone(), w.search_error.clone(), w.fetched_at)
+                        (
+                            w.rows.clone(),
+                            w.error.clone(),
+                            w.search_error.clone(),
+                            w.fetched_at,
+                            w.days_error.clone(),
+                        )
                     };
 
                     ui.horizontal(|ui| {
+                        // Exclusive by construction: one list or the other,
+                        // never both. Mixing finished and outstanding work in
+                        // one list is what the toggle exists to avoid.
+                        use ec2_manager::jira::TicketScope;
+                        if ui
+                            .selectable_label(scope == TicketScope::Open, "Opened")
+                            .on_hover_text("Tickets assigned to you that are not done.")
+                            .clicked()
+                        {
+                            scope = TicketScope::Open;
+                        }
+                        if ui
+                            .selectable_label(scope == TicketScope::Closed, "Closed")
+                            .on_hover_text(
+                                "Tickets assigned to you that are done, closed within \
+                                 the day window on the right.",
+                            )
+                            .clicked()
+                        {
+                            scope = TicketScope::Closed;
+                        }
+                        ui.separator();
                         if ui
                             .add_enabled(!loading, egui::Button::new("Refresh"))
                             .on_hover_text("Re-run the search now.")
@@ -13724,6 +13777,42 @@ mod gui {
                         if let Some(err) = &search_error {
                             note_label(ui, egui::Color32::from_rgb(220, 90, 90), err.as_str());
                         }
+
+                        // The closed window, far right of this same row. In a
+                        // right-to-left layout the first widget added is the
+                        // rightmost, so these are added in reverse of how
+                        // they read: Past Days [30] [Go].
+                        if scope == ec2_manager::jira::TicketScope::Closed {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_enabled(!loading, egui::Button::new("Go"))
+                                        .on_hover_text("Re-run with this window.")
+                                        .clicked()
+                                    {
+                                        apply_days = true;
+                                    }
+                                    let days_edit = ui.add(
+                                        egui::TextEdit::singleline(&mut closed_days)
+                                            .desired_width(48.0),
+                                    );
+                                    if days_edit.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                    {
+                                        apply_days = true;
+                                    }
+                                    ui.label("Past Days");
+                                    if let Some(err) = &days_error {
+                                        note_label(
+                                            ui,
+                                            egui::Color32::from_rgb(220, 90, 90),
+                                            err.as_str(),
+                                        );
+                                    }
+                                },
+                            );
+                        }
                     });
 
                     if let Some(err) = &error {
@@ -13737,10 +13826,19 @@ mod gui {
                     ui.separator();
 
                     if rows.is_empty() && !loading && error.is_none() {
-                        // "You have no open tickets" and "the reply could not
-                        // be read" must never look alike; the error line above
-                        // covers the second, so this only ever means the first.
-                        ui.weak("No open tickets assigned to you.");
+                        // "Nothing matched" and "the reply could not be read"
+                        // must never look alike; the error line above covers
+                        // the second, so this only ever means the first. The
+                        // closed wording names the window, or an empty list
+                        // reads as "you have closed nothing, ever".
+                        ui.weak(match scope {
+                            ec2_manager::jira::TicketScope::Open => {
+                                "No open tickets assigned to you.".to_string()
+                            }
+                            ec2_manager::jira::TicketScope::Closed => format!(
+                                "No tickets assigned to you were closed in the past {applied_days} days."
+                            ),
+                        });
                         return;
                     }
 
@@ -13755,10 +13853,22 @@ mod gui {
                                 .show(ui, |ui| {
                                     // Read once per frame, not per row.
                                     let today = chrono::Local::now().date_naive();
-                                    for h in ["Key", "Type", "Pri", "Status", "Due", "Summary"]
-                                    {
+                                    // Due swaps for Closed: a due date on a
+                                    // finished ticket is dead weight exactly
+                                    // where the closed date is wanted, and
+                                    // `due_state` already refuses to call a
+                                    // done ticket overdue.
+                                    let closed_view =
+                                        scope == ec2_manager::jira::TicketScope::Closed;
+                                    for h in ["Key", "Type", "Pri", "Status"] {
                                         ui.strong(h);
                                     }
+                                    if closed_view {
+                                        ui.strong(format!("Closed ({})", local_tz_label()));
+                                    } else {
+                                        ui.strong("Due");
+                                    }
+                                    ui.strong("Summary");
                                     ui.strong(format!("Updated ({})", local_tz_label()));
                                     ui.end_row();
 
@@ -13788,21 +13898,28 @@ mod gui {
                                             jira_status_color(&row.status_category),
                                             dash_if_blank(&row.status),
                                         );
-                                        // A due date is what a list gets
-                                        // scanned for, so it is a column and
-                                        // it is coloured.
-                                        let due_state = ec2_manager::jira::due_state(
-                                            &row.due,
-                                            &row.status_category,
-                                            today,
-                                        );
-                                        let due = ec2_manager::jira::due_label(&row.due);
-                                        match due_color(due_state) {
-                                            Some(c) => {
-                                                note_label(ui, c, dash_if_blank(&due));
-                                            }
-                                            None => {
-                                                ui.label(dash_if_blank(&due));
+                                        if closed_view {
+                                            ui.label(dash_if_blank(
+                                                &ec2_manager::jira::local_time(&row.closed),
+                                            ));
+                                        } else {
+                                            // A due date is what a list gets
+                                            // scanned for, so it is a column
+                                            // and it is coloured.
+                                            let due_state = ec2_manager::jira::due_state(
+                                                &row.due,
+                                                &row.status_category,
+                                                today,
+                                            );
+                                            let due =
+                                                ec2_manager::jira::due_label(&row.due);
+                                            match due_color(due_state) {
+                                                Some(c) => {
+                                                    note_label(ui, c, dash_if_blank(&due));
+                                                }
+                                                None => {
+                                                    ui.label(dash_if_blank(&due));
+                                                }
                                             }
                                         }
                                         ui.label(&row.summary);
@@ -13818,6 +13935,34 @@ mod gui {
             if let Some(w) = self.jira_window.as_mut() {
                 w.auto_refresh = auto_refresh;
                 w.search = search;
+                w.scope = scope;
+                w.closed_days = closed_days;
+                if scope != scope_was {
+                    // The rows on screen are the other list; showing them
+                    // under the new heading would misreport them.
+                    w.rows.clear();
+                    w.error = None;
+                    w.days_error = None;
+                    refresh_now = true;
+                }
+                if apply_days {
+                    match ec2_manager::jira::parse_days(&w.closed_days) {
+                        Some(days) => {
+                            w.days_error = None;
+                            // `applied_days` moves only here, so the rows on
+                            // screen are always labelled with the window that
+                            // actually produced them.
+                            if days != w.applied_days {
+                                w.applied_days = days;
+                                w.rows.clear();
+                            }
+                            refresh_now = true;
+                        }
+                        None => {
+                            w.days_error = Some("whole number of days, 1-3650".to_string());
+                        }
+                    }
+                }
             }
             if submit_search {
                 self.submit_jira_search(ctx);
@@ -14071,6 +14216,16 @@ mod gui {
                                         ui.end_row();
                                         field(ui, "Created", &ec2_manager::jira::local_time(&issue.created));
                                         field(ui, "Updated", &ec2_manager::jira::local_time(&issue.updated));
+                                    // Only on a ticket that has one. It would
+                                    // be odd for the list to know a date the
+                                    // ticket itself does not show.
+                                    if !issue.closed.trim().is_empty() {
+                                        field(
+                                            ui,
+                                            "Closed",
+                                            &ec2_manager::jira::local_time(&issue.closed),
+                                        );
+                                    }
                                         if !issue.labels.is_empty() {
                                             field(ui, "Labels", &issue.labels.join(", "));
                                         }
