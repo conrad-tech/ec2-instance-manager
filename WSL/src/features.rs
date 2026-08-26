@@ -95,6 +95,9 @@ pub struct Features {
     pub fed_auth: FedAuthFeature,
     /// Unattended reaper remediation: who may run it, and every tunable.
     pub reaper: ReaperFeature,
+    /// Unattended pingdom acknowledge-and-escalate: who may run it, and
+    /// every tunable.
+    pub pingdom: PingdomFeature,
 }
 
 /// The `fed_auth` section of `assets/features.json`.
@@ -547,14 +550,11 @@ impl AlertsFeature {
 /// environment → Windows Credential Manager only, via
 /// [`Self::resolved_schedule_id`] / [`Self::resolved_atlassian_account_id`]
 /// (see `jsm_auth`).
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct ReaperFeature {
     /// Master switch. Off in the shipped file.
     pub enabled: bool,
-    /// When true (the shipped default) the worker logs what it *would*
-    /// remediate and touches nothing. Arming is a deliberate edit.
-    pub dry_run: bool,
     /// OS usernames permitted to remediate. `"*"` is deliberately **not**
     /// honoured here.
     pub allowed_users: Vec<String>,
@@ -582,25 +582,105 @@ pub struct ReaperFeature {
     pub fetch_count: u32,
 }
 
-impl Default for ReaperFeature {
-    fn default() -> Self {
-        // Not `#[derive(Default)]`: `dry_run` must default to `true` (arming
-        // is opt-in), which a derived Default — false for every bool — would
-        // get backwards. This impl also backs `#[serde(default)]`, so a
-        // features.json that omits `dry_run` still ships safe.
-        Self {
-            enabled: false,
-            dry_run: true,
-            allowed_users: Vec::new(),
-            alertname_contains: String::new(),
-            app_contains: String::new(),
-            message_contains: String::new(),
-            send_command_timeout_secs: 0,
-            cooldown_mins: 0,
-            stage2_on_call_mins: 0,
-            stage2_off_call_mins: 0,
-            poll_secs: 0,
-            fetch_count: 0,
+/// The `pingdom` section of `assets/features.json`.
+///
+/// Gates the pingdom watcher: acknowledge a pingdom alert the moment it is
+/// seen, and escalate if it is still open `watch_mins` later.
+///
+/// **It has no remediation and never touches an instance.** Where reaper
+/// resolves a box, sends a fix and reads a verdict, this only ever does
+/// three things — acknowledge, wait, escalate — so it carries none of
+/// reaper's remote-command tunables.
+///
+/// Its own block rather than fields under `reaper`, so the two gates are
+/// independent: turning reaper off must not silently take pingdom with it,
+/// and reaper's allow-list must not decide who gets pingdom.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct PingdomFeature {
+    /// Master switch. Off in the shipped file.
+    pub enabled: bool,
+    /// OS usernames permitted to run it. `"*"` is deliberately **not**
+    /// honoured, exactly as it is not for reaper: this acknowledges a live
+    /// page and rings a phone with nobody watching.
+    pub allowed_users: Vec<String>,
+    /// Substring identifying a pingdom alert in `extraProperties.alertname`.
+    pub alertname_contains: String,
+    /// Substring identifying a pingdom alert in the `App:` tag. Secondary —
+    /// the tag is frequently an unrendered template or absent entirely.
+    pub app_contains: String,
+    /// Substring identifying a pingdom alert in `message` (the alert title).
+    /// The primary rule for this feed, whose titles are shaped
+    /// `[Pingdom] domain xxx yy <environment>`.
+    pub message_contains: String,
+    /// How long an acknowledged alert may stay open before it escalates.
+    pub watch_mins: u64,
+    /// Feed poll interval.
+    pub poll_secs: u64,
+    /// Alerts pulled per poll.
+    pub fetch_count: u32,
+}
+
+impl PingdomFeature {
+    /// True when `user` may run the watcher. Like [`ReaperFeature`] and
+    /// unlike every other gate in this file, `"*"` does not match.
+    pub fn is_allowed_user(&self, user: &str) -> bool {
+        let u = user.trim();
+        if u.is_empty() || !self.enabled {
+            return false;
+        }
+        self.allowed_users
+            .iter()
+            .any(|a| a.trim() != "*" && a.trim().eq_ignore_ascii_case(u))
+    }
+
+    /// True when the list names more than one user. The caller warns: two
+    /// machines watching one feed both acknowledge and both escalate, and
+    /// nothing arbitrates between them.
+    pub fn has_multiple_users(&self) -> bool {
+        self.allowed_users
+            .iter()
+            .filter(|a| !a.trim().is_empty())
+            .count()
+            > 1
+    }
+
+    /// The JSM schedule id and Atlassian account id, resolved exactly as
+    /// reaper resolves them: environment, then Windows Credential Manager,
+    /// and stopping there. `assets/features.json` is committed, so it is
+    /// never a source for either.
+    pub fn resolved_schedule_id(&self) -> String {
+        crate::jsm_auth::resolve_id(
+            crate::jsm_auth::SCHEDULE_ID_ENV,
+            crate::jsm_auth::SCHEDULE_ID_TARGET,
+            "",
+        )
+    }
+
+    pub fn resolved_atlassian_account_id(&self) -> String {
+        crate::jsm_auth::resolve_id(
+            crate::jsm_auth::ATLASSIAN_ACCOUNT_ID_ENV,
+            crate::jsm_auth::ATLASSIAN_ACCOUNT_ID_TARGET,
+            "",
+        )
+    }
+
+    /// Ten minutes by default. Zero means the default, never "escalate at
+    /// once" -- a missing section deserializes every tunable to zero, and
+    /// that must not turn into a phone call the instant an alert lands.
+    pub fn watch_window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(60 * if self.watch_mins == 0 { 10 } else { self.watch_mins })
+    }
+
+    pub fn poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(if self.poll_secs == 0 { 30 } else { self.poll_secs })
+    }
+
+    pub fn alerts_per_poll(&self) -> u32 {
+        if self.fetch_count == 0 {
+            10
+        } else {
+            self.fetch_count
         }
     }
 }
@@ -858,9 +938,12 @@ impl Default for Features {
             // Derived Default: `enabled` false and an empty allow-list, which
             // is the fail-closed state this feature must land in.
             fed_auth: FedAuthFeature::default(),
-            // `enabled` false, allow-list empty (fail-closed) and `dry_run`
-            // true (arming is opt-in) — see the hand-written `Default` impl.
+            // Derived Default: `enabled` false, an empty allow-list, and
+            // every `*_contains` rule blank — which matches nothing. Three
+            // independent reasons this lands disarmed.
             reaper: ReaperFeature::default(),
+            // Derived Default, and the same three reasons.
+            pingdom: PingdomFeature::default(),
         }
     }
 }
@@ -969,6 +1052,15 @@ impl Features {
     /// the feature must be switched on *and* the user named explicitly.
     pub fn reaper_enabled_for(&self, user: &str) -> bool {
         self.reaper.enabled && self.reaper.is_allowed_user(user)
+    }
+
+    /// True when the pingdom watcher may run for `user`.
+    ///
+    /// Deliberately independent of [`Self::reaper_enabled_for`]: the two
+    /// watchers share a feed and nothing else, and one being disarmed must
+    /// never disarm the other.
+    pub fn pingdom_enabled_for(&self, user: &str) -> bool {
+        self.pingdom.is_allowed_user(user)
     }
 
     /// True when `name` is on the protected never-delete list (case- and
@@ -1828,10 +1920,9 @@ mod tests {
     }
 
     #[test]
-    fn reaper_ships_disabled_dry_and_with_nobody_allowed() {
+    fn reaper_ships_disabled_and_with_nobody_allowed() {
         let f = Features::default();
         assert!(!f.reaper.enabled);
-        assert!(f.reaper.dry_run, "dry_run must default on — arming is opt-in");
         assert!(f.reaper.allowed_users.is_empty());
         assert!(!f.reaper_enabled_for("anyone"));
     }
@@ -1875,10 +1966,9 @@ mod tests {
         let f = load();
         assert!(!f.reaper.enabled);
         assert!(f.reaper.allowed_users.is_empty());
-        assert!(f.reaper.dry_run);
         // The load-bearing gate: a blank *_contains rule matches nothing
         // (see `contains_ci`), which is what makes shipping the armed code
-        // path safe even with `enabled`/`dry_run` both flipped by hand.
+        // path safe even with `enabled` flipped by hand.
         // Nothing else in this test actually exercises that guarantee.
         assert!(f.reaper.alertname_contains.trim().is_empty());
         assert!(f.reaper.app_contains.trim().is_empty());
@@ -1931,5 +2021,104 @@ mod tests {
              (all five JSM/Opsgenie values live in Windows Credential Manager only); \
              found: {found:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod pingdom_feature_tests {
+    use super::*;
+
+    fn armed() -> PingdomFeature {
+        PingdomFeature {
+            enabled: true,
+            allowed_users: vec!["bconrad".to_string()],
+            ..PingdomFeature::default()
+        }
+    }
+
+    #[test]
+    fn the_shipped_pingdom_block_is_closed() {
+        // Same posture as every other gate here: arming is a deliberate
+        // edit, never something a pull turns on for a whole site.
+        let shipped: Features = serde_json::from_str(&bundled_features()).expect("parses");
+        assert!(!shipped.pingdom.enabled, "pingdom must ship disabled");
+        assert!(
+            shipped.pingdom.allowed_users.is_empty(),
+            "pingdom must ship with an empty allow-list"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_never_arms_pingdom() {
+        // `"*"` is not honoured, for the same reason reaper refuses it: this
+        // acknowledges a live page and rings a phone unattended, and a
+        // site-wide wildcard must not authorise that by accident.
+        let wild = PingdomFeature {
+            enabled: true,
+            allowed_users: vec!["*".to_string()],
+            ..PingdomFeature::default()
+        };
+        assert!(!wild.is_allowed_user("anyone"));
+        assert!(!wild.is_allowed_user("bconrad"));
+    }
+
+    #[test]
+    fn the_gate_needs_both_the_switch_and_the_name() {
+        assert!(armed().is_allowed_user("bconrad"));
+        assert!(armed().is_allowed_user("BConrad"), "case-insensitive");
+        assert!(!armed().is_allowed_user("someone-else"));
+
+        let off = PingdomFeature { enabled: false, ..armed() };
+        assert!(!off.is_allowed_user("bconrad"), "the switch still gates it");
+    }
+
+    #[test]
+    fn an_empty_user_never_matches() {
+        // `current_os_user()` can come back blank, and a blank name must not
+        // match a blank entry left in the list.
+        let blank_entry = PingdomFeature {
+            enabled: true,
+            allowed_users: vec!["".to_string(), "   ".to_string()],
+            ..PingdomFeature::default()
+        };
+        assert!(!blank_entry.is_allowed_user(""));
+        assert!(!blank_entry.is_allowed_user("   "));
+        assert!(!armed().is_allowed_user(""));
+    }
+
+    #[test]
+    fn a_zero_tunable_means_the_default_not_no_wait_at_all() {
+        // A missing section deserializes to all-zero. Zero must not mean
+        // "escalate immediately" or "poll in a tight loop".
+        let d = PingdomFeature::default();
+        assert_eq!(d.watch_window(), std::time::Duration::from_secs(600));
+        assert_eq!(d.poll_interval(), std::time::Duration::from_secs(30));
+        assert_eq!(d.alerts_per_poll(), 10);
+
+        let set = PingdomFeature {
+            watch_mins: 3,
+            poll_secs: 15,
+            fetch_count: 25,
+            ..PingdomFeature::default()
+        };
+        assert_eq!(set.watch_window(), std::time::Duration::from_secs(180));
+        assert_eq!(set.poll_interval(), std::time::Duration::from_secs(15));
+        assert_eq!(set.alerts_per_poll(), 25);
+    }
+
+    #[test]
+    fn the_bundled_file_carries_a_pingdom_block() {
+        assert!(
+            bundled_features().contains("\"pingdom\""),
+            "assets/features.json must carry a pingdom block"
+        );
+    }
+
+    #[test]
+    fn a_malformed_features_file_leaves_pingdom_dark() {
+        // Fail closed: a JSON typo must not arm an unattended ack-and-page.
+        let missing: Features = serde_json::from_str("{}").expect("parses");
+        assert!(!missing.pingdom.enabled);
+        assert!(!missing.pingdom_enabled_for("bconrad"));
     }
 }

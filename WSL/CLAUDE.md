@@ -350,6 +350,9 @@ Two things that are easy to get wrong:
   (`-K -`), never argv, so the API token never appears in the process list.
   `curl.exe` ships with Windows 10 1803+.
 
+Its **Pingdom** entry is the second watcher — see "Pingdom: acknowledge, wait
+ten minutes, escalate" below.
+
 The `alerts` section of `assets/features.json` (compiled in) carries only
 `allowed_users` — the list of OS usernames that see the button (`["*"]` =
 everyone, `[]` = nobody; the shipped default is `[]`, so the button is hidden
@@ -609,8 +612,8 @@ overruled both.
   button. It takes a `ClosedAlert` — an enum, not a second `bool`, because it
   sits next to `on_call` at every call site and two adjacent booleans swap
   silently.
-- **Disabled under `dry_run`**, with hover text saying why. A button that
-  silently honoured dry run would read as broken.
+- **Always enabled once an alert id is typed.** It used to be disabled under
+  `reaper.dry_run`; that field no longer exists.
 - **The confirmation names the alert, lists the three commands, and says the
   watchdog is left stopped and that being on call means acknowledging first.**
   It cannot name the instance: resolution is two AWS calls away and happens
@@ -707,10 +710,10 @@ so one parser reads both.
   below it is still worth reporting, and "the box could not be reached" is
   itself an answer about whether a remediation would get anywhere.
 
-- **It never acknowledges, never sends an SSM command, never reaches a
-  notifier** — and that holds regardless of `dry_run`, which it does not
-  consult. `dry_run` decides what the *poll thread* does with a real alert;
-  this is a question, not a run. The read-only ELB calls behind a target group
+- **It never acknowledges and never changes anything on the box** — but it
+  *does* send one read-only SSM command, and it *does* reach the notifier.
+  See "Test Alert Match is the dry run, and it really does page" below; the
+  read-only guarantee rests on `reaper_probe.sh`, not on the caller. The read-only ELB calls behind a target group
   are the only thing it touches in AWS.
 - **Gated on `reaper.allowed_users` without `reaper.enabled`.** Gating it on
   the feature being armed would withhold the tool from the only situation it
@@ -719,6 +722,179 @@ so one parser reads both.
   only when the feature is armed. `poll_reaper_events` drains both.
 - A closed alert is reported and the projection continues, since a probe run
   after the fact is the normal case.
+
+### Pingdom: acknowledge, wait ten minutes, escalate
+
+`src/pingdom.rs` is the second alert watcher on the same JSM feed. It does
+three things and only three: **acknowledge** a pingdom alert as soon as it is
+seen, **wait** for it to close, and **escalate** if it is still open
+`watch_mins` (10) later. There is no remediation, and nothing here ever
+touches an instance — which is why it is its own module rather than a second
+`FixKind` in `reaper.rs`.
+
+- **Off call it does nothing at all** — no acknowledge, no timer, no
+  escalation. This is the opposite trade to reaper's, where off call still
+  sends one quiet message. Pingdom is only looked at by whoever holds the
+  pager, so acting off call would silence somebody else's page *and* ring a
+  phone about an alert this machine has no business taking. A lookup that
+  **failed** counts as off call: it is the only direction that can do neither
+  by mistake. `pingdom_on_call_decision` is pure and separate from the loop so
+  that rule is pinned by a test rather than by reading a `continue`.
+- **The environment comes from the alert title, not the `Environment:` tag.**
+  These alerts are shaped `[Pingdom] domain xxx yy <environment>` and do not
+  carry that tag, so `environment_from_title` takes the last whitespace token
+  of `Alert.message`. That field *is* in the list payload — unlike
+  `description`, which is what forces reaper to `fetch_alert_in_full` — so
+  pingdom matches straight off `fetch_latest` and never reads an alert in full
+  to decide.
+- **A token carrying `{`, `}`, `%`, `<` or `>` is refused.** This feed has been
+  observed serving unrendered `{{…}}` and `&{%…%}%` where values should be; a
+  live pull found two of ten alerts with a templated `App:` tag. Keying an
+  incident on a template string would file unrelated outages under one
+  environment and suppress all but the first.
+- **Duplicates are keyed on environment** (`IncidentKey`), upper-cased —
+  `MMODAL_ENV` is free text, and the repo already has the scar of treating
+  `dev1` and `DEV1` as two things. Several checks failing in one environment
+  are one outage: the first alert owns the timer and the escalation, every
+  later one is **acknowledged and otherwise ignored**. A different environment
+  is a new incident with its own timer, so PROD escalating never suppresses a
+  DEV1 outage.
+- **A duplicate deliberately does not refresh the owner's deadline.** Same
+  reasoning as reaper's `mark_duplicate`: a steady trickle would otherwise
+  hold the escalation off indefinitely, which is exactly when it is needed.
+- **An alert whose environment cannot be read becomes its own incident**,
+  keyed on its alert id. That can page twice for one outage; grouping them
+  under a blank key would swallow a second one, and swallowing is the worse
+  error.
+- **The environment's slot clears only when its alert closes** — there is no
+  ceiling. One alert nobody closes therefore mutes that environment until the
+  app restarts. Chosen deliberately: never paging twice for one incident was
+  worth more than the stuck-open case, and per-environment keying already
+  bounds the blast radius to one environment.
+- **Only the *owner's* close ends an incident.** A duplicate resolving on its
+  own says nothing about the outage the timer is about
+  (`a_duplicate_closing_does_not_end_the_incident`).
+- **Owners are re-read by id every poll**, never inferred from the list: an
+  alert older than `fetch_count` has fallen off it, and its absence there is
+  not evidence that it closed. A failed re-read leaves the incident alone — it
+  must not both free the slot and cancel the escalation.
+- **A failed acknowledge does not drop the watch.** It costs a duplicate page;
+  dropping the timer costs the escalation.
+- `PingdomState` is owned by the poll thread and never shared, so there is no
+  lock anywhere — the same property `start_reaper_poll` keeps. Nothing here
+  blocks longer than one HTTP call, so unlike reaper there is no per-incident
+  thread; the only work handed off is the send.
+
+#### The escalation send — the app's first working outbound path
+
+Until this landed **nothing in the app sent anything**: `ReaperEvent::Outcome`
+pushed into `pending_notify` and no code drained it, exactly as
+`2026-08-19-oncall-test-send-design.md` records. `send_escalation_email` is
+that missing half.
+
+- **The subject is the entire payload and the body is empty.** No domain, no
+  environment, no account, no alert text. The environment is used *locally* to
+  key incidents and never leaves — `a_pingdom_escalation_carries_nothing_but_a_code_and_a_time`
+  asserts the incident label and the alert id are both absent.
+- **The code is `RE-F`, reused from reaper rather than minted new**, and taken
+  from `OutcomeCode::Failure.as_str()`, never written as a literal. The
+  Pi-side daemon tiers on that vocabulary; a code it does not recognise is
+  escalated as unknown, which is a failure that looks exactly like success
+  from this side. Reusing it also means no Pi-side change was needed.
+- **It must never route through `send_access_email.ps1`.** That script's
+  recipient gates exist because it attaches a private key, and they must not
+  be relaxed to fit a fixed configured address with no attachment.
+- **Two EDR constraints carry over from the access-email spawn**: the script
+  is run from the file **next to the exe**, never written to `%TEMP%`, and
+  `-WindowStyle Hidden` is not used — the console is suppressed with
+  `CREATE_NO_WINDOW`, an ordinary Win32 flag. `package_windows_zip` already
+  copies `send_escalation.ps1` beside the exe.
+- **No marker is read as failure, never as success.** The script prints
+  exactly one marker on every path, so silence means it did not run.
+- **A send that fails is never retried**, and is logged at **error** saying the
+  alert is acknowledged and nothing will ring. Retrying risks double-paging,
+  and the parent design's most important property is one email per failure and
+  never a repeat — a re-send would defeat the Pi-side acknowledgement, which is
+  the one thing that must not travel back across the boundary.
+- **`escalation_script_args` names `-To`/`-Subject` once**, shared by the spawn
+  and by the test that checks the script declares them. They live in different
+  files, a rename is not a compile error, and PowerShell would reject the call
+  at runtime inside a spawn nobody is watching — the same drift that broke
+  `secondary_mirror_step_matches_its_wait`.
+
+#### Why the pingdom watcher could look dead
+
+Four states leave it dark and each one names itself at startup
+(`pingdom_gate_report`, pure and tested), plus `pingdom=` on the `gates:` line:
+
+- `pingdom.enabled` is false in this build
+- the os_user is not on `pingdom.allowed_users` (`"*"` is **not** honoured
+  here, as it is not for reaper)
+- no JSM credentials
+- **no escalation mailbox** — `ESCALATION_MAILBOX`, or the
+  `ec2_manager/escalation_mailbox` credential. It stays dark rather than
+  running acknowledge-only, because silencing a live page and then never being
+  able to ring is worse than doing nothing.
+
+The address itself never appears in a startup line: the app log gets pasted
+into tickets. Armed, there is a DEBUG heartbeat per poll
+(`polled N alert(s), M matched, K incident(s) being timed`) so a running
+thread and a thread that never started are distinguishable.
+
+`dry_run` is **not** a config field for either watcher — see "Test Alert
+Match is the dry run, and it really does page" below.
+
+#### Test Alert Match is the dry run, and it really does page
+
+`dry_run` used to be a `features.json` field on `reaper` (and briefly on
+`pingdom`) meaning "log what you would do and touch nothing". It is gone from
+both, and there is no checkbox in its place. **Test Alert Match is the dry
+run.** Run Remediation and Override are unchanged.
+
+- **It sends a real escalation.** That is the point: a simulated send leaves
+  the only part that can silently be broken untested. The button's hover text
+  leads with it, because a control called "Test" that rings a phone is
+  otherwise a trap.
+- **It does everything except the thing that changes something.** For a reaper
+  alert: fetch, identify, match, resolve the target group to an instance, and
+  read the box with `reaper_probe.sh` — `docker ps -a`, `compose ps`, the
+  watchdog, container uptimes — then escalate as though the fix had failed. No
+  watchdog stop, no `compose down`, no `compose up -d`. For a pingdom alert:
+  fetch and identify, which is all a pingdom decision has ever needed, then
+  escalate. No ten-minute wait.
+- **It never acknowledges**, either watcher. Acking silences a live page, and
+  doing that as a side effect of a test is not a test.
+- **On call is reported but not obeyed.** The log says what a real run would
+  have done about acknowledging; the escalation goes either way, since it
+  lands in the operator's own mailbox and is the thing being tested.
+  Withholding it off call would make the feature untestable exactly when
+  someone is setting it up.
+- **`dry_run_route` decides which watcher runs, and reaper wins when both
+  claim the alert** — it is the one with a box to read, so the more thorough
+  run happens and answers the pingdom question on the way. Pure, so the
+  precedence is pinned by a test rather than by the order of two `if`s inside
+  a thread. Blank `*_contains` rules claim nothing, so an unconfigured build
+  routes everything to `Neither`.
+- **An alert no watcher claims escalates nothing** and says so. Paging about
+  an alert neither watcher would ever act on proves nothing about either.
+- **A failure the person needs to see goes to the window, not just the log**
+  (`alert_submit_error`, a red line under the Alert ID box): an alert id that
+  could not be fetched, one no watcher claims, or a send that did not go. The
+  log is a different tab, and "nothing happened" is what a wrong id otherwise
+  looks like. It clears on the next submit, and goes through `note_label` like
+  every other status-coloured line — a bare `colored_label` stays thin on a
+  light panel, and there is a test that says so.
+- **No confirmation dialog.** Nothing is taken down, and the mode is meant to
+  run the moment it is asked to. Run Remediation keeps its confirmation.
+- **`start_reaper_probe` is gone**, folded into `start_alert_dry_run`. Keeping
+  both would have been two overlapping walks of the same alert, one of which
+  escalated and one of which did not.
+
+**The cost of removing the field:** reaper drops from three safeties to two.
+`enabled: true` plus a name on `allowed_users` now arms a live
+`compose down`/`up -d`; there is no longer a third flag standing between a
+config edit and production. Both remaining gates still ship closed, and every
+`*_contains` rule ships blank, which matches nothing.
 
 #### The Logs tab's On-Call filter
 

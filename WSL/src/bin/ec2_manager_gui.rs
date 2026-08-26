@@ -295,6 +295,10 @@ mod gui {
         /// the follow-up snapshots, and the startup lines about whether the
         /// feature came up at all.
         ReaperDown,
+        /// The pingdom watcher: the poll thread, every acknowledge, every
+        /// timer, every escalation, and the startup lines about whether the
+        /// feature came up at all.
+        Pingdom,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -319,13 +323,14 @@ mod gui {
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     struct OnCallFilters {
         reaper_down: bool,
+        pingdom: bool,
     }
 
     impl OnCallFilters {
         /// True when at least one script is selected. With none selected the
         /// filter is off entirely rather than matching nothing.
         fn any(self) -> bool {
-            self.reaper_down
+            self.reaper_down || self.pingdom
         }
 
         fn includes(self, source: LogSource) -> bool {
@@ -334,6 +339,7 @@ mod gui {
             }
             match source {
                 LogSource::ReaperDown => self.reaper_down,
+                LogSource::Pingdom => self.pingdom,
                 LogSource::App => false,
             }
         }
@@ -341,11 +347,22 @@ mod gui {
         /// What the closed dropdown reads. A filter narrowing the whole log
         /// must not be invisible once the popup shuts — that is how someone
         /// concludes the app has stopped logging.
-        fn label(self) -> &'static str {
+        ///
+        /// Returns an owned `String` rather than a `&'static str` because
+        /// with more than one script the label is a list; a fixed set of
+        /// literals would need one per combination.
+        fn label(self) -> String {
+            let mut picked: Vec<&str> = Vec::new();
             if self.reaper_down {
-                "On-Call: Reaper Down"
+                picked.push("Reaper Down");
+            }
+            if self.pingdom {
+                picked.push("Pingdom");
+            }
+            if picked.is_empty() {
+                "On-Call".to_string()
             } else {
-                "On-Call"
+                format!("On-Call: {}", picked.join(", "))
             }
         }
     }
@@ -2667,61 +2684,107 @@ mod gui {
         });
     }
 
-    /// Run the whole reaper decision against one alert id and report every
-    /// step, without touching anything.
+    /// Which watcher a dry run should exercise for this alert.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum DryRunRoute {
+        Reaper,
+        Pingdom,
+        /// No watcher claims it. Nothing is run and nothing is escalated —
+        /// paging about an alert neither watcher would ever act on proves
+        /// nothing about either of them.
+        Neither,
+    }
+
+    /// Pick the route. **Reaper wins when both claim the alert**: it is the
+    /// watcher with a box to read, so an alert both match gets the more
+    /// thorough run — which answers the pingdom question along the way.
     ///
-    /// The point is to answer "would this alert be remediated, and on which
-    /// box" **without** taking reaper down to find out. It fetches the alert,
-    /// runs the same `identifies`/`match_alert` the poll thread runs,
-    /// resolves the subject through the same `resolve_reaper_target`, and
-    /// reports the projection.
+    /// Pure, so the precedence is pinned by a test rather than by the order
+    /// of two `if`s inside a thread.
+    fn dry_run_route(
+        alert: &ec2_manager::alerts::Alert,
+        reaper_cfg: &ec2_manager::features::ReaperFeature,
+        pingdom_cfg: &ec2_manager::features::PingdomFeature,
+    ) -> DryRunRoute {
+        if ec2_manager::reaper::identifies(alert, reaper_cfg) {
+            DryRunRoute::Reaper
+        } else if ec2_manager::pingdom::identifies(alert, pingdom_cfg) {
+            DryRunRoute::Pingdom
+        } else {
+            DryRunRoute::Neither
+        }
+    }
+
+    /// **Test Alert Match**: everything a real run does except the thing that
+    /// changes something, then a **real** escalation.
     ///
-    /// It never acknowledges, never sends an SSM command and never reaches a
-    /// notifier — and that is true regardless of `dry_run`, which it does not
-    /// consult. `dry_run` decides what the *poll thread* does with a real
-    /// alert; this is a question, not a run, so there is nothing for it to
-    /// gate. The read-only ELB calls behind a target group are the only thing
-    /// this touches in AWS.
+    /// It answers one question — *if this alert fired for real, could we find
+    /// it, read what a fix needs off it, and would my phone ring?* — so every
+    /// step is reported and the escalation is genuinely sent. A simulated
+    /// send would leave the only part that can silently be broken untested.
     ///
-    /// Its own thread, because `fetch_alert`, the on-call lookup and the ELB
-    /// calls are all network and the UI is immediate mode.
-    fn start_reaper_probe(
+    /// Per watcher:
+    ///
+    /// * **reaper** — fetch, identify, match, resolve the target group to an
+    ///   instance, and read the box with `reaper_probe.sh` (`docker ps -a`,
+    ///   `compose ps`, the watchdog's state, container uptimes). Everything
+    ///   `run_reaper_remediation` does apart from stopping the watchdog and
+    ///   the `compose down` / `compose up -d`.
+    /// * **pingdom** — fetch and identify, which is all a pingdom decision
+    ///   has ever needed; there is no box in its path to read.
+    ///
+    /// **It never acknowledges**, whichever watcher claims the alert. Acking
+    /// silences a live page, and doing that as a side effect of a test is not
+    /// a test.
+    ///
+    /// **On call is reported but not obeyed.** The escalation goes to the
+    /// operator's own mailbox and is the thing being tested; withholding it
+    /// off call would make the feature untestable exactly when someone is
+    /// setting it up. The line still says what a *real* run would have done,
+    /// since that is the part on-call state actually decides.
+    #[allow(clippy::too_many_arguments)]
+    fn start_alert_dry_run(
         auth: ec2_manager::alerts::AlertsAuth,
-        cfg: ec2_manager::features::ReaperFeature,
+        reaper_cfg: ec2_manager::features::ReaperFeature,
+        pingdom_cfg: ec2_manager::features::PingdomFeature,
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
+        mailbox: Option<String>,
         alert_id: String,
         tx: Sender<ReaperEvent>,
+        err_tx: Sender<String>,
     ) {
-        use ec2_manager::{alerts, oncall, reaper};
+        use ec2_manager::{alerts, oncall, pingdom, reaper};
 
         std::thread::spawn(move || {
             let note = |level: LogLevel, message: String| {
                 let _ = tx.send(ReaperEvent::Note { level, message });
             };
-            note(
-                LogLevel::Info,
-                format!("reaper probe: fetching alert {alert_id}"),
-            );
+            // Both, always: the log is the record, the window line is what
+            // the person who just pressed the button is looking at.
+            let fail = |message: String| {
+                let _ = tx.send(ReaperEvent::Note {
+                    level: LogLevel::Error,
+                    message: format!("dry run: {message}"),
+                });
+                let _ = err_tx.send(message);
+            };
 
+            note(LogLevel::Info, format!("dry run: fetching alert {alert_id}"));
             let alert = match alerts::fetch_alert(&auth, &alert_id) {
                 Ok(a) => a,
                 Err(e) => {
-                    note(
-                        LogLevel::Error,
-                        format!("reaper probe: could not fetch alert {alert_id} — {e}"),
-                    );
+                    fail(format!("alert {alert_id} could not be found — {e}"));
                     return;
                 }
             };
-
-            // The fields the matcher actually reads, spelled out, so a rule
+            // The fields the matchers actually read, spelled out, so a rule
             // that does not fire can be compared against what it was given
             // rather than guessed at.
             note(
                 LogLevel::Info,
                 format!(
-                    "reaper probe: alert {} status={:?} alertname={:?} app={:?} \
+                    "dry run: alert {} found — status={:?} alertname={:?} app={:?} \
                      account={:?} env={:?}",
                     alert.id,
                     alert.status,
@@ -2733,165 +2796,253 @@ mod gui {
             );
             note(
                 LogLevel::Info,
-                format!("reaper probe: message {:?}", clip_for_log(&alert.message, 400)),
+                format!("dry run: message {:?}", clip_for_log(&alert.message, 400)),
             );
-            // The description is where a target group usually lives, so it is
+            // Where a reaper alert's target group usually lives, so it is
             // reported every run rather than only when something fails.
             note(
                 LogLevel::Info,
                 format!(
-                    "reaper probe: description {:?}",
+                    "dry run: description {:?}",
                     clip_for_log(&alert.description, 400)
                 ),
             );
 
-            if !reaper::identifies(&alert, &cfg) {
-                note(
-                    LogLevel::Warn,
-                    format!(
-                        "reaper probe: alert {} does not match any reaper rule \
-                         (alertname~{:?} app~{:?} message~{:?}) — a real poll would \
-                         pass over it",
-                        alert.id,
-                        cfg.alertname_contains,
-                        cfg.app_contains,
-                        cfg.message_contains,
-                    ),
-                );
-                return;
-            }
-            note(
-                LogLevel::Info,
-                format!("reaper probe: alert {} matches the reaper rules", alert.id),
-            );
-
-            let Some(m) = reaper::match_alert(&alert, &cfg) else {
-                note(
-                    LogLevel::Warn,
-                    format!(
-                        "reaper probe: alert {} names neither an instance id nor a \
-                         target group — a real poll would have nothing to act on",
-                        alert.id
-                    ),
-                );
-                // What was there instead. Reporting only that nothing matched
-                // leaves the one question this tool exists to answer
-                // unanswered.
-                for line in reaper_subject_evidence(&alert) {
-                    note(LogLevel::Warn, line);
-                }
-                return;
-            };
-            note(
-                LogLevel::Info,
-                match &m.subject {
-                    reaper::Subject::Instance(id) => {
-                        format!("reaper probe: the alert names instance {id}")
-                    }
-                    reaper::Subject::TargetGroup(tg) => {
-                        format!("reaper probe: the alert names target group {tg}")
-                    }
-                },
-            );
-
-            // The context is built here rather than left to
-            // `resolve_reaper_target`, because the probe needs it twice: to
-            // resolve the target group, and then to send its read-only
-            // command to whatever that resolved to.
-            let ctx = match reaper_account_context(&mode, &app_config, &m.account_id) {
-                Ok(c) => c,
-                Err(why) => {
-                    note(LogLevel::Error, format!("reaper probe: {why}"));
-                    return;
-                }
-            };
-            let instance = match resolve_reaper_subject(&ctx.profile, &ctx.region, &m.subject) {
-                Ok(id) => id,
-                Err(why) => {
+            match dry_run_route(&alert, &reaper_cfg, &pingdom_cfg) {
+                DryRunRoute::Reaper => {
                     note(
-                        LogLevel::Error,
-                        format!("reaper probe: could not resolve to one instance — {why}"),
+                        LogLevel::Info,
+                        format!("dry run: alert {} matches the reaper rules", alert.id),
                     );
-                    return;
-                }
-            };
-            note(
-                LogLevel::Info,
-                format!("reaper probe: resolves to instance {instance}"),
-            );
-
-            // Read the box itself. Everything in `reaper_probe.sh` is a
-            // read -- it is `reaper_fix.sh` with every command that changes
-            // something removed -- so this is safe to point at production
-            // from a button labelled "test", which is the only reason it is
-            // done at all.
-            note(
-                LogLevel::Info,
-                format!("reaper probe: reading {instance} (read-only, nothing is changed)"),
-            );
-            match exec_remote_command(
-                &None,
-                &ctx,
-                &instance,
-                &reaper_probe_command(),
-                cfg.send_command_timeout(),
-            ) {
-                Ok(out) => {
-                    let _ = tx.send(ReaperEvent::Transcript {
-                        instance: instance.clone(),
-                        stage: "probe".to_string(),
-                        output: out.clone(),
-                    });
-                    for line in reaper_probe_state_lines(&instance, &out) {
-                        note(LogLevel::Info, line);
+                    if !dry_run_reaper_details(&alert, &reaper_cfg, &app_config, &mode, &tx)
+                    {
+                        // Already reported in full by the helper. The
+                        // escalation still goes: "we could not get what we
+                        // need" is exactly the failure this pages about.
+                        note(
+                            LogLevel::Warn,
+                            "dry run: could not gather the details a real fix would \
+                             need — escalating anyway, which is what a real failure \
+                             would do"
+                                .to_string(),
+                        );
                     }
                 }
-                // Not fatal: the projection below is still worth reporting,
-                // and "the box could not be reached" is itself an answer
-                // about whether a remediation would get anywhere.
-                Err(e) => note(
-                    LogLevel::Warn,
-                    format!("reaper probe: could not read {instance} — {e}"),
-                ),
+                DryRunRoute::Pingdom => {
+                    let incident = pingdom::incident_key(&alert).label();
+                    note(
+                        LogLevel::Info,
+                        format!(
+                            "dry run: alert {} matches the pingdom rules, incident \
+                             {incident} — a real run would acknowledge it and escalate \
+                             if it were still open {} minute(s) later",
+                            alert.id,
+                            pingdom_cfg.watch_window().as_secs() / 60,
+                        ),
+                    );
+                }
+                DryRunRoute::Neither => {
+                    fail(format!(
+                        "alert {} matches no watcher — not a reaper alert \
+                         (alertname~{:?} app~{:?} message~{:?}) and not a pingdom alert \
+                         (alertname~{:?} app~{:?} message~{:?}). Nothing was escalated.",
+                        alert.id,
+                        reaper_cfg.alertname_contains,
+                        reaper_cfg.app_contains,
+                        reaper_cfg.message_contains,
+                        pingdom_cfg.alertname_contains,
+                        pingdom_cfg.app_contains,
+                        pingdom_cfg.message_contains,
+                    ));
+                    return;
+                }
             }
 
-            // Reported, not returned on: a closed alert is exactly what a
-            // probe run after the fact looks at, and the rest of the
-            // projection is still worth seeing.
+            // Reported, never a reason to stop: a dry run after the fact is
+            // the normal case, and the escalation is still the thing being
+            // tested.
             if reaper::alert_is_closed(&alert.status) {
                 note(
                     LogLevel::Info,
                     format!(
-                        "reaper probe: alert {} is closed — a real poll would stand down here",
+                        "dry run: alert {} is closed — a real poll would have stood down \
+                         here",
                         alert.id
                     ),
                 );
             }
 
-            let on_call = match oncall::is_on_call(
+            // What a real run would have done about acknowledging. Said, not
+            // obeyed: see this function's doc comment.
+            match oncall::is_on_call(
                 &auth,
-                &cfg.resolved_schedule_id(),
-                &cfg.resolved_atlassian_account_id(),
+                &reaper_cfg.resolved_schedule_id(),
+                &reaper_cfg.resolved_atlassian_account_id(),
             ) {
-                Ok(v) => v,
-                Err(e) => {
-                    note(
-                        LogLevel::Warn,
-                        format!("reaper probe: on-call lookup failed ({e}) — treating as off call"),
-                    );
-                    false
-                }
+                Ok(true) => note(
+                    LogLevel::Info,
+                    "dry run: you are on call — a real run would have acknowledged this \
+                     alert; the dry run does not"
+                        .to_string(),
+                ),
+                Ok(false) => note(
+                    LogLevel::Info,
+                    "dry run: you are not on call — a real run would not have \
+                     acknowledged either"
+                        .to_string(),
+                ),
+                Err(e) => note(
+                    LogLevel::Warn,
+                    format!("dry run: on-call lookup failed ({e}) — escalating regardless"),
+                ),
+            }
+
+            // ---- the escalation, for real ----
+            let Some(mailbox) = mailbox.filter(|m| !m.trim().is_empty()) else {
+                fail(
+                    "no escalation mailbox is configured, so nothing can be sent — set \
+                     ESCALATION_MAILBOX or store the ec2_manager/escalation_mailbox \
+                     credential"
+                        .to_string(),
+                );
+                return;
             };
 
+            let subject = reaper::escalation_subject(
+                // Never a literal: the code has to stay the vocabulary the
+                // Pi-side daemon matches on.
+                reaper::OutcomeCode::Failure,
+                &alert.created_at,
+            );
             note(
-                LogLevel::Info,
+                LogLevel::Warn,
+                format!("dry run: escalating for real, subject {subject:?}"),
+            );
+            match send_escalation_email(&mailbox, &subject) {
+                Ok(address) => note(
+                    LogLevel::Warn,
+                    format!(
+                        "dry run: escalation sent to {address} — the call and the Telegram \
+                         message are the Pi daemon's job from here"
+                    ),
+                ),
+                Err(reason) => fail(format!("the escalation could not be sent — {reason}")),
+            }
+        });
+    }
+
+    /// The reaper half of a dry run: resolve the alert to an instance and
+    /// read that box, reporting every step.
+    ///
+    /// `false` when it could not get as far as reading the box. The caller
+    /// escalates either way — being unable to find the details a fix needs is
+    /// itself worth a page — but says which happened.
+    ///
+    /// Everything here is a read. It is the same command the read-only probe
+    /// has always sent (`reaper_probe.sh`, pinned by
+    /// `the_probe_script_changes_nothing_on_the_box`), so the one thing a dry
+    /// run must not do — change something on the box — is enforced by that
+    /// test rather than by this function being careful.
+    fn dry_run_reaper_details(
+        alert: &ec2_manager::alerts::Alert,
+        cfg: &ec2_manager::features::ReaperFeature,
+        app_config: &ec2_manager::config::AppConfig,
+        mode: &Mode,
+        tx: &Sender<ReaperEvent>,
+    ) -> bool {
+        use ec2_manager::reaper;
+
+        let note = |level: LogLevel, message: String| {
+            let _ = tx.send(ReaperEvent::Note { level, message });
+        };
+
+        let Some(m) = reaper::match_alert(alert, cfg) else {
+            note(
+                LogLevel::Warn,
                 format!(
-                    "reaper probe: would remediate {instance} (on_call={on_call}), projected \
-                     code {} — nothing was acknowledged, sent or changed",
-                    dry_run_projection(on_call).as_str()
+                    "dry run: alert {} names neither an instance id nor a target group — \
+                     a real fix would have nothing to act on",
+                    alert.id
                 ),
             );
-        });
+            // What was there instead. Reporting only that nothing matched
+            // leaves the one question this tool exists to answer unanswered.
+            for line in reaper_subject_evidence(alert) {
+                note(LogLevel::Warn, line);
+            }
+            return false;
+        };
+        note(
+            LogLevel::Info,
+            match &m.subject {
+                reaper::Subject::Instance(id) => {
+                    format!("dry run: the alert names instance {id}")
+                }
+                reaper::Subject::TargetGroup(tg) => {
+                    format!("dry run: the alert names target group {tg}")
+                }
+            },
+        );
+
+        // Built here rather than left to `resolve_reaper_target`, because it
+        // is needed twice: to resolve the target group, then to send the
+        // read-only command to whatever that resolved to.
+        let ctx = match reaper_account_context(mode, app_config, &m.account_id) {
+            Ok(c) => c,
+            Err(why) => {
+                note(LogLevel::Error, format!("dry run: {why}"));
+                return false;
+            }
+        };
+        let instance = match resolve_reaper_subject(&ctx.profile, &ctx.region, &m.subject) {
+            Ok(id) => id,
+            Err(why) => {
+                note(
+                    LogLevel::Error,
+                    format!("dry run: could not resolve to one instance — {why}"),
+                );
+                return false;
+            }
+        };
+        note(
+            LogLevel::Info,
+            format!("dry run: resolves to instance {instance}"),
+        );
+        note(
+            LogLevel::Info,
+            format!(
+                "dry run: reading {instance} — docker ps -a, compose ps and the watchdog, \
+                 but NOT compose down / compose up -d"
+            ),
+        );
+        match exec_remote_command(
+            &None,
+            &ctx,
+            &instance,
+            &reaper_probe_command(),
+            cfg.send_command_timeout(),
+        ) {
+            Ok(out) => {
+                let _ = tx.send(ReaperEvent::Transcript {
+                    instance: instance.clone(),
+                    stage: "dry run".to_string(),
+                    output: out.clone(),
+                });
+                for line in reaper_probe_state_lines(&instance, &out) {
+                    note(LogLevel::Info, line);
+                }
+                true
+            }
+            // Not fatal: "the box could not be reached" is itself an answer
+            // about whether a remediation would get anywhere.
+            Err(e) => {
+                note(
+                    LogLevel::Error,
+                    format!("dry run: could not read {instance} — {e}"),
+                );
+                false
+            }
+        }
     }
 
     /// Resolve a matched alert's subject to the instance to remediate,
@@ -6754,6 +6905,15 @@ mod gui {
         /// when the feature itself is off, which is exactly when someone is
         /// trying to get the rules right.
         reaper_cfg: ec2_manager::features::ReaperFeature,
+        /// The compiled-in pingdom rules, for the dry run's matcher. The
+        /// watcher's own copy is moved into its thread.
+        pingdom_cfg: ec2_manager::features::PingdomFeature,
+        /// Where a dry run reports a failure the *window* has to show — an
+        /// alert that could not be fetched, one no watcher claims, or a send
+        /// that did not go. A channel, not a shared field, because the run is
+        /// on its own thread.
+        dry_run_error_tx: Sender<String>,
+        dry_run_error_rx: Receiver<String>,
         /// Whether that probe is offered. `reaper.allowed_users` **without**
         /// `reaper.enabled`: it reads an alert and makes read-only ELB calls,
         /// never acknowledges and never touches an instance, so gating it on
@@ -6780,6 +6940,11 @@ mod gui {
         /// Run Remediation's Override tick: skip the "is it already healthy"
         /// check and remediate regardless.
         reaper_override: bool,
+        /// The red line under the Alert ID box: an id that could not be
+        /// fetched, or one no watcher claims. Shown in the Alerts window
+        /// rather than only in the log, because the log is a different tab
+        /// and "nothing happened" is what a wrong id otherwise looks like.
+        alert_submit_error: Option<String>,
         /// Alerts window state; `None` while the window is closed.
         alerts_window: Option<AlertsWindow>,
         /// Alerts fetch worker → UI.
@@ -6823,6 +6988,10 @@ mod gui {
         /// Background reaper poll thread. `None` when the feature is off for
         /// this user or JSM credentials are not configured.
         reaper: Option<ReaperRuntime>,
+        /// Background pingdom watcher. `None` when the feature is off for
+        /// this user, JSM credentials are not configured, or no escalation
+        /// mailbox is set — see `pingdom_gate_report`, which names which.
+        pingdom: Option<PingdomRuntime>,
         /// Finished remediations waiting on a notifier: the outcome code
         /// (`RE-F`/`RE-N`/`RE-K`/`RE-C`) and the alert's `createdAt`.
         /// Nothing reads this yet — wiring it to a send path is a separate,
@@ -6973,6 +7142,7 @@ mod gui {
             let (create_pre_tx, create_pre_rx) = mpsc::channel();
             let (fed_tx, fed_rx) = mpsc::channel();
             let (reaper_probe_tx, reaper_probe_rx) = mpsc::channel();
+            let (dry_run_error_tx, dry_run_error_rx) = mpsc::channel();
             // Created here rather than inside `start_reaper_poll`, because
             // the Run Remediation button needs the in-flight set whether or
             // not the poll thread was ever started.
@@ -7097,8 +7267,7 @@ mod gui {
                         reaper_startup_log.push((
                             false,
                             format!(
-                                "reaper: armed (dry_run={}), polling every {}s over the {}                                  newest alert(s), matching alertname~{:?} app~{:?}                                  message~{:?}",
-                                features.reaper.dry_run,
+                                "reaper: armed, polling every {}s over the {}                                  newest alert(s), matching alertname~{:?} app~{:?}                                  message~{:?}",
                                 features.reaper.poll_interval().as_secs(),
                                 features.reaper.alerts_per_poll(),
                                 features.reaper.alertname_contains,
@@ -7122,6 +7291,33 @@ mod gui {
                 } else {
                     None
                 }
+            };
+
+            // Its own gate, its own thread, its own dark-state reporting.
+            // Deliberately not folded into the reaper block above: the two
+            // watchers share a feed and nothing else, and one being disarmed
+            // must never disarm the other.
+            let (pingdom, pingdom_startup_log) = {
+                let user = ec2_manager::features::current_os_user();
+                // One `CredReadW`, at startup, never per frame — the same
+                // rule `resolve_escalation_mailbox`'s own doc comment states.
+                let mailbox = ec2_manager::jsm_auth::escalation_mailbox();
+                let (armed, lines) = pingdom_gate_report(
+                    &features.pingdom,
+                    &user,
+                    resolved_alerts_auth.is_complete(),
+                    mailbox.as_deref(),
+                );
+                let rt = if armed {
+                    Some(start_pingdom_poll(
+                        resolved_alerts_auth.clone(),
+                        features.pingdom.clone(),
+                        mailbox.unwrap_or_default(),
+                    ))
+                } else {
+                    None
+                };
+                (rt, lines)
             };
 
             let mut app = Self {
@@ -7294,6 +7490,9 @@ mod gui {
                     &resolved_alerts_auth,
                 ),
                 reaper_cfg: features.reaper.clone(),
+                pingdom_cfg: features.pingdom.clone(),
+                dry_run_error_tx,
+                dry_run_error_rx,
                 reaper_probe_enabled: features
                     .reaper
                     .is_allowed_user(&ec2_manager::features::current_os_user())
@@ -7305,6 +7504,7 @@ mod gui {
                 reaper_in_flight,
                 pending_run_remediation: None,
                 reaper_override: false,
+                alert_submit_error: None,
                 alerts_auth: resolved_alerts_auth,
                 alerts_window: None,
                 alerts_tx,
@@ -7315,6 +7515,7 @@ mod gui {
                 ack_all_running: false,
                 alerts_generation: 0,
                 reaper,
+                pingdom,
                 pending_notify: Vec::new(),
                 fed_auth_enabled: features
                     .fed_auth_enabled_for(&ec2_manager::features::current_os_user()),
@@ -7394,6 +7595,13 @@ mod gui {
                 let level = if is_warn { LogLevel::Warn } else { LogLevel::Info };
                 app.log_reaper(level, msg);
             }
+            for (is_warn, msg) in pingdom_startup_log {
+                // Same reasoning, its own tag: "the watcher never came up" is
+                // the first thing to look for under On-Call -> Pingdom when
+                // nothing else is there.
+                let level = if is_warn { LogLevel::Warn } else { LogLevel::Info };
+                app.log_pingdom(level, msg);
+            }
             // The name every `allowed_users` gate is matched against, and what
             // each one decided. Without this a gate that does not match is
             // invisible: the button simply never appears, with nothing to say
@@ -7405,12 +7613,14 @@ mod gui {
             // process started later and never consulted here.
             app.log_info(format!(
                 "gates: os_user='{}' (from {}) — git_scripts={} alerts={} reaper={} \
-                 vault_iam={} vault_iam_delete={} fed_auth={} fed_auto_sign_in={}",
+                 pingdom={} vault_iam={} vault_iam_delete={} fed_auth={} \
+                 fed_auto_sign_in={}",
                 if os_user.is_empty() { "(unset!)" } else { &os_user },
                 if cfg!(target_os = "windows") { "%USERNAME%" } else { "$USER" },
                 app.git_scripts_enabled,
                 app.alerts_enabled,
                 features.reaper_enabled_for(&os_user),
+                features.pingdom_enabled_for(&os_user),
                 features.vault_iam_enabled_for(&os_user),
                 features.vault_iam_delete_enabled_for(&os_user),
                 app.fed_auth_enabled,
@@ -8197,6 +8407,10 @@ mod gui {
         /// dropdown can show that script on its own.
         fn log_reaper(&mut self, level: LogLevel, message: impl Into<String>) {
             self.log_from(LogSource::ReaperDown, level, message);
+        }
+
+        fn log_pingdom(&mut self, level: LogLevel, message: impl Into<String>) {
+            self.log_from(LogSource::Pingdom, level, message);
         }
 
         fn log_error(&mut self, message: impl Into<String>) {
@@ -12432,14 +12646,6 @@ mod gui {
             }
             for ev in &events {
                 match ev {
-                    ReaperEvent::Considered { code, instance, on_call } => {
-                        // A projection, not a result: dry run never ran the
-                        // fix, never acknowledged, never contacted the
-                        // instance. Must not be mistaken for a real outcome.
-                        self.log_reaper(LogLevel::Info, format!(
-                            "reaper: DRY RUN — would remediate {instance} (on_call={on_call}), projected code {code}"
-                        ));
-                    }
                     ReaperEvent::Skipped { reason } => {
                         self.log_reaper(LogLevel::Debug, format!("reaper: skipped — {reason}"))
                     }
@@ -12470,6 +12676,43 @@ mod gui {
             }
         }
 
+        /// Drain whatever the pingdom watcher has said since the last frame.
+        ///
+        /// Unlike `poll_reaper_events` this feeds no notifier seam: the
+        /// escalation is sent by the watcher's own thread, so by the time an
+        /// `Escalated` event arrives the mail has already gone (or has
+        /// already failed). What lands here is the record of it.
+        fn poll_pingdom_events(&mut self) {
+            let Some(rt) = &self.pingdom else { return };
+            let events: Vec<PingdomEvent> = rt.rx.try_iter().collect();
+            for ev in events {
+                match ev {
+                    PingdomEvent::Note { level, message } => self.log_pingdom(level, message),
+                    PingdomEvent::Escalated { incident, detail, ok } => {
+                        // An escalation that did not send is the worst state
+                        // this feature has: the alert is open, the page is
+                        // acknowledged and therefore quiet, and nothing is
+                        // going to ring. It is logged at error and says so.
+                        if ok {
+                            self.log_pingdom(
+                                LogLevel::Warn,
+                                format!("pingdom: escalation for {incident} {detail}"),
+                            );
+                        } else {
+                            self.log_pingdom(
+                                LogLevel::Error,
+                                format!(
+                                    "pingdom: escalation for {incident} FAILED TO SEND — {detail}. \
+                                     The alert is acknowledged and nothing will ring; handle it \
+                                     by hand"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         /// Render the on-call Alerts window. Times are shown in the user's
         /// local timezone; the API reports UTC.
         fn render_alerts_window(&mut self, ctx: &egui::Context) {
@@ -12491,8 +12734,14 @@ mod gui {
             // Carried out of the window closure for the same reason the two
             // above are: spawning needs `&self` fields the closure is already
             // borrowing mutably.
-            let mut probe_alert_id: Option<String> = None;
             let mut confirm_remediation_id: Option<(String, bool)> = None;
+            let mut dry_run_alert_id: Option<String> = None;
+            // Whatever the dry-run thread could not do. Kept as the *last*
+            // one: a run reports at most one failure and then stops, so
+            // there is never a queue of them to reconcile.
+            if let Some(latest) = self.dry_run_error_rx.try_iter().last() {
+                self.alert_submit_error = Some(latest);
+            }
             let mut rerun_alert_check = false;
 
             egui::Window::new("On-Call Alerts")
@@ -12578,42 +12827,41 @@ mod gui {
                                     .desired_width(300.0),
                             );
                             let id = self.reaper_probe_id.trim().to_string();
+                            // The dry run. Everything a real run does except
+                            // the thing that changes something — and then a
+                            // REAL escalation, which is the half that cannot
+                            // be proven any other way.
                             if ui
                                 .add_enabled(
                                     !id.is_empty(),
                                     egui::Button::new("Test Alert Match"),
                                 )
                                 .on_hover_text(
-                                    "Run the matcher against this alert and report every \
-                                     step in the log (On-Call -> Reaper Down): the fields \
-                                     it read, the instance a target group resolves to, and \
-                                     what it found on that box.\n\n\
-                                     Read-only throughout. It runs the parts of the fix \
-                                     that only look — docker ps -a, compose ps, the \
-                                     watchdog's state — and never acknowledges, restarts \
-                                     or changes anything.",
+                                    "Dry run this alert — and SEND A REAL ESCALATION: \
+                                     your phone rings and Telegram fires.\n\n\
+                                     It fetches the alert, matches it, and for a reaper \
+                                     alert resolves the instance and reads the box \
+                                     (docker ps -a, compose ps, the watchdog) — everything \
+                                     the real run does EXCEPT compose down / compose up -d. \
+                                     Then it escalates as though the fix had failed.\n\n\
+                                     Nothing is acknowledged and nothing on the box is \
+                                     changed. Every step is in the log under On-Call.",
                                 )
                                 .clicked()
                             {
-                                probe_alert_id = Some(id.clone());
+                                // No confirmation: nothing is taken down, and
+                                // the point of the mode is that it runs the
+                                // moment it is asked to.
+                                dry_run_alert_id = Some(id.clone());
                             }
 
-                            // The real thing. Disabled under dry run rather
-                            // than quietly doing nothing: dry_run means this
-                            // build cannot change anything, and a button that
-                            // silently honoured that would read as broken.
-                            let dry = self.reaper_cfg.dry_run;
-                            let run = ui.add_enabled(
-                                !id.is_empty() && !dry,
-                                egui::Button::new("Run Remediation"),
-                            );
-                            let run = if dry {
-                                run.on_disabled_hover_text(
-                                    "reaper.dry_run is true in this build, so nothing can \
-                                     be remediated. Set it to false and rebuild.",
+                            // The real thing, unchanged.
+                            if ui
+                                .add_enabled(
+                                    !id.is_empty(),
+                                    egui::Button::new("Run Remediation"),
                                 )
-                            } else {
-                                run.on_hover_text(
+                                .on_hover_text(
                                     "Remediate this alert now, as if it had just come in: \
                                      acknowledge (only if you are on call), stop the \
                                      watchdog, compose down, compose up -d, then watch for \
@@ -12622,8 +12870,8 @@ mod gui {
                                      unacknowledged alert, and ignores the cooldown and \
                                      whatever this session has already handled.",
                                 )
-                            };
-                            if run.clicked() {
+                                .clicked()
+                            {
                                 confirm_remediation_id =
                                     Some((id.clone(), self.reaper_override));
                             }
@@ -12665,6 +12913,19 @@ mod gui {
                             }
                             ui.weak("results appear in the Logs tab");
                         });
+                        if let Some(err) = &self.alert_submit_error {
+                            // Under the box, in red, and it stays until the
+                            // next submit: a person who typed an id that does
+                            // not exist otherwise sees nothing happen at all.
+                            // Through `note_label`, like every other
+                            // status-coloured line here: a direct
+                            // `colored_label` stays thin on a light panel,
+                            // and there is a test that says so.
+                            let red = egui::Color32::from_rgb(220, 80, 80);
+                            ui.horizontal_wrapped(|ui| {
+                                note_label(ui, red, format!("\u{26a0} {err}"));
+                            });
+                        }
                     }
 
                     // Rendered as two distinct lines on purpose: a fetch
@@ -12776,18 +13037,27 @@ mod gui {
             if let Some(pending) = confirm_remediation_id {
                 self.pending_run_remediation = Some(pending);
             }
-            if let Some(id) = probe_alert_id {
+            if let Some(id) = dry_run_alert_id {
+                // Cleared on every submit: a stale error under the box after
+                // a run that worked is worse than none at all.
+                self.alert_submit_error = None;
                 self.log_reaper(
-                    LogLevel::Info,
-                    format!("reaper probe: requested for alert {id}"),
+                    LogLevel::Warn,
+                    format!(
+                        "DRY RUN requested for alert {id} — everything except the fix, \
+                         then a REAL escalation"
+                    ),
                 );
-                start_reaper_probe(
+                start_alert_dry_run(
                     self.alerts_auth.clone(),
                     self.reaper_cfg.clone(),
+                    self.pingdom_cfg.clone(),
                     self.config.clone(),
                     self.options.mode.clone(),
+                    ec2_manager::jsm_auth::escalation_mailbox(),
                     id,
                     self.reaper_probe_tx.clone(),
+                    self.dry_run_error_tx.clone(),
                 );
             }
 
@@ -21440,6 +21710,15 @@ mod gui {
                             },
                         );
                     });
+                    ui.horizontal(|ui| {
+                        ui.label("Pingdom");
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.checkbox(&mut self.oncall_filters.pingdom, "");
+                            },
+                        );
+                    });
                 })
                 .response
                 .on_hover_text(
@@ -21848,6 +22127,17 @@ mod gui {
                 self.poll_alerts_events();
                 self.poll_ack_all_events();
                 self.poll_reaper_events();
+                self.poll_pingdom_events();
+                if self.pingdom.is_some() {
+                    // The watcher runs on its own thread and does not need a
+                    // frame to acknowledge, time or escalate — but its log is
+                    // the only account it gives of itself, and without a tick
+                    // those lines sit in the channel until the user happens to
+                    // click something. One frame a second while armed is the
+                    // cost; an escalation nobody sees recorded is what it buys
+                    // against.
+                    ctx.request_repaint_after(Duration::from_secs(1));
+                }
 
                 if self.wsl_show_password_popup {
                     let mut open = true;
@@ -24120,12 +24410,6 @@ mod gui {
     /// What the reaper poll thread reports back to the UI thread.
     #[derive(Clone, Debug)]
     enum ReaperEvent {
-        /// Dry run: this is what would have been done.
-        Considered {
-            code: String,
-            instance: String,
-            on_call: bool,
-        },
         /// Matched, but not acted on.
         Skipped { reason: String },
         /// A line of narration from a remediation in flight — the ack, the
@@ -24385,23 +24669,482 @@ mod gui {
         }
     }
 
+    // ---- pingdom watcher ------------------------------------------------
+
+    /// What the pingdom poll thread reports back.
+    ///
+    /// Its own event type rather than a reuse of [`ReaperEvent`]: that one
+    /// carries transcripts, verdicts and instance ids, none of which exist
+    /// here, and a shared enum would be mostly variants one producer can
+    /// never emit.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum PingdomEvent {
+        /// Anything worth a line in the log.
+        Note { level: LogLevel, message: String },
+        /// An escalation was sent, or could not be. Separate from `Note` so
+        /// the app can tell whether the phone was actually going to ring.
+        Escalated { incident: String, detail: String, ok: bool },
+    }
+
+    struct PingdomRuntime {
+        rx: std::sync::mpsc::Receiver<PingdomEvent>,
+        _handle: std::thread::JoinHandle<()>,
+    }
+
+    /// The entire payload of a pingdom escalation: a tier code and the
+    /// alert's own timestamp, and nothing else.
+    ///
+    /// **The code is `OutcomeCode::Failure`, taken from `as_str()` and never
+    /// written as a literal.** Pingdom deliberately reuses reaper's escalating
+    /// code rather than minting its own: the Pi-side daemon tiers on this
+    /// vocabulary, and a code it does not recognise is escalated as unknown —
+    /// a failure that looks exactly like success from this side.
+    ///
+    /// `Escalation::incident` and `Escalation::alert_id` are for the local
+    /// log and are dropped here. The incident label is an environment name,
+    /// which names a corporate estate; this string crosses the org boundary
+    /// into a personal mailbox, on to Telegram, and through a third-party
+    /// text-to-speech service.
+    fn pingdom_escalation_subject(e: &ec2_manager::pingdom::Escalation) -> String {
+        ec2_manager::reaper::escalation_subject(
+            ec2_manager::reaper::OutcomeCode::Failure,
+            &e.created_at,
+        )
+    }
+
+    /// Whether the pingdom watcher may run, and the startup lines saying why.
+    ///
+    /// Pure, and returns the lines instead of logging them, so every dark
+    /// state can be asserted without an `Ec2GuiApp`. There are four of them,
+    /// and each one names itself — reaper had three that all wrote nothing at
+    /// all, and telling them apart took five rounds of guessing.
+    ///
+    /// `mailbox` is the resolved escalation address. Without one the watcher
+    /// stays dark rather than running acknowledge-only: silencing a live page
+    /// and then never being able to ring is worse than doing nothing.
+    /// Deliberately **not** included in any line — the app log gets pasted
+    /// into tickets.
+    fn pingdom_gate_report(
+        cfg: &ec2_manager::features::PingdomFeature,
+        user: &str,
+        auth_complete: bool,
+        mailbox: Option<&str>,
+    ) -> (bool, Vec<(bool, String)>) {
+        let mut lines: Vec<(bool, String)> = Vec::new();
+
+        if !cfg.enabled {
+            lines.push((
+                false,
+                "pingdom: off — pingdom.enabled is false in this build".to_string(),
+            ));
+            return (false, lines);
+        }
+        if !cfg.is_allowed_user(user) {
+            lines.push((
+                false,
+                format!(
+                    "pingdom: off — os_user '{user}' is not on pingdom.allowed_users \
+                     (note '*' is deliberately not honoured for pingdom)"
+                ),
+            ));
+            return (false, lines);
+        }
+        if cfg.has_multiple_users() {
+            lines.push((
+                true,
+                "pingdom.allowed_users names more than one user; both machines will \
+                 acknowledge and both will escalate, and nothing arbitrates between them"
+                    .to_string(),
+            ));
+        }
+        if !auth_complete {
+            lines.push((false, "pingdom: no JSM credentials, staying dark".to_string()));
+            return (false, lines);
+        }
+        if mailbox.map(str::trim).unwrap_or("").is_empty() {
+            lines.push((
+                false,
+                "pingdom: no escalation mailbox configured, staying dark — set \
+                 ESCALATION_MAILBOX or store the ec2_manager/escalation_mailbox \
+                 credential. Acknowledging without being able to escalate would \
+                 silence a live page and never ring"
+                    .to_string(),
+            ));
+            return (false, lines);
+        }
+
+        lines.push((
+            false,
+            format!(
+                "pingdom: armed, polling every {}s over the {} newest alert(s), \
+                 escalating anything still open after {} minute(s), matching \
+                 alertname~{:?} app~{:?} message~{:?}",
+                cfg.poll_interval().as_secs(),
+                cfg.alerts_per_poll(),
+                cfg.watch_window().as_secs() / 60,
+                cfg.alertname_contains,
+                cfg.app_contains,
+                cfg.message_contains,
+            ),
+        ));
+        (true, lines)
+    }
+
+    /// Where `send_escalation.ps1` lives: next to the executable.
+    ///
+    /// **Never written to `%TEMP%` and run from there**, and never spawned
+    /// with `-WindowStyle Hidden` — both are patterns EDRs quarantine on
+    /// sight, and this app has a CrowdStrike quarantine in its history.
+    /// `package_windows_zip` copies the script beside the exe for the same
+    /// reason. Mirrors `access_email_script_path`.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn escalation_script_path() -> std::path::PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|d| d.join("send_escalation.ps1")))
+            .unwrap_or_else(|| std::path::PathBuf::from("send_escalation.ps1"))
+    }
+
+    /// Send one escalation email. `Ok` carries the address it went to.
+    ///
+    /// This is the app's outbound path across the org boundary, and it is
+    /// deliberately narrow: one fixed recipient, a subject that is the entire
+    /// payload, an empty body, and no attachment. It must never route through
+    /// `send_access_email.ps1` — that script's recipient gates exist because
+    /// it attaches a private key, and they must not be relaxed to fit this.
+    ///
+    /// Blocking: it runs PowerShell and drives Outlook COM, which takes
+    /// seconds. Callers run it off the poll thread.
+    #[cfg(target_os = "windows")]
+    fn send_escalation_email(
+        mailbox: &str,
+        subject: &str,
+    ) -> std::result::Result<String, String> {
+        // `std::result::Result` spelled out: the crate's own `Result<T>`
+        // alias (src/error.rs) is in scope and takes one parameter. This only
+        // fails on the Windows target, so cross-compile before trusting a
+        // change here.
+        use std::io::Read;
+        use std::os::windows::process::CommandExt;
+
+        let path = escalation_script_path();
+        if !path.exists() {
+            return Err(format!(
+                "send_escalation.ps1 was not found next to the executable ({})",
+                path.display()
+            ));
+        }
+        let mut child = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&path)
+            .arg(escalation_script_args()[0])
+            .arg(mailbox)
+            .arg(escalation_script_args()[1])
+            .arg(subject)
+            // The GUI owns no console, so without this PowerShell gets a
+            // window of its own. An ordinary Win32 flag, and what every other
+            // child process here already uses -- unlike `-WindowStyle
+            // Hidden`, which is a flagged PowerShell switch.
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("could not start PowerShell: {e}"))?;
+
+        let mut out = String::new();
+        if let Some(mut so) = child.stdout.take() {
+            let _ = so.read_to_string(&mut out);
+        }
+        let _ = child.wait();
+
+        // Keep the last real marker seen, so a stray line before it does not
+        // discard the verdict.
+        let mut status = None;
+        for line in out.lines() {
+            if let Some(st) = parse_escalation_marker(line) {
+                status = Some(st);
+            }
+        }
+        match status {
+            Some(EscalationStatus::Sent { address }) => Ok(address),
+            Some(EscalationStatus::Failed { reason }) => Err(reason),
+            // The script prints exactly one marker on every path, so nothing
+            // here means it did not run as expected. Never read as success.
+            None => Err(format!(
+                "send_escalation.ps1 printed no marker (output: {:?})",
+                out.trim()
+            )),
+        }
+    }
+
+    /// Non-Windows builds have no Outlook to drive. The Linux dev build must
+    /// compile and stay warning-free without weakening the path where it
+    /// actually ships.
+    #[cfg(not(target_os = "windows"))]
+    fn send_escalation_email(
+        _mailbox: &str,
+        _subject: &str,
+    ) -> std::result::Result<String, String> {
+        Err("escalation email is only sent on Windows (Outlook COM)".to_string())
+    }
+
+    /// Whether the pingdom watcher may act this poll, and the sentence the
+    /// log gets when the answer changes.
+    ///
+    /// **Off call it does nothing at all** — no acknowledge, no timer, no
+    /// escalation. Pingdom is only looked at by whoever holds the pager, so
+    /// acting off call would silence somebody else's page and ring a phone
+    /// about an alert this machine has no business taking.
+    ///
+    /// A lookup that *failed* counts as off call. That is the only direction
+    /// which can neither acknowledge nor escalate by mistake, and it is the
+    /// same conservative degradation `oncall::is_on_call` documents. Note
+    /// this is the opposite trade to reaper's, where off call still means a
+    /// quiet message: here it means silence.
+    ///
+    /// Pure, and separate from the loop, so the rule is pinned by a test
+    /// rather than by reading a `continue`.
+    fn pingdom_on_call_decision(
+        lookup: std::result::Result<bool, String>,
+    ) -> (bool, String) {
+        match lookup {
+            Ok(true) => (
+                true,
+                "pingdom: on call — watching the feed".to_string(),
+            ),
+            Ok(false) => (
+                false,
+                "pingdom: off call — doing nothing at all: no acknowledge, no timer, \
+                 no escalation"
+                    .to_string(),
+            ),
+            Err(e) => (
+                false,
+                format!(
+                    "pingdom: on-call lookup failed ({e}) — treating as off call, so \
+                     nothing is acknowledged and nothing escalates"
+                ),
+            ),
+        }
+    }
+
+    /// The argument names `send_escalation_email` passes to
+    /// `send_escalation.ps1`.
+    ///
+    /// Named once so the spawn and the test that checks the script declares
+    /// them read the same list. They live in different files, a rename here
+    /// is not a compile error, and PowerShell would reject the call at
+    /// runtime inside a spawn nobody is watching — on the one path that
+    /// exists to ring a phone.
+    /// Only the Windows spawn consumes it in production; the agreement test
+    /// runs everywhere. Same shape as `EmailStatus` and `parse_email_marker`
+    /// — the Linux dev build stays warning-free without weakening the check
+    /// where it ships.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn escalation_script_args() -> [&'static str; 2] {
+        ["-To", "-Subject"]
+    }
+
+    /// Poll the alert feed and run the pingdom watcher: acknowledge, wait,
+    /// escalate.
+    ///
+    /// **Off call it does nothing at all** — no acknowledge, no timer, no
+    /// escalation. Pingdom is only looked at by the person holding the pager,
+    /// so acting off call would silence somebody else's page and ring a phone
+    /// about an alert this machine has no business taking. A *failed* on-call
+    /// lookup counts as off call for the same reason: it is the only
+    /// direction that cannot do either of those things by mistake.
+    ///
+    /// Everything the watcher knows lives in `PingdomState`, owned by this
+    /// thread and never shared — the same property `start_reaper_poll` keeps.
+    /// Nothing here blocks longer than one HTTP call, so unlike reaper there
+    /// is no per-incident thread: the only work handed off is the escalation
+    /// send, which drives Outlook COM and takes seconds.
+    fn start_pingdom_poll(
+        auth: ec2_manager::alerts::AlertsAuth,
+        cfg: ec2_manager::features::PingdomFeature,
+        mailbox: String,
+    ) -> PingdomRuntime {
+        use ec2_manager::{alerts, oncall, pingdom};
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut state = pingdom::PingdomState::new();
+            let window_ms = cfg.watch_window().as_millis() as u64;
+            let schedule_id = cfg.resolved_schedule_id();
+            let account_id = cfg.resolved_atlassian_account_id();
+            // Last on-call answer reported, so a machine that is off call for
+            // a week says so once rather than every poll.
+            let mut last_on_call: Option<bool> = None;
+
+            let note = |level: LogLevel, message: String| {
+                let _ = tx.send(PingdomEvent::Note { level, message });
+            };
+
+            loop {
+                let now_ms = monotonic_ms(started);
+
+                // On call first, before the feed is even read: off call
+                // there is nothing to decide.
+                let (on_call, reason) = pingdom_on_call_decision(
+                    oncall::is_on_call(&auth, &schedule_id, &account_id)
+                        .map_err(|e| e.to_string()),
+                );
+                // Said once per change, not once per poll: a machine that is
+                // off call for a week must not fill the log saying so.
+                if last_on_call != Some(on_call) {
+                    note(
+                        if on_call { LogLevel::Info } else { LogLevel::Warn },
+                        reason,
+                    );
+                    last_on_call = Some(on_call);
+                }
+                if !on_call {
+                    std::thread::sleep(cfg.poll_interval());
+                    continue;
+                }
+
+                match alerts::fetch_latest(&auth, cfg.alerts_per_poll()) {
+                    Ok(list) => {
+                        let mut identified = 0usize;
+                        for alert in &list {
+                            if !pingdom::identifies(alert, &cfg) {
+                                continue;
+                            }
+                            identified += 1;
+                            // A closed alert is never acknowledged and never
+                            // timed. Matching off the list is enough here:
+                            // unlike reaper, nothing this watcher needs lives
+                            // in `description`, so there is no full read.
+                            if ec2_manager::reaper::alert_is_closed(&alert.status) {
+                                continue;
+                            }
+
+                            let incident = pingdom::incident_key(alert).label();
+                            match state.consider(alert, now_ms, window_ms) {
+                                pingdom::Action::Ignore => {}
+                                pingdom::Action::AckAndWatch => {
+                                    match alerts::acknowledge_alert(&auth, &alert.id) {
+                                        Ok(()) => note(
+                                            LogLevel::Info,
+                                            format!(
+                                                "pingdom: acknowledged {} ({incident}) — \
+                                                 escalating if still open in {} minute(s)",
+                                                alert.id,
+                                                cfg.watch_window().as_secs() / 60,
+                                            ),
+                                        ),
+                                        // Not fatal, and the timer is already
+                                        // running: a failed acknowledge costs
+                                        // a duplicate page, whereas dropping
+                                        // the watch costs the escalation.
+                                        Err(e) => note(
+                                            LogLevel::Warn,
+                                            format!(
+                                                "pingdom: could not acknowledge {} \
+                                                 ({incident}): {e} — still timing it",
+                                                alert.id
+                                            ),
+                                        ),
+                                    }
+                                }
+                                pingdom::Action::AckOnly { owner } => {
+                                    match alerts::acknowledge_alert(&auth, &alert.id) {
+                                        Ok(()) => note(
+                                            LogLevel::Info,
+                                            format!(
+                                                "pingdom: acknowledged {} — another report of \
+                                                 {incident}, already timed by {owner}; its \
+                                                 deadline is unchanged",
+                                                alert.id
+                                            ),
+                                        ),
+                                        Err(e) => note(
+                                            LogLevel::Warn,
+                                            format!(
+                                                "pingdom: could not acknowledge duplicate {}: \
+                                                 {e}",
+                                                alert.id
+                                            ),
+                                        ),
+                                    }
+                                }
+                            }
+                        }
+                        note(
+                            LogLevel::Debug,
+                            format!(
+                                "pingdom: polled {} alert(s), {identified} matched, {} \
+                                 incident(s) being timed",
+                                list.len(),
+                                state.watching_count(),
+                            ),
+                        );
+                    }
+                    Err(e) => note(LogLevel::Warn, format!("pingdom: feed read failed: {e}")),
+                }
+
+                // Has anything being timed closed? Read each owner by id
+                // rather than trusting the list: an alert older than
+                // `fetch_count` has fallen off it, and its absence there is
+                // not evidence that it closed.
+                for id in state.watched_alert_ids() {
+                    match alerts::fetch_alert(&auth, &id) {
+                        Ok(a) if ec2_manager::reaper::alert_is_closed(&a.status) => {
+                            note(
+                                LogLevel::Info,
+                                format!("pingdom: {id} closed — incident over, nothing escalated"),
+                            );
+                            state.closed(&id);
+                        }
+                        Ok(_) => {}
+                        // Left alone deliberately: a transient failure must
+                        // not end an incident, which would both free the slot
+                        // and cancel the escalation.
+                        Err(e) => note(
+                            LogLevel::Warn,
+                            format!("pingdom: could not re-read {id}, still timing it: {e}"),
+                        ),
+                    }
+                }
+
+                for due in state.due(monotonic_ms(started)) {
+                    let subject = pingdom_escalation_subject(&due);
+                    note(
+                        LogLevel::Error,
+                        format!(
+                            "pingdom: {} ({}) is still open after {} minute(s) — escalating",
+                            due.alert_id,
+                            due.incident,
+                            cfg.watch_window().as_secs() / 60,
+                        ),
+                    );
+                    // Off the poll thread: this drives Outlook COM and takes
+                    // seconds, and nothing else here may wait on it.
+                    let tx2 = tx.clone();
+                    let mailbox2 = mailbox.clone();
+                    let incident = due.incident.clone();
+                    std::thread::spawn(move || {
+                        let (ok, detail) = match send_escalation_email(&mailbox2, &subject) {
+                            Ok(address) => (true, format!("sent to {address}")),
+                            Err(reason) => (false, reason),
+                        };
+                        let _ = tx2.send(PingdomEvent::Escalated { incident, detail, ok });
+                    });
+                }
+
+                std::thread::sleep(cfg.poll_interval());
+            }
+        });
+
+        PingdomRuntime { rx, _handle: handle }
+    }
+
     /// Monotonic milliseconds for the cooldown bookkeeping. A wall clock
     /// would let an NTP step or a DST change reopen a cooldown window.
     fn monotonic_ms(start: std::time::Instant) -> u64 {
         start.elapsed().as_millis() as u64
-    }
-
-    /// What the dry-run path reports: the tier that would fire if this alert
-    /// were real, the fix were attempted, and it told us nothing. Dry run
-    /// never runs the remediation — never acknowledges, never contacts the
-    /// instance — so the only honest inputs to `decide_outcome` are "no
-    /// verdict was established" and "nothing closed".
-    fn dry_run_projection(on_call: bool) -> ec2_manager::reaper::OutcomeCode {
-        ec2_manager::reaper::decide_outcome(
-            on_call,
-            &ec2_manager::reaper::Verdict::Indeterminate(String::new()),
-            false,
-        )
     }
 
     /// Seam over the two alert-API calls the remediation sequence makes
@@ -24991,27 +25734,6 @@ mod gui {
                                     state.mark_duplicate(&target.alert_id);
                                     continue;
                                 }
-                            }
-
-                            if cfg.dry_run {
-                                // Read-only projection: never runs the fix,
-                                // never acknowledges, never contacts the
-                                // instance. The code is what would have been
-                                // sent if the fix were attempted and told us
-                                // nothing.
-                                let code = dry_run_projection(on_call);
-                                let _ = tx.send(ReaperEvent::Considered {
-                                    code: code.as_str().to_string(),
-                                    instance: target.instance_id.clone(),
-                                    on_call,
-                                });
-                                state.mark_handled(
-                                    &target.alert_id,
-                                    target.fix,
-                                    &target.instance_id,
-                                    now_ms,
-                                );
-                                continue;
                             }
 
                             // Marked handled BEFORE the remediation runs and
@@ -27582,46 +28304,10 @@ mod gui {
 
         /// Arming is an explicit edit, never a default.
         #[test]
-        fn dry_run_is_what_the_shipped_config_does() {
+        fn the_shipped_config_leaves_reaper_disarmed() {
             let f = ec2_manager::features::load();
-            assert!(f.reaper.dry_run);
             assert!(!f.reaper.enabled);
-        }
-
-        /// This is the function `start_reaper_poll`'s dry-run branch actually
-        /// calls — not a hand re-derivation of `decide_outcome` — so this
-        /// test exercises what dry run really reports: the tier that would
-        /// fire if the alert were real and the fix told us nothing.
-        #[test]
-        fn dry_run_projects_the_failure_tier_from_on_call_state_alone() {
-            use ec2_manager::reaper::OutcomeCode;
-            assert_eq!(dry_run_projection(true), OutcomeCode::Failure);
-            assert_eq!(dry_run_projection(false), OutcomeCode::FailureQuiet);
-        }
-
-        /// The dry-run code is one of the four wire codes and nothing richer
-        /// — not the instance id, not free text, not anything else that
-        /// would cross the privacy boundary if this path were ever wired to
-        /// a real notifier. `!code.contains(&instance)` alone would pass for
-        /// any code, including one that leaked something else entirely —
-        /// this pins the actual shape instead.
-        #[test]
-        fn the_dry_run_wire_code_is_exactly_one_of_the_four_known_codes() {
-            use ec2_manager::reaper::OutcomeCode;
-            for on_call in [true, false] {
-                let code = dry_run_projection(on_call).as_str().to_string();
-                assert_eq!(code.len(), 4, "{code}");
-                assert!(
-                    [
-                        OutcomeCode::Failure.as_str(),
-                        OutcomeCode::FailureQuiet.as_str(),
-                        OutcomeCode::Ok.as_str(),
-                        OutcomeCode::Canary.as_str(),
-                    ]
-                    .contains(&code.as_str()),
-                    "{code}"
-                );
-            }
+            assert!(f.reaper.allowed_users.is_empty());
         }
 
         /// Split across several send-commands there is a window between
@@ -27934,18 +28620,11 @@ mod gui {
             }
         }
 
-        /// Only a finished remediation earns a notifier entry. A dry-run
-        /// projection in particular must not — it never ran the fix, never
-        /// acknowledged and never contacted the instance, so sending on it
-        /// would ring a phone about something that did not happen.
+        /// Only a finished remediation earns a notifier entry. Every other
+        /// event — a skip, a failed lookup, a line of narration — must not,
+        /// or a phone would ring about something that did not happen.
         #[test]
         fn no_other_reaper_event_earns_a_notifier_entry() {
-            assert!(notify_from_event(&ReaperEvent::Considered {
-                code: "RE-F".to_string(),
-                instance: "i-0abc123def4567890".to_string(),
-                on_call: true,
-            })
-            .is_none());
             assert!(notify_from_event(&ReaperEvent::Skipped {
                 reason: "cooldown".to_string()
             })
@@ -31719,7 +32398,7 @@ mod gui {
 
         #[test]
         fn ticking_reaper_down_narrows_the_log_to_that_script() {
-            let only_reaper = OnCallFilters { reaper_down: true };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false };
             assert!(only_reaper.any());
             assert!(only_reaper.includes(LogSource::ReaperDown));
             assert!(!only_reaper.includes(LogSource::App));
@@ -31730,7 +32409,7 @@ mod gui {
             // The popup shuts as soon as it is used, so without this the only
             // evidence that most of the log is being hidden is the log being
             // short — which reads as the app having stopped logging.
-            assert_eq!(OnCallFilters { reaper_down: true }.label(), "On-Call: Reaper Down");
+            assert_eq!(OnCallFilters { reaper_down: true, pingdom: false }.label(), "On-Call: Reaper Down");
         }
 
         #[test]
@@ -31751,7 +32430,7 @@ mod gui {
 
             // And that tag is what the dropdown filters on — asserted through
             // the same predicate the panel uses, not a reimplementation of it.
-            let only_reaper = OnCallFilters { reaper_down: true };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false };
             let kept: Vec<&str> = app
                 .logs
                 .iter()
@@ -31766,7 +32445,7 @@ mod gui {
             // The two filters are independent and both on screen. A DEBUG
             // reaper line with DEBUG unticked stays hidden, the same as any
             // other DEBUG line.
-            let only_reaper = OnCallFilters { reaper_down: true };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false };
             let mut levels = LogFilters::default();
             levels.set_verbosity_low();
             assert!(!levels.includes(LogLevel::Debug));
@@ -33125,6 +33804,303 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let (role, groups) = parse_instance_extras(&serde_json::json!({}));
             assert!(role.is_none());
             assert!(groups.is_empty());
+        }
+
+        // -- pingdom watcher ---------------------------------------------
+
+        fn pingdom_cfg() -> ec2_manager::features::PingdomFeature {
+            ec2_manager::features::PingdomFeature {
+                enabled: true,
+                allowed_users: vec!["bconrad".to_string()],
+                message_contains: "[Pingdom]".to_string(),
+                ..Default::default()
+            }
+        }
+
+        fn dry_run_reaper_cfg() -> ec2_manager::features::ReaperFeature {
+            ec2_manager::features::ReaperFeature {
+                enabled: true,
+                allowed_users: vec!["bconrad".to_string()],
+                alertname_contains: "reaper".to_string(),
+                ..Default::default()
+            }
+        }
+
+        fn dry_run_alert(title: &str) -> ec2_manager::alerts::Alert {
+            ec2_manager::alerts::Alert {
+                id: "a1".to_string(),
+                status: "open".to_string(),
+                message: title.to_string(),
+                created_at: "2026-08-26T14:03:11Z".to_string(),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn a_dry_run_routes_a_pingdom_alert_to_the_pingdom_path() {
+            assert_eq!(
+                dry_run_route(
+                    &dry_run_alert("[Pingdom] domain xxx yy PROD"),
+                    &dry_run_reaper_cfg(),
+                    &pingdom_cfg(),
+                ),
+                DryRunRoute::Pingdom
+            );
+        }
+
+        #[test]
+        fn a_dry_run_routes_a_reaper_alert_to_the_reaper_path() {
+            let mut a = dry_run_alert("something is wrong");
+            a.extra.insert("alertname".to_string(), "reaper-stalled".to_string());
+            assert_eq!(
+                dry_run_route(&a, &dry_run_reaper_cfg(), &pingdom_cfg()),
+                DryRunRoute::Reaper
+            );
+        }
+
+        #[test]
+        fn an_alert_both_watchers_claim_takes_the_reaper_path() {
+            // Reaper is the one with a box to read, so an alert both claim
+            // gets the more thorough run -- and the more thorough run answers
+            // the pingdom question too.
+            let mut a = dry_run_alert("[Pingdom] domain xxx yy PROD");
+            a.extra.insert("alertname".to_string(), "reaper-stalled".to_string());
+            assert_eq!(
+                dry_run_route(&a, &dry_run_reaper_cfg(), &pingdom_cfg()),
+                DryRunRoute::Reaper
+            );
+        }
+
+        #[test]
+        fn an_alert_no_watcher_claims_is_routed_nowhere() {
+            // And the caller escalates nothing: a dry run that paged on an
+            // alert neither watcher would ever act on proves nothing about
+            // either of them.
+            assert_eq!(
+                dry_run_route(
+                    &dry_run_alert("disk usage on some unrelated box"),
+                    &dry_run_reaper_cfg(),
+                    &pingdom_cfg(),
+                ),
+                DryRunRoute::Neither
+            );
+        }
+
+        #[test]
+        fn unconfigured_rules_claim_nothing() {
+            // A blank *_contains matches nothing, so a build nobody has
+            // configured routes every alert to Neither rather than to
+            // whichever watcher is checked first.
+            assert_eq!(
+                dry_run_route(
+                    &dry_run_alert("[Pingdom] domain xxx yy PROD"),
+                    &ec2_manager::features::ReaperFeature::default(),
+                    &ec2_manager::features::PingdomFeature::default(),
+                ),
+                DryRunRoute::Neither
+            );
+        }
+
+        #[test]
+        fn a_pingdom_escalation_carries_nothing_but_a_code_and_a_time() {
+            // The subject is the entire payload. The incident label and the
+            // alert id are for the local log and must never reach it: the
+            // environment names a corporate estate, and this leaves the org.
+            let e = ec2_manager::pingdom::Escalation {
+                alert_id: "0b3f-alert-id".to_string(),
+                created_at: "2026-08-26T14:03:11Z".to_string(),
+                incident: "PROD".to_string(),
+            };
+            let subject = pingdom_escalation_subject(&e);
+
+            assert_eq!(subject, "RE-F 2026-08-26T14:03:11Z");
+            assert!(!subject.contains("PROD"), "the environment must not leave the org");
+            assert!(!subject.contains("0b3f"), "the alert id must not leave the org");
+        }
+
+        #[test]
+        fn the_pingdom_code_is_taken_from_the_shared_vocabulary() {
+            // Never a literal. A drifted code sends mail the Pi daemon does
+            // not recognise, which it escalates as unknown -- a failure that
+            // looks exactly like success.
+            let e = ec2_manager::pingdom::Escalation {
+                alert_id: "a1".to_string(),
+                created_at: "2026-08-26T14:03:11Z".to_string(),
+                incident: "PROD".to_string(),
+            };
+            assert!(pingdom_escalation_subject(&e)
+                .starts_with(ec2_manager::reaper::OutcomeCode::Failure.as_str()));
+        }
+
+        #[test]
+        fn a_pingdom_escalation_with_no_timestamp_still_sends_the_code() {
+            // An escalation that arrives without a timestamp is worth far
+            // more than one that does not arrive.
+            let e = ec2_manager::pingdom::Escalation {
+                alert_id: "a1".to_string(),
+                created_at: String::new(),
+                incident: "PROD".to_string(),
+            };
+            assert_eq!(pingdom_escalation_subject(&e), "RE-F");
+        }
+
+        #[test]
+        fn a_disabled_pingdom_block_says_so_rather_than_going_quiet() {
+            // Three different dark states wrote nothing at all for reaper and
+            // it took five rounds of guessing to tell them apart. Each one
+            // here names itself.
+            let off = ec2_manager::features::PingdomFeature {
+                enabled: false,
+                ..pingdom_cfg()
+            };
+            let (armed, lines) = pingdom_gate_report(&off, "bconrad", true, Some("x@y.com"));
+            assert!(!armed);
+            assert!(
+                lines.iter().any(|(_, m)| m.contains("pingdom.enabled")),
+                "{lines:?}"
+            );
+        }
+
+        #[test]
+        fn a_user_off_the_pingdom_allow_list_is_told_which_name_was_checked() {
+            let (armed, lines) =
+                pingdom_gate_report(&pingdom_cfg(), "someone-else", true, Some("x@y.com"));
+            assert!(!armed);
+            let joined = lines.iter().map(|(_, m)| m.as_str()).collect::<Vec<_>>().join(" ");
+            assert!(joined.contains("someone-else"), "{joined}");
+            assert!(joined.contains("pingdom.allowed_users"), "{joined}");
+        }
+
+        #[test]
+        fn pingdom_stays_dark_without_jsm_credentials() {
+            let (armed, lines) = pingdom_gate_report(&pingdom_cfg(), "bconrad", false, Some("x@y.com"));
+            assert!(!armed);
+            assert!(
+                lines.iter().any(|(_, m)| m.contains("JSM credentials")),
+                "{lines:?}"
+            );
+        }
+
+        #[test]
+        fn pingdom_stays_dark_without_an_escalation_mailbox() {
+            // Acknowledging without ever being able to escalate is worse
+            // than doing nothing: it silences a live page and then never
+            // rings. Fail closed.
+            for mailbox in [None, Some(""), Some("   ")] {
+                let (armed, lines) = pingdom_gate_report(&pingdom_cfg(), "bconrad", true, mailbox);
+                assert!(!armed, "{mailbox:?}");
+                assert!(
+                    lines.iter().any(|(_, m)| m.contains("escalation mailbox")),
+                    "{mailbox:?} {lines:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn an_armed_pingdom_watcher_reports_what_it_will_do() {
+            let (armed, lines) = pingdom_gate_report(&pingdom_cfg(), "bconrad", true, Some("x@y.com"));
+            assert!(armed);
+            let joined = lines.iter().map(|(_, m)| m.as_str()).collect::<Vec<_>>().join(" ");
+            assert!(joined.contains("armed"), "{joined}");
+            assert!(joined.contains("[Pingdom]"), "the match rule: {joined}");
+            assert!(joined.contains("10"), "the window in minutes: {joined}");
+        }
+
+        #[test]
+        fn the_startup_line_never_carries_the_escalation_address() {
+            // It goes to the app log, which users paste into tickets.
+            let (_, lines) =
+                pingdom_gate_report(&pingdom_cfg(), "bconrad", true, Some("secret@example.com"));
+            let joined = lines.iter().map(|(_, m)| m.as_str()).collect::<Vec<_>>().join(" ");
+            assert!(!joined.contains("secret@example.com"), "{joined}");
+        }
+
+        #[test]
+        fn two_users_watching_one_feed_is_warned_about() {
+            // Both machines acknowledge and both escalate; nothing
+            // arbitrates. Same hazard reaper warns about.
+            let shared = ec2_manager::features::PingdomFeature {
+                allowed_users: vec!["bconrad".to_string(), "someone".to_string()],
+                ..pingdom_cfg()
+            };
+            let (armed, lines) = pingdom_gate_report(&shared, "bconrad", true, Some("x@y.com"));
+            assert!(armed);
+            assert!(lines.iter().any(|(warn, _)| *warn), "must warn: {lines:?}");
+        }
+
+        #[test]
+        fn pingdom_does_nothing_at_all_when_off_call() {
+            // The user's rule, and the sharpest one this feature has:
+            // pingdom is only looked at by whoever holds the pager. Acting
+            // off call would silence somebody else's page and ring a phone
+            // about an alert this machine has no business taking.
+            let (act, why) = pingdom_on_call_decision(Ok(false));
+            assert!(!act);
+            assert!(why.contains("off call"), "{why}");
+        }
+
+        #[test]
+        fn pingdom_acts_only_when_the_schedule_says_this_machine_holds_the_pager() {
+            let (act, why) = pingdom_on_call_decision(Ok(true));
+            assert!(act);
+            assert!(why.contains("on call"), "{why}");
+        }
+
+        #[test]
+        fn an_unanswerable_schedule_counts_as_off_call() {
+            // The only direction that can neither acknowledge nor escalate
+            // by mistake. Same conservative degradation `oncall::is_on_call`
+            // documents for reaper.
+            let (act, why) = pingdom_on_call_decision(Err("403 from the schedule API".to_string()));
+            assert!(!act, "a lookup that failed must never authorise an ack or a page");
+            assert!(why.contains("403"), "the reason has to survive: {why}");
+        }
+
+        #[test]
+        fn the_escalation_spawn_and_the_script_agree_on_their_argument_names() {
+            // They live in different files and drifted apart once already for
+            // the secondary-mirror step. A renamed parameter here is not a
+            // compile error -- PowerShell would reject the call at runtime,
+            // inside a spawn nobody is watching, on the one path that exists
+            // to ring a phone.
+            const SCRIPT: &str = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/assets/scripts/send_escalation.ps1"
+            ));
+            for arg in escalation_script_args() {
+                assert!(
+                    SCRIPT.contains(&format!("${}", arg.trim_start_matches('-'))),
+                    "send_escalation.ps1 declares no parameter for {arg}"
+                );
+            }
+        }
+
+        #[test]
+        fn the_on_call_filter_can_narrow_the_log_to_pingdom() {
+            let only_pingdom = OnCallFilters { reaper_down: false, pingdom: true };
+            assert!(only_pingdom.includes(LogSource::Pingdom));
+            assert!(!only_pingdom.includes(LogSource::ReaperDown));
+            assert!(!only_pingdom.includes(LogSource::App));
+            assert_eq!(only_pingdom.label(), "On-Call: Pingdom");
+        }
+
+        #[test]
+        fn nothing_ticked_still_shows_the_pingdom_lines() {
+            // A dropdown nobody opens must not remove anything from view.
+            let none = OnCallFilters { reaper_down: false, pingdom: false };
+            assert!(none.includes(LogSource::Pingdom));
+            assert!(none.includes(LogSource::ReaperDown));
+            assert!(none.includes(LogSource::App));
+            assert_eq!(none.label(), "On-Call");
+        }
+
+        #[test]
+        fn both_ticked_shows_both_and_says_so() {
+            let both = OnCallFilters { reaper_down: true, pingdom: true };
+            assert!(both.includes(LogSource::Pingdom));
+            assert!(both.includes(LogSource::ReaperDown));
+            assert!(!both.includes(LogSource::App));
+            assert_eq!(both.label(), "On-Call: Reaper Down, Pingdom");
         }
     }
 }
