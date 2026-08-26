@@ -1369,6 +1369,11 @@ mod gui {
         comment_in_flight: bool,
         /// Outcome of the last comment post.
         comment_note: Option<std::result::Result<String, String>>,
+        /// What this ticket looked like the last time it was opened,
+        /// captured **before** opening overwrites it. This is what makes the
+        /// window able to say exactly what changed, where the list can only
+        /// say that something did.
+        seen_before: Option<ec2_manager::jira::SeenRecord>,
         /// The `@` dropdown, while one is open.
         mention: Option<MentionPopup>,
         /// `("@John Smith", accountId)` for every name **picked** from that
@@ -1477,9 +1482,10 @@ mod gui {
     }
 
     impl TicketWindow {
-        fn new(key: String) -> Self {
+        fn new(key: String, seen_before: Option<ec2_manager::jira::SeenRecord>) -> Self {
             Self {
                 key,
+                seen_before,
                 issue: None,
                 transitions: Vec::new(),
                 error: None,
@@ -1528,6 +1534,10 @@ mod gui {
             key: String,
             result: std::result::Result<Vec<ec2_manager::jira::Comment>, String>,
         },
+        /// An open-tickets poll made by the background watcher rather than
+        /// by the window. Feeds the unread set and the badge; never touches
+        /// the window's rows, which may be showing the Closed scope.
+        Background(std::result::Result<Vec<ec2_manager::jira::IssueRow>, String>),
         /// Directory results for one `@` query.
         Users {
             key: String,
@@ -7504,6 +7514,15 @@ mod gui {
         /// Resolved once at startup, like `alerts_auth` — the credentials
         /// behind it are a `CredReadW` per field on Windows.
         jira_site: ec2_manager::jira::JiraSite,
+        /// Ticket keys that have changed since they were last opened.
+        /// Drives the toolbar badge and the `new` marker in the list.
+        jira_unread: std::collections::BTreeSet<String>,
+        /// Open tickets from the most recent poll, for the badge's hover
+        /// text. The badge itself counts `jira_unread`.
+        jira_open_count: usize,
+        /// True while the ticket window is open, read by the background poll
+        /// so the two do not both fetch on the same cadence.
+        jira_window_open: std::sync::Arc<std::sync::atomic::AtomicBool>,
         /// Ticket list window state; `None` while the window is closed.
         jira_window: Option<JiraWindow>,
         /// Open ticket windows, one per ticket key. A Vec rather than a map
@@ -7700,6 +7719,8 @@ mod gui {
             let (preflight_tx, preflight_rx) = mpsc::channel();
             let (alerts_tx, alerts_rx) = mpsc::channel();
             let (jira_tx, jira_rx) = mpsc::channel();
+            let jira_window_open_flag =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (ack_all_tx, ack_all_rx) = mpsc::channel();
             let (probe_tx, probe_rx) = mpsc::channel();
             let (email_tx, email_rx) = mpsc::channel();
@@ -8090,6 +8111,9 @@ mod gui {
                 alerts_rx,
                 jira_enabled,
                 jira_site,
+                jira_unread: std::collections::BTreeSet::new(),
+                jira_open_count: 0,
+                jira_window_open: jira_window_open_flag,
                 jira_window: None,
                 jira_tickets: Vec::new(),
                 jira_tx,
@@ -8186,6 +8210,9 @@ mod gui {
                 // the Jira site returns a perfectly valid, entirely empty
                 // ticket list, and nothing else in the log would say so.
                 app.log_info(format!("jira: reading tickets from {}", app.jira_site.api_base()));
+                // The badge is only worth having if it is live before the
+                // window is ever opened.
+                app.start_jira_background_poll();
             }
             for (is_warn, msg) in reaper_startup_log {
                 // Tagged like the rest of the remediation's output: "the
@@ -12912,6 +12939,99 @@ mod gui {
             });
         }
 
+        /// The background watcher: one open-tickets poll every five minutes,
+        /// whether or not the window is open, so the toolbar badge means
+        /// something before you look.
+        ///
+        /// **Skipped while the window is open** — its own auto-refresh
+        /// already polls on the same cadence, and running both would double
+        /// the traffic for one answer. A DEBUG heartbeat per tick keeps "the
+        /// thread never started" and "nothing has changed" distinguishable,
+        /// which is the lesson the reaper and pingdom watchers both carry.
+        fn start_jira_background_poll(&mut self) {
+            if !self.jira_enabled {
+                return;
+            }
+            let site = self.jira_site.clone();
+            let tx = self.jira_tx.clone();
+            let window_open = self.jira_window_open.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(JIRA_REFRESH_SECS));
+                if window_open.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                let result = ec2_manager::jira::search_my_issues(
+                    &site,
+                    ec2_manager::jira::TicketScope::Open,
+                    ec2_manager::jira::DEFAULT_CLOSED_DAYS,
+                )
+                .map_err(|e| e.to_string());
+                if tx.send(JiraEvent::Background(result)).is_err() {
+                    return; // the app is gone
+                }
+            });
+        }
+
+        /// Fold a fresh set of **open** rows into the unread state.
+        ///
+        /// Called for both the background poll and the window's own Open
+        /// searches, so there is one definition of what unread means and the
+        /// two cannot drift.
+        fn absorb_jira_open_rows(&mut self, rows: &[ec2_manager::jira::IssueRow]) {
+            self.jira_open_count = rows.len();
+            let truncated = ec2_manager::jira::is_truncated(rows);
+
+            if !self.config.jira_seen_baselined {
+                // First run: record what is already there rather than
+                // announcing all of it. Every ticket unread on first launch
+                // is technically true and completely useless.
+                for row in rows {
+                    self.config.jira_seen.insert(
+                        row.key.clone(),
+                        ec2_manager::jira::SeenRecord {
+                            updated: row.updated.clone(),
+                            status: row.status.clone(),
+                        },
+                    );
+                }
+                self.config.jira_seen_baselined = true;
+                self.jira_unread.clear();
+                self.save_config_quietly("the Jira seen list");
+                self.log_info(format!(
+                    "jira: baselined {} open ticket(s); changes from here are flagged",
+                    rows.len()
+                ));
+                return;
+            }
+
+            let before = self.config.jira_seen.len();
+            ec2_manager::jira::prune_closed(&mut self.config.jira_seen, rows, truncated);
+            ec2_manager::jira::prune_seen(&mut self.config.jira_seen, chrono::Utc::now(), 180);
+            if self.config.jira_seen.len() != before {
+                self.save_config_quietly("the Jira seen list");
+            }
+            self.jira_unread = ec2_manager::jira::unread_keys(rows, &self.config.jira_seen)
+                .into_iter()
+                .collect();
+        }
+
+        /// Record what a ticket looked like, so it stops being unread.
+        ///
+        /// Only called once the issue has actually been read: marking on
+        /// *open* would let a failed fetch silently eat the notification.
+        fn mark_jira_ticket_seen(&mut self, issue: &ec2_manager::jira::Issue) {
+            self.config.jira_seen.insert(
+                issue.key.clone(),
+                ec2_manager::jira::SeenRecord {
+                    updated: issue.updated.clone(),
+                    status: issue.status.clone(),
+                },
+            );
+            self.config.jira_seen_baselined = true;
+            self.jira_unread.remove(&issue.key);
+            self.save_config_quietly("the Jira seen list");
+        }
+
         /// Open a ticket's window, or raise the one it already has.
         ///
         /// Identity is the ticket key, so clicking the same row twice never
@@ -12931,7 +13051,9 @@ mod gui {
                 return;
             }
             self.log_info(format!("jira: opening {key}"));
-            self.jira_tickets.push(TicketWindow::new(key.clone()));
+            let seen_before = self.config.jira_seen.get(&key).cloned();
+            self.jira_tickets
+                .push(TicketWindow::new(key.clone(), seen_before));
             self.start_jira_ticket_load(&key);
         }
 
@@ -13076,9 +13198,16 @@ mod gui {
                         win.loading = false;
                         match result {
                             Ok(rows) => {
-                                win.rows = rows;
+                                let scope = win.scope;
+                                win.rows = rows.clone();
                                 win.error = None;
                                 win.fetched_at = Some(chrono::Local::now());
+                                // Only the Open scope says anything about
+                                // unread: a closed ticket cannot be waiting
+                                // on you.
+                                if scope == ec2_manager::jira::TicketScope::Open {
+                                    self.absorb_jira_open_rows(&rows);
+                                }
                             }
                             Err(err) => {
                                 self.log_error(format!("jira: {err}"));
@@ -13096,8 +13225,9 @@ mod gui {
                         win.loading = false;
                         match result {
                             Ok(issue) => {
-                                win.issue = Some(*issue);
+                                win.issue = Some(*issue.clone());
                                 win.error = None;
+                                self.mark_jira_ticket_seen(&issue);
                             }
                             Err(err) => {
                                 self.log_error(format!("jira: {key}: {err}"));
@@ -13155,6 +13285,24 @@ mod gui {
                             }
                         }
                     }
+                    JiraEvent::Background(result) => match result {
+                        Ok(rows) => {
+                            let was = self.jira_unread.len();
+                            self.absorb_jira_open_rows(&rows);
+                            let now = self.jira_unread.len();
+                            self.log_debug(format!(
+                                "jira: polled {} open ticket(s), {now} unread",
+                                rows.len()
+                            ));
+                            if now > was {
+                                self.log_info(format!(
+                                    "jira: {} ticket(s) changed since you last looked",
+                                    now - was
+                                ));
+                            }
+                        }
+                        Err(err) => self.log_warn(format!("jira: background poll: {err}")),
+                    },
                     JiraEvent::Users { key, query, result } => {
                         let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key)
                         else {
@@ -13699,6 +13847,7 @@ mod gui {
                 .resizable(true)
                 .default_size([940.0, 460.0])
                 .show(ctx, |ui| {
+                    let unread = self.jira_unread.clone();
                     let (rows, error, search_error, fetched_at, days_error) = {
                         let w = self.jira_window.as_ref().expect("checked above");
                         (
@@ -13847,7 +13996,7 @@ mod gui {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             egui::Grid::new("jira_grid")
-                                .num_columns(7)
+                                .num_columns(8)
                                 .striped(true)
                                 .spacing([12.0, 6.0])
                                 .show(ui, |ui| {
@@ -13860,7 +14009,7 @@ mod gui {
                                     // done ticket overdue.
                                     let closed_view =
                                         scope == ec2_manager::jira::TicketScope::Closed;
-                                    for h in ["Key", "Type", "Pri", "Status"] {
+                                    for h in ["Key", "", "Type", "Pri", "Status"] {
                                         ui.strong(h);
                                     }
                                     if closed_view {
@@ -13886,6 +14035,15 @@ mod gui {
                                             .clicked()
                                         {
                                             open_key = Some(row.key.clone());
+                                        }
+                                        if unread.contains(&row.key) {
+                                            note_label(
+                                                ui,
+                                                egui::Color32::from_rgb(220, 160, 60),
+                                                "new",
+                                            );
+                                        } else {
+                                            ui.label("");
                                         }
                                         ui.label(dash_if_blank(&row.issue_type));
                                         note_label(
@@ -13972,6 +14130,10 @@ mod gui {
             }
             if !open {
                 self.jira_window = None;
+                // The background poll steps aside while the window is open;
+                // it has to be told when that stops being true.
+                self.jira_window_open
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
 
@@ -14057,13 +14219,14 @@ mod gui {
                         w.note.clone(),
                     )
                 };
-                let (comments, comments_error, comment_in_flight, comment_note) = {
+                let (comments, comments_error, comment_in_flight, comment_note, seen_before) = {
                     let w = &self.jira_tickets[idx];
                     (
                         w.comments.clone(),
                         w.comments_error.clone(),
                         w.comment_in_flight,
                         w.comment_note.clone(),
+                        w.seen_before.clone(),
                     )
                 };
                 // Edited in place by the widgets, written back after the
@@ -14165,6 +14328,40 @@ mod gui {
                                     );
                                 });
                                 ui.label(egui::RichText::new(&issue.summary).size(16.0));
+
+                                // What changed since the last look. The list
+                                // can only say "something did"; here the
+                                // comments have been fetched anyway, so it
+                                // can be exact.
+                                if let Some(seen) = &seen_before {
+                                    let new_comments = ec2_manager::jira::comments_since(
+                                        &comments,
+                                        &seen.updated,
+                                    );
+                                    let mut changes: Vec<String> = Vec::new();
+                                    if new_comments > 0 {
+                                        changes.push(format!(
+                                            "{new_comments} new comment{}",
+                                            if new_comments == 1 { "" } else { "s" }
+                                        ));
+                                    }
+                                    if !seen.status.is_empty() && seen.status != issue.status {
+                                        changes.push(format!(
+                                            "status: {} -> {}",
+                                            seen.status, issue.status
+                                        ));
+                                    }
+                                    if !changes.is_empty() {
+                                        note_label(
+                                            ui,
+                                            egui::Color32::from_rgb(220, 160, 60),
+                                            format!(
+                                                "Since you last looked: {}",
+                                                changes.join(", ")
+                                            ),
+                                        );
+                                    }
+                                }
                                 ui.add_space(6.0);
 
                                 egui::Grid::new(("jira_fields", key.as_str()))
@@ -24897,29 +25094,50 @@ mod gui {
                         // Jira tickets — the same allow-list-plus-credentials
                         // gate as Alerts, but shipped open (see JiraFeature).
                         if self.jira_enabled {
-                            let count = self
-                                .jira_window
-                                .as_ref()
-                                .map(|w| w.rows.len())
-                                .unwrap_or(0);
-                            let label = if count > 0 {
-                                format!("Jira Tickets ({count})")
+                            let unread = self.jira_unread.len();
+                            // A filled button, not coloured text: in a row of
+                            // identically-shaped grey buttons a few coloured
+                            // characters are easy to skim past, and a
+                            // notification cannot have that failure mode.
+                            // Amber rather than red — red means "a thing
+                            // failed" everywhere else in this app.
+                            let button = if unread > 0 {
+                                egui::Button::new(
+                                    egui::RichText::new(format!("Jira Tickets ({unread})"))
+                                        .strong()
+                                        .color(egui::Color32::BLACK),
+                                )
+                                .fill(egui::Color32::from_rgb(220, 160, 60))
                             } else {
-                                "Jira Tickets".to_string()
+                                egui::Button::new("Jira Tickets")
+                            };
+                            let hover = if unread > 0 {
+                                format!(
+                                    "{unread} changed since you looked · {} open ticket(s)\n\n\
+                                     A ticket is flagged when its status moves or it is \
+                                     updated — a new comment always counts. Opening it \
+                                     clears the flag.",
+                                    self.jira_open_count
+                                )
+                            } else {
+                                "Your open tickets. Click one to open its ticket view, \
+                                 where the moves that ticket's own workflow allows \
+                                 (Start Progress, Close, ...) are buttons."
+                                    .to_string()
                             };
                             if ui
-                                .button(label)
-                                .on_hover_text(
-                                    "Your open tickets. Click one to open its ticket view, \
-                                     where the moves that ticket's own workflow allows \
-                                     (Start Progress, Close, ...) are buttons.",
-                                )
+                                .add(button)
+                                .on_hover_text(hover)
                                 .clicked()
                             {
                                 if self.jira_window.is_some() {
                                     self.jira_window = None;
+                                    self.jira_window_open
+                                        .store(false, std::sync::atomic::Ordering::Relaxed);
                                 } else {
                                     self.jira_window = Some(JiraWindow::new());
+                                    self.jira_window_open
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
                                     self.log_info("jira: opening ticket list");
                                     self.start_jira_search();
                                 }

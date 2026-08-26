@@ -38,7 +38,7 @@
 //!   wrappers around them, so the whole of the parsing — including the
 //!   fields Jira routinely returns as `null` — is tested without a network.
 
-use chrono::{DateTime, Local, TimeZone};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use serde_json::Value;
 
 use crate::alerts::AlertsAuth;
@@ -55,6 +55,126 @@ const MAX_RESULTS: u32 = 50;
 /// `accountId = …` clause.
 pub const DEFAULT_JQL: &str =
     "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC";
+
+/// What was on a ticket the last time it was actually looked at.
+///
+/// Both halves matter: `status` alone misses a comment, and `updated` alone
+/// cannot say *what* changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SeenRecord {
+    /// `updated` as the API returned it, at the moment the ticket was read.
+    pub updated: String,
+    pub status: String,
+}
+
+/// The tickets that have changed since they were last looked at.
+///
+/// Pure over the rows and the seen store, so the rule is pinned by a test
+/// rather than by a condition inside a render function.
+///
+/// **A ticket with no record is unread**, because a newly assigned ticket is
+/// exactly the thing worth being told about. The one exception is the very
+/// first run, which the caller handles by baselining the store rather than by
+/// weakening this — otherwise every ticket you already knew about would
+/// arrive as a notification.
+///
+/// Detection is `status` changed **or** `updated` moved. A comment always
+/// bumps `updated`, so every case this is meant to catch is caught; so is a
+/// label edit, which is why the list marker says *changed* rather than *new
+/// comment*. The ticket window is where it becomes precise, because the
+/// comments are fetched there anyway.
+pub fn unread_keys(
+    rows: &[IssueRow],
+    seen: &std::collections::BTreeMap<String, SeenRecord>,
+) -> Vec<String> {
+    rows.iter()
+        .filter(|row| match seen.get(&row.key) {
+            None => true,
+            Some(rec) => rec.status != row.status || rec.updated != row.updated,
+        })
+        .map(|row| row.key.clone())
+        .collect()
+}
+
+/// How many comments arrived after `since` (an `updated` stamp from a
+/// [`SeenRecord`]).
+///
+/// Returns 0 when `since` cannot be parsed rather than claiming every comment
+/// is new: an unreadable stamp is not evidence of anything.
+pub fn comments_since(comments: &[Comment], since: &str) -> usize {
+    let Some(cutoff) = parse_stamp(since) else {
+        return 0;
+    };
+    comments
+        .iter()
+        .filter(|c| parse_stamp(&c.created).is_some_and(|at| at > cutoff))
+        .count()
+}
+
+/// Drop seen-records for tickets nobody has touched in `max_age_days`.
+///
+/// The store is written to `config.ini` and gains an entry per ticket ever
+/// opened, so without this it grows for the life of the install. Age is read
+/// from the recorded `updated`, which is the last time the ticket changed —
+/// an unparseable one is dropped too, since it can never compare equal and so
+/// leaves the ticket permanently unread anyway.
+pub fn prune_seen(
+    seen: &mut std::collections::BTreeMap<String, SeenRecord>,
+    now: DateTime<Utc>,
+    max_age_days: i64,
+) {
+    let cutoff = now - chrono::Duration::days(max_age_days);
+    seen.retain(|_, rec| match parse_stamp(&rec.updated) {
+        Some(at) => at.with_timezone(&Utc) >= cutoff,
+        None => false,
+    });
+}
+
+/// Forget the tickets that are no longer open.
+///
+/// A closed ticket needs no seen-record: it will not gain comments anyone is
+/// waiting on, and the store is written to `config.ini`, so keeping one per
+/// ticket ever opened grows the file for the life of the install. Clearing on
+/// close bounds it to roughly the number of tickets you currently have open.
+///
+/// **A reopened ticket then has no record and reads as unread — which is
+/// right.** A ticket coming back is exactly the thing worth being told about.
+///
+/// `truncated` is the guard that makes this safe. The open search is capped
+/// at [`MAX_RESULTS`], so when the cap is hit, absence from the list is not
+/// evidence that a ticket closed — it may simply be row 51. Pruning then
+/// would drop live records and make those tickets announce themselves as new
+/// the moment they surfaced.
+pub fn prune_closed(
+    seen: &mut std::collections::BTreeMap<String, SeenRecord>,
+    open_rows: &[IssueRow],
+    truncated: bool,
+) {
+    if truncated {
+        return;
+    }
+    let live: std::collections::BTreeSet<&str> =
+        open_rows.iter().map(|r| r.key.as_str()).collect();
+    seen.retain(|key, _| live.contains(key.as_str()));
+}
+
+/// True when a result set may have been cut off by the row cap, so absence
+/// from it says nothing.
+pub fn is_truncated(rows: &[IssueRow]) -> bool {
+    rows.len() as u32 >= MAX_RESULTS
+}
+
+/// Jira's own timestamp spelling, which writes the offset without a colon.
+fn parse_stamp(s: &str) -> Option<DateTime<chrono::FixedOffset>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(s)
+        .or_else(|_| DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.3f%z"))
+        .or_else(|_| DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%z"))
+        .ok()
+}
 
 /// How far back the closed list looks, unless the user says otherwise.
 pub const DEFAULT_CLOSED_DAYS: u32 = 30;
@@ -997,10 +1117,7 @@ pub fn local_time(ts: &str) -> String {
     if ts.is_empty() {
         return String::new();
     }
-    let parsed = DateTime::parse_from_rfc3339(ts)
-        .or_else(|_| DateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.3f%z"))
-        .or_else(|_| DateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%z"));
-    match parsed {
+    match parse_stamp(ts).ok_or(()) {
         Ok(dt) => Local
             .from_utc_datetime(&dt.naive_utc())
             .format("%Y-%m-%d %-I:%M %p")
@@ -2066,6 +2183,116 @@ mod tests {
 
     /// The default JQL must not need an account id: `currentUser()` is what
     /// lets this work on a machine that has never been told who you are.
+    fn row(key: &str, status: &str, updated: &str) -> IssueRow {
+        IssueRow {
+            key: key.to_string(),
+            status: status.to_string(),
+            updated: updated.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn seen_of(pairs: &[(&str, &str, &str)]) -> std::collections::BTreeMap<String, SeenRecord> {
+        pairs
+            .iter()
+            .map(|(k, updated, status)| {
+                (
+                    k.to_string(),
+                    SeenRecord {
+                        updated: updated.to_string(),
+                        status: status.to_string(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_ticket_is_unread_when_its_status_or_its_updated_stamp_moved() {
+        let rows = vec![
+            row("OPS-1", "In Progress", "2026-08-26T10:00:00.000+0100"),
+            row("OPS-2", "To Do", "2026-08-26T10:00:00.000+0100"),
+            row("OPS-3", "To Do", "2026-08-26T10:00:00.000+0100"),
+        ];
+        let seen = seen_of(&[
+            // unchanged
+            ("OPS-1", "2026-08-26T10:00:00.000+0100", "In Progress"),
+            // a comment landed: `updated` moved, status did not
+            ("OPS-2", "2026-08-25T09:00:00.000+0100", "To Do"),
+            // status moved under us
+            ("OPS-3", "2026-08-26T10:00:00.000+0100", "In Progress"),
+        ]);
+        assert_eq!(unread_keys(&rows, &seen), vec!["OPS-2", "OPS-3"]);
+
+        // A ticket with no record at all is unread: a newly assigned ticket
+        // is exactly the thing worth being told about.
+        assert_eq!(
+            unread_keys(&rows, &std::collections::BTreeMap::new()).len(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_closed_ticket_is_forgotten_but_only_when_the_list_is_complete() {
+        let mut seen = seen_of(&[
+            ("OPS-1", "2026-08-26T10:00:00.000+0100", "To Do"),
+            ("OPS-9", "2026-08-01T10:00:00.000+0100", "In Progress"),
+        ]);
+        let open = vec![row("OPS-1", "To Do", "2026-08-26T10:00:00.000+0100")];
+
+        // OPS-9 is gone from the open list, so it closed: forget it. A
+        // reopened ticket then reads as unread, which is right.
+        prune_closed(&mut seen, &open, false);
+        assert_eq!(seen.keys().collect::<Vec<_>>(), vec!["OPS-1"]);
+
+        // But when the search hit its row cap, absence proves nothing -- the
+        // ticket may simply be row 51. Pruning there would drop live records
+        // and make those tickets announce themselves the moment they surface.
+        let mut seen = seen_of(&[("OPS-9", "2026-08-01T10:00:00.000+0100", "In Progress")]);
+        prune_closed(&mut seen, &open, true);
+        assert_eq!(seen.len(), 1, "a truncated list must prune nothing");
+
+        let full: Vec<IssueRow> = (0..MAX_RESULTS)
+            .map(|i| row(&format!("OPS-{i}"), "To Do", "2026-08-26T10:00:00.000+0100"))
+            .collect();
+        assert!(is_truncated(&full));
+        assert!(!is_truncated(&open));
+    }
+
+    #[test]
+    fn the_age_backstop_drops_records_nothing_else_would() {
+        // Close-based pruning misses a ticket that left your list another
+        // way -- reassigned, or moved to a project you cannot see.
+        let mut seen = seen_of(&[
+            ("OPS-1", "2026-08-20T10:00:00.000+0100", "To Do"),
+            ("OPS-OLD", "2025-01-01T10:00:00.000+0100", "To Do"),
+            ("OPS-BAD", "not a timestamp", "To Do"),
+        ]);
+        let now = DateTime::parse_from_rfc3339("2026-08-26T10:00:00+01:00")
+            .expect("valid")
+            .with_timezone(&Utc);
+        prune_seen(&mut seen, now, 180);
+        // An unparseable stamp can never compare equal, so its ticket is
+        // permanently unread either way -- dropping it changes nothing but
+        // the file size.
+        assert_eq!(seen.keys().collect::<Vec<_>>(), vec!["OPS-1"]);
+    }
+
+    #[test]
+    fn only_comments_newer_than_the_last_look_are_counted() {
+        let comments = vec![
+            Comment { created: "2026-08-25T09:00:00.000+0100".to_string(), ..Default::default() },
+            Comment { created: "2026-08-26T11:00:00.000+0100".to_string(), ..Default::default() },
+            Comment { created: "2026-08-26T12:00:00.000+0100".to_string(), ..Default::default() },
+        ];
+        assert_eq!(comments_since(&comments, "2026-08-26T10:00:00.000+0100"), 2);
+        assert_eq!(comments_since(&comments, "2026-08-26T23:00:00.000+0100"), 0);
+
+        // An unreadable stamp is not evidence that every comment is new.
+        assert_eq!(comments_since(&comments, ""), 0);
+        assert_eq!(comments_since(&comments, "who knows"), 0);
+    }
+
     #[test]
     fn the_default_jql_resolves_the_user_server_side() {
         // Neither scope may need an account id: `currentUser()` is what lets

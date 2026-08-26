@@ -53,6 +53,16 @@ pub struct AppConfig {
     /// added or that were discovered while scanning ~/.ssh/config.
     pub ssh_pem_library: Vec<String>,
     /// Per-profile default pem path (profile_id -> pem path).
+    /// What each Jira ticket looked like when it was last opened, keyed by
+    /// ticket key. Drives the unread badge; see `jira::unread_keys`.
+    pub jira_seen: BTreeMap<String, crate::jira::SeenRecord>,
+    /// Whether the seen store has ever been populated.
+    ///
+    /// Without this the first launch marks **every** ticket unread, because
+    /// none has a record — technically true and completely useless. The first
+    /// poll baselines instead, and only then does an unrecorded ticket mean
+    /// "new to you".
+    pub jira_seen_baselined: bool,
     pub ssh_pem_default: BTreeMap<String, String>,
     /// Per-profile SSH login user (profile_id -> user, e.g. "ec2-user").
     pub ssh_user_default: BTreeMap<String, String>,
@@ -144,6 +154,8 @@ impl Default for AppConfig {
             default_remote_browser_path: None,
             default_local_dialog_path: None,
             ssh_pem_library: Vec::new(),
+            jira_seen: BTreeMap::new(),
+            jira_seen_baselined: false,
             ssh_pem_default: BTreeMap::new(),
             ssh_user_default: BTreeMap::new(),
             ssh_pem_instance: BTreeMap::new(),
@@ -844,6 +856,29 @@ impl AppConfig {
                 continue;
             }
 
+            if let Some(rest) = key.strip_prefix("jira_seen.") {
+                // `<updated>|<b64 status>`. The status is encoded for the
+                // reason personal_script's fields are: this file is line-based
+                // and a status name is free text.
+                if !rest.is_empty() {
+                    if let Some((updated, status)) = value.split_once('|') {
+                        cfg.jira_seen.insert(
+                            rest.to_string(),
+                            crate::jira::SeenRecord {
+                                updated: updated.trim().to_string(),
+                                status: decode_b64(status).unwrap_or_default(),
+                            },
+                        );
+                    }
+                }
+                continue;
+            }
+
+            if key == "jira_seen_baselined" {
+                cfg.jira_seen_baselined = value == "1";
+                continue;
+            }
+
             if let Some(rest) = key.strip_prefix("forwards_disabled.") {
                 if !rest.is_empty() {
                     let names: Vec<String> = value
@@ -1105,6 +1140,16 @@ impl AppConfig {
             if *off {
                 lines.push(format!("forward_ports_off.{key}=1"));
             }
+        }
+        for (ticket, rec) in &self.jira_seen {
+            lines.push(format!(
+                "jira_seen.{ticket}={}|{}",
+                rec.updated,
+                encode_b64(&rec.status)
+            ));
+        }
+        if self.jira_seen_baselined {
+            lines.push("jira_seen_baselined=1".to_string());
         }
         for (key, names) in &self.disabled_forwards {
             if !names.is_empty() {

@@ -1241,6 +1241,50 @@ window, and a search box opens any ticket by key.
 - **The empty closed list names the window it searched** — otherwise "no
   tickets" reads as "you have closed nothing, ever" rather than "nothing in
   the last 30 days".
+#### The unread badge
+
+The **Jira Tickets** button carries an amber fill and a count while anything
+has changed since you last looked at it.
+
+- **What "unread" detects.** `unread_keys` is pure over the rows and the seen
+  store: a ticket is unread when its **status moved**, its **`updated` stamp
+  moved**, or it has **no record at all**. The list search already returns
+  both fields, so this costs **no extra API calls** — which is the whole
+  reason it is defined this way. A comment always bumps `updated`, so every
+  case it is meant to catch is caught; so does a label edit, which is why the
+  list marker reads **`new`** (something changed) rather than "new comment".
+- **The ticket window is where it becomes exact.** The comments are fetched
+  there anyway, so it says `2 new comments, status: To Do -> In Progress`,
+  built from `seen_before` — the record captured **before** opening
+  overwrites it.
+- **A ticket with no record is unread**, because a newly assigned ticket is
+  the thing most worth being told about. The exception is the **first ever
+  run**: with an empty store every ticket is unread, which is true and
+  useless, so the first poll **baselines** silently and sets
+  `jira_seen_baselined`.
+- **Read is recorded on a successful fetch, not on opening the window.** A
+  failed read would otherwise eat the notification silently.
+- **A closed ticket's record is dropped**, which bounds the store to roughly
+  your open-ticket count — it lives in `config.ini` and would otherwise gain
+  an entry per ticket ever opened. A *reopened* ticket then has no record and
+  reads as unread, which is right. **`prune_closed` is guarded on
+  truncation**: the open search is capped at 50, so when the cap is hit,
+  absence from the list is not evidence a ticket closed — it may be row 51,
+  and pruning would make it announce itself the moment it surfaced.
+  `prune_seen` is the age backstop (180 days) for tickets that left the list
+  another way, such as being reassigned.
+- **The background poll runs every five minutes and steps aside while the
+  window is open** (a shared `AtomicBool`), because the window's own
+  auto-refresh already polls on the same cadence and running both doubles the
+  traffic for one answer. It polls the **Open** scope only — unread on a
+  closed ticket is meaningless. DEBUG heartbeat per tick, so "the thread never
+  started" and "nothing changed" stay distinguishable, which is the lesson
+  both the reaper and pingdom watchers carry.
+- **A filled button, not coloured text.** In a row of identically-shaped grey
+  buttons a few coloured characters are easy to skim past, and a notification
+  cannot have that failure mode. **Amber, not red** — red means "a thing
+  failed" everywhere else in this app, and a new comment is not a failure.
+
 - **Auto-refresh is five minutes, not ten seconds.** An unacknowledged page is
   time-critical; a ticket list is not. It runs only while the window is open,
   the `loading` flag makes a tick that lands mid-search a skip rather than a
