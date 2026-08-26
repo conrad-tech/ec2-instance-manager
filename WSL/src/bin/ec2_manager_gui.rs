@@ -1381,6 +1381,16 @@ mod gui {
         /// picks them, which is the common case.
         selected: usize,
         loading: bool,
+        /// Ask the window's scroll area to bring the dropdown into view on
+        /// the next frame.
+        ///
+        /// The list is drawn *below* the comment box, which is already near
+        /// the bottom of the window, so it opens off-screen and has to be
+        /// scrolled to by hand — which is most of the point of a dropdown
+        /// gone. Set when it opens, when the token changes and when the
+        /// highlight moves; cleared once used, so it never fights someone
+        /// deliberately scrolling up to read the ticket while it is open.
+        scroll_into_view: bool,
     }
 
     /// A transition that cannot be a single click, because its screen has
@@ -13926,6 +13936,7 @@ mod gui {
                     (
                         m.selected,
                         m.loading,
+                        m.scroll_into_view,
                         ec2_manager::jira::mention_candidates(
                             &m.token,
                             &people,
@@ -13939,6 +13950,11 @@ mod gui {
                 let mut mention_move: i32 = 0;
                 let mut mention_close = false;
                 let mut mention_caret: Option<usize> = None;
+                // The comment box's real widget id, taken from the widget
+                // itself. `id_salt` is a *salt* — egui derives the actual id
+                // from it and the parent Ui — so `Id::new(salt)` addresses
+                // nothing, and loading state with it silently does nothing.
+                let mut comment_box_id: Option<egui::Id> = None;
                 let mut pending = self.jira_tickets[idx].pending_transition.take();
                 let mut post_comment = false;
                 let mut submit_pending = false;
@@ -14146,7 +14162,11 @@ mod gui {
                                         ui.spinner();
                                     }
                                     if ui
-                                        .add_enabled(!loading, egui::Button::new("↻"))
+                                        // Plain text, not a glyph: egui's
+                                        // default font has no Arrows block,
+                                        // so a reload arrow renders as an
+                                        // empty box.
+                                        .add_enabled(!loading, egui::Button::new("Reload"))
                                         .on_hover_text("Re-read this ticket")
                                         .clicked()
                                     {
@@ -14252,7 +14272,7 @@ mod gui {
                                 // the queue when it is added.
                                 let popup_open = mention_view
                                     .as_ref()
-                                    .map(|(_, _, rows)| !rows.is_empty())
+                                    .map(|(_, _, _, rows)| !rows.is_empty())
                                     .unwrap_or(false);
                                 if popup_open {
                                     ui.input_mut(|i| {
@@ -14265,7 +14285,7 @@ mod gui {
                                         if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
                                             || i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
                                         {
-                                            if let Some((sel, _, _)) = &mention_view {
+                                            if let Some((sel, _, _, _)) = &mention_view {
                                                 mention_pick = Some(*sel);
                                             }
                                         }
@@ -14282,18 +14302,19 @@ mod gui {
                                     .show(ui);
                                 // The caret is what says whether an `@` is being typed
                                 // right now, and where it starts.
+                                comment_box_id = Some(edit.response.id);
                                 if edit.response.has_focus() {
                                     mention_caret = edit.cursor_range.map(|r| r.primary.index);
                                 } else if edit.response.lost_focus() {
                                     mention_close = true;
                                 }
-                                if let Some((selected, loading, rows)) = &mention_view {
+                                if let Some((selected, loading, scroll, rows)) = &mention_view {
                                     if !rows.is_empty() {
                                         // Inline, not a floating Area: a popup inside a
                                         // window inside a scroll area is where egui
                                         // z-order and clipping bugs live, and this window
                                         // has already cost one layout bug.
-                                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                                        let listed = egui::Frame::group(ui.style()).show(ui, |ui| {
                                             for (i, u) in rows.iter().enumerate() {
                                                 if ui
                                                     .selectable_label(i == *selected, &u.display_name)
@@ -14308,8 +14329,22 @@ mod gui {
                                                     ui.weak("searching…");
                                                 });
                                             }
-                                            ui.weak("↑↓ to choose, Enter to insert, Esc to dismiss");
+                                            // Spelled out for the same
+                                            // reason: the arrow glyphs are
+                                            // not in the default font.
+                                            ui.weak(
+                                                "Up/Down to choose, Enter to insert, \
+                                                 Esc to dismiss",
+                                            );
                                         });
+                                        if *scroll {
+                                            // Otherwise the list opens below
+                                            // the fold and has to be scrolled
+                                            // to by hand.
+                                            listed
+                                                .response
+                                                .scroll_to_me(Some(egui::Align::BOTTOM));
+                                        }
                                     }
                                 }
                                 ui.horizontal(|ui| {
@@ -14371,7 +14406,7 @@ mod gui {
                 {
                     let w = &mut self.jira_tickets[idx];
 
-                    if let (Some(i), Some((_, _, rows))) = (mention_pick, &mention_view) {
+                    if let (Some(i), Some((_, _, _, rows))) = (mention_pick, &mention_view) {
                         if let (Some(user), Some(popup)) = (rows.get(i), w.mention.as_ref()) {
                             let (next, caret, label) = apply_mention_pick(
                                 &draft,
@@ -14399,6 +14434,7 @@ mod gui {
                     } else if let Some(caret) = mention_caret {
                         match mention_token_at(&draft, caret) {
                             Some((at, token)) => {
+                                let existed = w.mention.is_some();
                                 let popup = w.mention.get_or_insert(MentionPopup {
                                     at,
                                     token: token.clone(),
@@ -14408,7 +14444,15 @@ mod gui {
                                     // Enter picks them -- the common case.
                                     selected: 0,
                                     loading: false,
+                                    scroll_into_view: true,
                                 });
+                                if existed {
+                                    // Consumed by the render just done. Left
+                                    // set, it would re-scroll every frame and
+                                    // fight anyone scrolling up to read the
+                                    // ticket with the dropdown open.
+                                    popup.scroll_into_view = false;
+                                }
                                 if popup.at != at || popup.token != token {
                                     popup.at = at;
                                     popup.token = token.clone();
@@ -14416,15 +14460,17 @@ mod gui {
                                     // back to the top rather than pointing at
                                     // whatever row that index now holds.
                                     popup.selected = 0;
+                                    popup.scroll_into_view = true;
                                 }
                                 if mention_move != 0 {
-                                    if let Some((_, _, rows)) = &mention_view {
+                                    if let Some((_, _, _, rows)) = &mention_view {
                                         if !rows.is_empty() {
                                             let len = rows.len() as i32;
                                             let next =
                                                 (popup.selected as i32 + mention_move + len)
                                                     % len;
                                             popup.selected = next as usize;
+                                            popup.scroll_into_view = true;
                                         }
                                     }
                                 }
@@ -14448,15 +14494,20 @@ mod gui {
                 }
                 // Move the caret past the name just inserted, or the next
                 // keystroke lands where the `@` was.
-                if let Some(caret) = mention_caret.filter(|_| mention_pick.is_some()) {
-                    let id = egui::Id::new(("jira_comment_box", key.as_str()));
-                    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
-                        let ccursor = egui::text::CCursor::new(caret);
-                        state
-                            .cursor
-                            .set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
-                        egui::TextEdit::store_state(ctx, id, state);
-                    }
+                if let (Some(caret), Some(id)) =
+                    (mention_caret.filter(|_| mention_pick.is_some()), comment_box_id)
+                {
+                    // Without this the caret stays where the `@` was typed and
+                    // the next keystroke lands in the middle of the name that
+                    // was just inserted.
+                    let mut state = egui::TextEdit::load_state(ctx, id)
+                        .unwrap_or_default();
+                    let ccursor = egui::text::CCursor::new(caret);
+                    state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
+                    egui::TextEdit::store_state(ctx, id, state);
+                    ctx.memory_mut(|m| m.request_focus(id));
                 }
                 if let Some(query) = search_for {
                     self.start_jira_user_search(&key, &query);

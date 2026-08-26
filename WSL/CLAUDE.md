@@ -1141,6 +1141,26 @@ window, and a search box opens any ticket by key.
   - **Longest label wins when one mention's text prefixes another's**
     ("@John Smith" vs "@John Smithson"), or the shorter would be tagged and
     the remainder left as stray text.
+  - **It scrolls itself into view.** The list is drawn below the comment box,
+    which already sits near the bottom of the window, so it opens off-screen
+    and would have to be scrolled to by hand — most of the point of a
+    dropdown gone. `scroll_into_view` is set when it opens, when the token
+    changes and when the highlight moves, and **cleared once used**, so it
+    never fights someone deliberately scrolling up to read the ticket while
+    the dropdown is open.
+  - **The caret is moved past the inserted name, using the id the widget
+    reports** (`edit.response.id`) — **not** `Id::new(salt)`. `id_salt` is a
+    salt: egui derives the real id from it and the parent `Ui`, so an id
+    built from the salt alone addresses nothing and `load_state`/`store_state`
+    silently do nothing. Without the move the caret stays where the `@` was
+    and the next keystroke lands inside the name just inserted.
+  - **No glyphs from Unicode's Arrows block (U+2190–U+21FF) in any UI
+    string.** egui's default font has none of them, so `↻` on a button and
+    `↑↓` in a hint both rendered as empty boxes. Spell them: `Reload`,
+    `Up/Down`. `·`, `—` and `…` are fine and already used throughout.
+    (Pre-existing strings elsewhere still carry `→` and `↔` — several log
+    lines and the create-user result popup — and show boxes for the same
+    reason.)
   - **The dropdown renders inline, not as a floating `Area`.** A popup inside
     a window inside a scroll area is where egui z-order and clipping bugs
     live, and this window has already cost one layout bug.
