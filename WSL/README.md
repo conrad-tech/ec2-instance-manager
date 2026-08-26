@@ -104,6 +104,53 @@ Expected files (Linux):
 - `dist/linux/ec2_manager_1.1`
 - `dist/linux/ec2_manager_gui_1.1`
 
+### The build refuses a still-template configuration
+
+Three of the compiled-in asset files are checked by `build.rs`, and the build
+**fails** — naming the file, the field and the value — when one of them is
+still what this repo ships as a template:
+
+- **`assets/accounts.json`** — an account still on an example account number
+  (`123456789012`, `234567890123`, `345678901234`), or any value still
+  carrying a `YOUR-COMPANY` / `YOUR-ENTERPRISE` / `example.com` placeholder.
+- **`assets/features.json`** — placeholder text in any feature that is
+  switched **on**: `personal_scripts.git_host` and its `default_scripts`
+  (checked only once `personal_scripts.allowed_users` names somebody), and
+  `access_email`'s `email_domains` and `encrypt_template_guid` (checked only
+  while `access_email.enabled` is `true`). A section nobody can reach is left
+  alone — it hands its template text to no one.
+- **`assets/forwards.json`** — no port forwards declared at all.
+
+None of these can be noticed later, which is why they are asked about here.
+All three files are *valid* as shipped, so a template build comes up looking
+healthy and is simply pointed at nothing: an empty inventory reads exactly
+like an account you have no access to, an empty Port Forwards window reads
+exactly like a site with no forwards, and an access email addressed to
+`test.com` just quietly opens a draft instead of sending.
+
+**`ALLOW_NO_FORWARDS=1` waives all three**, for building a tree nobody has
+configured yet:
+
+```bash
+ALLOW_NO_FORWARDS=1 cargo build --features gui
+ALLOW_NO_FORWARDS=1 cargo test --features gui
+
+# the same thing as a build target — it exports the variable for you
+./scripts/build_binaries.sh test
+```
+
+The name is historical: the variable started as the `forwards.json` check and
+now covers all three, deliberately — they ask the same question about three
+files, and a developer on an unconfigured tree wants past all of them or none.
+
+It waives only *"this is still the default"*. A file that is genuinely **wrong**
+— bad JSON, a missing required field, a misspelled key, a port written as a
+string — fails the build either way.
+
+> **Do not release a build made with it.** What it produces is
+> indistinguishable from a properly configured build until somebody opens the
+> app and finds nothing in it.
+
 ## Launch Desktop GUI (Pop!_OS 24.04)
 
 From source:
@@ -393,6 +440,11 @@ If `TEST_VAR` is empty, WSLENV forwarding is broken. Run `wsl --shutdown` and re
 
 Place an `accounts.json` file next to `config.ini` (same directory) to configure your AWS accounts.
 The file is an array of account objects:
+
+> The copy in `assets/accounts.json` is compiled into the binary, and the build
+> refuses it while it still holds the example account numbers or a
+> `YOUR-COMPANY` placeholder — see
+> [The build refuses a still-template configuration](#the-build-refuses-a-still-template-configuration).
 
 ```json
 [
@@ -880,6 +932,9 @@ actions.
 Parsing **fails closed**: if the file is malformed, every gate defaults to off.
 To ship a build for admins who need user deletion, set `"allow_delete_user": true`
 and rebuild.
+
+The build also refuses placeholder values in any section that is switched on —
+see [The build refuses a still-template configuration](#the-build-refuses-a-still-template-configuration).
 
 ### Enabling Vault IAM Access
 

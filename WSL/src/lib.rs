@@ -6,6 +6,7 @@ pub mod aws_context;
 pub mod config;
 pub mod connection_tabs;
 pub mod credentials;
+pub mod defaults_check;
 pub mod diagnostics;
 pub mod error;
 pub mod fed_auth;

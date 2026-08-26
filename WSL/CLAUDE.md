@@ -27,9 +27,11 @@ When the user asks to revert, restore, or reference a prior change (e.g. "change
 
 ## Build commands
 
-**A build with no port forwards declared fails**, so the commands below need
-`ALLOW_NO_FORWARDS=1` in a tree whose `assets/forwards.json` still ships the
-empty `environments` block (see "The forwards.json build check" below).
+**A build against unconfigured assets fails** — no port forwards declared, or
+an `accounts.json` / `features.json` still holding this repo's template values
+— so the commands below need `ALLOW_NO_FORWARDS=1` on this tree, which ships
+all three that way. One variable waives all three; see "The forwards.json
+build check" and "The still-the-template check" below.
 
 ```bash
 # Development build (library + CLI)
@@ -1281,6 +1283,58 @@ script's own `#[cfg(test)]` code is never run.
   real environments are filled in. `the_bundled_forwards_file_passes_the_build_time_check`
   runs the same check with `require_forwards: false`, so the shipped file's
   *shape* is still guarded by the test suite.
+
+#### The still-the-template check (accounts.json / features.json)
+
+`src/defaults_check.rs` is the same arrangement as `forwards_check` — one file
+`include!`d by build.rs *and* compiled into the library, which is where its
+tests live — asking the third version of the same question: **not "is this
+file well-formed" but "has anyone actually filled it in".**
+
+- **It is the only one of the three checks a correctly-shaped file can fail.**
+  build.rs's own `accounts.json` / `features.json` validators check that every
+  required field is present with the right type, and the shipped template
+  passes both, because it is well-formed on purpose. So the build that comes
+  out is valid, runs, and is wrong in the one way nothing downstream can
+  notice: three AWS accounts that do not exist, a git host called
+  `github.YOUR-ENTERPRISE.com`, and an access-email path whose only permitted
+  mail domain is `test.com`. Each of those fails later, somewhere else, as
+  something else — an empty inventory reads exactly like an account you have
+  no access to.
+- **`validate_not_template` runs last**, after both shape validators, so a
+  file that is malformed or missing a field is reported by the check that
+  knows what to do about it. For the same reason `check_accounts_json` /
+  `check_features_json` return **no** problems for input they cannot parse:
+  offering "fill in your accounts" as the remedy for a stray comma is worse
+  than staying quiet.
+- **Placeholders are matched case-insensitively against every string**
+  (`YOUR-COMPANY`, `YOUR-ENTERPRISE`, `example.com`…), recursively, so a
+  template value is caught wherever it was copied to and the report names its
+  dotted path. Two values that read as perfectly real are named **by value**
+  instead — the shipped `test.com` / `test2.com` mail domains and the
+  all-zeros `encrypt_template_guid` — because nothing about their shape says
+  placeholder.
+- **`_`-prefixed keys are documentation, exactly as in `forwards_check`.**
+  Most of features.json by volume is `_*_comment` prose, and that prose names
+  example hosts and example domains deliberately. Reading it as configuration
+  would make the check impossible to satisfy.
+- **A section nobody can reach is skipped**, and this is what stops the check
+  becoming a nuisance: `personal_scripts` is only examined once its
+  `allowed_users` names somebody, and `access_email` only while `enabled` is
+  true. The binary hands that text to no one, so holding a build up over it
+  would force a site to configure a feature it deliberately left switched off.
+  Both gates live in the same file the check does, so arming a feature and
+  checking it are one rebuild.
+- **The bypass is `ALLOW_NO_FORWARDS=1`, shared with the forwards check** and
+  set by `./scripts/build_binaries.sh test`. The name is now wider than it
+  reads; one variable is deliberate, since the three checks ask the same
+  question about three files and a developer on an unconfigured tree wants
+  past all of them or none. It waives *only* "still the default" — every
+  shape problem stays fatal.
+- **There is no test asserting the shipped files are still the template.**
+  It would be true today and would have to be deleted the moment real values
+  land, and the build itself already asserts it: this tree does not compile
+  without the bypass.
 
 ### Background port-forward tunnels
 

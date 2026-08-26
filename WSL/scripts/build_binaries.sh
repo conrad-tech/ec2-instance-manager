@@ -64,14 +64,16 @@ Modes:
   all      Build linux + windows binaries (best on Linux host)
   linux    Build Linux binaries
   windows  Build Windows binaries
-  test     Host-native development build that BYPASSES the forwards check.
-           assets/forwards.json normally has to declare at least one port
-           forward or the build fails (a file that declares none yields no
-           forwards at runtime instead of an error, so nothing downstream can
-           tell that apart from a site that has none). This mode sets
-           ALLOW_NO_FORWARDS=1 so an unconfigured tree still builds for
-           development. Do not release what it produces: it forwards nothing.
-           The same variable works with plain cargo, e.g.
+  test     Host-native development build that BYPASSES the unconfigured-assets
+           checks. A build normally fails when assets/forwards.json declares no
+           port forwards, or when assets/accounts.json / assets/features.json
+           still hold this repo's template values. None of those can be noticed
+           later: every one of the files is valid as shipped, so the app comes
+           up looking healthy and is simply pointed at nothing. This mode sets
+           ALLOW_NO_FORWARDS=1, which waives all three, so an unconfigured tree
+           still builds for development. Do not release what it produces: it
+           forwards nothing and points at nothing. The same variable works with
+           plain cargo, e.g.
            ALLOW_NO_FORWARDS=1 cargo test --features gui
 
 Options:
@@ -572,15 +574,17 @@ main() {
   local os
   os="$(uname -s)"
 
-  # `test` is the development escape hatch for the forwards check in build.rs:
-  # it lets a tree whose assets/forwards.json declares no port forwards build
-  # anyway. Announced twice, loudly, because the resulting binary is
-  # indistinguishable from a real one until someone opens Port Forwards and
-  # finds it empty — which is the exact failure the check exists to prevent.
+  # `test` is the development escape hatch for build.rs's unconfigured-assets
+  # checks: it lets a tree that declares no port forwards, or whose
+  # accounts.json / features.json are still the shipped template, build anyway.
+  # Announced loudly, because the resulting binary is indistinguishable from a
+  # real one until someone opens the app and finds nothing in it — which is the
+  # exact failure those checks exist to prevent.
   if [[ "$mode" == "test" ]]; then
     export ALLOW_NO_FORWARDS=1
-    echo "warning: test build — forwards check bypassed (ALLOW_NO_FORWARDS=1)."
+    echo "warning: test build — unconfigured-assets checks bypassed (ALLOW_NO_FORWARDS=1)."
     echo "warning: any environment missing from assets/forwards.json forwards nothing."
+    echo "warning: template values left in accounts.json / features.json point at nothing."
     echo "warning: do not release a test build."
   fi
 

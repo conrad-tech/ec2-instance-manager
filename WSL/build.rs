@@ -15,6 +15,11 @@ include!("src/obf_core.rs");
 // live) so the build-time check and the schema it checks cannot drift.
 include!("src/forwards_check.rs");
 
+// Likewise the `defaults_check` module: the shape checks below say every
+// required field is present, and this says the values in them are not still
+// the ones this repo ships as a template.
+include!("src/defaults_check.rs");
+
 fn main() {
     // Validate the file the binary actually embeds via
     // `include_str!("../assets/accounts.json")` from `src/`, i.e.
@@ -101,6 +106,7 @@ fn main() {
 
     validate_features();
     validate_forwards();
+    validate_not_template();
     emit_obfuscated_assets();
     embed_windows_icon();
 }
@@ -404,5 +410,74 @@ fn validate_forwards() {
          Set {ALLOW_NO_FORWARDS_ENV}=1 to build with no forwards declared, or build with\n\
          `./scripts/build_binaries.sh test`, which sets it for you.\n",
         path.display()
+    );
+}
+
+/// Fail the build when `assets/accounts.json` or `assets/features.json` is
+/// still carrying the values this repo ships as a template.
+///
+/// The two validators above check *shape* — every required field present with
+/// the right type — and a wholly unedited pair of files passes both, because
+/// the template is well-formed on purpose. So the build that comes out is
+/// valid, runs, and is wrong in the one way nothing downstream can notice: it
+/// offers three AWS accounts that do not exist, a git host called
+/// `github.YOUR-ENTERPRISE.com`, and an access-email path whose only permitted
+/// mail domain is `test.com`. Every one of those fails later, somewhere else,
+/// as something else — an empty inventory, a clone that will not resolve, a
+/// create that quietly opens a draft instead of sending.
+///
+/// This runs last, so a file that is malformed or missing a field is reported
+/// by the check that actually knows what to do about it.
+///
+/// The bypass is the same one the forwards check uses — `ALLOW_NO_FORWARDS=1`,
+/// set for you by `./scripts/build_binaries.sh test`. One variable covers all
+/// three checks deliberately: they ask the same question about three files,
+/// and a developer building an unconfigured tree wants past all of them or
+/// none. Do not release a build made with it.
+fn validate_not_template() {
+    // `rerun-if-changed` for both files, and for the variable, is already
+    // printed by the validators above.
+    if std::env::var_os(ALLOW_NO_FORWARDS_ENV).is_some() {
+        return;
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    for (path, check) in [
+        (
+            "assets/accounts.json",
+            check_accounts_json as fn(&str) -> Vec<String>,
+        ),
+        ("assets/features.json", check_features_json),
+    ] {
+        // Unreadable is the other validators' business; they have already
+        // panicked on it by the time this runs.
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        problems.extend(check(&raw).into_iter().map(|p| format!("  - {path}: {p}")));
+    }
+
+    if problems.is_empty() {
+        return;
+    }
+
+    panic!(
+        "\nBuild failed: the bundled configuration is still this repo's template:\n{}\n\n\
+         assets/accounts.json must name the AWS accounts this build is for — label,\n\
+         account_id, region, sort_order and color per account, plus each account's\n\
+         environments and their vault_addr. See README \"Account configuration\".\n\n\
+         assets/features.json must name your site wherever a feature is switched on:\n\
+         personal_scripts.git_host and its default_scripts (checked only once\n\
+         personal_scripts.allowed_users names somebody), and access_email's mail\n\
+         domains and encrypt_template_guid (checked only while access_email.enabled\n\
+         is true). See README \"Feature flags\" and ACCESS_EMAIL_WALKTHROUGH.md.\n\n\
+         This is checked here because it cannot be noticed later. The template is\n\
+         valid JSON with every required field, so the app comes up looking healthy\n\
+         and is simply pointed at nothing — an empty inventory reads exactly like an\n\
+         account you have no access to.\n\n\
+         Set {ALLOW_NO_FORWARDS_ENV}=1 to build against the template anyway, or build with\n\
+         `./scripts/build_binaries.sh test`, which sets it for you. The same variable\n\
+         waives the forwards.json check; do not release a build made with it.\n",
+        problems.join("\n")
     );
 }
