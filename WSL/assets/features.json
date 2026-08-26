@@ -41,10 +41,17 @@
     "same ones the Alerts button uses and resolve from the environment or",
     "Windows Credential Manager, never from this committed file.",
     "Ships EMPTY, like alerts: the button is hidden until an admin opts",
-    "users in. Add OS usernames, or ['*'] for everyone."
+    "users in. Add OS usernames, or ['*'] for everyone.",
+    "base_url is the Jira site -- 'jira.example.com' or",
+    "'https://example.atlassian.net'. It is needed because Jira is not",
+    "necessarily on the same tenant as the JSM Ops alert feed; blank falls",
+    "back to addressing the alerts cloud id. NOTE this file is committed,",
+    "so a domain set here lands in git; the JIRA_BASE_URL environment",
+    "variable overrides it if you would rather it did not."
   ],
   "jira": {
-    "allowed_users": []
+    "allowed_users": [],
+    "base_url": ""
   },
   "_reaper_comment": "Unattended reaper auto-remediation. Ships disabled, dry-run, and with nobody allowed. allowed_users is SINGLE-ENTRY by policy - nothing arbitrates two machines remediating one alert - and '*' is deliberately not honoured here. The JSM schedule id and the caller's Atlassian account id drive the on-call lookup, which selects handling (ack + 15min + escalate, vs no ack + 10min + one message), never whether the fix runs -- like the alerts credentials above, NEITHER lives in this file: they resolve environment -> Windows Credential Manager only (targets ec2_manager/jsm_schedule_id and ec2_manager/jsm_account_id; env overrides SCHEDULE_ID and MY_ID). The *_contains fields identify a reaper alert; leave blank until a real reaper payload confirms them.",
   "reaper": {

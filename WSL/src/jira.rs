@@ -12,15 +12,23 @@
 //!
 //! Things here that are load-bearing:
 //!
-//! - **API v2, not v3.** v3 returns rich text fields (the description,
-//!   comments) as ADF — Atlassian Document Format, a JSON document tree that
-//!   would need a translator before egui could draw a word of it. v2 returns
-//!   the same fields as plain text. Both versions are live; v2 is the one
-//!   whose payload this app can render, so it is used throughout rather than
-//!   mixing versions per endpoint.
-//! - **Search is `/search/jql`, not `/search`.** Atlassian removed the old
-//!   unsuffixed search endpoint. The response shape is
-//!   `{"issues": [...]}` either way.
+//! - **The site is configurable, and it is not necessarily the alerts one.**
+//!   The JSM Ops feed is addressed by cloud id through
+//!   `api.atlassian.com/ex/jira/<cloud_id>`; a site can equally be addressed
+//!   by its own domain, and an org may run Jira somewhere other than the
+//!   tenant the alert feed lives in. [`resolve_base_url`] layers
+//!   `JIRA_BASE_URL` → `features.json` `jira.base_url` → the cloud-id form,
+//!   so an unset build behaves exactly as before.
+//! - **API v3, and search is `POST /search/jql`.** Atlassian removed the old
+//!   unsuffixed `/search`, and the v2 spelling of the replacement is not
+//!   dependable — a real tenant served v3 and only v3. POST rather than GET
+//!   because that is the form proven against that tenant, and it keeps a long
+//!   JQL out of a URL.
+//! - **v3 means the description arrives as ADF**, a JSON node tree rather
+//!   than text, so [`description_text`] flattens it. It also accepts a plain
+//!   string, because that is what v2 returns and a site may still answer that
+//!   way — one function, either payload, rather than a version to keep track
+//!   of.
 //! - **The issue key and the transition id are whitelisted, not escaped.**
 //!   The key is interpolated into a URL path and the transition id into a
 //!   JSON body, so both are checked against a strict shape and refused
@@ -48,16 +56,188 @@ const MAX_RESULTS: u32 = 50;
 pub const DEFAULT_JQL: &str =
     "assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC";
 
-/// Fields the list needs. Deliberately not `*all`: the list renders six
+/// Environment override for the Jira site. Layered above the `features.json`
+/// value so a domain need not be committed to git to be used.
+pub const JIRA_BASE_URL_ENV: &str = "JIRA_BASE_URL";
+
+/// Fields the list needs. Deliberately not every field: the list renders six
 /// columns and a search that drags every custom field on every ticket is
 /// slower for nothing.
-const LIST_FIELDS: &str = "summary,status,issuetype,priority,updated,project";
+const LIST_FIELDS: &[&str] =
+    &["summary", "status", "issuetype", "priority", "updated", "project"];
 
 /// Fields the ticket view needs. `description` is here and absent from
 /// [`LIST_FIELDS`] on purpose — it is the largest field on most tickets and
 /// the list never shows it.
 const ISSUE_FIELDS: &str =
     "summary,description,status,issuetype,priority,assignee,reporter,created,updated,labels";
+
+/// Where the Jira issue API is, and what to authenticate to it with.
+///
+/// Resolved **once** at startup and passed around, for the same reason
+/// `App::alerts_auth` is: the credentials behind it are a `CredReadW` per
+/// field on Windows.
+#[derive(Clone, Debug, Default)]
+pub struct JiraSite {
+    auth: AlertsAuth,
+    /// Fully-qualified `…/rest/api/3`, no trailing slash.
+    api_base: String,
+}
+
+impl JiraSite {
+    /// `configured` is `features.json`'s `jira.base_url`; `env` is
+    /// [`JIRA_BASE_URL_ENV`]. Either may be blank.
+    pub fn new(auth: AlertsAuth, configured: &str, env: Option<String>) -> Self {
+        let api_base = resolve_base_url(configured, env, &auth.cloud_id);
+        Self { auth, api_base }
+    }
+
+    /// True when a request could be made — credentials present *and* a site
+    /// to send them to.
+    pub fn is_complete(&self) -> bool {
+        self.auth.is_complete() && !self.api_base.is_empty()
+    }
+
+    /// The resolved `…/rest/api/3` base, for the startup log line.
+    pub fn api_base(&self) -> &str {
+        &self.api_base
+    }
+}
+
+/// Work out the `…/rest/api/3` base for the issue API.
+///
+/// `JIRA_BASE_URL` wins, then `features.json`'s `jira.base_url`, then the
+/// cloud-id form the alert feed uses — so a build that configures nothing
+/// behaves exactly as it did before the field existed.
+///
+/// Input is forgiving on purpose: this is pasted by a human from a browser
+/// bar or a curl command, so a bare host, a trailing slash, and a URL that
+/// already carries `/rest/api/3` (or `/rest/api/2`) all resolve to the same
+/// thing. A blank cloud id with no configured site yields an empty string,
+/// which `is_complete` reports rather than building a request against
+/// nowhere.
+pub fn resolve_base_url(configured: &str, env: Option<String>, cloud_id: &str) -> String {
+    let picked = [env.as_deref().unwrap_or_default(), configured]
+        .into_iter()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .unwrap_or_default()
+        .to_string();
+
+    if picked.is_empty() {
+        let cloud_id = cloud_id.trim();
+        if cloud_id.is_empty() {
+            return String::new();
+        }
+        return format!("https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3");
+    }
+
+    let mut base = picked;
+    // A scheme-less host is what someone types when copying a domain out of
+    // a browser bar. https only: this carries a bearer-equivalent token.
+    if !base.starts_with("http://") && !base.starts_with("https://") {
+        base = format!("https://{base}");
+    }
+    base = base.trim_end_matches('/').to_string();
+    // Someone pasting a working curl URL brings the path with it.
+    for suffix in ["/rest/api/3/search/jql", "/rest/api/2/search/jql", "/rest/api/3", "/rest/api/2"]
+    {
+        if let Some(stripped) = base.strip_suffix(suffix) {
+            base = stripped.trim_end_matches('/').to_string();
+            break;
+        }
+    }
+    format!("{base}/rest/api/3")
+}
+
+/// Flatten a description field to plain text.
+///
+/// v3 returns ADF — `{"type":"doc","content":[…]}` — where the text lives in
+/// leaf nodes and the structure carries the line breaks. v2 returns a plain
+/// string. Both arrive here, because which one a site sends is not worth
+/// tracking in the caller, and `null` (a ticket with no description) is
+/// neither.
+///
+/// This is a *reader*, not a renderer: it recovers the words and the shape of
+/// the paragraphs, and deliberately drops formatting marks (bold, colour,
+/// links' display styling) that egui is not being asked to reproduce. A link
+/// keeps its URL, a mention keeps the name, since both are content rather
+/// than decoration.
+pub fn description_text(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        // v2, or a site still answering the old way.
+        Value::String(s) => s.trim().to_string(),
+        _ => {
+            let mut out = String::new();
+            adf_node(v, &mut out);
+            // Block nodes each add their own break, so nesting them stacks
+            // blank lines that were never in the document.
+            let mut collapsed = String::new();
+            let mut blanks = 0usize;
+            for line in out.lines() {
+                if line.trim().is_empty() {
+                    blanks += 1;
+                    if blanks > 1 {
+                        continue;
+                    }
+                } else {
+                    blanks = 0;
+                }
+                collapsed.push_str(line.trim_end());
+                collapsed.push('\n');
+            }
+            collapsed.trim().to_string()
+        }
+    }
+}
+
+/// One ADF node into `out`. Unknown node types recurse into their children
+/// rather than being dropped: ADF gains node types over time, and losing a
+/// paragraph because it sat inside a panel nobody had heard of is worse than
+/// rendering it without its box.
+fn adf_node(node: &Value, out: &mut String) {
+    let node_type = node.get("type").and_then(Value::as_str).unwrap_or("");
+    let attr = |k: &str| node.get("attrs").and_then(|a| a.get(k)).and_then(Value::as_str);
+
+    match node_type {
+        "text" => out.push_str(node.get("text").and_then(Value::as_str).unwrap_or("")),
+        "hardBreak" => out.push('\n'),
+        "rule" => out.push_str("\n---\n"),
+        // Content, not decoration: dropping these loses the who and the where.
+        "mention" => out.push_str(attr("text").unwrap_or("@unknown")),
+        "emoji" => out.push_str(attr("text").or(attr("shortName")).unwrap_or("")),
+        "inlineCard" | "blockCard" | "embedCard" => {
+            out.push_str(attr("url").unwrap_or("[link]"))
+        }
+        "media" | "mediaSingle" | "mediaGroup" | "mediaInline" => {
+            out.push_str(attr("alt").unwrap_or("[attachment]"));
+            out.push('\n');
+        }
+        "listItem" => {
+            out.push_str("• ");
+            adf_children(node, out);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        "paragraph" | "heading" | "blockquote" | "codeBlock" => {
+            adf_children(node, out);
+            out.push_str("\n\n");
+        }
+        // "doc", "bulletList", "orderedList", "panel", "table", and whatever
+        // ADF adds next.
+        _ => adf_children(node, out),
+    }
+}
+
+fn adf_children(node: &Value, out: &mut String) {
+    if let Some(kids) = node.get("content").and_then(Value::as_array) {
+        for kid in kids {
+            adf_node(kid, out);
+        }
+    }
+}
 
 /// One row of the ticket list.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -109,17 +289,14 @@ pub struct Transition {
     pub to_status: String,
 }
 
-/// Base `…/rest/api/2` for this site. v2 — see the module doc.
-fn api_base(auth: &AlertsAuth) -> String {
-    format!("https://api.atlassian.com/ex/jira/{}/rest/api/2", auth.cloud_id.trim())
-}
-
-fn require_complete(auth: &AlertsAuth) -> Result<()> {
-    if auth.is_complete() {
+fn require_complete(site: &JiraSite) -> Result<()> {
+    if site.is_complete() {
         Ok(())
     } else {
         Err(AppError::InvalidArgument(
-            "jira: email, token and cloud id must all be set".to_string(),
+            "jira: needs an email, an API token, and a site (jira.base_url, \
+             JIRA_BASE_URL, or a cloud id)"
+                .to_string(),
         ))
     }
 }
@@ -139,7 +316,7 @@ pub fn validate_issue_key(key: &str) -> Result<()> {
     let key = key.trim();
     let Some((project, number)) = key.split_once('-') else {
         return Err(AppError::InvalidArgument(format!(
-            "jira: '{key}' is not a ticket key (expected something like OPS-123)"
+            "jira: '{key}' is not a ticket key (expected something like CATDO-123)"
         )));
     };
     let project_ok = !project.is_empty()
@@ -150,7 +327,7 @@ pub fn validate_issue_key(key: &str) -> Result<()> {
         Ok(())
     } else {
         Err(AppError::InvalidArgument(format!(
-            "jira: '{key}' is not a ticket key (expected something like OPS-123)"
+            "jira: '{key}' is not a ticket key (expected something like CATDO-123)"
         )))
     }
 }
@@ -237,7 +414,11 @@ pub fn parse_issue(body: &str) -> Result<Issue> {
     Ok(Issue {
         key,
         summary: field_str(&v, &["fields", "summary"]),
-        description: field_str(&v, &["fields", "description"]),
+        description: v
+            .get("fields")
+            .and_then(|f| f.get("description"))
+            .map(description_text)
+            .unwrap_or_default(),
         status: field_str(&v, &["fields", "status", "name"]),
         status_category: field_str(&v, &["fields", "status", "statusCategory", "key"]),
         issue_type: field_str(&v, &["fields", "issuetype", "name"]),
@@ -300,31 +481,36 @@ pub fn local_time(ts: &str) -> String {
 }
 
 /// The tickets assigned to whoever this token belongs to and not yet done.
-pub fn search_my_issues(auth: &AlertsAuth) -> Result<Vec<IssueRow>> {
-    require_complete(auth)?;
-    let url = format!("{}/search/jql", api_base(auth));
+///
+/// `POST`, not `GET`: it is the form proven against a real tenant, and it
+/// keeps a JQL clause out of a URL that gets logged and rendered.
+pub fn search_my_issues(site: &JiraSite) -> Result<Vec<IssueRow>> {
+    require_complete(site)?;
+    let url = format!("{}/search/jql", site.api_base);
+    let payload = serde_json::json!({
+        "jql": DEFAULT_JQL,
+        "fields": LIST_FIELDS,
+        "maxResults": MAX_RESULTS,
+    })
+    .to_string();
     let body = atlassian_http::request(
-        &auth.email,
-        &auth.token,
+        &site.auth.email,
+        &site.auth.token,
         &url,
-        &[
-            ("jql", DEFAULT_JQL.to_string()),
-            ("fields", LIST_FIELDS.to_string()),
-            ("maxResults", MAX_RESULTS.to_string()),
-        ],
-        None,
+        &[],
+        Some(&payload),
     )?;
     parse_issue_list(&body)
 }
 
 /// One ticket in full.
-pub fn fetch_issue(auth: &AlertsAuth, key: &str) -> Result<Issue> {
-    require_complete(auth)?;
+pub fn fetch_issue(site: &JiraSite, key: &str) -> Result<Issue> {
+    require_complete(site)?;
     validate_issue_key(key)?;
-    let url = format!("{}/issue/{}", api_base(auth), key.trim());
+    let url = format!("{}/issue/{}", site.api_base, key.trim());
     let body = atlassian_http::request(
-        &auth.email,
-        &auth.token,
+        &site.auth.email,
+        &site.auth.token,
         &url,
         &[("fields", ISSUE_FIELDS.to_string())],
         None,
@@ -337,22 +523,28 @@ pub fn fetch_issue(auth: &AlertsAuth, key: &str) -> Result<Issue> {
 /// Asked of Jira rather than assumed, because workflows differ per project:
 /// "Start Progress" and "Close" exist in some and not others, and a hardcoded
 /// pair of buttons would be dead in any project that names them differently.
-pub fn fetch_transitions(auth: &AlertsAuth, key: &str) -> Result<Vec<Transition>> {
-    require_complete(auth)?;
+pub fn fetch_transitions(site: &JiraSite, key: &str) -> Result<Vec<Transition>> {
+    require_complete(site)?;
     validate_issue_key(key)?;
-    let url = format!("{}/issue/{}/transitions", api_base(auth), key.trim());
-    let body = atlassian_http::request(&auth.email, &auth.token, &url, &[], None)?;
+    let url = format!("{}/issue/{}/transitions", site.api_base, key.trim());
+    let body = atlassian_http::request(&site.auth.email, &site.auth.token, &url, &[], None)?;
     parse_transitions(&body)
 }
 
 /// Move a ticket. The only call in this module that changes anything.
-pub fn do_transition(auth: &AlertsAuth, key: &str, transition_id: &str) -> Result<()> {
-    require_complete(auth)?;
+pub fn do_transition(site: &JiraSite, key: &str, transition_id: &str) -> Result<()> {
+    require_complete(site)?;
     validate_issue_key(key)?;
     validate_transition_id(transition_id)?;
-    let url = format!("{}/issue/{}/transitions", api_base(auth), key.trim());
+    let url = format!("{}/issue/{}/transitions", site.api_base, key.trim());
     let payload = format!(r#"{{"transition":{{"id":"{}"}}}}"#, transition_id.trim());
-    atlassian_http::request(&auth.email, &auth.token, &url, &[], Some(&payload))?;
+    atlassian_http::request(
+        &site.auth.email,
+        &site.auth.token,
+        &url,
+        &[],
+        Some(&payload),
+    )?;
     Ok(())
 }
 
@@ -369,13 +561,67 @@ mod tests {
     }
 
     #[test]
-    fn the_base_url_is_api_v2_for_this_cloud_id() {
-        // v3 would return the description as ADF, which nothing here can
-        // render. See the module doc.
+    fn an_unconfigured_site_still_addresses_the_alerts_cloud_id() {
+        // A build that sets nothing must behave exactly as it did before the
+        // field existed.
+        let site = JiraSite::new(auth(), "", None);
         assert_eq!(
-            api_base(&auth()),
-            "https://api.atlassian.com/ex/jira/cloud-1/rest/api/2"
+            site.api_base(),
+            "https://api.atlassian.com/ex/jira/cloud-1/rest/api/3"
         );
+        assert!(site.is_complete());
+    }
+
+    #[test]
+    fn a_configured_domain_wins_over_the_cloud_id_and_the_env_wins_over_both() {
+        // The alert feed's tenant and the Jira site are not necessarily the
+        // same place -- which is the bug this whole field exists for.
+        assert_eq!(
+            resolve_base_url("jira.example.com", None, "cloud-1"),
+            "https://jira.example.com/rest/api/3"
+        );
+        assert_eq!(
+            resolve_base_url("jira.example.com", Some("other.example.com".into()), "cloud-1"),
+            "https://other.example.com/rest/api/3"
+        );
+        // Blank-but-set must not shadow the configured value.
+        assert_eq!(
+            resolve_base_url("jira.example.com", Some("   ".into()), "cloud-1"),
+            "https://jira.example.com/rest/api/3"
+        );
+    }
+
+    #[test]
+    fn the_site_is_forgiving_about_how_it_was_pasted() {
+        // Typed from a browser bar, or copied out of a working curl command.
+        for input in [
+            "jira.example.com",
+            "https://jira.example.com",
+            "https://jira.example.com/",
+            "https://jira.example.com/rest/api/3",
+            "https://jira.example.com/rest/api/2",
+            "https://jira.example.com/rest/api/3/search/jql",
+        ] {
+            assert_eq!(
+                resolve_base_url(input, None, "cloud-1"),
+                "https://jira.example.com/rest/api/3",
+                "{input} should normalise"
+            );
+        }
+        // A token travels on this, so a scheme-less host is upgraded, never
+        // downgraded.
+        assert!(resolve_base_url("jira.example.com", None, "").starts_with("https://"));
+    }
+
+    #[test]
+    fn nothing_configured_and_no_cloud_id_is_no_site_at_all() {
+        // Better an empty base that `is_complete` refuses than a request
+        // built against nowhere.
+        assert_eq!(resolve_base_url("", None, ""), "");
+        let site = JiraSite::new(AlertsAuth::default(), "", None);
+        assert!(!site.is_complete());
+        // Credentials without a site is equally unusable.
+        assert!(!JiraSite::new(auth(), "", None).api_base().is_empty());
     }
 
     #[test]
@@ -501,8 +747,7 @@ mod tests {
         assert_eq!(issue.status, "In Progress");
         assert_eq!(issue.reporter, "A Reporter");
         assert_eq!(issue.labels, vec!["bastion", "efs"]);
-        // The description is plain text, which is the entire reason this
-        // module talks to API v2 rather than v3.
+        // Flattened by `description_text`, whichever way the site sent it.
         assert!(issue.description.starts_with("The secondary bastion"));
         assert!(issue.description.contains('\n'));
         // `assignee: null` is an unassigned ticket, not a broken response.
@@ -569,12 +814,78 @@ mod tests {
     }
 
     #[test]
-    fn an_incomplete_auth_is_refused_before_any_request_is_made() {
-        let blank = AlertsAuth::default();
+    fn an_incomplete_site_is_refused_before_any_request_is_made() {
+        let blank = JiraSite::new(AlertsAuth::default(), "", None);
         assert!(search_my_issues(&blank).is_err());
         assert!(fetch_issue(&blank, "OPS-1").is_err());
         assert!(fetch_transitions(&blank, "OPS-1").is_err());
         assert!(do_transition(&blank, "OPS-1", "11").is_err());
+    }
+
+    /// The ADF a real v3 description arrives as. Getting this wrong renders
+    /// every ticket's description empty, which reads as "this ticket has no
+    /// description" rather than as a bug.
+    const ADF: &str = r#"{
+      "type": "doc",
+      "version": 1,
+      "content": [
+        { "type": "paragraph", "content": [
+            { "type": "text", "text": "The secondary bastion is missing " },
+            { "type": "text", "text": "three accounts", "marks": [{"type":"strong"}] },
+            { "type": "text", "text": "." } ] },
+        { "type": "paragraph", "content": [
+            { "type": "text", "text": "Raised by " },
+            { "type": "mention", "attrs": { "id": "abc", "text": "@A Person" } } ] },
+        { "type": "bulletList", "content": [
+            { "type": "listItem", "content": [
+                { "type": "paragraph", "content": [{"type":"text","text":"run the sync"}] } ] },
+            { "type": "listItem", "content": [
+                { "type": "paragraph", "content": [{"type":"text","text":"re-check uids"}] } ] } ] },
+        { "type": "paragraph", "content": [
+            { "type": "inlineCard", "attrs": { "url": "https://example.com/runbook" } } ] }
+      ]
+    }"#;
+
+    #[test]
+    fn an_adf_description_flattens_to_readable_text() {
+        let v: Value = serde_json::from_str(ADF).expect("adf parses");
+        let out = description_text(&v);
+        // Text survives, and so does the sentence it was split across --
+        // ADF breaks a styled run into its own node.
+        assert!(out.contains("The secondary bastion is missing three accounts."), "{out}");
+        // Content, not decoration: the who and the where are kept.
+        assert!(out.contains("@A Person"), "{out}");
+        assert!(out.contains("https://example.com/runbook"), "{out}");
+        // List structure survives as something readable.
+        assert!(out.contains("• run the sync"), "{out}");
+        assert!(out.contains("• re-check uids"), "{out}");
+        // Nested block nodes each add a break; stacking them would leave the
+        // description full of blank lines that were never in the document.
+        assert!(!out.contains("\n\n\n"), "runs of blank lines: {out:?}");
+        assert!(!out.starts_with('\n') && !out.ends_with('\n'));
+    }
+
+    #[test]
+    fn a_plain_string_description_is_taken_as_is() {
+        // v2's spelling, and what a site may still answer with. One function,
+        // either payload.
+        let v = Value::String("just text\nover two lines".to_string());
+        assert_eq!(description_text(&v), "just text\nover two lines");
+        // A ticket with no description is neither.
+        assert_eq!(description_text(&Value::Null), "");
+    }
+
+    #[test]
+    fn an_unknown_adf_node_keeps_the_text_inside_it() {
+        // ADF gains node types over time. Losing a paragraph because it sat
+        // inside a panel nobody had heard of is worse than losing the panel.
+        let v: Value = serde_json::from_str(
+            r#"{"type":"doc","content":[
+                 {"type":"panelOfTheFuture","content":[
+                   {"type":"paragraph","content":[{"type":"text","text":"still here"}]}]}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(description_text(&v), "still here");
     }
 
     /// The default JQL must not need an account id: `currentUser()` is what

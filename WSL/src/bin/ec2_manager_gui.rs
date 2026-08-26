@@ -7196,6 +7196,10 @@ mod gui {
         /// current OS user (features.json `jira.allowed_users`, ANDed with
         /// credentials that actually resolve).
         jira_enabled: bool,
+        /// Where the Jira issue API is, and what to authenticate with.
+        /// Resolved once at startup, like `alerts_auth` — the credentials
+        /// behind it are a `CredReadW` per field on Windows.
+        jira_site: ec2_manager::jira::JiraSite,
         /// Ticket list window state; `None` while the window is closed.
         jira_window: Option<JiraWindow>,
         /// Open ticket windows, one per ticket key. A Vec rather than a map
@@ -7493,8 +7497,19 @@ mod gui {
             // `resolved_alerts_auth` is moved into `alerts_auth` before the
             // jira fields are reached, so borrowing it there would not
             // compile.
+            // The Jira site is not necessarily the alerts tenant, so it is
+            // resolved separately: JIRA_BASE_URL, then features.json's
+            // `jira.base_url`, then the alerts cloud id.
+            let jira_site = ec2_manager::jira::JiraSite::new(
+                resolved_alerts_auth.clone(),
+                &features.jira.base_url,
+                std::env::var(ec2_manager::jira::JIRA_BASE_URL_ENV).ok(),
+            );
+            // The site counts toward the gate: a button that is visible and
+            // cannot reach anything is worse than one that is absent.
             let jira_enabled = features
-                .jira_visible_for(&ec2_manager::features::current_os_user(), &resolved_alerts_auth);
+                .jira_visible_for(&ec2_manager::features::current_os_user(), &resolved_alerts_auth)
+                && jira_site.is_complete();
 
             let reaper = {
                 let user = ec2_manager::features::current_os_user();
@@ -7770,6 +7785,7 @@ mod gui {
                 alerts_tx,
                 alerts_rx,
                 jira_enabled,
+                jira_site,
                 jira_window: None,
                 jira_tickets: Vec::new(),
                 jira_tx,
@@ -7857,8 +7873,15 @@ mod gui {
                 &features.jira,
                 &ec2_manager::features::current_os_user(),
                 app.alerts_auth.is_complete(),
+                app.jira_site.is_complete(),
             ) {
                 app.log_info(reason);
+            } else {
+                // Which site the tickets are actually read from. Worth a line
+                // of its own: pointing at the alert feed's tenant instead of
+                // the Jira site returns a perfectly valid, entirely empty
+                // ticket list, and nothing else in the log would say so.
+                app.log_info(format!("jira: reading tickets from {}", app.jira_site.api_base()));
             }
             for (is_warn, msg) in reaper_startup_log {
                 // Tagged like the rest of the remediation's output: "the
@@ -12573,11 +12596,11 @@ mod gui {
             }
             win.loading = true;
             win.last_fetch = Some(Instant::now());
-            let auth = self.alerts_auth.clone();
+            let site = self.jira_site.clone();
             let tx = self.jira_tx.clone();
             std::thread::spawn(move || {
                 let result =
-                    ec2_manager::jira::search_my_issues(&auth).map_err(|e| e.to_string());
+                    ec2_manager::jira::search_my_issues(&site).map_err(|e| e.to_string());
                 let _ = tx.send(JiraEvent::List(result));
             });
         }
@@ -12617,15 +12640,15 @@ mod gui {
                 win.transitions_error = None;
             }
             let key = key.to_string();
-            let auth = self.alerts_auth.clone();
+            let site = self.jira_site.clone();
             let tx = self.jira_tx.clone();
             std::thread::spawn(move || {
-                let issue = ec2_manager::jira::fetch_issue(&auth, &key)
+                let issue = ec2_manager::jira::fetch_issue(&site, &key)
                     .map(Box::new)
                     .map_err(|e| e.to_string());
                 let _ = tx.send(JiraEvent::Issue { key: key.clone(), result: issue });
                 let transitions =
-                    ec2_manager::jira::fetch_transitions(&auth, &key).map_err(|e| e.to_string());
+                    ec2_manager::jira::fetch_transitions(&site, &key).map_err(|e| e.to_string());
                 let _ = tx.send(JiraEvent::Transitions { key, result: transitions });
             });
         }
@@ -12647,10 +12670,10 @@ mod gui {
             win.note = None;
             let (key, id, name) = (key.to_string(), id.to_string(), name.to_string());
             self.log_info(format!("jira: {key} — applying transition '{name}' (id {id})"));
-            let auth = self.alerts_auth.clone();
+            let site = self.jira_site.clone();
             let tx = self.jira_tx.clone();
             std::thread::spawn(move || {
-                let result = ec2_manager::jira::do_transition(&auth, &key, &id)
+                let result = ec2_manager::jira::do_transition(&site, &key, &id)
                     .map_err(|e| e.to_string());
                 let _ = tx.send(JiraEvent::Transitioned { key, name, result });
             });
@@ -13240,10 +13263,10 @@ mod gui {
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label("Open ticket:");
+                        ui.label("Ticket:");
                         let edit = ui.add(
                             egui::TextEdit::singleline(&mut search)
-                                .hint_text("OPS-123")
+                                .hint_text("CATDO-123")
                                 .desired_width(180.0),
                         );
                         let entered =
@@ -13252,7 +13275,7 @@ mod gui {
                             || ui
                                 .add_enabled(
                                     !search.trim().is_empty(),
-                                    egui::Button::new("Open"),
+                                    egui::Button::new("Search"),
                                 )
                                 .on_hover_text("Open this ticket's view, whoever it belongs to.")
                                 .clicked()
@@ -13389,7 +13412,7 @@ mod gui {
             if !ec2_manager::jira::looks_like_issue_key(&key) {
                 if let Some(w) = self.jira_window.as_mut() {
                     w.search_error =
-                        Some(format!("'{typed}' is not a ticket key — try OPS-123"));
+                        Some(format!("'{typed}' is not a ticket key — try CATDO-123"));
                 }
                 return;
             }
@@ -22474,7 +22497,14 @@ mod gui {
         /// alone — the flag is plain state and a user who lost access
         /// between builds must not keep a trace the gate no longer allows.
         fn render_alerts_api_trace(&mut self, ui: &mut egui::Ui) {
-            if !self.alerts_enabled || !self.log_show_alerts_api {
+            // Either feature's gate opens this: the trace records *every*
+            // Atlassian call (`atlassian_http::request`), and since the Jira
+            // Tickets button started using that same chokepoint, gating the
+            // trace on `alerts` alone hid the ticket calls from the only
+            // person who could be looking at them — a user opted into `jira`
+            // and not `alerts` (the shipped state of both lists) could not
+            // reach the one thing that says what the API actually returned.
+            if !(self.alerts_enabled || self.jira_enabled) || !self.log_show_alerts_api {
                 return;
             }
             let calls = ec2_manager::alerts::recent_api_calls();
@@ -22628,12 +22658,13 @@ mod gui {
                 if ui.button("High").clicked() {
                     self.log_filters.set_verbosity_high();
                 }
-                // Same gate as the Alerts button itself (`alerts_visible_for`
-                // — on the allow-list *and* the site configured), so a user
-                // who cannot reach the feed is not offered a trace of it.
-                if self.alerts_enabled {
+                // Same gate as the buttons themselves, so a user who cannot
+                // reach either API is not offered a trace of it. Both count:
+                // the trace covers every Atlassian call, alerts and tickets
+                // alike.
+                if self.alerts_enabled || self.jira_enabled {
                     ui.separator();
-                    ui.checkbox(&mut self.log_show_alerts_api, "Jira Alerts")
+                    ui.checkbox(&mut self.log_show_alerts_api, "Jira API")
                         .on_hover_text(
                             "Show the last 5 calls to the Jira on-call alerts API. \
                              The newest one keeps its full response; older rows are \
@@ -25616,6 +25647,7 @@ mod gui {
         cfg: &ec2_manager::features::JiraFeature,
         user: &str,
         auth_complete: bool,
+        site_complete: bool,
     ) -> Option<String> {
         if !cfg.is_allowed_user(user) {
             return Some(format!(
@@ -25628,6 +25660,14 @@ mod gui {
                 "jira: no Jira Tickets button — no JSM credentials resolved. Set \
                  ATLASSIAN_EMAIL, JIRA_TOKEN and CLOUD_ID, or store them in Windows \
                  Credential Manager (ec2_manager/jsm, ec2_manager/jsm_cloud_id)"
+                    .to_string(),
+            );
+        }
+        if !site_complete {
+            return Some(
+                "jira: no Jira Tickets button — no Jira site. Set jira.base_url in \
+                 features.json, or the JIRA_BASE_URL environment variable, to the \
+                 site your tickets are on"
                     .to_string(),
             );
         }
@@ -28901,7 +28941,7 @@ mod gui {
         /// they cannot reach — and an unconfigured site hides it too,
         /// failing closed the way `allow_delete_user` does.
         #[test]
-        fn the_jira_alerts_checkbox_uses_the_alerts_allow_list() {
+        fn the_jira_api_trace_opens_for_either_feature_not_just_alerts() {
             // cloud_id/email/token are no longer features.json fields at all
             // (see jsm_auth) — the resolved auth is passed in directly, the
             // way `Features::alerts_visible_for` now requires, rather than
@@ -28926,6 +28966,21 @@ mod gui {
             // Allow-listed but nothing resolved from Credential Manager /
             // the environment hides it as well.
             assert!(!cfg(r#"["*"]"#).alerts_visible_for("bconrad", &incomplete));
+
+            // The trace covers every Atlassian call, tickets included, so
+            // being on EITHER allow-list must open it. Gating it on `alerts`
+            // alone hid the ticket calls from a user opted into `jira` only
+            // -- which is the shipped state of both lists, and so the state
+            // anyone debugging the ticket list would actually be in.
+            let jira_only: ec2_manager::features::Features =
+                serde_json::from_str(r#"{"jira":{"allowed_users":["bconrad"]}}"#)
+                    .expect("features json");
+            assert!(!jira_only.alerts_visible_for("bconrad", &complete));
+            assert!(jira_only.jira_visible_for("bconrad", &complete));
+            // Neither list, no trace.
+            let neither = cfg("[]");
+            assert!(!neither.alerts_visible_for("bconrad", &complete));
+            assert!(!neither.jira_visible_for("bconrad", &complete));
         }
 
         /// Walk a whole session the way a person actually does, asserting
@@ -34855,6 +34910,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         fn jira_cfg(users: &[&str]) -> ec2_manager::features::JiraFeature {
             ec2_manager::features::JiraFeature {
                 allowed_users: users.iter().map(|s| s.to_string()).collect(),
+                base_url: String::new(),
             }
         }
 
@@ -34862,28 +34918,36 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         fn a_missing_jira_button_says_which_gate_closed() {
             // "The button is not there" is not a diagnosis, and it is the
             // whole of what the user sees when either half of the gate fails.
-            let off = jira_gate_report(&jira_cfg(&["someone-else"]), "bconrad", true)
+            let off = jira_gate_report(&jira_cfg(&["someone-else"]), "bconrad", true, true)
                 .expect("should be hidden");
             assert!(off.contains("jira.allowed_users"), "{off}");
             assert!(off.contains("bconrad"), "names the user it checked: {off}");
 
-            let no_creds = jira_gate_report(&jira_cfg(&["*"]), "bconrad", false)
+            let no_creds = jira_gate_report(&jira_cfg(&["*"]), "bconrad", false, true)
                 .expect("should be hidden");
             assert!(no_creds.contains("credentials"), "{no_creds}");
             // It must say how to fix it, not merely that it is broken.
             assert!(no_creds.contains("JIRA_TOKEN"), "{no_creds}");
 
+            // A site that resolved to nothing is its own state: without it
+            // the button would be there and every call would fail.
+            let no_site = jira_gate_report(&jira_cfg(&["*"]), "bconrad", true, false)
+                .expect("should be hidden");
+            assert!(no_site.contains("jira.base_url"), "{no_site}");
+            assert!(no_site.contains("JIRA_BASE_URL"), "{no_site}");
+
             // Shown: no line at all.
-            assert!(jira_gate_report(&jira_cfg(&["*"]), "bconrad", true).is_none());
-            assert!(jira_gate_report(&jira_cfg(&["BConrad"]), "bconrad", true).is_none());
+            assert!(jira_gate_report(&jira_cfg(&["*"]), "bconrad", true, true).is_none());
+            assert!(jira_gate_report(&jira_cfg(&["BConrad"]), "bconrad", true, true).is_none());
         }
 
         #[test]
         fn the_jira_gate_report_never_carries_a_credential() {
             // The app log gets pasted into tickets.
             for report in [
-                jira_gate_report(&jira_cfg(&[]), "bconrad", true),
-                jira_gate_report(&jira_cfg(&["*"]), "bconrad", false),
+                jira_gate_report(&jira_cfg(&[]), "bconrad", true, true),
+                jira_gate_report(&jira_cfg(&["*"]), "bconrad", false, true),
+                jira_gate_report(&jira_cfg(&["*"]), "bconrad", true, false),
             ]
             .into_iter()
             .flatten()

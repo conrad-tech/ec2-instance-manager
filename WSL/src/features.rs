@@ -560,6 +560,23 @@ pub struct JiraFeature {
     /// insensitive). `["*"]` shows it to everyone; an empty list hides it
     /// from everyone.
     pub allowed_users: Vec<String>,
+    /// The Jira site, e.g. `jira.example.com` or
+    /// `https://example.atlassian.net`. Blank falls back to addressing the
+    /// alerts tenant by cloud id, which is what this did before the field
+    /// existed.
+    ///
+    /// **This file is committed**, so a domain set here goes into git — the
+    /// reason every other tenant-identifying Atlassian value resolves from
+    /// the environment or Credential Manager instead (see `jsm_auth`). It is
+    /// a field here at the maintainer's explicit request;
+    /// `jira::JIRA_BASE_URL_ENV` overrides it, so a machine can point
+    /// somewhere else without the value ever being committed.
+    ///
+    /// It exists because **the Jira site is not necessarily the alerts
+    /// tenant** — an org can run Jira on its own domain while the JSM Ops
+    /// alert feed lives elsewhere, and addressing the alert feed's cloud id
+    /// then finds a site with none of your tickets on it.
+    pub base_url: String,
 }
 
 impl JiraFeature {

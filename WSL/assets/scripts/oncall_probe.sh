@@ -47,6 +47,15 @@ done
 
 OPS="https://api.atlassian.com/jsm/ops/api/${CLOUD_ID}/v1"
 JIRA="https://api.atlassian.com/ex/jira/${CLOUD_ID}"
+# The Jira *issue* API may be on a different site from the alert feed's
+# tenant -- an org can run Jira on its own domain. JIRA_BASE_URL matches the
+# app's own override; unset, this probes the alerts tenant, exactly as the
+# app does with no jira.base_url configured.
+JIRA_SITE="${JIRA_BASE_URL:-$JIRA}"
+JIRA_SITE="${JIRA_SITE%/}"
+JIRA_SITE="${JIRA_SITE%/rest/api/3}"
+JIRA_SITE="${JIRA_SITE%/rest/api/2}"
+case "$JIRA_SITE" in https://*|http://*) ;; *) JIRA_SITE="https://${JIRA_SITE}" ;; esac
 
 STATUS=""
 BODY=""
@@ -199,43 +208,46 @@ else
 fi
 
 # ------------------------------------------------------- N. jira tickets API
-# The Jira Tickets button reads the *issue* API with this same token. Two
-# things it depends on are worth confirming against a real tenant rather than
-# taken on trust:
+# The Jira Tickets button reads the *issue* API. Three things it depends on
+# are worth confirming against a real tenant rather than taken on trust:
 #
-#   * `/search/jql`, not the old `/search` -- Atlassian removed the
-#     unsuffixed endpoint, and a 404/410 here is what that looks like.
-#   * API **v2**, not v3 -- v3 returns the description as ADF (a JSON
-#     document tree) and the app renders plain text.
+#   * the **site** -- Jira is not necessarily on the alert feed's tenant, and
+#     pointing at the wrong one returns a valid, entirely empty ticket list.
+#   * `/search/jql`, not the old `/search`, and by **POST**.
+#   * API **v3**, whose description arrives as ADF rather than text.
 rule "jira tickets API (the Jira Tickets button)"
+echo "  site: ${JIRA_SITE}"
+[[ -n "${JIRA_BASE_URL:-}" ]] && echo "  (from JIRA_BASE_URL)" \
+                             || echo "  (from CLOUD_ID -- set JIRA_BASE_URL if tickets live elsewhere)"
 JIRA_TICKETS="no"
 JQL='assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC'
-get "${JIRA}/rest/api/2/search/jql?fields=summary,status&maxResults=5&jql=$(
-  jq -rn --arg q "$JQL" '$q|@uri')"
+BODY=$(curl -sS -K - -X POST -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -w $'\n__STATUS__%{http_code}' \
+            "${JIRA_SITE}/rest/api/3/search/jql" \
+            -d "$(jq -n --arg q "$JQL" \
+                    '{jql:$q,fields:["summary","status","priority","issuetype","project","updated"],maxResults:20}')" \
+       <<<"user = \"${ATLASSIAN_EMAIL}:${JIRA_TOKEN}\"" 2>&1)
+STATUS="${BODY##*__STATUS__}"
+BODY="${BODY%$'\n'__STATUS__*}"
 if [[ "$STATUS" == "200" ]]; then
   n=$(jq -r '(.issues // []) | length' <<<"$BODY")
-  echo "  /search/jql works -- ${n} open ticket(s) assigned to this token"
+  echo "  POST /rest/api/3/search/jql works -- ${n} open ticket(s) for this token"
   JIRA_TICKETS="yes"
+  jq -r '(.issues // [])[] | "    \(.key)  \(.fields.status.name // "?")  \(.fields.summary // "")"' <<<"$BODY"
   FIRST_KEY=$(jq -r '(.issues // [])[0].key // empty' <<<"$BODY")
   if [[ -n "$FIRST_KEY" ]]; then
-    jq -r '(.issues // [])[] | "    \(.key)  \(.fields.status.name // "?")  \(.fields.summary // "")"' <<<"$BODY"
-    # The description is the field that differs between v2 and v3, so it is
-    # the one worth reading back.
-    get "${JIRA}/rest/api/2/issue/${FIRST_KEY}?fields=description"
+    # The description is the field the app has to flatten, so it is the one
+    # worth reading back.
+    get "${JIRA_SITE}/rest/api/3/issue/${FIRST_KEY}?fields=description"
     if [[ "$STATUS" == "200" ]]; then
-      if jq -e '.fields.description == null or (.fields.description|type) == "string"' \
-           >/dev/null <<<"$BODY"; then
-        echo "  v2 returns the description as plain text (or null) -- as the app expects"
-      else
-        echo "  WARNING: the description came back as $(jq -r '.fields.description|type' <<<"$BODY"),"
-        echo "  not a string. The app renders plain text; check it is really talking to v2."
-      fi
+      dtype=$(jq -r '.fields.description | type' <<<"$BODY")
+      echo "  description arrives as: ${dtype} (object = ADF, string = v2-style; the app reads both)"
     else
       echo "  could not read ${FIRST_KEY} itself"
       explain_failure
     fi
-    # What the ticket view puts on its buttons.
-    get "${JIRA}/rest/api/2/issue/${FIRST_KEY}/transitions"
+    get "${JIRA_SITE}/rest/api/3/issue/${FIRST_KEY}/transitions"
     if [[ "$STATUS" == "200" ]]; then
       echo "  transitions available on ${FIRST_KEY}:"
       jq -r '(.transitions // [])[] | "    \(.id)  \(.name)  -> \(.to.name // "?")"' <<<"$BODY"
@@ -246,8 +258,9 @@ if [[ "$STATUS" == "200" ]]; then
     fi
   fi
 else
-  echo "  /search/jql is not readable. A 404 or 410 here means the endpoint moved"
-  echo "  again; anything else is a permissions or credentials problem."
+  printf '  search failed: HTTP %s\n' "$STATUS"
+  echo "  A 404 usually means the site is wrong (this is the failure that returns"
+  echo "  an empty ticket list rather than an error); 401/403 is credentials."
   explain_failure
 fi
 

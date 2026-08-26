@@ -992,15 +992,41 @@ window, and a search box opens any ticket by key.
   a near-identical `JiraAuth`. `assets/scripts/oncall_probe.sh` had been
   reading `https://api.atlassian.com/ex/jira/<cloud_id>/rest/api/3/myself`
   with that token since before this feature existed.
-- **API v2, not v3.** v3 returns the description as ADF — a JSON document tree
-  that would need a translator before egui could draw a word of it. v2 returns
-  it as plain text. Both are live; v2 is the one this app can render, so it is
-  used for *every* call rather than mixed per endpoint. The probe script reads
-  a real ticket back and warns if the description arrives as anything but a
-  string, because a silent switch to v3 renders as an empty description.
-- **Search is `/search/jql`.** Atlassian removed the old unsuffixed
-  `/search`. A 404 or 410 from the list is what a further move looks like;
-  `oncall_probe.sh` says so in those words.
+- **The Jira site is not necessarily the alerts tenant, and that is the
+  failure this feature shipped with.** The JSM Ops feed is addressed by cloud
+  id through `api.atlassian.com/ex/jira/<cloud_id>`; an org can run Jira on
+  its own domain entirely. Addressing the alert feed's tenant then returns
+  HTTP 200 and an **empty** ticket list — a valid answer about the wrong
+  site, indistinguishable from having no tickets. `jira::resolve_base_url`
+  layers `JIRA_BASE_URL` → `features.json` `jira.base_url` → the cloud-id
+  form, so a build that configures nothing behaves as it did before.
+  - **`base_url` is in `features.json` at the maintainer's explicit request**,
+    against this file's usual rule — that file is committed, so the domain
+    lands in git, which is why every *other* tenant-identifying Atlassian
+    value resolves from the environment or Credential Manager (see
+    `jsm_auth`). `JIRA_BASE_URL` overrides it, so a machine can point
+    elsewhere without committing anything.
+  - **The resolved site is logged at startup** (`jira: reading tickets from
+    …`). Nothing else in the log would say which site an empty list came
+    from, and that ambiguity is what cost a debugging round trip.
+  - **`resolve_base_url` is forgiving about input**: a bare host, a trailing
+    slash, and a pasted URL that already carries `/rest/api/{2,3}` or
+    `/search/jql` all normalise to the same base. It is typed by a human out
+    of a browser bar or a working curl command. A scheme-less host is
+    upgraded to `https`, never `http` — a token travels on it.
+- **API v3, and search is `POST /search/jql`.** Atlassian removed the old
+  unsuffixed `/search`, and the v2 spelling of the replacement is not
+  dependable — a real tenant served v3 and only v3. POST because that is the
+  form proven against that tenant, and it keeps a long JQL out of a URL that
+  gets logged and rendered.
+- **v3 means the description is ADF**, so `description_text` flattens it: a
+  recursive walk that keeps the words and the paragraph shape and drops
+  formatting marks. It **also accepts a plain string**, which is what v2
+  returns — one function, either payload, rather than a version to track.
+  A mention keeps its name and a link its URL, because those are content
+  rather than decoration; an **unknown node type recurses into its children**
+  rather than being dropped, since ADF gains node types and losing a
+  paragraph because it sat in an unfamiliar panel is the worse failure.
 - **The default JQL uses `currentUser()`**, so nothing has to be told who you
   are — the Atlassian account id that `reaper`/`pingdom` need is not consulted
   here at all.
@@ -1049,6 +1075,12 @@ window, and a search box opens any ticket by key.
   per-workflow free text ("Closed", "Resolved", "Shipped"); the category is
   one of three fixed values, so matching the name would colour correctly in
   one project and wrongly in the next.
+- **The Logs tab trace opens for *either* feature.** It records every
+  Atlassian call, so gating it on `alerts` alone hid the ticket calls from a
+  user opted into `jira` and not `alerts` — the shipped state of both lists,
+  and therefore the exact state anyone debugging the ticket list is in. The
+  checkbox is labelled **Jira API** rather than "Jira Alerts" for the same
+  reason.
 - **The search box takes a key and nothing else.** Free-text search across
   summaries is deliberately absent: it is a second search mode with its own
   result list, not a variation on opening a ticket. Non-key input gets an
@@ -1063,8 +1095,10 @@ window, and a search box opens any ticket by key.
   `Features::default()` is empty too, so a features.json nobody can parse
   hands out no button either.
 - **A missing button names the gate that closed it** (`jira_gate_report`,
-  pure and tested), and `jira=` is on the startup `gates:` line beside
-  `alerts=`. "The button is not there" is not a diagnosis — reaper had three
+  pure and tested) — off the allow-list, no credentials, or **no site** —
+  and `jira=` is on the startup `gates:` line beside `alerts=`. The site
+  counts toward the gate: a visible button that cannot reach anything is
+  worse than an absent one. "The button is not there" is not a diagnosis — reaper had three
   dark states that all wrote nothing and telling them apart took five rounds
   of guessing. The report never carries the address or the token: the app log
   gets pasted into tickets.
