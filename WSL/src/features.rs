@@ -80,6 +80,8 @@ pub struct Features {
     pub protected_users: Vec<String>,
     /// On-call Alerts button: Jira site + who may see it.
     pub alerts: AlertsFeature,
+    /// "Jira Tickets" button: who may see it.
+    pub jira: JiraFeature,
     /// Git PAT + credential setup + default hotkey scripts: who gets them.
     pub personal_scripts: PersonalScriptsFeature,
     /// "Vault IAM Access" entry in the Scripts menu: who may see it.
@@ -536,6 +538,37 @@ impl AlertsFeature {
     }
 }
 
+/// The `jira` section of `assets/features.json`.
+///
+/// Gates the **Jira Tickets** button. Like [`AlertsFeature`] it carries only
+/// the allow-list — it reaches the Jira issue API with the very same
+/// credentials, which resolve environment → Windows Credential Manager and
+/// may never live in this committed file.
+///
+/// **Ships empty**, like `alerts` — the button is hidden until an admin opts
+/// users in. It is not the dangerous half of the gate that earns this (the
+/// feature reads and moves the caller's *own* tickets, and
+/// `Features::jira_visible_for` already hides it wherever credentials do not
+/// resolve); it is that a button reaching a live ticket system is an opt-in
+/// on the same terms as every other feature in this file, and defaulting it
+/// on for whoever happens to run the build is a decision the build should
+/// not be making on an admin's behalf.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct JiraFeature {
+    /// OS usernames allowed to see the Jira Tickets button (case-
+    /// insensitive). `["*"]` shows it to everyone; an empty list hides it
+    /// from everyone.
+    pub allowed_users: Vec<String>,
+}
+
+impl JiraFeature {
+    /// True when `user` may see the Jira Tickets button.
+    pub fn is_allowed_user(&self, user: &str) -> bool {
+        user_in_list(&self.allowed_users, user)
+    }
+}
+
 /// The `reaper` section of `assets/features.json`.
 ///
 /// Gates the unattended reaper auto-remediation. Being on this list is a
@@ -610,9 +643,18 @@ pub struct PingdomFeature {
     /// the tag is frequently an unrendered template or absent entirely.
     pub app_contains: String,
     /// Substring identifying a pingdom alert in `message` (the alert title).
-    /// The primary rule for this feed, whose titles are shaped
-    /// `[Pingdom] domain xxx yy <environment>`.
+    /// The primary rule for this feed.
     pub message_contains: String,
+    /// App names to look for in the alert summary. **The environment is
+    /// everything after the first one that appears** — list order decides,
+    /// not the summary's word order, and the match is case-insensitive.
+    ///
+    /// Everything after, rather than the next word, because an environment
+    /// here can be more than one word (`prod one`). Empty, or none present in
+    /// a given summary, falls back to the last word — which cannot see a
+    /// two-word environment, and the log says when that happened so a marker
+    /// can be added.
+    pub environment_after: Vec<String>,
     /// How long an acknowledged alert may stay open before it escalates.
     pub watch_mins: u64,
     /// Feed poll interval.
@@ -926,6 +968,10 @@ impl Default for Features {
             secondary_bastion_filter: "bastion".to_string(),
             protected_users: default_protected_users(),
             alerts: AlertsFeature::default(),
+            // Derived Default: an empty allow-list, which is both what the
+            // shipped file says and the fail-closed state a malformed
+            // features.json must land in.
+            jira: JiraFeature::default(),
             personal_scripts: PersonalScriptsFeature::default(),
             vault_iam: VaultIamFeature::default(),
             // Derived Default: an empty allow-list, which is the fail-closed
@@ -973,6 +1019,19 @@ impl Features {
     /// re-resolved on every call.
     pub fn alerts_visible_for(&self, user: &str, auth: &crate::alerts::AlertsAuth) -> bool {
         auth.is_complete() && self.alerts.is_allowed_user(user)
+    }
+
+    /// True when `user` may see the **Jira Tickets** button.
+    ///
+    /// Two halves, like [`Self::alerts_visible_for`]: on the allow-list, and
+    /// credentials that actually resolve. It takes the resolved auth as a
+    /// parameter for the same reason that one does — resolving it is a
+    /// `CredReadW` per field, so the GUI resolves it once at startup and
+    /// hands the same value to every gate rather than each re-reading the
+    /// credential store. A control that is visible but cannot work is worse
+    /// than one that is absent, so this fails closed.
+    pub fn jira_visible_for(&self, user: &str, auth: &crate::alerts::AlertsAuth) -> bool {
+        auth.is_complete() && self.jira.is_allowed_user(user)
     }
 
     /// True when `user` gets the git integration — the PAT prompt on launch,
@@ -1251,6 +1310,51 @@ mod tests {
         assert!(f.alerts_visible_for("BConrad", &auth)); // case-insensitive
         assert!(!f.alerts_visible_for("someone.else", &auth));
         assert!(!f.alerts_visible_for("", &auth)); // unknown user → hidden
+    }
+
+    fn jira_features(allowed: &str) -> Features {
+        serde_json::from_str(&format!(r#"{{"jira":{{"allowed_users":{allowed}}}}}"#))
+            .expect("should parse")
+    }
+
+    #[test]
+    fn jira_button_needs_both_the_allow_list_and_working_credentials() {
+        let f = jira_features(r#"["bconrad"]"#);
+        let auth = complete_alerts_auth();
+        assert!(f.jira_visible_for("bconrad", &auth));
+        assert!(f.jira_visible_for("BConrad", &auth), "usernames are case-insensitive");
+        assert!(!f.jira_visible_for("someone.else", &auth));
+        assert!(!f.jira_visible_for("", &auth), "unknown user -> hidden");
+        // A visible control that cannot work is worse than an absent one, so
+        // no credentials means no button however the allow-list reads.
+        assert!(!f.jira_visible_for("bconrad", &crate::alerts::AlertsAuth::default()));
+    }
+
+    #[test]
+    fn jira_wildcard_shows_to_everyone_and_an_empty_list_to_nobody() {
+        assert!(jira_features(r#"["*"]"#).jira_visible_for("anyone", &complete_alerts_auth()));
+        assert!(!jira_features("[]").jira_visible_for("bconrad", &complete_alerts_auth()));
+    }
+
+    #[test]
+    fn the_shipped_features_json_hides_jira_until_someone_is_opted_in() {
+        // Same stance as `alerts`: the button is an opt-in, not a default.
+        // If this ever needs to ship open, change the file -- not this
+        // assertion.
+        let f = load();
+        assert!(f.jira.allowed_users.is_empty());
+        assert!(!f.jira.is_allowed_user("anyone"));
+        assert!(!f.jira_visible_for("bconrad", &complete_alerts_auth()));
+    }
+
+    #[test]
+    fn a_malformed_features_file_hides_the_jira_button_from_everyone() {
+        // `Default` is what an unparseable file falls back to. It matches the
+        // shipped file today; the point of asserting it separately is that it
+        // must stay closed even if the shipped file is later opened up.
+        let f = Features::default();
+        assert!(f.jira.allowed_users.is_empty());
+        assert!(!f.jira_visible_for("bconrad", &complete_alerts_auth()));
     }
 
     #[test]

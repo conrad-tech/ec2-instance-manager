@@ -16,3 +16,9 @@ WSL/docs/superpowers/**/*escalation-notifier*
 
 WSL/docs/superpowers/specs/2026-08-14-reaper-auto-remediation-design.md
 WSL/docs/superpowers/plans/2026-08-17-reaper-auto-remediation.md
+
+# Design docs are working notes for the spec -> plan workflow, not something
+# the app ships. The whole tree stays local from here on. Files already
+# tracked above this line stay tracked -- a .gitignore rule does not untrack
+# anything, and CLAUDE.md refers to some of them by name.
+WSL/docs/

@@ -1265,6 +1265,130 @@ mod gui {
         result: std::result::Result<Vec<alerts::Alert>, String>,
     }
 
+    /// How often the ticket list refreshes itself while its window is open.
+    ///
+    /// Five minutes, not the Alerts window's ten seconds: an unacknowledged
+    /// page is time-critical and a ticket list is not. The manual **Refresh**
+    /// button covers the case this misses — you changed something in the
+    /// browser and want to see it now.
+    const JIRA_REFRESH_SECS: u64 = 300;
+
+    /// Jira Tickets list window state; `None` while the window is closed.
+    struct JiraWindow {
+        /// Rows from the last successful search, as the JQL ordered them
+        /// (most recently updated first).
+        rows: Vec<ec2_manager::jira::IssueRow>,
+        /// Error from the last search, if it failed.
+        error: Option<String>,
+        /// A search is in flight. This is what keeps the five-minute timer
+        /// from stacking requests when the API is slow — a tick that lands
+        /// mid-search is skipped, not queued.
+        loading: bool,
+        /// Poll on a timer as well as on demand. Session state, never
+        /// persisted.
+        auto_refresh: bool,
+        /// When the last search was kicked off (drives auto-refresh).
+        last_fetch: Option<Instant>,
+        /// Local-time clock reading of the last successful search.
+        fetched_at: Option<chrono::DateTime<chrono::Local>>,
+        /// The search box. Holds a ticket key to open directly.
+        search: String,
+        /// Why the typed search could not be used, shown under the box. Not
+        /// folded into `error`: that one belongs to the list and is written
+        /// by a different (async) writer, and an auto-refresh landing a
+        /// moment later would erase this one.
+        search_error: Option<String>,
+    }
+
+    impl JiraWindow {
+        fn new() -> Self {
+            Self {
+                rows: Vec::new(),
+                error: None,
+                loading: false,
+                auto_refresh: true,
+                last_fetch: None,
+                fetched_at: None,
+                search: String::new(),
+                search_error: None,
+            }
+        }
+    }
+
+    /// One open ticket window. Identity is the ticket key — clicking a ticket
+    /// that already has a window raises it rather than opening a second.
+    struct TicketWindow {
+        key: String,
+        /// `None` until the fetch lands.
+        issue: Option<ec2_manager::jira::Issue>,
+        /// What this ticket can legally do right now, per its own workflow.
+        transitions: Vec<ec2_manager::jira::Transition>,
+        /// The issue fetch failed. The window stays open showing the key, so
+        /// it is clear *which* ticket could not be read.
+        error: Option<String>,
+        /// The transitions fetch failed. Deliberately separate from `error`:
+        /// a token that can read a ticket but not list its transitions is an
+        /// ordinary permissions state, and it must leave the ticket readable
+        /// rather than blanking it — the same reason the Details tab keeps
+        /// volumes and security groups on separate events.
+        transitions_error: Option<String>,
+        /// The issue fetch is in flight.
+        loading: bool,
+        /// Id of the transition being applied, if any. Disables the whole
+        /// button row, so a double-click cannot fire two moves.
+        in_flight: Option<String>,
+        /// Outcome of the last transition, shown in the window.
+        note: Option<std::result::Result<String, String>>,
+    }
+
+    impl TicketWindow {
+        fn new(key: String) -> Self {
+            Self {
+                key,
+                issue: None,
+                transitions: Vec::new(),
+                error: None,
+                transitions_error: None,
+                loading: true,
+                in_flight: None,
+                note: None,
+            }
+        }
+    }
+
+    /// Jira workers → UI.
+    ///
+    /// One channel carrying an enum rather than a channel per call, following
+    /// `ReaperEvent`: there are four distinct results and they all land in
+    /// the same place.
+    ///
+    /// The issue and its transitions arrive as **separate** events even
+    /// though one thread makes both calls, so that a transitions failure
+    /// cannot blank a ticket that read perfectly well.
+    enum JiraEvent {
+        /// The ticket list.
+        List(std::result::Result<Vec<ec2_manager::jira::IssueRow>, String>),
+        /// One ticket's fields. Boxed because an `Issue` is several times
+        /// the size of every other variant, and an unboxed one would make
+        /// each of them that large.
+        Issue {
+            key: String,
+            result: std::result::Result<Box<ec2_manager::jira::Issue>, String>,
+        },
+        /// One ticket's legal moves.
+        Transitions {
+            key: String,
+            result: std::result::Result<Vec<ec2_manager::jira::Transition>, String>,
+        },
+        /// A transition was applied (or was not).
+        Transitioned {
+            key: String,
+            /// The workflow's name for the move, for the outcome line.
+            name: String,
+            result: std::result::Result<(), String>,
+        },
+    }
+
     /// "Acknowledge all" worker → UI. One `Result` per alert as its POST
     /// lands, so rows update progressively; one final `Done` once the whole
     /// (sequential, single-thread) run finishes — always sent by
@@ -2684,6 +2808,64 @@ mod gui {
         });
     }
 
+    /// The right-click menu on a row in the Alerts window.
+    ///
+    /// The same two actions the Alert ID box offers, aimed at the row under
+    /// the cursor — which is how anyone actually reaches for them: the alert
+    /// is already on screen, and copying its id into a box to act on it is a
+    /// step that exists only because the box came first.
+    ///
+    /// Writes into the caller's `Option`s rather than acting, because the
+    /// menu is drawn deep inside a `Grid` closure that has `&self` borrowed;
+    /// the caller applies them after the window is rendered, exactly as the
+    /// buttons already do.
+    ///
+    /// Split out so both cannot drift from the buttons' behaviour: dry run
+    /// runs at once, and Run Remediation goes through the confirmation with
+    /// the Override state as it stands.
+    fn alert_row_menu(
+        ui: &mut egui::Ui,
+        alert: &ec2_manager::alerts::Alert,
+        dry_run: &mut Option<String>,
+        remediate: &mut Option<String>,
+    ) {
+        ui.label(
+            egui::RichText::new(if alert.tiny_id.is_empty() {
+                alert.id.clone()
+            } else {
+                format!("#{}", alert.tiny_id)
+            })
+            .strong(),
+        );
+        ui.separator();
+        if ui
+            .button("Test Alert Match")
+            .on_hover_text(
+                "Dry run this alert — and SEND A REAL ESCALATION: your phone rings and \
+                 Telegram fires.\n\n\
+                 Everything the real run does except compose down / compose up -d. \
+                 Nothing is acknowledged and nothing on the box is changed.",
+            )
+            .clicked()
+        {
+            *dry_run = Some(alert.id.clone());
+            ui.close();
+        }
+        if ui
+            .button("Run Remediation")
+            .on_hover_text(
+                "Remediate this alert now, as if it had just come in: acknowledge (only \
+                 if you are on call), stop the watchdog, compose down, compose up -d, \
+                 then watch for the alert to close.\n\n\
+                 Asks for confirmation first.",
+            )
+            .clicked()
+        {
+            *remediate = Some(alert.id.clone());
+            ui.close();
+        }
+    }
+
     /// Which watcher a dry run should exercise for this alert.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum DryRunRoute {
@@ -2829,14 +3011,33 @@ mod gui {
                     }
                 }
                 DryRunRoute::Pingdom => {
-                    let incident = pingdom::incident_key(&alert).label();
+                    let (key, source) = pingdom::incident_key_with_source(
+                        &alert,
+                        &pingdom_cfg.environment_after,
+                    );
+                    // The whole reason to dry run a pingdom alert: see what
+                    // the summary yielded before trusting it to group real
+                    // incidents.
                     note(
                         LogLevel::Info,
                         format!(
-                            "dry run: alert {} matches the pingdom rules, incident \
-                             {incident} — a real run would acknowledge it and escalate \
-                             if it were still open {} minute(s) later",
+                            "dry run: environment {} — {} (markers: {:?})",
+                            match &key {
+                                pingdom::IncidentKey::Environment(e) => format!("{e:?}"),
+                                pingdom::IncidentKey::Alert(_) => "NOT FOUND".to_string(),
+                            },
+                            source.describe(),
+                            pingdom_cfg.environment_after,
+                        ),
+                    );
+                    note(
+                        LogLevel::Info,
+                        format!(
+                            "dry run: alert {} matches the pingdom rules, incident {} \
+                             — a real run would acknowledge it and escalate if it were \
+                             still open {} minute(s) later",
                             alert.id,
+                            key.label(),
                             pingdom_cfg.watch_window().as_secs() / 60,
                         ),
                     );
@@ -3974,6 +4175,49 @@ mod gui {
     }
 
     /// P1/P2 read as urgent, P3 as warning, the rest neutral.
+    /// Status colour, keyed on `statusCategory` rather than the status
+    /// *name*: names are per-workflow free text ("Closed", "Resolved",
+    /// "Shipped"), so matching on them would colour correctly in one project
+    /// and wrongly in the next. The category is one of three fixed values.
+    fn jira_status_color(category: &str) -> egui::Color32 {
+        match category.trim().to_ascii_lowercase().as_str() {
+            "done" => egui::Color32::from_rgb(90, 190, 110),
+            "indeterminate" => egui::Color32::from_rgb(90, 150, 230),
+            "new" => egui::Color32::from_rgb(150, 150, 160),
+            // An unknown category is not coloured as anything in particular.
+            _ => egui::Color32::GRAY,
+        }
+    }
+
+    /// `-` for an empty field, so a blank cell never reads as a missing
+    /// column.
+    fn dash_if_blank(s: &str) -> &str {
+        if s.trim().is_empty() {
+            "-"
+        } else {
+            s
+        }
+    }
+
+    /// Shorten for a window title, keeping both ends — the start says what
+    /// the ticket is and the end is where a distinguishing detail usually
+    /// sits, so cutting only the tail makes two similar tickets identical.
+    /// Counts characters, not bytes: a summary may hold non-ASCII, and
+    /// slicing a `String` mid-codepoint panics.
+    fn truncate_middle(s: &str, max: usize) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        if chars.len() <= max || max < 5 {
+            return s.to_string();
+        }
+        let keep = max - 1;
+        let head = keep.div_ceil(2);
+        let tail = keep - head;
+        let mut out: String = chars[..head].iter().collect();
+        out.push('…');
+        out.extend(chars[chars.len() - tail..].iter());
+        out
+    }
+
     fn priority_color(priority: &str) -> egui::Color32 {
         match priority.trim().to_ascii_uppercase().as_str() {
             "P1" | "P2" => egui::Color32::from_rgb(220, 60, 60),
@@ -6927,8 +7171,6 @@ mod gui {
         /// is not.
         reaper_probe_tx: Sender<ReaperEvent>,
         reaper_probe_rx: Receiver<ReaperEvent>,
-        /// Wakes the poll thread for "Re-run Alert Check".
-        reaper_nudge: ReaperNudgeHandle,
         /// Alert ids with a remediation in flight, shared with the poll
         /// thread so a manual run and an automatic one cannot collide.
         reaper_in_flight: ReaperInFlight,
@@ -6950,6 +7192,20 @@ mod gui {
         /// Alerts fetch worker → UI.
         alerts_tx: Sender<AlertsFetch>,
         alerts_rx: Receiver<AlertsFetch>,
+        /// Build-time gate: whether the Jira Tickets button is shown to the
+        /// current OS user (features.json `jira.allowed_users`, ANDed with
+        /// credentials that actually resolve).
+        jira_enabled: bool,
+        /// Ticket list window state; `None` while the window is closed.
+        jira_window: Option<JiraWindow>,
+        /// Open ticket windows, one per ticket key. A Vec rather than a map
+        /// because it is walked every frame to render and never looked up by
+        /// key in a hot path, and the order is the order they were opened in.
+        jira_tickets: Vec<TicketWindow>,
+        /// Jira workers → UI. One channel for every Jira call; see
+        /// `JiraEvent`.
+        jira_tx: Sender<JiraEvent>,
+        jira_rx: Receiver<JiraEvent>,
         /// Ids awaiting confirmation for an "Acknowledge all" run, captured
         /// at the moment the button was clicked. `Some` shows the confirm
         /// dialog; cleared on confirm or cancel. App-level (not on
@@ -7135,6 +7391,7 @@ mod gui {
             let (verify_tx, verify_rx) = mpsc::channel();
             let (preflight_tx, preflight_rx) = mpsc::channel();
             let (alerts_tx, alerts_rx) = mpsc::channel();
+            let (jira_tx, jira_rx) = mpsc::channel();
             let (ack_all_tx, ack_all_rx) = mpsc::channel();
             let (probe_tx, probe_rx) = mpsc::channel();
             let (email_tx, email_rx) = mpsc::channel();
@@ -7146,8 +7403,6 @@ mod gui {
             // Created here rather than inside `start_reaper_poll`, because
             // the Run Remediation button needs the in-flight set whether or
             // not the poll thread was ever started.
-            let reaper_nudge: ReaperNudgeHandle =
-                Arc::new((Mutex::new(ReaperNudge::default()), Condvar::new()));
             let reaper_in_flight: ReaperInFlight = Arc::new(Mutex::new(HashSet::new()));
             let features = ec2_manager::features::load();
             #[cfg(target_os = "windows")]
@@ -7234,6 +7489,13 @@ mod gui {
             // than each re-reading the registry on its own.
             let resolved_alerts_auth = features.alerts_auth();
 
+            // Computed here rather than inline in the struct literal below:
+            // `resolved_alerts_auth` is moved into `alerts_auth` before the
+            // jira fields are reached, so borrowing it there would not
+            // compile.
+            let jira_enabled = features
+                .jira_visible_for(&ec2_manager::features::current_os_user(), &resolved_alerts_auth);
+
             let reaper = {
                 let user = ec2_manager::features::current_os_user();
                 // Say what the gate decided, always. The `else` below used to
@@ -7280,7 +7542,6 @@ mod gui {
                             features.reaper.clone(),
                             config.clone(),
                             options.mode.clone(),
-                            Arc::clone(&reaper_nudge),
                             Arc::clone(&reaper_in_flight),
                         ))
                     } else {
@@ -7500,7 +7761,6 @@ mod gui {
                 reaper_probe_id: String::new(),
                 reaper_probe_tx,
                 reaper_probe_rx,
-                reaper_nudge,
                 reaper_in_flight,
                 pending_run_remediation: None,
                 reaper_override: false,
@@ -7509,6 +7769,11 @@ mod gui {
                 alerts_window: None,
                 alerts_tx,
                 alerts_rx,
+                jira_enabled,
+                jira_window: None,
+                jira_tickets: Vec::new(),
+                jira_tx,
+                jira_rx,
                 pending_ack_all: None,
                 ack_all_tx,
                 ack_all_rx,
@@ -7588,6 +7853,13 @@ mod gui {
                 });
             }
             app.log_info("application started");
+            if let Some(reason) = jira_gate_report(
+                &features.jira,
+                &ec2_manager::features::current_os_user(),
+                app.alerts_auth.is_complete(),
+            ) {
+                app.log_info(reason);
+            }
             for (is_warn, msg) in reaper_startup_log {
                 // Tagged like the rest of the remediation's output: "the
                 // feature never came up" is the first thing to look for under
@@ -7613,7 +7885,7 @@ mod gui {
             // process started later and never consulted here.
             app.log_info(format!(
                 "gates: os_user='{}' (from {}) — git_scripts={} alerts={} reaper={} \
-                 pingdom={} vault_iam={} vault_iam_delete={} fed_auth={} \
+                 pingdom={} jira={} vault_iam={} vault_iam_delete={} fed_auth={} \
                  fed_auto_sign_in={}",
                 if os_user.is_empty() { "(unset!)" } else { &os_user },
                 if cfg!(target_os = "windows") { "%USERNAME%" } else { "$USER" },
@@ -7621,6 +7893,7 @@ mod gui {
                 app.alerts_enabled,
                 features.reaper_enabled_for(&os_user),
                 features.pingdom_enabled_for(&os_user),
+                app.jira_enabled,
                 features.vault_iam_enabled_for(&os_user),
                 features.vault_iam_delete_enabled_for(&os_user),
                 app.fed_auth_enabled,
@@ -12286,6 +12559,210 @@ mod gui {
         /// "Acknowledge all" run is — a fetch issued mid-run can land after
         /// the run finishes and stomp the rows it just acknowledged, and one
         /// issued during the run races the run's own reconciling fetch.
+        /// Kick off a search for the caller's open tickets.
+        ///
+        /// The `loading` guard is what makes the five-minute timer safe: a
+        /// tick that arrives while a search is still running is skipped
+        /// rather than queued behind it.
+        fn start_jira_search(&mut self) {
+            let Some(win) = self.jira_window.as_mut() else {
+                return;
+            };
+            if win.loading {
+                return;
+            }
+            win.loading = true;
+            win.last_fetch = Some(Instant::now());
+            let auth = self.alerts_auth.clone();
+            let tx = self.jira_tx.clone();
+            std::thread::spawn(move || {
+                let result =
+                    ec2_manager::jira::search_my_issues(&auth).map_err(|e| e.to_string());
+                let _ = tx.send(JiraEvent::List(result));
+            });
+        }
+
+        /// Open a ticket's window, or raise the one it already has.
+        ///
+        /// Identity is the ticket key, so clicking the same row twice never
+        /// produces two windows to keep in step.
+        fn open_jira_ticket(&mut self, ctx: &egui::Context, key: &str) {
+            let key = key.trim().to_string();
+            if key.is_empty() {
+                return;
+            }
+            if self.jira_tickets.iter().any(|w| w.key == key) {
+                // Already open: bring it to the front rather than adding a
+                // duplicate. egui keys the window on the same id.
+                ctx.move_to_top(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new(("jira_ticket", key.as_str())),
+                ));
+                return;
+            }
+            self.log_info(format!("jira: opening {key}"));
+            self.jira_tickets.push(TicketWindow::new(key.clone()));
+            self.start_jira_ticket_load(&key);
+        }
+
+        /// Fetch one ticket and its legal moves.
+        ///
+        /// One thread, but **two** events: a token that can read a ticket and
+        /// not list its transitions is an ordinary permissions state, and it
+        /// must leave the ticket readable instead of blanking it.
+        fn start_jira_ticket_load(&mut self, key: &str) {
+            if let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key) {
+                win.loading = true;
+                win.error = None;
+                win.transitions_error = None;
+            }
+            let key = key.to_string();
+            let auth = self.alerts_auth.clone();
+            let tx = self.jira_tx.clone();
+            std::thread::spawn(move || {
+                let issue = ec2_manager::jira::fetch_issue(&auth, &key)
+                    .map(Box::new)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(JiraEvent::Issue { key: key.clone(), result: issue });
+                let transitions =
+                    ec2_manager::jira::fetch_transitions(&auth, &key).map_err(|e| e.to_string());
+                let _ = tx.send(JiraEvent::Transitions { key, result: transitions });
+            });
+        }
+
+        /// Apply one transition, then re-read the ticket.
+        ///
+        /// No confirmation dialog: it is the caller's own ticket and the move
+        /// is reversible from the very same button row. What guards it
+        /// instead is `in_flight`, which disables the row for the duration so
+        /// a double-click cannot fire two moves.
+        fn start_jira_transition(&mut self, key: &str, id: &str, name: &str) {
+            let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key) else {
+                return;
+            };
+            if win.in_flight.is_some() {
+                return;
+            }
+            win.in_flight = Some(id.to_string());
+            win.note = None;
+            let (key, id, name) = (key.to_string(), id.to_string(), name.to_string());
+            self.log_info(format!("jira: {key} — applying transition '{name}' (id {id})"));
+            let auth = self.alerts_auth.clone();
+            let tx = self.jira_tx.clone();
+            std::thread::spawn(move || {
+                let result = ec2_manager::jira::do_transition(&auth, &key, &id)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(JiraEvent::Transitioned { key, name, result });
+            });
+        }
+
+        /// Drain finished Jira calls into their windows.
+        fn poll_jira_events(&mut self) {
+            // Tickets to re-read once the borrow of `self.jira_tickets` ends.
+            let mut reload: Vec<String> = Vec::new();
+            while let Ok(event) = self.jira_rx.try_recv() {
+                match event {
+                    JiraEvent::List(result) => {
+                        let Some(win) = self.jira_window.as_mut() else {
+                            continue; // window closed while the search ran
+                        };
+                        win.loading = false;
+                        match result {
+                            Ok(rows) => {
+                                win.rows = rows;
+                                win.error = None;
+                                win.fetched_at = Some(chrono::Local::now());
+                            }
+                            Err(err) => {
+                                self.log_error(format!("jira: {err}"));
+                                if let Some(win) = self.jira_window.as_mut() {
+                                    win.error = Some(err);
+                                }
+                            }
+                        }
+                    }
+                    JiraEvent::Issue { key, result } => {
+                        let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key)
+                        else {
+                            continue; // ticket window closed mid-flight
+                        };
+                        win.loading = false;
+                        match result {
+                            Ok(issue) => {
+                                win.issue = Some(*issue);
+                                win.error = None;
+                            }
+                            Err(err) => {
+                                self.log_error(format!("jira: {key}: {err}"));
+                                if let Some(win) =
+                                    self.jira_tickets.iter_mut().find(|w| w.key == key)
+                                {
+                                    win.error = Some(err);
+                                }
+                            }
+                        }
+                    }
+                    JiraEvent::Transitions { key, result } => {
+                        let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key)
+                        else {
+                            continue;
+                        };
+                        match result {
+                            Ok(list) => {
+                                win.transitions = list;
+                                win.transitions_error = None;
+                            }
+                            Err(err) => {
+                                // A warning, not an error: the ticket itself
+                                // is still perfectly readable without this.
+                                self.log_warn(format!("jira: {key}: transitions: {err}"));
+                                if let Some(win) =
+                                    self.jira_tickets.iter_mut().find(|w| w.key == key)
+                                {
+                                    win.transitions.clear();
+                                    win.transitions_error = Some(err);
+                                }
+                            }
+                        }
+                    }
+                    JiraEvent::Transitioned { key, name, result } => {
+                        let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key)
+                        else {
+                            continue;
+                        };
+                        win.in_flight = None;
+                        match result {
+                            Ok(()) => {
+                                win.note = Some(Ok(format!("Applied '{name}'")));
+                                self.log_info(format!("jira: {key} — '{name}' applied"));
+                                // The status just changed, and so did the set
+                                // of legal next moves, so both are re-read
+                                // rather than guessed at locally.
+                                reload.push(key);
+                            }
+                            Err(err) => {
+                                self.log_error(format!(
+                                    "jira: {key} — '{name}' failed: {err}"
+                                ));
+                                if let Some(win) =
+                                    self.jira_tickets.iter_mut().find(|w| w.key == key)
+                                {
+                                    win.note = Some(Err(err));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for key in reload {
+                self.start_jira_ticket_load(&key);
+                // The list's status column is now stale for that row too.
+                if self.jira_window.is_some() {
+                    self.start_jira_search();
+                }
+            }
+        }
+
         fn start_alerts_fetch(&mut self) {
             if self.ack_all_running {
                 return;
@@ -12715,6 +13192,406 @@ mod gui {
 
         /// Render the on-call Alerts window. Times are shown in the user's
         /// local timezone; the API reports UTC.
+        /// The ticket list.
+        fn render_jira_window(&mut self, ctx: &egui::Context) {
+            if self.jira_window.is_none() {
+                return;
+            }
+            let mut open = true;
+            let mut refresh_now = false;
+            let mut submit_search = false;
+            let mut open_key: Option<String> = None;
+            let (mut auto_refresh, mut search, loading, last_fetch) = {
+                let w = self.jira_window.as_ref().expect("checked above");
+                (w.auto_refresh, w.search.clone(), w.loading, w.last_fetch)
+            };
+
+            egui::Window::new("Jira Tickets")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([940.0, 460.0])
+                .show(ctx, |ui| {
+                    let (rows, error, search_error, fetched_at) = {
+                        let w = self.jira_window.as_ref().expect("checked above");
+                        (w.rows.clone(), w.error.clone(), w.search_error.clone(), w.fetched_at)
+                    };
+
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!loading, egui::Button::new("Refresh"))
+                            .on_hover_text("Re-run the search now.")
+                            .clicked()
+                        {
+                            refresh_now = true;
+                        }
+                        ui.checkbox(&mut auto_refresh, "Auto").on_hover_text(
+                            "Re-run the search every 5 minutes while this window is open.",
+                        );
+                        if loading {
+                            ui.spinner();
+                        }
+                        if !rows.is_empty() {
+                            ui.label(format!("{} ticket(s)", rows.len()));
+                        }
+                        if let Some(at) = fetched_at {
+                            ui.weak(format!("updated {}", at.format("%-I:%M:%S %p")));
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Open ticket:");
+                        let edit = ui.add(
+                            egui::TextEdit::singleline(&mut search)
+                                .hint_text("OPS-123")
+                                .desired_width(180.0),
+                        );
+                        let entered =
+                            edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if entered
+                            || ui
+                                .add_enabled(
+                                    !search.trim().is_empty(),
+                                    egui::Button::new("Open"),
+                                )
+                                .on_hover_text("Open this ticket's view, whoever it belongs to.")
+                                .clicked()
+                        {
+                            submit_search = true;
+                        }
+                        if let Some(err) = &search_error {
+                            note_label(ui, egui::Color32::from_rgb(220, 90, 90), err.as_str());
+                        }
+                    });
+
+                    if let Some(err) = &error {
+                        ui.add_space(4.0);
+                        note_label(
+                            ui,
+                            egui::Color32::from_rgb(220, 90, 90),
+                            format!("Search failed: {err}"),
+                        );
+                    }
+                    ui.separator();
+
+                    if rows.is_empty() && !loading && error.is_none() {
+                        // "You have no open tickets" and "the reply could not
+                        // be read" must never look alike; the error line above
+                        // covers the second, so this only ever means the first.
+                        ui.weak("No open tickets assigned to you.");
+                        return;
+                    }
+
+                    egui::ScrollArea::vertical()
+                        .id_salt("jira_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            egui::Grid::new("jira_grid")
+                                .num_columns(6)
+                                .striped(true)
+                                .spacing([12.0, 6.0])
+                                .show(ui, |ui| {
+                                    for h in ["Key", "Type", "Pri", "Status", "Summary"] {
+                                        ui.strong(h);
+                                    }
+                                    ui.strong(format!("Updated ({})", local_tz_label()));
+                                    ui.end_row();
+
+                                    for row in &rows {
+                                        // The key is the click target; the
+                                        // rest of the row is plain text, so
+                                        // there is one obvious place to click
+                                        // and no accidental opens while
+                                        // reading.
+                                        if ui
+                                            .add(egui::Link::new(
+                                                egui::RichText::new(&row.key).strong(),
+                                            ))
+                                            .on_hover_text("Open this ticket")
+                                            .clicked()
+                                        {
+                                            open_key = Some(row.key.clone());
+                                        }
+                                        ui.label(dash_if_blank(&row.issue_type));
+                                        note_label(
+                                            ui,
+                                            priority_color(&row.priority),
+                                            dash_if_blank(&row.priority),
+                                        );
+                                        note_label(
+                                            ui,
+                                            jira_status_color(&row.status_category),
+                                            dash_if_blank(&row.status),
+                                        );
+                                        ui.label(&row.summary);
+                                        ui.label(ec2_manager::jira::local_time(&row.updated));
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                });
+
+            // Write the widget-owned values back before anything else reads
+            // them, then act on what was clicked.
+            if let Some(w) = self.jira_window.as_mut() {
+                w.auto_refresh = auto_refresh;
+                w.search = search;
+            }
+            if submit_search {
+                self.submit_jira_search(ctx);
+            }
+            if let Some(key) = open_key {
+                self.open_jira_ticket(ctx, &key);
+            }
+            if !open {
+                self.jira_window = None;
+                return;
+            }
+
+            // Auto-refresh. egui only redraws when something happens, so the
+            // timer asks for the frame it needs rather than firing whenever
+            // the next one happens to occur -- the same mistake the tunnel
+            // status banner already made and fixed.
+            if auto_refresh && !loading {
+                let period = Duration::from_secs(JIRA_REFRESH_SECS);
+                match last_fetch {
+                    None => refresh_now = true,
+                    Some(at) => {
+                        let elapsed = at.elapsed();
+                        if elapsed >= period {
+                            refresh_now = true;
+                        } else {
+                            ctx.request_repaint_after(period - elapsed);
+                        }
+                    }
+                }
+            }
+            if refresh_now {
+                self.start_jira_search();
+            }
+        }
+
+        /// Open whatever is in the search box, or say why it cannot be.
+        ///
+        /// Key-shaped input only. Free-text search across summaries is
+        /// deliberately not here: it is a second search mode with its own
+        /// result list, not a variation on opening a ticket.
+        fn submit_jira_search(&mut self, ctx: &egui::Context) {
+            let typed = self
+                .jira_window
+                .as_ref()
+                .map(|w| w.search.trim().to_string())
+                .unwrap_or_default();
+            if typed.is_empty() {
+                return;
+            }
+            let key = typed.to_ascii_uppercase();
+            if !ec2_manager::jira::looks_like_issue_key(&key) {
+                if let Some(w) = self.jira_window.as_mut() {
+                    w.search_error =
+                        Some(format!("'{typed}' is not a ticket key — try OPS-123"));
+                }
+                return;
+            }
+            if let Some(w) = self.jira_window.as_mut() {
+                w.search_error = None;
+                w.search.clear();
+            }
+            self.open_jira_ticket(ctx, &key);
+        }
+
+        /// Every open ticket window.
+        fn render_jira_ticket_windows(&mut self, ctx: &egui::Context) {
+            // Actions are collected and applied after the loop: the render
+            // borrows `self.jira_tickets`, and both of these need `&mut self`.
+            let mut closed: Vec<String> = Vec::new();
+            let mut transition: Option<(String, String, String)> = None;
+            let mut reload: Option<String> = None;
+
+            for idx in 0..self.jira_tickets.len() {
+                let (key, issue, transitions, error, transitions_error, loading, in_flight, note) = {
+                    let w = &self.jira_tickets[idx];
+                    (
+                        w.key.clone(),
+                        w.issue.clone(),
+                        w.transitions.clone(),
+                        w.error.clone(),
+                        w.transitions_error.clone(),
+                        w.loading,
+                        w.in_flight.clone(),
+                        w.note.clone(),
+                    )
+                };
+                let title = match &issue {
+                    Some(i) if !i.summary.is_empty() => {
+                        format!("{}  ·  {}", key, truncate_middle(&i.summary, 60))
+                    }
+                    _ => key.clone(),
+                };
+                let mut open = true;
+                egui::Window::new(title)
+                    // Identity is the ticket key, not the title -- the title
+                    // gains the summary the moment the fetch lands, and a
+                    // window whose id changed would lose its position.
+                    .id(egui::Id::new(("jira_ticket", key.as_str())))
+                    .open(&mut open)
+                    .collapsible(true)
+                    .resizable(true)
+                    .default_size([620.0, 520.0])
+                    .show(ctx, |ui| {
+                        if loading && issue.is_none() {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(format!("Loading {key}…"));
+                            });
+                            return;
+                        }
+                        if let Some(err) = &error {
+                            note_label(
+                                ui,
+                                egui::Color32::from_rgb(220, 90, 90),
+                                format!("Could not read {key}: {err}"),
+                            );
+                            return;
+                        }
+                        let Some(issue) = &issue else {
+                            return;
+                        };
+
+                        ui.horizontal_wrapped(|ui| {
+                            ui.heading(&issue.key);
+                            note_label(
+                                ui,
+                                jira_status_color(&issue.status_category),
+                                egui::RichText::new(dash_if_blank(&issue.status)).strong(),
+                            );
+                        });
+                        ui.label(egui::RichText::new(&issue.summary).size(16.0));
+                        ui.add_space(6.0);
+
+                        egui::Grid::new(("jira_fields", key.as_str()))
+                            .num_columns(2)
+                            .spacing([14.0, 4.0])
+                            .show(ui, |ui| {
+                                let mut field = |label: &str, value: &str| {
+                                    ui.weak(label);
+                                    ui.label(dash_if_blank(value));
+                                    ui.end_row();
+                                };
+                                field("Type", &issue.issue_type);
+                                field("Priority", &issue.priority);
+                                // An unassigned ticket is an ordinary state,
+                                // and saying so beats an empty cell.
+                                field(
+                                    "Assignee",
+                                    if issue.assignee.is_empty() {
+                                        "Unassigned"
+                                    } else {
+                                        &issue.assignee
+                                    },
+                                );
+                                field("Reporter", &issue.reporter);
+                                field("Created", &ec2_manager::jira::local_time(&issue.created));
+                                field("Updated", &ec2_manager::jira::local_time(&issue.updated));
+                                if !issue.labels.is_empty() {
+                                    field("Labels", &issue.labels.join(", "));
+                                }
+                            });
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.strong("Description");
+                        egui::ScrollArea::vertical()
+                            .id_salt(("jira_desc", key.as_str()))
+                            .max_height(240.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if issue.description.is_empty() {
+                                    ui.weak("(no description)");
+                                } else {
+                                    // Plain text, straight from API v2 -- see
+                                    // the note in src/jira.rs on why this is
+                                    // not ADF.
+                                    ui.add(
+                                        egui::Label::new(&issue.description).wrap(),
+                                    );
+                                }
+                            });
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.horizontal_wrapped(|ui| {
+                            ui.strong("Actions");
+                            if let Some(err) = &transitions_error {
+                                // The ticket above is still fully readable;
+                                // only the buttons are missing.
+                                note_label(
+                                    ui,
+                                    egui::Color32::from_rgb(220, 160, 60),
+                                    format!("could not load actions: {err}"),
+                                );
+                            } else if transitions.is_empty() {
+                                ui.weak("this ticket's workflow offers no moves from here");
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            for tr in &transitions {
+                                let busy = in_flight.is_some();
+                                let btn = ui.add_enabled(
+                                    !busy,
+                                    egui::Button::new(&tr.name),
+                                );
+                                let btn = if tr.to_status.is_empty() {
+                                    btn
+                                } else {
+                                    // A button named "Done" that actually
+                                    // moves the ticket to "Closed" says so.
+                                    btn.on_hover_text(format!("Moves {key} to {}", tr.to_status))
+                                };
+                                if btn.clicked() {
+                                    transition =
+                                        Some((key.clone(), tr.id.clone(), tr.name.clone()));
+                                }
+                            }
+                            if in_flight.is_some() {
+                                ui.spinner();
+                            }
+                            if ui
+                                .add_enabled(!loading, egui::Button::new("↻"))
+                                .on_hover_text("Re-read this ticket")
+                                .clicked()
+                            {
+                                reload = Some(key.clone());
+                            }
+                        });
+                        match &note {
+                            Some(Ok(msg)) => {
+                                note_label(ui, egui::Color32::from_rgb(90, 190, 110), msg.as_str());
+                            }
+                            Some(Err(err)) => {
+                                note_label(
+                                    ui,
+                                    egui::Color32::from_rgb(220, 90, 90),
+                                    format!("Failed: {err}"),
+                                );
+                            }
+                            None => {}
+                        }
+                    });
+                if !open {
+                    closed.push(key);
+                }
+            }
+
+            self.jira_tickets.retain(|w| !closed.contains(&w.key));
+            if let Some((key, id, name)) = transition {
+                self.start_jira_transition(&key, &id, &name);
+            }
+            if let Some(key) = reload {
+                self.start_jira_ticket_load(&key);
+            }
+        }
+
         fn render_alerts_window(&mut self, ctx: &egui::Context) {
             if self.alerts_window.is_none() {
                 return;
@@ -12736,13 +13613,20 @@ mod gui {
             // borrowing mutably.
             let mut confirm_remediation_id: Option<(String, bool)> = None;
             let mut dry_run_alert_id: Option<String> = None;
+            // What the row menu asked for. Separate from the two above so the
+            // menu can be drawn inside the grid closure without borrowing
+            // `self`, then applied below alongside the buttons' results.
+            let mut menu_dry_run: Option<String> = None;
+            let mut menu_remediate: Option<String> = None;
+            // Copied out for the same reason: the grid closure cannot read
+            // `self`. Same gate as the Alert ID row's buttons.
+            let probe_enabled = self.reaper_probe_enabled;
             // Whatever the dry-run thread could not do. Kept as the *last*
             // one: a run reports at most one failure and then stops, so
             // there is never a queue of them to reconcile.
             if let Some(latest) = self.dry_run_error_rx.try_iter().last() {
                 self.alert_submit_error = Some(latest);
             }
-            let mut rerun_alert_check = false;
 
             egui::Window::new("On-Call Alerts")
                 .open(&mut open)
@@ -12888,29 +13772,6 @@ mod gui {
                             // Makes the poll behave as though it has never
                             // seen anything: history and cooldowns dropped,
                             // a pass run immediately.
-                            let armed = self.reaper.is_some();
-                            let recheck = ui.add_enabled(
-                                armed,
-                                egui::Button::new("Re-run Alert Check"),
-                            );
-                            let recheck = if armed {
-                                recheck.on_hover_text(
-                                    "Run the alert check again now, as a live setup would \
-                                     on its next poll — forgetting what this session has \
-                                     already handled and every cooldown, so an open alert \
-                                     waiting to be resolved is picked up as if it had just \
-                                     arrived.",
-                                )
-                            } else {
-                                recheck.on_disabled_hover_text(
-                                    "The reaper poll is not running in this build \
-                                     (reaper.enabled is false, or you are not on \
-                                     reaper.allowed_users).",
-                                )
-                            };
-                            if recheck.clicked() {
-                                rerun_alert_check = true;
-                            }
                             ui.weak("results appear in the Logs tab");
                         });
                         if let Some(err) = &self.alert_submit_error {
@@ -12976,44 +13837,65 @@ mod gui {
                                     ui.end_row();
 
                                     for a in &rows {
-                                        ui.label(format_local_time(&a.created_at));
-                                        ui.label(if a.tiny_id.is_empty() {
+                                        // Right-click anywhere on the row.
+                                        // egui has no row-level response in a
+                                        // Grid, so every cell carries the same
+                                        // menu -- otherwise the target would be
+                                        // whichever column the user happened to
+                                        // aim at.
+                                        let mut menu = |r: egui::Response| {
+                                            if !probe_enabled {
+                                                return;
+                                            }
+                                            r.context_menu(|ui| {
+                                                alert_row_menu(
+                                                    ui,
+                                                    a,
+                                                    &mut menu_dry_run,
+                                                    &mut menu_remediate,
+                                                );
+                                            });
+                                        };
+                                        menu(ui.label(format_local_time(&a.created_at)));
+                                        menu(ui.label(if a.tiny_id.is_empty() {
                                             "-".to_string()
                                         } else {
                                             format!("#{}", a.tiny_id)
-                                        });
-                                        note_label(ui, 
+                                        }));
+                                        menu(note_label(ui,
                                             priority_color(&a.priority),
                                             if a.priority.is_empty() {
                                                 "-"
                                             } else {
                                                 &a.priority
                                             },
-                                        );
-                                        ui.label(if a.status.is_empty() {
+                                        ));
+                                        menu(ui.label(if a.status.is_empty() {
                                             "?"
                                         } else {
                                             &a.status
-                                        });
+                                        }));
                                         if a.acknowledged {
-                                            ui.label("ack");
+                                            menu(ui.label("ack"));
                                         } else {
-                                            note_label(ui, 
+                                            menu(note_label(ui,
                                                 egui::Color32::from_rgb(220, 160, 60),
                                                 "unack",
-                                            );
+                                            ));
                                         }
-                                        ui.label(if a.account.is_empty() {
+                                        menu(ui.label(if a.account.is_empty() {
                                             "-"
                                         } else {
                                             &a.account
-                                        });
-                                        ui.label(if a.environment.is_empty() {
+                                        }));
+                                        menu(ui.label(if a.environment.is_empty() {
                                             "-"
                                         } else {
                                             &a.environment
-                                        });
-                                        ui.label(&a.message).on_hover_text(&a.message);
+                                        }));
+                                        menu(
+                                            ui.label(&a.message).on_hover_text(&a.message),
+                                        );
                                         ui.end_row();
                                     }
                                 });
@@ -13027,13 +13909,13 @@ mod gui {
             if let Some(ids) = ack_all_ids {
                 self.pending_ack_all = Some(ids);
             }
-            if rerun_alert_check {
-                self.log_reaper(
-                    LogLevel::Info,
-                    "reaper: re-run of the alert check requested".to_string(),
-                );
-                nudge_reaper_poll(&self.reaper_nudge, true);
-            }
+            // The row menu and the Alert ID box feed the same two paths. The
+            // box wins if somehow both fired in one frame, which it cannot,
+            // since a context menu swallows the click that opens it.
+            let confirm_remediation_id = confirm_remediation_id
+                .or_else(|| menu_remediate.map(|id| (id, self.reaper_override)));
+            let dry_run_alert_id = dry_run_alert_id.or(menu_dry_run);
+
             if let Some(pending) = confirm_remediation_id {
                 self.pending_run_remediation = Some(pending);
             }
@@ -22120,11 +23002,14 @@ mod gui {
                 self.render_pat_dialog(ctx);
                 self.render_script_result_popup(ctx);
                 self.render_alerts_window(ctx);
+                self.render_jira_window(ctx);
+                self.render_jira_ticket_windows(ctx);
                 self.render_ack_all_confirm(ctx);
                 self.render_run_remediation_confirm(ctx);
                 self.pump_script_runs();
                 self.poll_script_events();
                 self.poll_alerts_events();
+                self.poll_jira_events();
                 self.poll_ack_all_events();
                 self.poll_reaper_events();
                 self.poll_pingdom_events();
@@ -22902,6 +23787,38 @@ mod gui {
                                     let msg = "Alerts: no API token. Set JIRA_TOKEN in your environment, or store it in Windows Credential Manager (ec2_manager/jsm), and restart.";
                                     self.log_error(msg);
                                     self.set_script_status(msg, ScriptState::Failed);
+                                }
+                            }
+                        }
+
+                        // Jira tickets — the same allow-list-plus-credentials
+                        // gate as Alerts, but shipped open (see JiraFeature).
+                        if self.jira_enabled {
+                            let count = self
+                                .jira_window
+                                .as_ref()
+                                .map(|w| w.rows.len())
+                                .unwrap_or(0);
+                            let label = if count > 0 {
+                                format!("Jira Tickets ({count})")
+                            } else {
+                                "Jira Tickets".to_string()
+                            };
+                            if ui
+                                .button(label)
+                                .on_hover_text(
+                                    "Your open tickets. Click one to open its ticket view, \
+                                     where the moves that ticket's own workflow allows \
+                                     (Start Progress, Close, ...) are buttons.",
+                                )
+                                .clicked()
+                            {
+                                if self.jira_window.is_some() {
+                                    self.jira_window = None;
+                                } else {
+                                    self.jira_window = Some(JiraWindow::new());
+                                    self.log_info("jira: opening ticket list");
+                                    self.start_jira_search();
                                 }
                             }
                         }
@@ -24512,32 +25429,6 @@ mod gui {
         })
     }
 
-    /// What the UI can ask the poll thread to do out of band.
-    ///
-    /// The thread waits on the condvar for its poll interval rather than
-    /// sleeping, so a press takes effect at once instead of up to 30s later.
-    #[derive(Debug, Default)]
-    struct ReaperNudge {
-        /// Run a pass now.
-        now: bool,
-        /// Forget what this process has already handled, so an alert it has
-        /// acted on — or is holding in cooldown — is considered again. This
-        /// is what makes a re-run behave like the alert has just arrived.
-        forget: bool,
-    }
-
-    type ReaperNudgeHandle = Arc<(Mutex<ReaperNudge>, Condvar)>;
-
-    /// Ask the poll thread to run now, optionally forgetting its history.
-    fn nudge_reaper_poll(handle: &ReaperNudgeHandle, forget: bool) {
-        let (lock, cv) = &**handle;
-        if let Ok(mut n) = lock.lock() {
-            n.now = true;
-            n.forget |= forget;
-            cv.notify_all();
-        }
-    }
-
     struct ReaperRuntime {
         rx: std::sync::mpsc::Receiver<ReaperEvent>,
         _handle: std::thread::JoinHandle<()>,
@@ -24710,6 +25601,37 @@ mod gui {
             ec2_manager::reaper::OutcomeCode::Failure,
             &e.created_at,
         )
+    }
+
+    /// Why the **Jira Tickets** button is or is not there.
+    ///
+    /// Pure, and returns the line instead of logging it, so both dark states
+    /// can be asserted without an `Ec2GuiApp`. A missing button is the whole
+    /// of what a user sees when this gate closes, and "the button is not
+    /// there" is not a diagnosis — reaper had three states that all wrote
+    /// nothing at all and telling them apart took five rounds of guessing.
+    ///
+    /// `None` means the button is shown.
+    fn jira_gate_report(
+        cfg: &ec2_manager::features::JiraFeature,
+        user: &str,
+        auth_complete: bool,
+    ) -> Option<String> {
+        if !cfg.is_allowed_user(user) {
+            return Some(format!(
+                "jira: no Jira Tickets button — os_user '{user}' is not on \
+                 jira.allowed_users"
+            ));
+        }
+        if !auth_complete {
+            return Some(
+                "jira: no Jira Tickets button — no JSM credentials resolved. Set \
+                 ATLASSIAN_EMAIL, JIRA_TOKEN and CLOUD_ID, or store them in Windows \
+                 Credential Manager (ec2_manager/jsm, ec2_manager/jsm_cloud_id)"
+                    .to_string(),
+            );
+        }
+        None
     }
 
     /// Whether the pingdom watcher may run, and the startup lines saying why.
@@ -25021,10 +25943,37 @@ mod gui {
                                 continue;
                             }
 
-                            let incident = pingdom::incident_key(alert).label();
-                            match state.consider(alert, now_ms, window_ms) {
+                            let (key, source) =
+                                pingdom::incident_key_with_source(alert, &cfg.environment_after);
+                            let incident = key.label();
+                            match state.consider(
+                                alert,
+                                &cfg.environment_after,
+                                now_ms,
+                                window_ms,
+                            ) {
                                 pingdom::Action::Ignore => {}
                                 pingdom::Action::AckAndWatch => {
+                                    // What the summary actually yielded, and
+                                    // by which rule. This is the line the
+                                    // `environment_after` markers are tuned
+                                    // from: `last word of the summary` on an
+                                    // environment that is two words is the
+                                    // signal to add one.
+                                    note(
+                                        LogLevel::Info,
+                                        format!(
+                                            "pingdom: {} environment {} — {}",
+                                            alert.id,
+                                            match &key {
+                                                pingdom::IncidentKey::Environment(e) =>
+                                                    format!("{e:?}"),
+                                                pingdom::IncidentKey::Alert(_) =>
+                                                    "NOT FOUND".to_string(),
+                                            },
+                                            source.describe(),
+                                        ),
+                                    );
                                     match alerts::acknowledge_alert(&auth, &alert.id) {
                                         Ok(()) => note(
                                             LogLevel::Info,
@@ -25506,7 +26455,6 @@ mod gui {
         cfg: ec2_manager::features::ReaperFeature,
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
-        nudge: ReaperNudgeHandle,
         in_flight: ReaperInFlight,
     ) -> ReaperRuntime {
         use ec2_manager::{alerts, oncall, reaper};
@@ -25543,16 +26491,31 @@ mod gui {
                             // come first, so a settled alert never costs a
                             // full read. Everything past here is about an
                             // alert we may actually act on.
+                            // Said once per alert, not once per poll. A
+                            // closed alert is finished: it keeps coming back
+                            // on the feed until newer ones push it off the
+                            // newest-N window, and re-announcing it every 30s
+                            // filled the log with lines about something that
+                            // had already been settled. Same for one this
+                            // process has already acted on.
                             if reaper::alert_is_closed(&alert.status) {
-                                let _ = tx.send(ReaperEvent::Skipped {
-                                    reason: format!("{} already closed", alert.id),
-                                });
+                                report_reaper_reason_change(
+                                    &mut reported,
+                                    &alert.id,
+                                    LogLevel::Debug,
+                                    format!("reaper: skipped — {} already closed", alert.id),
+                                    &tx,
+                                );
                                 continue;
                             }
                             if state.already_handled(&alert.id) {
-                                let _ = tx.send(ReaperEvent::Skipped {
-                                    reason: format!("{} already handled", alert.id),
-                                });
+                                report_reaper_reason_change(
+                                    &mut reported,
+                                    &alert.id,
+                                    LogLevel::Debug,
+                                    format!("reaper: skipped — {} already handled", alert.id),
+                                    &tx,
+                                );
                                 continue;
                             }
 
@@ -25842,32 +26805,7 @@ mod gui {
                         });
                     }
                 }
-                // Waited on rather than slept, so "Re-run Alert Check"
-                // takes effect at once instead of up to a poll interval
-                // later. A spurious wakeup just polls early, which is
-                // harmless.
-                let (lock, cv) = &*nudge;
-                if let Ok(mut n) = lock.lock() {
-                    if !n.now {
-                        let (guard, _) = cv
-                            .wait_timeout(n, cfg.poll_interval())
-                            .unwrap_or_else(|e| e.into_inner());
-                        n = guard;
-                    }
-                    n.now = false;
-                    if std::mem::take(&mut n.forget) {
-                        // Everything this process has acted on, and every
-                        // cooldown, dropped — so the next pass treats an open
-                        // alert exactly as it would a new one.
-                        state = reaper::ReaperState::new();
-                        let _ = tx.send(ReaperEvent::Note {
-                            level: LogLevel::Info,
-                            message: "reaper: re-run requested — forgetting handled \
-                                      alerts and cooldowns, checking now"
-                                .to_string(),
-                        });
-                    }
-                }
+                std::thread::sleep(cfg.poll_interval());
             }
         });
         ReaperRuntime { rx, _handle: handle }
@@ -29045,36 +29983,6 @@ mod gui {
             drop(other);
             drop(again);
             assert!(set.lock().expect("not poisoned").is_empty());
-        }
-
-        #[test]
-        fn a_re_run_asks_the_poll_to_forget_and_check_now() {
-            // "As if the alert had just arrived": the handled set and every
-            // cooldown dropped, and a pass immediately rather than up to a
-            // poll interval later.
-            let handle: ReaperNudgeHandle =
-                Arc::new((Mutex::new(ReaperNudge::default()), Condvar::new()));
-            {
-                let n = handle.0.lock().expect("not poisoned");
-                assert!(!n.now && !n.forget, "nothing asked for yet");
-            }
-            nudge_reaper_poll(&handle, true);
-            let n = handle.0.lock().expect("not poisoned");
-            assert!(n.now, "the poll is asked to run now");
-            assert!(n.forget, "and to forget what it has handled");
-        }
-
-        #[test]
-        fn a_plain_nudge_does_not_clear_the_history() {
-            // `forget` is the destructive half — it makes an alert already
-            // acted on eligible again — so it is never implied by asking for
-            // an early poll.
-            let handle: ReaperNudgeHandle =
-                Arc::new((Mutex::new(ReaperNudge::default()), Condvar::new()));
-            nudge_reaper_poll(&handle, false);
-            let n = handle.0.lock().expect("not poisoned");
-            assert!(n.now);
-            assert!(!n.forget);
         }
 
         #[test]
@@ -33942,6 +34850,82 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 incident: "PROD".to_string(),
             };
             assert_eq!(pingdom_escalation_subject(&e), "RE-F");
+        }
+
+        fn jira_cfg(users: &[&str]) -> ec2_manager::features::JiraFeature {
+            ec2_manager::features::JiraFeature {
+                allowed_users: users.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+
+        #[test]
+        fn a_missing_jira_button_says_which_gate_closed() {
+            // "The button is not there" is not a diagnosis, and it is the
+            // whole of what the user sees when either half of the gate fails.
+            let off = jira_gate_report(&jira_cfg(&["someone-else"]), "bconrad", true)
+                .expect("should be hidden");
+            assert!(off.contains("jira.allowed_users"), "{off}");
+            assert!(off.contains("bconrad"), "names the user it checked: {off}");
+
+            let no_creds = jira_gate_report(&jira_cfg(&["*"]), "bconrad", false)
+                .expect("should be hidden");
+            assert!(no_creds.contains("credentials"), "{no_creds}");
+            // It must say how to fix it, not merely that it is broken.
+            assert!(no_creds.contains("JIRA_TOKEN"), "{no_creds}");
+
+            // Shown: no line at all.
+            assert!(jira_gate_report(&jira_cfg(&["*"]), "bconrad", true).is_none());
+            assert!(jira_gate_report(&jira_cfg(&["BConrad"]), "bconrad", true).is_none());
+        }
+
+        #[test]
+        fn the_jira_gate_report_never_carries_a_credential() {
+            // The app log gets pasted into tickets.
+            for report in [
+                jira_gate_report(&jira_cfg(&[]), "bconrad", true),
+                jira_gate_report(&jira_cfg(&["*"]), "bconrad", false),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assert!(!report.contains('@'), "no address should appear: {report}");
+            }
+        }
+
+        #[test]
+        fn a_status_is_coloured_by_category_not_by_its_name() {
+            // Status *names* are per-workflow free text, so matching on them
+            // colours correctly in one project and wrongly in the next.
+            assert_eq!(jira_status_color("done"), jira_status_color("DONE"));
+            assert_ne!(jira_status_color("done"), jira_status_color("new"));
+            assert_ne!(jira_status_color("indeterminate"), jira_status_color("new"));
+            // A category nobody recognises is not coloured as anything.
+            assert_eq!(jira_status_color("Shipped It"), egui::Color32::GRAY);
+            assert_eq!(jira_status_color(""), egui::Color32::GRAY);
+        }
+
+        #[test]
+        fn a_blank_field_renders_as_a_dash_not_an_empty_cell() {
+            assert_eq!(dash_if_blank(""), "-");
+            assert_eq!(dash_if_blank("   "), "-");
+            assert_eq!(dash_if_blank("High"), "High");
+        }
+
+        #[test]
+        fn a_long_summary_is_shortened_from_the_middle() {
+            assert_eq!(truncate_middle("short", 60), "short");
+            let long = "a".repeat(40) + &"b".repeat(40);
+            let cut = truncate_middle(&long, 21);
+            assert_eq!(cut.chars().count(), 21);
+            // Both ends survive: two tickets differing only in their tails
+            // must not shorten to the same string.
+            assert!(cut.starts_with('a'));
+            assert!(cut.ends_with('b'));
+            assert!(cut.contains('…'));
+            // Counted in chars, not bytes -- slicing a multi-byte codepoint
+            // would panic rather than truncate.
+            let wide = "π".repeat(50);
+            assert_eq!(truncate_middle(&wide, 11).chars().count(), 11);
         }
 
         #[test]

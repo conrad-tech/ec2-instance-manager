@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod alerts;
+pub mod atlassian_http;
 pub mod aws_cli;
 pub mod aws_context;
 pub mod config;
@@ -14,6 +15,7 @@ pub mod forwards;
 pub mod forwards_check;
 pub mod gui_cli;
 pub mod inventory;
+pub mod jira;
 pub mod jsm_auth;
 pub mod models;
 pub mod obf_core;

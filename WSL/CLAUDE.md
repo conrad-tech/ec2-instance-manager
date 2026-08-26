@@ -348,7 +348,12 @@ Two things that are easy to get wrong:
 - **HTTP goes through `curl`,** not a linked HTTP stack (consistent with how the
   app shells out to `aws`). Credentials are written to curl's **stdin**
   (`-K -`), never argv, so the API token never appears in the process list.
-  `curl.exe` ships with Windows 10 1803+.
+  `curl.exe` ships with Windows 10 1803+. That request lives in
+  **`src/atlassian_http.rs`**, not here: the Jira issue calls behind the Jira
+  Tickets button use the same token, and one definition of how a token reaches
+  curl is worth more than two modules that each look right. `alerts.rs`
+  re-exports `ApiCall` / `recent_api_calls` / `clear_api_calls` so the Logs tab
+  still reaches them as `alerts::…`.
 
 Its **Pingdom** entry is the second watcher — see "Pingdom: acknowledge, wait
 ten minutes, escalate" below.
@@ -647,11 +652,12 @@ overruled both.
   time, so toggling it while the dialog is open cannot change what was agreed
   to. The dialog restates which mode it will run in.
 
-**Re-run Alert Check** makes the poll forget every handled alert and every
-cooldown and run a pass immediately, so an open alert is picked up as if it had
-just arrived. The poll thread now **waits on a condvar** rather than sleeping,
-so this lands at once instead of up to a poll interval later. `forget` is never
-implied by asking for an early poll — it is the destructive half.
+**Re-run Alert Check is gone**, along with the condvar nudge behind it. It read
+as "check the alerts again" and actually meant "forget every handled alert and
+every cooldown, then act on whatever is still open" — so the one button whose
+name promised the least was the one that could start a real `compose down`. The
+row menu and the Alert ID box aim at a specific alert, which is what anyone
+re-running something actually wants. The poll thread sleeps its interval again.
 
 **One alert cannot be remediated twice at once.** The poll and the button each
 spawn their own thread, so `ReaperState` cannot arbitrate between them —
@@ -740,13 +746,31 @@ touches an instance — which is why it is its own module rather than a second
   **failed** counts as off call: it is the only direction that can do neither
   by mistake. `pingdom_on_call_decision` is pure and separate from the loop so
   that rule is pinned by a test rather than by reading a `continue`.
-- **The environment comes from the alert title, not the `Environment:` tag.**
-  These alerts are shaped `[Pingdom] domain xxx yy <environment>` and do not
-  carry that tag, so `environment_from_title` takes the last whitespace token
-  of `Alert.message`. That field *is* in the list payload — unlike
-  `description`, which is what forces reaper to `fetch_alert_in_full` — so
-  pingdom matches straight off `fetch_latest` and never reads an alert in full
-  to decide.
+- **The environment comes from the alert summary, not the `Environment:`
+  tag.** These alerts do not carry that tag, so `environment_from_title` reads
+  `Alert.message`. That field *is* in the list payload — unlike `description`,
+  which is what forces reaper to `fetch_alert_in_full` — so pingdom matches
+  straight off `fetch_latest` and never reads an alert in full to decide.
+- **`pingdom.environment_after` is the rule that matters: a list of app names,
+  and the environment is EVERYTHING AFTER the first one that appears.** List
+  order decides, not the summary's word order, and markers match
+  case-insensitively (an app name drifts in case the same way `MMODAL_ENV`
+  does). A blank entry is skipped — it would match at offset 0 and make the
+  whole summary the environment.
+- **Everything after, not the next word, because an environment can be two
+  words** (`prod one`). Taking one word would file `prod one` and `dev one`
+  under the same `one`, which is the wrong incident. The cost is that trailing
+  prose after the environment ends up in the key — visible in the log line, so
+  the marker gets moved.
+- **The fallback is the last word**, which is what this did before markers
+  existed. It cannot see a two-word environment, so the log says
+  `last word of the summary` when it fires — that is the signal to add a
+  marker. `IncidentKey` normalises **case and internal whitespace**, so
+  `prod one`, `PROD ONE` and `prod  one` are one environment.
+- **Every first sighting logs what the summary yielded and by which rule**
+  (`EnvSource::describe`), and the dry run logs it along with the configured
+  markers. Without that line an environment read wrongly is invisible until
+  two unrelated outages share a timer.
 - **A token carrying `{`, `}`, `%`, `<` or `>` is refused.** This feed has been
   observed serving unrendered `{{…}}` and `&{%…%}%` where values should be; a
   live pull found two of ten alerts with a templated `App:` tag. Keying an
@@ -844,6 +868,41 @@ thread and a thread that never started are distinguishable.
 `dry_run` is **not** a config field for either watcher — see "Test Alert
 Match is the dry run, and it really does page" below.
 
+#### Right-click an alert row
+
+Every cell in the Alerts window's grid carries the same context menu
+(`alert_row_menu`): **Test Alert Match** and **Run Remediation**, aimed at that
+row. Copying an id out of the table and into a box to act on it was a step that
+existed only because the box came first.
+
+- **Every cell, not the row.** egui's `Grid` has no row-level response, so
+  without this the target would be whichever column the user happened to aim
+  at.
+- **It writes into the caller's `Option`s rather than acting.** The menu is
+  drawn deep inside a closure with `&self` borrowed; the results are applied
+  after the window renders, exactly as the buttons' already are. That is also
+  what keeps the two entry points from drifting — they converge on one pair of
+  variables.
+- **Same gate as the buttons** (`reaper_probe_enabled`, i.e.
+  `reaper.allowed_users`), read into a local before the grid closure for the
+  same borrow reason.
+- Dry run runs at once; Run Remediation goes through its confirmation carrying
+  the Override tick as it stands.
+
+#### A closed alert is said once, not every poll
+
+`reaper::alert_is_closed` and `already_handled` used to send a `Skipped` event
+per alert **per poll**. A closed alert stays on the `fetch_latest` window until
+newer alerts push it off, so a single settled alert wrote a line every 30
+seconds — DEBUG, so usually invisible, but real, and it counted against
+`MAX_LOG_LINES`. Both now go through `report_reaper_reason_change`, which
+reports once per alert and again only if the reason changes. A closed alert is
+finished, and the log says so once.
+
+Pingdom never had the problem: its closed check `continue`s silently, and a
+watched alert that closes logs one line and drops the watch, so it stops being
+re-read at all.
+
 #### Test Alert Match is the dry run, and it really does page
 
 `dry_run` used to be a `features.json` field on `reaper` (and briefly on
@@ -919,6 +978,98 @@ log to that script's lines; nothing ticked is the whole log, exactly as before.
   and the remediation it triggered are the same story; hiding one while reading
   the other is the opposite of what the dropdown is for.
 - Gated by `alerts_enabled`, the same gate as the checkbox beside it.
+
+### Jira Tickets (the ticket list and the ticket view)
+
+`src/jira.rs` reads the Jira **issue** API — a different API from the JSM Ops
+alert feed, reached with the *same* credentials. The **Jira Tickets** button
+(beside Alerts) opens a list of your open tickets; clicking one opens a ticket
+window, and a search box opens any ticket by key.
+
+- **No new secret, and no second resolution.** The Atlassian email, API token
+  and cloud id are the ones already resolved once at startup for Alerts
+  (`App::alerts_auth`), and `jira.rs` takes `AlertsAuth` rather than declaring
+  a near-identical `JiraAuth`. `assets/scripts/oncall_probe.sh` had been
+  reading `https://api.atlassian.com/ex/jira/<cloud_id>/rest/api/3/myself`
+  with that token since before this feature existed.
+- **API v2, not v3.** v3 returns the description as ADF — a JSON document tree
+  that would need a translator before egui could draw a word of it. v2 returns
+  it as plain text. Both are live; v2 is the one this app can render, so it is
+  used for *every* call rather than mixed per endpoint. The probe script reads
+  a real ticket back and warns if the description arrives as anything but a
+  string, because a silent switch to v3 renders as an empty description.
+- **Search is `/search/jql`.** Atlassian removed the old unsuffixed
+  `/search`. A 404 or 410 from the list is what a further move looks like;
+  `oncall_probe.sh` says so in those words.
+- **The default JQL uses `currentUser()`**, so nothing has to be told who you
+  are — the Atlassian account id that `reaper`/`pingdom` need is not consulted
+  here at all.
+- **The buttons are whatever the ticket's own workflow allows.** Jira is asked
+  (`GET /issue/{key}/transitions`) and one button is rendered per answer,
+  labelled as Jira names it. "Start Progress" and "Close" appear where the
+  workflow has them; a project that calls them something else still works. A
+  pair of hardcoded buttons would be dead in any project that disagrees. The
+  landing status is hover text, so a button named "Done" that moves the ticket
+  to "Closed" says so.
+- **The key and the transition id are whitelisted, not escaped.** The key is
+  interpolated into a URL path and the id into a JSON body — the same stance
+  `alerts::validate_alert_id` and `vault_iam` take with ARNs.
+- **"No open tickets" and "the reply could not be read" must never look
+  alike.** `parse_issue_list` errors on a missing `issues` key and returns an
+  empty list for an empty one. Rendering the second as the first is the
+  silent-empty failure the forwards.json build check exists to prevent
+  elsewhere in this repo.
+- **The issue and its transitions are two events**, though one thread makes
+  both calls. A token that can read a ticket but not list its transitions is
+  an ordinary permissions state and must leave the ticket **readable**, with a
+  note where the buttons go — the same reasoning that keeps volumes and
+  security groups on separate events in the Details tab.
+- **Four error surfaces, deliberately not folded together**: the list's, each
+  ticket's, each ticket's *transitions*, and the per-transition outcome. They
+  have four independent async writers, and `AlertsWindow` already carries the
+  scar of merging two — `ack_summary` is separate from `error` because a
+  routine fetch landing seconds later erased a partial-failure banner.
+- **One window per ticket, keyed on the ticket key.** `egui::Id::new(("jira_ticket",
+  key))` — *not* the title, which gains the summary the moment the fetch lands
+  and would move the window if it were the id. Clicking a ticket that is
+  already open calls `ctx.move_to_top` rather than opening a second.
+- **A transition has no confirmation dialog** — it is your own ticket and the
+  move is reversible from the same button row. What guards it is `in_flight`,
+  which disables the row so a double-click cannot fire two moves. On success
+  the ticket **and** the list are re-read: the status changed, and so did the
+  set of legal next moves.
+- **Auto-refresh is five minutes, not ten seconds.** An unacknowledged page is
+  time-critical; a ticket list is not. It runs only while the window is open,
+  the `loading` flag makes a tick that lands mid-search a skip rather than a
+  queued request, and the window calls `request_repaint_after` for the
+  remainder — egui only redraws when something happens, so a timer merely
+  *checked* at render fires whenever the next frame happens to occur. That is
+  the mistake the tunnel status banner already made and fixed.
+- **Colour is keyed on `statusCategory`, never the status name.** Names are
+  per-workflow free text ("Closed", "Resolved", "Shipped"); the category is
+  one of three fixed values, so matching the name would colour correctly in
+  one project and wrongly in the next.
+- **The search box takes a key and nothing else.** Free-text search across
+  summaries is deliberately absent: it is a second search mode with its own
+  result list, not a variation on opening a ticket. Non-key input gets an
+  inline hint rather than a request.
+- **`jira.allowed_users` ships empty**, like `alerts` — the button is hidden
+  until an admin opts users in, and on this tree that means **you will not see
+  it until you add your OS username** (or `"*"`) to `assets/features.json` and
+  rebuild. Not because the feature is dangerous — it reads and moves *your
+  own* tickets, and `Features::jira_visible_for` already hides it wherever
+  credentials do not resolve — but because a button onto a live ticket system
+  is an opt-in on the same terms as everything else in that file.
+  `Features::default()` is empty too, so a features.json nobody can parse
+  hands out no button either.
+- **A missing button names the gate that closed it** (`jira_gate_report`,
+  pure and tested), and `jira=` is on the startup `gates:` line beside
+  `alerts=`. "The button is not there" is not a diagnosis — reaper had three
+  dark states that all wrote nothing and telling them apart took five rounds
+  of guessing. The report never carries the address or the token: the app log
+  gets pasted into tickets.
+- **Nothing here is persisted.** Open windows, the search box, the list and
+  the Auto tick are all session state; there are no new `config.ini` keys.
 
 ### Open in VS Code (right-click) — how the wrong login sneaks back in
 

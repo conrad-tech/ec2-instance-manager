@@ -34,6 +34,18 @@
   "alerts": {
     "allowed_users": []
   },
+  "_jira_comment": [
+    "Jira Tickets button: your open tickets, the ticket view, and the",
+    "transitions that ticket's own workflow allows. allowed_users is the",
+    "only field here -- the Atlassian email, API token and cloud id are the",
+    "same ones the Alerts button uses and resolve from the environment or",
+    "Windows Credential Manager, never from this committed file.",
+    "Ships EMPTY, like alerts: the button is hidden until an admin opts",
+    "users in. Add OS usernames, or ['*'] for everyone."
+  ],
+  "jira": {
+    "allowed_users": []
+  },
   "_reaper_comment": "Unattended reaper auto-remediation. Ships disabled, dry-run, and with nobody allowed. allowed_users is SINGLE-ENTRY by policy - nothing arbitrates two machines remediating one alert - and '*' is deliberately not honoured here. The JSM schedule id and the caller's Atlassian account id drive the on-call lookup, which selects handling (ack + 15min + escalate, vs no ack + 10min + one message), never whether the fix runs -- like the alerts credentials above, NEITHER lives in this file: they resolve environment -> Windows Credential Manager only (targets ec2_manager/jsm_schedule_id and ec2_manager/jsm_account_id; env overrides SCHEDULE_ID and MY_ID). The *_contains fields identify a reaper alert; leave blank until a real reaper payload confirms them.",
   "reaper": {
     "enabled": false,
@@ -60,6 +72,16 @@
     "  *_contains         substrings identifying a pingdom alert, checked against",
     "                     extraProperties.alertname, the App: tag, then message.",
     "                     message is the primary rule for this feed.",
+    "  environment_after  app names to look for in the alert summary. The",
+    "                     ENVIRONMENT IS EVERYTHING AFTER the first one that",
+    "                     appears -- list order decides, matched case-",
+    "                     insensitively. Use this when the environment is more",
+    "                     than one word (e.g. 'prod one'), which the fallback",
+    "                     cannot read. Empty, or no marker present, falls back",
+    "                     to the last word of the summary; the log says which",
+    "                     rule produced the value so these can be tuned.",
+    "                     e.g. [\"MyApp\", \"OtherApp\"] against a summary",
+    "                     '[Pingdom] example.com MyApp prod one' -> 'prod one'.",
     "  watch_mins         how long an acknowledged alert may stay open before it",
     "                     escalates. 0 means the default (10).",
     "  poll_secs          feed poll interval. 0 means the default (30).",
@@ -75,6 +97,7 @@
     "alertname_contains": "",
     "app_contains": "",
     "message_contains": "[Pingdom]",
+    "environment_after": [],
     "watch_mins": 10,
     "poll_secs": 30,
     "fetch_count": 10

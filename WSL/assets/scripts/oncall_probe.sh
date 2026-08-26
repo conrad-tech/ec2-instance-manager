@@ -198,12 +198,66 @@ else
   explain_failure
 fi
 
+# ------------------------------------------------------- N. jira tickets API
+# The Jira Tickets button reads the *issue* API with this same token. Two
+# things it depends on are worth confirming against a real tenant rather than
+# taken on trust:
+#
+#   * `/search/jql`, not the old `/search` -- Atlassian removed the
+#     unsuffixed endpoint, and a 404/410 here is what that looks like.
+#   * API **v2**, not v3 -- v3 returns the description as ADF (a JSON
+#     document tree) and the app renders plain text.
+rule "jira tickets API (the Jira Tickets button)"
+JIRA_TICKETS="no"
+JQL='assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC'
+get "${JIRA}/rest/api/2/search/jql?fields=summary,status&maxResults=5&jql=$(
+  jq -rn --arg q "$JQL" '$q|@uri')"
+if [[ "$STATUS" == "200" ]]; then
+  n=$(jq -r '(.issues // []) | length' <<<"$BODY")
+  echo "  /search/jql works -- ${n} open ticket(s) assigned to this token"
+  JIRA_TICKETS="yes"
+  FIRST_KEY=$(jq -r '(.issues // [])[0].key // empty' <<<"$BODY")
+  if [[ -n "$FIRST_KEY" ]]; then
+    jq -r '(.issues // [])[] | "    \(.key)  \(.fields.status.name // "?")  \(.fields.summary // "")"' <<<"$BODY"
+    # The description is the field that differs between v2 and v3, so it is
+    # the one worth reading back.
+    get "${JIRA}/rest/api/2/issue/${FIRST_KEY}?fields=description"
+    if [[ "$STATUS" == "200" ]]; then
+      if jq -e '.fields.description == null or (.fields.description|type) == "string"' \
+           >/dev/null <<<"$BODY"; then
+        echo "  v2 returns the description as plain text (or null) -- as the app expects"
+      else
+        echo "  WARNING: the description came back as $(jq -r '.fields.description|type' <<<"$BODY"),"
+        echo "  not a string. The app renders plain text; check it is really talking to v2."
+      fi
+    else
+      echo "  could not read ${FIRST_KEY} itself"
+      explain_failure
+    fi
+    # What the ticket view puts on its buttons.
+    get "${JIRA}/rest/api/2/issue/${FIRST_KEY}/transitions"
+    if [[ "$STATUS" == "200" ]]; then
+      echo "  transitions available on ${FIRST_KEY}:"
+      jq -r '(.transitions // [])[] | "    \(.id)  \(.name)  -> \(.to.name // "?")"' <<<"$BODY"
+    else
+      echo "  could not list transitions for ${FIRST_KEY} -- the ticket view would still"
+      echo "  render, with a note where its buttons go."
+      explain_failure
+    fi
+  fi
+else
+  echo "  /search/jql is not readable. A 404 or 410 here means the endpoint moved"
+  echo "  again; anything else is a permissions or credentials problem."
+  explain_failure
+fi
+
 # ------------------------------------------------------------------ verdict
 rule "verdict"
 printf '  account id known      : %s\n' "${ACCOUNT_ID:-NO}"
 printf '  schedules readable    : %s\n' "$([[ ${#SCHEDULE_IDS[@]} -gt 0 ]] && echo "yes (${#SCHEDULE_IDS[@]})" || echo NO)"
 printf '  on call right now     : %s\n' "${ON_CALL_NOW:-no (or not detected)}"
 printf '  .ics identifier       : %s\n' "${ICS_IDENTIFIER:-NONE ACCEPTED}"
+printf '  jira tickets readable : %s\n' "${JIRA_TICKETS:-no}"
 echo
 if [[ -n "$ICS_IDENTIFIER" ]]; then
   echo "  One .ics request covers every schedule and carries shift start AND end,"
