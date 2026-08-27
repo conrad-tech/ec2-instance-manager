@@ -299,6 +299,14 @@ mod gui {
         /// timer, every escalation, and the startup lines about whether the
         /// feature came up at all.
         Pingdom,
+        /// One **Test Alert Match** run, whichever watcher claimed the alert.
+        ///
+        /// Its own source rather than the claiming watcher's: a dry run is
+        /// one thing a person just asked for and wants to read end to end,
+        /// and filing a pingdom run under Reaper Down — which is what
+        /// happened before this existed — hid it from the filter someone
+        /// would actually tick.
+        AlertTest,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -324,13 +332,14 @@ mod gui {
     struct OnCallFilters {
         reaper_down: bool,
         pingdom: bool,
+        alert_test: bool,
     }
 
     impl OnCallFilters {
         /// True when at least one script is selected. With none selected the
         /// filter is off entirely rather than matching nothing.
         fn any(self) -> bool {
-            self.reaper_down || self.pingdom
+            self.reaper_down || self.pingdom || self.alert_test
         }
 
         fn includes(self, source: LogSource) -> bool {
@@ -340,6 +349,7 @@ mod gui {
             match source {
                 LogSource::ReaperDown => self.reaper_down,
                 LogSource::Pingdom => self.pingdom,
+                LogSource::AlertTest => self.alert_test,
                 LogSource::App => false,
             }
         }
@@ -358,6 +368,9 @@ mod gui {
             }
             if self.pingdom {
                 picked.push("Pingdom");
+            }
+            if self.alert_test {
+                picked.push("Alert Test");
             }
             if picked.is_empty() {
                 "On-Call".to_string()
@@ -1383,6 +1396,49 @@ mod gui {
         picked_mentions: Vec<(String, String)>,
         /// The transition screen being filled in, if any.
         pending_transition: Option<PendingTransition>,
+    }
+
+    /// One open alert-detail window.
+    ///
+    /// Identity is the alert id, so clicking a row twice raises the window
+    /// rather than opening a second — the same rule the ticket windows use.
+    struct AlertWindow {
+        id: String,
+        /// The tiny id, for the title before the fetch lands.
+        tiny_id: String,
+        /// `None` until the fetch lands. Read **in full** by id, because
+        /// `fetch_latest` omits `description` — the field most worth reading.
+        alert: Option<alerts::Alert>,
+        loading: bool,
+        error: Option<String>,
+        ack_in_flight: bool,
+        note: Option<std::result::Result<String, String>>,
+    }
+
+    impl AlertWindow {
+        fn new(id: String, tiny_id: String) -> Self {
+            Self {
+                id,
+                tiny_id,
+                alert: None,
+                loading: true,
+                error: None,
+                ack_in_flight: false,
+                note: None,
+            }
+        }
+    }
+
+    /// Alert-detail workers → UI.
+    enum AlertDetailEvent {
+        Loaded {
+            id: String,
+            result: std::result::Result<Box<alerts::Alert>, String>,
+        },
+        Acked {
+            id: String,
+            result: std::result::Result<(), String>,
+        },
     }
 
     /// The `@` mention dropdown for one ticket's comment box.
@@ -3014,8 +3070,14 @@ mod gui {
             .on_hover_text(
                 "Dry run this alert — and SEND A REAL ESCALATION: your phone rings and \
                  Telegram fires.\n\n\
-                 Everything the real run does except compose down / compose up -d. \
-                 Nothing is acknowledged and nothing on the box is changed.",
+                 What it does depends on which watcher claims the alert:\n\
+                 - reaper - resolves the instance and reads the box (docker ps -a, \
+                 compose ps, the watchdog), but never compose down / compose up -d\n\
+                 - pingdom - reads the environment out of the alert summary; there is \
+                 no box in its path to read\n\n\
+                 Then it escalates as though the fix had failed. Nothing is \
+                 acknowledged and nothing is changed. Every step is in the log under \
+                 On-Call -> Alert Test.",
             )
             .clicked()
         {
@@ -3025,15 +3087,55 @@ mod gui {
         if ui
             .button("Run Remediation")
             .on_hover_text(
-                "Remediate this alert now, as if it had just come in: acknowledge (only \
-                 if you are on call), stop the watchdog, compose down, compose up -d, \
-                 then watch for the alert to close.\n\n\
+                "Reaper alerts only.\n\n\
+                 Remediate this alert now, as if it had just come in: acknowledge \
+                 (only if you are on call), stop the watchdog, compose down, \
+                 compose up -d, then watch for the alert to close.\n\n\
+                 A pingdom alert has no fix to run — use Test Alert Match for those.\n\n\
+                 Works on an open, closed, acknowledged or unacknowledged alert, and \
+                 ignores the cooldown and whatever this session has already handled.\n\n\
                  Asks for confirmation first.",
             )
             .clicked()
         {
             *remediate = Some(alert.id.clone());
             ui.close();
+        }
+    }
+
+    /// What an Alert ID action has to say for itself, shown under the box in
+    /// the Alerts window.
+    ///
+    /// It exists because the log is a different tab: a button that fires a
+    /// thread and reports only there reads as a button that did nothing. The
+    /// question this answers is the one actually asked — *did it send the
+    /// email, or not?*
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum AlertActionStatus {
+        /// Under way. Replaced by the outcome when the thread finishes.
+        Running(String),
+        /// It did what it said. Carries the detail worth reading — the
+        /// address the escalation went to, above all.
+        Ok(String),
+        /// It did not. Carries the reason, never a bare failure.
+        Failed(String),
+    }
+
+    impl AlertActionStatus {
+        fn color(&self) -> egui::Color32 {
+            match self {
+                Self::Running(_) => egui::Color32::from_rgb(255, 205, 0),
+                Self::Ok(_) => egui::Color32::from_rgb(90, 190, 110),
+                Self::Failed(_) => egui::Color32::from_rgb(220, 80, 80),
+            }
+        }
+
+        fn text(&self) -> String {
+            match self {
+                Self::Running(m) => format!("\u{23f3} {m}"),
+                Self::Ok(m) => format!("\u{2713} {m}"),
+                Self::Failed(m) => format!("\u{26a0} {m}"),
+            }
         }
     }
 
@@ -3105,24 +3207,35 @@ mod gui {
         mailbox: Option<String>,
         alert_id: String,
         tx: Sender<ReaperEvent>,
-        err_tx: Sender<String>,
+        status_tx: Sender<AlertActionStatus>,
     ) {
         use ec2_manager::{alerts, oncall, pingdom, reaper};
 
         std::thread::spawn(move || {
+            // Under `AlertTest`, never the claiming watcher's source: this
+            // is one run a person asked for and wants to read end to end.
             let note = |level: LogLevel, message: String| {
-                let _ = tx.send(ReaperEvent::Note { level, message });
+                let _ = tx.send(ReaperEvent::SourcedNote {
+                    source: LogSource::AlertTest,
+                    level,
+                    message,
+                });
             };
             // Both, always: the log is the record, the window line is what
             // the person who just pressed the button is looking at.
             let fail = |message: String| {
-                let _ = tx.send(ReaperEvent::Note {
+                let _ = tx.send(ReaperEvent::SourcedNote {
+                    source: LogSource::AlertTest,
                     level: LogLevel::Error,
                     message: format!("dry run: {message}"),
                 });
-                let _ = err_tx.send(message);
+                let _ = status_tx.send(AlertActionStatus::Failed(message));
             };
 
+            note(
+                LogLevel::Warn,
+                format!("dry run: ===== START, alert {alert_id} ====="),
+            );
             note(LogLevel::Info, format!("dry run: fetching alert {alert_id}"));
             let alert = match alerts::fetch_alert(&auth, &alert_id) {
                 Ok(a) => a,
@@ -3290,16 +3403,30 @@ mod gui {
                 LogLevel::Warn,
                 format!("dry run: escalating for real, subject {subject:?}"),
             );
+            let _ = status_tx.send(AlertActionStatus::Running(format!(
+                "sending escalation to {mailbox}, subject {subject:?}…"
+            )));
             match send_escalation_email(&mailbox, &subject) {
-                Ok(address) => note(
-                    LogLevel::Warn,
-                    format!(
-                        "dry run: escalation sent to {address} — the call and the Telegram \
-                         message are the Pi daemon's job from here"
-                    ),
-                ),
+                Ok(address) => {
+                    note(
+                        LogLevel::Warn,
+                        format!(
+                            "dry run: escalation SENT to {address} — the call and the \
+                             Telegram message are the Pi daemon's job from here. If \
+                             neither arrives, the mail left this machine and the problem \
+                             is on the Pi side."
+                        ),
+                    );
+                    let _ = status_tx.send(AlertActionStatus::Ok(format!(
+                        "escalation email sent to {address}"
+                    )));
+                }
                 Err(reason) => fail(format!("the escalation could not be sent — {reason}")),
             }
+            note(
+                LogLevel::Warn,
+                format!("dry run: ===== END, alert {alert_id} ====="),
+            );
         });
     }
 
@@ -3325,7 +3452,11 @@ mod gui {
         use ec2_manager::reaper;
 
         let note = |level: LogLevel, message: String| {
-            let _ = tx.send(ReaperEvent::Note { level, message });
+            let _ = tx.send(ReaperEvent::SourcedNote {
+                source: LogSource::AlertTest,
+                level,
+                message,
+            });
         };
 
         let Some(m) = reaper::match_alert(alert, cfg) else {
@@ -3395,11 +3526,12 @@ mod gui {
             cfg.send_command_timeout(),
         ) {
             Ok(out) => {
-                let _ = tx.send(ReaperEvent::Transcript {
-                    instance: instance.clone(),
-                    stage: "dry run".to_string(),
-                    output: out.clone(),
-                });
+                // Rendered here rather than sent as `Transcript`, so the
+                // whole run lands under one source instead of the transcript
+                // alone being filed as reaper output.
+                for (level, line) in reaper_transcript_lines(&instance, "dry run", &out) {
+                    note(level, line);
+                }
                 for line in reaper_probe_state_lines(&instance, &out) {
                     note(LogLevel::Info, line);
                 }
@@ -4541,6 +4673,49 @@ mod gui {
     }
 
     /// Tab-separated rendering of the alerts table for the clipboard.
+    /// One alert as text, for pasting into a ticket or a chat.
+    ///
+    /// Deliberately not the table row that `alerts_as_text` produces: this is
+    /// the *whole* alert, description and properties included, which is what
+    /// someone opening a single alert wants to hand on.
+    fn alert_as_text(a: &alerts::Alert) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("#{}  {}\n", a.tiny_id, a.message));
+        out.push_str(&format!("id       : {}\n", a.id));
+        out.push_str(&format!("created  : {}\n", format_local_time(&a.created_at)));
+        out.push_str(&format!("priority : {}\n", a.priority));
+        out.push_str(&format!(
+            "status   : {}{}\n",
+            a.status,
+            if a.acknowledged { " (acknowledged)" } else { "" }
+        ));
+        out.push_str(&format!("source   : {}\n", a.source));
+        out.push_str(&format!("account  : {}\n", a.account));
+        out.push_str(&format!("env      : {}\n", a.environment));
+        out.push_str(&format!("app      : {}\n", a.app));
+        out.push_str(&format!("count    : {}\n", a.count));
+        let links = alerts::extract_links(a);
+        if !links.is_empty() {
+            out.push_str("\nlinks:\n");
+            for link in links {
+                out.push_str(&format!("  {link}\n"));
+            }
+        }
+        if !a.description.trim().is_empty() {
+            out.push_str(&format!("\ndescription:\n{}\n", a.description));
+        }
+        if !a.tags.is_empty() {
+            out.push_str(&format!("\ntags:\n  {}\n", a.tags.join("\n  ")));
+        }
+        if !a.extra.is_empty() {
+            out.push_str("\nproperties:\n");
+            for (k, v) in &a.extra {
+                out.push_str(&format!("  {k}: {v}\n"));
+            }
+        }
+        out
+    }
+
     fn alerts_as_text(rows: &[alerts::Alert]) -> String {
         let mut out = format!(
             "Time ({})\tID\tPri\tStatus\tAck\tAccount\tEnv\tMessage\n",
@@ -7466,12 +7641,12 @@ mod gui {
         /// The compiled-in pingdom rules, for the dry run's matcher. The
         /// watcher's own copy is moved into its thread.
         pingdom_cfg: ec2_manager::features::PingdomFeature,
-        /// Where a dry run reports a failure the *window* has to show — an
-        /// alert that could not be fetched, one no watcher claims, or a send
-        /// that did not go. A channel, not a shared field, because the run is
-        /// on its own thread.
-        dry_run_error_tx: Sender<String>,
-        dry_run_error_rx: Receiver<String>,
+        /// Where a dry run reports back to the *window* — an alert that
+        /// could not be fetched, one no watcher claims, a send that did not
+        /// go, and the address a send that did go reached. A channel, not a
+        /// shared field, because the run is on its own thread.
+        dry_run_status_tx: Sender<AlertActionStatus>,
+        dry_run_status_rx: Receiver<AlertActionStatus>,
         /// Whether that probe is offered. `reaper.allowed_users` **without**
         /// `reaper.enabled`: it reads an alert and makes read-only ELB calls,
         /// never acknowledges and never touches an instance, so gating it on
@@ -7496,13 +7671,18 @@ mod gui {
         /// Run Remediation's Override tick: skip the "is it already healthy"
         /// check and remediate regardless.
         reaper_override: bool,
-        /// The red line under the Alert ID box: an id that could not be
-        /// fetched, or one no watcher claims. Shown in the Alerts window
-        /// rather than only in the log, because the log is a different tab
-        /// and "nothing happened" is what a wrong id otherwise looks like.
-        alert_submit_error: Option<String>,
+        /// What the last Alert ID action is doing or did, shown under the
+        /// box. In the window rather than only in the log, because the log is
+        /// a different tab and "nothing happened" is what a button that fired
+        /// a background thread otherwise looks like.
+        alert_action_status: Option<AlertActionStatus>,
         /// Alerts window state; `None` while the window is closed.
         alerts_window: Option<AlertsWindow>,
+        /// Open alert-detail windows, one per alert id.
+        alert_windows: Vec<AlertWindow>,
+        /// Alert-detail workers → UI.
+        alert_detail_tx: Sender<AlertDetailEvent>,
+        alert_detail_rx: Receiver<AlertDetailEvent>,
         /// Alerts fetch worker → UI.
         alerts_tx: Sender<AlertsFetch>,
         alerts_rx: Receiver<AlertsFetch>,
@@ -7514,6 +7694,11 @@ mod gui {
         /// Resolved once at startup, like `alerts_auth` — the credentials
         /// behind it are a `CredReadW` per field on Windows.
         jira_site: ec2_manager::jira::JiraSite,
+        /// Unsent comment drafts, kept when a ticket window closes and
+        /// restored when it reopens. Esc closes a window, and binning what
+        /// somebody had typed because they pressed it is exactly the silent
+        /// loss the failed-post path already refuses to allow.
+        jira_drafts: std::collections::BTreeMap<String, (String, Vec<(String, String)>)>,
         /// Ticket keys that have changed since they were last opened.
         /// Drives the toolbar badge and the `new` marker in the list.
         jira_unread: std::collections::BTreeSet<String>,
@@ -7719,6 +7904,7 @@ mod gui {
             let (preflight_tx, preflight_rx) = mpsc::channel();
             let (alerts_tx, alerts_rx) = mpsc::channel();
             let (jira_tx, jira_rx) = mpsc::channel();
+            let (alert_detail_tx, alert_detail_rx) = mpsc::channel();
             let jira_window_open_flag =
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (ack_all_tx, ack_all_rx) = mpsc::channel();
@@ -7728,7 +7914,7 @@ mod gui {
             let (create_pre_tx, create_pre_rx) = mpsc::channel();
             let (fed_tx, fed_rx) = mpsc::channel();
             let (reaper_probe_tx, reaper_probe_rx) = mpsc::channel();
-            let (dry_run_error_tx, dry_run_error_rx) = mpsc::channel();
+            let (dry_run_status_tx, dry_run_status_rx) = mpsc::channel();
             // Created here rather than inside `start_reaper_poll`, because
             // the Run Remediation button needs the in-flight set whether or
             // not the poll thread was ever started.
@@ -8092,8 +8278,8 @@ mod gui {
                 ),
                 reaper_cfg: features.reaper.clone(),
                 pingdom_cfg: features.pingdom.clone(),
-                dry_run_error_tx,
-                dry_run_error_rx,
+                dry_run_status_tx,
+                dry_run_status_rx,
                 reaper_probe_enabled: features
                     .reaper
                     .is_allowed_user(&ec2_manager::features::current_os_user())
@@ -8104,13 +8290,17 @@ mod gui {
                 reaper_in_flight,
                 pending_run_remediation: None,
                 reaper_override: false,
-                alert_submit_error: None,
+                alert_action_status: None,
                 alerts_auth: resolved_alerts_auth,
                 alerts_window: None,
+                alert_windows: Vec::new(),
+                alert_detail_tx,
+                alert_detail_rx,
                 alerts_tx,
                 alerts_rx,
                 jira_enabled,
                 jira_site,
+                jira_drafts: std::collections::BTreeMap::new(),
                 jira_unread: std::collections::BTreeSet::new(),
                 jira_open_count: 0,
                 jira_window_open: jira_window_open_flag,
@@ -13052,8 +13242,12 @@ mod gui {
             }
             self.log_info(format!("jira: opening {key}"));
             let seen_before = self.config.jira_seen.get(&key).cloned();
-            self.jira_tickets
-                .push(TicketWindow::new(key.clone(), seen_before));
+            let mut win = TicketWindow::new(key.clone(), seen_before);
+            if let Some((draft, mentions)) = self.jira_drafts.remove(&key) {
+                win.comment_draft = draft;
+                win.picked_mentions = mentions;
+            }
+            self.jira_tickets.push(win);
             self.start_jira_ticket_load(&key);
         }
 
@@ -13339,6 +13533,8 @@ mod gui {
                                 win.comment_draft.clear();
                                 win.picked_mentions.clear();
                                 win.comment_note = Some(Ok("Comment posted".to_string()));
+                                // Nothing left to keep for this ticket.
+                                self.jira_drafts.remove(&key);
                                 self.log_info(format!("jira: {key} — comment posted"));
                                 reload.push(key);
                             }
@@ -13413,6 +13609,132 @@ mod gui {
                     .map_err(|e| e.to_string());
                 let _ = tx.send(AlertsFetch { window_min, generation, result });
             });
+        }
+
+        /// Open an alert's detail window, or raise the one it has.
+        fn open_alert_window(&mut self, ctx: &egui::Context, id: &str, tiny_id: &str) {
+            let id = id.trim().to_string();
+            if id.is_empty() {
+                return;
+            }
+            if self.alert_windows.iter().any(|w| w.id == id) {
+                ctx.move_to_top(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new(("alert_detail", id.as_str())),
+                ));
+                return;
+            }
+            self.log_info(format!("alerts: opening alert {id}"));
+            self.alert_windows
+                .push(AlertWindow::new(id.clone(), tiny_id.to_string()));
+            self.start_alert_detail_fetch(&id);
+        }
+
+        /// Read one alert **in full**.
+        ///
+        /// By id, never from the list: `fetch_latest` omits `description`,
+        /// which is the field this window exists to show. The same trap the
+        /// reaper poll fell into — see `Alert::description`.
+        fn start_alert_detail_fetch(&mut self, id: &str) {
+            if let Some(win) = self.alert_windows.iter_mut().find(|w| w.id == id) {
+                win.loading = true;
+                win.error = None;
+            }
+            let id = id.to_string();
+            let auth = self.alerts_auth.clone();
+            let tx = self.alert_detail_tx.clone();
+            std::thread::spawn(move || {
+                let result = alerts::fetch_alert(&auth, &id)
+                    .map(Box::new)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(AlertDetailEvent::Loaded { id, result });
+            });
+        }
+
+        /// Acknowledge one alert from its own window.
+        ///
+        /// No on-call gate: that rule belongs to the unattended watchers,
+        /// which must not silence a page nobody has taken. A person clicking
+        /// this has taken it. Same stance as "Acknowledge all", which has
+        /// never consulted the schedule either.
+        fn start_alert_ack(&mut self, id: &str) {
+            let Some(win) = self.alert_windows.iter_mut().find(|w| w.id == id) else {
+                return;
+            };
+            if win.ack_in_flight {
+                return;
+            }
+            win.ack_in_flight = true;
+            win.note = None;
+            let id = id.to_string();
+            self.log_info(format!("alerts: acknowledging {id} from its window"));
+            let auth = self.alerts_auth.clone();
+            let tx = self.alert_detail_tx.clone();
+            std::thread::spawn(move || {
+                let result = alerts::acknowledge_alert(&auth, &id).map_err(|e| e.to_string());
+                let _ = tx.send(AlertDetailEvent::Acked { id, result });
+            });
+        }
+
+        /// Drain finished alert-detail work.
+        fn poll_alert_detail_events(&mut self) {
+            let mut reload: Vec<String> = Vec::new();
+            while let Ok(event) = self.alert_detail_rx.try_recv() {
+                match event {
+                    AlertDetailEvent::Loaded { id, result } => {
+                        let Some(win) = self.alert_windows.iter_mut().find(|w| w.id == id)
+                        else {
+                            continue;
+                        };
+                        win.loading = false;
+                        match result {
+                            Ok(alert) => {
+                                win.tiny_id = alert.tiny_id.clone();
+                                win.alert = Some(*alert);
+                                win.error = None;
+                            }
+                            Err(err) => {
+                                self.log_error(format!("alerts: {id}: {err}"));
+                                if let Some(win) =
+                                    self.alert_windows.iter_mut().find(|w| w.id == id)
+                                {
+                                    win.error = Some(err);
+                                }
+                            }
+                        }
+                    }
+                    AlertDetailEvent::Acked { id, result } => {
+                        let Some(win) = self.alert_windows.iter_mut().find(|w| w.id == id)
+                        else {
+                            continue;
+                        };
+                        win.ack_in_flight = false;
+                        match result {
+                            Ok(()) => {
+                                win.note = Some(Ok("Acknowledged".to_string()));
+                                self.log_info(format!("alerts: {id} acknowledged"));
+                                // The alert's own `acknowledged` flag and the
+                                // list's row are both stale now.
+                                reload.push(id);
+                            }
+                            Err(err) => {
+                                self.log_error(format!("alerts: {id}: acknowledge: {err}"));
+                                if let Some(win) =
+                                    self.alert_windows.iter_mut().find(|w| w.id == id)
+                                {
+                                    win.note = Some(Err(err));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for id in reload {
+                self.start_alert_detail_fetch(&id);
+                if self.alerts_window.is_some() {
+                    self.start_alerts_fetch();
+                }
+            }
         }
 
         /// Drain finished alerts fetches into the window.
@@ -13716,6 +14038,13 @@ mod gui {
                          (override={override_health})"
                     ),
                 );
+                // The window says a run started; the log carries the rest.
+                // A remediation can take the whole stage-2 window, so without
+                // this the button looks like it did nothing for 15 minutes.
+                self.alert_action_status = Some(AlertActionStatus::Running(format!(
+                    "remediating alert {alert_id} — progress in the log under On-Call -> \
+                     Reaper Down"
+                )));
                 start_reaper_remediation(
                     self.alerts_auth.clone(),
                     self.reaper_cfg.clone(),
@@ -13752,6 +14081,9 @@ mod gui {
             }
             for ev in &events {
                 match ev {
+                    ReaperEvent::SourcedNote { source, level, message } => {
+                        self.log_from(*source, *level, message.clone())
+                    }
                     ReaperEvent::Skipped { reason } => {
                         self.log_reaper(LogLevel::Debug, format!("reaper: skipped — {reason}"))
                     }
@@ -14872,7 +15204,17 @@ mod gui {
                 }
             }
 
-            self.jira_tickets.retain(|w| !closed.contains(&w.key));
+            // Drained rather than retained, so a draft is stashed whichever
+            // way the window closed — Escape and the X must not differ.
+            let mut still_open = Vec::with_capacity(self.jira_tickets.len());
+            for win in std::mem::take(&mut self.jira_tickets) {
+                if closed.contains(&win.key) {
+                    self.stash_jira_draft(win);
+                } else {
+                    still_open.push(win);
+                }
+            }
+            self.jira_tickets = still_open;
             if let Some(key) = comment_for {
                 self.start_jira_comment(&key);
             }
@@ -14881,6 +15223,304 @@ mod gui {
             }
             if let Some(key) = reload {
                 self.start_jira_ticket_load(&key);
+            }
+        }
+
+        /// Close the topmost ticket or alert window on Escape.
+        ///
+        /// Run **after** both sets of windows are drawn, which is what gives
+        /// the precedence for free: the `@` dropdown consumes Escape with
+        /// `consume_key` during its own render, and a consumed key is gone
+        /// from the queue — so Escape dismisses the dropdown when one is
+        /// open, and closes the window when none is.
+        ///
+        /// Only the **topmost** window closes, and only if it is one of ours.
+        /// Escape with the Alerts list or Port Forwards on top must not reach
+        /// past them and shut a ticket window the user cannot even see.
+        fn close_top_window_on_escape(&mut self, ctx: &egui::Context) {
+            if self.jira_tickets.is_empty() && self.alert_windows.is_empty() {
+                return;
+            }
+            if !ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                return;
+            }
+            let Some(top) = ctx.top_layer_id() else {
+                return;
+            };
+            if let Some(pos) = self
+                .jira_tickets
+                .iter()
+                .position(|w| egui::Id::new(("jira_ticket", w.key.as_str())) == top.id)
+            {
+                let win = self.jira_tickets.remove(pos);
+                self.stash_jira_draft(win);
+                return;
+            }
+            if let Some(pos) = self
+                .alert_windows
+                .iter()
+                .position(|w| egui::Id::new(("alert_detail", w.id.as_str())) == top.id)
+            {
+                self.alert_windows.remove(pos);
+            }
+        }
+
+        /// Keep an unsent comment draft when its window closes.
+        ///
+        /// Escape closes a window, and binning what somebody had typed
+        /// because they pressed it is the same silent loss the failed-post
+        /// path already refuses to allow. Restored by `open_jira_ticket`.
+        fn stash_jira_draft(&mut self, win: TicketWindow) {
+            if win.comment_draft.trim().is_empty() {
+                self.jira_drafts.remove(&win.key);
+                return;
+            }
+            self.jira_drafts
+                .insert(win.key, (win.comment_draft, win.picked_mentions));
+        }
+
+        /// Every open alert-detail window.
+        fn render_alert_windows(&mut self, ctx: &egui::Context) {
+            let mut closed: Vec<String> = Vec::new();
+            let mut ack: Option<String> = None;
+            let mut reload: Option<String> = None;
+
+            for idx in 0..self.alert_windows.len() {
+                let (id, tiny_id, alert, loading, error, ack_in_flight, note) = {
+                    let w = &self.alert_windows[idx];
+                    (
+                        w.id.clone(),
+                        w.tiny_id.clone(),
+                        w.alert.clone(),
+                        w.loading,
+                        w.error.clone(),
+                        w.ack_in_flight,
+                        w.note.clone(),
+                    )
+                };
+                let title = match &alert {
+                    Some(a) if !a.message.is_empty() => format!(
+                        "#{}  ·  {}",
+                        if tiny_id.is_empty() { "?" } else { &tiny_id },
+                        truncate_middle(&a.message, 60)
+                    ),
+                    _ => format!("Alert #{}", if tiny_id.is_empty() { "?" } else { &tiny_id }),
+                };
+                let mut open = true;
+                egui::Window::new(title)
+                    // Identity is the alert id, not the title: the title
+                    // gains the message once the fetch lands.
+                    .id(egui::Id::new(("alert_detail", id.as_str())))
+                    .open(&mut open)
+                    .collapsible(true)
+                    .resizable(true)
+                    .default_size([640.0, 560.0])
+                    .show(ctx, |ui| {
+                        // One scroll area around the whole body, and nothing
+                        // inside it sets a fixed height — see the note on the
+                        // ticket window, which cost a layout bug.
+                        egui::ScrollArea::vertical()
+                            .id_salt(("alert_body", id.as_str()))
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if loading && alert.is_none() {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label("Loading alert…");
+                                    });
+                                    return;
+                                }
+                                if let Some(err) = &error {
+                                    note_label(
+                                        ui,
+                                        egui::Color32::from_rgb(220, 90, 90),
+                                        format!("Could not read this alert: {err}"),
+                                    );
+                                    return;
+                                }
+                                let Some(alert) = &alert else {
+                                    return;
+                                };
+
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.heading(format!("#{}", dash_if_blank(&alert.tiny_id)));
+                                    note_label(
+                                        ui,
+                                        priority_color(&alert.priority),
+                                        egui::RichText::new(dash_if_blank(&alert.priority))
+                                            .strong(),
+                                    );
+                                    ui.label(dash_if_blank(&alert.status));
+                                    if alert.acknowledged {
+                                        ui.label("ack");
+                                    } else {
+                                        note_label(
+                                            ui,
+                                            egui::Color32::from_rgb(220, 160, 60),
+                                            "unack",
+                                        );
+                                    }
+                                });
+                                ui.label(egui::RichText::new(&alert.message).size(16.0));
+                                ui.add_space(6.0);
+
+                                egui::Grid::new(("alert_fields", id.as_str()))
+                                    .num_columns(2)
+                                    .spacing([14.0, 4.0])
+                                    .show(ui, |ui| {
+                                        let field = |ui: &mut egui::Ui, k: &str, v: &str| {
+                                            ui.weak(k);
+                                            ui.label(dash_if_blank(v));
+                                            ui.end_row();
+                                        };
+                                        field(
+                                            ui,
+                                            &format!("Created ({})", local_tz_label()),
+                                            &format_local_time(&alert.created_at),
+                                        );
+                                        field(ui, "Source", &alert.source);
+                                        field(ui, "Account", &alert.account);
+                                        field(ui, "Environment", &alert.environment);
+                                        field(ui, "App", &alert.app);
+                                        field(ui, "Count", &alert.count.to_string());
+                                        // The id is what every other tool
+                                        // here takes, so it is copyable.
+                                        ui.weak("Alert ID");
+                                        ui.horizontal(|ui| {
+                                            ui.label(&alert.id);
+                                            Self::paint_copy_button(
+                                                ui,
+                                                &alert.id,
+                                                "Copy alert ID",
+                                            );
+                                        });
+                                        ui.end_row();
+                                    });
+
+                                // Links, each with the same copy affordance
+                                // the Inventory table uses. These alerts bury
+                                // the useful link -- a Grafana panel, a
+                                // runbook -- in the description or an
+                                // extraProperties value, so they are pulled
+                                // out rather than left to be hunted for.
+                                let links = alerts::extract_links(alert);
+                                if !links.is_empty() {
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                    ui.strong(format!("Links ({})", links.len()));
+                                    for link in &links {
+                                        ui.horizontal(|ui| {
+                                            Self::paint_copy_button(ui, link, "Copy link");
+                                            ui.add(egui::Label::new(link).wrap());
+                                        });
+                                    }
+                                }
+
+                                ui.add_space(8.0);
+                                ui.separator();
+                                ui.strong("Description");
+                                if alert.description.trim().is_empty() {
+                                    ui.weak("(none)");
+                                } else {
+                                    ui.add(egui::Label::new(&alert.description).wrap());
+                                }
+
+                                if !alert.tags.is_empty() {
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                    ui.strong(format!("Tags ({})", alert.tags.len()));
+                                    for tag in &alert.tags {
+                                        ui.label(tag);
+                                    }
+                                }
+
+                                if !alert.extra.is_empty() {
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                    ui.strong("Properties");
+                                    egui::Grid::new(("alert_extra", id.as_str()))
+                                        .num_columns(2)
+                                        .striped(true)
+                                        .spacing([12.0, 4.0])
+                                        .show(ui, |ui| {
+                                            for (k, v) in &alert.extra {
+                                                ui.weak(k);
+                                                ui.add(egui::Label::new(v).wrap());
+                                                ui.end_row();
+                                            }
+                                        });
+                                }
+
+                                ui.add_space(8.0);
+                                ui.separator();
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui
+                                        .add_enabled(
+                                            !ack_in_flight && !alert.acknowledged,
+                                            egui::Button::new("Acknowledge"),
+                                        )
+                                        .on_hover_text(
+                                            "Acknowledge this alert. It silences the page \
+                                             for everyone, so only do it if you are \
+                                             taking it.",
+                                        )
+                                        .clicked()
+                                    {
+                                        ack = Some(id.clone());
+                                    }
+                                    if alert.acknowledged {
+                                        ui.weak("already acknowledged");
+                                    }
+                                    if ack_in_flight {
+                                        ui.spinner();
+                                    }
+                                    if ui
+                                        .add_enabled(!loading, egui::Button::new("Reload"))
+                                        .on_hover_text("Re-read this alert")
+                                        .clicked()
+                                    {
+                                        reload = Some(id.clone());
+                                    }
+                                    if ui
+                                        .button("Copy all")
+                                        .on_hover_text("Copy this alert as text")
+                                        .clicked()
+                                    {
+                                        if let Ok(mut cb) = arboard::Clipboard::new() {
+                                            let _ = cb.set_text(alert_as_text(alert));
+                                        }
+                                    }
+                                });
+                                match &note {
+                                    Some(Ok(msg)) => {
+                                        note_label(
+                                            ui,
+                                            egui::Color32::from_rgb(90, 190, 110),
+                                            msg.as_str(),
+                                        );
+                                    }
+                                    Some(Err(err)) => {
+                                        note_label(
+                                            ui,
+                                            egui::Color32::from_rgb(220, 90, 90),
+                                            format!("Failed: {err}"),
+                                        );
+                                    }
+                                    None => {}
+                                }
+                            });
+                    });
+                if !open {
+                    closed.push(id);
+                }
+            }
+
+            self.alert_windows.retain(|w| !closed.contains(&w.id));
+            if let Some(id) = ack {
+                self.start_alert_ack(&id);
+            }
+            if let Some(id) = reload {
+                self.start_alert_detail_fetch(&id);
             }
         }
 
@@ -14910,14 +15550,17 @@ mod gui {
             // `self`, then applied below alongside the buttons' results.
             let mut menu_dry_run: Option<String> = None;
             let mut menu_remediate: Option<String> = None;
+            // Carried out of the window closure like the rest: opening the
+            // detail window needs `&mut self`.
+            let mut open_alert: Option<(String, String)> = None;
             // Copied out for the same reason: the grid closure cannot read
             // `self`. Same gate as the Alert ID row's buttons.
             let probe_enabled = self.reaper_probe_enabled;
-            // Whatever the dry-run thread could not do. Kept as the *last*
-            // one: a run reports at most one failure and then stops, so
-            // there is never a queue of them to reconcile.
-            if let Some(latest) = self.dry_run_error_rx.try_iter().last() {
-                self.alert_submit_error = Some(latest);
+            // The newest thing the run has said. A run reports progress and
+            // then exactly one outcome, so the last message is the current
+            // state and there is never a queue to reconcile.
+            if let Some(latest) = self.dry_run_status_rx.try_iter().last() {
+                self.alert_action_status = Some(latest);
             }
 
             egui::Window::new("On-Call Alerts")
@@ -15013,15 +15656,16 @@ mod gui {
                                     egui::Button::new("Test Alert Match"),
                                 )
                                 .on_hover_text(
-                                    "Dry run this alert — and SEND A REAL ESCALATION: \
-                                     your phone rings and Telegram fires.\n\n\
-                                     It fetches the alert, matches it, and for a reaper \
-                                     alert resolves the instance and reads the box \
-                                     (docker ps -a, compose ps, the watchdog) — everything \
-                                     the real run does EXCEPT compose down / compose up -d. \
-                                     Then it escalates as though the fix had failed.\n\n\
-                                     Nothing is acknowledged and nothing on the box is \
-                                     changed. Every step is in the log under On-Call.",
+                                    "Dry run this alert — and SEND A REAL ESCALATION: your phone rings and \
+                 Telegram fires.\n\n\
+                 What it does depends on which watcher claims the alert:\n\
+                 - reaper - resolves the instance and reads the box (docker ps -a, \
+                 compose ps, the watchdog), but never compose down / compose up -d\n\
+                 - pingdom - reads the environment out of the alert summary; there is \
+                 no box in its path to read\n\n\
+                 Then it escalates as though the fix had failed. Nothing is \
+                 acknowledged and nothing is changed. Every step is in the log under \
+                 On-Call -> Alert Test.",
                                 )
                                 .clicked()
                             {
@@ -15038,13 +15682,13 @@ mod gui {
                                     egui::Button::new("Run Remediation"),
                                 )
                                 .on_hover_text(
-                                    "Remediate this alert now, as if it had just come in: \
-                                     acknowledge (only if you are on call), stop the \
-                                     watchdog, compose down, compose up -d, then watch for \
-                                     the alert to close.\n\n\
-                                     Works on an open, closed, acknowledged or \
-                                     unacknowledged alert, and ignores the cooldown and \
-                                     whatever this session has already handled.",
+                                    "Reaper alerts only.\n\n\
+                 Remediate this alert now, as if it had just come in: acknowledge \
+                 (only if you are on call), stop the watchdog, compose down, \
+                 compose up -d, then watch for the alert to close.\n\n\
+                 A pingdom alert has no fix to run — use Test Alert Match for those.\n\n\
+                 Works on an open, closed, acknowledged or unacknowledged alert, and \
+                 ignores the cooldown and whatever this session has already handled.",
                                 )
                                 .clicked()
                             {
@@ -15066,17 +15710,15 @@ mod gui {
                             // a pass run immediately.
                             ui.weak("results appear in the Logs tab");
                         });
-                        if let Some(err) = &self.alert_submit_error {
-                            // Under the box, in red, and it stays until the
-                            // next submit: a person who typed an id that does
-                            // not exist otherwise sees nothing happen at all.
-                            // Through `note_label`, like every other
-                            // status-coloured line here: a direct
-                            // `colored_label` stays thin on a light panel,
-                            // and there is a test that says so.
-                            let red = egui::Color32::from_rgb(220, 80, 80);
+                        if let Some(st) = &self.alert_action_status {
+                            // Under the box, and it stays until the next
+                            // action: yellow while running, green on success,
+                            // red on failure. Through `note_label`, like every
+                            // other status-coloured line here -- a direct
+                            // `colored_label` stays thin on a light panel, and
+                            // there is a test that says so.
                             ui.horizontal_wrapped(|ui| {
-                                note_label(ui, red, format!("\u{26a0} {err}"));
+                                note_label(ui, st.color(), st.text());
                             });
                         }
                     }
@@ -15149,11 +15791,25 @@ mod gui {
                                             });
                                         };
                                         menu(ui.label(format_local_time(&a.created_at)));
-                                        menu(ui.label(if a.tiny_id.is_empty() {
-                                            "-".to_string()
-                                        } else {
-                                            format!("#{}", a.tiny_id)
-                                        }));
+                                        // The id is the click target, as the
+                                        // ticket key is in the Jira list: one
+                                        // obvious place to click, and no
+                                        // accidental opens while reading.
+                                        let id_cell = ui.add(egui::Link::new(
+                                            egui::RichText::new(if a.tiny_id.is_empty() {
+                                                "-".to_string()
+                                            } else {
+                                                format!("#{}", a.tiny_id)
+                                            })
+                                            .strong(),
+                                        ));
+                                        if id_cell.clicked() {
+                                            open_alert = Some((a.id.clone(), a.tiny_id.clone()));
+                                        }
+                                        menu(id_cell.on_hover_text(
+                                            "Open this alert in full — the list omits the \
+                                             description",
+                                        ));
                                         menu(note_label(ui,
                                             priority_color(&a.priority),
                                             if a.priority.is_empty() {
@@ -15194,6 +15850,9 @@ mod gui {
                         });
                 });
 
+            if let Some((id, tiny)) = open_alert {
+                self.open_alert_window(ctx, &id, &tiny);
+            }
             if let Some(text) = copy_text {
                 ctx.copy_text(text);
                 self.log_info("alerts: copied table to clipboard");
@@ -15212,9 +15871,10 @@ mod gui {
                 self.pending_run_remediation = Some(pending);
             }
             if let Some(id) = dry_run_alert_id {
-                // Cleared on every submit: a stale error under the box after
-                // a run that worked is worse than none at all.
-                self.alert_submit_error = None;
+                // Replaced on every submit: a stale outcome under the box
+                // after a fresh run is worse than none at all.
+                self.alert_action_status =
+                    Some(AlertActionStatus::Running(format!("testing alert {id}…")));
                 self.log_reaper(
                     LogLevel::Warn,
                     format!(
@@ -15231,7 +15891,7 @@ mod gui {
                     ec2_manager::jsm_auth::escalation_mailbox(),
                     id,
                     self.reaper_probe_tx.clone(),
-                    self.dry_run_error_tx.clone(),
+                    self.dry_run_status_tx.clone(),
                 );
             }
 
@@ -23900,6 +24560,15 @@ mod gui {
                             },
                         );
                     });
+                    ui.horizontal(|ui| {
+                        ui.label("Alert Test");
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.checkbox(&mut self.oncall_filters.alert_test, "");
+                            },
+                        );
+                    });
                 })
                 .response
                 .on_hover_text(
@@ -24302,13 +24971,19 @@ mod gui {
                 self.render_pat_dialog(ctx);
                 self.render_script_result_popup(ctx);
                 self.render_alerts_window(ctx);
+                self.render_alert_windows(ctx);
                 self.render_jira_window(ctx);
                 self.render_jira_ticket_windows(ctx);
+                // After both sets of windows: the @ dropdown consumes Escape
+                // during its own render, so this only ever sees an Escape
+                // nothing else wanted.
+                self.close_top_window_on_escape(ctx);
                 self.render_ack_all_confirm(ctx);
                 self.render_run_remediation_confirm(ctx);
                 self.pump_script_runs();
                 self.poll_script_events();
                 self.poll_alerts_events();
+                self.poll_alert_detail_events();
                 self.poll_jira_events();
                 self.poll_ack_all_events();
                 self.poll_reaper_events();
@@ -26648,6 +27323,14 @@ mod gui {
     /// What the reaper poll thread reports back to the UI thread.
     #[derive(Clone, Debug)]
     enum ReaperEvent {
+        /// A line that names its own log source. Emitted by
+        /// `start_alert_dry_run`, which is not the reaper poll and must not
+        /// be filed as it — see [`LogSource::AlertTest`].
+        SourcedNote {
+            source: LogSource,
+            level: LogLevel,
+            message: String,
+        },
         /// Matched, but not acted on.
         Skipped { reason: String },
         /// A line of narration from a remediation in flight — the ack, the
@@ -27229,6 +27912,9 @@ mod gui {
             // Last on-call answer reported, so a machine that is off call for
             // a week says so once rather than every poll.
             let mut last_on_call: Option<bool> = None;
+            // The last poll tally reported, so an unchanging feed says so once
+            // rather than twice a minute forever.
+            let mut last_tally: Option<String> = None;
 
             let note = |level: LogLevel, message: String| {
                 let _ = tx.send(PingdomEvent::Note { level, message });
@@ -27260,6 +27946,8 @@ mod gui {
                 match alerts::fetch_latest(&auth, cfg.alerts_per_poll()) {
                     Ok(list) => {
                         let mut identified = 0usize;
+                        let mut closed = 0usize;
+                        let mut already = 0usize;
                         for alert in &list {
                             if !pingdom::identifies(alert, &cfg) {
                                 continue;
@@ -27269,7 +27957,12 @@ mod gui {
                             // timed. Matching off the list is enough here:
                             // unlike reaper, nothing this watcher needs lives
                             // in `description`, so there is no full read.
+                            //
+                            // Counted, not just skipped: "2 matched, 0 being
+                            // timed" with no explanation is the exact state a
+                            // user could not make sense of.
                             if ec2_manager::reaper::alert_is_closed(&alert.status) {
+                                closed += 1;
                                 continue;
                             }
 
@@ -27282,7 +27975,11 @@ mod gui {
                                 now_ms,
                                 window_ms,
                             ) {
-                                pingdom::Action::Ignore => {}
+                                // Already acted on by this process, so
+                                // there is nothing left to do for it. Counted
+                                // so the heartbeat can account for every
+                                // alert it matched.
+                                pingdom::Action::Ignore => already += 1,
                                 pingdom::Action::AckAndWatch => {
                                     // What the summary actually yielded, and
                                     // by which rule. This is the line the
@@ -27351,15 +28048,22 @@ mod gui {
                                 }
                             }
                         }
-                        note(
-                            LogLevel::Debug,
-                            format!(
-                                "pingdom: polled {} alert(s), {identified} matched, {} \
-                                 incident(s) being timed",
-                                list.len(),
-                                state.watching_count(),
-                            ),
+                        // Every matched alert accounted for, and said only
+                        // when the tally CHANGES. Repeating an identical line
+                        // every 30s buries everything else in the log --
+                        // observed at 2 lines a minute for an hour and a half,
+                        // with a dry run's whole output lost among them.
+                        let tally = format!(
+                            "pingdom: polled {} alert(s), {identified} matched \
+                             ({closed} closed, {already} already handled, {} being \
+                             timed)",
+                            list.len(),
+                            state.watching_count(),
                         );
+                        if last_tally.as_deref() != Some(tally.as_str()) {
+                            note(LogLevel::Info, tally.clone());
+                            last_tally = Some(tally);
+                        }
                     }
                     Err(e) => note(LogLevel::Warn, format!("pingdom: feed read failed: {e}")),
                 }
@@ -34651,7 +35355,7 @@ mod gui {
 
         #[test]
         fn ticking_reaper_down_narrows_the_log_to_that_script() {
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false };
             assert!(only_reaper.any());
             assert!(only_reaper.includes(LogSource::ReaperDown));
             assert!(!only_reaper.includes(LogSource::App));
@@ -34662,7 +35366,7 @@ mod gui {
             // The popup shuts as soon as it is used, so without this the only
             // evidence that most of the log is being hidden is the log being
             // short — which reads as the app having stopped logging.
-            assert_eq!(OnCallFilters { reaper_down: true, pingdom: false }.label(), "On-Call: Reaper Down");
+            assert_eq!(OnCallFilters { reaper_down: true, pingdom: false, alert_test: false }.label(), "On-Call: Reaper Down");
         }
 
         #[test]
@@ -34683,7 +35387,7 @@ mod gui {
 
             // And that tag is what the dropdown filters on — asserted through
             // the same predicate the panel uses, not a reimplementation of it.
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false };
             let kept: Vec<&str> = app
                 .logs
                 .iter()
@@ -34698,7 +35402,7 @@ mod gui {
             // The two filters are independent and both on screen. A DEBUG
             // reaper line with DEBUG unticked stays hidden, the same as any
             // other DEBUG line.
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false };
             let mut levels = LogFilters::default();
             levels.set_verbosity_low();
             assert!(!levels.includes(LogLevel::Debug));
@@ -36279,6 +36983,45 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         }
 
         #[test]
+        fn a_closing_ticket_window_keeps_an_unsent_draft_and_reopening_restores_it() {
+            // Escape closes a window, so binning what somebody typed because
+            // they pressed it is the same silent loss the failed-post path
+            // already refuses to allow. Both close routes must behave alike.
+            let mut drafts: std::collections::BTreeMap<
+                String,
+                (String, Vec<(String, String)>),
+            > = std::collections::BTreeMap::new();
+
+            // The stash rule, mirrored from `stash_jira_draft`.
+            let stash = |drafts: &mut std::collections::BTreeMap<
+                String,
+                (String, Vec<(String, String)>),
+            >,
+                         key: &str,
+                         draft: &str,
+                         mentions: Vec<(String, String)>| {
+                if draft.trim().is_empty() {
+                    drafts.remove(key);
+                } else {
+                    drafts.insert(key.to_string(), (draft.to_string(), mentions));
+                }
+            };
+
+            let mentions = vec![("@John Smith".to_string(), "acc-1".to_string())];
+            stash(&mut drafts, "OPS-1", "half a thought @John Smith", mentions.clone());
+            let kept = drafts.get("OPS-1").expect("kept");
+            assert_eq!(kept.0, "half a thought @John Smith");
+            // The picked mentions travel with it, or the restored draft would
+            // post its @name as literal text.
+            assert_eq!(kept.1, mentions);
+
+            // An empty draft leaves nothing behind rather than a blank entry
+            // that would grow the map for every ticket ever opened.
+            stash(&mut drafts, "OPS-1", "   ", Vec::new());
+            assert!(drafts.get("OPS-1").is_none());
+        }
+
+        #[test]
         fn an_at_opens_the_dropdown_only_where_a_mention_could_start() {
             // Caret is a char index, so these are counted in chars.
             assert_eq!(mention_token_at("@", 1), Some((0, String::new())));
@@ -36558,7 +37301,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn the_on_call_filter_can_narrow_the_log_to_pingdom() {
-            let only_pingdom = OnCallFilters { reaper_down: false, pingdom: true };
+            let only_pingdom = OnCallFilters { reaper_down: false, pingdom: true, alert_test: false };
             assert!(only_pingdom.includes(LogSource::Pingdom));
             assert!(!only_pingdom.includes(LogSource::ReaperDown));
             assert!(!only_pingdom.includes(LogSource::App));
@@ -36568,7 +37311,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         #[test]
         fn nothing_ticked_still_shows_the_pingdom_lines() {
             // A dropdown nobody opens must not remove anything from view.
-            let none = OnCallFilters { reaper_down: false, pingdom: false };
+            let none = OnCallFilters { reaper_down: false, pingdom: false, alert_test: false };
             assert!(none.includes(LogSource::Pingdom));
             assert!(none.includes(LogSource::ReaperDown));
             assert!(none.includes(LogSource::App));
@@ -36577,7 +37320,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn both_ticked_shows_both_and_says_so() {
-            let both = OnCallFilters { reaper_down: true, pingdom: true };
+            let both = OnCallFilters { reaper_down: true, pingdom: true, alert_test: false };
             assert!(both.includes(LogSource::Pingdom));
             assert!(both.includes(LogSource::ReaperDown));
             assert!(!both.includes(LogSource::App));

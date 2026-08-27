@@ -385,6 +385,52 @@ Credential Manager.
 `assets/scripts/alerts_10min.sh` is the standalone bash equivalent (curl + jq,
 same tag parsing, same local-time conversion) for terminal use.
 
+#### The alert window (click an alert's id)
+
+Clicking the `#id` in the Alerts list opens that alert in its own window,
+several at once, keyed on the alert id — the same shape as the Jira ticket
+windows, and `move_to_top` rather than a duplicate when it is already open.
+
+- **It reads the alert in full, by id.** `fetch_latest` omits `description`,
+  which is the field the window exists to show — the same trap the reaper poll
+  fell into (see "The poll always reads the alert in full"). Never rendered
+  from the list row.
+- **Links are pulled out rather than left to be hunted for.** These alerts are
+  machine-generated and the useful link — a Grafana panel, a runbook — arrives
+  buried in the description or in an `extraProperties` value, never in a field
+  of its own. `alerts::extract_links` scans message, description, properties
+  and tags, dedupes, and **trims trailing punctuation**: a link at the end of a
+  sentence or inside brackets otherwise carries a `.` or `)` that is invisible
+  until someone pastes it. The `{{extraProperties}}` template key is skipped,
+  as everywhere else here, or every link is listed twice. Each gets the
+  Inventory table's own `paint_copy_button`.
+- **Acknowledge has no on-call gate.** That rule belongs to the unattended
+  watchers, which must not silence a page nobody has taken; a person clicking
+  the button has taken it. "Acknowledge all" has never consulted the schedule
+  either.
+- **One scroll area, nothing inside it with a fixed height** — the constraint
+  the ticket window records, for the reason it cost a layout bug there.
+
+#### Escape closes the topmost ticket or alert window
+
+`close_top_window_on_escape` runs **after** both sets of windows are drawn,
+and that ordering is what gives the precedence for nothing: the `@` mention
+dropdown consumes Escape with `consume_key` during its own render, and a
+consumed key is gone from the queue — so Escape dismisses the dropdown when
+one is open and closes the window when none is.
+
+- **Only the topmost window, and only if it is one of ours.** Escape with the
+  Alerts list or Port Forwards on top must not reach past them and shut a
+  ticket window the user cannot see. `ctx.top_layer_id()` is matched against
+  each window's own `Id`.
+- **Closing keeps an unsent comment draft** (`stash_jira_draft`), restored by
+  `open_jira_ticket`. Escape is easy to press, and binning what somebody had
+  typed is the same silent loss the failed-post path already refuses to allow.
+  **Both close routes stash** — the X and Escape must not differ — which is
+  why the ticket list is drained rather than `retain`ed.
+  The picked mentions travel with the draft, or a restored `@name` would post
+  as literal text.
+
 #### The Jira Alerts API trace (Logs tab)
 
 The Logs tab carries a **Jira Alerts** checkbox that shows the last 5 calls to
@@ -938,6 +984,23 @@ run.** Run Remediation and Override are unchanged.
   routes everything to `Neither`.
 - **An alert no watcher claims escalates nothing** and says so. Paging about
   an alert neither watcher would ever act on proves nothing about either.
+- **Its output is its own log source, `LogSource::AlertTest`**, with its own
+  **Alert Test** entry in the Logs tab's On-Call dropdown — not the claiming
+  watcher's. A dry run is one thing a person just asked for and wants to read
+  end to end, and a *pingdom* run filed under Reaper Down (which is what
+  happened before this existed) is invisible to the filter they would tick.
+  The run is bracketed by `===== START` / `===== END` lines at warn level, so
+  it is findable in an unfiltered log too. The reaper transcript is rendered
+  inline into the same source rather than sent as `ReaperEvent::Transcript`,
+  or that one part of the run would file itself as reaper output.
+- **The hover text must stay watcher-neutral.** Which watcher claims the
+  alert is not known until it has been fetched, so a tooltip promising
+  `compose down` is simply wrong on a pingdom alert — it said exactly that
+  until a user hovered one. It now names what each watcher does.
+- **Run Remediation is reaper-only**, and its tooltip says so in the first
+  line. The row menu offers it on every alert because the menu is drawn
+  before anything is fetched; on a pingdom alert there is no fix to run and
+  the log says so.
 - **A failure the person needs to see goes to the window, not just the log**
   (`alert_submit_error`, a red line under the Alert ID box): an alert id that
   could not be fetched, one no watcher claims, or a send that did not go. The

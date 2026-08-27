@@ -280,6 +280,62 @@ fn validate_alert_id(alert_id: &str) -> Result<()> {
     }
 }
 
+/// Every URL an alert carries, in the order found, deduplicated.
+///
+/// These alerts are machine-generated and the useful link — a Grafana panel,
+/// a runbook, a dashboard — arrives buried in the description or in an
+/// `extraProperties` value rather than in a field of its own. Scanning is the
+/// only way to surface them.
+///
+/// **The `{{extraProperties}}` key is skipped**, as everywhere else here: the
+/// feed sometimes serves that unrendered template holding a flattened copy of
+/// the same map, so matching it would list every link twice.
+pub fn extract_links(alert: &Alert) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let push_from = |text: &str, out: &mut Vec<String>| {
+        for url in find_urls(text) {
+            if !out.contains(&url) {
+                out.push(url);
+            }
+        }
+    };
+    push_from(&alert.message, &mut out);
+    push_from(&alert.description, &mut out);
+    for (key, value) in &alert.extra {
+        if key.contains("{{") {
+            continue;
+        }
+        push_from(value, &mut out);
+    }
+    for tag in &alert.tags {
+        push_from(tag, &mut out);
+    }
+    out
+}
+
+/// URLs inside one string.
+///
+/// Trailing punctuation is trimmed because these appear in prose — a link at
+/// the end of a sentence, or wrapped in brackets — and a URL carrying a
+/// trailing `.` or `)` is broken in a way that is invisible until someone
+/// pastes it.
+fn find_urls(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("http://").or_else(|| rest.find("https://")) {
+        let tail = &rest[start..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '<' || c == '>')
+            .unwrap_or(tail.len());
+        let url = tail[..end].trim_end_matches(|c| ",.;:!)]}".contains(c));
+        if url.len() > "https://".len() {
+            out.push(url.to_string());
+        }
+        rest = &tail[end..];
+    }
+    out
+}
+
 /// One request against the alerts API, with this site's credentials.
 ///
 /// A thin wrapper over [`atlassian_http::request`]: the credentials-on-stdin
@@ -401,6 +457,58 @@ pub fn cutoff_string(window_min: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_are_found_wherever_the_feed_buried_them() {
+        let mut alert = Alert {
+            message: "Gateway down, see https://grafana.example.com/d/abc".to_string(),
+            description: "Runbook: https://wiki.example.com/runbook#step-2.\n\
+                          Dashboard (https://grafana.example.com/d/xyz)".to_string(),
+            ..Default::default()
+        };
+        alert.extra.insert("url".to_string(), "https://example.com/panel".to_string());
+        alert.tags.push("Doc: http://intranet.example.com/doc".to_string());
+
+        let links = extract_links(&alert);
+        assert_eq!(
+            links,
+            vec![
+                "https://grafana.example.com/d/abc",
+                // A trailing sentence full stop is trimmed -- a URL carrying
+                // one is broken in a way nobody notices until they paste it.
+                "https://wiki.example.com/runbook#step-2",
+                // ...and so is a wrapping bracket.
+                "https://grafana.example.com/d/xyz",
+                "https://example.com/panel",
+                "http://intranet.example.com/doc",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_unrendered_template_key_is_not_scanned_for_links() {
+        // The feed sometimes serves `{{extraProperties}}` holding a flattened
+        // copy of the same map; scanning it lists every link twice.
+        let mut alert = Alert::default();
+        alert.extra.insert("url".to_string(), "https://example.com/a".to_string());
+        alert
+            .extra
+            .insert("{{extraProperties}}".to_string(), "url=https://example.com/a".to_string());
+        assert_eq!(extract_links(&alert), vec!["https://example.com/a"]);
+    }
+
+    #[test]
+    fn an_alert_with_no_links_yields_none() {
+        let alert = Alert {
+            message: "no links here".to_string(),
+            description: "still none".to_string(),
+            ..Default::default()
+        };
+        assert!(extract_links(&alert).is_empty());
+        // A bare scheme is not a link.
+        let bare = Alert { message: "https://".to_string(), ..Default::default() };
+        assert!(extract_links(&bare).is_empty());
+    }
 
     /// Trimmed-down copy of a real response (the shape in the screenshot).
     const SAMPLE: &str = r#"{
