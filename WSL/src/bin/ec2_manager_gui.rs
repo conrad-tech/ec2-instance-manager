@@ -1394,6 +1394,14 @@ mod gui {
         /// real mention nodes; anything typed by hand stays text, because
         /// without an account id there is nobody to tag.
         picked_mentions: Vec<(String, String)>,
+        /// The description editor, while open. Holds the flattened text
+        /// being edited, the mentions to re-emit, and whether the lossy-save
+        /// confirmation has been given.
+        desc_edit: Option<TextEditState>,
+        /// The comment being edited, while one is.
+        comment_edit: Option<(String, TextEditState)>,
+        /// Outcome of the last edit save.
+        edit_note: Option<std::result::Result<String, String>>,
         /// The transition screen being filled in, if any.
         pending_transition: Option<PendingTransition>,
     }
@@ -1441,8 +1449,47 @@ mod gui {
         },
     }
 
+    /// One open editor: the text, the mentions to re-emit with it, and
+    /// whether a lossy save has been agreed to.
+    struct TextEditState {
+        text: String,
+        /// Mentions carried from the original document plus any picked while
+        /// editing. Without these an edit silently un-tags everyone the text
+        /// named.
+        mentions: Vec<(String, String)>,
+        /// Ticked only when the original held formatting this editor cannot
+        /// reproduce. Save stays disabled until then.
+        confirm_lossy: bool,
+        saving: bool,
+    }
+
+    /// Which box an open `@` dropdown belongs to.
+    ///
+    /// One ticket window now has three boxes that accept mentions — the new
+    /// comment, the description editor and a comment editor — and only one
+    /// dropdown may be open at a time. Without this the popup would render
+    /// under whichever box drew last.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum MentionTarget {
+        NewComment,
+        Description,
+        Comment(String),
+    }
+
+    /// Whatever a mention-capable text box reported this frame.
+    #[derive(Default)]
+    struct MentionBoxOut {
+        box_id: Option<egui::Id>,
+        caret: Option<usize>,
+        pick: Option<usize>,
+        move_by: i32,
+        close: bool,
+    }
+
     /// The `@` mention dropdown for one ticket's comment box.
     struct MentionPopup {
+        /// Which box it belongs to.
+        target: MentionTarget,
         /// Character index of the `@` in the draft, so the picked name can
         /// replace the token that was typed.
         at: usize,
@@ -1554,6 +1601,9 @@ mod gui {
                 comment_draft: String::new(),
                 comment_in_flight: false,
                 comment_note: None,
+                desc_edit: None,
+                comment_edit: None,
+                edit_note: None,
                 mention: None,
                 picked_mentions: Vec::new(),
                 pending_transition: None,
@@ -1594,6 +1644,13 @@ mod gui {
         /// by the window. Feeds the unread set and the badge; never touches
         /// the window's rows, which may be showing the Closed scope.
         Background(std::result::Result<Vec<ec2_manager::jira::IssueRow>, String>),
+        /// Who this token belongs to.
+        Myself(std::result::Result<ec2_manager::jira::User, String>),
+        /// A description or a comment edit was saved (or was not).
+        Edited {
+            key: String,
+            result: std::result::Result<String, String>,
+        },
         /// Directory results for one `@` query.
         Users {
             key: String,
@@ -4489,6 +4546,85 @@ mod gui {
             "new" => egui::Color32::from_rgb(150, 150, 160),
             // An unknown category is not coloured as anything in particular.
             _ => egui::Color32::GRAY,
+        }
+    }
+
+    /// A text box that can take `@` mentions, plus its dropdown.
+    ///
+    /// Shared by all three boxes in a ticket window — the new comment, the
+    /// description editor, and a comment editor — so the key handling, the
+    /// caret rules and the dropdown cannot drift between them. `view` is
+    /// `Some` only for the box the open dropdown belongs to.
+    fn mention_text_box(
+        ui: &mut egui::Ui,
+        salt: (&'static str, &str),
+        hint: &str,
+        rows: usize,
+        text: &mut String,
+        view: Option<&(usize, bool, bool, Vec<ec2_manager::jira::User>)>,
+        out: &mut MentionBoxOut,
+    ) {
+        // Keys are consumed BEFORE the box is built, so while the dropdown is
+        // open Enter picks a name instead of inserting a newline. A widget
+        // only sees events still in the queue when it is added.
+        let popup_open = view.map(|(_, _, _, rows)| !rows.is_empty()).unwrap_or(false);
+        if popup_open {
+            ui.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                    out.move_by = 1;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                    out.move_by = -1;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                {
+                    if let Some((sel, _, _, _)) = view {
+                        out.pick = Some(*sel);
+                    }
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                    out.close = true;
+                }
+            });
+        }
+        let edit = egui::TextEdit::multiline(text)
+            .hint_text(hint)
+            .desired_rows(rows)
+            .desired_width(f32::INFINITY)
+            .id_salt(salt)
+            .show(ui);
+        out.box_id = Some(edit.response.id);
+        if edit.response.has_focus() {
+            out.caret = edit.cursor_range.map(|r| r.primary.index);
+        } else if edit.response.lost_focus() {
+            out.close = true;
+        }
+
+        if let Some((selected, loading, scroll, rows)) = view {
+            if !rows.is_empty() {
+                // Inline, not a floating Area: a popup inside a window inside
+                // a scroll area is where egui z-order and clipping bugs live.
+                let listed = egui::Frame::group(ui.style()).show(ui, |ui| {
+                    for (i, u) in rows.iter().enumerate() {
+                        if ui.selectable_label(i == *selected, &u.display_name).clicked() {
+                            out.pick = Some(i);
+                        }
+                    }
+                    if *loading {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.weak("searching…");
+                        });
+                    }
+                    ui.weak("Up/Down to choose, Enter to insert, Esc to dismiss");
+                });
+                if *scroll {
+                    // Otherwise the list opens below the fold and has to be
+                    // scrolled to by hand.
+                    listed.response.scroll_to_me(Some(egui::Align::BOTTOM));
+                }
+            }
         }
     }
 
@@ -7699,6 +7835,12 @@ mod gui {
         /// somebody had typed because they pressed it is exactly the silent
         /// loss the failed-post path already refuses to allow.
         jira_drafts: std::collections::BTreeMap<String, (String, Vec<(String, String)>)>,
+        /// This token's own Atlassian account id, read once from `/myself`.
+        /// Decides which comments carry an Edit button. `None` until it
+        /// lands, or if it could not be read — in which case no comment
+        /// offers editing, which is the honest failure: without knowing who
+        /// you are, "is this mine" has no answer.
+        jira_me: Option<String>,
         /// Ticket keys that have changed since they were last opened.
         /// Drives the toolbar badge and the `new` marker in the list.
         jira_unread: std::collections::BTreeSet<String>,
@@ -8300,6 +8442,7 @@ mod gui {
                 alerts_rx,
                 jira_enabled,
                 jira_site,
+                jira_me: None,
                 jira_drafts: std::collections::BTreeMap::new(),
                 jira_unread: std::collections::BTreeSet::new(),
                 jira_open_count: 0,
@@ -8403,6 +8546,8 @@ mod gui {
                 // The badge is only worth having if it is live before the
                 // window is ever opened.
                 app.start_jira_background_poll();
+                // Who this token is — decides which comments you may edit.
+                app.start_jira_myself();
             }
             for (is_warn, msg) in reaper_startup_log {
                 // Tagged like the rest of the remediation's output: "the
@@ -13353,6 +13498,74 @@ mod gui {
             });
         }
 
+        /// Read who this token is, once. Decides which comments are yours.
+        fn start_jira_myself(&mut self) {
+            if !self.jira_enabled || self.jira_me.is_some() {
+                return;
+            }
+            let site = self.jira_site.clone();
+            let tx = self.jira_tx.clone();
+            std::thread::spawn(move || {
+                let result = ec2_manager::jira::fetch_myself(&site).map_err(|e| e.to_string());
+                let _ = tx.send(JiraEvent::Myself(result));
+            });
+        }
+
+        /// Save an edited description.
+        fn start_jira_save_description(&mut self, key: &str) {
+            let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key) else {
+                return;
+            };
+            let Some(edit) = win.desc_edit.as_mut() else {
+                return;
+            };
+            if edit.saving {
+                return;
+            }
+            edit.saving = true;
+            let (text, mentions) = (edit.text.clone(), edit.mentions.clone());
+            win.edit_note = None;
+            let key = key.to_string();
+            self.log_info(format!("jira: {key} — saving an edited description"));
+            let site = self.jira_site.clone();
+            let tx = self.jira_tx.clone();
+            std::thread::spawn(move || {
+                let result =
+                    ec2_manager::jira::update_description(&site, &key, &text, &mentions)
+                        .map(|()| "Description saved".to_string())
+                        .map_err(|e| e.to_string());
+                let _ = tx.send(JiraEvent::Edited { key, result });
+            });
+        }
+
+        /// Save an edited comment.
+        fn start_jira_save_comment_edit(&mut self, key: &str) {
+            let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key) else {
+                return;
+            };
+            let Some((comment_id, edit)) = win.comment_edit.as_mut() else {
+                return;
+            };
+            if edit.saving {
+                return;
+            }
+            edit.saving = true;
+            let (id, text, mentions) =
+                (comment_id.clone(), edit.text.clone(), edit.mentions.clone());
+            win.edit_note = None;
+            let key = key.to_string();
+            self.log_info(format!("jira: {key} — saving an edit to comment {id}"));
+            let site = self.jira_site.clone();
+            let tx = self.jira_tx.clone();
+            std::thread::spawn(move || {
+                let result =
+                    ec2_manager::jira::update_comment(&site, &key, &id, &text, &mentions)
+                        .map(|()| "Comment saved".to_string())
+                        .map_err(|e| e.to_string());
+                let _ = tx.send(JiraEvent::Edited { key, result });
+            });
+        }
+
         /// Post the ticket window's typed comment.
         fn start_jira_comment(&mut self, key: &str) {
             let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key) else {
@@ -13497,6 +13710,53 @@ mod gui {
                         }
                         Err(err) => self.log_warn(format!("jira: background poll: {err}")),
                     },
+                    JiraEvent::Myself(result) => match result {
+                        Ok(me) => {
+                            self.log_info(format!(
+                                "jira: signed in as {} ({})",
+                                me.display_name, me.account_id
+                            ));
+                            self.jira_me = Some(me.account_id);
+                        }
+                        // No Edit buttons on comments, which is honest:
+                        // without knowing who you are, "is this mine" has no
+                        // answer worth acting on.
+                        Err(err) => self.log_warn(format!(
+                            "jira: could not read /myself ({err}); comment editing is off"
+                        )),
+                    },
+                    JiraEvent::Edited { key, result } => {
+                        let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key)
+                        else {
+                            continue;
+                        };
+                        match result {
+                            Ok(msg) => {
+                                // Only now are the editors safe to close;
+                                // shutting them on submit would lose the text
+                                // if the save failed.
+                                win.desc_edit = None;
+                                win.comment_edit = None;
+                                win.edit_note = Some(Ok(msg.clone()));
+                                self.log_info(format!("jira: {key} — {msg}"));
+                                reload.push(key);
+                            }
+                            Err(err) => {
+                                self.log_error(format!("jira: {key} — edit failed: {err}"));
+                                if let Some(win) =
+                                    self.jira_tickets.iter_mut().find(|w| w.key == key)
+                                {
+                                    if let Some(e) = win.desc_edit.as_mut() {
+                                        e.saving = false;
+                                    }
+                                    if let Some((_, e)) = win.comment_edit.as_mut() {
+                                        e.saving = false;
+                                    }
+                                    win.edit_note = Some(Err(err));
+                                }
+                            }
+                        }
+                    }
                     JiraEvent::Users { key, query, result } => {
                         let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key)
                         else {
@@ -14536,6 +14796,8 @@ mod gui {
             )> = None;
             let mut reload: Option<String> = None;
             let mut comment_for: Option<String> = None;
+            let mut save_desc_for: Option<String> = None;
+            let mut save_comment_for: Option<String> = None;
 
             for idx in 0..self.jira_tickets.len() {
                 let (key, issue, transitions, error, transitions_error, loading, in_flight, note) = {
@@ -14574,27 +14836,42 @@ mod gui {
                         None => Vec::new(),
                     };
                     (
-                        m.selected,
-                        m.loading,
-                        m.scroll_into_view,
-                        ec2_manager::jira::mention_candidates(
-                            &m.token,
-                            &people,
-                            &m.directory,
-                            ec2_manager::jira::MENTION_LIMIT,
+                        m.target.clone(),
+                        (
+                            m.selected,
+                            m.loading,
+                            m.scroll_into_view,
+                            ec2_manager::jira::mention_candidates(
+                                &m.token,
+                                &people,
+                                &m.directory,
+                                ec2_manager::jira::MENTION_LIMIT,
+                            ),
                         ),
                     )
                 });
-                // Carried out of the closure: acting on them needs `&mut self`.
-                let mut mention_pick: Option<usize> = None;
-                let mut mention_move: i32 = 0;
-                let mut mention_close = false;
-                let mut mention_caret: Option<usize> = None;
-                // The comment box's real widget id, taken from the widget
-                // itself. `id_salt` is a *salt* — egui derives the actual id
-                // from it and the parent Ui — so `Id::new(salt)` addresses
-                // nothing, and loading state with it silently does nothing.
-                let mut comment_box_id: Option<egui::Id> = None;
+                // `Some` only for the box the open dropdown belongs to.
+                let view_for = |target: &MentionTarget| {
+                    mention_view
+                        .as_ref()
+                        .filter(|(t, _)| t == target)
+                        .map(|(_, v)| v)
+                };
+                // Editor state, edited in place and written back after.
+                let mut desc_edit = self.jira_tickets[idx].desc_edit.take();
+                let mut comment_edit = self.jira_tickets[idx].comment_edit.take();
+                let edit_note = self.jira_tickets[idx].edit_note.clone();
+                let mut begin_desc_edit = false;
+                let mut cancel_desc_edit = false;
+                let mut save_desc = false;
+                let mut begin_comment_edit: Option<String> = None;
+                let mut cancel_comment_edit = false;
+                let mut save_comment_edit = false;
+                let mut box_out = MentionBoxOut::default();
+                let my_account_id = self.jira_me.clone();
+                let mut active_target: Option<MentionTarget> = None;
+                // Everything a mention-capable box reports now arrives in
+                // `box_out`, which is shared by all three of them.
                 let mut pending = self.jira_tickets[idx].pending_transition.take();
                 let mut post_comment = false;
                 let mut submit_pending = false;
@@ -14762,16 +15039,91 @@ mod gui {
 
                                 ui.add_space(8.0);
                                 ui.separator();
-                                ui.strong("Description");
-                                if issue.description.is_empty() {
-                                    ui.weak("(no description)");
-                                } else {
-                                    // Flattened to plain text by `jira::description_text`
-                                    // — see that function on ADF. Rendered inline: the
-                                    // window's one scroll area handles a long one, and a
-                                    // nested scroll would reserve its height whether the
-                                    // description needed it or not.
-                                    ui.add(egui::Label::new(&issue.description).wrap());
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.strong("Description");
+                                    if desc_edit.is_none()
+                                        && ui.small_button("Edit").clicked()
+                                    {
+                                        begin_desc_edit = true;
+                                    }
+                                });
+                                match desc_edit.as_mut() {
+                                    None => {
+                                        if issue.description.is_empty() {
+                                            ui.weak("(no description)");
+                                        } else {
+                                            // Flattened to plain text by
+                                            // `jira::description_text` — see that
+                                            // function on ADF. Rendered inline: the
+                                            // window's one scroll area handles a long
+                                            // one, and a nested scroll would reserve
+                                            // its height whether it was needed or not.
+                                            ui.add(
+                                                egui::Label::new(&issue.description).wrap(),
+                                            );
+                                        }
+                                    }
+                                    Some(edit) => {
+                                        mention_text_box(
+                                            ui,
+                                            ("jira_desc_box", key.as_str()),
+                                            "Description… (@ to mention)",
+                                            8,
+                                            &mut edit.text,
+                                            view_for(&MentionTarget::Description),
+                                            &mut box_out,
+                                        );
+                                        if box_out.caret.is_some()
+                                            && active_target.is_none()
+                                        {
+                                            active_target = Some(MentionTarget::Description);
+                                        }
+                                        // The whole point of the warning: saving
+                                        // REPLACES the document, so whatever the
+                                        // flattening dropped is gone from a live
+                                        // ticket with no undo here.
+                                        if !issue.description_rich_parts.is_empty() {
+                                            note_label(
+                                                ui,
+                                                egui::Color32::from_rgb(220, 90, 90),
+                                                format!(
+                                                    "This description contains {}. \
+                                                     Saving from here replaces it with \
+                                                     plain text and that formatting is \
+                                                     lost — permanently. Edit it in Jira \
+                                                     to keep it.",
+                                                    issue.description_rich_parts.join(", ")
+                                                ),
+                                            );
+                                            ui.checkbox(
+                                                &mut edit.confirm_lossy,
+                                                "I understand the formatting will be lost",
+                                            );
+                                        }
+                                        ui.horizontal(|ui| {
+                                            let allowed = issue.description_rich_parts
+                                                .is_empty()
+                                                || edit.confirm_lossy;
+                                            if ui
+                                                .add_enabled(
+                                                    allowed && !edit.saving,
+                                                    egui::Button::new("Save"),
+                                                )
+                                                .clicked()
+                                            {
+                                                save_desc = true;
+                                            }
+                                            if ui.button("Cancel").clicked() {
+                                                cancel_desc_edit = true;
+                                            }
+                                            if edit.saving {
+                                                ui.spinner();
+                                            }
+                                            if !allowed {
+                                                ui.weak("tick the box above to save");
+                                            }
+                                        });
+                                    }
                                 }
 
                                 ui.add_space(8.0);
@@ -14939,6 +15291,17 @@ mod gui {
                                     }
                                 });
                                 for c in &comments {
+                                    // Offered only on your own comments.
+                                    // Editing someone else's is a permission
+                                    // Jira decides, and showing a button that
+                                    // can only 403 is worse than no button.
+                                    let mine = my_account_id
+                                        .as_deref()
+                                        .is_some_and(|me| !c.author_id.is_empty()
+                                            && c.author_id == me);
+                                    let editing_this = comment_edit
+                                        .as_ref()
+                                        .is_some_and(|(id, _)| id == &c.id);
                                     ui.horizontal_wrapped(|ui| {
                                         ui.strong(if c.author.is_empty() {
                                             "(unknown)"
@@ -14946,90 +15309,86 @@ mod gui {
                                             &c.author
                                         });
                                         ui.weak(ec2_manager::jira::local_time(&c.created));
-                                    });
-                                    ui.add(egui::Label::new(&c.body).wrap());
-                                    ui.separator();
-                                }
-                                // Keys are consumed BEFORE the text box is built, so while
-                                // the dropdown is open Enter picks a name instead of
-                                // inserting a newline. A widget only sees events still in
-                                // the queue when it is added.
-                                let popup_open = mention_view
-                                    .as_ref()
-                                    .map(|(_, _, _, rows)| !rows.is_empty())
-                                    .unwrap_or(false);
-                                if popup_open {
-                                    ui.input_mut(|i| {
-                                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-                                            mention_move = 1;
-                                        }
-                                        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                                            mention_move = -1;
-                                        }
-                                        if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
-                                            || i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                                        if mine && !editing_this && !c.id.is_empty()
+                                            && ui.small_button("Edit").clicked()
                                         {
-                                            if let Some((sel, _, _, _)) = &mention_view {
-                                                mention_pick = Some(*sel);
-                                            }
-                                        }
-                                        if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
-                                            mention_close = true;
+                                            begin_comment_edit = Some(c.id.clone());
                                         }
                                     });
-                                }
-                                let edit = egui::TextEdit::multiline(&mut draft)
-                                    .hint_text("Add a comment… (@ to mention)")
-                                    .desired_rows(2)
-                                    .desired_width(f32::INFINITY)
-                                    .id_salt(("jira_comment_box", key.as_str()))
-                                    .show(ui);
-                                // The caret is what says whether an `@` is being typed
-                                // right now, and where it starts.
-                                comment_box_id = Some(edit.response.id);
-                                if edit.response.has_focus() {
-                                    mention_caret = edit.cursor_range.map(|r| r.primary.index);
-                                } else if edit.response.lost_focus() {
-                                    mention_close = true;
-                                }
-                                if let Some((selected, loading, scroll, rows)) = &mention_view {
-                                    if !rows.is_empty() {
-                                        // Inline, not a floating Area: a popup inside a
-                                        // window inside a scroll area is where egui
-                                        // z-order and clipping bugs live, and this window
-                                        // has already cost one layout bug.
-                                        let listed = egui::Frame::group(ui.style()).show(ui, |ui| {
-                                            for (i, u) in rows.iter().enumerate() {
+                                    if editing_this {
+                                        if let Some((_, edit)) = comment_edit.as_mut() {
+                                            mention_text_box(
+                                                ui,
+                                                ("jira_comment_edit", key.as_str()),
+                                                "Edit this comment… (@ to mention)",
+                                                3,
+                                                &mut edit.text,
+                                                view_for(&MentionTarget::Comment(
+                                                    c.id.clone(),
+                                                )),
+                                                &mut box_out,
+                                            );
+                                            if box_out.caret.is_some()
+                                                && active_target.is_none()
+                                            {
+                                                active_target =
+                                                    Some(MentionTarget::Comment(c.id.clone()));
+                                            }
+                                            ui.horizontal(|ui| {
                                                 if ui
-                                                    .selectable_label(i == *selected, &u.display_name)
+                                                    .add_enabled(
+                                                        !edit.saving
+                                                            && !edit.text.trim().is_empty(),
+                                                        egui::Button::new("Save"),
+                                                    )
                                                     .clicked()
                                                 {
-                                                    mention_pick = Some(i);
+                                                    save_comment_edit = true;
                                                 }
-                                            }
-                                            if *loading {
-                                                ui.horizontal(|ui| {
+                                                if ui.button("Cancel").clicked() {
+                                                    cancel_comment_edit = true;
+                                                }
+                                                if edit.saving {
                                                     ui.spinner();
-                                                    ui.weak("searching…");
-                                                });
-                                            }
-                                            // Spelled out for the same
-                                            // reason: the arrow glyphs are
-                                            // not in the default font.
-                                            ui.weak(
-                                                "Up/Down to choose, Enter to insert, \
-                                                 Esc to dismiss",
-                                            );
-                                        });
-                                        if *scroll {
-                                            // Otherwise the list opens below
-                                            // the fold and has to be scrolled
-                                            // to by hand.
-                                            listed
-                                                .response
-                                                .scroll_to_me(Some(egui::Align::BOTTOM));
+                                                }
+                                            });
                                         }
+                                    } else {
+                                        ui.add(egui::Label::new(&c.body).wrap());
                                     }
+                                    ui.separator();
+                                }
+                                match &edit_note {
+                                    Some(Ok(msg)) => {
+                                        note_label(
+                                            ui,
+                                            egui::Color32::from_rgb(90, 190, 110),
+                                            msg.as_str(),
+                                        );
+                                    }
+                                    Some(Err(err)) => {
+                                        note_label(
+                                            ui,
+                                            egui::Color32::from_rgb(220, 90, 90),
+                                            format!("Not saved: {err}"),
+                                        );
+                                    }
+                                    None => {}
+                                }
+                                // One shared helper for every mention-capable box in
+                                // this window, so the key handling and the caret rules
+                                // cannot drift between them.
+                                mention_text_box(
+                                    ui,
+                                    ("jira_comment_box", key.as_str()),
+                                    "Add a comment… (@ to mention)",
+                                    2,
+                                    &mut draft,
+                                    view_for(&MentionTarget::NewComment),
+                                    &mut box_out,
+                                );
+                                if box_out.caret.is_some() && active_target.is_none() {
+                                    active_target = Some(MentionTarget::NewComment);
                                 }
                                 ui.horizontal(|ui| {
                                     // Only the button posts. Enter inserts a newline:
@@ -15086,73 +15445,120 @@ mod gui {
                     }
                 }
                 // --- the @ dropdown: open / move / pick / close ---
+                //
+                // One popup serves three boxes, so every step here is
+                // keyed on the target it belongs to.
                 let mut search_for: Option<String> = None;
                 {
                     let w = &mut self.jira_tickets[idx];
+                    let target = w
+                        .mention
+                        .as_ref()
+                        .map(|m| m.target.clone())
+                        .or_else(|| active_target.clone());
+                    // The text the dropdown is editing, whichever box that is.
+                    let current: Option<String> = match &target {
+                        Some(MentionTarget::NewComment) => Some(draft.clone()),
+                        Some(MentionTarget::Description) => {
+                            desc_edit.as_ref().map(|e| e.text.clone())
+                        }
+                        Some(MentionTarget::Comment(_)) => {
+                            comment_edit.as_ref().map(|(_, e)| e.text.clone())
+                        }
+                        None => None,
+                    };
 
-                    if let (Some(i), Some((_, _, _, rows))) = (mention_pick, &mention_view) {
+                    if let (Some(i), Some(text), Some((_, view))) =
+                        (box_out.pick, current.clone(), &mention_view)
+                    {
+                        let rows = &view.3;
                         if let (Some(user), Some(popup)) = (rows.get(i), w.mention.as_ref()) {
                             let (next, caret, label) = apply_mention_pick(
-                                &draft,
+                                &text,
                                 popup.at,
                                 popup.token.chars().count(),
                                 &user.display_name,
                             );
-                            draft = next;
-                            // Record the pick. This pairing is the whole
-                            // difference between a real tag and the literal
-                            // text that typing a name by hand produces.
-                            if !w
-                                .picked_mentions
-                                .iter()
-                                .any(|(l, id)| l == &label && id == &user.account_id)
-                            {
-                                w.picked_mentions
-                                    .push((label, user.account_id.clone()));
+                            // Record the pick against the box it was made in. This
+                            // pairing is the whole difference between a real tag and
+                            // the literal text typing a name by hand produces.
+                            let pair = (label, user.account_id.clone());
+                            match popup.target.clone() {
+                                MentionTarget::NewComment => {
+                                    draft = next;
+                                    if !w.picked_mentions.contains(&pair) {
+                                        w.picked_mentions.push(pair);
+                                    }
+                                }
+                                MentionTarget::Description => {
+                                    if let Some(e) = desc_edit.as_mut() {
+                                        e.text = next;
+                                        if !e.mentions.contains(&pair) {
+                                            e.mentions.push(pair);
+                                        }
+                                    }
+                                }
+                                MentionTarget::Comment(_) => {
+                                    if let Some((_, e)) = comment_edit.as_mut() {
+                                        e.text = next;
+                                        if !e.mentions.contains(&pair) {
+                                            e.mentions.push(pair);
+                                        }
+                                    }
+                                }
                             }
-                            mention_caret = Some(caret);
+                            box_out.caret = Some(caret);
                             w.mention = None;
                         }
-                    } else if mention_close {
+                    } else if box_out.close {
                         w.mention = None;
-                    } else if let Some(caret) = mention_caret {
-                        match mention_token_at(&draft, caret) {
+                    } else if let (Some(caret), Some(text), Some(target)) =
+                        (box_out.caret, current, target)
+                    {
+                        match mention_token_at(&text, caret) {
                             Some((at, token)) => {
-                                let existed = w.mention.is_some();
+                                let existed = w
+                                    .mention
+                                    .as_ref()
+                                    .is_some_and(|m| m.target == target);
+                                if !existed {
+                                    w.mention = None;
+                                }
                                 let popup = w.mention.get_or_insert(MentionPopup {
                                     at,
                                     token: token.clone(),
                                     directory: Vec::new(),
                                     queried: None,
-                                    // The reporter is row 0, so `@` then
-                                    // Enter picks them -- the common case.
+                                    // The reporter is row 0, so `@` then Enter
+                                    // picks them -- the common case.
                                     selected: 0,
                                     loading: false,
                                     scroll_into_view: true,
+                                    target: target.clone(),
                                 });
                                 if existed {
-                                    // Consumed by the render just done. Left
-                                    // set, it would re-scroll every frame and
-                                    // fight anyone scrolling up to read the
-                                    // ticket with the dropdown open.
+                                    // Consumed by the render just done. Left set, it
+                                    // would re-scroll every frame and fight anyone
+                                    // scrolling up with the dropdown open.
                                     popup.scroll_into_view = false;
                                 }
                                 if popup.at != at || popup.token != token {
                                     popup.at = at;
                                     popup.token = token.clone();
-                                    // A different token; the highlight goes
-                                    // back to the top rather than pointing at
-                                    // whatever row that index now holds.
+                                    // A different token; the highlight goes back to
+                                    // the top rather than pointing at whatever row
+                                    // that index now holds.
                                     popup.selected = 0;
                                     popup.scroll_into_view = true;
                                 }
-                                if mention_move != 0 {
-                                    if let Some((_, _, _, rows)) = &mention_view {
-                                        if !rows.is_empty() {
-                                            let len = rows.len() as i32;
-                                            let next =
-                                                (popup.selected as i32 + mention_move + len)
-                                                    % len;
+                                if box_out.move_by != 0 {
+                                    if let Some((_, view)) = &mention_view {
+                                        let len = view.3.len() as i32;
+                                        if len > 0 {
+                                            let next = (popup.selected as i32
+                                                + box_out.move_by
+                                                + len)
+                                                % len;
                                             popup.selected = next as usize;
                                             popup.scroll_into_view = true;
                                         }
@@ -15161,10 +15567,9 @@ mod gui {
                                 if ec2_manager::jira::should_search_users(&token) {
                                     search_for = Some(token);
                                 } else {
-                                    // Below the threshold the ticket's own
-                                    // people answer it, and any results from
-                                    // a longer token are no longer about what
-                                    // is on screen.
+                                    // Below the threshold the ticket's own people
+                                    // answer it, and results from a longer token are
+                                    // no longer about what is on screen.
                                     popup.directory.clear();
                                     popup.queried = None;
                                 }
@@ -15174,12 +15579,14 @@ mod gui {
                     }
 
                     w.comment_draft = draft;
+                    w.desc_edit = desc_edit;
+                    w.comment_edit = comment_edit;
                     w.pending_transition = pending;
                 }
                 // Move the caret past the name just inserted, or the next
                 // keystroke lands where the `@` was.
                 if let (Some(caret), Some(id)) =
-                    (mention_caret.filter(|_| mention_pick.is_some()), comment_box_id)
+                    (box_out.caret.filter(|_| box_out.pick.is_some()), box_out.box_id)
                 {
                     // Without this the caret stays where the `@` was typed and
                     // the next keystroke lands in the middle of the name that
@@ -15199,6 +15606,48 @@ mod gui {
                 if post_comment {
                     comment_for = Some(key.clone());
                 }
+                {
+                    let w = &mut self.jira_tickets[idx];
+                    if begin_desc_edit {
+                        if let Some(issue) = w.issue.as_ref() {
+                            w.edit_note = None;
+                            w.desc_edit = Some(TextEditState {
+                                text: issue.description.clone(),
+                                // The tags already in the document, carried
+                                // so an edit does not silently un-tag them.
+                                mentions: issue.description_mentions.clone(),
+                                confirm_lossy: false,
+                                saving: false,
+                            });
+                        }
+                    }
+                    if cancel_desc_edit {
+                        w.desc_edit = None;
+                    }
+                    if let Some(id) = begin_comment_edit {
+                        if let Some(c) = w.comments.iter().find(|c| c.id == id) {
+                            w.edit_note = None;
+                            w.comment_edit = Some((
+                                id,
+                                TextEditState {
+                                    text: c.body.clone(),
+                                    mentions: Vec::new(),
+                                    confirm_lossy: false,
+                                    saving: false,
+                                },
+                            ));
+                        }
+                    }
+                    if cancel_comment_edit {
+                        w.comment_edit = None;
+                    }
+                }
+                if save_desc {
+                    save_desc_for = Some(key.clone());
+                }
+                if save_comment_edit {
+                    save_comment_for = Some(key.clone());
+                }
                 if !open {
                     closed.push(key);
                 }
@@ -15217,6 +15666,12 @@ mod gui {
             self.jira_tickets = still_open;
             if let Some(key) = comment_for {
                 self.start_jira_comment(&key);
+            }
+            if let Some(key) = save_desc_for {
+                self.start_jira_save_description(&key);
+            }
+            if let Some(key) = save_comment_for {
+                self.start_jira_save_comment_edit(&key);
             }
             if let Some((key, id, name, fields, inputs)) = transition {
                 self.start_jira_transition(&key, &id, &name, fields, inputs);

@@ -376,6 +376,124 @@ pub fn description_text(v: &Value) -> String {
     }
 }
 
+/// The description field of an issue response, if it has one.
+fn description_value(v: &Value) -> Option<&Value> {
+    v.get("fields")
+        .and_then(|f| f.get("description"))
+        .filter(|d| !d.is_null())
+}
+
+/// True when a description holds **only** what the plain-text editor can put
+/// back: paragraphs, text, soft breaks and mentions.
+///
+/// This is the guard on editing. [`description_text`] flattens ADF for
+/// display, and saving that flattened form back replaces the document — so a
+/// table, a code block, a bullet list or a bold word is **destroyed**, on a
+/// live ticket, with no undo in this app. A plain description round-trips
+/// exactly; anything else does not, and the editor says so before it will
+/// save.
+///
+/// A `mention` counts as plain because its account id is carried across
+/// separately (see [`adf_mentions`]), so it survives the round trip. A text
+/// node carrying `marks` does **not**: that is bold, a link, a colour — all
+/// of which flatten to bare characters.
+pub fn adf_is_plain(v: &Value) -> bool {
+    rich_adf_parts(v).is_empty()
+}
+
+/// What editing a description would destroy, named for the warning.
+///
+/// Deduplicated and in a stable order, because this is read by a person
+/// deciding whether to continue — "a table, formatted text" is actionable
+/// where "3 unsupported nodes" is not.
+pub fn rich_adf_parts(v: &Value) -> Vec<String> {
+    // A plain string description (v2, or a site still answering that way)
+    // has no structure to lose.
+    if v.is_string() {
+        return Vec::new();
+    }
+    let mut found: Vec<String> = Vec::new();
+    let mut note = |what: &str, found: &mut Vec<String>| {
+        if !found.iter().any(|f| f == what) {
+            found.push(what.to_string());
+        }
+    };
+    fn walk(node: &Value, note: &mut impl FnMut(&str, &mut Vec<String>), found: &mut Vec<String>) {
+        let kind = node.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "doc" | "paragraph" | "hardBreak" | "mention" => {}
+            "text" => {
+                // Bold, italic, a link, a colour — all of it flattens to
+                // bare characters.
+                if node
+                    .get("marks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|m| !m.is_empty())
+                {
+                    note("formatted text", found);
+                }
+            }
+            "bulletList" | "orderedList" | "listItem" => note("a list", found),
+            "codeBlock" => note("a code block", found),
+            "table" | "tableRow" | "tableCell" | "tableHeader" => note("a table", found),
+            "heading" => note("a heading", found),
+            "blockquote" => note("a quote", found),
+            "panel" => note("a panel", found),
+            "rule" => note("a divider", found),
+            "media" | "mediaSingle" | "mediaGroup" | "mediaInline" => {
+                note("an attachment", found)
+            }
+            "inlineCard" | "blockCard" | "embedCard" => note("a link card", found),
+            "emoji" => note("an emoji", found),
+            other => note(
+                if other.is_empty() { "unknown content" } else { other },
+                found,
+            ),
+        }
+        if let Some(kids) = node.get("content").and_then(Value::as_array) {
+            for kid in kids {
+                walk(kid, note, found);
+            }
+        }
+    }
+    walk(v, &mut note, &mut found);
+    found
+}
+
+/// Every mention already in a document, as `("@Display Name", accountId)`.
+///
+/// Carried across an edit so a tag that was there stays a tag. Without this,
+/// flattening for display and saving back turns every `@mention` into literal
+/// text — silently un-tagging everyone the description named.
+pub fn adf_mentions(v: &Value) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    fn walk(node: &Value, out: &mut Vec<(String, String)>) {
+        if node.get("type").and_then(Value::as_str) == Some("mention") {
+            let attrs = node.get("attrs");
+            let text = attrs
+                .and_then(|a| a.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let id = attrs
+                .and_then(|a| a.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !text.is_empty() && !id.is_empty() && !out.iter().any(|(t, _)| t == &text) {
+                out.push((text, id));
+            }
+        }
+        if let Some(kids) = node.get("content").and_then(Value::as_array) {
+            for kid in kids {
+                walk(kid, out);
+            }
+        }
+    }
+    walk(v, &mut out);
+    out
+}
+
 /// One ADF node into `out`. Unknown node types recurse into their children
 /// rather than being dropped: ADF gains node types over time, and losing a
 /// paragraph because it sat inside a panel nobody had heard of is worse than
@@ -470,6 +588,17 @@ pub struct Issue {
     pub due: String,
     /// See [`IssueRow::closed`].
     pub closed: String,
+    /// True when the description is only paragraphs and plain text, so the
+    /// flattened form in [`Self::description`] can be saved back without
+    /// losing anything. See [`adf_is_plain`].
+    pub description_is_plain: bool,
+    /// What editing would destroy, named — `a table`, `formatted text`. Empty
+    /// when [`Self::description_is_plain`].
+    pub description_rich_parts: Vec<String>,
+    /// `("@John Smith", accountId)` for every mention already in the
+    /// description, so an edit re-emits them as real mentions rather than
+    /// flattening a tag into literal text.
+    pub description_mentions: Vec<(String, String)>,
     pub labels: Vec<String>,
 }
 
@@ -572,6 +701,8 @@ pub enum FieldInput {
 /// One comment on a ticket.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Comment {
+    /// The comment's own id, needed to edit it.
+    pub id: String,
     pub author: String,
     /// The author's Atlassian account id. Kept so mention ranking works on
     /// identity rather than spelling — two people sharing a display name is
@@ -835,10 +966,15 @@ pub fn parse_issue(body: &str) -> Result<Issue> {
     Ok(Issue {
         key,
         summary: field_str(&v, &["fields", "summary"]),
-        description: v
-            .get("fields")
-            .and_then(|f| f.get("description"))
-            .map(description_text)
+        description: description_value(&v).map(description_text).unwrap_or_default(),
+        description_is_plain: description_value(&v)
+            .map(adf_is_plain)
+            .unwrap_or(true),
+        description_rich_parts: description_value(&v)
+            .map(rich_adf_parts)
+            .unwrap_or_default(),
+        description_mentions: description_value(&v)
+            .map(adf_mentions)
             .unwrap_or_default(),
         status: field_str(&v, &["fields", "status", "name"]),
         status_category: field_str(&v, &["fields", "status", "statusCategory", "key"]),
@@ -977,6 +1113,7 @@ pub fn parse_comments(body: &str) -> Result<Vec<Comment>> {
     Ok(list
         .iter()
         .map(|c| Comment {
+            id: field_str(c, &["id"]),
             author: field_str(c, &["author", "displayName"]),
             author_id: field_str(c, &["author", "accountId"]),
             created: field_str(c, &["created"]),
@@ -1377,6 +1514,113 @@ pub fn do_transition(
         Some(&payload.to_string()),
     )?;
     Ok(())
+}
+
+/// Who this token belongs to.
+///
+/// Needed to decide which comments are **yours** and therefore offer an Edit
+/// button on them. Read once per session and cached by the caller: it never
+/// changes while the app is running.
+pub fn fetch_myself(site: &JiraSite) -> Result<User> {
+    require_complete(site)?;
+    let url = format!("{}/myself", site.api_base);
+    let body = atlassian_http::request(&site.auth.email, &site.auth.token, &url, &[], None)?;
+    let v: Value = serde_json::from_str(&body)
+        .map_err(|e| AppError::InvalidArgument(format!("jira: could not parse myself: {e}")))?;
+    let account_id = field_str(&v, &["accountId"]);
+    if account_id.is_empty() {
+        return Err(AppError::InvalidArgument(
+            "jira: /myself returned no accountId".to_string(),
+        ));
+    }
+    Ok(User {
+        account_id,
+        display_name: field_str(&v, &["displayName"]),
+    })
+}
+
+/// Replace a ticket's description.
+///
+/// `mentions` carries the tags to re-emit — both the ones already in the
+/// document (from [`Issue::description_mentions`]) and any newly picked while
+/// editing. Without them an edit silently un-tags everyone the description
+/// named.
+///
+/// **This replaces the whole document.** Whether that is safe is
+/// [`adf_is_plain`]'s question, and the caller is expected to have asked it:
+/// nothing here can recover a table it was handed as flattened text.
+pub fn update_description(
+    site: &JiraSite,
+    key: &str,
+    text: &str,
+    mentions: &[(String, String)],
+) -> Result<()> {
+    require_complete(site)?;
+    validate_issue_key(key)?;
+    let url = format!("{}/issue/{}", site.api_base, key.trim());
+    let payload = serde_json::json!({
+        "fields": { "description": comment_adf_with_mentions(text, mentions) }
+    })
+    .to_string();
+    atlassian_http::request_with_method(
+        &site.auth.email,
+        &site.auth.token,
+        "PUT",
+        &url,
+        &[],
+        Some(&payload),
+    )?;
+    Ok(())
+}
+
+/// Replace the body of one comment.
+///
+/// Jira decides whether the caller may: editing someone else's comment is a
+/// permission, not a client-side rule. The app only *offers* the button on
+/// comments whose author id matches [`fetch_myself`], which keeps the UI
+/// honest; a refusal still surfaces as the API's own message.
+pub fn update_comment(
+    site: &JiraSite,
+    key: &str,
+    comment_id: &str,
+    text: &str,
+    mentions: &[(String, String)],
+) -> Result<()> {
+    require_complete(site)?;
+    validate_issue_key(key)?;
+    validate_comment_id(comment_id)?;
+    require_comment_text(text)?;
+    let url = format!(
+        "{}/issue/{}/comment/{}",
+        site.api_base,
+        key.trim(),
+        comment_id.trim()
+    );
+    let payload =
+        serde_json::json!({ "body": comment_adf_with_mentions(text, mentions) }).to_string();
+    atlassian_http::request_with_method(
+        &site.auth.email,
+        &site.auth.token,
+        "PUT",
+        &url,
+        &[],
+        Some(&payload),
+    )?;
+    Ok(())
+}
+
+/// The comment id goes into a URL path, so it is whitelisted rather than
+/// escaped — the same stance as the issue key and the transition id. Jira's
+/// comment ids are numeric strings.
+fn validate_comment_id(id: &str) -> Result<()> {
+    let id = id.trim();
+    if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) {
+        Ok(())
+    } else {
+        Err(AppError::InvalidArgument(format!(
+            "jira: refusing malformed comment id '{id}'"
+        )))
+    }
 }
 
 /// How a due date stands relative to today.
@@ -2156,6 +2400,116 @@ mod tests {
         // description full of blank lines that were never in the document.
         assert!(!out.contains("\n\n\n"), "runs of blank lines: {out:?}");
         assert!(!out.starts_with('\n') && !out.ends_with('\n'));
+    }
+
+    #[test]
+    fn a_plain_description_round_trips_and_a_rich_one_is_flagged() {
+        // This is the guard on the whole edit feature: saving the flattened
+        // form REPLACES the document, so anything the flattening dropped is
+        // destroyed on a live ticket with no undo in the app.
+        let plain: Value = serde_json::from_str(
+            r#"{"type":"doc","content":[
+                 {"type":"paragraph","content":[{"type":"text","text":"just words"}]}]}"#,
+        )
+        .expect("parses");
+        assert!(adf_is_plain(&plain));
+        assert!(rich_adf_parts(&plain).is_empty());
+
+        // A mention is plain: its account id travels separately and the tag
+        // survives the round trip.
+        let mentioned: Value = serde_json::from_str(
+            r#"{"type":"doc","content":[
+                 {"type":"paragraph","content":[
+                   {"type":"mention","attrs":{"id":"acc-1","text":"@John Smith"}}]}]}"#,
+        )
+        .expect("parses");
+        assert!(adf_is_plain(&mentioned));
+        assert_eq!(
+            adf_mentions(&mentioned),
+            vec![("@John Smith".to_string(), "acc-1".to_string())]
+        );
+
+        // A v2 string description has no structure to lose.
+        assert!(adf_is_plain(&Value::String("plain".to_string())));
+    }
+
+    #[test]
+    fn the_warning_names_what_editing_would_destroy() {
+        // "a table, formatted text" is actionable where "3 unsupported
+        // nodes" is not -- a person reads this to decide whether to go on.
+        let rich: Value = serde_json::from_str(
+            r#"{"type":"doc","content":[
+                 {"type":"paragraph","content":[
+                   {"type":"text","text":"bold","marks":[{"type":"strong"}]}]},
+                 {"type":"table","content":[{"type":"tableRow","content":[]}]},
+                 {"type":"codeBlock","content":[{"type":"text","text":"x=1"}]},
+                 {"type":"bulletList","content":[
+                   {"type":"listItem","content":[
+                     {"type":"paragraph","content":[{"type":"text","text":"a"}]}]}]}]}"#,
+        )
+        .expect("parses");
+        assert!(!adf_is_plain(&rich));
+        let parts = rich_adf_parts(&rich);
+        assert!(parts.contains(&"formatted text".to_string()), "{parts:?}");
+        assert!(parts.contains(&"a table".to_string()), "{parts:?}");
+        assert!(parts.contains(&"a code block".to_string()), "{parts:?}");
+        assert!(parts.contains(&"a list".to_string()), "{parts:?}");
+        // Deduplicated -- a table has many cells and naming it four times
+        // reads as four problems.
+        assert_eq!(parts.iter().filter(|p| *p == "a table").count(), 1);
+    }
+
+    #[test]
+    fn an_edited_description_keeps_the_mentions_it_already_had() {
+        // Flatten for display, then save back: without carrying the ids
+        // across, every @mention silently becomes literal text and everyone
+        // the description named is un-tagged.
+        let original: Value = serde_json::from_str(
+            r#"{"type":"doc","content":[
+                 {"type":"paragraph","content":[
+                   {"type":"text","text":"ping "},
+                   {"type":"mention","attrs":{"id":"acc-1","text":"@John Smith"}},
+                   {"type":"text","text":" please"}]}]}"#,
+        )
+        .expect("parses");
+        let flat = description_text(&original);
+        assert_eq!(flat, "ping @John Smith please");
+
+        let carried = adf_mentions(&original);
+        let saved = comment_adf_with_mentions(&flat, &carried);
+        let nodes = saved["content"][0]["content"].as_array().expect("nodes");
+        assert_eq!(nodes[1]["type"], "mention");
+        assert_eq!(nodes[1]["attrs"]["id"], "acc-1");
+
+        // Without carrying them, the tag is gone -- this is the bug the
+        // carry-across exists to prevent.
+        let lost = comment_adf_with_mentions(&flat, &[]);
+        let nodes = lost["content"][0]["content"].as_array().expect("nodes");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["type"], "text");
+    }
+
+    #[test]
+    fn a_comment_id_is_whitelisted_because_it_lands_in_a_url_path() {
+        assert!(validate_comment_id("10142").is_ok());
+        for bad in ["", "abc", "1 2", "10142/../x", "-1"] {
+            assert!(validate_comment_id(bad).is_err(), "{bad:?} must be refused");
+        }
+        let blank = JiraSite::new(AlertsAuth::default(), "", None);
+        assert!(update_comment(&blank, "OPS-1", "1", "hi", &[]).is_err());
+        assert!(update_description(&blank, "OPS-1", "hi", &[]).is_err());
+        assert!(fetch_myself(&blank).is_err());
+    }
+
+    #[test]
+    fn a_comment_carries_its_id_so_it_can_be_edited() {
+        let cs = parse_comments(
+            r#"{"comments":[{"id":"10142","author":{"displayName":"A","accountId":"acc-1"},
+                 "created":"2026-08-25T09:00:00.000+0100","body":"hi"}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(cs[0].id, "10142");
+        assert_eq!(cs[0].author_id, "acc-1");
     }
 
     #[test]

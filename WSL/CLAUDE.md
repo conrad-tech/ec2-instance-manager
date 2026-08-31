@@ -1283,6 +1283,38 @@ window, and a search box opens any ticket by key.
     disables while in flight so it cannot be double-sent.
   - The thread is fetched on its own event, like transitions, so a thread
     that will not load leaves the ticket readable.
+- **Editing a description can destroy content, so it asks first.** What the
+  window shows is `description_text`'s **flattened** rendering of ADF, and
+  saving that back **replaces the whole document** — a table, a code block, a
+  list, a bold word: gone, on a live ticket, with no undo in this app.
+  `adf_is_plain` is the guard and `rich_adf_parts` names what would go, so the
+  warning reads "contains a table, formatted text" rather than "3 unsupported
+  nodes". A plain description — the common case — edits with no friction; a
+  rich one needs a separate tick before Save enables. **Never quietly save
+  over formatting.**
+- **An edit carries the mentions the text already had.** `adf_mentions` pulls
+  `("@John Smith", accountId)` out of the original document and
+  `comment_adf_with_mentions` re-emits them, because a flattened mention is
+  just the characters `@John Smith` — saving without carrying the ids
+  silently un-tags everyone the text named. A `mention` therefore counts as
+  *plain*: it survives the round trip, unlike a `mark`.
+- **Comment editing is offered only on your own comments**, decided by
+  `author_id` against `/myself` (read once per session, cached in `jira_me`).
+  If that call fails, **no comment offers editing** — without knowing who you
+  are, "is this mine" has no answer worth acting on. Jira still decides
+  permission; the client-side check only avoids showing a button that can
+  only 403.
+- **The editors close on a successful save, never on submit.** Closing on
+  submit loses the text when the save fails, which is the same rule the
+  comment draft already follows.
+- **One `mention_text_box` serves all three boxes** — new comment, description
+  editor, comment editor — so the key handling, the caret rules and the
+  dropdown cannot drift between them. `MentionPopup.target` says which box the
+  single open dropdown belongs to; without it the list renders under whichever
+  box drew last.
+- **`request_with_method` exists only for `PUT`.** The edit endpoints need it;
+  everything else about the call is identical, so there is still exactly one
+  place credentials reach curl.
 - **The due date is a calendar date and is never timezone-converted.**
   `duedate` has no time and no offset; putting it through `local_time` shifts
   the day for anyone not on UTC, so a ticket due the 1st reads as the 31st.

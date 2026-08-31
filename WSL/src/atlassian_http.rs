@@ -125,6 +125,21 @@ pub fn request(
     query: &[(&str, String)],
     post_body: Option<&str>,
 ) -> Result<String> {
+    let method = if post_body.is_some() { "POST" } else { "GET" };
+    request_with_method(email, token, method, url, query, post_body)
+}
+
+/// As [`request`], but naming the method — `PUT` for the edit endpoints,
+/// which is the only reason this exists. Everything else about the call is
+/// identical, so there is still exactly one place credentials reach curl.
+pub fn request_with_method(
+    email: &str,
+    token: &str,
+    method: &'static str,
+    url: &str,
+    query: &[(&str, String)],
+    body: Option<&str>,
+) -> Result<String> {
     // curl config-file syntax: quotes in the token/email would break out of
     // the quoted value, so reject them rather than mangle the config.
     if email.contains('"') || token.contains('"') {
@@ -134,9 +149,9 @@ pub fn request(
     }
     let mut cmd = Command::new("curl");
     cmd.args(["-sS", "--fail-with-body", "-K", "-", "-H", "Accept: application/json"]);
-    match post_body {
+    match body {
         Some(body) => {
-            cmd.args(["-X", "POST", "-H", "Content-Type: application/json", "-d", body]);
+            cmd.args(["-X", method, "-H", "Content-Type: application/json", "-d", body]);
         }
         None => {
             cmd.arg("-G");
@@ -162,7 +177,6 @@ pub fn request(
         let pairs: Vec<String> = query.iter().map(|(k, v)| format!("{k}={v}")).collect();
         format!("{url}?{}", pairs.join("&"))
     };
-    let method = if post_body.is_some() { "POST" } else { "GET" };
     let started_at = Utc::now();
     let started = Instant::now();
 
