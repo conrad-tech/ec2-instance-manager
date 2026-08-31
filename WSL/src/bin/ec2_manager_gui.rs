@@ -44,6 +44,7 @@ mod gui {
         AuthStatus, AwsContext, DependencyStatus, Instance, Inventory, Mode, PersonalScript,
         ProfileAuthInfo, ProfileConfig, SavedFilter, TerminalKind, TerminalOption,
     };
+    use ec2_manager::power::{self, PowerAction, PowerPhase};
     use ec2_manager::profile_choice::profile_choice_path;
     use ec2_manager::terminal::{
         build_ssm_port_forward_args, build_ssm_session_args, dependency_status,
@@ -458,6 +459,20 @@ mod gui {
         /// can read one but not the other must still see what it can.
         SecurityGroupResult {
             groups: std::result::Result<Vec<SecurityGroupInfo>, String>,
+        },
+        /// A Start / Stop / Restart run reached a new phase. Progress only:
+        /// a run is over when `PowerDone` arrives, never on a phase.
+        PowerProgress {
+            instance_id: String,
+            phase: PowerPhase,
+        },
+        /// A Start / Stop / Restart run finished. `Ok` carries the sentence
+        /// for the status line; `Err` carries the failure, which is also
+        /// logged at error level.
+        PowerDone {
+            instance_id: String,
+            action: PowerAction,
+            result: std::result::Result<String, String>,
         },
     }
 
@@ -1198,6 +1213,39 @@ mod gui {
         /// moment after the state *changes* and then gets out of the way.
         Ok,
     }
+
+    /// A Start / Stop / Restart the user has asked for and not yet agreed
+    /// to. The AWS context is captured **here**, at click time, rather than
+    /// looked up on confirm: the inventory can refresh underneath an open
+    /// dialog, and the account the row belonged to when it was clicked is
+    /// the one the action was meant for.
+    struct PowerConfirm {
+        instance_id: String,
+        /// The instance as the table shows it, e.g. `i-0abc (web01)`.
+        label: String,
+        action: PowerAction,
+        context: AwsContext,
+        /// The state the row carried when the entry was clicked, so the
+        /// dialog can say what it is acting on.
+        state: String,
+    }
+
+    /// The Start / Stop / Restart status line above the inventory table.
+    struct PowerStatus {
+        instance_id: String,
+        text: String,
+        state: ScriptState,
+        /// When a finished line was raised, for the auto-hide. `None` while
+        /// the run is still going, which is what keeps a long restart on
+        /// screen for its whole five minutes.
+        settled_at: Option<Instant>,
+    }
+
+    /// How long a finished Start / Stop / Restart line stays up before
+    /// hiding itself. A failure is left for the user to dismiss, on the same
+    /// reasoning as the tunnel banner: a green line saying a thing worked is
+    /// noise once it has been read, and a red one is not.
+    const POWER_OK_BANNER: Duration = Duration::from_secs(30);
 
     /// How long the "everything is forwarding" line stays on the toolbar
     /// before hiding itself. It reappears if forwarding breaks and recovers,
@@ -7756,6 +7804,23 @@ mod gui {
         /// Personal script awaiting delete confirmation (index into
         /// `config.personal_scripts`).
         pending_script_delete: Option<usize>,
+        /// True when the Inventory right-click Start / Stop / Restart
+        /// entries are shown. Resolved once at startup, like every other
+        /// `allowed_users` gate — the lookup must not run per frame, and the
+        /// answer cannot change while the app is up.
+        instance_power_enabled: bool,
+        /// A Start / Stop / Restart awaiting confirmation, if any.
+        power_confirm: Option<PowerConfirm>,
+        /// Instance ids with a power run already going. Shared with the
+        /// workers, each of which removes its own id on the way out.
+        ///
+        /// Claimed **before** the thread is spawned, for the reason
+        /// `ReaperInFlight` is: the menu and a second click are two entry
+        /// points, and without this a double-click can put two
+        /// stop-and-starts on one box at once.
+        power_in_flight: Arc<Mutex<HashSet<String>>>,
+        /// The status line above the inventory table.
+        power_status: Option<PowerStatus>,
         /// Active git-PAT prompt, if any.
         pat_dialog: Option<PatDialog>,
         /// Set for one frame when a personal-script hotkey fired, so the key
@@ -8411,6 +8476,11 @@ mod gui {
                 default_scripts,
                 script_editor: None,
                 pending_script_delete: None,
+                instance_power_enabled: features
+                    .instance_power_enabled_for(&ec2_manager::features::current_os_user()),
+                power_confirm: None,
+                power_in_flight: Arc::new(Mutex::new(HashSet::new())),
+                power_status: None,
                 pat_dialog,
                 hotkey_consumed_frame: false,
                 last_git_failure_prompt: None,
@@ -8575,7 +8645,7 @@ mod gui {
             app.log_info(format!(
                 "gates: os_user='{}' (from {}) — git_scripts={} alerts={} reaper={} \
                  pingdom={} jira={} vault_iam={} vault_iam_delete={} fed_auth={} \
-                 fed_auto_sign_in={}",
+                 fed_auto_sign_in={} instance_power={}",
                 if os_user.is_empty() { "(unset!)" } else { &os_user },
                 if cfg!(target_os = "windows") { "%USERNAME%" } else { "$USER" },
                 app.git_scripts_enabled,
@@ -8587,6 +8657,7 @@ mod gui {
                 features.vault_iam_delete_enabled_for(&os_user),
                 app.fed_auth_enabled,
                 app.fed_auto_sign_in,
+                app.instance_power_enabled,
             ));
             // Report the compiled-in access-email config immediately, so a
             // config that did not survive a rebuild or a pull is visible
@@ -16541,6 +16612,7 @@ mod gui {
             if self.script_editor.is_some()
                 || self.pat_dialog.is_some()
                 || self.pending_script_delete.is_some()
+                || self.power_confirm.is_some()
                 || (self.default_scripts.is_empty()
                     && self.config.personal_scripts.is_empty())
             {
@@ -19877,6 +19949,66 @@ mod gui {
                             }
                         }
                     }
+                    ProcEvent::PowerProgress { instance_id, phase } => {
+                        // Only the run that owns the line may move it: a
+                        // second instance's run must not overwrite the one
+                        // being watched.
+                        let owns = self
+                            .power_status
+                            .as_ref()
+                            .is_some_and(|st| st.instance_id == instance_id);
+                        if owns {
+                            let text = phase.describe();
+                            if let Some(st) = self.power_status.as_mut() {
+                                st.text = text;
+                                st.state = ScriptState::Running;
+                                st.settled_at = None;
+                            }
+                        }
+                    }
+                    ProcEvent::PowerDone {
+                        instance_id,
+                        action,
+                        result,
+                    } => {
+                        if let Ok(mut guard) = self.power_in_flight.lock() {
+                            guard.remove(&instance_id);
+                        }
+                        let (text, state) = match &result {
+                            Ok(msg) => {
+                                self.log_info(format!("{instance_id}: {msg}"));
+                                (msg.clone(), ScriptState::Ok)
+                            }
+                            Err(err) => {
+                                self.log_error(format!(
+                                    "{instance_id}: {} failed: {err}",
+                                    action.verb()
+                                ));
+                                (err.clone(), ScriptState::Failed)
+                            }
+                        };
+                        if self
+                            .power_status
+                            .as_ref()
+                            .is_some_and(|st| st.instance_id == instance_id)
+                        {
+                            if let Some(st) = self.power_status.as_mut() {
+                                st.text = text;
+                                st.state = state;
+                                st.settled_at = Some(Instant::now());
+                            }
+                        }
+                        // The State column is now wrong whichever way the
+                        // run went — a failed restart still stopped the box.
+                        // Force the refresh rather than let the 45s cache
+                        // answer.
+                        // Through the queue, not `spawn_refresh` directly,
+                        // so the one-at-a-time limit still holds; `front` so
+                        // the row the user is watching updates first.
+                        if let Some(profile_id) = self.selected_profile.clone() {
+                            self.enqueue_refresh(&profile_id, true, true);
+                        }
+                    }
                 }
                 events_processed += 1;
                 if events_processed >= MAX_EVENTS_PER_FRAME {
@@ -21968,7 +22100,238 @@ mod gui {
             }
         }
 
+        /// The AWS context the instance belongs to.
+        ///
+        /// Looked up by which cached inventory actually holds the id, rather
+        /// than assumed to be the selected profile: the table can show rows
+        /// from several accounts at once, and acting on one with another
+        /// account's credentials finds nothing — which reads exactly like a
+        /// permissions failure.
+        fn context_for_instance(&self, instance_id: &str) -> Option<AwsContext> {
+            self.profile_inventory_cache
+                .iter()
+                .find(|(_, (inv, _))| {
+                    inv.instances.iter().any(|i| i.instance_id == instance_id)
+                })
+                .map(|(_, (_, ctx))| ctx.clone())
+                .or_else(|| self.context.clone())
+        }
+
+        /// The instance as the table shows it, for a dialog or a log line.
+        fn instance_label(instance: &Instance) -> String {
+            match instance.name.as_deref().filter(|n| !n.is_empty()) {
+                Some(name) => format!("{} ({name})", instance.instance_id),
+                None => instance.instance_id.clone(),
+            }
+        }
+
+        /// A Start / Stop / Restart was picked from the row menu. Raises the
+        /// confirmation; nothing reaches AWS until that is agreed to.
+        fn request_instance_power(&mut self, instance: &Instance, action: PowerAction) {
+            let label = Self::instance_label(instance);
+            if self
+                .power_in_flight
+                .lock()
+                .map(|g| g.contains(&instance.instance_id))
+                .unwrap_or(false)
+            {
+                self.message = format!("{label} already has a power action running");
+                self.log_warn(self.message.clone());
+                return;
+            }
+            let Some(context) = self.context_for_instance(&instance.instance_id) else {
+                self.message = format!("no AWS context for {label}");
+                self.log_error(self.message.clone());
+                return;
+            };
+            // Sim fakes `auth_status: Ok`, so this has to be refused on the
+            // mode rather than on the credentials. Sim's whole promise is
+            // that it makes no real AWS calls, and stopping a production box
+            // out of the mode that says it touches nothing is the one
+            // failure this must not have.
+            if context.mode != Mode::Live {
+                self.message =
+                    format!("{} is Live-mode only (this profile is Sim)", action.verb());
+                self.log_warn(self.message.clone());
+                return;
+            }
+            self.power_confirm = Some(PowerConfirm {
+                instance_id: instance.instance_id.clone(),
+                label,
+                action,
+                context,
+                state: instance.state.clone(),
+            });
+        }
+
+        /// The Start / Stop / Restart confirmation. All three confirm: the
+        /// entries sit in a row-click menu next to Quick Connect, and a
+        /// misclick that stops a production box has no undo.
+        fn render_power_confirm(&mut self, ctx: &egui::Context) {
+            let Some(pending) = self.power_confirm.take() else {
+                return;
+            };
+            let mut window_open = true;
+            let mut do_run = false;
+            let mut do_cancel = false;
+            // Re-checked here as well as on the menu: the inventory may have
+            // refreshed while the dialog sat open.
+            let refusal = power::action_allowed(&pending.state, pending.action).err();
+
+            egui::Window::new(format!("{} instance", pending.action.verb()))
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(power::confirm_text(pending.action, &pending.label));
+                    ui.add_space(4.0);
+                    ui.label(format!(
+                        "Account {} · region {} · currently {}",
+                        pending.context.account_id.as_deref().unwrap_or("unknown"),
+                        pending.context.region,
+                        pending.state,
+                    ));
+                    if let Some(why) = &refusal {
+                        ui.add_space(4.0);
+                        note_label(ui, ui.visuals().error_fg_color, format!("Cannot run: {why}"));
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                refusal.is_none(),
+                                egui::Button::new(pending.action.verb()),
+                            )
+                            .clicked()
+                        {
+                            do_run = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+
+            if do_run {
+                self.start_power_run(pending);
+            } else if !do_cancel && window_open {
+                self.power_confirm = Some(pending);
+            }
+        }
+
+        /// Spawn the worker for an agreed Start / Stop / Restart.
+        fn start_power_run(&mut self, pending: PowerConfirm) {
+            let PowerConfirm {
+                instance_id,
+                label,
+                action,
+                context,
+                ..
+            } = pending;
+            // Claimed before the spawn, not inside it: two clicks landing in
+            // the same frame would otherwise both pass the check and put two
+            // stop-and-starts on one box.
+            // The guard is scoped so it is dropped before any `&mut self`
+            // logging call below.
+            let claimed = match self.power_in_flight.lock() {
+                Ok(mut guard) => guard.insert(instance_id.clone()),
+                Err(_) => false,
+            };
+            if !claimed {
+                self.log_warn(format!(
+                    "{label}: a power action is already running, refusing to start another"
+                ));
+                return;
+            }
+
+            self.log_warn(format!(
+                "{label}: {} requested by the user (account {} region {})",
+                action.verb(),
+                context.account_id.as_deref().unwrap_or("unknown"),
+                context.region,
+            ));
+            self.power_status = Some(PowerStatus {
+                instance_id: instance_id.clone(),
+                text: format!("{}…", action.verb()),
+                state: ScriptState::Running,
+                settled_at: None,
+            });
+
+            let tx = self.proc_tx.clone();
+            let egui_ctx = self.egui_ctx.clone();
+            let in_flight = Arc::clone(&self.power_in_flight);
+            std::thread::spawn(move || {
+                let result = run_power_action(&context, &instance_id, action, &tx, &egui_ctx);
+                // The event handler clears this too. Doing it here as well
+                // means a send that fails — the app closing mid-run — cannot
+                // leave the instance permanently claimed.
+                if let Ok(mut guard) = in_flight.lock() {
+                    guard.remove(&instance_id);
+                }
+                let _ = tx.send(ProcEvent::PowerDone {
+                    instance_id,
+                    action,
+                    result,
+                });
+                if let Some(c) = &egui_ctx {
+                    c.request_repaint();
+                }
+            });
+        }
+
+        /// The Start / Stop / Restart line above the inventory table.
+        ///
+        /// A finished success hides itself after [`POWER_OK_BANNER`]; a
+        /// failure stays until dismissed. Expiry is judged here, at render,
+        /// and a repaint is requested for the instant it falls due — egui
+        /// only redraws when something happens, so a timer merely *checked*
+        /// on a frame fires whenever the next frame happens to occur. That
+        /// is the mistake the tunnel banner already made and fixed.
+        fn render_power_status(&mut self, ui: &mut egui::Ui) {
+            let Some(status) = self.power_status.as_ref() else {
+                return;
+            };
+            if status.state == ScriptState::Ok {
+                if let Some(at) = status.settled_at {
+                    let age = at.elapsed();
+                    if age >= POWER_OK_BANNER {
+                        self.power_status = None;
+                        return;
+                    }
+                    ui.ctx().request_repaint_after(POWER_OK_BANNER - age);
+                }
+            }
+            let color = match status.state {
+                ScriptState::Running => ui.visuals().warn_fg_color,
+                ScriptState::Failed => ui.visuals().error_fg_color,
+                ScriptState::Ok => egui::Color32::from_rgb(0x4c, 0xaf, 0x50),
+            };
+            let mut dismiss = false;
+            ui.horizontal(|ui| {
+                note_label(
+                    ui,
+                    color,
+                    format!("{} · {}", status.instance_id, status.text),
+                );
+                // Only a failure is something to dismiss; a green line
+                // clears itself.
+                if status.state == ScriptState::Failed && ui.button("\u{2716}").clicked() {
+                    dismiss = true;
+                }
+            });
+            if status.state == ScriptState::Running {
+                // The stopping counter has to tick even when nothing else on
+                // screen is moving.
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
+            }
+            if dismiss {
+                self.power_status = None;
+            }
+        }
+
         fn render_inventory_panel(&mut self, ui: &mut egui::Ui) {
+            self.render_power_status(ui);
             ui.horizontal(|ui| {
                 ui.label(format!(
                     "Instances: {} filtered / {} total",
@@ -22065,6 +22428,10 @@ mod gui {
                         let region_scope = self.region_scope();
                         let mut pending_connect: Option<String> = None;
                         let mut pending_open_vscode: Option<Instance> = None;
+                        let mut pending_power: Option<(Instance, PowerAction)> = None;
+                        // Read out of `self` before the grid closure, which
+                        // borrows `self` immutably for the saved filters.
+                        let instance_power_enabled = self.instance_power_enabled;
                         let mut pending_fav_toggle: Option<String> = None;
                         let mut pending_add_to_saved_filter: Option<(String, String, String)> = None;
                         let mut pending_remove_from_saved_filter: Option<(String, Instance, String)> =
@@ -22339,6 +22706,7 @@ mod gui {
                             let mut remove_from_saved_filter: Option<(String, Instance, String)> =
                                 None;
                             let vscode_instance_clone = instance.clone();
+                            let power_instance_clone = instance.clone();
                             row_response.context_menu(|ui| {
                                 if ui.button("Quick Connect").clicked() {
                                     quick_connect_clicked = true;
@@ -22423,7 +22791,13 @@ mod gui {
                                     self.detail_security_groups_error = None;
                                     self.detail_security_groups_loading = true;
                                     self.main_tab = MainTab::Details;
-                                    // Fetch volumes in background
+                                    // Fetch volumes in background.
+                                    // Deliberately not `context_for_instance`:
+                                    // this closure already borrows `self`
+                                    // mutably, and a `&self` call here would
+                                    // conflict with the row loop's borrow of
+                                    // `self.filtered`. Borrowing the two
+                                    // fields directly is captured per-field.
                                     let context = self.profile_inventory_cache.iter()
                                         .find(|(_, (inv, _))| inv.instances.iter().any(|i| i.instance_id == iid))
                                         .map(|(_, (_, ctx))| ctx.clone())
@@ -22452,6 +22826,42 @@ mod gui {
                                         self.detail_security_groups_error = Some(err);
                                     }
                                     ui.close();
+                                }
+                                // Start / Stop / Restart. Hidden outright off
+                                // the allow-list rather than greyed out: a
+                                // disabled "Stop instance" invites a question
+                                // whose answer is "you are not allowed",
+                                // which the startup `gates:` line already
+                                // records.
+                                if instance_power_enabled {
+                                    ui.separator();
+                                    for action in [
+                                        PowerAction::Start,
+                                        PowerAction::Stop,
+                                        PowerAction::Restart,
+                                    ] {
+                                        // The row can be up to 45s stale, so
+                                        // this is a courtesy — the worker
+                                        // re-reads the state before the call
+                                        // goes out, and that answer is the
+                                        // one that counts.
+                                        let refusal =
+                                            power::action_allowed(&power_instance_clone.state, action)
+                                                .err();
+                                        let btn = ui.add_enabled(
+                                            refusal.is_none(),
+                                            egui::Button::new(action.label()),
+                                        );
+                                        let btn = match &refusal {
+                                            Some(why) => btn.on_disabled_hover_text(why.clone()),
+                                            None => btn,
+                                        };
+                                        if btn.clicked() {
+                                            pending_power =
+                                                Some((power_instance_clone.clone(), action));
+                                            ui.close();
+                                        }
+                                    }
                                 }
                             });
 
@@ -22512,6 +22922,10 @@ mod gui {
                         if let Some(instance) = pending_open_vscode {
                             self.selected_instance_id = instance.instance_id.clone();
                             self.open_in_vscode(&instance);
+                        }
+
+                        if let Some((instance, action)) = pending_power {
+                            self.request_instance_power(&instance, action);
                         }
 
                         if let Some(instance_id) = pending_fav_toggle {
@@ -25430,6 +25844,7 @@ mod gui {
                 self.render_user_sync_dialog(ctx);
                 self.render_script_editor(ctx);
                 self.render_script_delete_confirm(ctx);
+                self.render_power_confirm(ctx);
                 self.render_pat_dialog(ctx);
                 self.render_script_result_popup(ctx);
                 self.render_alerts_window(ctx);
@@ -31199,6 +31614,168 @@ mod gui {
         let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
             .map_err(|e| format!("JSON parse error: {e}"))?;
         Ok(parse_security_groups(&parsed))
+    }
+
+    /// Read one instance's current lifecycle state.
+    fn fetch_instance_state(
+        profile: &str,
+        region: &str,
+        instance_id: &str,
+    ) -> std::result::Result<String, String> {
+        let output = aws_command()
+            .args([
+                "ec2", "describe-instances",
+                "--profile", profile,
+                "--region", region,
+                "--instance-ids", instance_id,
+                "--query", "Reservations[0].Instances[0].State.Name",
+                "--output", "text",
+            ])
+            .output()
+            .map_err(|e| format!("describe-instances failed: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("describe-instances error: {}", stderr.trim()));
+        }
+        let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if state.is_empty() || state == "None" {
+            return Err("describe-instances returned no state".to_string());
+        }
+        Ok(state)
+    }
+
+    /// Send one `start-instances` / `stop-instances`.
+    fn send_power_call(
+        profile: &str,
+        region: &str,
+        instance_id: &str,
+        start: bool,
+    ) -> std::result::Result<(), String> {
+        let verb = if start { "start-instances" } else { "stop-instances" };
+        let output = aws_command()
+            .args([
+                "ec2", verb,
+                "--profile", profile,
+                "--region", region,
+                "--instance-ids", instance_id,
+                "--output", "json",
+            ])
+            .output()
+            .map_err(|e| format!("{verb} failed: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("{verb} error: {}", stderr.trim()));
+        }
+        Ok(())
+    }
+
+    /// The whole of a Start / Stop / Restart, on its own thread.
+    ///
+    /// The restart is a stop, a poll until the instance actually reports
+    /// `stopped`, a hold, and then a start — **not** `ec2 reboot-instances`.
+    /// The poll is what makes it work at all: a real stop takes 30-90s, so a
+    /// fixed sleep would call `start-instances` while the box was still
+    /// `stopping` and be refused with `IncorrectInstanceState`, leaving it
+    /// down with the restart half-done.
+    ///
+    /// Every failure after the stop has landed says explicitly that the
+    /// instance is stopped and was not started, because that is the state a
+    /// human is then left to finish by hand.
+    fn run_power_action(
+        context: &AwsContext,
+        instance_id: &str,
+        action: PowerAction,
+        tx: &Sender<ProcEvent>,
+        egui_ctx: &Option<egui::Context>,
+    ) -> std::result::Result<String, String> {
+        let profile = &context.profile;
+        let region = &context.region;
+        let progress = |phase: PowerPhase| {
+            let _ = tx.send(ProcEvent::PowerProgress {
+                instance_id: instance_id.to_string(),
+                phase,
+            });
+            if let Some(c) = egui_ctx {
+                c.request_repaint();
+            }
+        };
+
+        // The row that was clicked can be up to 45 seconds stale, and the
+        // dialog may have sat open longer still. This read is the one that
+        // decides, so a box someone else stopped in the meantime is refused
+        // here rather than by a confusing AWS error.
+        let state = fetch_instance_state(profile, region, instance_id)?;
+        power::action_allowed(&state, action)?;
+
+        match action {
+            PowerAction::Start => {
+                send_power_call(profile, region, instance_id, true)?;
+                Ok("start requested — the instance is booting".to_string())
+            }
+            PowerAction::Stop => {
+                send_power_call(profile, region, instance_id, false)?;
+                Ok("stop requested — the instance is shutting down".to_string())
+            }
+            PowerAction::Restart => {
+                send_power_call(profile, region, instance_id, false)?;
+                let began = Instant::now();
+                loop {
+                    let waited = began.elapsed();
+                    progress(PowerPhase::Stopping {
+                        waited_secs: waited.as_secs(),
+                    });
+                    // A failed read becomes an empty state, which matches
+                    // none of the checks below and simply costs one poll.
+                    // One failed read is not a failed restart — the poll has
+                    // minutes of budget, and giving up on a transient API
+                    // error would abandon a box that is on its way down. A
+                    // read that keeps failing runs out the clock below and is
+                    // reported there, naming the state as unreadable.
+                    let state = fetch_instance_state(profile, region, instance_id)
+                        .unwrap_or_default();
+                    if power::is_stopped(&state) {
+                        break;
+                    }
+                    if power::poll_is_hopeless(&state) {
+                        return Err(format!(
+                            "instance went to '{state}' instead of stopped — not started"
+                        ));
+                    }
+                    if power::stop_timed_out(waited) {
+                        return Err(format!(
+                            "still not stopped after {}s (last seen '{}') — \
+                             the instance was NOT started; start it once it settles",
+                            waited.as_secs(),
+                            if state.is_empty() { "unreadable" } else { &state },
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_secs(power::POLL_INTERVAL_SECS));
+                }
+
+                // It is down. Hold, so that is visible, then bring it up.
+                let stopped_at = Instant::now();
+                loop {
+                    let left = power::settle_remaining(stopped_at.elapsed());
+                    if left.is_zero() {
+                        break;
+                    }
+                    progress(PowerPhase::Settling {
+                        secs_left: left.as_secs().max(1),
+                    });
+                    std::thread::sleep(Duration::from_secs(1).min(left));
+                }
+
+                progress(PowerPhase::Starting);
+                send_power_call(profile, region, instance_id, true).map_err(|e| {
+                    format!("stopped, but the start failed: {e} — the instance is stopped")
+                })?;
+                Ok(format!(
+                    "restarted: stopped after {}s, held {}s, start requested",
+                    began.elapsed().as_secs().saturating_sub(power::SETTLE_SECS),
+                    power::SETTLE_SECS,
+                ))
+            }
+        }
     }
 
     fn aws_command() -> std::process::Command {
@@ -37425,6 +38002,80 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         /// complete test for one.
         ///
         /// Write `->`, not `→`. `·`, `—` and `…` are fine and used widely.
+        /// The label every power dialog and log line names the instance by.
+        #[test]
+        fn an_instance_is_labelled_by_id_and_name_and_by_id_alone_when_unnamed() {
+            let mut named = Instance::new("i-0abc".to_string(), "running".to_string());
+            named.name = Some("web01".to_string());
+            assert_eq!(Ec2GuiApp::instance_label(&named), "i-0abc (web01)");
+
+            let unnamed = Instance::new("i-0abc".to_string(), "running".to_string());
+            assert_eq!(Ec2GuiApp::instance_label(&unnamed), "i-0abc");
+
+            // An empty Name tag is not a name — `i-0abc ()` names nothing
+            // and reads as a rendering bug.
+            let mut blank = Instance::new("i-0abc".to_string(), "running".to_string());
+            blank.name = Some(String::new());
+            assert_eq!(Ec2GuiApp::instance_label(&blank), "i-0abc");
+        }
+
+        /// Restart is a stop and a start. `ec2 reboot-instances` keeps the
+        /// same underlying host and never reports `stopped`, so it is not
+        /// what was asked for and must not creep in as a "simplification".
+        #[test]
+        fn nothing_here_ever_calls_reboot_instances() {
+            let src = include_str!("ec2_manager_gui.rs");
+            // Assembled rather than written out, or this scan matches its
+            // own source and can never pass.
+            let banned = format!("reboot-{}", "instances");
+            for (n, line) in src.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                assert!(
+                    !line.contains(&banned),
+                    "line {}: Restart must stay a stop-then-start: {}",
+                    n + 1,
+                    line.trim(),
+                );
+            }
+        }
+
+        /// The row menu's Start / Stop / Restart entries must stay behind
+        /// the allow-list. The gate is one `if`, and an edit that moved the
+        /// entries out from under it would arm live start/stop calls for
+        /// everyone with no compile error and nothing on screen to say so.
+        #[test]
+        fn the_power_menu_entries_stay_behind_the_allow_list() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let gate = "if instance_power_enabled {";
+            let start = src.find(gate).expect("the power menu gate is still there");
+            // The three labels come from `PowerAction::label`, so the menu
+            // is identified by the loop that walks the actions.
+            let body = &src[start..start + 1200];
+            for needle in [
+                "PowerAction::Start,",
+                "PowerAction::Stop,",
+                "PowerAction::Restart,",
+                "power::action_allowed(",
+            ] {
+                assert!(
+                    body.contains(needle),
+                    "{needle} must sit inside the instance_power gate",
+                );
+            }
+            // Counted by assignment lines rather than by substring: a bare
+            // substring would also match this test's own source.
+            let raises = src
+                .lines()
+                .filter(|l| l.trim_start().starts_with("pending_power ="))
+                .count();
+            assert_eq!(
+                raises, 1,
+                "one place raises a power request, so one gate covers it",
+            );
+        }
+
         #[test]
         fn no_ui_string_uses_a_glyph_the_default_font_cannot_draw() {
             let src = include_str!("ec2_manager_gui.rs");

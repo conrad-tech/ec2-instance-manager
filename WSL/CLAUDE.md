@@ -2059,6 +2059,91 @@ slowest one.
 - **An instance with no groups makes no second call** — `--group-ids` with
   nothing after it is an error, not an empty result.
 
+### Inventory: Start / Stop / Restart an instance
+
+The row right-click menu carries **Start instance**, **Stop instance** and
+**Restart (stop -> start)**. The decisions live in `src/power.rs` — state
+strings and durations in, verdicts and sentences out — so the parts that can
+be *wrong* are settled by tests rather than by reading a worker loop; the AWS
+calls and the thread that sequences them are in the GUI binary.
+
+- **Restart is a stop and a start, and never `ec2 reboot-instances`.** A
+  reboot keeps the same underlying host and never reports `stopped`, which is
+  not what was asked for. `nothing_here_ever_calls_reboot_instances` scans the
+  GUI file so it cannot creep back in as a simplification.
+- **The 20s hold is *additional* to a poll, not a substitute for it.** A real
+  stop takes 30-90s to reach `stopped`, so a bare 20-second sleep would call
+  `start-instances` while the instance was still `stopping`, be refused with
+  `IncorrectInstanceState`, and leave the box down with the restart half
+  done. The worker polls `describe-instances` every 5s until the state is
+  actually `stopped`, *then* holds `SETTLE_SECS` (20) so the shutdown is
+  visible, then starts.
+- **`stopping` must never satisfy `is_stopped`.** Reading it as done is
+  precisely the early start the poll exists to prevent, and it is one
+  character away in the source.
+- **`poll_is_hopeless` ends the wait early for `terminated` /
+  `shutting-down`.** Those never reach `stopped`, so the poll would otherwise
+  sit through the full five-minute timeout before saying anything.
+- **A single failed `describe-instances` costs one poll, not the run.** The
+  poll has minutes of budget and a transient API error must not abandon a box
+  on its way down; a read that keeps failing runs the clock out and is
+  reported with the state named `unreadable`.
+- **Every failure after the stop has landed says the instance is stopped and
+  was NOT started.** That is the state a human is left to finish by hand, and
+  a message that only says "restart failed" does not tell them which half ran.
+- **The state is re-read inside the worker, and `action_allowed` runs again
+  there.** The row can be 45s stale (the inventory cache) and the dialog may
+  have sat open longer; the menu's answer is a courtesy, the worker's is the
+  one that counts. It is also checked a third time when the dialog renders, so
+  a refresh underneath an open dialog disables the button.
+- **`action_allowed` refuses an unrecognised state** rather than acting on it.
+  The column is fed by `describe-instances`, so anything outside the six
+  documented values means we are not reading what we think we are — and a
+  `stop-instances` on that guess is the expensive direction to be wrong.
+- **Restart on an already-stopped instance is refused, not downgraded to a
+  Start.** Turning a click on one action into a different one is exactly the
+  silent substitution this menu must not make; the refusal points at Start.
+- **Live mode only.** Sim fakes `auth_status: Ok`, so the refusal is on
+  `context.mode`, not on credentials. Sim's whole promise is that it makes no
+  real AWS calls.
+- **The account comes from whichever cached inventory holds the id**
+  (`context_for_instance`), not from the selected profile: the table shows
+  rows from several accounts at once, and acting with the wrong account's
+  credentials finds nothing — which reads exactly like a permissions failure.
+  The See Details path deliberately still inlines that lookup: its menu
+  closure already borrows `self` mutably, and a `&self` call there collides
+  with the row loop's borrow of `self.filtered`, while borrowing the two
+  fields directly is captured per-field.
+- **All three confirm.** The entries sit in a row menu beside Quick Connect
+  and a misclick that stops a production box has no undo. The dialog names the
+  instance, the account, the region and the current state, and for Restart it
+  lists the four steps and says outright that it is *not* an EC2 reboot.
+- **`power_in_flight` is claimed before the spawn**, for the reason
+  `ReaperInFlight` is: two clicks landing in one frame would otherwise both
+  pass the check and put two stop-and-starts on one box. The worker clears its
+  own id as well as the event handler, so a send that fails while the app is
+  closing cannot leave an instance permanently claimed.
+- **The status line auto-hides on success and waits to be dismissed on
+  failure**, and expiry is judged **at render** with `request_repaint_after`
+  for the instant it falls due — egui only redraws when something happens, so
+  a timer merely *checked* on a frame fires whenever the next frame happens to
+  occur. Same mistake the tunnel banner already made and fixed. The running
+  line repaints twice a second, or the `stopping… 25s` counter looks stuck
+  exactly while it is being watched.
+- **A finished run forces an inventory refresh** through `enqueue_refresh`
+  (not `spawn_refresh`, so the one-at-a-time limit holds). The State column is
+  wrong whichever way the run went — a failed restart still stopped the box —
+  and the 45s cache would otherwise answer with the old value.
+- **Gated by `instance_power` in `assets/features.json`, which needs
+  `enabled: true` *and* the username on `allowed_users`** — the two-key stance
+  `reaper` and `fed_auth` take, so a stray `["*"]` cannot arm live start/stop
+  for a whole site on its own. It ships closed, so **you will not see the
+  entries until you add your OS username and rebuild**. `instance_power=` is
+  on the startup `gates:` line. The entries are hidden rather than greyed out:
+  a disabled "Stop instance" invites a question whose answer the gates line
+  already records. `the_power_menu_entries_stay_behind_the_allow_list` pins
+  that the menu stays inside that `if` and that one place raises a request.
+
 ### Instance search
 
 `filter::searchable_text` is the *whole* haystack for the search box —

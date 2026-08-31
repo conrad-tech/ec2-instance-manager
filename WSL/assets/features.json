@@ -109,6 +109,11 @@
     "poll_secs": 30,
     "fetch_count": 10
   },
+  "_instance_power_comment": "Start instance / Stop instance / Restart (stop -> start) on the Inventory tab's right-click menu. Restart is a STOP, a poll until the instance actually reports 'stopped', a 20s hold so the shutdown is visible, and then a START — it is NOT ec2 reboot-instances, which keeps the same host and never reports stopped. These write live AWS state, so BOTH keys are required: set enabled to true AND name the OS username in allowed_users ([\"*\"] = everyone, [] = nobody). Shipped closed on both counts, so the menu entries are hidden until an admin opts users in and rebuilds; instance_power= on the startup gates: log line says which way it resolved. Live mode only — a Sim profile refuses. One list covers all three actions.",
+  "instance_power": {
+    "enabled": false,
+    "allowed_users": []
+  },
   "_personal_scripts_comment": "\"Add Script\" in the Scripts menu (save your own shell scripts, optionally bound to a hotkey, that paste into the focused connection tab) is available to everyone. This section instead gates the git integration: users on allowed_users are prompted once for a git personal access token, get git's credential store on the remote box populated by Prep Terminal (scoped to git_host, so git clone/pull over HTTPS just work), and receive the hardcoded default_scripts below (e.g. a Ctrl+1 're-clone the repo' script). Users NOT on the list can still create their own scripts and bind Ctrl+1 themselves. Matching: OS username, case-insensitive, [\"*\"] = everyone, [] = nobody (the shipped default). The PAT is cached in the user's local config.ini (base64, not encrypted) — never in this file. default_scripts fields: name, hotkey (e.g. \"Ctrl+1\"), body (the shell script; the credential store makes the clone auth automatically). In a body, {{user}} is replaced with the local OS username (the allowed_users name) before it runs — use it for per-user paths like /home/efs/{{user}}, since the remote $USER is the SSM/root account, not the person running the app.",
   "personal_scripts": {
     "allowed_users": [],

@@ -100,6 +100,9 @@ pub struct Features {
     /// Unattended pingdom acknowledge-and-escalate: who may run it, and
     /// every tunable.
     pub pingdom: PingdomFeature,
+    /// Start / Stop / Restart from the Inventory right-click menu: who may
+    /// see the entries.
+    pub instance_power: InstancePowerFeature,
 }
 
 /// The `fed_auth` section of `assets/features.json`.
@@ -425,6 +428,36 @@ pub struct UserSyncFeature {
 
 impl UserSyncFeature {
     /// True when `user` may see the Bastion User Sync entry.
+    pub fn is_allowed_user(&self, user: &str) -> bool {
+        user_in_list(&self.allowed_users, user)
+    }
+}
+
+/// The `instance_power` section of `assets/features.json`.
+///
+/// Gates the **Start instance / Stop instance / Restart** entries on the
+/// Inventory tab's right-click menu. These write live AWS state — a stop
+/// takes down whatever is running on the box — so it ships with `enabled`
+/// false *and* an empty allow-list, and needs both, the same two-key stance
+/// `reaper` and `fed_auth` take. A stray `["*"]` copied into the file
+/// therefore cannot arm it for a whole site on its own.
+///
+/// One list covers all three actions rather than splitting Start off: an
+/// account that may start an instance is already choosing to spend money on
+/// it, and a two-list gate that nobody configures separately is a gate that
+/// reads as noise.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct InstancePowerFeature {
+    /// Master switch. Shipped false.
+    pub enabled: bool,
+    /// OS usernames allowed to see the entries (case-insensitive).
+    /// `["*"]` for everyone, an empty list for nobody. Shipped empty.
+    pub allowed_users: Vec<String>,
+}
+
+impl InstancePowerFeature {
+    /// True when `user` is named on the allow-list.
     pub fn is_allowed_user(&self, user: &str) -> bool {
         user_in_list(&self.allowed_users, user)
     }
@@ -1007,6 +1040,10 @@ impl Default for Features {
             reaper: ReaperFeature::default(),
             // Derived Default, and the same three reasons.
             pingdom: PingdomFeature::default(),
+            // Derived Default: `enabled` false and an empty allow-list. Both
+            // are required by the gate, so a features.json nobody can parse
+            // hands out no power to stop a production instance.
+            instance_power: InstancePowerFeature::default(),
         }
     }
 }
@@ -1137,6 +1174,19 @@ impl Features {
     /// never disarm the other.
     pub fn pingdom_enabled_for(&self, user: &str) -> bool {
         self.pingdom.is_allowed_user(user)
+    }
+
+    /// True when the Inventory tab's **Start / Stop / Restart** entries
+    /// should be shown to `user`.
+    ///
+    /// Fails closed twice over: a malformed features.json leaves `enabled`
+    /// false *and* the allow-list empty, and the shipped file ships both.
+    /// The menu is hidden rather than disabled when this is false — a
+    /// greyed-out "Stop instance" invites a support question that the answer
+    /// to is "you are not allowed", which the startup `gates:` line already
+    /// says.
+    pub fn instance_power_enabled_for(&self, user: &str) -> bool {
+        self.instance_power.enabled && self.instance_power.is_allowed_user(user)
     }
 
     /// True when `name` is on the protected never-delete list (case- and
@@ -1478,6 +1528,58 @@ mod tests {
         let f: Features = serde_json::from_str("{}").expect("parses");
         assert!(!f.user_sync_enabled_for("anyone"));
         assert!(!Features::default().user_sync_enabled_for("anyone"));
+    }
+
+    // ---- instance_power ---------------------------------------------
+
+    #[test]
+    fn the_shipped_file_hands_instance_power_to_nobody() {
+        let f = load();
+        assert!(
+            !f.instance_power_enabled_for("any.user"),
+            "assets/features.json must ship instance_power switched off with \
+             an empty allowed_users"
+        );
+    }
+
+    /// Both halves are required, so a stray `["*"]` copied into the file
+    /// cannot start and stop production instances for a whole site on its
+    /// own — the same two-key stance `reaper` and `fed_auth` take.
+    #[test]
+    fn instance_power_needs_the_flag_and_the_name() {
+        let armed: Features = serde_json::from_str(
+            r#"{"instance_power":{"enabled":true,"allowed_users":["bconrad"]}}"#,
+        )
+        .expect("parses");
+        assert!(armed.instance_power_enabled_for("bconrad"));
+        assert!(armed.instance_power_enabled_for("BConrad"), "case-insensitive");
+        assert!(!armed.instance_power_enabled_for("someone.else"));
+
+        let named_but_off: Features = serde_json::from_str(
+            r#"{"instance_power":{"enabled":false,"allowed_users":["bconrad"]}}"#,
+        )
+        .expect("parses");
+        assert!(!named_but_off.instance_power_enabled_for("bconrad"));
+
+        let on_but_unnamed: Features =
+            serde_json::from_str(r#"{"instance_power":{"enabled":true,"allowed_users":[]}}"#)
+                .expect("parses");
+        assert!(!on_but_unnamed.instance_power_enabled_for("anyone"));
+
+        let everyone: Features = serde_json::from_str(
+            r#"{"instance_power":{"enabled":true,"allowed_users":["*"]}}"#,
+        )
+        .expect("parses");
+        assert!(everyone.instance_power_enabled_for("anyone"));
+    }
+
+    /// A features.json nobody can parse must not hand out the power to stop
+    /// a production box.
+    #[test]
+    fn instance_power_fails_closed_on_a_missing_section() {
+        let f: Features = serde_json::from_str("{}").expect("parses");
+        assert!(!f.instance_power_enabled_for("anyone"));
+        assert!(!Features::default().instance_power_enabled_for("anyone"));
     }
 
     #[test]

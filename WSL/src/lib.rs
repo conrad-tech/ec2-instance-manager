@@ -21,6 +21,7 @@ pub mod jsm_auth;
 pub mod models;
 pub mod obf_core;
 pub mod oncall;
+pub mod power;
 pub mod probe;
 pub mod profile_choice;
 pub mod pingdom;
