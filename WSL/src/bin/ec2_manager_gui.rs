@@ -15595,7 +15595,14 @@ mod gui {
                                         ui.close();
                                     }
                                 }
-                            });
+                            })
+                            .response
+                            .on_hover_text(
+                                "How far back to show CLOSED alerts.\n\n\
+                                 Open alerts always show, however old they are — an \
+                                 alert acknowledged hours ago and never closed is still \
+                                 live, and narrowing the window must not hide it.",
+                            );
                         if ui
                             .add_enabled(
                                 !loading && !ack_all_running,
@@ -15741,7 +15748,7 @@ mod gui {
 
                     if rows.is_empty() {
                         if !loading && error.is_none() {
-                            ui.label("(no alerts in window)");
+                            ui.label("(no open alerts, and none closed in this window)");
                         }
                         return;
                     }

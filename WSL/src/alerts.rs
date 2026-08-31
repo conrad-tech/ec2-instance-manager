@@ -33,6 +33,11 @@ const PAGE_SIZE: u32 = 50;
 /// Stop walking the feed after this many pages, however wide the window.
 const MAX_PAGES: u32 = 20;
 
+/// Pages to walk for the open-alerts pass. Small on purpose: with
+/// `query=status:open` honoured there are only ever a handful of rows, and
+/// this pass runs on every refresh of the Alerts window.
+const OPEN_MAX_PAGES: u32 = 4;
+
 /// Credentials + site for the alerts API. Resolved environment → Windows
 /// Credential Manager (see `jsm_auth::load_auth`) — never from
 /// `assets/features.json`, which is committed and must never carry any of
@@ -212,6 +217,88 @@ fn offset_from_next(next: &str) -> Option<u32> {
 /// first. Walks the feed page by page and stops as soon as a page runs past
 /// the cutoff (the feed is sorted `createdAt desc`, so everything after that
 /// is older too).
+/// Whether this alert belongs in the window's results.
+///
+/// **The window governs closed alerts only.** An open alert is shown however
+/// old it is: one acknowledged two hours ago and never closed is the single
+/// most important row on the screen, and it used to disappear the moment it
+/// aged past the selected window — found by having to widen the window to
+/// 4 hours to see a live incident.
+///
+/// `acknowledged` is *not* closed. It is a separate field, and acking is what
+/// you do to an alert you are working; only `status` says whether it is over.
+///
+/// An unparseable timestamp is kept whatever its status — better a visible
+/// odd row than a silently missing alert, which is the rule this already had.
+fn retain_in_window(alert: &Alert, cutoff: chrono::DateTime<Utc>) -> bool {
+    if !alert.status.trim().eq_ignore_ascii_case("closed") {
+        return true;
+    }
+    alert.created_utc().map(|t| t >= cutoff).unwrap_or(true)
+}
+
+/// Whether a page's oldest row predates the cutoff, i.e. the walk can stop.
+///
+/// `None` — nothing on the page carried a parseable timestamp — keeps
+/// walking: it says nothing about the cutoff, and stopping there would end
+/// the whole fetch on one malformed page.
+fn page_is_past_cutoff(
+    oldest: Option<chrono::DateTime<Utc>>,
+    cutoff: chrono::DateTime<Utc>,
+) -> bool {
+    oldest.map(|t| t < cutoff).unwrap_or(false)
+}
+
+/// Every alert that is still open, whatever its age.
+///
+/// A separate pass rather than walking the whole feed until the oldest open
+/// alert is found: that walk has no bound — one forgotten open alert would
+/// drag it to `MAX_PAGES` on every 10-second refresh — while this one asks
+/// the API for exactly the rows wanted.
+///
+/// **Defensive about the `query` parameter.** If the API ignores it, this
+/// degrades to "the open alerts among the newest few pages" rather than
+/// returning closed rows: the result is filtered by status here as well,
+/// so a server that does not honour the filter costs coverage, never
+/// correctness. `OPEN_MAX_PAGES` is small for the same reason — with the
+/// filter working there is nothing to page through.
+fn fetch_open(auth: &AlertsAuth, base: &str) -> Result<Vec<Alert>> {
+    let mut out: Vec<Alert> = Vec::new();
+    let mut offset: u32 = 0;
+    for _ in 0..OPEN_MAX_PAGES {
+        let body = curl_request(
+            auth,
+            base,
+            &[
+                ("query", "status:open".to_string()),
+                ("sort", "createdAt".to_string()),
+                ("order", "desc".to_string()),
+                ("size", PAGE_SIZE.to_string()),
+                ("offset", offset.to_string()),
+            ],
+            None,
+        )?;
+        let (alerts, next) = parse_alerts_page(&body)?;
+        if alerts.is_empty() {
+            break;
+        }
+        out.extend(
+            alerts
+                .into_iter()
+                .filter(|a| !a.status.trim().eq_ignore_ascii_case("closed")),
+        );
+        let Some(next) = next else { break };
+        let Some(next_offset) = offset_from_next(&next) else {
+            break;
+        };
+        if next_offset <= offset {
+            break; // defensive: never loop on a non-advancing cursor
+        }
+        offset = next_offset;
+    }
+    Ok(out)
+}
+
 pub fn fetch_recent(auth: &AlertsAuth, window_min: i64) -> Result<Vec<Alert>> {
     if !auth.is_complete() {
         return Err(AppError::InvalidArgument(
@@ -236,14 +323,9 @@ pub fn fetch_recent(auth: &AlertsAuth, window_min: i64) -> Result<Vec<Alert>> {
         // A row with an unparseable timestamp is kept rather than dropped —
         // better a visible odd row than a silently missing alert.
         let oldest_in_page = alerts.last().and_then(|a| a.created_utc());
-        out.extend(
-            alerts
-                .into_iter()
-                .filter(|a| a.created_utc().map(|t| t >= cutoff).unwrap_or(true)),
-        );
-        match oldest_in_page {
-            Some(t) if t < cutoff => break,
-            _ => {}
+        out.extend(alerts.into_iter().filter(|a| retain_in_window(a, cutoff)));
+        if page_is_past_cutoff(oldest_in_page, cutoff) {
+            break;
         }
         let Some(next) = next else { break };
         let Some(next_offset) = offset_from_next(&next) else {
@@ -253,6 +335,27 @@ pub fn fetch_recent(auth: &AlertsAuth, window_min: i64) -> Result<Vec<Alert>> {
             break; // defensive: never loop on a non-advancing cursor
         }
         offset = next_offset;
+    }
+
+    // Open alerts, whatever their age. Merged rather than replacing the walk
+    // above: that one carries the closed history the window is actually for.
+    //
+    // A failure here is logged by the caller through the usual error path
+    // only if *everything* failed — an open-pass failure alone degrades to
+    // the windowed results, which is what this returned before open alerts
+    // were pinned. Losing the window as well because one extra request
+    // failed would be the worse trade.
+    match fetch_open(auth, &base) {
+        Ok(open) => {
+            for a in open {
+                if !out.iter().any(|seen| seen.id == a.id) {
+                    out.push(a);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("alerts: open-alert pass failed, showing the window only: {e}");
+        }
     }
 
     out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -714,5 +817,87 @@ mod tests {
         assert!(fetch_alert(&auth, "../schedules").is_err());
         assert!(acknowledge_alert(&auth, "a/b").is_err());
         assert!(fetch_alert(&auth, "has space").is_err());
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    fn at(created: &str, status: &str) -> Alert {
+        Alert {
+            id: format!("{created}-{status}"),
+            created_at: created.to_string(),
+            status: status.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// One hour ago and three hours ago, against a two-hour window.
+    const RECENT: &str = "2026-08-30T11:00:00Z";
+    const OLD: &str = "2026-08-30T09:00:00Z";
+    const NOW: &str = "2026-08-30T12:00:00Z";
+
+    fn cutoff() -> chrono::DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339(NOW)
+            .expect("valid")
+            .with_timezone(&Utc)
+            - Duration::minutes(120)
+    }
+
+    #[test]
+    fn an_open_alert_older_than_the_window_is_still_shown() {
+        // The whole point: an alert acknowledged two hours ago and never
+        // closed is the one most worth seeing, and it used to vanish the
+        // moment it aged past the window.
+        assert!(retain_in_window(&at(OLD, "open"), cutoff()));
+    }
+
+    #[test]
+    fn an_acknowledged_alert_counts_as_open() {
+        // `acknowledged` is a separate field from `status`; acking does not
+        // close anything. This is exactly the alert that went missing.
+        let mut a = at(OLD, "open");
+        a.acknowledged = true;
+        assert!(retain_in_window(&a, cutoff()));
+    }
+
+    #[test]
+    fn a_closed_alert_older_than_the_window_is_dropped() {
+        // Closed alerts are history, and history is what the window is for.
+        assert!(!retain_in_window(&at(OLD, "closed"), cutoff()));
+    }
+
+    #[test]
+    fn a_closed_alert_inside_the_window_is_shown() {
+        assert!(retain_in_window(&at(RECENT, "closed"), cutoff()));
+    }
+
+    #[test]
+    fn an_unparseable_timestamp_is_kept_whatever_its_status() {
+        // Pre-existing rule, and it still holds: better a visible odd row
+        // than a silently missing alert.
+        assert!(retain_in_window(&at("not-a-date", "closed"), cutoff()));
+        assert!(retain_in_window(&at("", "closed"), cutoff()));
+    }
+
+    #[test]
+    fn paging_stops_on_a_page_whose_closed_alerts_are_all_past_the_cutoff() {
+        // The walk must still terminate. Open alerts are carried by the
+        // `query=status:open` pass, so this one stops exactly where it did
+        // before: the first page whose oldest row predates the cutoff.
+        assert!(page_is_past_cutoff(Some(
+            chrono::DateTime::parse_from_rfc3339(OLD)
+                .expect("valid")
+                .with_timezone(&Utc)
+        ), cutoff()));
+        assert!(!page_is_past_cutoff(Some(
+            chrono::DateTime::parse_from_rfc3339(RECENT)
+                .expect("valid")
+                .with_timezone(&Utc)
+        ), cutoff()));
+        // Nothing parseable on the page says nothing about the cutoff, so
+        // keep walking rather than stopping early on a malformed row.
+        assert!(!page_is_past_cutoff(None, cutoff()));
     }
 }

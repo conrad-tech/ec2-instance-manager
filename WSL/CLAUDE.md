@@ -431,6 +431,35 @@ one is open and closes the window when none is.
   The picked mentions travel with the draft, or a restored `@name` would post
   as literal text.
 
+#### The window governs closed alerts only
+
+`fetch_recent`'s window used to filter **every** row by `createdAt`, so an
+alert acknowledged two hours ago and never closed vanished from a one-hour
+window — found by having to widen the window to 4 hours to see a live
+incident. `retain_in_window` now keeps any alert whose `status` is not
+`closed`, whatever its age; the window applies to closed alerts, which are the
+history it exists for.
+
+- **`acknowledged` is not `closed`.** They are separate fields, and acking is
+  what you do to an alert you are *working*. Only `status` says it is over.
+  That distinction is the whole bug.
+- **Open alerts come from a second pass** (`fetch_open`, `query=status:open`),
+  not from walking the main feed further. That walk has no bound — one
+  forgotten open alert would drag it to `MAX_PAGES` on every 10-second
+  refresh — while this asks the API for exactly the rows wanted, so
+  `OPEN_MAX_PAGES` is 4.
+- **It re-filters by status client-side**, so an API that ignores `query`
+  costs coverage (the open alerts among the newest few pages) and never
+  correctness (closed rows leaking past the window).
+- **A failed open pass degrades to the windowed results** rather than failing
+  the fetch. Losing the whole window because one extra request failed is the
+  worse trade; it is the behaviour this had before open alerts were pinned.
+- **`page_is_past_cutoff` returns false for a page with no parseable
+  timestamp.** Nothing on it says anything about the cutoff, and stopping
+  there would end the walk on one malformed page.
+- An unparseable timestamp is still kept whatever its status — better a
+  visible odd row than a silently missing alert.
+
 #### The Jira Alerts API trace (Logs tab)
 
 The Logs tab carries a **Jira Alerts** checkbox that shows the last 5 calls to
