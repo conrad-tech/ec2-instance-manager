@@ -2160,7 +2160,7 @@ calls and the thread that sequences them are in the GUI binary.
 ### Inventory sub-tabs: the other AWS resource types
 
 The Inventory page carries a second tab row — `EC2 · Target Groups · Load
-Balancers · ASGs · S3 · Route 53` (`InventoryTab::all()`; Target Groups is
+Balancers · ASG · S3 · Route 53` (`InventoryTab::all()`; Target Groups is
 second because it was the resource type phase 1 actually built, and the rest
 follow build order, not alphabetical or importance) — listing each resource
 type across the same multi-account pool the EC2 table draws from. `MainTab`

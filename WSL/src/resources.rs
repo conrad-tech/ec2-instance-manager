@@ -46,7 +46,7 @@ impl ResourceKind {
         match self {
             Self::TargetGroup => "Target Groups",
             Self::LoadBalancer => "Load Balancers",
-            Self::Asg => "ASGs",
+            Self::Asg => "ASG",
             Self::Bucket => "S3",
             Self::HostedZone => "Route 53",
         }

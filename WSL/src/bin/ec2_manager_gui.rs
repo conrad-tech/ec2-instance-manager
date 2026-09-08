@@ -34203,7 +34203,7 @@ mod gui {
             let labels: Vec<&str> = InventoryTab::all().iter().map(|t| t.label()).collect();
             assert_eq!(
                 labels,
-                vec!["EC2", "Target Groups", "Load Balancers", "ASGs", "S3", "Route 53"]
+                vec!["EC2", "Target Groups", "Load Balancers", "ASG", "S3", "Route 53"]
             );
         }
 
