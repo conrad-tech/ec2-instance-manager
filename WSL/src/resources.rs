@@ -75,6 +75,47 @@ pub fn cache_key(kind: ResourceKind, mode: &str, account: &str, region: &str) ->
     }
 }
 
+/// The most rows a configured priority list may pull ahead of the visible
+/// range.
+///
+/// A pattern like `prod` or `-` can match every target group in the account,
+/// which would turn the bounded visible-row fill into one call per group. Past
+/// the cap the rest are left to the ordinary path.
+pub const PRIORITY_HEALTH_MAX: usize = 50;
+
+/// Which of `names` a configured priority list claims, in list order, capped.
+///
+/// Matching is a **case-insensitive substring of the name**, never of the ARN:
+/// an ARN carries an account id and a random suffix, so a short pattern would
+/// match by accident.
+///
+/// A blank pattern is skipped rather than treated as a match-all. An empty
+/// string is a substring of everything, so one stray entry would otherwise
+/// prioritise the whole account — the same trap `forwards.rs` records for a
+/// blank section marker.
+pub fn priority_indexes(patterns: &[String], names: &[String], cap: usize) -> Vec<usize> {
+    let needles: Vec<String> = patterns
+        .iter()
+        .map(|p| p.trim().to_ascii_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if needles.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for (idx, name) in names.iter().enumerate() {
+        if out.len() >= cap {
+            break;
+        }
+        let hay = name.to_ascii_lowercase();
+        if needles.iter().any(|needle| hay.contains(needle)) {
+            out.push(idx);
+        }
+    }
+    out
+}
+
 /// What a non-zero exit from the AWS CLI actually meant.
 ///
 /// These are three different facts and they must never render alike. The S3
@@ -233,5 +274,62 @@ mod tests {
         let tg = cache_key(ResourceKind::TargetGroup, "live", "1111", "us-east-1");
         let lb = cache_key(ResourceKind::LoadBalancer, "live", "1111", "us-east-1");
         assert_ne!(tg, lb);
+    }
+
+    /// Names drift in case the same way MMODAL_ENV does, and a pattern is
+    /// typed by a human into a config file.
+    #[test]
+    fn priority_matching_ignores_case() {
+        let names = vec!["APP-Web-Prod".to_string(), "other".to_string()];
+        let patterns = vec!["app-web".to_string()];
+        assert_eq!(priority_indexes(&patterns, &names, 50), vec![0]);
+    }
+
+    /// Substring, not exact match: "app-web" must find "app-web-prod-tg".
+    #[test]
+    fn priority_matching_is_a_substring() {
+        let names = vec!["app-web-prod-tg".to_string()];
+        assert_eq!(
+            priority_indexes(&["app-web".to_string()], &names, 50),
+            vec![0]
+        );
+    }
+
+    /// The shipped state. Prioritising nothing is not prioritising everything.
+    #[test]
+    fn no_patterns_prioritises_nothing() {
+        let names = vec!["a".to_string(), "b".to_string()];
+        assert!(priority_indexes(&[], &names, 50).is_empty());
+    }
+
+    /// A blank entry is skipped, never treated as a match-all. This is the
+    /// same bug forwards.rs records for a blank section marker: an empty
+    /// string is a substring of everything, so one stray entry in the config
+    /// would prioritise the entire account.
+    #[test]
+    fn a_blank_pattern_matches_nothing() {
+        let names = vec!["a".to_string(), "b".to_string()];
+        let patterns = vec!["".to_string(), "   ".to_string()];
+        assert!(priority_indexes(&patterns, &names, 50).is_empty());
+    }
+
+    /// A broad pattern like "prod" could match the whole account and turn a
+    /// bounded fill into an unbounded one.
+    #[test]
+    fn the_cap_bounds_a_pattern_that_matches_everything() {
+        let names: Vec<String> = (0..200).map(|i| format!("prod-{i}")).collect();
+        let hits = priority_indexes(&["prod".to_string()], &names, 50);
+        assert_eq!(hits.len(), 50);
+        // The cap keeps the first matches, so the order is the list's own.
+        assert_eq!(hits[0], 0);
+        assert_eq!(hits[49], 49);
+    }
+
+    /// One name matched by two patterns is still one fetch.
+    #[test]
+    fn a_name_matched_twice_is_listed_once() {
+        let names = vec!["app-web-prod".to_string()];
+        let patterns = vec!["app".to_string(), "web".to_string()];
+        assert_eq!(priority_indexes(&patterns, &names, 50), vec![0]);
     }
 }
