@@ -42,7 +42,7 @@ cargo build --features gui
 
 # Run tests
 cargo test                  # lib + CLI tests
-cargo test --features gui   # all tests including GUI (46 GUI tests)
+cargo test --features gui   # all tests including GUI (415 GUI tests)
 
 # Clippy
 cargo clippy --features gui
