@@ -8,6 +8,7 @@ pub mod connection_tabs;
 pub mod credentials;
 pub mod defaults_check;
 pub mod diagnostics;
+pub mod elb;
 pub mod error;
 pub mod fed_auth;
 pub mod features;
