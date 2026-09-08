@@ -9,13 +9,13 @@ pub struct Filters {
 }
 
 #[derive(Clone, Debug)]
-enum SearchMatcher {
+pub enum SearchMatcher {
     Substring(String),
     RegexLite(Vec<Pattern>),
 }
 
 #[derive(Clone, Debug)]
-struct Pattern {
+pub struct Pattern {
     anchored_start: bool,
     anchored_end: bool,
     atoms: Vec<Atom>,
@@ -67,20 +67,12 @@ pub fn apply_filters(instances: &[Instance], filters: &Filters) -> Vec<Instance>
                 return false;
             }
 
+            // The emptiness guard is kept deliberately: `searchable_text`
+            // allocates per instance, and an empty search box is the common
+            // case on a large inventory.
             if !include_matchers.is_empty() || !exclude_matchers.is_empty() {
                 let searchable = searchable_text(instance);
-
-                if !include_matchers
-                    .iter()
-                    .all(|matcher| matcher_matches(matcher, &searchable))
-                {
-                    return false;
-                }
-
-                if exclude_matchers
-                    .iter()
-                    .any(|matcher| matcher_matches(matcher, &searchable))
-                {
+                if !text_matches(&searchable, &include_matchers, &exclude_matchers) {
                     return false;
                 }
             }
@@ -159,12 +151,41 @@ fn build_matcher(raw: &str) -> SearchMatcher {
     }
 }
 
-fn build_matchers(values: &[String]) -> Vec<SearchMatcher> {
+pub fn build_matchers(values: &[String]) -> Vec<SearchMatcher> {
     values
         .iter()
         .map(|value| build_matcher(value))
         .filter(|matcher| !matches!(matcher, SearchMatcher::Substring(v) if v.is_empty()))
         .collect()
+}
+
+/// Does `searchable` satisfy the rules? Every include must match and no
+/// exclude may.
+///
+/// This is the engine behind the Inventory search box, lifted out of
+/// `apply_filters` so every resource type in the sub-tabs filters by the same
+/// rules the user already knows. Callers supply their own haystack;
+/// `searchable_text` is the EC2 one.
+///
+/// No matchers at all accepts everything — an empty search box must not empty
+/// the table.
+pub fn text_matches(
+    searchable: &str,
+    includes: &[SearchMatcher],
+    excludes: &[SearchMatcher],
+) -> bool {
+    if includes.is_empty() && excludes.is_empty() {
+        return true;
+    }
+    if !includes
+        .iter()
+        .all(|matcher| matcher_matches(matcher, searchable))
+    {
+        return false;
+    }
+    !excludes
+        .iter()
+        .any(|matcher| matcher_matches(matcher, searchable))
 }
 
 fn looks_like_regex(query: &str) -> bool {
@@ -625,5 +646,30 @@ mod tests {
         let matched = matching_tags(&instance, &vec!["^bill.*$".to_string()]);
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].0, "Service");
+    }
+
+    /// The engine every resource type shares. An include must match, an
+    /// exclude must not, and no matchers at all matches everything.
+    #[test]
+    fn text_matches_applies_includes_and_excludes() {
+        let includes = build_matchers(&["prod".to_string()]);
+        let excludes = build_matchers(&["canary".to_string()]);
+
+        assert!(text_matches("prod-web-01\n", &includes, &excludes));
+        assert!(!text_matches("dev-web-01\n", &includes, &excludes));
+        assert!(!text_matches("prod-canary-01\n", &includes, &excludes));
+    }
+
+    #[test]
+    fn text_matches_with_no_matchers_accepts_anything() {
+        assert!(text_matches("anything at all", &[], &[]));
+    }
+
+    /// Every include must match, not merely one of them.
+    #[test]
+    fn text_matches_requires_all_includes() {
+        let includes = build_matchers(&["prod".to_string(), "web".to_string()]);
+        assert!(text_matches("prod-web-01\n", &includes, &[]));
+        assert!(!text_matches("prod-db-01\n", &includes, &[]));
     }
 }
