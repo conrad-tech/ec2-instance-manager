@@ -5,6 +5,76 @@
 //! on — how a cache key is shaped, how long a result is good for, how an
 //! error is classified, and which rows are worth fetching first.
 
+use std::time::Duration;
+
+/// How long a fetched resource list is good for.
+///
+/// Five minutes rather than the inventory's 45 seconds: that one is short
+/// because the EC2 State column has to be current, and buckets, hosted zones
+/// and target groups do not change on that timescale. Each sub-tab has a
+/// Refresh button for when they do.
+pub const RESOURCE_TTL: Duration = Duration::from_secs(300);
+
+/// The resource types the Inventory sub-tabs can list.
+///
+/// EC2 instances are deliberately absent: they have their own inventory, their
+/// own cache and their own 45-second TTL, and folding them in here would mean
+/// changing all three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ResourceKind {
+    TargetGroup,
+    LoadBalancer,
+    Asg,
+    Bucket,
+    HostedZone,
+}
+
+impl ResourceKind {
+    /// The cache-key fragment. Stable: it is part of a key, not a label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TargetGroup => "targetgroup",
+            Self::LoadBalancer => "loadbalancer",
+            Self::Asg => "asg",
+            Self::Bucket => "bucket",
+            Self::HostedZone => "hostedzone",
+        }
+    }
+
+    /// The sub-tab's label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TargetGroup => "Target Groups",
+            Self::LoadBalancer => "Load Balancers",
+            Self::Asg => "ASGs",
+            Self::Bucket => "S3",
+            Self::HostedZone => "Route 53",
+        }
+    }
+
+    /// True for a service that has no region at all.
+    ///
+    /// S3 and Route 53 are global: a bucket belongs to an account, not to a
+    /// region, and `list-buckets` returns the same answer whichever region the
+    /// CLI is pointed at. Keying either on region lists every one of them once
+    /// per region the user has visited.
+    pub fn is_global(self) -> bool {
+        matches!(self, Self::Bucket | Self::HostedZone)
+    }
+}
+
+/// The cache key for one kind's list in one account.
+///
+/// A global kind's key omits the region entirely rather than substituting a
+/// placeholder, so the omission is visible in a logged key.
+pub fn cache_key(kind: ResourceKind, mode: &str, account: &str, region: &str) -> String {
+    if kind.is_global() {
+        format!("{mode}:{account}:{}", kind.as_str())
+    } else {
+        format!("{mode}:{account}:{region}:{}", kind.as_str())
+    }
+}
+
 /// What a non-zero exit from the AWS CLI actually meant.
 ///
 /// These are three different facts and they must never render alike. The S3
@@ -124,5 +194,44 @@ mod tests {
         let both = "An error occurred (AccessDenied) when calling GetBucketPolicy: \
                     NoSuchBucketPolicy";
         assert_eq!(classify_absent(both), Absence::Denied);
+    }
+
+    /// S3 and Route 53 are global. A region in their cache key lists every
+    /// bucket once per region the user has visited.
+    #[test]
+    fn a_global_kinds_key_carries_no_region() {
+        for kind in [ResourceKind::Bucket, ResourceKind::HostedZone] {
+            let east = cache_key(kind, "live", "111122223333", "us-east-1");
+            let west = cache_key(kind, "live", "111122223333", "eu-west-2");
+            assert_eq!(east, west, "{kind:?} must not key on region");
+            assert!(!east.contains("us-east-1"), "{kind:?}: {east}");
+        }
+    }
+
+    /// A regional kind must key on region, or two regions' target groups
+    /// collapse into one list.
+    #[test]
+    fn a_regional_kinds_key_carries_its_region() {
+        let east = cache_key(ResourceKind::TargetGroup, "live", "111122223333", "us-east-1");
+        let west = cache_key(ResourceKind::TargetGroup, "live", "111122223333", "eu-west-2");
+        assert_ne!(east, west);
+    }
+
+    /// Two accounts, and sim versus live, are never one cache entry.
+    #[test]
+    fn account_and_mode_separate_entries() {
+        let a = cache_key(ResourceKind::TargetGroup, "live", "111122223333", "us-east-1");
+        let b = cache_key(ResourceKind::TargetGroup, "live", "444455556666", "us-east-1");
+        let sim = cache_key(ResourceKind::TargetGroup, "sim", "111122223333", "us-east-1");
+        assert_ne!(a, b);
+        assert_ne!(a, sim);
+    }
+
+    /// Two kinds in one account and region are never one entry.
+    #[test]
+    fn kinds_do_not_collide() {
+        let tg = cache_key(ResourceKind::TargetGroup, "live", "1111", "us-east-1");
+        let lb = cache_key(ResourceKind::LoadBalancer, "live", "1111", "us-east-1");
+        assert_ne!(tg, lb);
     }
 }
