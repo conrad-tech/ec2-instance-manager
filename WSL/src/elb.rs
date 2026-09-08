@@ -235,7 +235,11 @@ pub fn health_summary(targets: &[Target]) -> HealthSummary {
 /// than `0/0` — having no targets is a different fact from having broken ones.
 pub fn health_label(summary: HealthSummary) -> String {
     if summary.total == 0 {
-        return "—".to_string();
+        // Words, not a dash. This was an em dash, and an em dash in a column
+        // whose other states are a blank cell and an ellipsis reads as "we
+        // never got an answer" — which is the opposite of what it means. It
+        // was reported as the health column failing to load.
+        return "no targets".to_string();
     }
     format!("{}/{}", summary.healthy, summary.total)
 }
@@ -627,11 +631,20 @@ mod tests {
 
     /// A target group with nothing registered is not "0 of 0 healthy" — it has
     /// no targets, which is a different thing from having broken ones.
+    ///
+    /// It says so in **words**. This was an em dash, and in a column whose
+    /// other states are a blank cell and an ellipsis, a dash reads as "no
+    /// answer came back" — it was reported as the health column failing to
+    /// load. The one thing this cell must never look like is an absent
+    /// answer, because that is a different diagnosis entirely.
     #[test]
-    fn a_group_with_no_targets_is_a_dash_not_a_zero() {
+    fn a_group_with_no_targets_says_so_in_words() {
         let empty = parse_target_health(r#"{"TargetHealthDescriptions":[]}"#);
         assert!(empty.is_empty());
-        assert_eq!(health_label(health_summary(&empty)), "—");
+        let label = health_label(health_summary(&empty));
+        assert_eq!(label, "no targets");
+        // Not punctuation that could be mistaken for a missing value.
+        assert!(!label.contains('—') && !label.contains('-'));
     }
 
     #[test]

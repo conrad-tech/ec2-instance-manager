@@ -7738,6 +7738,8 @@ mod gui {
         /// warning, so it is said once rather than every frame — the rule
         /// `report_reaper_reason_change` follows.
         tg_priority_warned: Option<usize>,
+        /// Same shape as `tg_priority_warned`, for the background-fill ceiling.
+        tg_fill_warned: Option<usize>,
         /// `resources.priority_target_groups`, read once at startup.
         ///
         /// There is **no `self.features`** on this struct: `App::new` holds
@@ -8567,6 +8569,7 @@ mod gui {
                 tg_list_errors: HashMap::new(),
                 tg_list_failures: HashMap::new(),
                 tg_priority_warned: None,
+                tg_fill_warned: None,
                 // `features` is the local in `App::new`, the same one
                 // `instance_power_enabled` below is resolved from.
                 tg_priority_patterns: features.resources.priority_target_groups.clone(),
@@ -23595,6 +23598,7 @@ mod gui {
                     // claimed.
                     self.tg_list_loading.clear();
                     self.tg_priority_warned = None;
+                    self.tg_fill_warned = None;
                 }
             });
 
@@ -23778,6 +23782,15 @@ mod gui {
                             HealthCell::Known(s) if s.healthy == 0 && s.total > 0 => {
                                 Some(egui::Color32::RED)
                             }
+                            // No targets registered is a fact, not a warning.
+                            // It fell through to the yellow catch-all because
+                            // both arms above require `total > 0`, so an empty
+                            // target group rendered as a coloured dash — and
+                            // yellow means "needs attention" everywhere else in
+                            // this app. It was read as the column failing to
+                            // load, which is the one thing it must not look
+                            // like.
+                            HealthCell::Known(s) if s.total == 0 => None,
                             HealthCell::Known(_) => Some(egui::Color32::YELLOW),
                             HealthCell::Failed(_) => Some(egui::Color32::RED),
                             _ => None,
@@ -23832,9 +23845,26 @@ mod gui {
                 .map(|tg| (tg.arn.clone(), tg.account_id.clone()))
                 .collect();
 
+            // Every row, in table order, minus the ceiling. Rows past it are
+            // not stranded — they still fill the moment they are scrolled to,
+            // through the visible tier.
+            let rest: Vec<String> = rows
+                .iter()
+                .take(MAX_HEALTH_PER_LIST)
+                .map(|tg| tg.arn.clone())
+                .collect();
+            if let Some(line) = priority_truncation_warning(
+                rows.len(),
+                MAX_HEALTH_PER_LIST,
+                &mut self.tg_fill_warned,
+            ) {
+                self.log_warn(line);
+            }
+
             let wanted = health_requests(&HealthRequestInput {
                 priority,
                 visible,
+                rest: &rest,
                 settled: &settled,
                 denied_accounts: &self.tg_denied_accounts,
                 account_of: &account_of,
@@ -33299,9 +33329,9 @@ mod gui {
         }
         *last_warned = Some(matched);
         Some(format!(
-            "target group health: the priority list matched {matched} group(s); only the \
-             first {cap} are pulled ahead of the visible rows — the rest fill in as you \
-             scroll. Narrow resources.priority_target_groups if that is not what you meant."
+            "target group health: {matched} group(s) exceed the cap of {cap}; only the \
+             first {cap} are fetched ahead of the scroll position — the rest fill in as \
+             you scroll to them."
         ))
     }
 
@@ -33570,12 +33600,31 @@ mod gui {
     ///
     const MAX_HEALTH_IN_FLIGHT: usize = 6;
 
+    /// The most rows one list will background-fill health for.
+    ///
+    /// `describe-target-health` is one call per target group, so this is the
+    /// number of `aws` invocations a single Target Groups view will make on its
+    /// own. Five hundred at six in flight is on the order of a minute, once per
+    /// `RESOURCE_TTL`, which is a fair price for seeing a whole account's
+    /// health. It exists so that an account far larger than any seen here
+    /// cannot turn a background fill into thousands of calls; past it, rows
+    /// still fill when scrolled to.
+    const MAX_HEALTH_PER_LIST: usize = 500;
+
     /// Everything the scheduler needs to decide what to ask about.
     struct HealthRequestInput<'a> {
         /// ARNs matched by `resources.priority_target_groups`, already capped.
         priority: &'a [String],
         /// ARNs of the rows `ScrollArea::show_rows` says are on screen.
         visible: &'a [String],
+        /// Every other row in the table, in its own order.
+        ///
+        /// The visible tier alone means a row nobody scrolls to is never asked
+        /// about, which is correct for cost and wrong for someone who wants to
+        /// see the state of the whole account. This tier fills the rest in the
+        /// background, still one call at a time under the same concurrency cap,
+        /// and still never twice thanks to the cache.
+        rest: &'a [String],
         /// ARNs already answered, already failed, or already in flight.
         settled: &'a HashSet<String>,
         /// Accounts that have refused a health call once.
@@ -33587,9 +33636,14 @@ mod gui {
 
     /// Which target groups to ask about health for on this frame.
     ///
-    /// Priority first, then the visible rows; nothing already settled, nothing
-    /// belonging to an account that has refused, and never more than the
-    /// concurrency limit allows.
+    /// Priority first, then the visible rows, then everything else; nothing
+    /// already settled, nothing belonging to an account that has refused, and
+    /// never more than the concurrency limit allows.
+    ///
+    /// The order is the whole design. What somebody is looking at is answered
+    /// before what they are not, so a big account still feels immediate, and
+    /// the background tier then works through the remainder at the same six
+    /// calls in flight rather than in a burst.
     ///
     /// Pure, and tested, because every way of getting it wrong is expensive: a
     /// missing `settled` check issues one call per visible row on every frame,
@@ -33602,7 +33656,12 @@ mod gui {
         }
 
         let mut out: Vec<String> = Vec::new();
-        for arn in input.priority.iter().chain(input.visible.iter()) {
+        for arn in input
+            .priority
+            .iter()
+            .chain(input.visible.iter())
+            .chain(input.rest.iter())
+        {
             if out.len() >= budget {
                 break;
             }
@@ -40238,12 +40297,58 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             HealthRequestInput {
                 priority,
                 visible,
+                // The existing cases are all about the first two tiers; the
+                // background tier has its own test below.
+                rest: &[],
                 settled,
                 denied_accounts: denied,
                 account_of,
                 in_flight,
                 max_in_flight: MAX_HEALTH_IN_FLIGHT,
             }
+        }
+
+        /// Rows nobody scrolls to are still answered, after the two tiers that
+        /// are about what somebody is actually looking at.
+        ///
+        /// The visible tier alone means the health of a 200-row account is only
+        /// ever known for the ~30 rows that fit on screen, which reads as the
+        /// column half-working. Ordering is the whole design: what is on screen
+        /// first, the rest afterwards, all of it under the same concurrency cap.
+        #[test]
+        fn the_background_tier_fills_rows_nobody_scrolled_to() {
+            let priority = vec!["arn:p".to_string()];
+            let visible = vec!["arn:v".to_string()];
+            let rest = vec![
+                "arn:p".to_string(), // already claimed above
+                "arn:v".to_string(), // already claimed above
+                "arn:r1".to_string(),
+                "arn:r2".to_string(),
+            ];
+            let settled = HashSet::new();
+            let denied = HashSet::new();
+            let account_of = HashMap::new();
+            let out = health_requests(&HealthRequestInput {
+                priority: &priority,
+                visible: &visible,
+                rest: &rest,
+                settled: &settled,
+                denied_accounts: &denied,
+                account_of: &account_of,
+                in_flight: 0,
+                max_in_flight: MAX_HEALTH_IN_FLIGHT,
+            });
+            // Priority, then visible, then the two the user has not reached —
+            // and nothing twice.
+            assert_eq!(
+                out,
+                vec![
+                    "arn:p".to_string(),
+                    "arn:v".to_string(),
+                    "arn:r1".to_string(),
+                    "arn:r2".to_string()
+                ]
+            );
         }
 
         /// The configured apps are answered before whatever happens to be on

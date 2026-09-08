@@ -2261,9 +2261,17 @@ is no bulk form — so a whole-account fill is one call per group.
   a sample value in the live key fails `defaults_check` on this tree.
 - **Only `healthy` counts as healthy and the total is every registered
   target.** A `draining` target during a deploy is neither; counting it
-  either way misreports the deploy. A group with nothing registered reads as
-  `—`, not `0/0` — having no targets is a different fact from having broken
-  ones.
+  either way misreports the deploy. A group with nothing registered reads
+  **`no targets`, in the ordinary text colour** — not `0/0`, not a dash, and
+  not yellow. Having no targets is a different fact from having broken ones,
+  and both are different from not having got an answer. It was an em dash
+  painted yellow (it fell through to the catch-all, since the green and red
+  arms both require `total > 0`), and in a column whose other states are a
+  blank cell and an ellipsis that read as "the health column is not loading" —
+  which is exactly what it was reported as.
+- **Nothing in this column may look like an absent answer except an absent
+  answer.** Blank means not yet requested, `…` means in flight; every state
+  that *has* an answer says it in words or numbers.
 - **The first `AccessDenied` switches the column off for that account**, and
   says so at warn level once.
 - **Sim mode has no resources of any of these kinds** and the sub-tabs say
