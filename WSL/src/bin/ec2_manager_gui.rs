@@ -31980,6 +31980,69 @@ mod gui {
         }
     }
 
+    /// How many `describe-target-health` calls may be in flight at once.
+    ///
+    /// The API takes one target group per call, so a fast scroll through a
+    /// large account would otherwise spawn a thread per row. Six fills a
+    /// screen quickly without becoming the throttling that
+    /// `aws_cli::retry_envs` already exists to survive.
+    ///
+    /// `allow(dead_code)`: consumed by a later task that wires the scheduler
+    /// into the Target Groups table's render loop.
+    #[allow(dead_code)]
+    const MAX_HEALTH_IN_FLIGHT: usize = 6;
+
+    /// Everything the scheduler needs to decide what to ask about.
+    #[allow(dead_code)]
+    struct HealthRequestInput<'a> {
+        /// ARNs matched by `resources.priority_target_groups`, already capped.
+        priority: &'a [String],
+        /// ARNs of the rows `ScrollArea::show_rows` says are on screen.
+        visible: &'a [String],
+        /// ARNs already answered, already failed, or already in flight.
+        settled: &'a HashSet<String>,
+        /// Accounts that have refused a health call once.
+        denied_accounts: &'a HashSet<String>,
+        account_of: &'a HashMap<String, String>,
+        in_flight: usize,
+        max_in_flight: usize,
+    }
+
+    /// Which target groups to ask about health for on this frame.
+    ///
+    /// Priority first, then the visible rows; nothing already settled, nothing
+    /// belonging to an account that has refused, and never more than the
+    /// concurrency limit allows.
+    ///
+    /// Pure, and tested, because every way of getting it wrong is expensive: a
+    /// missing `settled` check issues one call per visible row on every frame,
+    /// and a missing `denied_accounts` check issues one refused call per row
+    /// for as long as somebody keeps scrolling.
+    #[allow(dead_code)]
+    fn health_requests(input: &HealthRequestInput) -> Vec<String> {
+        let budget = input.max_in_flight.saturating_sub(input.in_flight);
+        if budget == 0 {
+            return Vec::new();
+        }
+
+        let mut out: Vec<String> = Vec::new();
+        for arn in input.priority.iter().chain(input.visible.iter()) {
+            if out.len() >= budget {
+                break;
+            }
+            if input.settled.contains(arn) || out.iter().any(|a| a == arn) {
+                continue;
+            }
+            if let Some(account) = input.account_of.get(arn) {
+                if input.denied_accounts.contains(account) {
+                    continue;
+                }
+            }
+            out.push(arn.clone());
+        }
+        out
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -38537,6 +38600,118 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert!(both.includes(LogSource::ReaperDown));
             assert!(!both.includes(LogSource::App));
             assert_eq!(both.label(), "On-Call: Reaper Down, Pingdom");
+        }
+
+        fn health_input<'a>(
+            priority: &'a [String],
+            visible: &'a [String],
+            settled: &'a HashSet<String>,
+            denied: &'a HashSet<String>,
+            account_of: &'a HashMap<String, String>,
+            in_flight: usize,
+        ) -> HealthRequestInput<'a> {
+            HealthRequestInput {
+                priority,
+                visible,
+                settled,
+                denied_accounts: denied,
+                account_of,
+                in_flight,
+                max_in_flight: MAX_HEALTH_IN_FLIGHT,
+            }
+        }
+
+        /// The configured apps are answered before whatever happens to be on
+        /// screen — that is the whole point of the priority list.
+        #[test]
+        fn priority_groups_are_asked_about_before_visible_ones() {
+            let priority = vec!["arn:p".to_string()];
+            let visible = vec!["arn:v".to_string()];
+            let settled = HashSet::new();
+            let denied = HashSet::new();
+            let account_of = HashMap::new();
+            let out = health_requests(&health_input(
+                &priority, &visible, &settled, &denied, &account_of, 0,
+            ));
+            assert_eq!(out, vec!["arn:p".to_string(), "arn:v".to_string()]);
+        }
+
+        /// Without this the table issues one call per row on every single frame,
+        /// which is sixty calls a second per visible group.
+        #[test]
+        fn a_group_already_known_or_in_flight_is_not_asked_about_again() {
+            let visible = vec!["arn:a".to_string(), "arn:b".to_string()];
+            let mut settled = HashSet::new();
+            settled.insert("arn:a".to_string());
+            let denied = HashSet::new();
+            let account_of = HashMap::new();
+            let out = health_requests(&health_input(
+                &[], &visible, &settled, &denied, &account_of, 0,
+            ));
+            assert_eq!(out, vec!["arn:b".to_string()]);
+        }
+
+        /// A role that can list target groups but not read their health must cost
+        /// one refused call, not one per row for as long as somebody scrolls.
+        #[test]
+        fn nothing_is_asked_of_an_account_that_already_refused() {
+            let visible = vec!["arn:a".to_string(), "arn:b".to_string()];
+            let settled = HashSet::new();
+            let mut denied = HashSet::new();
+            denied.insert("1111".to_string());
+            let mut account_of = HashMap::new();
+            account_of.insert("arn:a".to_string(), "1111".to_string());
+            account_of.insert("arn:b".to_string(), "2222".to_string());
+            let out = health_requests(&health_input(
+                &[], &visible, &settled, &denied, &account_of, 0,
+            ));
+            assert_eq!(out, vec!["arn:b".to_string()]);
+        }
+
+        /// The concurrency limit counts what is already running, or a fast scroll
+        /// queues hundreds of threads at once.
+        #[test]
+        fn the_in_flight_limit_counts_what_is_already_running() {
+            let visible: Vec<String> = (0..20).map(|i| format!("arn:{i}")).collect();
+            let settled = HashSet::new();
+            let denied = HashSet::new();
+            let account_of = HashMap::new();
+            let out = health_requests(&health_input(
+                &[], &visible, &settled, &denied, &account_of, 4,
+            ));
+            assert_eq!(out.len(), MAX_HEALTH_IN_FLIGHT - 4);
+        }
+
+        /// A group that is both configured as priority and currently on screen is
+        /// one request, not two.
+        #[test]
+        fn a_group_that_is_both_priority_and_visible_is_asked_once() {
+            let arns = vec!["arn:a".to_string()];
+            let settled = HashSet::new();
+            let denied = HashSet::new();
+            let account_of = HashMap::new();
+            let out = health_requests(&health_input(
+                &arns, &arns, &settled, &denied, &account_of, 0,
+            ));
+            assert_eq!(out, vec!["arn:a".to_string()]);
+        }
+
+        /// Already at the limit, nothing more is started.
+        #[test]
+        fn at_the_health_limit_nothing_is_started() {
+            let visible = vec!["arn:a".to_string()];
+            let settled = HashSet::new();
+            let denied = HashSet::new();
+            let account_of = HashMap::new();
+            let out = health_requests(&health_input(
+                &[],
+                &visible,
+                &settled,
+                &denied,
+                &account_of,
+                MAX_HEALTH_IN_FLIGHT,
+            ));
+            assert!(out.is_empty());
         }
     }
 }
