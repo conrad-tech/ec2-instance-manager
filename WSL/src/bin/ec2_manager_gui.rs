@@ -34,7 +34,7 @@ mod gui {
     use ec2_manager::vault_iam::{self, VaultIamDeleteRequest, VaultIamRequest};
     use ec2_manager::connection_tabs::ConnectionTabs;
     use ec2_manager::diagnostics::run_diagnostics;
-    use ec2_manager::elb::{self, FetchError, HealthSummary, Target, TargetGroup};
+    use ec2_manager::elb::{self, FetchError, HealthSummary, LoadBalancer, Target, TargetGroup};
     use ec2_manager::error::{AppError, Result};
     use ec2_manager::filter::{
         apply_filters, build_matchers, matching_tags, parse_tag_term, tag_term_matches,
@@ -540,6 +540,14 @@ mod gui {
             account_id: String,
             cache_key: String,
             result: std::result::Result<Vec<TargetGroup>, FetchError>,
+        },
+        /// One account's load balancer list landed. Same shape as
+        /// `TargetGroupList`, including the cache key stamped at spawn — see
+        /// its comment for why the handler must not re-derive it.
+        LoadBalancerList {
+            account_id: String,
+            cache_key: String,
+            result: std::result::Result<Vec<LoadBalancer>, FetchError>,
         },
         /// One target group's health landed.
         TargetGroupHealth {
@@ -7744,6 +7752,13 @@ mod gui {
         /// means "whatever `tg_auto_widths` says", so a column the user has
         /// never touched keeps following its content.
         tg_col_widths: HashMap<usize, f32>,
+        /// Load balancers per cache key — the same arrangement as
+        /// `target_groups`, and for the same reasons.
+        load_balancers: HashMap<String, (Instant, Vec<LoadBalancer>)>,
+        lb_list_loading: HashSet<String>,
+        lb_list_errors: HashMap<String, String>,
+        lb_list_failures: HashMap<String, Instant>,
+        lb_col_widths: HashMap<usize, f32>,
         /// `resources.priority_target_groups`, read once at startup.
         ///
         /// There is **no `self.features`** on this struct: `App::new` holds
@@ -8575,6 +8590,11 @@ mod gui {
                 tg_priority_warned: None,
                 tg_fill_warned: None,
                 tg_col_widths: HashMap::new(),
+                load_balancers: HashMap::new(),
+                lb_list_loading: HashSet::new(),
+                lb_list_errors: HashMap::new(),
+                lb_list_failures: HashMap::new(),
+                lb_col_widths: HashMap::new(),
                 // `features` is the local in `App::new`, the same one
                 // `instance_power_enabled` below is resolved from.
                 tg_priority_patterns: features.resources.priority_target_groups.clone(),
@@ -20256,6 +20276,58 @@ mod gui {
                             }
                         }
                     }
+                    ProcEvent::LoadBalancerList {
+                        account_id,
+                        cache_key,
+                        result,
+                    } => {
+                        // Applied only while this reply is still the one being
+                        // waited on: Refresh clears the set, and a reply that
+                        // was already in flight then must not land afterwards
+                        // stamped as fresh. Same rule as `TargetGroupList`.
+                        if !self.lb_list_loading.remove(&cache_key) {
+                            self.log_debug(format!(
+                                "load balancers: dropping a reply for {cache_key} that \
+                                 Refresh already superseded"
+                            ));
+                            continue;
+                        }
+                        match result {
+                            Ok(lbs) => {
+                                self.log_info(format!(
+                                    "load balancers: {} in account {account_id}",
+                                    lbs.len()
+                                ));
+                                self.lb_list_failures.remove(&cache_key);
+                                remember_list_error(&mut self.lb_list_errors, &account_id, None);
+                                self.load_balancers.insert(cache_key, (Instant::now(), lbs));
+                            }
+                            Err(err) => {
+                                let msg = err.message();
+                                let news = list_error_is_news(
+                                    &self.lb_list_errors,
+                                    &account_id,
+                                    &msg,
+                                );
+                                if news {
+                                    self.log_error(format!(
+                                        "load balancers: account {account_id}: {msg}"
+                                    ));
+                                } else {
+                                    self.log_debug(format!(
+                                        "load balancers: account {account_id}: {msg} \
+                                         (unchanged)"
+                                    ));
+                                }
+                                self.lb_list_failures.insert(cache_key, Instant::now());
+                                remember_list_error(
+                                    &mut self.lb_list_errors,
+                                    &account_id,
+                                    Some(msg),
+                                );
+                            }
+                        }
+                    }
                     ProcEvent::TargetGroupHealth {
                         arn,
                         account_id,
@@ -23442,12 +23514,288 @@ mod gui {
                 ui.label(sim_resource_note(kind));
                 return;
             }
-            if kind != ResourceKind::TargetGroup {
-                ui.label(format!("{} is not built yet.", kind.label()));
+            match kind {
+                ResourceKind::TargetGroup => {
+                    self.ensure_target_groups();
+                    self.render_target_groups(ui);
+                }
+                ResourceKind::LoadBalancer => {
+                    self.ensure_load_balancers();
+                    self.render_load_balancers(ui);
+                }
+                other => {
+                    ui.label(format!("{} is not built yet.", other.label()));
+                }
+            }
+        }
+
+        /// Start a list fetch for any account whose load balancers are missing
+        /// or stale.
+        ///
+        /// Mirrors `ensure_target_groups`, failure cooldown included — without
+        /// it a permissions failure re-spawns an `aws` process every frame.
+        fn ensure_load_balancers(&mut self) {
+            let mode = self.options.mode.as_str().to_string();
+            for account in self.resource_pool_accounts() {
+                let key = account.cache_key(ResourceKind::LoadBalancer, &mode);
+                let fresh = self
+                    .load_balancers
+                    .get(&key)
+                    .is_some_and(|(at, _)| at.elapsed() <= resources::RESOURCE_TTL);
+                if !list_fetch_due(
+                    fresh,
+                    self.lb_list_loading.contains(&key),
+                    self.lb_list_failures.get(&key).map(Instant::elapsed),
+                    resources::RESOURCE_TTL,
+                ) {
+                    continue;
+                }
+                self.lb_list_loading.insert(key.clone());
+                let tx = self.proc_tx.clone();
+                let (p, r, a) = (
+                    account.profile.clone(),
+                    account.region.clone(),
+                    account.account_id.clone(),
+                );
+                let repaint = self.egui_ctx.clone();
+                std::thread::spawn(move || {
+                    let result = elb::fetch_load_balancers(&p, &r, &a);
+                    let _ = tx.send(ProcEvent::LoadBalancerList {
+                        account_id: a,
+                        cache_key: key,
+                        result,
+                    });
+                    if let Some(ctx) = &repaint {
+                        ctx.request_repaint();
+                    }
+                });
+            }
+        }
+
+        /// The cache keys of the accounts currently in the pool.
+        fn current_load_balancer_keys(&self) -> Vec<String> {
+            let mode = self.options.mode.as_str().to_string();
+            self.resource_pool_accounts()
+                .iter()
+                .map(|a| a.cache_key(ResourceKind::LoadBalancer, &mode))
+                .collect()
+        }
+
+        /// The load balancers the search box leaves visible, from every account
+        /// in the pool.
+        ///
+        /// Reads only the current pool's keys, so an account since unchecked —
+        /// or a region since switched away from — does not leave its rows on
+        /// screen. The cache keeps them; only the display is scoped.
+        fn filtered_load_balancers(&self) -> Vec<LoadBalancer> {
+            let (includes, excludes) = search_terms_from_rules(&self.search_rules);
+            let include_matchers = build_matchers(&includes);
+            let exclude_matchers = build_matchers(&excludes);
+
+            let mut rows: Vec<LoadBalancer> = self
+                .current_load_balancer_keys()
+                .iter()
+                .filter_map(|k| self.load_balancers.get(k))
+                .flat_map(|(_, lbs)| lbs.iter().cloned())
+                .filter(|lb| {
+                    text_matches(
+                        &elb::load_balancer_searchable_text(lb),
+                        &include_matchers,
+                        &exclude_matchers,
+                    )
+                })
+                .collect();
+            rows.sort_by(|a, b| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+                    .then_with(|| a.account_id.cmp(&b.account_id))
+            });
+            rows
+        }
+
+        fn render_load_balancers(&mut self, ui: &mut egui::Ui) {
+            let rows = self.filtered_load_balancers();
+            let total: usize = self
+                .current_load_balancer_keys()
+                .iter()
+                .filter_map(|k| self.load_balancers.get(k))
+                .map(|(_, lbs)| lbs.len())
+                .sum();
+
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "Load balancers: {} filtered / {total} total",
+                    rows.len()
+                ));
+                if ui.button("Refresh").clicked() {
+                    self.load_balancers.clear();
+                    self.lb_list_loading.clear();
+                    self.lb_list_errors.clear();
+                    self.lb_list_failures.clear();
+                }
+            });
+
+            // Named accounts that could not be listed, shown even when others
+            // returned rows: one AccessDenied must not blank a pool, and its
+            // absence must not be invisible either.
+            if let Some(detail) = list_error_detail(&self.lb_list_errors) {
+                note_label(
+                    ui,
+                    egui::Color32::RED,
+                    format!("Could not list Load Balancers: {detail}"),
+                );
+            }
+
+            if !self.lb_list_loading.is_empty() {
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
+
+            if rows.is_empty() {
+                ui.label(resource_empty_note(
+                    ResourceKind::LoadBalancer,
+                    !self.lb_list_loading.is_empty(),
+                    list_error_detail(&self.lb_list_errors).as_deref(),
+                ));
                 return;
             }
-            self.ensure_target_groups();
-            self.render_target_groups(ui);
+
+            let auto = lb_auto_widths(&rows);
+            let overrides = self.lb_col_widths.clone();
+            let mut pending_detail: Option<LoadBalancer> = None;
+            let mut pending_width: Option<(usize, f32)> = None;
+
+            egui::ScrollArea::both()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .show(ui, |ui| {
+                    let cw =
+                        |idx: usize| -> f32 { overrides.get(&idx).copied().unwrap_or(auto[idx]) };
+                    egui::Grid::new("load_balancer_grid")
+                        .striped(true)
+                        .min_col_width(0.0)
+                        .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
+                        .show(ui, |ui| {
+                            for (idx, label) in LB_COLUMN_LABELS.iter().enumerate() {
+                                let width = cw(idx);
+                                let cell = ui.allocate_ui_with_layout(
+                                    egui::vec2(width, TG_ROW_H),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(*label).strong(),
+                                            )
+                                            .wrap_mode(egui::TextWrapMode::Truncate),
+                                        )
+                                    },
+                                );
+                                let resp = cell.response;
+                                let drag_id = ui.id().with(("lb_col_resize", idx));
+                                let near_right = ui.input(|i| {
+                                    i.pointer.hover_pos().is_some_and(|pos| {
+                                        resp.rect.contains(pos)
+                                            && pos.x > resp.rect.right() - 8.0
+                                    })
+                                });
+                                if near_right || ui.ctx().is_being_dragged(drag_id) {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+                                    let x = resp.rect.right();
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(x, resp.rect.top()),
+                                            egui::pos2(x, resp.rect.bottom()),
+                                        ],
+                                        egui::Stroke::new(2.0, ui.visuals().text_color()),
+                                    );
+                                    let drag = ui.interact(
+                                        egui::Rect::from_min_size(
+                                            resp.rect.right_top() - egui::vec2(8.0, 0.0),
+                                            egui::vec2(16.0, resp.rect.height()),
+                                        ),
+                                        drag_id,
+                                        egui::Sense::drag(),
+                                    );
+                                    if drag.dragged() {
+                                        pending_width = Some((
+                                            idx,
+                                            (width + drag.drag_delta().x).max(TG_COL_MIN_W),
+                                        ));
+                                    }
+                                }
+                            }
+                            ui.end_row();
+
+                            for lb in &rows {
+                                let name_cell = ui.allocate_ui_with_layout(
+                                    egui::vec2(cw(0), TG_ROW_H),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(lb.name.clone())
+                                                .wrap_mode(egui::TextWrapMode::Truncate)
+                                                .sense(egui::Sense::click()),
+                                        )
+                                    },
+                                );
+                                name_cell
+                                    .inner
+                                    .on_hover_text(lb.name.clone())
+                                    .context_menu(|ui| {
+                                        if ui.button("See Details").clicked() {
+                                            pending_detail = Some(lb.clone());
+                                            ui.close();
+                                        }
+                                    });
+
+                                tg_cell(ui, cw(1), TG_ROW_H, elb::load_balancer_kind_label(lb))
+                                    .on_hover_text(lb.kind.clone());
+                                tg_cell(
+                                    ui,
+                                    cw(2),
+                                    TG_ROW_H,
+                                    lb.scheme.clone().unwrap_or_else(|| "—".to_string()),
+                                );
+
+                                let state = match lb_state_colour(&lb.state) {
+                                    Some(c) => notification_text(ui, c, lb.state.clone()),
+                                    None => egui::RichText::new(lb.state.clone()),
+                                };
+                                tg_cell(ui, cw(3), TG_ROW_H, state);
+
+                                // The one field people copy out of this table,
+                                // so it carries the Inventory table's own copy
+                                // button rather than making somebody select
+                                // text out of a truncating cell.
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(cw(4), TG_ROW_H),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        Self::paint_copy_button(
+                                            ui,
+                                            &lb.dns_name,
+                                            "Copy DNS name",
+                                        );
+                                        ui.add(
+                                            egui::Label::new(lb.dns_name.clone())
+                                                .wrap_mode(egui::TextWrapMode::Truncate),
+                                        )
+                                        .on_hover_text(lb.dns_name.clone());
+                                    },
+                                );
+                                ui.end_row();
+                            }
+                        });
+                });
+
+            if let Some((idx, w)) = pending_width {
+                self.lb_col_widths.insert(idx, w);
+            }
+            if let Some(lb) = pending_detail {
+                self.log_info(format!(
+                    "load balancer detail view is not built yet: {}",
+                    lb.name
+                ));
+            }
         }
 
         /// Start a list fetch for any account in the pool whose entry is
@@ -33323,6 +33671,63 @@ mod gui {
             .collect()
     }
 
+    /// The Load Balancers table's columns.
+    ///
+    /// Five, not the spec's seven: VPC and Account came out for the same
+    /// reason they came out of the Target Groups table — true, but rarely
+    /// looked at, and both stay searchable and in the detail view. DNS name
+    /// earns its place because it is the thing people actually copy out of
+    /// this table.
+    const LB_COLUMN_LABELS: [&str; 5] = ["Name", "Type", "Scheme", "State", "DNS name"];
+
+    const LB_MIN_COL_W: [f32; 5] = [180.0, 60.0, 110.0, 110.0, 260.0];
+    const LB_MAX_COL_W: [f32; 5] = [520.0, 90.0, 150.0, 160.0, 620.0];
+
+    /// Each column sized to its widest cell and clamped — `tg_auto_widths` for
+    /// the other table, and the same reasoning: sized to content with a
+    /// horizontal scrollbar, never divided out of the window's width.
+    fn lb_auto_widths(rows: &[LoadBalancer]) -> [f32; 5] {
+        let text_w = |s: &str| s.chars().count() as f32 * TG_CHAR_W + 8.0;
+        let mut out = [0.0f32; 5];
+        for (idx, label) in LB_COLUMN_LABELS.iter().enumerate() {
+            out[idx] = text_w(label) + 6.0;
+        }
+        for lb in rows {
+            let cells = [
+                text_w(&lb.name),
+                text_w(&elb::load_balancer_kind_label(lb)),
+                text_w(lb.scheme.as_deref().unwrap_or("—")),
+                text_w(&lb.state),
+                // The copy button sits in this cell too.
+                text_w(&lb.dns_name) + COL_COPY_W,
+            ];
+            for (idx, w) in cells.iter().enumerate() {
+                out[idx] = out[idx].max(*w);
+            }
+        }
+        for idx in 0..out.len() {
+            out[idx] = out[idx].clamp(LB_MIN_COL_W[idx], LB_MAX_COL_W[idx]);
+        }
+        out
+    }
+
+    /// The colour for a load balancer's state, or `None` to leave it alone.
+    ///
+    /// `active` is the boring answer and gets no colour at all rather than
+    /// green: a table where every row is coloured has said nothing, and the
+    /// point of colouring this column is that the rare states stand out.
+    /// `active_impaired` is amber despite containing the word active — it is
+    /// not a working load balancer, and matching on a prefix would call it one.
+    fn lb_state_colour(state: &str) -> Option<egui::Color32> {
+        match state {
+            "active" => None,
+            "failed" => Some(egui::Color32::RED),
+            // provisioning, active_impaired, and anything the API grows later:
+            // not broken, not finished, worth looking at.
+            _ => Some(egui::Color32::YELLOW),
+        }
+    }
+
     const TG_COLUMN_LABELS: [&str; 4] = ["Name", "Protocol:Port", "Healthy/Total", "Path"];
 
     /// Does a search narrow the table enough that every row it left should be
@@ -40767,6 +41172,60 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             );
         }
 
+        /// `active` is the one state that gets no colour.
+        ///
+        /// A table where every row is coloured has said nothing; the point of
+        /// colouring this column is that the rare states stand out. And
+        /// `active_impaired` must NOT be green despite containing the word
+        /// active — it is not a working load balancer, which is exactly what a
+        /// `starts_with("active")` would have called it.
+        #[test]
+        fn only_an_unusual_load_balancer_state_is_coloured() {
+            assert_eq!(lb_state_colour("active"), None);
+            assert_eq!(lb_state_colour("failed"), Some(egui::Color32::RED));
+            assert_eq!(
+                lb_state_colour("active_impaired"),
+                Some(egui::Color32::YELLOW)
+            );
+            assert_eq!(lb_state_colour("provisioning"), Some(egui::Color32::YELLOW));
+            // A state the API grows later is worth looking at, not ignored.
+            assert_eq!(lb_state_colour("something-new"), Some(egui::Color32::YELLOW));
+        }
+
+        /// The load balancer columns follow their content and clamp, exactly as
+        /// the target group ones do.
+        #[test]
+        fn load_balancer_columns_are_sized_to_their_content_and_clamped() {
+            let short = LoadBalancer {
+                name: "a".to_string(),
+                dns_name: "a".to_string(),
+                ..Default::default()
+            };
+            let narrow = lb_auto_widths(std::slice::from_ref(&short));
+            for idx in 0..LB_COLUMN_LABELS.len() {
+                assert_eq!(
+                    narrow[idx], LB_MIN_COL_W[idx],
+                    "column {idx} should sit at its floor for tiny content"
+                );
+            }
+
+            // A long DNS name widens its own column and no other, and stops at
+            // the ceiling rather than pushing the rest off screen.
+            let mut long = short.clone();
+            long.dns_name = "d".repeat(300);
+            let wide = lb_auto_widths(std::slice::from_ref(&long));
+            assert_eq!(wide[4], LB_MAX_COL_W[4]);
+            for idx in 0..LB_COLUMN_LABELS.len() - 1 {
+                assert_eq!(wide[idx], narrow[idx], "column {idx} must not move");
+            }
+
+            // An empty table still yields usable columns rather than zeros.
+            let empty = lb_auto_widths(&[]);
+            for idx in 0..LB_COLUMN_LABELS.len() {
+                assert!(empty[idx] >= LB_MIN_COL_W[idx]);
+            }
+        }
+
         /// Every column is sized to its own widest cell and clamped, and the
         /// table does NOT fill the window.
         ///
@@ -41016,17 +41475,35 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 arm.contains("if !self.tg_list_loading.remove(&cache_key)"),
                 "the handler must apply a reply only while it is still claimed:\n{arm}"
             );
-            // And the Refresh button must clear the set in the first place, or
-            // an account with a fetch in flight is skipped and never refetched.
-            let refresh = src
-                .find("if ui.button(\"Refresh\").clicked() {")
-                .map(|i| &src[i..i + 1400])
-                .expect("the target groups Refresh button");
-            for cleared in [
-                "self.tg_list_loading.clear()",
-                "self.tg_list_failures.clear()",
+            // And each table's Refresh button must clear its own in-flight set
+            // in the first place, or an account with a fetch running is skipped
+            // and never refetched.
+            //
+            // Scoped to the function that owns each button, not to "the first
+            // Refresh in the file" — that was fine while one table existed and
+            // silently started checking the wrong one the moment a second was
+            // added.
+            for (func, cleared) in [
+                (
+                    "fn render_target_groups",
+                    ["self.tg_list_loading.clear()", "self.tg_list_failures.clear()"],
+                ),
+                (
+                    "fn render_load_balancers",
+                    ["self.lb_list_loading.clear()", "self.lb_list_failures.clear()"],
+                ),
             ] {
-                assert!(refresh.contains(cleared), "Refresh must run {cleared}");
+                let body_start = src.find(func).unwrap_or_else(|| panic!("{func}"));
+                let refresh = src[body_start..]
+                    .find("if ui.button(\"Refresh\").clicked() {")
+                    .map(|i| &src[body_start + i..body_start + i + 1400])
+                    .unwrap_or_else(|| panic!("{func} has no Refresh button"));
+                for needle in cleared {
+                    assert!(
+                        refresh.contains(needle),
+                        "{func}'s Refresh must run {needle}"
+                    );
+                }
             }
         }
 

@@ -439,9 +439,649 @@ pub fn parse_elb_tags(raw: &str) -> Vec<(String, String)> {
     out
 }
 
+/// One application or network load balancer, as the Load Balancers sub-tab
+/// lists it.
+///
+/// Classic ELB (the `elb` API) is a different service and is deliberately not
+/// covered — see this module's header.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LoadBalancer {
+    pub arn: String,
+    pub name: String,
+    pub dns_name: String,
+    /// `application`, `network` or `gateway`, as the API spells it.
+    pub kind: String,
+    /// `internet-facing` or `internal`.
+    pub scheme: Option<String>,
+    /// `State.Code`: `active`, `provisioning`, `active_impaired` or `failed`.
+    pub state: String,
+    pub vpc_id: Option<String>,
+    pub created: Option<String>,
+    pub ip_address_type: Option<String>,
+    /// Zone name and subnet, one per entry.
+    pub zones: Vec<(String, String)>,
+    /// Absent on a network load balancer, which historically has none — an
+    /// empty list and "this kind does not have them" are different facts.
+    pub security_groups: Vec<String>,
+    /// Stamped in by the caller from the AWS context, as `TargetGroup`'s is.
+    pub account_id: String,
+}
+
+/// One listener on a load balancer.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Listener {
+    pub arn: String,
+    pub protocol: Option<String>,
+    pub port: Option<u16>,
+    /// What the listener does with a request no rule matched — usually
+    /// `forward -> <target group name>`, sometimes a redirect or a fixed
+    /// response.
+    pub default_action: String,
+    pub certificate_count: usize,
+    pub ssl_policy: Option<String>,
+}
+
+/// One rule on a listener, in priority order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ListenerRule {
+    /// `default` for the catch-all, otherwise a number as a string — the API
+    /// reports it that way and sorting is done on the parsed value.
+    pub priority: String,
+    pub conditions: Vec<String>,
+    pub action: String,
+}
+
+/// Read `elbv2 describe-load-balancers --output json`.
+///
+/// Empty on unreadable input, for the reason `parse_target_groups` is: this
+/// fills one table, and the caller tells an empty account from a failed call
+/// by whether the *fetch* returned `Err`.
+pub fn parse_load_balancers(raw: &str) -> Vec<LoadBalancer> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(entries) = value.get("LoadBalancers").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<LoadBalancer> = entries
+        .iter()
+        .map(|lb| LoadBalancer {
+            arn: str_field(lb, "LoadBalancerArn").unwrap_or_default(),
+            name: str_field(lb, "LoadBalancerName").unwrap_or_default(),
+            dns_name: str_field(lb, "DNSName").unwrap_or_default(),
+            kind: str_field(lb, "Type").unwrap_or_default(),
+            scheme: str_field(lb, "Scheme"),
+            state: lb
+                .get("State")
+                .and_then(|s| str_field(s, "Code"))
+                .unwrap_or_else(|| "unknown".to_string()),
+            vpc_id: str_field(lb, "VpcId"),
+            created: str_field(lb, "CreatedTime"),
+            ip_address_type: str_field(lb, "IpAddressType"),
+            zones: lb
+                .get("AvailabilityZones")
+                .and_then(|z| z.as_array())
+                .map(|zones| {
+                    zones
+                        .iter()
+                        .map(|z| {
+                            (
+                                str_field(z, "ZoneName").unwrap_or_default(),
+                                str_field(z, "SubnetId").unwrap_or_default(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            security_groups: lb
+                .get("SecurityGroups")
+                .and_then(|g| g.as_array())
+                .map(|g| g.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default(),
+            account_id: String::new(),
+        })
+        .collect();
+
+    // The API's order is not stable between calls.
+    out.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.arn.cmp(&b.arn))
+    });
+    out
+}
+
+/// `ALB` / `NLB` / `GWLB`, or the API's own word if it ever grows a fourth.
+///
+/// The table has no room for `application`, and nobody says it out loud
+/// either. The raw value stays searchable — see `load_balancer_searchable_text`
+/// — so typing `application` still finds it.
+pub fn load_balancer_kind_label(lb: &LoadBalancer) -> String {
+    match lb.kind.as_str() {
+        "application" => "ALB".to_string(),
+        "network" => "NLB".to_string(),
+        "gateway" => "GWLB".to_string(),
+        "" => "—".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The whole haystack the search box filters a load balancer row on.
+///
+/// **Every column the table shows must appear here**, plus the fields the
+/// table dropped — the account, the VPC and the API's own spelling of the
+/// type — so a search still reaches them even though no column does.
+pub fn load_balancer_searchable_text(lb: &LoadBalancer) -> String {
+    let mut out = String::new();
+    for field in [
+        lb.name.as_str(),
+        lb.arn.as_str(),
+        lb.dns_name.as_str(),
+        lb.kind.as_str(),
+        lb.state.as_str(),
+        lb.account_id.as_str(),
+    ] {
+        out.push_str(&field.to_ascii_lowercase());
+        out.push('\n');
+    }
+    out.push_str(&load_balancer_kind_label(lb).to_ascii_lowercase());
+    out.push('\n');
+    for v in [lb.scheme.as_deref(), lb.vpc_id.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        out.push_str(&v.to_ascii_lowercase());
+        out.push('\n');
+    }
+    for (zone, subnet) in &lb.zones {
+        out.push_str(&zone.to_ascii_lowercase());
+        out.push('\n');
+        out.push_str(&subnet.to_ascii_lowercase());
+        out.push('\n');
+    }
+    out
+}
+
+/// Read `elbv2 describe-listeners --output json`.
+pub fn parse_listeners(raw: &str) -> Vec<Listener> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(entries) = value.get("Listeners").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<Listener> = entries
+        .iter()
+        .map(|l| Listener {
+            arn: str_field(l, "ListenerArn").unwrap_or_default(),
+            protocol: str_field(l, "Protocol"),
+            port: l.get("Port").and_then(|p| p.as_u64()).map(|p| p as u16),
+            default_action: describe_actions(l.get("DefaultActions")),
+            certificate_count: l
+                .get("Certificates")
+                .and_then(|c| c.as_array())
+                .map(|c| c.len())
+                .unwrap_or(0),
+            ssl_policy: str_field(l, "SslPolicy"),
+        })
+        .collect();
+    // By port, which is how anyone looking for one thinks of it.
+    out.sort_by_key(|l| l.port.unwrap_or(u16::MAX));
+    out
+}
+
+/// Read `elbv2 describe-rules --output json`, in priority order.
+pub fn parse_listener_rules(raw: &str) -> Vec<ListenerRule> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(entries) = value.get("Rules").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<ListenerRule> = entries
+        .iter()
+        .map(|r| ListenerRule {
+            priority: str_field(r, "Priority").unwrap_or_else(|| "default".to_string()),
+            conditions: describe_conditions(r.get("Conditions")),
+            action: describe_actions(r.get("Actions")),
+        })
+        .collect();
+    // Numeric where it is a number; the catch-all sorts last, which is where
+    // it fires.
+    out.sort_by_key(|r| r.priority.parse::<u32>().unwrap_or(u32::MAX));
+    out
+}
+
+/// One human sentence for a rule's actions.
+///
+/// A forward names its target group by NAME, taken from the ARN's own path,
+/// not the whole ARN: the ARN is 100-odd characters of which about ten carry
+/// the answer, and the panel is read, not parsed.
+fn describe_actions(actions: Option<&serde_json::Value>) -> String {
+    let Some(actions) = actions.and_then(|a| a.as_array()) else {
+        return "—".to_string();
+    };
+    let parts: Vec<String> = actions
+        .iter()
+        .map(|a| {
+            let kind = str_field(a, "Type").unwrap_or_else(|| "?".to_string());
+            match kind.as_str() {
+                "forward" => {
+                    let names = forward_target_names(a);
+                    if names.is_empty() {
+                        "forward".to_string()
+                    } else {
+                        format!("forward -> {}", names.join(", "))
+                    }
+                }
+                "redirect" => {
+                    let code = a
+                        .get("RedirectConfig")
+                        .and_then(|c| str_field(c, "StatusCode"))
+                        .unwrap_or_default();
+                    format!("redirect {code}").trim_end().to_string()
+                }
+                "fixed-response" => {
+                    let code = a
+                        .get("FixedResponseConfig")
+                        .and_then(|c| str_field(c, "StatusCode"))
+                        .unwrap_or_default();
+                    format!("fixed {code}").trim_end().to_string()
+                }
+                other => other.to_string(),
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join("; ")
+    }
+}
+
+/// The target group names a forward action points at.
+///
+/// Both shapes the API uses: a single `TargetGroupArn`, and the weighted
+/// `ForwardConfig.TargetGroups` list. A rule written in the console produces
+/// the first; one written by Terraform often produces the second, and reading
+/// only one of them makes half the rules look actionless.
+fn forward_target_names(action: &serde_json::Value) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    if let Some(arn) = str_field(action, "TargetGroupArn") {
+        names.push(target_group_name_from_arn(&arn));
+    }
+    if let Some(groups) = action
+        .get("ForwardConfig")
+        .and_then(|c| c.get("TargetGroups"))
+        .and_then(|g| g.as_array())
+    {
+        for g in groups {
+            if let Some(arn) = str_field(g, "TargetGroupArn") {
+                let name = target_group_name_from_arn(&arn);
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    names
+}
+
+/// `…:targetgroup/app-web/73e2d6bc` -> `app-web`.
+///
+/// Falls back to the whole string rather than to nothing: a shape this does
+/// not recognise is better shown than swallowed.
+fn target_group_name_from_arn(arn: &str) -> String {
+    arn.split("targetgroup/")
+        .nth(1)
+        .and_then(|tail| tail.split('/').next())
+        .unwrap_or(arn)
+        .to_string()
+}
+
+/// One sentence per rule condition.
+fn describe_conditions(conditions: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(conditions) = conditions.and_then(|c| c.as_array()) else {
+        return Vec::new();
+    };
+    conditions
+        .iter()
+        .map(|c| {
+            let field = str_field(c, "Field").unwrap_or_else(|| "?".to_string());
+            // `Values` is the old spelling and the per-field config the new
+            // one; a rule made in the console carries the config, so reading
+            // only `Values` shows an empty condition on most modern rules.
+            let mut values: Vec<String> = c
+                .get("Values")
+                .and_then(|v| v.as_array())
+                .map(|v| v.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            for key in [
+                "HostHeaderConfig",
+                "PathPatternConfig",
+                "HttpRequestMethodConfig",
+                "SourceIpConfig",
+            ] {
+                if let Some(vs) = c.get(key).and_then(|k| k.get("Values")).and_then(|v| v.as_array()) {
+                    for v in vs {
+                        if let Some(s) = v.as_str() {
+                            if !values.iter().any(|existing| existing == s) {
+                                values.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            if values.is_empty() {
+                field
+            } else {
+                format!("{field} = {}", values.join(", "))
+            }
+        })
+        .collect()
+}
+
+/// Every load balancer in one account and region.
+pub fn fetch_load_balancers(
+    profile: &str,
+    region: &str,
+    account_id: &str,
+) -> std::result::Result<Vec<LoadBalancer>, FetchError> {
+    let raw = run(
+        profile,
+        region,
+        &["elbv2", "describe-load-balancers", "--output", "json"],
+    )?;
+    let mut lbs = parse_load_balancers(&raw);
+    for lb in &mut lbs {
+        lb.account_id = account_id.to_string();
+    }
+    Ok(lbs)
+}
+
+/// One load balancer's listeners.
+pub fn fetch_listeners(
+    profile: &str,
+    region: &str,
+    lb_arn: &str,
+) -> std::result::Result<Vec<Listener>, FetchError> {
+    let raw = run(
+        profile,
+        region,
+        &[
+            "elbv2",
+            "describe-listeners",
+            "--load-balancer-arn",
+            lb_arn,
+            "--output",
+            "json",
+        ],
+    )?;
+    Ok(parse_listeners(&raw))
+}
+
+/// One listener's rules.
+pub fn fetch_listener_rules(
+    profile: &str,
+    region: &str,
+    listener_arn: &str,
+) -> std::result::Result<Vec<ListenerRule>, FetchError> {
+    let raw = run(
+        profile,
+        region,
+        &[
+            "elbv2",
+            "describe-rules",
+            "--listener-arn",
+            listener_arn,
+            "--output",
+            "json",
+        ],
+    )?;
+    Ok(parse_listener_rules(&raw))
+}
+
+/// A load balancer's attributes, as sorted name/value pairs.
+///
+/// Same reply shape as a target group's, so it shares the parser.
+pub fn fetch_load_balancer_attributes(
+    profile: &str,
+    region: &str,
+    lb_arn: &str,
+) -> std::result::Result<Vec<(String, String)>, FetchError> {
+    let raw = run(
+        profile,
+        region,
+        &[
+            "elbv2",
+            "describe-load-balancer-attributes",
+            "--load-balancer-arn",
+            lb_arn,
+            "--output",
+            "json",
+        ],
+    )?;
+    Ok(parse_target_group_attributes(&raw))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real `describe-load-balancers` payload: an internet-facing ALB with
+    /// security groups, and an internal NLB with none.
+    const LOAD_BALANCERS_JSON: &str = r#"{
+      "LoadBalancers": [
+        {
+          "LoadBalancerArn": "arn:aws:elasticloadbalancing:us-east-1:111122223333:loadbalancer/net/zulu-nlb/abc123",
+          "DNSName": "zulu-nlb-abc123.elb.us-east-1.amazonaws.com",
+          "CreatedTime": "2026-02-01T09:00:00.000Z",
+          "LoadBalancerName": "zulu-nlb",
+          "Scheme": "internal",
+          "VpcId": "vpc-3ac0fb5f",
+          "State": { "Code": "provisioning" },
+          "Type": "network",
+          "AvailabilityZones": [ { "ZoneName": "us-east-1a", "SubnetId": "subnet-1" } ],
+          "IpAddressType": "ipv4"
+        },
+        {
+          "LoadBalancerArn": "arn:aws:elasticloadbalancing:us-east-1:111122223333:loadbalancer/app/alpha-alb/50dc6c49",
+          "DNSName": "alpha-alb-50dc6c49.us-east-1.elb.amazonaws.com",
+          "CreatedTime": "2026-01-15T10:30:00.000Z",
+          "LoadBalancerName": "alpha-alb",
+          "Scheme": "internet-facing",
+          "VpcId": "vpc-3ac0fb5f",
+          "State": { "Code": "active" },
+          "Type": "application",
+          "AvailabilityZones": [
+            { "ZoneName": "us-east-1a", "SubnetId": "subnet-8360a9e7" },
+            { "ZoneName": "us-east-1b", "SubnetId": "subnet-b7d581c0" }
+          ],
+          "SecurityGroups": [ "sg-5943793c" ],
+          "IpAddressType": "ipv4"
+        }
+      ]
+    }"#;
+
+    #[test]
+    fn parses_an_application_load_balancer() {
+        let lbs = parse_load_balancers(LOAD_BALANCERS_JSON);
+        assert_eq!(lbs.len(), 2);
+        // Sorted by name, so the ALB comes first whatever order the API used.
+        let alb = &lbs[0];
+        assert_eq!(alb.name, "alpha-alb");
+        assert_eq!(alb.kind, "application");
+        assert_eq!(alb.scheme.as_deref(), Some("internet-facing"));
+        assert_eq!(alb.state, "active");
+        assert_eq!(alb.dns_name, "alpha-alb-50dc6c49.us-east-1.elb.amazonaws.com");
+        assert_eq!(alb.zones.len(), 2);
+        assert_eq!(alb.zones[0], ("us-east-1a".to_string(), "subnet-8360a9e7".to_string()));
+        assert_eq!(alb.security_groups, vec!["sg-5943793c".to_string()]);
+    }
+
+    /// A network load balancer has no security groups, and `State.Code` is
+    /// nested rather than a top-level string — reading it flat gives every NLB
+    /// the same "unknown" state.
+    #[test]
+    fn parses_a_network_load_balancer_with_no_security_groups() {
+        let lbs = parse_load_balancers(LOAD_BALANCERS_JSON);
+        let nlb = &lbs[1];
+        assert_eq!(nlb.name, "zulu-nlb");
+        assert_eq!(nlb.kind, "network");
+        assert_eq!(nlb.state, "provisioning");
+        assert!(nlb.security_groups.is_empty());
+    }
+
+    #[test]
+    fn the_kind_label_is_the_short_name_people_use() {
+        let lbs = parse_load_balancers(LOAD_BALANCERS_JSON);
+        assert_eq!(load_balancer_kind_label(&lbs[0]), "ALB");
+        assert_eq!(load_balancer_kind_label(&lbs[1]), "NLB");
+        // An unfamiliar type is shown as the API spelled it rather than hidden.
+        let odd = LoadBalancer {
+            kind: "something-new".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(load_balancer_kind_label(&odd), "something-new");
+    }
+
+    /// The table shows the short label, so `application` must still be findable
+    /// — and so must the fields the table has no column for.
+    #[test]
+    fn a_load_balancer_is_searchable_by_what_the_table_hides() {
+        let mut lbs = parse_load_balancers(LOAD_BALANCERS_JSON);
+        lbs[0].account_id = "111122223333".to_string();
+        let text = load_balancer_searchable_text(&lbs[0]);
+        for needle in [
+            "alpha-alb",
+            "application",          // the API's word, though the column says ALB
+            "alb",                  // and the label
+            "internet-facing",
+            "active",
+            "vpc-3ac0fb5f",         // no column
+            "111122223333",         // no column
+            "subnet-8360a9e7",      // no column
+            "us-east-1a",
+        ] {
+            assert!(text.contains(needle), "{needle} missing from {text}");
+        }
+        assert!(!text.contains("Alpha"), "must be lower-cased");
+    }
+
+    #[test]
+    fn an_unreadable_load_balancer_payload_yields_none() {
+        assert!(parse_load_balancers("not json").is_empty());
+        assert!(parse_load_balancers("{}").is_empty());
+        assert!(parse_load_balancers(r#"{"LoadBalancers": "nope"}"#).is_empty());
+    }
+
+    const LISTENERS_JSON: &str = r#"{
+      "Listeners": [
+        {
+          "ListenerArn": "arn:...:listener/app/alpha-alb/50dc6c49/443",
+          "Protocol": "HTTPS",
+          "Port": 443,
+          "SslPolicy": "ELBSecurityPolicy-2016-08",
+          "Certificates": [ { "CertificateArn": "arn:acm:...", "IsDefault": true } ],
+          "DefaultActions": [
+            { "Type": "forward",
+              "TargetGroupArn": "arn:aws:elasticloadbalancing:us-east-1:1111:targetgroup/app-web/73e2d6bc" }
+          ]
+        },
+        {
+          "ListenerArn": "arn:...:listener/app/alpha-alb/50dc6c49/80",
+          "Protocol": "HTTP",
+          "Port": 80,
+          "DefaultActions": [
+            { "Type": "redirect", "RedirectConfig": { "StatusCode": "HTTP_301", "Protocol": "HTTPS" } }
+          ]
+        }
+      ]
+    }"#;
+
+    /// Listeners read in port order, and a forward names its target group by
+    /// name — the ARN is a hundred characters of which ten carry the answer.
+    #[test]
+    fn parses_listeners_in_port_order_and_names_the_target_group() {
+        let ls = parse_listeners(LISTENERS_JSON);
+        assert_eq!(ls.len(), 2);
+        assert_eq!(ls[0].port, Some(80));
+        assert_eq!(ls[0].protocol.as_deref(), Some("HTTP"));
+        assert_eq!(ls[0].default_action, "redirect HTTP_301");
+        assert_eq!(ls[1].port, Some(443));
+        assert_eq!(ls[1].default_action, "forward -> app-web");
+        assert_eq!(ls[1].certificate_count, 1);
+        assert_eq!(ls[1].ssl_policy.as_deref(), Some("ELBSecurityPolicy-2016-08"));
+    }
+
+    const RULES_JSON: &str = r#"{
+      "Rules": [
+        {
+          "Priority": "default",
+          "Conditions": [],
+          "Actions": [ { "Type": "fixed-response",
+                         "FixedResponseConfig": { "StatusCode": "404" } } ]
+        },
+        {
+          "Priority": "10",
+          "Conditions": [
+            { "Field": "path-pattern", "PathPatternConfig": { "Values": [ "/api/*" ] } }
+          ],
+          "Actions": [
+            { "Type": "forward",
+              "ForwardConfig": { "TargetGroups": [
+                { "TargetGroupArn": "arn:...:targetgroup/api-tg/aaa", "Weight": 1 }
+              ] } }
+          ]
+        },
+        {
+          "Priority": "2",
+          "Conditions": [ { "Field": "host-header", "Values": [ "old.example.com" ] } ],
+          "Actions": [ { "Type": "redirect", "RedirectConfig": { "StatusCode": "HTTP_302" } } ]
+        }
+      ]
+    }"#;
+
+    /// Numeric priority order, and the catch-all sorts last because that is
+    /// when it fires. Sorting these as strings puts "10" before "2".
+    #[test]
+    fn rules_sort_by_numeric_priority_with_the_default_last() {
+        let rules = parse_listener_rules(RULES_JSON);
+        let order: Vec<&str> = rules.iter().map(|r| r.priority.as_str()).collect();
+        assert_eq!(order, vec!["2", "10", "default"]);
+    }
+
+    /// Both shapes of forward, and both shapes of condition. A rule written in
+    /// the console carries the per-field config; one written by Terraform often
+    /// carries the old flat `Values`. Reading only one makes half the rules
+    /// look like they do nothing.
+    #[test]
+    fn rules_read_both_the_old_and_the_new_shapes() {
+        let rules = parse_listener_rules(RULES_JSON);
+        let host = rules.iter().find(|r| r.priority == "2").expect("rule 2");
+        assert_eq!(host.conditions, vec!["host-header = old.example.com".to_string()]);
+        assert_eq!(host.action, "redirect HTTP_302");
+
+        let path = rules.iter().find(|r| r.priority == "10").expect("rule 10");
+        assert_eq!(path.conditions, vec!["path-pattern = /api/*".to_string()]);
+        assert_eq!(path.action, "forward -> api-tg");
+
+        let default = rules.iter().find(|r| r.priority == "default").expect("default");
+        assert!(default.conditions.is_empty());
+        assert_eq!(default.action, "fixed 404");
+    }
+
+    #[test]
+    fn unreadable_listener_and_rule_payloads_yield_nothing() {
+        assert!(parse_listeners("not json").is_empty());
+        assert!(parse_listeners("{}").is_empty());
+        assert!(parse_listener_rules("not json").is_empty());
+        assert!(parse_listener_rules("{}").is_empty());
+    }
 
     /// A real `describe-target-groups` payload: one ordinary HTTP group and
     /// one lambda group, which carries no protocol, no port and no VPC.
