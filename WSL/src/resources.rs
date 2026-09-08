@@ -94,11 +94,7 @@ pub const PRIORITY_HEALTH_MAX: usize = 50;
 /// prioritise the whole account — the same trap `forwards.rs` records for a
 /// blank section marker.
 pub fn priority_indexes(patterns: &[String], names: &[String], cap: usize) -> Vec<usize> {
-    let needles: Vec<String> = patterns
-        .iter()
-        .map(|p| p.trim().to_ascii_lowercase())
-        .filter(|p| !p.is_empty())
-        .collect();
+    let needles = priority_needles(patterns);
     if needles.is_empty() {
         return Vec::new();
     }
@@ -108,12 +104,48 @@ pub fn priority_indexes(patterns: &[String], names: &[String], cap: usize) -> Ve
         if out.len() >= cap {
             break;
         }
-        let hay = name.to_ascii_lowercase();
-        if needles.iter().any(|needle| hay.contains(needle)) {
+        if matches_a_needle(name, &needles) {
             out.push(idx);
         }
     }
     out
+}
+
+/// How many of `names` the priority list claims, **ignoring the cap**.
+///
+/// [`priority_indexes`] truncates silently, and the silence is the failure:
+/// the star marker on a row and a warning are meant to be the pair that makes
+/// a too-broad pattern visible, so without this a pattern like `prod` matching
+/// a whole account reads exactly like one matching three groups. The caller
+/// compares this against [`PRIORITY_HEALTH_MAX`] and says so once.
+///
+/// Deliberately a separate function rather than a second return value:
+/// `priority_indexes` is pure, in a module with no logger, and must stay that
+/// way. The two share `priority_needles`, so the blank-pattern rule and the
+/// case folding cannot drift between what is counted and what is prioritised.
+pub fn priority_match_count(patterns: &[String], names: &[String]) -> usize {
+    let needles = priority_needles(patterns);
+    if needles.is_empty() {
+        return 0;
+    }
+    names
+        .iter()
+        .filter(|name| matches_a_needle(name, &needles))
+        .count()
+}
+
+/// The configured patterns, trimmed and case-folded, with the blanks dropped.
+fn priority_needles(patterns: &[String]) -> Vec<String> {
+    patterns
+        .iter()
+        .map(|p| p.trim().to_ascii_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+fn matches_a_needle(name: &str, needles: &[String]) -> bool {
+    let hay = name.to_ascii_lowercase();
+    needles.iter().any(|needle| hay.contains(needle))
 }
 
 /// What a non-zero exit from the AWS CLI actually meant.
@@ -323,6 +355,43 @@ mod tests {
         // The cap keeps the first matches, so the order is the list's own.
         assert_eq!(hits[0], 0);
         assert_eq!(hits[49], 49);
+    }
+
+    /// The cap truncates in silence, so the count has to come from somewhere
+    /// else: a pattern matching a whole account must not read like one
+    /// matching three groups.
+    #[test]
+    fn the_match_count_ignores_the_cap() {
+        let names: Vec<String> = (0..200).map(|i| format!("prod-{i}")).collect();
+        let patterns = vec!["prod".to_string()];
+        assert_eq!(
+            priority_indexes(&patterns, &names, PRIORITY_HEALTH_MAX).len(),
+            PRIORITY_HEALTH_MAX
+        );
+        assert_eq!(priority_match_count(&patterns, &names), 200);
+    }
+
+    /// Counting and prioritising share their needles, so the two can never
+    /// disagree about a blank entry, about case, or about a name two patterns
+    /// both claim.
+    #[test]
+    fn the_match_count_follows_the_same_rules_as_the_prioritising() {
+        let names = vec![
+            "APP-Web-Prod".to_string(),
+            "app-web-dev".to_string(),
+            "other".to_string(),
+        ];
+        // Blank entries are skipped by both, not treated as a match-all.
+        assert_eq!(priority_match_count(&["".to_string()], &names), 0);
+        assert_eq!(priority_match_count(&[], &names), 0);
+        // Case-insensitive, and a name matched twice is still counted once.
+        let patterns = vec!["app".to_string(), "web".to_string()];
+        assert_eq!(priority_match_count(&patterns, &names), 2);
+        assert_eq!(
+            priority_indexes(&patterns, &names, 50).len(),
+            priority_match_count(&patterns, &names),
+            "under the cap the two must agree exactly"
+        );
     }
 
     /// One name matched by two patterns is still one fetch.
