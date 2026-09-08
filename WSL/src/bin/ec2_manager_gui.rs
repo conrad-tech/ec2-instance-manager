@@ -23768,7 +23768,6 @@ mod gui {
                             });
 
                         tg_cell(ui, widths[1], text_h, elb::protocol_port_label(tg));
-                        tg_cell(ui, widths[2], text_h, tg.target_type.clone());
 
                         let cell = health
                             .get(&tg.arn)
@@ -23799,18 +23798,28 @@ mod gui {
                             Some(c) => notification_text(ui, c, text),
                             None => egui::RichText::new(text),
                         };
-                        let resp = tg_cell(ui, widths[3], text_h, rich);
+                        let resp = tg_cell(ui, widths[2], text_h, rich);
                         if let HealthCell::Failed(detail) = &cell {
                             resp.on_hover_text(detail.clone());
                         }
 
+                        // The health-check path, from the same
+                        // describe-target-groups reply the row itself came
+                        // from — so unlike Healthy/Total it is known the
+                        // moment the row exists and has no pending state. A
+                        // dash here is unambiguous for that reason: it means
+                        // this health check has no path (a TCP check), never
+                        // "no answer yet".
                         tg_cell(
                             ui,
-                            widths[4],
+                            widths[3],
                             text_h,
-                            tg.vpc_id.clone().unwrap_or_else(|| "—".to_string()),
-                        );
-                        tg_cell(ui, widths[5], text_h, tg.account_id.clone());
+                            tg.health_check
+                                .path
+                                .clone()
+                                .unwrap_or_else(|| "—".to_string()),
+                        )
+                        .on_hover_text(tg_health_check_hover(tg));
                         });
                     }
                 });
@@ -33247,14 +33256,7 @@ mod gui {
             .collect()
     }
 
-    const TG_COLUMN_LABELS: [&str; 6] = [
-        "Name",
-        "Protocol:Port",
-        "Target Type",
-        "Healthy/Total",
-        "VPC",
-        "Account",
-    ];
+    const TG_COLUMN_LABELS: [&str; 4] = ["Name", "Protocol:Port", "Healthy/Total", "Path"];
 
     /// Does a search narrow the table enough that every row it left should be
     /// fetched, rather than only the rows on screen?
@@ -33269,7 +33271,7 @@ mod gui {
     }
 
     /// Which of `TG_COLUMN_LABELS` is the Healthy/Total column.
-    const TG_HEALTH_COL: usize = 3;
+    const TG_HEALTH_COL: usize = 2;
 
     /// The Healthy/Total header, which says when the column is switched off.
     ///
@@ -33337,7 +33339,7 @@ mod gui {
 
     /// The five bounded columns' widths, in `TG_COLUMN_LABELS` order after
     /// Name. Their contents are short and bounded; Name is not.
-    const TG_FIXED_COL_W: [f32; 5] = [120.0, 110.0, 110.0, 170.0, 130.0];
+    const TG_FIXED_COL_W: [f32; 3] = [120.0, 110.0, 260.0];
 
     /// What the Healthy/Total column widens to while its header carries the
     /// `(not permitted)` suffix.
@@ -33372,7 +33374,7 @@ mod gui {
     /// construction rather than by two grids happening to agree.
     /// `health_denied` widens the Healthy/Total column to fit the longer
     /// header `tg_health_header` returns while an account has refused.
-    fn tg_column_widths(total: f32, health_denied: bool) -> [f32; 6] {
+    fn tg_column_widths(total: f32, health_denied: bool) -> [f32; 4] {
         let mut bounded = TG_FIXED_COL_W;
         if health_denied {
             // `TG_HEALTH_COL` counts from Name; the bounded array starts after
@@ -33382,9 +33384,7 @@ mod gui {
         let fixed: f32 = bounded.iter().sum();
         let gaps = TG_COL_GAP * (TG_COLUMN_LABELS.len() as f32 - 1.0);
         let name = (total - fixed - gaps).max(TG_NAME_MIN_W);
-        [
-            name, bounded[0], bounded[1], bounded[2], bounded[3], bounded[4],
-        ]
+        [name, bounded[0], bounded[1], bounded[2]]
     }
 
     /// Record — or clear — one account's list failure.
@@ -33414,6 +33414,35 @@ mod gui {
     /// for it; truncating keeps every row exactly one line, which is what makes
     /// the reserved and drawn heights equal. Returns the label's own response,
     /// so a caller can still hang a context menu or a tooltip on it.
+    /// What the Path cell says on hover: the whole health check, since the
+    /// column shows only its path.
+    ///
+    /// Target Type, VPC and Account left the table at the maintainer's request.
+    /// They are all still *searchable* — `target_group_searchable_text` is
+    /// unchanged — and all still shown in the detail view, so nothing became
+    /// unreachable; only the at-a-glance reading of them went.
+    fn tg_health_check_hover(tg: &TargetGroup) -> String {
+        let hc = &tg.health_check;
+        let dash = || "—".to_string();
+        format!(
+            "Health check: {} {}\nInterval {} · timeout {} · healthy {} · unhealthy {}\n\
+             Target type: {}\nVPC: {}\nAccount: {}",
+            hc.protocol.clone().unwrap_or_else(dash),
+            hc.path.clone().unwrap_or_else(dash),
+            hc.interval_secs.map_or_else(dash, |v| format!("{v}s")),
+            hc.timeout_secs.map_or_else(dash, |v| format!("{v}s")),
+            hc.healthy_threshold.map_or_else(dash, |v| v.to_string()),
+            hc.unhealthy_threshold.map_or_else(dash, |v| v.to_string()),
+            if tg.target_type.is_empty() {
+                dash()
+            } else {
+                tg.target_type.clone()
+            },
+            tg.vpc_id.clone().unwrap_or_else(dash),
+            tg.account_id.clone(),
+        )
+    }
+
     /// One row of the target-group table — the header included.
     ///
     /// Both go through this, and that is the whole point. The two halves were
@@ -40714,7 +40743,13 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             );
             assert_eq!(denied[TG_HEALTH_COL], TG_HEALTH_DENIED_COL_W);
             // Only that column and Name move; the others are untouched.
-            for idx in [1, 2, 4, 5] {
+            // Derived rather than a hardcoded index list, which broke on a
+            // column being removed — a layout change, not a behaviour change,
+            // and the test should not have had an opinion about it.
+            for idx in 1..TG_COLUMN_LABELS.len() {
+                if idx == TG_HEALTH_COL {
+                    continue;
+                }
                 assert_eq!(denied[idx], plain[idx], "column {idx} must not move");
             }
             assert!(denied[0] < plain[0], "Name absorbs the difference");

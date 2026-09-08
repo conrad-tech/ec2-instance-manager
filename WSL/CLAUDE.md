@@ -2218,6 +2218,20 @@ shape — a `parse_*`/`fetch_*` pair, a `render_resource_panel` arm and a
   which accounts failed to list while the rest still show their rows — an
   `AccessDenied` in one account must not blank a pool that includes accounts
   which answered fine.
+- **The columns are `Name · Protocol:Port · Healthy/Total · Path`**, and Path
+  is the health check's path. Target Type, VPC and Account were dropped at the
+  maintainer's request once the table had been used in anger: four columns of
+  what you actually look at beat seven of what is merely true. Nothing became
+  unreachable — all three are still matched by
+  `elb::target_group_searchable_text`, so the search box still finds a row by
+  its account id or VPC, they are all still in the detail view, and the Path
+  cell's hover repeats them along with the rest of the health check. **Do not
+  add a column without adding it to `target_group_searchable_text` too** — a
+  visible column that is not searchable is the bug this repo already has a
+  scar from.
+  - The cost is real and was accepted knowingly: with several accounts pooled,
+    two identically-named target groups in different accounts now look
+    identical in the table. The account is one hover away, not on screen.
 - **The table's header is drawn once, above the scroll area, and the columns
   are fixed-width and truncating** (`tg_column_widths`, `tg_cell`) —
   `ScrollArea::vertical()` with `show_rows`, deliberately **not** the
