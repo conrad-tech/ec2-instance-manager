@@ -22732,18 +22732,23 @@ mod gui {
             });
             ui.separator();
 
-            if let InventoryTab::Resource(kind) = self.inventory_tab {
-                self.render_resource_panel(ui, kind);
-                return;
-            }
-
+            // Drawn before the resource sub-tabs' early return, so both are
+            // common to every sub-tab. A Start/Stop/Restart status line raised
+            // on the EC2 tab used to disappear — and stop having its auto-hide
+            // judged — the moment somebody clicked Target Groups, and the zoom
+            // buttons vanished from a page that still has a table to zoom.
             self.render_power_status(ui);
+            // The count line is the one EC2-only part of this row: each
+            // resource tab prints its own.
+            let on_ec2 = self.inventory_tab == InventoryTab::Ec2;
             ui.horizontal(|ui| {
-                ui.label(format!(
-                    "Instances: {} filtered / {} total",
-                    self.filtered.len(),
-                    self.inventory.instances.len()
-                ));
+                if on_ec2 {
+                    ui.label(format!(
+                        "Instances: {} filtered / {} total",
+                        self.filtered.len(),
+                        self.inventory.instances.len()
+                    ));
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("+").on_hover_text("Zoom In").clicked() {
                         self.ui_scale = (self.ui_scale + 0.1).min(3.0);
@@ -22759,6 +22764,11 @@ mod gui {
                     }
                 });
             });
+
+            if let InventoryTab::Resource(kind) = self.inventory_tab {
+                self.render_resource_panel(ui, kind);
+                return;
+            }
 
             egui::ScrollArea::both()
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
@@ -40803,6 +40813,53 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert!(
                 failed.contains("Attributes:\n  none"),
                 "an empty section is 'none', not absent:\n{failed}"
+            );
+        }
+
+        /// The power status line and the zoom controls are common to every
+        /// Inventory sub-tab: a Start/Stop/Restart line raised on EC2 used to
+        /// vanish — and stop having its auto-hide judged — the moment somebody
+        /// clicked Target Groups. Only the instance count line is EC2-only.
+        ///
+        /// A source scan rather than a render, because reaching
+        /// `render_inventory_panel` needs a constructed `App` and an egui
+        /// context: the ordering is what is being pinned, and the ordering is
+        /// exactly what the source shows.
+        #[test]
+        fn the_power_line_and_the_zoom_buttons_survive_a_resource_sub_tab() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let start = src
+                .find("fn render_inventory_panel(&mut self, ui: &mut egui::Ui) {")
+                .expect("render_inventory_panel");
+            let body = &src[start..];
+            let early_return = body
+                .find("self.render_resource_panel(ui, kind);")
+                .expect("the resource sub-tab early return");
+            let power = body
+                .find("self.render_power_status(ui);")
+                .expect("the power status line");
+            let zoom = body.find("\"Zoom Out\"").expect("the zoom buttons");
+            let count = body
+                .find("Instances: {} filtered")
+                .expect("the instance count line");
+
+            assert!(
+                power < early_return,
+                "the power status line must be drawn before the resource return"
+            );
+            assert!(
+                zoom < early_return,
+                "the zoom buttons must be drawn before the resource return"
+            );
+            // The count line stays EC2-only — each resource tab prints its own.
+            assert!(
+                count < early_return,
+                "the count line sits in the same row and is gated instead"
+            );
+            let row = &body[count.saturating_sub(200)..count];
+            assert!(
+                row.contains("if on_ec2 {"),
+                "the count line must be gated on the EC2 tab:\n{row}"
             );
         }
 
