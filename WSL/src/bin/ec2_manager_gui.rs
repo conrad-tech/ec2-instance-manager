@@ -23244,6 +23244,22 @@ mod gui {
             out
         }
 
+        /// The cache keys the table may read: this mode, this region, and only
+        /// the accounts in the pool right now. See `pool_cache_keys`.
+        fn current_target_group_keys(&self) -> Vec<String> {
+            let accounts: Vec<String> = self
+                .resource_pool_accounts()
+                .into_iter()
+                .map(|(_, account)| account)
+                .collect();
+            pool_cache_keys(
+                ResourceKind::TargetGroup,
+                self.options.mode.as_str(),
+                &self.region_scope(),
+                &accounts,
+            )
+        }
+
         /// The rows the search box leaves visible, from every account in the
         /// pool, sorted by name then account so two accounts' identically
         /// named groups sit together.
@@ -23252,10 +23268,9 @@ mod gui {
             let include_matchers = build_matchers(&includes);
             let exclude_matchers = build_matchers(&excludes);
 
-            let mut rows: Vec<TargetGroup> = self
-                .target_groups
-                .values()
-                .flat_map(|(_, groups)| groups.iter().cloned())
+            let keys = self.current_target_group_keys();
+            let mut rows: Vec<TargetGroup> = cached_target_groups(&self.target_groups, &keys)
+                .into_iter()
                 .filter(|tg| {
                     text_matches(
                         &elb::target_group_searchable_text(tg),
@@ -23263,6 +23278,7 @@ mod gui {
                         &exclude_matchers,
                     )
                 })
+                .cloned()
                 .collect();
             rows.sort_by(|a, b| {
                 a.name
@@ -23275,7 +23291,10 @@ mod gui {
 
         fn render_target_groups(&mut self, ui: &mut egui::Ui) {
             let rows = self.filtered_target_groups();
-            let total: usize = self.target_groups.values().map(|(_, g)| g.len()).sum();
+            // The same population the table draws from, or the "N filtered /
+            // M total" line counts rows the table cannot show.
+            let keys = self.current_target_group_keys();
+            let total = cached_target_groups(&self.target_groups, &keys).len();
 
             ui.horizontal(|ui| {
                 ui.label(format!(
@@ -32416,6 +32435,41 @@ mod gui {
         }
     }
 
+    /// The cache keys belonging to the accounts currently in the pool.
+    ///
+    /// The cache is keyed by (mode, account, region) and is deliberately never
+    /// evicted — that is what the five-minute TTL buys, so re-checking an
+    /// account costs no refetch. The price is that it holds entries for
+    /// accounts since unchecked and for regions since switched away from, so
+    /// reading it wholesale leaves an unchecked account's rows on screen and
+    /// lists two regions' target groups together with nothing saying which is
+    /// which. Every read of the cache goes through these keys.
+    fn pool_cache_keys(
+        kind: ResourceKind,
+        mode: &str,
+        region: &str,
+        accounts: &[String],
+    ) -> Vec<String> {
+        accounts
+            .iter()
+            .map(|account| resources::cache_key(kind, mode, account, region))
+            .collect()
+    }
+
+    /// The cached rows for exactly those keys, in key order.
+    ///
+    /// A key with no entry is a fetch that has not landed yet, which is a
+    /// missing row rather than an error — the empty note reports the fetch.
+    fn cached_target_groups<'a>(
+        cache: &'a HashMap<String, (Instant, Vec<TargetGroup>)>,
+        keys: &[String],
+    ) -> Vec<&'a TargetGroup> {
+        keys.iter()
+            .filter_map(|key| cache.get(key))
+            .flat_map(|(_, groups)| groups.iter())
+            .collect()
+    }
+
     /// What a resource sub-tab says in sim mode.
     ///
     /// Sim generates fake EC2 instances and nothing else, so these tabs have
@@ -39210,6 +39264,68 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 health_cell_text(&HealthCell::Failed("Rate exceeded".to_string())),
                 "failed"
             );
+        }
+
+        /// The cache is never evicted, so it accumulates entries for accounts
+        /// since unchecked and for regions since switched away from. The table
+        /// must read the pool's keys, not the whole map: reading it wholesale
+        /// left an unchecked profile's rows on screen — which the EC2 table
+        /// never does — and listed two regions' groups together with nothing
+        /// on the row saying which region it came from.
+        #[test]
+        fn the_table_reads_only_the_pool_s_cache_keys() {
+            let tg = |name: &str, account: &str| TargetGroup {
+                arn: format!("arn:{name}"),
+                name: name.to_string(),
+                account_id: account.to_string(),
+                ..TargetGroup::default()
+            };
+
+            let mut cache: HashMap<String, (Instant, Vec<TargetGroup>)> = HashMap::new();
+            let key_of = |account: &str, region: &str| {
+                resources::cache_key(ResourceKind::TargetGroup, "live", account, region)
+            };
+            cache.insert(
+                key_of("1111", "us-east-1"),
+                (Instant::now(), vec![tg("in-pool-a", "1111")]),
+            );
+            cache.insert(
+                key_of("2222", "us-east-1"),
+                (Instant::now(), vec![tg("in-pool-b", "2222")]),
+            );
+            // An account the user has since unchecked.
+            cache.insert(
+                key_of("3333", "us-east-1"),
+                (Instant::now(), vec![tg("unchecked", "3333")]),
+            );
+            // The same account, in the region the user has switched away from.
+            cache.insert(
+                key_of("1111", "eu-west-1"),
+                (Instant::now(), vec![tg("other-region", "1111")]),
+            );
+
+            let pool = vec!["1111".to_string(), "2222".to_string()];
+            let keys = pool_cache_keys(ResourceKind::TargetGroup, "live", "us-east-1", &pool);
+            assert_eq!(keys.len(), 2, "one key per pooled account: {keys:?}");
+            assert!(
+                !keys.contains(&key_of("3333", "us-east-1")),
+                "an unchecked account must contribute no key: {keys:?}"
+            );
+            assert!(
+                !keys.contains(&key_of("1111", "eu-west-1")),
+                "the same account in another region is a different key: {keys:?}"
+            );
+
+            let mut names: Vec<&str> = cached_target_groups(&cache, &keys)
+                .into_iter()
+                .map(|tg| tg.name.as_str())
+                .collect();
+            names.sort_unstable();
+            assert_eq!(names, vec!["in-pool-a", "in-pool-b"]);
+
+            // The cache itself is untouched — this is display scoping, not
+            // eviction, or re-checking an account would cost a refetch.
+            assert_eq!(cache.len(), 4);
         }
     }
 }
