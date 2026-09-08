@@ -506,8 +506,16 @@ mod gui {
         /// event because they are different calls needing different IAM
         /// permissions — the same reason `VolumeResult` and
         /// `SecurityGroupResult` are separate.
+        ///
+        /// **`cache_key` is stamped at spawn time and must be used as-is.**
+        /// It carries the mode, account and *region* the call was made for.
+        /// Re-deriving it on arrival reads whatever region is current then, so
+        /// switching profile mid-fetch filed one region's target groups under
+        /// another region's key — which is exactly the mixing the table's own
+        /// key-scoped read exists to prevent.
         TargetGroupList {
             account_id: String,
+            cache_key: String,
             result: std::result::Result<Vec<TargetGroup>, FetchError>,
         },
         /// One target group's health landed.
@@ -7604,9 +7612,17 @@ mod gui {
         /// Accounts that refused a health call. One denial switches the column
         /// off for that account.
         tg_denied_accounts: HashSet<String>,
-        /// Accounts whose list fetch is running.
+        /// Cache keys whose list fetch is running — keyed the same way the
+        /// results are filed, not by account, so one account's two regions are
+        /// tracked separately and switching region does not find the correct
+        /// fetch suppressed by the stale one still in flight.
         tg_list_loading: HashSet<String>,
-        tg_list_error: Option<String>,
+        /// Account id -> why its list call failed. Per account, because with a
+        /// multi-account pool one account failing while another succeeds shows
+        /// rows and would otherwise say nothing at all; and removed on that
+        /// account's next success, or one transient failure would keep the
+        /// note up for the rest of the session.
+        tg_list_errors: HashMap<String, String>,
         /// `resources.priority_target_groups`, read once at startup.
         ///
         /// There is **no `self.features`** on this struct: `App::new` holds
@@ -8423,7 +8439,7 @@ mod gui {
                 tg_targets: HashMap::new(),
                 tg_denied_accounts: HashSet::new(),
                 tg_list_loading: HashSet::new(),
-                tg_list_error: None,
+                tg_list_errors: HashMap::new(),
                 // `features` is the local in `App::new`, the same one
                 // `instance_power_enabled` below is resolved from.
                 tg_priority_patterns: features.resources.priority_target_groups.clone(),
@@ -20041,28 +20057,35 @@ mod gui {
                             }
                         }
                     }
-                    ProcEvent::TargetGroupList { account_id, result } => {
-                        self.tg_list_loading.remove(&account_id);
+                    ProcEvent::TargetGroupList {
+                        account_id,
+                        cache_key,
+                        result,
+                    } => {
+                        self.tg_list_loading.remove(&cache_key);
+                        // The key the call was *made* with, never one derived
+                        // here: the region may have changed while it was in
+                        // flight. See the event's own doc comment.
                         match result {
                             Ok(groups) => {
                                 self.log_info(format!(
                                     "target groups: {} in account {account_id}",
                                     groups.len()
                                 ));
-                                let key = resources::cache_key(
-                                    ResourceKind::TargetGroup,
-                                    self.options.mode.as_str(),
-                                    &account_id,
-                                    &self.region_scope(),
-                                );
-                                self.target_groups.insert(key, (Instant::now(), groups));
+                                remember_list_error(&mut self.tg_list_errors, &account_id, None);
+                                self.target_groups
+                                    .insert(cache_key, (Instant::now(), groups));
                             }
                             Err(err) => {
                                 let msg = err.message();
                                 self.log_error(format!(
                                     "target groups: account {account_id}: {msg}"
                                 ));
-                                self.tg_list_error = Some(msg);
+                                remember_list_error(
+                                    &mut self.tg_list_errors,
+                                    &account_id,
+                                    Some(msg),
+                                );
                             }
                         }
                     }
@@ -23203,16 +23226,17 @@ mod gui {
                     .target_groups
                     .get(&key)
                     .is_some_and(|(at, _)| at.elapsed() <= resources::RESOURCE_TTL);
-                if fresh || self.tg_list_loading.contains(&account_id) {
+                if fresh || self.tg_list_loading.contains(&key) {
                     continue;
                 }
-                self.tg_list_loading.insert(account_id.clone());
+                self.tg_list_loading.insert(key.clone());
                 let tx = self.proc_tx.clone();
                 let (p, r, a) = (profile.clone(), region.clone(), account_id.clone());
                 std::thread::spawn(move || {
                     let result = elb::fetch_target_groups(&p, &r, &a);
                     let _ = tx.send(ProcEvent::TargetGroupList {
                         account_id: a,
+                        cache_key: key,
                         result,
                     });
                 });
@@ -23306,18 +23330,42 @@ mod gui {
                     self.tg_health.clear();
                     self.tg_targets.clear();
                     self.tg_denied_accounts.clear();
-                    self.tg_list_error = None;
+                    self.tg_list_errors.clear();
                 }
             });
+
+            // egui only redraws when something happens, so a table waiting on
+            // a fetch would sit on "Loading Target Groups…" — and every health
+            // cell on "…" — until the user happened to move the mouse. Judged
+            // at render for the reason the tunnel banner and the power status
+            // line already record: a timer merely *checked* on a frame fires
+            // whenever the next frame happens to occur.
+            if !self.tg_list_loading.is_empty()
+                || self.tg_health.values().any(|c| *c == HealthCell::InFlight)
+            {
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
+
+            let error_detail = list_error_detail(&self.tg_list_errors);
 
             if rows.is_empty() {
                 let loading = !self.tg_list_loading.is_empty();
                 ui.label(resource_empty_note(
                     ResourceKind::TargetGroup,
                     loading,
-                    self.tg_list_error.as_deref(),
+                    error_detail.as_deref(),
                 ));
                 return;
+            }
+
+            // Rows from the accounts that answered are on screen, so the ones
+            // that did not are invisible without this line.
+            if let Some(detail) = &error_detail {
+                note_label(
+                    ui,
+                    egui::Color32::RED,
+                    format!("Could not list Target Groups: {detail}"),
+                );
             }
 
             // Which rows the configured priority list claims, capped. Computed
@@ -23333,30 +23381,50 @@ mod gui {
                 priority_idx.iter().map(|i| rows[*i].arn.clone()).collect();
             let is_priority: HashSet<usize> = priority_idx.iter().copied().collect();
 
-            let row_h = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
+            // Solid rather than the default floating bar, for the reason
+            // recorded against the pem dropdown: a floating bar's dormant
+            // opacity is 0.0, so the pane reads as unscrollable. Solid also
+            // reserves its own width, which is what makes the allowance below
+            // a real number.
+            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+            let bar = &ui.spacing().scroll;
+            let bar_allowance = bar.bar_width + bar.bar_inner_margin + bar.bar_outer_margin;
+            let widths = tg_column_widths(ui.available_width() - bar_allowance);
+
+            let text_h = ui.text_style_height(&egui::TextStyle::Body);
+            // One text line plus the gap the grid puts after it. Every cell is
+            // allocated at exactly `text_h` and truncates rather than wrapping,
+            // so no row can be taller than that, and `min_row_height` stops one
+            // being shorter.
+            let row_h = text_h + TG_ROW_SPACING;
+
+            // Drawn once, above the scroll area — never inside `show_rows`.
+            // Inside, it was re-drawn at the top of every visible slice and
+            // pushed the rows down by its own height, so the range the scroll
+            // area reported and the rows actually on screen disagreed — and
+            // that range is what decides which rows get a health call.
+            egui::Grid::new("target_group_header")
+                .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
+                .min_row_height(text_h)
+                .show(ui, |ui| {
+                    for (label, width) in TG_COLUMN_LABELS.iter().zip(widths.iter()) {
+                        tg_cell(ui, *width, text_h, egui::RichText::new(*label).strong());
+                    }
+                    ui.end_row();
+                });
+
             let mut visible_arns: Vec<String> = Vec::new();
             let mut pending_detail: Option<TargetGroup> = None;
             let health = self.tg_health.clone();
 
-            egui::ScrollArea::both()
+            egui::ScrollArea::vertical()
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .show_rows(ui, row_h, rows.len(), |ui, range| {
                     egui::Grid::new("target_group_grid")
                         .striped(true)
-                        .spacing(egui::vec2(12.0, 4.0))
+                        .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
+                        .min_row_height(text_h)
                         .show(ui, |ui| {
-                            for label in [
-                                "Name",
-                                "Protocol:Port",
-                                "Target Type",
-                                "Healthy/Total",
-                                "VPC",
-                                "Account",
-                            ] {
-                                ui.strong(label);
-                            }
-                            ui.end_row();
-
                             for idx in range {
                                 let tg = &rows[idx];
                                 visible_arns.push(tg.arn.clone());
@@ -23366,42 +23434,50 @@ mod gui {
                                 } else {
                                     tg.name.clone()
                                 };
-                                ui.label(name).context_menu(|ui| {
-                                    if ui.button("See Details").clicked() {
-                                        pending_detail = Some(tg.clone());
-                                        ui.close();
-                                    }
-                                });
+                                tg_cell(ui, widths[0], text_h, name)
+                                    .on_hover_text(tg.name.clone())
+                                    .context_menu(|ui| {
+                                        if ui.button("See Details").clicked() {
+                                            pending_detail = Some(tg.clone());
+                                            ui.close();
+                                        }
+                                    });
 
-                                ui.label(elb::protocol_port_label(tg));
-                                ui.label(&tg.target_type);
+                                tg_cell(ui, widths[1], text_h, elb::protocol_port_label(tg));
+                                tg_cell(ui, widths[2], text_h, tg.target_type.clone());
 
                                 let cell = health
                                     .get(&tg.arn)
                                     .cloned()
                                     .unwrap_or(HealthCell::NotRequested);
                                 let text = health_cell_text(&cell);
-                                match &cell {
+                                let colour = match &cell {
                                     HealthCell::Known(s) if s.total > 0 && s.healthy == s.total => {
-                                        note_label(ui, egui::Color32::GREEN, text);
+                                        Some(egui::Color32::GREEN)
                                     }
                                     HealthCell::Known(s) if s.healthy == 0 && s.total > 0 => {
-                                        note_label(ui, egui::Color32::RED, text);
+                                        Some(egui::Color32::RED)
                                     }
-                                    HealthCell::Known(_) => {
-                                        note_label(ui, egui::Color32::YELLOW, text);
-                                    }
-                                    HealthCell::Failed(detail) => {
-                                        note_label(ui, egui::Color32::RED, text)
-                                            .on_hover_text(detail.clone());
-                                    }
-                                    _ => {
-                                        ui.label(text);
-                                    }
+                                    HealthCell::Known(_) => Some(egui::Color32::YELLOW),
+                                    HealthCell::Failed(_) => Some(egui::Color32::RED),
+                                    _ => None,
+                                };
+                                let rich = match colour {
+                                    Some(c) => notification_text(ui, c, text),
+                                    None => egui::RichText::new(text),
+                                };
+                                let resp = tg_cell(ui, widths[3], text_h, rich);
+                                if let HealthCell::Failed(detail) = &cell {
+                                    resp.on_hover_text(detail.clone());
                                 }
 
-                                ui.label(tg.vpc_id.clone().unwrap_or_else(|| "—".to_string()));
-                                ui.label(&tg.account_id);
+                                tg_cell(
+                                    ui,
+                                    widths[4],
+                                    text_h,
+                                    tg.vpc_id.clone().unwrap_or_else(|| "—".to_string()),
+                                );
+                                tg_cell(ui, widths[5], text_h, tg.account_id.clone());
                                 ui.end_row();
                             }
                         });
@@ -32470,6 +32546,113 @@ mod gui {
             .collect()
     }
 
+    const TG_COLUMN_LABELS: [&str; 6] = [
+        "Name",
+        "Protocol:Port",
+        "Target Type",
+        "Healthy/Total",
+        "VPC",
+        "Account",
+    ];
+
+    /// The five bounded columns' widths, in `TG_COLUMN_LABELS` order after
+    /// Name. Their contents are short and bounded; Name is not.
+    const TG_FIXED_COL_W: [f32; 5] = [120.0, 110.0, 110.0, 170.0, 130.0];
+
+    /// Name never shrinks past this, whatever the window does.
+    const TG_NAME_MIN_W: f32 = 140.0;
+
+    /// Horizontal gap between columns — the grid's own `spacing.x`.
+    const TG_COL_GAP: f32 = 12.0;
+
+    /// Vertical gap between rows.
+    ///
+    /// The `row_h` handed to `ScrollArea::show_rows` must be one text line plus
+    /// exactly this, or the height reserved per row and the height actually
+    /// drawn diverge and the scroll mapping drifts a little further with every
+    /// row — and that mapping is what decides which rows get a health call.
+    const TG_ROW_SPACING: f32 = 4.0;
+
+    /// Every column's width for a table `total` pixels wide: the five bounded
+    /// columns at their fixed widths, Name taking whatever is left.
+    ///
+    /// Computed once and handed to **both** the header and the rows. The header
+    /// is drawn outside the virtualized region, so it cannot inherit the rows'
+    /// own column sizing; passing both the same numbers makes them line up by
+    /// construction rather than by two grids happening to agree.
+    fn tg_column_widths(total: f32) -> [f32; 6] {
+        let fixed: f32 = TG_FIXED_COL_W.iter().sum();
+        let gaps = TG_COL_GAP * (TG_COLUMN_LABELS.len() as f32 - 1.0);
+        let name = (total - fixed - gaps).max(TG_NAME_MIN_W);
+        [
+            name,
+            TG_FIXED_COL_W[0],
+            TG_FIXED_COL_W[1],
+            TG_FIXED_COL_W[2],
+            TG_FIXED_COL_W[3],
+            TG_FIXED_COL_W[4],
+        ]
+    }
+
+    /// Record — or clear — one account's list failure.
+    ///
+    /// The clear on success is the load-bearing half: a single `Option<String>`
+    /// that was only ever *set* kept "Could not list…" on screen for the rest
+    /// of the session after one transient failure, and said nothing at all
+    /// about *which* account it was.
+    fn remember_list_error(
+        errors: &mut HashMap<String, String>,
+        account_id: &str,
+        error: Option<String>,
+    ) {
+        match error {
+            Some(msg) => {
+                errors.insert(account_id.to_string(), msg);
+            }
+            None => {
+                errors.remove(account_id);
+            }
+        }
+    }
+
+    /// One table cell, at an exact size and never wrapping.
+    ///
+    /// A cell that wrapped would draw a row taller than `show_rows` reserved
+    /// for it; truncating keeps every row exactly one line, which is what makes
+    /// the reserved and drawn heights equal. Returns the label's own response,
+    /// so a caller can still hang a context menu or a tooltip on it.
+    fn tg_cell(
+        ui: &mut egui::Ui,
+        width: f32,
+        height: f32,
+        text: impl Into<egui::RichText>,
+    ) -> egui::Response {
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, height),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| ui.add(egui::Label::new(text.into()).wrap_mode(egui::TextWrapMode::Truncate)),
+        )
+        .inner
+    }
+
+    /// The accounts that could not be listed, as one sentence fragment.
+    ///
+    /// Named per account and sorted, because with a multi-account pool one
+    /// account failing while another succeeds shows rows and no note — the
+    /// failed account's absence is otherwise completely invisible, which is
+    /// the "empty is not failed" rule this table exists to honour.
+    fn list_error_detail(errors: &HashMap<String, String>) -> Option<String> {
+        if errors.is_empty() {
+            return None;
+        }
+        let mut parts: Vec<String> = errors
+            .iter()
+            .map(|(account, msg)| format!("account {account}: {msg}"))
+            .collect();
+        parts.sort();
+        Some(parts.join("; "))
+    }
+
     /// What a resource sub-tab says in sim mode.
     ///
     /// Sim generates fake EC2 instances and nothing else, so these tabs have
@@ -39326,6 +39509,122 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             // The cache itself is untouched — this is display scoping, not
             // eviction, or re-checking an account would cost a refetch.
             assert_eq!(cache.len(), 4);
+        }
+
+        /// The reply must be filed under the key the call was MADE with. The
+        /// handler used to rebuild the key from `region_scope()` at arrival, so
+        /// switching profile to a different region mid-fetch filed the old
+        /// region's target groups under the new region's key — silently
+        /// undoing the scoping the test above pins.
+        #[test]
+        fn the_list_reply_is_filed_under_the_key_it_was_fetched_with() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let start = src
+                .find("ProcEvent::TargetGroupList {")
+                .and_then(|i| src[i..].find("=> {").map(|j| i + j))
+                .expect("the TargetGroupList handler arm");
+            let end = start
+                + src[start..]
+                    .find("ProcEvent::TargetGroupHealth")
+                    .expect("the arm that follows it");
+            let arm = &src[start..end];
+
+            assert!(
+                arm.contains(".insert(cache_key,"),
+                "the reply must be filed under the carried key:\n{arm}"
+            );
+            assert!(
+                !arm.contains("region_scope"),
+                "the handler must not re-derive the region on arrival:\n{arm}"
+            );
+            assert!(
+                !arm.contains("resources::cache_key"),
+                "the handler must not rebuild the key at all:\n{arm}"
+            );
+            // And the in-flight set is keyed the same way, or one account's two
+            // regions share a slot and the correct fetch is suppressed by the
+            // stale one.
+            assert!(
+                arm.contains("tg_list_loading.remove(&cache_key)"),
+                "the in-flight set is keyed by cache key:\n{arm}"
+            );
+        }
+
+        /// One transient failure used to keep "Could not list…" up for the
+        /// rest of the session, because the error was only ever set and never
+        /// cleared.
+        #[test]
+        fn a_later_success_clears_that_account_s_list_error() {
+            let mut errors: HashMap<String, String> = HashMap::new();
+            remember_list_error(&mut errors, "1111", Some("not permitted".to_string()));
+            assert_eq!(errors.get("1111").map(String::as_str), Some("not permitted"));
+            remember_list_error(&mut errors, "1111", None);
+            assert!(errors.is_empty(), "a success must clear it: {errors:?}");
+            // Clearing an account that never failed is a no-op, not a panic.
+            remember_list_error(&mut errors, "2222", None);
+            assert!(errors.is_empty());
+        }
+
+        /// With a multi-account pool, one account failing while another
+        /// succeeds shows rows and — before this — no note at all, so the
+        /// failed account's absence was completely invisible. The note names
+        /// every account that could not be listed.
+        #[test]
+        fn a_partial_multi_account_failure_names_the_accounts_that_failed() {
+            let mut errors: HashMap<String, String> = HashMap::new();
+            assert_eq!(list_error_detail(&errors), None);
+
+            remember_list_error(&mut errors, "2222", Some("throttled".to_string()));
+            assert_eq!(
+                list_error_detail(&errors).as_deref(),
+                Some("account 2222: throttled")
+            );
+
+            remember_list_error(&mut errors, "1111", Some("not permitted".to_string()));
+            // Sorted, so the sentence does not reshuffle between frames.
+            assert_eq!(
+                list_error_detail(&errors).as_deref(),
+                Some("account 1111: not permitted; account 2222: throttled")
+            );
+
+            // It still feeds the three-way empty state unchanged.
+            assert_eq!(
+                resource_empty_note(
+                    ResourceKind::TargetGroup,
+                    false,
+                    list_error_detail(&errors).as_deref()
+                ),
+                "Could not list Target Groups: account 1111: not permitted; \
+                 account 2222: throttled"
+            );
+        }
+
+        /// The header is drawn outside the virtualized rows, so it cannot
+        /// inherit their column sizing — both are handed the same widths, and
+        /// those widths must exactly fill the table so nothing is clipped and
+        /// no horizontal scroll can slide the rows out from under the header.
+        #[test]
+        fn the_header_and_the_rows_are_given_one_set_of_column_widths() {
+            let gaps = TG_COL_GAP * (TG_COLUMN_LABELS.len() as f32 - 1.0);
+            let total = 1200.0;
+            let widths = tg_column_widths(total);
+            assert_eq!(widths.len(), TG_COLUMN_LABELS.len());
+            let sum: f32 = widths.iter().sum::<f32>() + gaps;
+            assert!(
+                (sum - total).abs() < 0.01,
+                "the columns must fill the table exactly: {sum} vs {total}"
+            );
+            // The five bounded columns never move; only Name absorbs the change.
+            assert_eq!(&widths[1..], &TG_FIXED_COL_W[..]);
+            let narrower = tg_column_widths(900.0);
+            assert!(narrower[0] < widths[0]);
+            assert_eq!(&narrower[1..], &TG_FIXED_COL_W[..]);
+
+            // Past the floor Name stops shrinking rather than going negative,
+            // which would be a panic in `allocate_ui_with_layout`.
+            let tiny = tg_column_widths(10.0);
+            assert_eq!(tiny[0], TG_NAME_MIN_W);
+            assert_eq!(&tiny[1..], &TG_FIXED_COL_W[..]);
         }
     }
 }
