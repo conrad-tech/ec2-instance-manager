@@ -113,4 +113,16 @@ mod tests {
     fn empty_stderr_is_a_failure_not_an_absence() {
         assert!(matches!(classify_absent("   "), Absence::Failed(_)));
     }
+
+    /// The ordering is load-bearing, so it is pinned by construction: a
+    /// message carrying both markers must be read as a denial. AWS has no
+    /// such code today, which is exactly why nothing else would catch the
+    /// two blocks being swapped — and misfiling a denial as "nothing
+    /// configured" is the direction that hides a permissions hole.
+    #[test]
+    fn a_denial_wins_over_an_absent_code_in_the_same_message() {
+        let both = "An error occurred (AccessDenied) when calling GetBucketPolicy: \
+                    NoSuchBucketPolicy";
+        assert_eq!(classify_absent(both), Absence::Denied);
+    }
 }
