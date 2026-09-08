@@ -161,6 +161,82 @@ pub fn target_group_searchable_text(tg: &TargetGroup) -> String {
     out
 }
 
+/// One registered target, as the detail view's target table shows it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Target {
+    pub id: String,
+    pub port: Option<u16>,
+    /// Absent for a lambda or an `ip` target outside a zone.
+    pub az: Option<String>,
+    /// `healthy`, `unhealthy`, `initial`, `draining`, `unavailable` or
+    /// `unused`.
+    pub state: String,
+    pub reason: Option<String>,
+    pub description: Option<String>,
+}
+
+/// The Healthy/Total column's value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HealthSummary {
+    pub healthy: usize,
+    pub total: usize,
+}
+
+/// Read `elbv2 describe-target-health --output json`.
+pub fn parse_target_health(raw: &str) -> Vec<Target> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(entries) = value
+        .get("TargetHealthDescriptions")
+        .and_then(|d| d.as_array())
+    else {
+        return Vec::new();
+    };
+
+    entries
+        .iter()
+        .map(|d| {
+            let target = d.get("Target");
+            let health = d.get("TargetHealth");
+            Target {
+                id: target.and_then(|t| str_field(t, "Id")).unwrap_or_default(),
+                port: target
+                    .and_then(|t| t.get("Port"))
+                    .and_then(|p| p.as_u64())
+                    .map(|p| p as u16),
+                az: target.and_then(|t| str_field(t, "AvailabilityZone")),
+                state: health
+                    .and_then(|h| str_field(h, "State"))
+                    .unwrap_or_else(|| "unknown".to_string()),
+                reason: health.and_then(|h| str_field(h, "Reason")),
+                description: health.and_then(|h| str_field(h, "Description")),
+            }
+        })
+        .collect()
+}
+
+/// Healthy over registered.
+///
+/// **Only `healthy` counts as healthy**, and the total is every registered
+/// target whatever its state. A `draining` target is registered and is not
+/// healthy; counting it as either would misreport a deploy in progress.
+pub fn health_summary(targets: &[Target]) -> HealthSummary {
+    HealthSummary {
+        healthy: targets.iter().filter(|t| t.state == "healthy").count(),
+        total: targets.len(),
+    }
+}
+
+/// The cell's text. A group with nothing registered reads as an em dash rather
+/// than `0/0` — having no targets is a different fact from having broken ones.
+pub fn health_label(summary: HealthSummary) -> String {
+    if summary.total == 0 {
+        return "—".to_string();
+    }
+    format!("{}/{}", summary.healthy, summary.total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +370,81 @@ mod tests {
         let text = target_group_searchable_text(&groups[0]);
         assert!(text.contains("app-web"));
         assert!(!text.contains("APP-Web"));
+    }
+
+    /// A real `describe-target-health` payload: one healthy target, one
+    /// unhealthy with a reason, and one draining.
+    const TARGET_HEALTH_JSON: &str = r#"{
+      "TargetHealthDescriptions": [
+        {
+          "Target": { "Id": "i-0f76fade", "Port": 80, "AvailabilityZone": "us-east-1a" },
+          "HealthCheckPort": "80",
+          "TargetHealth": { "State": "healthy" }
+        },
+        {
+          "Target": { "Id": "i-0f76fadf", "Port": 80, "AvailabilityZone": "us-east-1b" },
+          "HealthCheckPort": "80",
+          "TargetHealth": {
+            "State": "unhealthy",
+            "Reason": "Target.ResponseCodeMismatch",
+            "Description": "Health checks failed with these codes: [500]"
+          }
+        },
+        {
+          "Target": { "Id": "i-0f76fae0", "Port": 80, "AvailabilityZone": "us-east-1c" },
+          "TargetHealth": {
+            "State": "draining",
+            "Reason": "Target.DeregistrationInProgress",
+            "Description": "Target deregistration is in progress"
+          }
+        }
+      ]
+    }"#;
+
+    #[test]
+    fn parses_every_target_with_its_reason() {
+        let targets = parse_target_health(TARGET_HEALTH_JSON);
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0].id, "i-0f76fade");
+        assert_eq!(targets[0].state, "healthy");
+        assert_eq!(targets[0].az.as_deref(), Some("us-east-1a"));
+        assert_eq!(targets[1].state, "unhealthy");
+        assert_eq!(
+            targets[1].reason.as_deref(),
+            Some("Target.ResponseCodeMismatch")
+        );
+        assert!(targets[1].description.as_deref().unwrap().contains("500"));
+    }
+
+    /// Only `healthy` counts as healthy, and the total is every registered
+    /// target. A draining target is registered and is not healthy — counting
+    /// it either way would misreport a deploy in progress.
+    #[test]
+    fn the_summary_counts_only_healthy_against_every_registered_target() {
+        let targets = parse_target_health(TARGET_HEALTH_JSON);
+        let summary = health_summary(&targets);
+        assert_eq!(summary.healthy, 1);
+        assert_eq!(summary.total, 3);
+    }
+
+    /// A target group with nothing registered is not "0 of 0 healthy" — it has
+    /// no targets, which is a different thing from having broken ones.
+    #[test]
+    fn a_group_with_no_targets_is_a_dash_not_a_zero() {
+        let empty = parse_target_health(r#"{"TargetHealthDescriptions":[]}"#);
+        assert!(empty.is_empty());
+        assert_eq!(health_label(health_summary(&empty)), "—");
+    }
+
+    #[test]
+    fn the_health_label_reads_as_the_console_writes_it() {
+        assert_eq!(health_label(HealthSummary { healthy: 3, total: 3 }), "3/3");
+        assert_eq!(health_label(HealthSummary { healthy: 0, total: 2 }), "0/2");
+    }
+
+    #[test]
+    fn an_unreadable_health_payload_yields_no_targets() {
+        assert!(parse_target_health("not json").is_empty());
+        assert!(parse_target_health("{}").is_empty());
     }
 }
