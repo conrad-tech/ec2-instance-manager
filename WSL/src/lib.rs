@@ -26,6 +26,7 @@ pub mod probe;
 pub mod profile_choice;
 pub mod pingdom;
 pub mod reaper;
+pub mod resources;
 pub mod script_env;
 pub mod sim;
 pub mod ssh_config;
