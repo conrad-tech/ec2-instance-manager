@@ -9,6 +9,9 @@
 //! the GUI binary free of resource models, and what lets these be tested
 //! without AWS.
 
+use crate::aws_cli::run_aws_cli;
+use crate::error::AppError;
+
 /// One target group, as the Target Groups sub-tab lists it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TargetGroup {
@@ -237,6 +240,201 @@ pub fn health_label(summary: HealthSummary) -> String {
     format!("{}/{}", summary.healthy, summary.total)
 }
 
+/// Why a fetch did not produce data.
+///
+/// `Denied` is separate from `Failed` because the caller acts on it: the
+/// Healthy/Total column switches itself off for an account on the first
+/// denial, rather than issuing one refused call per row for as long as
+/// somebody keeps scrolling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FetchError {
+    Denied,
+    Failed(String),
+}
+
+impl FetchError {
+    /// Classify a failed CLI invocation.
+    ///
+    /// `Absence::Absent` has no meaning for a list call — nothing here answers
+    /// "nothing configured" — so it is kept as a failure rather than silently
+    /// becoming an empty list, which would render as "no target groups in this
+    /// account".
+    pub fn from_stderr(stderr: &str) -> Self {
+        match crate::resources::classify_absent(stderr) {
+            crate::resources::Absence::Denied => Self::Denied,
+            crate::resources::Absence::Absent | crate::resources::Absence::Failed(_) => {
+                Self::Failed(stderr.trim().to_string())
+            }
+        }
+    }
+
+    /// The sentence to put on screen.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Denied => "not permitted".to_string(),
+            Self::Failed(text) => text.clone(),
+        }
+    }
+}
+
+/// Map a `run_aws_cli` error onto a `FetchError`, keeping the API's own
+/// explanation — `CommandFailed` carries stderr, which is the thing worth
+/// reading.
+fn fetch_error(err: AppError) -> FetchError {
+    match err {
+        AppError::CommandFailed { stderr, .. } => FetchError::from_stderr(&stderr),
+        other => FetchError::Failed(other.to_string()),
+    }
+}
+
+fn run(profile: &str, region: &str, args: &[&str]) -> std::result::Result<String, FetchError> {
+    run_aws_cli(Some(profile), Some(region), args).map_err(fetch_error)
+}
+
+/// Every target group in one account and region.
+///
+/// `account_id` is stamped onto each row: it is how two accounts'
+/// identically-named groups are told apart, and which credentials the detail
+/// calls must use.
+pub fn fetch_target_groups(
+    profile: &str,
+    region: &str,
+    account_id: &str,
+) -> std::result::Result<Vec<TargetGroup>, FetchError> {
+    let raw = run(
+        profile,
+        region,
+        &["elbv2", "describe-target-groups", "--output", "json"],
+    )?;
+    let mut groups = parse_target_groups(&raw);
+    for group in &mut groups {
+        group.account_id = account_id.to_string();
+    }
+    Ok(groups)
+}
+
+/// The registered targets of one group and their health.
+///
+/// **One group per call — the API has no bulk form.** That is the whole reason
+/// the Healthy/Total column is filled lazily rather than up front.
+pub fn fetch_target_health(
+    profile: &str,
+    region: &str,
+    arn: &str,
+) -> std::result::Result<Vec<Target>, FetchError> {
+    let raw = run(
+        profile,
+        region,
+        &[
+            "elbv2",
+            "describe-target-health",
+            "--target-group-arn",
+            arn,
+            "--output",
+            "json",
+        ],
+    )?;
+    Ok(parse_target_health(&raw))
+}
+
+pub fn fetch_target_group_attributes(
+    profile: &str,
+    region: &str,
+    arn: &str,
+) -> std::result::Result<Vec<(String, String)>, FetchError> {
+    let raw = run(
+        profile,
+        region,
+        &[
+            "elbv2",
+            "describe-target-group-attributes",
+            "--target-group-arn",
+            arn,
+            "--output",
+            "json",
+        ],
+    )?;
+    Ok(parse_target_group_attributes(&raw))
+}
+
+pub fn fetch_elb_tags(
+    profile: &str,
+    region: &str,
+    arn: &str,
+) -> std::result::Result<Vec<(String, String)>, FetchError> {
+    let raw = run(
+        profile,
+        region,
+        &[
+            "elbv2",
+            "describe-tags",
+            "--resource-arns",
+            arn,
+            "--output",
+            "json",
+        ],
+    )?;
+    Ok(parse_elb_tags(&raw))
+}
+
+/// `describe-target-group-attributes` as sorted name/value pairs.
+pub fn parse_target_group_attributes(raw: &str) -> Vec<(String, String)> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(entries) = value.get("Attributes").and_then(|a| a.as_array()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = entries
+        .iter()
+        .filter_map(|a| {
+            Some((
+                a.get("Key").and_then(|k| k.as_str())?.to_string(),
+                a.get("Value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// `describe-tags` for a single resource, as sorted key/value pairs.
+///
+/// The call is made one ARN at a time, so the first description is the only
+/// one; taking it by position rather than matching the ARN back keeps this
+/// working whether or not the API echoes it in the shape expected.
+pub fn parse_elb_tags(raw: &str) -> Vec<(String, String)> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(tags) = value
+        .get("TagDescriptions")
+        .and_then(|d| d.as_array())
+        .and_then(|d| d.first())
+        .and_then(|d| d.get("Tags"))
+        .and_then(|t| t.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = tags
+        .iter()
+        .filter_map(|t| {
+            Some((
+                t.get("Key").and_then(|k| k.as_str())?.to_string(),
+                t.get("Value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +644,64 @@ mod tests {
     fn an_unreadable_health_payload_yields_no_targets() {
         assert!(parse_target_health("not json").is_empty());
         assert!(parse_target_health("{}").is_empty());
+    }
+
+    #[test]
+    fn parses_target_group_attributes_as_name_value_pairs() {
+        let raw = r#"{"Attributes":[
+            {"Key":"deregistration_delay.timeout_seconds","Value":"300"},
+            {"Key":"stickiness.enabled","Value":"false"}
+        ]}"#;
+        let attrs = parse_target_group_attributes(raw);
+        assert_eq!(attrs.len(), 2);
+        // Sorted, so the panel does not reshuffle between visits.
+        assert_eq!(attrs[0].0, "deregistration_delay.timeout_seconds");
+        assert_eq!(attrs[0].1, "300");
+    }
+
+    #[test]
+    fn parses_elb_tags() {
+        let raw = r#"{"TagDescriptions":[{
+            "ResourceArn":"arn:aws:elasticloadbalancing:us-east-1:1111:targetgroup/app-web/abc",
+            "Tags":[{"Key":"Name","Value":"app-web"},{"Key":"Env","Value":"prod"}]
+        }]}"#;
+        let tags = parse_elb_tags(raw);
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0], ("Env".to_string(), "prod".to_string()));
+    }
+
+    #[test]
+    fn unreadable_attribute_and_tag_payloads_yield_nothing() {
+        assert!(parse_target_group_attributes("not json").is_empty());
+        assert!(parse_elb_tags("{}").is_empty());
+    }
+
+    /// A denial must reach the caller as its own variant: the Healthy/Total
+    /// column switches itself off for that account on the first one, rather
+    /// than issuing a denied call per row for as long as somebody scrolls.
+    #[test]
+    fn a_denied_call_is_its_own_error() {
+        let denied = FetchError::from_stderr(
+            "An error occurred (AccessDeniedException) when calling the DescribeTargetHealth operation",
+        );
+        assert!(matches!(denied, FetchError::Denied));
+
+        let other = FetchError::from_stderr("Could not connect to the endpoint URL");
+        match other {
+            FetchError::Failed(text) => assert!(text.contains("endpoint")),
+            _ => panic!("expected Failed"),
+        }
+    }
+
+    /// An `Absence::Absent` has no meaning for a list call — nothing here
+    /// answers "not configured" — so it is reported as a failure with its own
+    /// words rather than silently becoming an empty list, which would render
+    /// as "no target groups in this account".
+    #[test]
+    fn an_absent_code_on_a_list_call_is_still_a_failure() {
+        let err = FetchError::from_stderr(
+            "An error occurred (NoSuchTagSet) when calling the DescribeTags operation",
+        );
+        assert!(matches!(err, FetchError::Failed(_)));
     }
 }
