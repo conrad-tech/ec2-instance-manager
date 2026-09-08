@@ -23475,6 +23475,7 @@ mod gui {
                     account.region.clone(),
                     account.account_id.clone(),
                 );
+                let repaint = self.egui_ctx.clone();
                 std::thread::spawn(move || {
                     let result = elb::fetch_target_groups(&p, &r, &a);
                     let _ = tx.send(ProcEvent::TargetGroupList {
@@ -23482,6 +23483,15 @@ mod gui {
                         cache_key: key,
                         result,
                     });
+                    // Wake the UI. egui only redraws on an event, and the
+                    // render-side guard is judged BEFORE this thread is
+                    // spawned, so on the frame that starts a fetch it sees
+                    // nothing outstanding and schedules nothing. Without this
+                    // the reply sits in the channel until the user happens to
+                    // move the mouse.
+                    if let Some(ctx) = &repaint {
+                        ctx.request_repaint();
+                    }
                 });
             }
         }
@@ -23641,9 +23651,26 @@ mod gui {
             ) {
                 self.log_warn(line);
             }
-            let priority_arns: Vec<String> =
+            let mut priority_arns: Vec<String> =
                 priority_idx.iter().map(|i| rows[*i].arn.clone()).collect();
             let is_priority: HashSet<usize> = priority_idx.iter().copied().collect();
+
+            // A search is itself a statement of what matters. Somebody who has
+            // just narrowed 200 target groups to three is looking at all three,
+            // not only the ones the scroll position happens to cover, so a
+            // narrow search promotes its whole result set. Bounded by the same
+            // cap as the configured list: a search matching half the account
+            // must not turn the bounded fill into one call per row. Rows
+            // already claimed by the configured list are not added twice --
+            // `health_requests` dedupes -- and the star is left alone, since it
+            // marks the configured list, not the search.
+            if search_promotes_every_row(
+                self.search_rules.iter().any(|r| !r.term.trim().is_empty()),
+                rows.len(),
+                resources::PRIORITY_HEALTH_MAX,
+            ) {
+                priority_arns.extend(rows.iter().map(|tg| tg.arn.clone()));
+            }
 
             // Solid rather than the default floating bar, for the reason
             // recorded against the pem dropdown: a floating bar's dormant
@@ -23672,96 +23699,107 @@ mod gui {
             // that range is what decides which rows get a health call.
             let health_header = tg_health_header(self.tg_denied_accounts.len());
             let health_hover = tg_health_header_hover(&self.tg_denied_accounts);
-            egui::Grid::new("target_group_header")
-                .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
-                .min_row_height(text_h)
-                .show(ui, |ui| {
-                    for (idx, (label, width)) in
-                        TG_COLUMN_LABELS.iter().zip(widths.iter()).enumerate()
-                    {
-                        let text = if idx == TG_HEALTH_COL {
-                            health_header.clone()
-                        } else {
-                            (*label).to_string()
-                        };
-                        let resp = tg_cell(ui, *width, text_h, egui::RichText::new(text).strong());
-                        if idx == TG_HEALTH_COL {
-                            if let Some(hover) = &health_hover {
-                                resp.on_hover_text(hover.clone());
-                            }
+            tg_row(ui, text_h, |ui| {
+                for (idx, (label, width)) in
+                    TG_COLUMN_LABELS.iter().zip(widths.iter()).enumerate()
+                {
+                    let text = if idx == TG_HEALTH_COL {
+                        health_header.clone()
+                    } else {
+                        (*label).to_string()
+                    };
+                    let resp = tg_cell(ui, *width, text_h, egui::RichText::new(text).strong());
+                    if idx == TG_HEALTH_COL {
+                        if let Some(hover) = &health_hover {
+                            resp.on_hover_text(hover.clone());
                         }
                     }
-                    ui.end_row();
-                });
+                }
+            });
+            ui.add_space(TG_ROW_SPACING);
 
             let mut visible_arns: Vec<String> = Vec::new();
             let mut pending_detail: Option<TargetGroup> = None;
             let health = self.tg_health.clone();
+            let stripe = ui.visuals().faint_bg_color;
 
             egui::ScrollArea::vertical()
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .show_rows(ui, row_h, rows.len(), |ui, range| {
-                    egui::Grid::new("target_group_grid")
-                        .striped(true)
-                        .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
-                        .min_row_height(text_h)
-                        .show(ui, |ui| {
-                            for idx in range {
-                                let tg = &rows[idx];
-                                visible_arns.push(tg.arn.clone());
+                    // Exactly `row_h` of vertical advance per row, or the range
+                    // `show_rows` reports drifts from what is on screen -- and
+                    // that range is what decides which rows get a health call.
+                    ui.spacing_mut().item_spacing.y = TG_ROW_SPACING;
+                    for idx in range {
+                        // Striping by hand, because `egui::Grid` is gone: the
+                        // rect is painted before the row is drawn, since within
+                        // one layer egui paints in call order.
+                        if idx % 2 == 1 {
+                            let top_left = ui.cursor().min;
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_size(
+                                    top_left,
+                                    egui::vec2(ui.available_width(), text_h),
+                                ),
+                                0.0,
+                                stripe,
+                            );
+                        }
+                        tg_row(ui, text_h, |ui| {
+                        let tg = &rows[idx];
+                        visible_arns.push(tg.arn.clone());
 
-                                let name = if is_priority.contains(&idx) {
-                                    format!("★ {}", tg.name)
-                                } else {
-                                    tg.name.clone()
-                                };
-                                tg_cell(ui, widths[0], text_h, name)
-                                    .on_hover_text(tg.name.clone())
-                                    .context_menu(|ui| {
-                                        if ui.button("See Details").clicked() {
-                                            pending_detail = Some(tg.clone());
-                                            ui.close();
-                                        }
-                                    });
-
-                                tg_cell(ui, widths[1], text_h, elb::protocol_port_label(tg));
-                                tg_cell(ui, widths[2], text_h, tg.target_type.clone());
-
-                                let cell = health
-                                    .get(&tg.arn)
-                                    .cloned()
-                                    .unwrap_or(HealthCell::NotRequested);
-                                let text = health_cell_text(&cell);
-                                let colour = match &cell {
-                                    HealthCell::Known(s) if s.total > 0 && s.healthy == s.total => {
-                                        Some(egui::Color32::GREEN)
-                                    }
-                                    HealthCell::Known(s) if s.healthy == 0 && s.total > 0 => {
-                                        Some(egui::Color32::RED)
-                                    }
-                                    HealthCell::Known(_) => Some(egui::Color32::YELLOW),
-                                    HealthCell::Failed(_) => Some(egui::Color32::RED),
-                                    _ => None,
-                                };
-                                let rich = match colour {
-                                    Some(c) => notification_text(ui, c, text),
-                                    None => egui::RichText::new(text),
-                                };
-                                let resp = tg_cell(ui, widths[3], text_h, rich);
-                                if let HealthCell::Failed(detail) = &cell {
-                                    resp.on_hover_text(detail.clone());
+                        let name = if is_priority.contains(&idx) {
+                            format!("★ {}", tg.name)
+                        } else {
+                            tg.name.clone()
+                        };
+                        tg_cell(ui, widths[0], text_h, name)
+                            .on_hover_text(tg.name.clone())
+                            .context_menu(|ui| {
+                                if ui.button("See Details").clicked() {
+                                    pending_detail = Some(tg.clone());
+                                    ui.close();
                                 }
+                            });
 
-                                tg_cell(
-                                    ui,
-                                    widths[4],
-                                    text_h,
-                                    tg.vpc_id.clone().unwrap_or_else(|| "—".to_string()),
-                                );
-                                tg_cell(ui, widths[5], text_h, tg.account_id.clone());
-                                ui.end_row();
+                        tg_cell(ui, widths[1], text_h, elb::protocol_port_label(tg));
+                        tg_cell(ui, widths[2], text_h, tg.target_type.clone());
+
+                        let cell = health
+                            .get(&tg.arn)
+                            .cloned()
+                            .unwrap_or(HealthCell::NotRequested);
+                        let text = health_cell_text(&cell);
+                        let colour = match &cell {
+                            HealthCell::Known(s) if s.total > 0 && s.healthy == s.total => {
+                                Some(egui::Color32::GREEN)
                             }
+                            HealthCell::Known(s) if s.healthy == 0 && s.total > 0 => {
+                                Some(egui::Color32::RED)
+                            }
+                            HealthCell::Known(_) => Some(egui::Color32::YELLOW),
+                            HealthCell::Failed(_) => Some(egui::Color32::RED),
+                            _ => None,
+                        };
+                        let rich = match colour {
+                            Some(c) => notification_text(ui, c, text),
+                            None => egui::RichText::new(text),
+                        };
+                        let resp = tg_cell(ui, widths[3], text_h, rich);
+                        if let HealthCell::Failed(detail) = &cell {
+                            resp.on_hover_text(detail.clone());
+                        }
+
+                        tg_cell(
+                            ui,
+                            widths[4],
+                            text_h,
+                            tg.vpc_id.clone().unwrap_or_else(|| "—".to_string()),
+                        );
+                        tg_cell(ui, widths[5], text_h, tg.account_id.clone());
                         });
+                    }
                 });
 
             if let Some(tg) = pending_detail {
@@ -23831,6 +23869,7 @@ mod gui {
                 // landing together would otherwise both pass the check.
                 self.tg_health.insert(arn.clone(), HealthCell::InFlight);
                 let tx = self.proc_tx.clone();
+                let repaint = self.egui_ctx.clone();
                 std::thread::spawn(move || {
                     let result = elb::fetch_target_health(&profile, &region, &arn);
                     let _ = tx.send(ProcEvent::TargetGroupHealth {
@@ -23838,6 +23877,11 @@ mod gui {
                         account_id,
                         result,
                     });
+                    // See the list worker: without this the Healthy/Total cell
+                    // stays on the ellipsis until an unrelated event redraws.
+                    if let Some(ctx) = &repaint {
+                        ctx.request_repaint();
+                    }
                 });
             }
         }
@@ -23901,6 +23945,7 @@ mod gui {
                 self.tg_health.insert(tg.arn.clone(), HealthCell::InFlight);
             }
             let tx = self.proc_tx.clone();
+            let repaint = self.egui_ctx.clone();
             let arn = tg.arn.clone();
             let account_id = tg.account_id.clone();
             std::thread::spawn(move || {
@@ -23928,6 +23973,9 @@ mod gui {
                     attributes: None,
                     tags: Some(tags.map_err(|e| e.message())),
                 });
+                if let Some(ctx) = &repaint {
+                    ctx.request_repaint();
+                }
             });
 
             self.detail_subject = Some(DetailSubject::TargetGroup(Box::new(tg)));
@@ -33178,6 +33226,18 @@ mod gui {
         "Account",
     ];
 
+    /// Does a search narrow the table enough that every row it left should be
+    /// fetched, rather than only the rows on screen?
+    ///
+    /// Typing a filter says what you care about at least as clearly as the
+    /// configured priority list does. The cap is what keeps it honest: a search
+    /// that still leaves hundreds of rows is not a statement about three
+    /// particular target groups, and promoting all of them would be exactly the
+    /// unbounded whole-account fill the visible-range design exists to avoid.
+    fn search_promotes_every_row(filter_active: bool, row_count: usize, cap: usize) -> bool {
+        filter_active && row_count > 0 && row_count <= cap
+    }
+
     /// Which of `TG_COLUMN_LABELS` is the Healthy/Total column.
     const TG_HEALTH_COL: usize = 3;
 
@@ -33324,6 +33384,28 @@ mod gui {
     /// for it; truncating keeps every row exactly one line, which is what makes
     /// the reserved and drawn heights equal. Returns the label's own response,
     /// so a caller can still hang a context menu or a tooltip on it.
+    /// One row of the target-group table — the header included.
+    ///
+    /// Both go through this, and that is the whole point. The two halves were
+    /// an `egui::Grid` each, handed the same width array, and they still did
+    /// not line up: a `Grid` sizes its columns from the widest content *it* has
+    /// seen, keyed on its own id, so two grids in two different `Ui`s — the
+    /// body's inside a `ScrollArea` — reach two different answers no matter
+    /// what widths they are given. The array was a suggestion to each of them,
+    /// not a shared truth. Allocating every cell explicitly removes the second
+    /// opinion, so the header cannot sit over the wrong column.
+    ///
+    /// `egui_extras::TableBuilder` would be the idiomatic answer; it is not a
+    /// dependency of this crate and is not worth adding for one table.
+    fn tg_row<R>(ui: &mut egui::Ui, height: f32, add_cells: impl FnOnce(&mut egui::Ui) -> R) -> R {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = TG_COL_GAP;
+            ui.set_min_height(height);
+            add_cells(ui)
+        })
+        .inner
+    }
+
     fn tg_cell(
         ui: &mut egui::Ui,
         width: f32,
@@ -40276,6 +40358,26 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 resource_empty_note(ResourceKind::TargetGroup, false, None),
                 "No target groups in the selected account(s)."
             );
+        }
+
+        /// A search narrow enough to read is a statement about every row it
+        /// left, so those rows are fetched rather than only the ones the scroll
+        /// position covers. The cap is what stops it becoming the unbounded
+        /// whole-account fill the visible-range design exists to avoid, and an
+        /// empty search box must promote nothing at all — otherwise every row
+        /// in the account is "urgent" the moment the tab opens.
+        #[test]
+        fn a_narrow_search_promotes_its_whole_result_set() {
+            // Typed a filter, three rows left: all three.
+            assert!(search_promotes_every_row(true, 3, 50));
+            // Exactly at the cap is still in.
+            assert!(search_promotes_every_row(true, 50, 50));
+            // Past it, back to the visible-range path.
+            assert!(!search_promotes_every_row(true, 51, 50));
+            // No filter typed: the whole account is not a search result.
+            assert!(!search_promotes_every_row(false, 3, 50));
+            // Nothing matched: nothing to promote.
+            assert!(!search_promotes_every_row(true, 0, 50));
         }
 
         /// Sim's promise is that it makes no AWS calls, so the sub-tabs must say

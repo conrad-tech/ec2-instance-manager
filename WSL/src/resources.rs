@@ -327,6 +327,30 @@ mod tests {
         );
     }
 
+    /// One pattern claims EVERY name it matches, not just the first.
+    ///
+    /// This is the behaviour a configured list is actually relied on for: an
+    /// operator writes one app name and expects every target group carrying it
+    /// to be answered. Stopping at the first match would look like it worked —
+    /// one row fills promptly — and quietly leave the rest to the scroll
+    /// position.
+    #[test]
+    fn one_pattern_claims_every_name_it_matches() {
+        let names = vec![
+            "cassandra-prod-tg".to_string(),
+            "kafka-prod-tg".to_string(),
+            "cassandra-reaper-8080".to_string(),
+            "CASSANDRA-Backup".to_string(),
+            "postgres-tg".to_string(),
+        ];
+        // Indices, in the list's own order: all three cassandra rows, and
+        // neither of the others.
+        assert_eq!(
+            priority_indexes(&["cassandra".to_string()], &names, 50),
+            vec![0, 2, 3]
+        );
+    }
+
     /// The shipped state. Prioritising nothing is not prioritising everything.
     #[test]
     fn no_patterns_prioritises_nothing() {
