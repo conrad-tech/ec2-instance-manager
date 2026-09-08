@@ -7740,6 +7740,10 @@ mod gui {
         tg_priority_warned: Option<usize>,
         /// Same shape as `tg_priority_warned`, for the background-fill ceiling.
         tg_fill_warned: Option<usize>,
+        /// Per-column width overrides, set by dragging a header edge. Absent
+        /// means "whatever `tg_auto_widths` says", so a column the user has
+        /// never touched keeps following its content.
+        tg_col_widths: HashMap<usize, f32>,
         /// `resources.priority_target_groups`, read once at startup.
         ///
         /// There is **no `self.features`** on this struct: `App::new` holds
@@ -8570,6 +8574,7 @@ mod gui {
                 tg_list_failures: HashMap::new(),
                 tg_priority_warned: None,
                 tg_fill_warned: None,
+                tg_col_widths: HashMap::new(),
                 // `features` is the local in `App::new`, the same one
                 // `instance_power_enabled` below is resolved from.
                 tg_priority_patterns: features.resources.priority_target_groups.clone(),
@@ -23681,163 +23686,183 @@ mod gui {
             // opacity is 0.0, so the pane reads as unscrollable. Solid also
             // reserves its own width, which is what makes the allowance below
             // a real number.
-            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
-            let bar = &ui.spacing().scroll;
-            let bar_allowance = bar.bar_width + bar.bar_inner_margin + bar.bar_outer_margin;
-            let widths = tg_column_widths(
-                ui.available_width() - bar_allowance,
-                !self.tg_denied_accounts.is_empty(),
-            );
-
-            let text_h = ui.text_style_height(&egui::TextStyle::Body);
-            // One text line plus the gap the grid puts after it. Every cell is
-            // allocated at exactly `text_h` and truncates rather than wrapping,
-            // so no row can be taller than that, and `min_row_height` stops one
-            // being shorter.
-            let row_h = text_h + TG_ROW_SPACING;
-
-            // Drawn once, above the scroll area — never inside `show_rows`.
-            // Inside, it was re-drawn at the top of every visible slice and
-            // pushed the rows down by its own height, so the range the scroll
-            // area reported and the rows actually on screen disagreed — and
-            // that range is what decides which rows get a health call.
+            // The whole table is ONE grid, header row included, exactly as the
+            // EC2 instance table beside it is built. That is what makes the
+            // columns line up: a `Grid` enforces one width per column across
+            // every row it owns, so the header cannot disagree with the body.
+            // The previous arrangement -- a header grid above a separate body
+            // grid inside a scroll area -- could not line up however carefully
+            // both were handed the same width array, because each grid sizes
+            // its own columns from the content it alone has seen.
+            //
+            // `show_rows` virtualization went with it. It was here so the
+            // visible range could drive which rows got a health call; the
+            // background tier now fetches every row regardless, so the range
+            // bought nothing and cost the alignment.
+            let denied = !self.tg_denied_accounts.is_empty();
+            let auto = tg_auto_widths(&rows, denied);
             let health_header = tg_health_header(self.tg_denied_accounts.len());
             let health_hover = tg_health_header_hover(&self.tg_denied_accounts);
-            tg_row(ui, text_h, |ui| {
-                for (idx, (label, width)) in
-                    TG_COLUMN_LABELS.iter().zip(widths.iter()).enumerate()
-                {
-                    let text = if idx == TG_HEALTH_COL {
-                        health_header.clone()
-                    } else {
-                        (*label).to_string()
-                    };
-                    let resp = tg_cell(ui, *width, text_h, egui::RichText::new(text).strong());
-                    if idx == TG_HEALTH_COL {
-                        if let Some(hover) = &health_hover {
-                            resp.on_hover_text(hover.clone());
-                        }
-                    }
-                }
-            });
-            ui.add_space(TG_ROW_SPACING);
-
-            let mut visible_arns: Vec<String> = Vec::new();
-            let mut pending_detail: Option<TargetGroup> = None;
             let health = self.tg_health.clone();
-            let stripe = ui.visuals().faint_bg_color;
+            let overrides = self.tg_col_widths.clone();
+            let mut pending_detail: Option<TargetGroup> = None;
+            let mut pending_width: Option<(usize, f32)> = None;
 
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::both()
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-                .show_rows(ui, row_h, rows.len(), |ui, range| {
-                    // Exactly `row_h` of vertical advance per row, or the range
-                    // `show_rows` reports drifts from what is on screen -- and
-                    // that range is what decides which rows get a health call.
-                    ui.spacing_mut().item_spacing.y = TG_ROW_SPACING;
-                    for idx in range {
-                        // Striping by hand, because `egui::Grid` is gone: the
-                        // rect is painted before the row is drawn, since within
-                        // one layer egui paints in call order.
-                        if idx % 2 == 1 {
-                            let top_left = ui.cursor().min;
-                            ui.painter().rect_filled(
-                                egui::Rect::from_min_size(
-                                    top_left,
-                                    egui::vec2(ui.available_width(), text_h),
-                                ),
-                                0.0,
-                                stripe,
-                            );
-                        }
-                        tg_row(ui, text_h, |ui| {
-                        let tg = &rows[idx];
-                        visible_arns.push(tg.arn.clone());
-
-                        let name = if is_priority.contains(&idx) {
-                            format!("★ {}", tg.name)
-                        } else {
-                            tg.name.clone()
-                        };
-                        tg_cell(ui, widths[0], text_h, name)
-                            .on_hover_text(tg.name.clone())
-                            .context_menu(|ui| {
-                                if ui.button("See Details").clicked() {
-                                    pending_detail = Some(tg.clone());
-                                    ui.close();
+                .show(ui, |ui| {
+                    let cw = |idx: usize| -> f32 {
+                        overrides.get(&idx).copied().unwrap_or(auto[idx])
+                    };
+                    egui::Grid::new("target_group_grid")
+                        .striped(true)
+                        .min_col_width(0.0)
+                        .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
+                        .show(ui, |ui| {
+                            for (idx, label) in TG_COLUMN_LABELS.iter().enumerate() {
+                                let width = cw(idx);
+                                let text = if idx == TG_HEALTH_COL {
+                                    health_header.clone()
+                                } else {
+                                    (*label).to_string()
+                                };
+                                let resp = ui.add_sized(
+                                    [width, TG_ROW_H],
+                                    egui::Button::new(egui::RichText::new(text).strong())
+                                        .frame(false),
+                                );
+                                if idx == TG_HEALTH_COL {
+                                    if let Some(hover) = &health_hover {
+                                        resp.clone().on_hover_text(hover.clone());
+                                    }
                                 }
-                            });
 
-                        tg_cell(ui, widths[1], text_h, elb::protocol_port_label(tg));
+                                // Drag the right edge to resize — the same
+                                // handle the EC2 table has, and the reason the
+                                // fixed-width compromise is no longer needed.
+                                let drag_id = ui.id().with(("tg_col_resize", idx));
+                                let near_right = ui.input(|i| {
+                                    i.pointer.hover_pos().is_some_and(|pos| {
+                                        resp.rect.contains(pos)
+                                            && pos.x > resp.rect.right() - 8.0
+                                    })
+                                });
+                                if near_right || ui.ctx().is_being_dragged(drag_id) {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+                                    let x = resp.rect.right();
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(x, resp.rect.top()),
+                                            egui::pos2(x, resp.rect.bottom()),
+                                        ],
+                                        egui::Stroke::new(2.0, ui.visuals().text_color()),
+                                    );
+                                    let drag = ui.interact(
+                                        egui::Rect::from_min_size(
+                                            resp.rect.right_top() - egui::vec2(8.0, 0.0),
+                                            egui::vec2(16.0, resp.rect.height()),
+                                        ),
+                                        drag_id,
+                                        egui::Sense::drag(),
+                                    );
+                                    if drag.dragged() {
+                                        pending_width = Some((
+                                            idx,
+                                            (width + drag.drag_delta().x).max(TG_COL_MIN_W),
+                                        ));
+                                    }
+                                }
+                            }
+                            ui.end_row();
 
-                        let cell = health
-                            .get(&tg.arn)
-                            .cloned()
-                            .unwrap_or(HealthCell::NotRequested);
-                        let text = health_cell_text(&cell);
-                        let colour = match &cell {
-                            HealthCell::Known(s) if s.total > 0 && s.healthy == s.total => {
+                            for (idx, tg) in rows.iter().enumerate() {
+
+                                let name = if is_priority.contains(&idx) {
+                                format!("★ {}", tg.name)
+                                } else {
+                                tg.name.clone()
+                                };
+                                tg_cell(ui, cw(0), TG_ROW_H, name)
+                                .on_hover_text(tg.name.clone())
+                                .context_menu(|ui| {
+                                if ui.button("See Details").clicked() {
+                                pending_detail = Some(tg.clone());
+                                ui.close();
+                                }
+                                });
+
+                                tg_cell(ui, cw(1), TG_ROW_H, elb::protocol_port_label(tg));
+
+                                let cell = health
+                                .get(&tg.arn)
+                                .cloned()
+                                .unwrap_or(HealthCell::NotRequested);
+                                let text = health_cell_text(&cell);
+                                let colour = match &cell {
+                                HealthCell::Known(s) if s.total > 0 && s.healthy == s.total => {
                                 Some(egui::Color32::GREEN)
-                            }
-                            HealthCell::Known(s) if s.healthy == 0 && s.total > 0 => {
+                                }
+                                HealthCell::Known(s) if s.healthy == 0 && s.total > 0 => {
                                 Some(egui::Color32::RED)
-                            }
-                            // No targets registered is a fact, not a warning.
-                            // It fell through to the yellow catch-all because
-                            // both arms above require `total > 0`, so an empty
-                            // target group rendered as a coloured dash — and
-                            // yellow means "needs attention" everywhere else in
-                            // this app. It was read as the column failing to
-                            // load, which is the one thing it must not look
-                            // like.
-                            HealthCell::Known(s) if s.total == 0 => None,
-                            HealthCell::Known(_) => Some(egui::Color32::YELLOW),
-                            HealthCell::Failed(_) => Some(egui::Color32::RED),
-                            _ => None,
-                        };
-                        let rich = match colour {
-                            Some(c) => notification_text(ui, c, text),
-                            None => egui::RichText::new(text),
-                        };
-                        let resp = tg_cell(ui, widths[2], text_h, rich);
-                        if let HealthCell::Failed(detail) = &cell {
-                            resp.on_hover_text(detail.clone());
-                        }
+                                }
+                                // No targets registered is a fact, not a warning.
+                                // It fell through to the yellow catch-all because
+                                // both arms above require `total > 0`, so an empty
+                                // target group rendered as a coloured dash — and
+                                // yellow means "needs attention" everywhere else in
+                                // this app. It was read as the column failing to
+                                // load, which is the one thing it must not look
+                                // like.
+                                HealthCell::Known(s) if s.total == 0 => None,
+                                HealthCell::Known(_) => Some(egui::Color32::YELLOW),
+                                HealthCell::Failed(_) => Some(egui::Color32::RED),
+                                _ => None,
+                                };
+                                let rich = match colour {
+                                Some(c) => notification_text(ui, c, text),
+                                None => egui::RichText::new(text),
+                                };
+                                let resp = tg_cell(ui, cw(2), TG_ROW_H, rich);
+                                if let HealthCell::Failed(detail) = &cell {
+                                resp.on_hover_text(detail.clone());
+                                }
 
-                        // The health-check path, from the same
-                        // describe-target-groups reply the row itself came
-                        // from — so unlike Healthy/Total it is known the
-                        // moment the row exists and has no pending state. A
-                        // dash here is unambiguous for that reason: it means
-                        // this health check has no path (a TCP check), never
-                        // "no answer yet".
-                        tg_cell(
-                            ui,
-                            widths[3],
-                            text_h,
-                            tg.health_check
+                                // The health-check path, from the same
+                                // describe-target-groups reply the row itself came
+                                // from — so unlike Healthy/Total it is known the
+                                // moment the row exists and has no pending state. A
+                                // dash here is unambiguous for that reason: it means
+                                // this health check has no path (a TCP check), never
+                                // "no answer yet".
+                                tg_cell(
+                                ui,
+                                cw(3),
+                                TG_ROW_H,
+                                tg.health_check
                                 .path
                                 .clone()
                                 .unwrap_or_else(|| "—".to_string()),
-                        )
-                        .on_hover_text(tg_health_check_hover(tg));
+                                )
+                                .on_hover_text(tg_health_check_hover(tg));
+                                ui.end_row();
+                            }
                         });
-                    }
                 });
+
+            if let Some((idx, w)) = pending_width {
+                self.tg_col_widths.insert(idx, w);
+            }
+
 
             if let Some(tg) = pending_detail {
                 self.open_target_group_details(tg);
             }
 
-            self.spawn_health_requests(&priority_arns, &visible_arns, &rows);
+            self.spawn_health_requests(&priority_arns, &rows);
         }
 
         /// Start whatever health calls this frame is allowed.
-        fn spawn_health_requests(
-            &mut self,
-            priority: &[String],
-            visible: &[String],
-            rows: &[TargetGroup],
-        ) {
+        fn spawn_health_requests(&mut self, priority: &[String], rows: &[TargetGroup]) {
             let settled: HashSet<String> = self
                 .tg_health
                 .iter()
@@ -23872,7 +23897,6 @@ mod gui {
 
             let wanted = health_requests(&HealthRequestInput {
                 priority,
-                visible,
                 rest: &rest,
                 settled: &settled,
                 denied_accounts: &self.tg_denied_accounts,
@@ -33339,20 +33363,27 @@ mod gui {
 
     /// The five bounded columns' widths, in `TG_COLUMN_LABELS` order after
     /// Name. Their contents are short and bounded; Name is not.
-    const TG_FIXED_COL_W: [f32; 3] = [120.0, 110.0, 260.0];
-
-    /// What the Healthy/Total column widens to while its header carries the
-    /// `(not permitted)` suffix.
+    /// Floor for each column, in `TG_COLUMN_LABELS` order.
     ///
-    /// Widened only then, rather than reserved permanently: `Healthy/Total`
-    /// alone fits the ordinary width with room to spare, and a column sized
-    /// for a state most sessions never reach is dead space on every row. The
-    /// table does shift when it changes — which is the frame the header
-    /// changes too, so what caused it is on screen.
-    const TG_HEALTH_DENIED_COL_W: f32 = 200.0;
+    /// A column is sized to its widest cell (see `tg_auto_widths`) but never
+    /// below this, so an all-short column still reads as a column and the
+    /// header is never the thing that gets clipped.
+    const TG_MIN_COL_W: [f32; 4] = [180.0, 110.0, 110.0, 120.0];
 
-    /// Name never shrinks past this, whatever the window does.
-    const TG_NAME_MIN_W: f32 = 140.0;
+    /// Ceiling for the same. One pathological name must not push every other
+    /// column off the right-hand edge before the user has a chance to drag it.
+    const TG_MAX_COL_W: [f32; 4] = [520.0, 160.0, 220.0, 420.0];
+
+    /// The smallest a column can be dragged to.
+    const TG_COL_MIN_W: f32 = 40.0;
+
+    /// Height of one row, header included. Matches the EC2 table's cells.
+    const TG_ROW_H: f32 = 18.0;
+
+    /// Roughly how wide one character is in the default proportional font.
+    /// The EC2 table's `auto_size_columns` uses the same number for the same
+    /// purpose; neither needs to be exact, only stable.
+    const TG_CHAR_W: f32 = 6.5;
 
     /// Horizontal gap between columns — the grid's own `spacing.x`.
     const TG_COL_GAP: f32 = 12.0;
@@ -33365,26 +33396,52 @@ mod gui {
     /// row — and that mapping is what decides which rows get a health call.
     const TG_ROW_SPACING: f32 = 4.0;
 
-    /// Every column's width for a table `total` pixels wide: the five bounded
-    /// columns at their fixed widths, Name taking whatever is left.
+    /// Each column sized to its widest cell, clamped to its own floor and
+    /// ceiling.
     ///
-    /// Computed once and handed to **both** the header and the rows. The header
-    /// is drawn outside the virtualized region, so it cannot inherit the rows'
-    /// own column sizing; passing both the same numbers makes them line up by
-    /// construction rather than by two grids happening to agree.
-    /// `health_denied` widens the Healthy/Total column to fit the longer
-    /// header `tg_health_header` returns while an account has refused.
-    fn tg_column_widths(total: f32, health_denied: bool) -> [f32; 4] {
-        let mut bounded = TG_FIXED_COL_W;
-        if health_denied {
-            // `TG_HEALTH_COL` counts from Name; the bounded array starts after
-            // it.
-            bounded[TG_HEALTH_COL - 1] = TG_HEALTH_DENIED_COL_W;
+    /// This is the EC2 table's `auto_size_columns` idea, kept pure so the
+    /// clamping is testable. It deliberately does NOT fill the window: the
+    /// grid sits in a `ScrollArea::both`, so a table wider than the panel
+    /// scrolls sideways rather than squeezing every column. The previous
+    /// version divided the available width up instead, which is what forced
+    /// the fixed widths and the truncation.
+    ///
+    /// `health_denied` widens the Healthy/Total column, because its header
+    /// gains a `(not permitted)` suffix and that header is the whole point of
+    /// the state — it must not be the thing that gets clipped.
+    fn tg_auto_widths(rows: &[TargetGroup], health_denied: bool) -> [f32; 4] {
+        let text_w = |s: &str| s.chars().count() as f32 * TG_CHAR_W + 8.0;
+        let mut out = [0.0f32; 4];
+
+        for (idx, label) in TG_COLUMN_LABELS.iter().enumerate() {
+            let header = if idx == TG_HEALTH_COL && health_denied {
+                text_w(&tg_health_header(1))
+            } else {
+                text_w(label)
+            };
+            // The header is a strong (bold) label, so it needs a little more
+            // room than its character count suggests.
+            out[idx] = header + 6.0;
         }
-        let fixed: f32 = bounded.iter().sum();
-        let gaps = TG_COL_GAP * (TG_COLUMN_LABELS.len() as f32 - 1.0);
-        let name = (total - fixed - gaps).max(TG_NAME_MIN_W);
-        [name, bounded[0], bounded[1], bounded[2]]
+
+        for tg in rows {
+            let cells = [
+                // The star is only on some rows, but every row must leave room
+                // for it or the column jumps when one appears.
+                text_w(&tg.name) + TG_CHAR_W * 2.0,
+                text_w(&elb::protocol_port_label(tg)),
+                text_w("not permitted"),
+                text_w(tg.health_check.path.as_deref().unwrap_or("—")),
+            ];
+            for (idx, w) in cells.iter().enumerate() {
+                out[idx] = out[idx].max(*w);
+            }
+        }
+
+        for idx in 0..out.len() {
+            out[idx] = out[idx].clamp(TG_MIN_COL_W[idx], TG_MAX_COL_W[idx]);
+        }
+        out
     }
 
     /// Record — or clear — one account's list failure.
@@ -33443,27 +33500,6 @@ mod gui {
         )
     }
 
-    /// One row of the target-group table — the header included.
-    ///
-    /// Both go through this, and that is the whole point. The two halves were
-    /// an `egui::Grid` each, handed the same width array, and they still did
-    /// not line up: a `Grid` sizes its columns from the widest content *it* has
-    /// seen, keyed on its own id, so two grids in two different `Ui`s — the
-    /// body's inside a `ScrollArea` — reach two different answers no matter
-    /// what widths they are given. The array was a suggestion to each of them,
-    /// not a shared truth. Allocating every cell explicitly removes the second
-    /// opinion, so the header cannot sit over the wrong column.
-    ///
-    /// `egui_extras::TableBuilder` would be the idiomatic answer; it is not a
-    /// dependency of this crate and is not worth adding for one table.
-    fn tg_row<R>(ui: &mut egui::Ui, height: f32, add_cells: impl FnOnce(&mut egui::Ui) -> R) -> R {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = TG_COL_GAP;
-            ui.set_min_height(height);
-            add_cells(ui)
-        })
-        .inner
-    }
 
     fn tg_cell(
         ui: &mut egui::Ui,
@@ -33644,15 +33680,14 @@ mod gui {
     struct HealthRequestInput<'a> {
         /// ARNs matched by `resources.priority_target_groups`, already capped.
         priority: &'a [String],
-        /// ARNs of the rows `ScrollArea::show_rows` says are on screen.
-        visible: &'a [String],
-        /// Every other row in the table, in its own order.
+        /// Every row in the table, in its own order.
         ///
-        /// The visible tier alone means a row nobody scrolls to is never asked
-        /// about, which is correct for cost and wrong for someone who wants to
-        /// see the state of the whole account. This tier fills the rest in the
-        /// background, still one call at a time under the same concurrency cap,
-        /// and still never twice thanks to the cache.
+        /// There was a third tier between these two — the rows
+        /// `ScrollArea::show_rows` reported as on screen. It went when the
+        /// table stopped virtualizing (one grid, so the header and the body
+        /// cannot disagree about a column edge), and it is not missed: it
+        /// existed to spend a small budget on what somebody was looking at,
+        /// and this tier now covers every row anyway.
         rest: &'a [String],
         /// ARNs already answered, already failed, or already in flight.
         settled: &'a HashSet<String>,
@@ -33665,14 +33700,13 @@ mod gui {
 
     /// Which target groups to ask about health for on this frame.
     ///
-    /// Priority first, then the visible rows, then everything else; nothing
+    /// The configured priority list first, then every other row; nothing
     /// already settled, nothing belonging to an account that has refused, and
     /// never more than the concurrency limit allows.
     ///
-    /// The order is the whole design. What somebody is looking at is answered
-    /// before what they are not, so a big account still feels immediate, and
-    /// the background tier then works through the remainder at the same six
-    /// calls in flight rather than in a burst.
+    /// The order is the whole design. What somebody said they care about is
+    /// answered first, and the rest then works through at the same six calls
+    /// in flight rather than in a burst.
     ///
     /// Pure, and tested, because every way of getting it wrong is expensive: a
     /// missing `settled` check issues one call per visible row on every frame,
@@ -33685,12 +33719,7 @@ mod gui {
         }
 
         let mut out: Vec<String> = Vec::new();
-        for arn in input
-            .priority
-            .iter()
-            .chain(input.visible.iter())
-            .chain(input.rest.iter())
-        {
+        for arn in input.priority.iter().chain(input.rest.iter()) {
             if out.len() >= budget {
                 break;
             }
@@ -40317,7 +40346,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         fn health_input<'a>(
             priority: &'a [String],
-            visible: &'a [String],
+            rest: &'a [String],
             settled: &'a HashSet<String>,
             denied: &'a HashSet<String>,
             account_of: &'a HashMap<String, String>,
@@ -40325,10 +40354,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         ) -> HealthRequestInput<'a> {
             HealthRequestInput {
                 priority,
-                visible,
-                // The existing cases are all about the first two tiers; the
-                // background tier has its own test below.
-                rest: &[],
+                rest,
                 settled,
                 denied_accounts: denied,
                 account_of,
@@ -40345,12 +40371,10 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         /// column half-working. Ordering is the whole design: what is on screen
         /// first, the rest afterwards, all of it under the same concurrency cap.
         #[test]
-        fn the_background_tier_fills_rows_nobody_scrolled_to() {
+        fn the_background_tier_fills_every_row() {
             let priority = vec!["arn:p".to_string()];
-            let visible = vec!["arn:v".to_string()];
             let rest = vec![
-                "arn:p".to_string(), // already claimed above
-                "arn:v".to_string(), // already claimed above
+                "arn:p".to_string(), // already claimed by the priority tier
                 "arn:r1".to_string(),
                 "arn:r2".to_string(),
             ];
@@ -40359,7 +40383,6 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let account_of = HashMap::new();
             let out = health_requests(&HealthRequestInput {
                 priority: &priority,
-                visible: &visible,
                 rest: &rest,
                 settled: &settled,
                 denied_accounts: &denied,
@@ -40367,23 +40390,18 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 in_flight: 0,
                 max_in_flight: MAX_HEALTH_IN_FLIGHT,
             });
-            // Priority, then visible, then the two the user has not reached —
-            // and nothing twice.
+            // The configured one first, then the rest in table order — and
+            // nothing twice, though `rest` repeats it.
             assert_eq!(
                 out,
-                vec![
-                    "arn:p".to_string(),
-                    "arn:v".to_string(),
-                    "arn:r1".to_string(),
-                    "arn:r2".to_string()
-                ]
+                vec!["arn:p".to_string(), "arn:r1".to_string(), "arn:r2".to_string()]
             );
         }
 
         /// The configured apps are answered before whatever happens to be on
         /// screen — that is the whole point of the priority list.
         #[test]
-        fn priority_groups_are_asked_about_before_visible_ones() {
+        fn priority_groups_are_asked_about_before_the_rest() {
             let priority = vec!["arn:p".to_string()];
             let visible = vec!["arn:v".to_string()];
             let settled = HashSet::new();
@@ -40444,7 +40462,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         /// A group that is both configured as priority and currently on screen is
         /// one request, not two.
         #[test]
-        fn a_group_that_is_both_priority_and_visible_is_asked_once() {
+        fn a_group_in_both_tiers_is_asked_about_once() {
             let arns = vec!["arn:a".to_string()];
             let settled = HashSet::new();
             let denied = HashSet::new();
@@ -40699,66 +40717,81 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             );
         }
 
-        /// The header is drawn outside the virtualized rows, so it cannot
-        /// inherit their column sizing — both are handed the same widths, and
-        /// those widths must exactly fill the table so nothing is clipped and
-        /// no horizontal scroll can slide the rows out from under the header.
+        /// Every column is sized to its own widest cell and clamped, and the
+        /// table does NOT fill the window.
+        ///
+        /// That is the change: the columns used to divide the available width
+        /// between them, which is what forced fixed widths and truncation.
+        /// The grid now sits in a `ScrollArea::both`, so a table wider than the
+        /// panel scrolls sideways instead of squeezing.
         #[test]
-        fn the_header_and_the_rows_are_given_one_set_of_column_widths() {
-            let gaps = TG_COL_GAP * (TG_COLUMN_LABELS.len() as f32 - 1.0);
-            let total = 1200.0;
-            let widths = tg_column_widths(total, false);
-            assert_eq!(widths.len(), TG_COLUMN_LABELS.len());
-            let sum: f32 = widths.iter().sum::<f32>() + gaps;
-            assert!(
-                (sum - total).abs() < 0.01,
-                "the columns must fill the table exactly: {sum} vs {total}"
-            );
-            // The five bounded columns never move; only Name absorbs the change.
-            assert_eq!(&widths[1..], &TG_FIXED_COL_W[..]);
-            let narrower = tg_column_widths(900.0, false);
-            assert!(narrower[0] < widths[0]);
-            assert_eq!(&narrower[1..], &TG_FIXED_COL_W[..]);
+        fn columns_are_sized_to_their_content_and_clamped() {
+            let mut short = TargetGroup {
+                name: "a".to_string(),
+                ..Default::default()
+            };
+            short.health_check.path = Some("/x".to_string());
+            let narrow = tg_auto_widths(std::slice::from_ref(&short), false);
 
-            // Past the floor Name stops shrinking rather than going negative,
-            // which would be a panic in `allocate_ui_with_layout`.
-            let tiny = tg_column_widths(10.0, false);
-            assert_eq!(tiny[0], TG_NAME_MIN_W);
-            assert_eq!(&tiny[1..], &TG_FIXED_COL_W[..]);
+            // Nothing collapses to its content when that is tiny: the floor
+            // keeps a column readable and keeps its header from clipping.
+            for idx in 0..TG_COLUMN_LABELS.len() {
+                assert_eq!(
+                    narrow[idx], TG_MIN_COL_W[idx],
+                    "column {idx} should be at its floor for tiny content"
+                );
+            }
+
+            // A long name widens its own column and no other.
+            let mut long = short.clone();
+            long.name = "a".repeat(200);
+            let wide = tg_auto_widths(std::slice::from_ref(&long), false);
+            assert!(wide[0] > narrow[0], "the Name column follows its content");
+            for idx in 1..TG_COLUMN_LABELS.len() {
+                assert_eq!(wide[idx], narrow[idx], "column {idx} must not move");
+            }
+
+            // And it stops at the ceiling, so one pathological name cannot
+            // push every other column off the right-hand edge.
+            assert_eq!(wide[0], TG_MAX_COL_W[0]);
+
+            // An empty table still yields usable columns rather than zeros —
+            // `allocate_ui_with_layout` on a zero width is not a real column.
+            let empty = tg_auto_widths(&[], false);
+            for idx in 0..TG_COLUMN_LABELS.len() {
+                assert!(empty[idx] >= TG_MIN_COL_W[idx], "column {idx} is at least its floor");
+            }
         }
 
-        /// The denied header is longer than the ordinary one, so the column
-        /// widens to hold it and the table still fills exactly — otherwise the
-        /// header the fix exists to show is the one thing that gets truncated.
+        /// The denied header is longer than the ordinary one, so its column
+        /// widens to hold it — otherwise the header the whole denied state
+        /// exists to show is the one thing that gets clipped.
         #[test]
         fn the_denied_health_column_widens_for_its_own_header() {
-            let total = 1200.0;
-            let gaps = TG_COL_GAP * (TG_COLUMN_LABELS.len() as f32 - 1.0);
-            let plain = tg_column_widths(total, false);
-            let denied = tg_column_widths(total, true);
+            let rows: Vec<TargetGroup> = Vec::new();
+            let plain = tg_auto_widths(&rows, false);
+            let denied = tg_auto_widths(&rows, true);
 
             assert!(
                 denied[TG_HEALTH_COL] > plain[TG_HEALTH_COL],
-                "the Healthy/Total column must widen: {denied:?}"
+                "the Healthy/Total column must widen: {denied:?} vs {plain:?}"
             );
-            assert_eq!(denied[TG_HEALTH_COL], TG_HEALTH_DENIED_COL_W);
-            // Only that column and Name move; the others are untouched.
-            // Derived rather than a hardcoded index list, which broke on a
-            // column being removed — a layout change, not a behaviour change,
-            // and the test should not have had an opinion about it.
-            for idx in 1..TG_COLUMN_LABELS.len() {
+            // Wide enough for the string it is sized for, measured rather than
+            // asserted against a magic number that could drift from it.
+            let needed = tg_health_header(1).chars().count() as f32 * TG_CHAR_W;
+            assert!(
+                denied[TG_HEALTH_COL] >= needed,
+                "must hold {:?}: {} < {needed}",
+                tg_health_header(1),
+                denied[TG_HEALTH_COL]
+            );
+            // Only that column moves.
+            for idx in 0..TG_COLUMN_LABELS.len() {
                 if idx == TG_HEALTH_COL {
                     continue;
                 }
                 assert_eq!(denied[idx], plain[idx], "column {idx} must not move");
             }
-            assert!(denied[0] < plain[0], "Name absorbs the difference");
-            let sum: f32 = denied.iter().sum::<f32>() + gaps;
-            assert!(
-                (sum - total).abs() < 0.01,
-                "the widened columns must still fill the table: {sum} vs {total}"
-            );
-            // The header it is sized for is longer than the plain one.
             assert!(
                 tg_health_header(1).len() > tg_health_header(0).len(),
                 "the denied header must actually be the longer string"

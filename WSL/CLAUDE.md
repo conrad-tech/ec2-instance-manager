@@ -2232,18 +2232,36 @@ shape — a `parse_*`/`fetch_*` pair, a `render_resource_panel` arm and a
   - The cost is real and was accepted knowingly: with several accounts pooled,
     two identically-named target groups in different accounts now look
     identical in the table. The account is one hover away, not on screen.
-- **The table's header is drawn once, above the scroll area, and the columns
-  are fixed-width and truncating** (`tg_column_widths`, `tg_cell`) —
-  `ScrollArea::vertical()` with `show_rows`, deliberately **not** the
-  `ScrollArea::both()` plus user-resizable columns the sibling EC2 table
-  uses. Two reasons, both load-bearing: a header drawn inside the
-  virtualized region gets redrawn at the top of every visible slice and
-  pushes the rows down by its own height, desyncing the range `show_rows`
-  reports from the rows actually on screen — and that range is what decides
-  which visible rows get a health call; and a horizontally-scrolling body
-  under a fixed header would let the header slide out from under its own
-  columns. The inconsistency with the EC2 table is visible and deliberate —
-  do not "fix" it to match.
+- **The table is ONE `egui::Grid`, header row included, inside
+  `ScrollArea::both()` — built exactly like the EC2 instance table beside
+  it.** That is what makes the columns line up, and it is the only thing that
+  reliably does: a `Grid` enforces one width per column across every row it
+  owns, so the header physically cannot disagree with the body.
+  - **Two grids cannot be made to agree, however carefully.** The first
+    version drew the header in its own grid above a body grid inside the
+    scroll area and handed both the same width array. They still did not line
+    up, because a `Grid` sizes its columns from the widest content *it* has
+    seen, keyed on its own id — the array was a suggestion to each of them,
+    not a shared truth. Do not reintroduce a second grid for the header.
+  - **`show_rows` virtualization went with it**, and its loss costs nothing.
+    It existed so the visible row range could decide which rows got a health
+    call; the background tier now fetches every row regardless, so the range
+    bought nothing and cost the alignment. The health scheduler's `visible`
+    tier was removed at the same time for the same reason — there is no
+    visible range any more, and a permanently empty tier is worse than none.
+  - **Columns are sized to content and clamped** (`tg_auto_widths`), never
+    divided out of the window's width. Dividing is what forced the fixed
+    widths and the truncation; sizing to content plus a horizontal scrollbar
+    means a long name widens its own column and scrolls, rather than
+    squeezing every other column. Each column has its own floor and ceiling
+    in `TG_MIN_COL_W` / `TG_MAX_COL_W`, so a tiny table still reads as a
+    table and one pathological name cannot push the rest off screen.
+  - **Header edges drag to resize**, as EC2's do, into `tg_col_widths`. A
+    column the user has never touched keeps following its content; absent is
+    not zero.
+  - The denied Healthy/Total header widens by being *measured*
+    (`tg_health_header(1)`) rather than against a magic constant, so the
+    width cannot drift away from the string it exists to hold.
 
 #### The Healthy/Total column
 
