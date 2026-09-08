@@ -5087,6 +5087,17 @@ mod gui {
         ui.label(rich)
     }
 
+    /// The Targets section's message for a health call that did not succeed.
+    ///
+    /// Named once because two places produce it: the `TargetGroupHealth`
+    /// error arms, and the pre-emptive refusal in
+    /// `open_target_group_details` for an account already known to deny
+    /// `DescribeTargetHealth`. Those must not word one state two ways, and
+    /// it is the same sentence the table's own cell carries.
+    fn detail_health_message(err: &FetchError) -> String {
+        err.message()
+    }
+
     /// A pending / failed / empty / populated key-value section.
     ///
     /// Four states, all distinguishable: this is one section of a panel, and a
@@ -20178,42 +20189,67 @@ mod gui {
                         arn,
                         account_id,
                         result,
-                    } => match result {
-                        Ok(targets) => {
-                            self.tg_health.insert(
-                                arn.clone(),
-                                HealthCell::Known(elb::health_summary(&targets)),
-                            );
-                            // The same event fills the detail view, so opening a
-                            // group already on screen costs no second call — but
-                            // only where that group is the one still open.
-                            let open = matches!(
-                                &self.detail_subject,
-                                Some(DetailSubject::TargetGroup(tg)) if tg.arn == arn
-                            );
-                            if open {
-                                self.detail_tg_targets = Some(Ok(targets.clone()));
+                    } => {
+                        // Asked once, before the outcome is examined: *every*
+                        // outcome has to leave the detail view somewhere, and
+                        // only a reply for the group still on screen may move
+                        // it — a stale reply from one closed a moment ago must
+                        // not overwrite the one being read.
+                        let open = matches!(
+                            &self.detail_subject,
+                            Some(DetailSubject::TargetGroup(tg)) if tg.arn == arn
+                        );
+                        match result {
+                            Ok(targets) => {
+                                self.tg_health.insert(
+                                    arn.clone(),
+                                    HealthCell::Known(elb::health_summary(&targets)),
+                                );
+                                // The same event fills the detail view, so
+                                // opening a group already on screen costs no
+                                // second call.
+                                if open {
+                                    self.detail_tg_targets = Some(Ok(targets.clone()));
+                                }
+                                self.tg_targets.insert(arn, targets);
                             }
-                            self.tg_targets.insert(arn, targets);
-                        }
-                        Err(FetchError::Denied) => {
-                            // One denial switches the column off for this
-                            // account, rather than one refused call per row
-                            // for as long as somebody keeps scrolling.
-                            if self.tg_denied_accounts.insert(account_id.clone()) {
-                                self.log_warn(format!(
-                                    "target group health: account {account_id} refused \
-                                     DescribeTargetHealth — the Healthy/Total column is off \
-                                     for that account"
-                                ));
+                            Err(err) => {
+                                // The Targets section must reach an end state
+                                // too. Without this a refused health call left
+                                // it on "Fetching targets…" indefinitely — no
+                                // error, no answer — for exactly the role this
+                                // event exists to tell apart. The table already
+                                // renders `Denied`; the detail view must not be
+                                // the one place that disappears.
+                                if open {
+                                    self.detail_tg_targets =
+                                        Some(Err(detail_health_message(&err)));
+                                }
+                                match err {
+                                    FetchError::Denied => {
+                                        // One denial switches the column off for
+                                        // this account, rather than one refused
+                                        // call per row for as long as somebody
+                                        // keeps scrolling.
+                                        if self.tg_denied_accounts.insert(account_id.clone()) {
+                                            self.log_warn(format!(
+                                                "target group health: account {account_id} \
+                                                 refused DescribeTargetHealth — the \
+                                                 Healthy/Total column is off for that account"
+                                            ));
+                                        }
+                                        self.tg_health.insert(arn, HealthCell::Denied);
+                                    }
+                                    FetchError::Failed(text) => {
+                                        self.log_error(format!(
+                                            "target group health {arn}: {text}"
+                                        ));
+                                        self.tg_health.insert(arn, HealthCell::Failed(text));
+                                    }
+                                }
                             }
-                            self.tg_health.insert(arn, HealthCell::Denied);
                         }
-                        Err(FetchError::Failed(text)) => {
-                            self.log_error(format!("target group health {arn}: {text}"));
-                            self.tg_health.insert(arn, HealthCell::Failed(text));
-                        }
-                    },
+                    }
                     ProcEvent::TargetGroupDetail {
                         arn,
                         attributes,
@@ -23682,6 +23718,16 @@ mod gui {
             self.detail_tg_tags = None;
             self.detail_tg_filter.clear();
             self.detail_tg_targets = self.tg_targets.get(&tg.arn).cloned().map(Ok);
+            // An account that has already refused DescribeTargetHealth will
+            // refuse again, and the warn line is rate-limited by that set's
+            // own `insert` — so a second call would fail in silence and the
+            // only symptom would be a Targets section that never ends. Say so
+            // here instead. The attributes and tags calls are separate
+            // permissions and still run.
+            if self.detail_tg_targets.is_none() && self.tg_denied_accounts.contains(&tg.account_id)
+            {
+                self.detail_tg_targets = Some(Err(detail_health_message(&FetchError::Denied)));
+            }
             self.main_tab = MainTab::Details;
 
             let region = self.region_scope();
@@ -23704,7 +23750,18 @@ mod gui {
                 return;
             };
 
-            let need_health = self.detail_tg_targets.is_none();
+            // A call the table already has running will post the very event
+            // that fills this panel, so opening the row must not start a
+            // second one for the same group.
+            let health_in_flight = self.tg_health.get(&tg.arn) == Some(&HealthCell::InFlight);
+            let need_health = self.detail_tg_targets.is_none() && !health_in_flight;
+            if need_health {
+                // Claimed *before* the spawn, the rule `spawn_health_requests`
+                // already follows: two claims landing together would otherwise
+                // both pass the check and put two describe-target-health calls
+                // on one group.
+                self.tg_health.insert(tg.arn.clone(), HealthCell::InFlight);
+            }
             let tx = self.proc_tx.clone();
             let arn = tg.arn.clone();
             let account_id = tg.account_id.clone();
@@ -37463,6 +37520,30 @@ mod gui {
                 ..Default::default()
             };
             assert_eq!(DetailSubject::TargetGroup(Box::new(tg)).title(), "app-web");
+        }
+
+        /// A health call that did not succeed still ends the Targets section,
+        /// and both the places that end it say the same thing.
+        ///
+        /// Two sites produce this sentence — the `TargetGroupHealth` error
+        /// arm, and the pre-emptive refusal in `open_target_group_details`
+        /// for an account already on `tg_denied_accounts` — and they are far
+        /// apart in the file. Pinning the wording is what stops the two
+        /// describing one state differently.
+        #[test]
+        fn a_health_call_that_failed_words_the_targets_section_one_way() {
+            assert_eq!(detail_health_message(&FetchError::Denied), "not permitted");
+            assert_eq!(
+                detail_health_message(&FetchError::Failed("AccessDenied: nope".to_string())),
+                "AccessDenied: nope"
+            );
+            // The same sentence the table's own Healthy/Total cell carries: a
+            // refused group must not read as one thing in the list and another
+            // in the panel.
+            assert_eq!(
+                detail_health_message(&FetchError::Denied),
+                FetchError::Denied.message()
+            );
         }
 
         #[test]
