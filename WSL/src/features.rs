@@ -103,6 +103,9 @@ pub struct Features {
     /// Start / Stop / Restart from the Inventory right-click menu: who may
     /// see the entries.
     pub instance_power: InstancePowerFeature,
+    /// Inventory resource sub-tabs: which target groups have their health
+    /// fetched first. A preference, not a gate.
+    pub resources: ResourcesFeature,
 }
 
 /// The `fed_auth` section of `assets/features.json`.
@@ -461,6 +464,25 @@ impl InstancePowerFeature {
     pub fn is_allowed_user(&self, user: &str) -> bool {
         user_in_list(&self.allowed_users, user)
     }
+}
+
+/// The `resources` section of `assets/features.json`.
+///
+/// A **preference, not a gate**: nothing here hides or unlocks anything. The
+/// Inventory resource sub-tabs are read-only describe calls, so they need no
+/// allow-list; this only says which rows are worth answering first.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ResourcesFeature {
+    /// Target groups whose health is fetched as soon as the list lands, ahead
+    /// of whatever is on screen. Case-insensitive substring match against the
+    /// target group **name**, never the ARN — an ARN carries an account id and
+    /// a random suffix and would match by accident.
+    ///
+    /// Shipped empty, which prioritises nothing. Capped at
+    /// `resources::PRIORITY_HEALTH_MAX` at the point of use, so a broad
+    /// pattern cannot unbound the fill.
+    pub priority_target_groups: Vec<String>,
 }
 
 /// The "Send test escalation" action, which mails a content-free coded
@@ -1044,6 +1066,11 @@ impl Default for Features {
             // are required by the gate, so a features.json nobody can parse
             // hands out no power to stop a production instance.
             instance_power: InstancePowerFeature::default(),
+            // Derived Default: an empty priority list, which prioritises
+            // nothing. This one is not a gate, so there is no fail-closed
+            // state to reach — an unreadable features.json simply fetches in
+            // the order the table is scrolled.
+            resources: ResourcesFeature::default(),
         }
     }
 }
@@ -2343,5 +2370,45 @@ mod pingdom_feature_tests {
         let missing: Features = serde_json::from_str("{}").expect("parses");
         assert!(!missing.pingdom.enabled);
         assert!(!missing.pingdom_enabled_for("bconrad"));
+    }
+
+    /// Ships prioritising nothing, and a features.json nobody can parse must
+    /// land in the same place.
+    #[test]
+    fn resources_defaults_to_no_priority_list() {
+        assert!(Features::default()
+            .resources
+            .priority_target_groups
+            .is_empty());
+    }
+
+    /// The list is read as written; the app lower-cases at match time, not at
+    /// parse time, so a logged value is the one the admin typed.
+    #[test]
+    fn the_priority_list_is_read_from_the_file() {
+        let raw = r#"{
+            "allow_delete_user": false,
+            "primary_bastion_filter": "bastion",
+            "secondary_bastion_filter": "bastion",
+            "resources": { "priority_target_groups": ["app-web", "APP-Api"] }
+        }"#;
+        let features: Features = serde_json::from_str(raw).expect("parses");
+        assert_eq!(
+            features.resources.priority_target_groups,
+            vec!["app-web".to_string(), "APP-Api".to_string()]
+        );
+    }
+
+    /// A features.json with no `resources` block at all is the shipped state
+    /// and must parse.
+    #[test]
+    fn a_file_with_no_resources_block_still_parses() {
+        let raw = r#"{
+            "allow_delete_user": false,
+            "primary_bastion_filter": "bastion",
+            "secondary_bastion_filter": "bastion"
+        }"#;
+        let features: Features = serde_json::from_str(raw).expect("parses");
+        assert!(features.resources.priority_target_groups.is_empty());
     }
 }
