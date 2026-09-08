@@ -34,9 +34,11 @@ mod gui {
     use ec2_manager::vault_iam::{self, VaultIamDeleteRequest, VaultIamRequest};
     use ec2_manager::connection_tabs::ConnectionTabs;
     use ec2_manager::diagnostics::run_diagnostics;
+    use ec2_manager::elb::{self, FetchError, HealthSummary, Target, TargetGroup};
     use ec2_manager::error::{AppError, Result};
     use ec2_manager::filter::{
-        apply_filters, matching_tags, parse_tag_term, tag_term_matches, Filters,
+        apply_filters, build_matchers, matching_tags, parse_tag_term, tag_term_matches,
+        text_matches, Filters,
     };
     use ec2_manager::gui_cli::{gui_help_text, parse_gui_args, GuiOptions};
     use ec2_manager::inventory::load_inventory;
@@ -46,9 +48,6 @@ mod gui {
     };
     use ec2_manager::power::{self, PowerAction, PowerPhase};
     use ec2_manager::profile_choice::profile_choice_path;
-    // `self` is unused until a later task calls `resources::cache_key` etc.;
-    // kept here (not re-imported there) so the two tasks cannot collide on it.
-    #[allow(unused_imports)]
     use ec2_manager::resources::{self, ResourceKind};
     use ec2_manager::terminal::{
         build_ssm_port_forward_args, build_ssm_session_args, dependency_status,
@@ -502,6 +501,20 @@ mod gui {
         /// can read one but not the other must still see what it can.
         SecurityGroupResult {
             groups: std::result::Result<Vec<SecurityGroupInfo>, String>,
+        },
+        /// One account's target group list landed. Separate from the health
+        /// event because they are different calls needing different IAM
+        /// permissions — the same reason `VolumeResult` and
+        /// `SecurityGroupResult` are separate.
+        TargetGroupList {
+            account_id: String,
+            result: std::result::Result<Vec<TargetGroup>, FetchError>,
+        },
+        /// One target group's health landed.
+        TargetGroupHealth {
+            arn: String,
+            account_id: String,
+            result: std::result::Result<Vec<Target>, FetchError>,
         },
         /// A Start / Stop / Restart run reached a new phase. Progress only:
         /// a run is over when `PowerDone` arrives, never on a phase.
@@ -7579,6 +7592,28 @@ mod gui {
         /// moves.
         inventory_tab: InventoryTab,
         search_rules: Vec<SearchRuleInput>,
+        /// Target groups per cache key, so switching account does not discard
+        /// what was already fetched for the other one.
+        target_groups: HashMap<String, (Instant, Vec<TargetGroup>)>,
+        /// Health per target group ARN.
+        tg_health: HashMap<String, HealthCell>,
+        /// Full target lists, for the detail view. Filled by the same event
+        /// that fills `tg_health`, so opening a group already on screen costs
+        /// no second call.
+        tg_targets: HashMap<String, Vec<Target>>,
+        /// Accounts that refused a health call. One denial switches the column
+        /// off for that account.
+        tg_denied_accounts: HashSet<String>,
+        /// Accounts whose list fetch is running.
+        tg_list_loading: HashSet<String>,
+        tg_list_error: Option<String>,
+        /// `resources.priority_target_groups`, read once at startup.
+        ///
+        /// There is **no `self.features`** on this struct: `App::new` holds
+        /// `features` as a local and resolves each gate into a flat field
+        /// (`instance_power_enabled`, `alerts_enabled`, …). Following that
+        /// keeps the per-frame table render free of a features lookup.
+        tg_priority_patterns: Vec<String>,
         selected_state_filter: String,
         only_ssm: bool,
         /// Additional account profile IDs to include in the instance list
@@ -8383,6 +8418,15 @@ mod gui {
                 filtered: Vec::new(),
                 inventory_tab: InventoryTab::Ec2,
                 search_rules: vec![SearchRuleInput::default()],
+                target_groups: HashMap::new(),
+                tg_health: HashMap::new(),
+                tg_targets: HashMap::new(),
+                tg_denied_accounts: HashSet::new(),
+                tg_list_loading: HashSet::new(),
+                tg_list_error: None,
+                // `features` is the local in `App::new`, the same one
+                // `instance_power_enabled` below is resolved from.
+                tg_priority_patterns: features.resources.priority_target_groups.clone(),
                 selected_state_filter: "running".to_string(),
                 only_ssm: false,
                 multi_account_ids: std::collections::HashSet::new(),
@@ -19997,6 +20041,61 @@ mod gui {
                             }
                         }
                     }
+                    ProcEvent::TargetGroupList { account_id, result } => {
+                        self.tg_list_loading.remove(&account_id);
+                        match result {
+                            Ok(groups) => {
+                                self.log_info(format!(
+                                    "target groups: {} in account {account_id}",
+                                    groups.len()
+                                ));
+                                let key = resources::cache_key(
+                                    ResourceKind::TargetGroup,
+                                    self.options.mode.as_str(),
+                                    &account_id,
+                                    &self.region_scope(),
+                                );
+                                self.target_groups.insert(key, (Instant::now(), groups));
+                            }
+                            Err(err) => {
+                                let msg = err.message();
+                                self.log_error(format!(
+                                    "target groups: account {account_id}: {msg}"
+                                ));
+                                self.tg_list_error = Some(msg);
+                            }
+                        }
+                    }
+                    ProcEvent::TargetGroupHealth {
+                        arn,
+                        account_id,
+                        result,
+                    } => match result {
+                        Ok(targets) => {
+                            self.tg_health.insert(
+                                arn.clone(),
+                                HealthCell::Known(elb::health_summary(&targets)),
+                            );
+                            self.tg_targets.insert(arn, targets);
+                        }
+                        Err(FetchError::Denied) => {
+                            // One denial switches the column off for this
+                            // account, rather than one refused call per row
+                            // for as long as somebody keeps scrolling.
+                            if self.tg_denied_accounts.insert(account_id.clone()) {
+                                self.log_warn(format!(
+                                    "target group health: account {account_id} refused \
+                                     DescribeTargetHealth — the Healthy/Total column is off \
+                                     for that account"
+                                ));
+                            }
+                            self.tg_health.insert(arn, HealthCell::Denied);
+                        }
+                        Err(FetchError::Failed(text)) => {
+                            self.log_error(format!("target group health {arn}: {text}"));
+                            self.tg_health.insert(arn, HealthCell::Failed(text));
+                        }
+                    },
                     ProcEvent::PowerProgress { instance_id, phase } => {
                         // Only the run that owns the line may move it: a
                         // second instance's run must not overwrite the one
@@ -23073,8 +23172,298 @@ mod gui {
         /// lands; an unbuilt kind says so rather than showing an empty table,
         /// since "nothing here" and "not built yet" must not look alike.
         fn render_resource_panel(&mut self, ui: &mut egui::Ui, kind: ResourceKind) {
-            ui.label(format!("{} is not built yet.", kind.label()));
+            // Sim mode fakes `auth_status: Ok`, so without this guard every
+            // sub-tab would make real `aws` calls out of the one mode whose
+            // whole promise is that it does not. Same stance `power.rs` takes:
+            // the refusal is on `mode`, never on credentials.
+            if self.options.mode == Mode::Sim {
+                ui.label(sim_resource_note(kind));
+                return;
+            }
+            if kind != ResourceKind::TargetGroup {
+                ui.label(format!("{} is not built yet.", kind.label()));
+                return;
+            }
+            self.ensure_target_groups();
+            self.render_target_groups(ui);
         }
+
+        /// Start a list fetch for any account in the pool whose entry is
+        /// missing or stale.
+        ///
+        /// Lazy: nothing here runs until the sub-tab is opened, so a user who
+        /// never looks at target groups never pays for them.
+        fn ensure_target_groups(&mut self) {
+            let region = self.region_scope();
+            let mode = self.options.mode.as_str().to_string();
+            for (profile, account_id) in self.resource_pool_accounts() {
+                let key =
+                    resources::cache_key(ResourceKind::TargetGroup, &mode, &account_id, &region);
+                let fresh = self
+                    .target_groups
+                    .get(&key)
+                    .is_some_and(|(at, _)| at.elapsed() <= resources::RESOURCE_TTL);
+                if fresh || self.tg_list_loading.contains(&account_id) {
+                    continue;
+                }
+                self.tg_list_loading.insert(account_id.clone());
+                let tx = self.proc_tx.clone();
+                let (p, r, a) = (profile.clone(), region.clone(), account_id.clone());
+                std::thread::spawn(move || {
+                    let result = elb::fetch_target_groups(&p, &r, &a);
+                    let _ = tx.send(ProcEvent::TargetGroupList {
+                        account_id: a,
+                        result,
+                    });
+                });
+            }
+        }
+
+        /// Every (profile, account id) the resource sub-tabs draw from: the
+        /// selected account plus any checked multi-account profiles — the same
+        /// pool `instance_pool` uses for the EC2 table.
+        fn resource_pool_accounts(&self) -> Vec<(String, String)> {
+            let mut out: Vec<(String, String)> = Vec::new();
+            let mut push = |ctx: &AwsContext| {
+                let account = ctx.account_id.clone().unwrap_or_default();
+                if account.is_empty() {
+                    return;
+                }
+                if !out.iter().any(|(_, a)| a == &account) {
+                    out.push((ctx.profile.to_string(), account));
+                }
+            };
+            if let Some(ctx) = &self.context {
+                push(ctx);
+            }
+            for pid in &self.multi_account_ids {
+                if let Some((_, ctx)) = self.profile_inventory_cache.get(pid) {
+                    push(ctx);
+                }
+            }
+            out
+        }
+
+        /// The rows the search box leaves visible, from every account in the
+        /// pool, sorted by name then account so two accounts' identically
+        /// named groups sit together.
+        fn filtered_target_groups(&self) -> Vec<TargetGroup> {
+            let (includes, excludes) = search_terms_from_rules(&self.search_rules);
+            let include_matchers = build_matchers(&includes);
+            let exclude_matchers = build_matchers(&excludes);
+
+            let mut rows: Vec<TargetGroup> = self
+                .target_groups
+                .values()
+                .flat_map(|(_, groups)| groups.iter().cloned())
+                .filter(|tg| {
+                    text_matches(
+                        &elb::target_group_searchable_text(tg),
+                        &include_matchers,
+                        &exclude_matchers,
+                    )
+                })
+                .collect();
+            rows.sort_by(|a, b| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+                    .then_with(|| a.account_id.cmp(&b.account_id))
+            });
+            rows
+        }
+
+        fn render_target_groups(&mut self, ui: &mut egui::Ui) {
+            let rows = self.filtered_target_groups();
+            let total: usize = self.target_groups.values().map(|(_, g)| g.len()).sum();
+
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "Target groups: {} filtered / {total} total",
+                    rows.len()
+                ));
+                if ui.button("Refresh").clicked() {
+                    self.target_groups.clear();
+                    self.tg_health.clear();
+                    self.tg_targets.clear();
+                    self.tg_denied_accounts.clear();
+                    self.tg_list_error = None;
+                }
+            });
+
+            if rows.is_empty() {
+                let loading = !self.tg_list_loading.is_empty();
+                ui.label(resource_empty_note(
+                    ResourceKind::TargetGroup,
+                    loading,
+                    self.tg_list_error.as_deref(),
+                ));
+                return;
+            }
+
+            // Which rows the configured priority list claims, capped. Computed
+            // over the filtered rows, so a search that hides an app also stops
+            // it being pulled ahead of what is actually on screen.
+            let names: Vec<String> = rows.iter().map(|tg| tg.name.clone()).collect();
+            let priority_idx = resources::priority_indexes(
+                &self.tg_priority_patterns,
+                &names,
+                resources::PRIORITY_HEALTH_MAX,
+            );
+            let priority_arns: Vec<String> =
+                priority_idx.iter().map(|i| rows[*i].arn.clone()).collect();
+            let is_priority: HashSet<usize> = priority_idx.iter().copied().collect();
+
+            let row_h = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
+            let mut visible_arns: Vec<String> = Vec::new();
+            let mut pending_detail: Option<TargetGroup> = None;
+            let health = self.tg_health.clone();
+
+            egui::ScrollArea::both()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .show_rows(ui, row_h, rows.len(), |ui, range| {
+                    egui::Grid::new("target_group_grid")
+                        .striped(true)
+                        .spacing(egui::vec2(12.0, 4.0))
+                        .show(ui, |ui| {
+                            for label in [
+                                "Name",
+                                "Protocol:Port",
+                                "Target Type",
+                                "Healthy/Total",
+                                "VPC",
+                                "Account",
+                            ] {
+                                ui.strong(label);
+                            }
+                            ui.end_row();
+
+                            for idx in range {
+                                let tg = &rows[idx];
+                                visible_arns.push(tg.arn.clone());
+
+                                let name = if is_priority.contains(&idx) {
+                                    format!("★ {}", tg.name)
+                                } else {
+                                    tg.name.clone()
+                                };
+                                ui.label(name).context_menu(|ui| {
+                                    if ui.button("See Details").clicked() {
+                                        pending_detail = Some(tg.clone());
+                                        ui.close();
+                                    }
+                                });
+
+                                ui.label(elb::protocol_port_label(tg));
+                                ui.label(&tg.target_type);
+
+                                let cell = health
+                                    .get(&tg.arn)
+                                    .cloned()
+                                    .unwrap_or(HealthCell::NotRequested);
+                                let text = health_cell_text(&cell);
+                                match &cell {
+                                    HealthCell::Known(s) if s.total > 0 && s.healthy == s.total => {
+                                        note_label(ui, egui::Color32::GREEN, text);
+                                    }
+                                    HealthCell::Known(s) if s.healthy == 0 && s.total > 0 => {
+                                        note_label(ui, egui::Color32::RED, text);
+                                    }
+                                    HealthCell::Known(_) => {
+                                        note_label(ui, egui::Color32::YELLOW, text);
+                                    }
+                                    HealthCell::Failed(detail) => {
+                                        note_label(ui, egui::Color32::RED, text)
+                                            .on_hover_text(detail.clone());
+                                    }
+                                    _ => {
+                                        ui.label(text);
+                                    }
+                                }
+
+                                ui.label(tg.vpc_id.clone().unwrap_or_else(|| "—".to_string()));
+                                ui.label(&tg.account_id);
+                                ui.end_row();
+                            }
+                        });
+                });
+
+            if let Some(tg) = pending_detail {
+                self.open_target_group_details(tg);
+            }
+
+            self.spawn_health_requests(&priority_arns, &visible_arns, &rows);
+        }
+
+        /// Start whatever health calls this frame is allowed.
+        fn spawn_health_requests(
+            &mut self,
+            priority: &[String],
+            visible: &[String],
+            rows: &[TargetGroup],
+        ) {
+            let settled: HashSet<String> = self
+                .tg_health
+                .iter()
+                .filter(|(_, cell)| **cell != HealthCell::NotRequested)
+                .map(|(arn, _)| arn.clone())
+                .collect();
+            let in_flight = self
+                .tg_health
+                .values()
+                .filter(|cell| **cell == HealthCell::InFlight)
+                .count();
+            let account_of: HashMap<String, String> = rows
+                .iter()
+                .map(|tg| (tg.arn.clone(), tg.account_id.clone()))
+                .collect();
+
+            let wanted = health_requests(&HealthRequestInput {
+                priority,
+                visible,
+                settled: &settled,
+                denied_accounts: &self.tg_denied_accounts,
+                account_of: &account_of,
+                in_flight,
+                max_in_flight: MAX_HEALTH_IN_FLIGHT,
+            });
+            if wanted.is_empty() {
+                return;
+            }
+
+            let region = self.region_scope();
+            let profile_of: HashMap<String, String> = self
+                .resource_pool_accounts()
+                .into_iter()
+                .map(|(profile, account)| (account, profile))
+                .collect();
+
+            for arn in wanted {
+                let Some(account_id) = account_of.get(&arn).cloned() else {
+                    continue;
+                };
+                let Some(profile) = profile_of.get(&account_id).cloned() else {
+                    continue;
+                };
+                // Marked in flight *before* the spawn, for the reason
+                // `ReaperInFlight` is claimed before its spawn: two frames
+                // landing together would otherwise both pass the check.
+                self.tg_health.insert(arn.clone(), HealthCell::InFlight);
+                let tx = self.proc_tx.clone();
+                let region = region.clone();
+                std::thread::spawn(move || {
+                    let result = elb::fetch_target_health(&profile, &region, &arn);
+                    let _ = tx.send(ProcEvent::TargetGroupHealth {
+                        arn,
+                        account_id,
+                        result,
+                    });
+                });
+            }
+        }
+
+        /// Filled in by the detail view.
+        fn open_target_group_details(&mut self, _tg: TargetGroup) {}
 
         fn render_connections_panel(&mut self, ui: &mut egui::Ui) {
             let tabs_snapshot: Vec<(u64, String, String, bool)> = self
@@ -31980,6 +32369,67 @@ mod gui {
         }
     }
 
+    /// What the Healthy/Total column knows about one target group.
+    ///
+    /// Five states, all of which must read differently: a blank cell for
+    /// "asked about nothing yet", and a failed call and a refused one are
+    /// three different facts. Rendering any of them as an empty cell says
+    /// nothing at all.
+    #[derive(Clone, Debug, PartialEq)]
+    enum HealthCell {
+        NotRequested,
+        InFlight,
+        Known(HealthSummary),
+        Denied,
+        Failed(String),
+    }
+
+    fn health_cell_text(cell: &HealthCell) -> String {
+        match cell {
+            // Blank rather than a placeholder: the row is on screen and the
+            // request is about to be made, and a "-" that becomes a number a
+            // frame later reads as a flicker.
+            HealthCell::NotRequested => String::new(),
+            HealthCell::InFlight => "…".to_string(),
+            HealthCell::Known(summary) => elb::health_label(*summary),
+            HealthCell::Denied => "not permitted".to_string(),
+            // The text goes in the tooltip; the cell stays narrow.
+            HealthCell::Failed(_) => "failed".to_string(),
+        }
+    }
+
+    /// What an empty resource table says about itself.
+    ///
+    /// "Nothing here", "still loading" and "the call failed" must never look
+    /// alike — reporting either of the last two as the first is the
+    /// silent-empty failure this repo has already been bitten by twice.
+    fn resource_empty_note(kind: ResourceKind, loading: bool, error: Option<&str>) -> String {
+        if loading {
+            return format!("Loading {}…", kind.label());
+        }
+        if let Some(err) = error {
+            return format!("Could not list {}: {err}", kind.label());
+        }
+        match kind {
+            ResourceKind::TargetGroup => "No target groups in the selected account(s).".to_string(),
+            other => format!("No {} in the selected account(s).", other.label()),
+        }
+    }
+
+    /// What a resource sub-tab says in sim mode.
+    ///
+    /// Sim generates fake EC2 instances and nothing else, so these tabs have
+    /// nothing to show. Writing five fake generators is real work for a mode
+    /// that demos none of this, and the alternative — letting the tabs fetch —
+    /// would make real AWS calls out of the mode whose promise is that it does
+    /// not.
+    fn sim_resource_note(kind: ResourceKind) -> String {
+        format!(
+            "Sim mode has no {}. Switch to live mode to browse them.",
+            kind.label()
+        )
+    }
+
     /// How many `describe-target-health` calls may be in flight at once.
     ///
     /// The API takes one target group per call, so a fast scroll through a
@@ -31987,13 +32437,9 @@ mod gui {
     /// screen quickly without becoming the throttling that
     /// `aws_cli::retry_envs` already exists to survive.
     ///
-    /// `allow(dead_code)`: consumed by a later task that wires the scheduler
-    /// into the Target Groups table's render loop.
-    #[allow(dead_code)]
     const MAX_HEALTH_IN_FLIGHT: usize = 6;
 
     /// Everything the scheduler needs to decide what to ask about.
-    #[allow(dead_code)]
     struct HealthRequestInput<'a> {
         /// ARNs matched by `resources.priority_target_groups`, already capped.
         priority: &'a [String],
@@ -32018,7 +32464,6 @@ mod gui {
     /// missing `settled` check issues one call per visible row on every frame,
     /// and a missing `denied_accounts` check issues one refused call per row
     /// for as long as somebody keeps scrolling.
-    #[allow(dead_code)]
     fn health_requests(input: &HealthRequestInput) -> Vec<String> {
         let budget = input.max_in_flight.saturating_sub(input.in_flight);
         if budget == 0 {
@@ -38712,6 +39157,59 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 MAX_HEALTH_IN_FLIGHT,
             ));
             assert!(out.is_empty());
+        }
+
+        /// The empty state must distinguish three things that look alike: an
+        /// account with no target groups, a fetch still running, and a fetch that
+        /// failed. Reporting either of the last two as the first is the
+        /// silent-empty failure the forwards.json build check exists to prevent
+        /// elsewhere in this repo.
+        #[test]
+        fn the_empty_table_says_which_kind_of_empty_it_is() {
+            assert_eq!(
+                resource_empty_note(ResourceKind::TargetGroup, true, None),
+                "Loading Target Groups…"
+            );
+            assert_eq!(
+                resource_empty_note(ResourceKind::TargetGroup, false, Some("not permitted")),
+                "Could not list Target Groups: not permitted"
+            );
+            assert_eq!(
+                resource_empty_note(ResourceKind::TargetGroup, false, None),
+                "No target groups in the selected account(s)."
+            );
+        }
+
+        /// Sim's promise is that it makes no AWS calls, so the sub-tabs must say
+        /// they have nothing rather than fetching. The note names the kind, so
+        /// "sim has none" and "this type is not built yet" stay distinguishable.
+        #[test]
+        fn sim_mode_says_it_has_no_resources_of_that_kind() {
+            let note = sim_resource_note(ResourceKind::TargetGroup);
+            assert!(note.contains("Sim mode"), "{note}");
+            assert!(note.contains("Target Groups"), "{note}");
+        }
+
+        /// A group whose health has not been asked about yet, one in flight and
+        /// one that was refused must all read differently — a blank cell in all
+        /// three cases says nothing.
+        #[test]
+        fn every_health_cell_state_has_its_own_text() {
+            use ec2_manager::elb::HealthSummary;
+            assert_eq!(health_cell_text(&HealthCell::NotRequested), "");
+            assert_eq!(health_cell_text(&HealthCell::InFlight), "…");
+            assert_eq!(
+                health_cell_text(&HealthCell::Known(HealthSummary {
+                    healthy: 2,
+                    total: 3
+                })),
+                "2/3"
+            );
+            assert_eq!(health_cell_text(&HealthCell::Denied), "not permitted");
+            assert_eq!(
+                health_cell_text(&HealthCell::Failed("Rate exceeded".to_string())),
+                "failed"
+            );
         }
     }
 }
