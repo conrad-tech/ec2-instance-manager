@@ -46,6 +46,10 @@ mod gui {
     };
     use ec2_manager::power::{self, PowerAction, PowerPhase};
     use ec2_manager::profile_choice::profile_choice_path;
+    // `self` is unused until a later task calls `resources::cache_key` etc.;
+    // kept here (not re-imported there) so the two tasks cannot collide on it.
+    #[allow(unused_imports)]
+    use ec2_manager::resources::{self, ResourceKind};
     use ec2_manager::terminal::{
         build_ssm_port_forward_args, build_ssm_session_args, dependency_status,
         discover_terminals, pick_default_terminal,
@@ -172,6 +176,45 @@ mod gui {
         Connections,
         Details,
         Log,
+    }
+
+    /// The Inventory page's second tab row.
+    ///
+    /// `MainTab` is untouched: this lives *inside* the Inventory panel, so the
+    /// top-level tab bar stays at four entries rather than growing to nine.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum InventoryTab {
+        Ec2,
+        Resource(ResourceKind),
+    }
+
+    impl InventoryTab {
+        /// EC2 first: it is what the app opens on and what everybody already
+        /// knows. The rest follow the order the resource types were built in.
+        fn all() -> Vec<InventoryTab> {
+            vec![
+                InventoryTab::Ec2,
+                InventoryTab::Resource(ResourceKind::TargetGroup),
+                InventoryTab::Resource(ResourceKind::LoadBalancer),
+                InventoryTab::Resource(ResourceKind::Asg),
+                InventoryTab::Resource(ResourceKind::Bucket),
+                InventoryTab::Resource(ResourceKind::HostedZone),
+            ]
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                InventoryTab::Ec2 => "EC2",
+                InventoryTab::Resource(kind) => kind.label(),
+            }
+        }
+
+        /// The State dropdown, the SSM-only checkbox and the Match Tag column
+        /// are EC2-only. They mean nothing for a bucket, and a control that
+        /// silently does nothing is worse than an absent one.
+        fn shows_ec2_controls(self) -> bool {
+            matches!(self, InventoryTab::Ec2)
+        }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7531,6 +7574,10 @@ mod gui {
         inventory: Inventory,
         filtered: Vec<Instance>,
 
+        /// Which Inventory sub-tab is showing. Session state, never persisted:
+        /// the app opens on EC2, so nothing about the familiar startup view
+        /// moves.
+        inventory_tab: InventoryTab,
         search_rules: Vec<SearchRuleInput>,
         selected_state_filter: String,
         only_ssm: bool,
@@ -8334,6 +8381,7 @@ mod gui {
                     fetched_at: std::time::SystemTime::now(),
                 },
                 filtered: Vec::new(),
+                inventory_tab: InventoryTab::Ec2,
                 search_rules: vec![SearchRuleInput::default()],
                 selected_state_filter: "running".to_string(),
                 only_ssm: false,
@@ -22331,6 +22379,23 @@ mod gui {
         }
 
         fn render_inventory_panel(&mut self, ui: &mut egui::Ui) {
+            ui.horizontal_wrapped(|ui| {
+                for tab in InventoryTab::all() {
+                    if ui
+                        .selectable_label(self.inventory_tab == tab, tab.label())
+                        .clicked()
+                    {
+                        self.inventory_tab = tab;
+                    }
+                }
+            });
+            ui.separator();
+
+            if let InventoryTab::Resource(kind) = self.inventory_tab {
+                self.render_resource_panel(ui, kind);
+                return;
+            }
+
             self.render_power_status(ui);
             ui.horizontal(|ui| {
                 ui.label(format!(
@@ -23002,6 +23067,13 @@ mod gui {
                     });
                 ui.add_space(20.0);
             });
+        }
+
+        /// One resource sub-tab's table. Filled in per kind as each phase
+        /// lands; an unbuilt kind says so rather than showing an empty table,
+        /// since "nothing here" and "not built yet" must not look alike.
+        fn render_resource_panel(&mut self, ui: &mut egui::Ui, kind: ResourceKind) {
+            ui.label(format!("{} is not built yet.", kind.label()));
         }
 
         fn render_connections_panel(&mut self, ui: &mut egui::Ui) {
@@ -27302,47 +27374,49 @@ mod gui {
                         self.apply_filters();
                     }
 
-                    ui.horizontal(|ui| {
-                        ui.label("States");
-                        let before = self.selected_state_filter.clone();
-                        egui::ComboBox::from_id_salt("state_filter_combo")
-                            .selected_text(if self.selected_state_filter.is_empty() {
-                                "No filter".to_string()
-                            } else {
-                                self.selected_state_filter.clone()
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut self.selected_state_filter,
-                                    STATE_FILTER_NONE.to_string(),
-                                    "No filter",
-                                );
-                                ui.selectable_value(
-                                    &mut self.selected_state_filter,
-                                    STATE_FILTER_RUNNING.to_string(),
-                                    "running",
-                                );
-                                ui.selectable_value(
-                                    &mut self.selected_state_filter,
-                                    STATE_FILTER_STOPPED.to_string(),
-                                    "stopped",
-                                );
-                                ui.selectable_value(
-                                    &mut self.selected_state_filter,
-                                    STATE_FILTER_TERMINATED.to_string(),
-                                    "terminated",
-                                );
-                            });
-                        if self.selected_state_filter != before {
+                    if self.inventory_tab.shows_ec2_controls() {
+                        ui.horizontal(|ui| {
+                            ui.label("States");
+                            let before = self.selected_state_filter.clone();
+                            egui::ComboBox::from_id_salt("state_filter_combo")
+                                .selected_text(if self.selected_state_filter.is_empty() {
+                                    "No filter".to_string()
+                                } else {
+                                    self.selected_state_filter.clone()
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.selected_state_filter,
+                                        STATE_FILTER_NONE.to_string(),
+                                        "No filter",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.selected_state_filter,
+                                        STATE_FILTER_RUNNING.to_string(),
+                                        "running",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.selected_state_filter,
+                                        STATE_FILTER_STOPPED.to_string(),
+                                        "stopped",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.selected_state_filter,
+                                        STATE_FILTER_TERMINATED.to_string(),
+                                        "terminated",
+                                    );
+                                });
+                            if self.selected_state_filter != before {
+                                self.apply_filters();
+                            }
+                        });
+
+                        if ui
+                            .checkbox(&mut self.only_ssm, "Only SSM-managed")
+                            .changed()
+                        {
                             self.apply_filters();
                         }
-                    });
-
-                    if ui
-                        .checkbox(&mut self.only_ssm, "Only SSM-managed")
-                        .changed()
-                    {
-                        self.apply_filters();
                     }
 
                     // Multi-account lookup
@@ -31909,6 +31983,31 @@ mod gui {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The row reads left to right as EC2 first — the tab the app opens on and
+        /// the one everybody already knows — then the rest in the order the spec's
+        /// build order introduces them.
+        #[test]
+        fn the_sub_tab_row_leads_with_ec2() {
+            let labels: Vec<&str> = InventoryTab::all().iter().map(|t| t.label()).collect();
+            assert_eq!(
+                labels,
+                vec!["EC2", "Target Groups", "Load Balancers", "ASGs", "S3", "Route 53"]
+            );
+        }
+
+        /// The State dropdown, the SSM-only checkbox and the Match Tag column mean
+        /// nothing for a bucket, and a control that silently does nothing is worse
+        /// than an absent one.
+        #[test]
+        fn only_ec2_shows_the_ec2_only_controls() {
+            assert!(InventoryTab::Ec2.shows_ec2_controls());
+            for tab in InventoryTab::all() {
+                if tab != InventoryTab::Ec2 {
+                    assert!(!tab.shows_ec2_controls(), "{} must hide them", tab.label());
+                }
+            }
+        }
 
         fn trace_call(err: Option<&str>) -> ec2_manager::alerts::ApiCall {
             ec2_manager::alerts::ApiCall {
