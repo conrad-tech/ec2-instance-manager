@@ -548,12 +548,23 @@ mod gui {
             result: std::result::Result<Vec<Target>, FetchError>,
         },
         /// Attributes and tags for the target group open in the Details tab.
-        /// `tags` is `None` on the attributes message and `Some` on the tags
-        /// one, so the two arrive independently — a token that can read one
-        /// and not the other must leave the panel readable.
+        ///
+        /// **Both fields are `Option`, and each says only what its own message
+        /// actually knows.** The two calls are separate permissions and arrive
+        /// independently — a token that can read one and not the other must
+        /// leave the panel readable — so the attributes message carries
+        /// `tags: None` and the tags message carries `attributes: None`. The
+        /// handler applies whichever is `Some` and leaves the other section
+        /// alone.
+        ///
+        /// The tags message used to send `attributes: Ok(Vec::new())`, which
+        /// was safe only because the handler happened to inspect `tags` first:
+        /// one reordering there blanks a live Attributes section with an
+        /// untruth, and no test would see it. This event shape is the template
+        /// the remaining resource kinds copy, so it says what is true.
         TargetGroupDetail {
             arn: String,
-            attributes: std::result::Result<Vec<(String, String)>, String>,
+            attributes: Option<std::result::Result<Vec<(String, String)>, String>>,
             tags: Option<std::result::Result<Vec<(String, String)>, String>>,
         },
         /// A Start / Stop / Restart run reached a new phase. Progress only:
@@ -7705,6 +7716,28 @@ mod gui {
         /// account's next success, or one transient failure would keep the
         /// note up for the rest of the session.
         tg_list_errors: HashMap<String, String>,
+        /// Cache key -> when its list fetch last failed.
+        ///
+        /// A failure writes nothing into `target_groups`, so without this the
+        /// key is neither fresh nor loading on the very next frame and
+        /// `ensure_target_groups` spawns again — roughly five `aws`
+        /// subprocesses a second, for as long as the tab is open, on the most
+        /// likely failure there is (a role without
+        /// `elasticloadbalancing:DescribeTargetGroups`). A recorded failure is
+        /// therefore a cooldown: the same job `tg_denied_accounts` already
+        /// does for the health path, which is the one this had no equivalent
+        /// of.
+        ///
+        /// Keyed by **cache key**, not by account, because that is what the
+        /// spawn decision is keyed on — an account listed in two regions must
+        /// not have one region's failure suppress the other's fetch.
+        /// `tg_list_errors` stays per account because it feeds a sentence
+        /// about accounts.
+        tg_list_failures: HashMap<String, Instant>,
+        /// The matched-count already reported for the priority truncation
+        /// warning, so it is said once rather than every frame — the rule
+        /// `report_reaper_reason_change` follows.
+        tg_priority_warned: Option<usize>,
         /// `resources.priority_target_groups`, read once at startup.
         ///
         /// There is **no `self.features`** on this struct: `App::new` holds
@@ -8532,6 +8565,8 @@ mod gui {
                 tg_denied_accounts: HashSet::new(),
                 tg_list_loading: HashSet::new(),
                 tg_list_errors: HashMap::new(),
+                tg_list_failures: HashMap::new(),
+                tg_priority_warned: None,
                 // `features` is the local in `App::new`, the same one
                 // `instance_power_enabled` below is resolved from.
                 tg_priority_patterns: features.resources.priority_target_groups.clone(),
@@ -20158,7 +20193,19 @@ mod gui {
                         cache_key,
                         result,
                     } => {
-                        self.tg_list_loading.remove(&cache_key);
+                        // Applied only while this reply is still claimed.
+                        // Refresh clears `tg_list_loading`, so a fetch already
+                        // in flight when it was pressed belongs to nobody —
+                        // and caching it here would stamp pre-Refresh rows
+                        // with a fresh timestamp, which is Refresh answering
+                        // with stale data and calling it new.
+                        if !self.tg_list_loading.remove(&cache_key) {
+                            self.log_debug(format!(
+                                "target groups: dropped an unclaimed reply for account \
+                                 {account_id} (key {cache_key}) — Refresh superseded it"
+                            ));
+                            continue;
+                        }
                         // The key the call was *made* with, never one derived
                         // here: the region may have changed while it was in
                         // flight. See the event's own doc comment.
@@ -20169,19 +20216,35 @@ mod gui {
                                     groups.len()
                                 ));
                                 remember_list_error(&mut self.tg_list_errors, &account_id, None);
+                                self.tg_list_failures.remove(&cache_key);
                                 self.target_groups
                                     .insert(cache_key, (Instant::now(), groups));
                             }
                             Err(err) => {
                                 let msg = err.message();
-                                self.log_error(format!(
-                                    "target groups: account {account_id}: {msg}"
-                                ));
+                                // Once per reason, not once per retry. The
+                                // cooldown below still lets a permanently
+                                // refused account be re-tried every TTL, and
+                                // an error line per retry for the rest of the
+                                // session is noise no log filter can undo.
+                                // Same rule as `report_reaper_reason_change`.
+                                let line = format!("target groups: account {account_id}: {msg}");
+                                if list_error_is_news(&self.tg_list_errors, &account_id, &msg) {
+                                    self.log_error(line);
+                                } else {
+                                    self.log_debug(line);
+                                }
                                 remember_list_error(
                                     &mut self.tg_list_errors,
                                     &account_id,
                                     Some(msg),
                                 );
+                                // The cooldown, recorded against the key the
+                                // call was made with: without it a failure
+                                // leaves the key neither fresh nor loading and
+                                // `ensure_target_groups` re-spawns it on the
+                                // very next frame, forever.
+                                self.tg_list_failures.insert(cache_key, Instant::now());
                             }
                         }
                     }
@@ -20263,9 +20326,15 @@ mod gui {
                             Some(DetailSubject::TargetGroup(tg)) if tg.arn == arn
                         );
                         if open {
-                            match tags {
-                                Some(tags) => self.detail_tg_tags = Some(tags),
-                                None => self.detail_tg_attributes = Some(attributes),
+                            // Whichever the message actually carries, and
+                            // only that one. Not an if/else on `tags`: the
+                            // two fields are independent answers, and a
+                            // message that grew both would apply both.
+                            if let Some(attributes) = attributes {
+                                self.detail_tg_attributes = Some(attributes);
+                            }
+                            if let Some(tags) = tags {
+                                self.detail_tg_tags = Some(tags);
                             }
                         }
                     }
@@ -23369,21 +23438,33 @@ mod gui {
         /// Lazy: nothing here runs until the sub-tab is opened, so a user who
         /// never looks at target groups never pays for them.
         fn ensure_target_groups(&mut self) {
-            let region = self.region_scope();
             let mode = self.options.mode.as_str().to_string();
-            for (profile, account_id) in self.resource_pool_accounts() {
-                let key =
-                    resources::cache_key(ResourceKind::TargetGroup, &mode, &account_id, &region);
+            for account in self.resource_pool_accounts() {
+                let key = account.cache_key(ResourceKind::TargetGroup, &mode);
                 let fresh = self
                     .target_groups
                     .get(&key)
                     .is_some_and(|(at, _)| at.elapsed() <= resources::RESOURCE_TTL);
-                if fresh || self.tg_list_loading.contains(&key) {
+                if !list_fetch_due(
+                    fresh,
+                    self.tg_list_loading.contains(&key),
+                    self.tg_list_failures.get(&key).map(Instant::elapsed),
+                    resources::RESOURCE_TTL,
+                ) {
                     continue;
                 }
                 self.tg_list_loading.insert(key.clone());
                 let tx = self.proc_tx.clone();
-                let (p, r, a) = (profile.clone(), region.clone(), account_id.clone());
+                // Each account's own region, never the selected context's: a
+                // checked multi-account profile configured elsewhere would
+                // otherwise be asked for the selected region's groups and file
+                // whatever came back under that region's key. See
+                // `PoolAccount`.
+                let (p, r, a) = (
+                    account.profile.clone(),
+                    account.region.clone(),
+                    account.account_id.clone(),
+                );
                 std::thread::spawn(move || {
                     let result = elb::fetch_target_groups(&p, &r, &a);
                     let _ = tx.send(ProcEvent::TargetGroupList {
@@ -23395,18 +23476,22 @@ mod gui {
             }
         }
 
-        /// Every (profile, account id) the resource sub-tabs draw from: the
-        /// selected account plus any checked multi-account profiles — the same
-        /// pool `instance_pool` uses for the EC2 table.
-        fn resource_pool_accounts(&self) -> Vec<(String, String)> {
-            let mut out: Vec<(String, String)> = Vec::new();
+        /// Every account the resource sub-tabs draw from: the selected account
+        /// plus any checked multi-account profiles — the same pool
+        /// `instance_pool` uses for the EC2 table.
+        fn resource_pool_accounts(&self) -> Vec<PoolAccount> {
+            let mut out: Vec<PoolAccount> = Vec::new();
             let mut push = |ctx: &AwsContext| {
-                let account = ctx.account_id.clone().unwrap_or_default();
-                if account.is_empty() {
+                let account_id = ctx.account_id.clone().unwrap_or_default();
+                if account_id.is_empty() {
                     return;
                 }
-                if !out.iter().any(|(_, a)| a == &account) {
-                    out.push((ctx.profile.to_string(), account));
+                if !out.iter().any(|a| a.account_id == account_id) {
+                    out.push(PoolAccount {
+                        profile: ctx.profile.to_string(),
+                        account_id,
+                        region: ctx.region.clone(),
+                    });
                 }
             };
             if let Some(ctx) = &self.context {
@@ -23420,19 +23505,14 @@ mod gui {
             out
         }
 
-        /// The cache keys the table may read: this mode, this region, and only
-        /// the accounts in the pool right now. See `pool_cache_keys`.
+        /// The cache keys the table may read: this mode, and only the accounts
+        /// in the pool right now, each in **its own** region. See
+        /// `pool_cache_keys`.
         fn current_target_group_keys(&self) -> Vec<String> {
-            let accounts: Vec<String> = self
-                .resource_pool_accounts()
-                .into_iter()
-                .map(|(_, account)| account)
-                .collect();
             pool_cache_keys(
                 ResourceKind::TargetGroup,
                 self.options.mode.as_str(),
-                &self.region_scope(),
-                &accounts,
+                &self.resource_pool_accounts(),
             )
         }
 
@@ -23483,6 +23563,18 @@ mod gui {
                     self.tg_targets.clear();
                     self.tg_denied_accounts.clear();
                     self.tg_list_errors.clear();
+                    // The cooldown is cleared too, or Refresh would be
+                    // ignored for whatever is left of it — which is exactly
+                    // the button somebody presses after fixing a permission.
+                    self.tg_list_failures.clear();
+                    // And the in-flight set: without this an account with a
+                    // fetch already running is skipped by
+                    // `ensure_target_groups` and simply never refetched. The
+                    // other half of that is in the `TargetGroupList` handler,
+                    // which now applies a reply only while it is still
+                    // claimed.
+                    self.tg_list_loading.clear();
+                    self.tg_priority_warned = None;
                 }
             });
 
@@ -23529,6 +23621,16 @@ mod gui {
                 &names,
                 resources::PRIORITY_HEALTH_MAX,
             );
+            // The cap truncates silently, so the caller says so — the counting
+            // lives in `resources`, which is pure and has no logger, and the
+            // reporting lives here.
+            if let Some(line) = priority_truncation_warning(
+                resources::priority_match_count(&self.tg_priority_patterns, &names),
+                resources::PRIORITY_HEALTH_MAX,
+                &mut self.tg_priority_warned,
+            ) {
+                self.log_warn(line);
+            }
             let priority_arns: Vec<String> =
                 priority_idx.iter().map(|i| rows[*i].arn.clone()).collect();
             let is_priority: HashSet<usize> = priority_idx.iter().copied().collect();
@@ -23541,7 +23643,10 @@ mod gui {
             ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
             let bar = &ui.spacing().scroll;
             let bar_allowance = bar.bar_width + bar.bar_inner_margin + bar.bar_outer_margin;
-            let widths = tg_column_widths(ui.available_width() - bar_allowance);
+            let widths = tg_column_widths(
+                ui.available_width() - bar_allowance,
+                !self.tg_denied_accounts.is_empty(),
+            );
 
             let text_h = ui.text_style_height(&egui::TextStyle::Body);
             // One text line plus the gap the grid puts after it. Every cell is
@@ -23555,12 +23660,26 @@ mod gui {
             // pushed the rows down by its own height, so the range the scroll
             // area reported and the rows actually on screen disagreed — and
             // that range is what decides which rows get a health call.
+            let health_header = tg_health_header(self.tg_denied_accounts.len());
+            let health_hover = tg_health_header_hover(&self.tg_denied_accounts);
             egui::Grid::new("target_group_header")
                 .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
                 .min_row_height(text_h)
                 .show(ui, |ui| {
-                    for (label, width) in TG_COLUMN_LABELS.iter().zip(widths.iter()) {
-                        tg_cell(ui, *width, text_h, egui::RichText::new(*label).strong());
+                    for (idx, (label, width)) in
+                        TG_COLUMN_LABELS.iter().zip(widths.iter()).enumerate()
+                    {
+                        let text = if idx == TG_HEALTH_COL {
+                            health_header.clone()
+                        } else {
+                            (*label).to_string()
+                        };
+                        let resp = tg_cell(ui, *width, text_h, egui::RichText::new(text).strong());
+                        if idx == TG_HEALTH_COL {
+                            if let Some(hover) = &health_hover {
+                                resp.on_hover_text(hover.clone());
+                            }
+                        }
                     }
                     ui.end_row();
                 });
@@ -23678,18 +23797,23 @@ mod gui {
                 return;
             }
 
-            let region = self.region_scope();
-            let profile_of: HashMap<String, String> = self
+            // Each account's own profile *and* its own region: a health call
+            // aimed at the selected region finds nothing for a group that
+            // lives elsewhere, which reads as an empty target group.
+            let pool_of: HashMap<String, PoolAccount> = self
                 .resource_pool_accounts()
                 .into_iter()
-                .map(|(profile, account)| (account, profile))
+                .map(|account| (account.account_id.clone(), account))
                 .collect();
 
             for arn in wanted {
                 let Some(account_id) = account_of.get(&arn).cloned() else {
                     continue;
                 };
-                let Some(profile) = profile_of.get(&account_id).cloned() else {
+                let Some((profile, region)) = pool_of
+                    .get(&account_id)
+                    .map(|a| (a.profile.clone(), a.region.clone()))
+                else {
                     continue;
                 };
                 // Marked in flight *before* the spawn, for the reason
@@ -23697,7 +23821,6 @@ mod gui {
                 // landing together would otherwise both pass the check.
                 self.tg_health.insert(arn.clone(), HealthCell::InFlight);
                 let tx = self.proc_tx.clone();
-                let region = region.clone();
                 std::thread::spawn(move || {
                     let result = elb::fetch_target_health(&profile, &region, &arn);
                     let _ = tx.send(ProcEvent::TargetGroupHealth {
@@ -23730,14 +23853,19 @@ mod gui {
             }
             self.main_tab = MainTab::Details;
 
-            let region = self.region_scope();
-            let profile = self
+            // The group's *own* account's profile and region. Taking the
+            // region from the selected context aims every detail call for a
+            // pooled account at the wrong region, where the ARN does not
+            // exist.
+            let pooled = self
                 .resource_pool_accounts()
                 .into_iter()
-                .find(|(_, account)| account == &tg.account_id)
-                .map(|(profile, _)| profile);
+                .find(|account| account.account_id == tg.account_id);
 
-            let Some(profile) = profile else {
+            let Some(PoolAccount {
+                profile, region, ..
+            }) = pooled
+            else {
                 // No context for this account, so nothing will ever post a
                 // result: say so rather than spin forever.
                 let err = format!("no AWS context for account {}", tg.account_id);
@@ -23779,13 +23907,15 @@ mod gui {
                 let attributes = elb::fetch_target_group_attributes(&profile, &region, &arn);
                 let _ = tx.send(ProcEvent::TargetGroupDetail {
                     arn: arn.clone(),
-                    attributes: attributes.map_err(|e| e.message()),
+                    attributes: Some(attributes.map_err(|e| e.message())),
                     tags: None,
                 });
                 let tags = elb::fetch_elb_tags(&profile, &region, &arn);
                 let _ = tx.send(ProcEvent::TargetGroupDetail {
                     arn,
-                    attributes: Ok(Vec::new()),
+                    // `None`, never an empty `Ok`: this message has no answer
+                    // about attributes and must not claim one.
+                    attributes: None,
                     tags: Some(tags.map_err(|e| e.message())),
                 });
             });
@@ -23801,6 +23931,19 @@ mod gui {
         ) {
             ui.horizontal(|ui| {
                 ui.heading(title);
+                // The Details tab carries Copy All whatever it is showing, and
+                // each subject supplies its own text.
+                if ui.button("Copy All").clicked() {
+                    let text = target_group_detail_text(
+                        &tg,
+                        &self.detail_tg_targets,
+                        &self.detail_tg_attributes,
+                        &self.detail_tg_tags,
+                    );
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(&text);
+                    }
+                }
                 if ui.button("Close").clicked() {
                     self.detail_subject = None;
                     self.main_tab = MainTab::Inventory;
@@ -32915,6 +33058,32 @@ mod gui {
         }
     }
 
+    /// One account the resource sub-tabs draw from, **with its own region**.
+    ///
+    /// The region is the load-bearing field. It used to be taken from the
+    /// selected context and applied to every account in the pool, so a checked
+    /// multi-account profile configured for another region was asked for the
+    /// selected region's groups — and whatever came back was filed under the
+    /// selected region's key. The table has no Region column, so nothing on
+    /// screen said so. The sibling EC2 table has never behaved that way:
+    /// `instance_pool` merges each profile's own cached inventory, fetched
+    /// with that profile's own context.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct PoolAccount {
+        profile: String,
+        account_id: String,
+        region: String,
+    }
+
+    impl PoolAccount {
+        /// This account's cache key for one resource kind. Named here so the
+        /// list fetch, the table's read and the detail calls cannot each build
+        /// it from a different region.
+        fn cache_key(&self, kind: ResourceKind, mode: &str) -> String {
+            resources::cache_key(kind, mode, &self.account_id, &self.region)
+        }
+    }
+
     /// The cache keys belonging to the accounts currently in the pool.
     ///
     /// The cache is keyed by (mode, account, region) and is deliberately never
@@ -32924,16 +33093,56 @@ mod gui {
     /// reading it wholesale leaves an unchecked account's rows on screen and
     /// lists two regions' target groups together with nothing saying which is
     /// which. Every read of the cache goes through these keys.
-    fn pool_cache_keys(
-        kind: ResourceKind,
-        mode: &str,
-        region: &str,
-        accounts: &[String],
-    ) -> Vec<String> {
+    fn pool_cache_keys(kind: ResourceKind, mode: &str, accounts: &[PoolAccount]) -> Vec<String> {
         accounts
             .iter()
-            .map(|account| resources::cache_key(kind, mode, account, region))
+            .map(|account| account.cache_key(kind, mode))
             .collect()
+    }
+
+    /// Whether a list fetch may be spawned for one cache key this frame.
+    ///
+    /// The failure case is the one that matters. A failed list call writes
+    /// nothing into the cache, so the key is neither fresh nor loading on the
+    /// very next frame — and `ensure_target_groups` spawned it again, at
+    /// whatever rate the table repainted (200 ms while anything is loading,
+    /// which the loop itself kept true). That is roughly five `aws`
+    /// subprocesses a second for as long as the tab is open, on the single
+    /// most likely failure there is: a role without
+    /// `elasticloadbalancing:DescribeTargetGroups`.
+    ///
+    /// So a recorded failure is a cooldown of the same length as the TTL: a
+    /// successful list is good for `RESOURCE_TTL`, and a failed one is not
+    /// worth re-asking any sooner than that. Refresh clears the record, which
+    /// is what makes the failure re-checkable on demand rather than only on
+    /// the clock.
+    ///
+    /// Pure and separate from the loop, because every way of getting it wrong
+    /// is a subprocess storm rather than a wrong pixel.
+    fn list_fetch_due(
+        fresh: bool,
+        in_flight: bool,
+        since_failure: Option<Duration>,
+        cooldown: Duration,
+    ) -> bool {
+        if fresh || in_flight {
+            return false;
+        }
+        match since_failure {
+            Some(age) => age >= cooldown,
+            None => true,
+        }
+    }
+
+    /// Whether a list failure is worth an error line, or is the same thing the
+    /// last one already said.
+    ///
+    /// Reported once per reason and again only when the reason changes — the
+    /// rule `report_reaper_reason_change` and `poll_port_tunnels` both follow.
+    /// The cooldown re-tries a permanently refused account every TTL, and an
+    /// error line each time is noise no log filter can undo.
+    fn list_error_is_news(errors: &HashMap<String, String>, account_id: &str, msg: &str) -> bool {
+        errors.get(account_id).map(String::as_str) != Some(msg)
     }
 
     /// The cached rows for exactly those keys, in key order.
@@ -32959,9 +33168,86 @@ mod gui {
         "Account",
     ];
 
+    /// Which of `TG_COLUMN_LABELS` is the Healthy/Total column.
+    const TG_HEALTH_COL: usize = 3;
+
+    /// The Healthy/Total header, which says when the column is switched off.
+    ///
+    /// The first `AccessDenied` disables health for that whole account, and
+    /// the only evidence of it was `not permitted` repeated down the column
+    /// plus one warn line in a tab nobody has open. A constant header is the
+    /// one place a reader looks to find out what a column is doing, so it says
+    /// so — in the same words the cells use, or the header and the rows would
+    /// name one state two ways.
+    ///
+    /// The count is deliberately absent: with a multi-account pool it would
+    /// change as accounts answer, and the hover text names them anyway.
+    fn tg_health_header(denied_accounts: usize) -> String {
+        if denied_accounts == 0 {
+            return TG_COLUMN_LABELS[TG_HEALTH_COL].to_string();
+        }
+        format!("{} (not permitted)", TG_COLUMN_LABELS[TG_HEALTH_COL])
+    }
+
+    /// The hover text behind that header: which accounts, and how many.
+    fn tg_health_header_hover(denied: &HashSet<String>) -> Option<String> {
+        if denied.is_empty() {
+            return None;
+        }
+        let mut accounts: Vec<&str> = denied.iter().map(String::as_str).collect();
+        accounts.sort_unstable();
+        Some(format!(
+            "{} account(s) refused DescribeTargetHealth, so the column is off for them: {}",
+            accounts.len(),
+            accounts.join(", ")
+        ))
+    }
+
+    /// The log line for a priority list that matched more than the cap, or
+    /// `None` when there is nothing new to say.
+    ///
+    /// `resources::priority_indexes` truncates in silence, and silence is the
+    /// bug: the star marker and a warning are meant to be the pair that makes
+    /// a too-broad pattern visible, so a pattern matching a whole account
+    /// reads exactly like one matching three groups.
+    ///
+    /// Said once per distinct count and again only when it changes — the rule
+    /// `report_reaper_reason_change` follows — because this is decided at
+    /// render, and a line per frame is not a warning. Dropping back under the
+    /// cap clears the marker, so a later truncation is reported again.
+    fn priority_truncation_warning(
+        matched: usize,
+        cap: usize,
+        last_warned: &mut Option<usize>,
+    ) -> Option<String> {
+        if matched <= cap {
+            *last_warned = None;
+            return None;
+        }
+        if *last_warned == Some(matched) {
+            return None;
+        }
+        *last_warned = Some(matched);
+        Some(format!(
+            "target group health: the priority list matched {matched} group(s); only the \
+             first {cap} are pulled ahead of the visible rows — the rest fill in as you \
+             scroll. Narrow resources.priority_target_groups if that is not what you meant."
+        ))
+    }
+
     /// The five bounded columns' widths, in `TG_COLUMN_LABELS` order after
     /// Name. Their contents are short and bounded; Name is not.
     const TG_FIXED_COL_W: [f32; 5] = [120.0, 110.0, 110.0, 170.0, 130.0];
+
+    /// What the Healthy/Total column widens to while its header carries the
+    /// `(not permitted)` suffix.
+    ///
+    /// Widened only then, rather than reserved permanently: `Healthy/Total`
+    /// alone fits the ordinary width with room to spare, and a column sized
+    /// for a state most sessions never reach is dead space on every row. The
+    /// table does shift when it changes — which is the frame the header
+    /// changes too, so what caused it is on screen.
+    const TG_HEALTH_DENIED_COL_W: f32 = 200.0;
 
     /// Name never shrinks past this, whatever the window does.
     const TG_NAME_MIN_W: f32 = 140.0;
@@ -32984,17 +33270,20 @@ mod gui {
     /// is drawn outside the virtualized region, so it cannot inherit the rows'
     /// own column sizing; passing both the same numbers makes them line up by
     /// construction rather than by two grids happening to agree.
-    fn tg_column_widths(total: f32) -> [f32; 6] {
-        let fixed: f32 = TG_FIXED_COL_W.iter().sum();
+    /// `health_denied` widens the Healthy/Total column to fit the longer
+    /// header `tg_health_header` returns while an account has refused.
+    fn tg_column_widths(total: f32, health_denied: bool) -> [f32; 6] {
+        let mut bounded = TG_FIXED_COL_W;
+        if health_denied {
+            // `TG_HEALTH_COL` counts from Name; the bounded array starts after
+            // it.
+            bounded[TG_HEALTH_COL - 1] = TG_HEALTH_DENIED_COL_W;
+        }
+        let fixed: f32 = bounded.iter().sum();
         let gaps = TG_COL_GAP * (TG_COLUMN_LABELS.len() as f32 - 1.0);
         let name = (total - fixed - gaps).max(TG_NAME_MIN_W);
         [
-            name,
-            TG_FIXED_COL_W[0],
-            TG_FIXED_COL_W[1],
-            TG_FIXED_COL_W[2],
-            TG_FIXED_COL_W[3],
-            TG_FIXED_COL_W[4],
+            name, bounded[0], bounded[1], bounded[2], bounded[3], bounded[4],
         ]
     }
 
@@ -33037,6 +33326,115 @@ mod gui {
             |ui| ui.add(egui::Label::new(text.into()).wrap_mode(egui::TextWrapMode::Truncate)),
         )
         .inner
+    }
+
+    /// Everything the target group detail view shows, as plain text for
+    /// Copy All.
+    ///
+    /// Pure over exactly the state the panel renders from, so what is copied
+    /// and what is on screen cannot drift — the instance panel builds its own
+    /// text inline and has no such guarantee.
+    ///
+    /// A section still loading, or one that failed, says which rather than
+    /// being omitted: an absent Tags heading in a pasted block reads as "this
+    /// group has no tags", which is the silent-empty failure this whole tab is
+    /// built to avoid.
+    fn target_group_detail_text(
+        tg: &TargetGroup,
+        targets: &Option<std::result::Result<Vec<Target>, String>>,
+        attributes: &Option<std::result::Result<Vec<(String, String)>, String>>,
+        tags: &Option<std::result::Result<Vec<(String, String)>, String>>,
+    ) -> String {
+        let dash = || "-".to_string();
+        let mut text = String::new();
+        text.push_str(&format!("Target Group: {}\n", tg.name));
+        text.push_str(&format!("ARN: {}\n", tg.arn));
+        text.push_str(&format!(
+            "Protocol:Port: {}\n",
+            elb::protocol_port_label(tg)
+        ));
+        text.push_str(&format!("Target Type: {}\n", tg.target_type));
+        text.push_str(&format!(
+            "VPC: {}\n",
+            tg.vpc_id.clone().unwrap_or_else(dash)
+        ));
+        text.push_str(&format!("Account: {}\n", tg.account_id));
+        text.push_str("Load Balancers:");
+        if tg.load_balancer_arns.is_empty() {
+            text.push_str(" none\n");
+        } else {
+            text.push('\n');
+            for arn in &tg.load_balancer_arns {
+                text.push_str(&format!("  {arn}\n"));
+            }
+        }
+
+        let hc = &tg.health_check;
+        text.push_str("\nHealth Check:\n");
+        text.push_str(&format!(
+            "  Enabled: {}\n",
+            if hc.enabled { "Yes" } else { "No" }
+        ));
+        text.push_str(&format!(
+            "  Protocol: {}\n",
+            hc.protocol.clone().unwrap_or_else(dash)
+        ));
+        text.push_str(&format!("  Port: {}\n", hc.port.clone().unwrap_or_else(dash)));
+        text.push_str(&format!("  Path: {}\n", hc.path.clone().unwrap_or_else(dash)));
+        text.push_str(&format!(
+            "  Interval: {}\n",
+            hc.interval_secs.map_or_else(dash, |v| format!("{v}s"))
+        ));
+        text.push_str(&format!(
+            "  Timeout: {}\n",
+            hc.timeout_secs.map_or_else(dash, |v| format!("{v}s"))
+        ));
+        text.push_str(&format!(
+            "  Healthy Threshold: {}\n",
+            hc.healthy_threshold.map_or_else(dash, |v| v.to_string())
+        ));
+        text.push_str(&format!(
+            "  Unhealthy Threshold: {}\n",
+            hc.unhealthy_threshold.map_or_else(dash, |v| v.to_string())
+        ));
+        text.push_str(&format!(
+            "  Matcher: {}\n",
+            hc.matcher.clone().unwrap_or_else(dash)
+        ));
+
+        text.push_str("\nTargets:\n");
+        match targets {
+            None => text.push_str("  (still loading)\n"),
+            Some(Err(err)) => text.push_str(&format!("  Error: {err}\n")),
+            Some(Ok(list)) if list.is_empty() => text.push_str("  none registered\n"),
+            Some(Ok(list)) => {
+                for t in list {
+                    text.push_str(&format!(
+                        "  {} | {} | {} | {} | {}\n",
+                        t.id,
+                        t.port.map_or_else(dash, |p| p.to_string()),
+                        t.az.clone().unwrap_or_else(dash),
+                        t.state,
+                        t.reason.clone().unwrap_or_else(dash),
+                    ));
+                }
+            }
+        }
+
+        for (heading, pairs) in [("Attributes", attributes), ("Tags", tags)] {
+            text.push_str(&format!("\n{heading}:\n"));
+            match pairs {
+                None => text.push_str("  (still loading)\n"),
+                Some(Err(err)) => text.push_str(&format!("  Error: {err}\n")),
+                Some(Ok(list)) if list.is_empty() => text.push_str("  none\n"),
+                Some(Ok(list)) => {
+                    for (k, v) in list {
+                        text.push_str(&format!("  {k}: {v}\n"));
+                    }
+                }
+            }
+        }
+        text
     }
 
     /// The accounts that could not be listed, as one sentence fragment.
@@ -39940,8 +40338,11 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 (Instant::now(), vec![tg("other-region", "1111")]),
             );
 
-            let pool = vec!["1111".to_string(), "2222".to_string()];
-            let keys = pool_cache_keys(ResourceKind::TargetGroup, "live", "us-east-1", &pool);
+            let pool = vec![
+                pool_account("1111", "us-east-1"),
+                pool_account("2222", "us-east-1"),
+            ];
+            let keys = pool_cache_keys(ResourceKind::TargetGroup, "live", &pool);
             assert_eq!(keys.len(), 2, "one key per pooled account: {keys:?}");
             assert!(
                 !keys.contains(&key_of("3333", "us-east-1")),
@@ -40060,7 +40461,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         fn the_header_and_the_rows_are_given_one_set_of_column_widths() {
             let gaps = TG_COL_GAP * (TG_COLUMN_LABELS.len() as f32 - 1.0);
             let total = 1200.0;
-            let widths = tg_column_widths(total);
+            let widths = tg_column_widths(total, false);
             assert_eq!(widths.len(), TG_COLUMN_LABELS.len());
             let sum: f32 = widths.iter().sum::<f32>() + gaps;
             assert!(
@@ -40069,15 +40470,372 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             );
             // The five bounded columns never move; only Name absorbs the change.
             assert_eq!(&widths[1..], &TG_FIXED_COL_W[..]);
-            let narrower = tg_column_widths(900.0);
+            let narrower = tg_column_widths(900.0, false);
             assert!(narrower[0] < widths[0]);
             assert_eq!(&narrower[1..], &TG_FIXED_COL_W[..]);
 
             // Past the floor Name stops shrinking rather than going negative,
             // which would be a panic in `allocate_ui_with_layout`.
-            let tiny = tg_column_widths(10.0);
+            let tiny = tg_column_widths(10.0, false);
             assert_eq!(tiny[0], TG_NAME_MIN_W);
             assert_eq!(&tiny[1..], &TG_FIXED_COL_W[..]);
+        }
+
+        /// The denied header is longer than the ordinary one, so the column
+        /// widens to hold it and the table still fills exactly — otherwise the
+        /// header the fix exists to show is the one thing that gets truncated.
+        #[test]
+        fn the_denied_health_column_widens_for_its_own_header() {
+            let total = 1200.0;
+            let gaps = TG_COL_GAP * (TG_COLUMN_LABELS.len() as f32 - 1.0);
+            let plain = tg_column_widths(total, false);
+            let denied = tg_column_widths(total, true);
+
+            assert!(
+                denied[TG_HEALTH_COL] > plain[TG_HEALTH_COL],
+                "the Healthy/Total column must widen: {denied:?}"
+            );
+            assert_eq!(denied[TG_HEALTH_COL], TG_HEALTH_DENIED_COL_W);
+            // Only that column and Name move; the others are untouched.
+            for idx in [1, 2, 4, 5] {
+                assert_eq!(denied[idx], plain[idx], "column {idx} must not move");
+            }
+            assert!(denied[0] < plain[0], "Name absorbs the difference");
+            let sum: f32 = denied.iter().sum::<f32>() + gaps;
+            assert!(
+                (sum - total).abs() < 0.01,
+                "the widened columns must still fill the table: {sum} vs {total}"
+            );
+            // The header it is sized for is longer than the plain one.
+            assert!(
+                tg_health_header(1).len() > tg_health_header(0).len(),
+                "the denied header must actually be the longer string"
+            );
+        }
+
+        /// The first AccessDenied switches the column off for a whole account,
+        /// and the only sign of it used to be `not permitted` repeated down the
+        /// rows — a header that never changes is where a reader looks to find
+        /// out what a column is doing.
+        #[test]
+        fn the_health_header_says_when_the_column_is_off() {
+            assert_eq!(tg_health_header(0), "Healthy/Total");
+            assert_eq!(
+                tg_health_header(0),
+                TG_COLUMN_LABELS[TG_HEALTH_COL],
+                "with nothing denied it is exactly the ordinary label"
+            );
+            // The wording matches the per-row cell, or the header and the rows
+            // name one state two ways.
+            let denied = tg_health_header(2);
+            assert!(denied.starts_with("Healthy/Total"), "{denied}");
+            assert!(
+                denied.contains(&health_cell_text(&HealthCell::Denied)),
+                "the header must use the cells' own words: {denied}"
+            );
+
+            // Nothing denied says nothing; otherwise the hover names them all,
+            // sorted, with a count.
+            let mut accounts: HashSet<String> = HashSet::new();
+            assert_eq!(tg_health_header_hover(&accounts), None);
+            accounts.insert("2222".to_string());
+            accounts.insert("1111".to_string());
+            let hover = tg_health_header_hover(&accounts).expect("a hover once something is denied");
+            assert!(hover.contains('2') && hover.contains("1111") && hover.contains("2222"));
+            assert!(
+                hover.find("1111") < hover.find("2222"),
+                "sorted, so it does not reshuffle between frames: {hover}"
+            );
+        }
+
+        fn pool_account(account_id: &str, region: &str) -> PoolAccount {
+            PoolAccount {
+                profile: format!("profile-{account_id}"),
+                account_id: account_id.to_string(),
+                region: region.to_string(),
+            }
+        }
+
+        /// A checked multi-account profile configured for another region was
+        /// asked for the *selected* region's target groups, and whatever came
+        /// back was filed under the selected region's key. The table has no
+        /// Region column, so nothing on screen said so.
+        #[test]
+        fn each_pooled_account_is_keyed_in_its_own_region() {
+            let pool = vec![
+                pool_account("1111", "us-east-1"),
+                pool_account("2222", "eu-west-2"),
+            ];
+            let keys = pool_cache_keys(ResourceKind::TargetGroup, "live", &pool);
+            assert_eq!(
+                keys,
+                vec![
+                    resources::cache_key(ResourceKind::TargetGroup, "live", "1111", "us-east-1"),
+                    resources::cache_key(ResourceKind::TargetGroup, "live", "2222", "eu-west-2"),
+                ],
+                "each account keys on its own region: {keys:?}"
+            );
+            // And the key one account is fetched under is the one the table
+            // reads it back with — the same method builds both.
+            assert_eq!(
+                pool[1].cache_key(ResourceKind::TargetGroup, "live"),
+                keys[1]
+            );
+            // A global kind still drops the region, so two accounts in
+            // different regions do not become four entries.
+            let global = pool_cache_keys(ResourceKind::Bucket, "live", &pool);
+            assert!(
+                global.iter().all(|k| !k.contains("us-east-1")),
+                "a global kind carries no region: {global:?}"
+            );
+        }
+
+        /// A failed list call writes nothing into the cache, so without a
+        /// cooldown the key is neither fresh nor loading on the very next
+        /// frame and the fetch is spawned again — roughly five `aws`
+        /// subprocesses a second for as long as the tab is open.
+        #[test]
+        fn a_failed_list_is_not_respawned_until_the_cooldown_passes() {
+            let ttl = resources::RESOURCE_TTL;
+            // Nothing known: fetch.
+            assert!(list_fetch_due(false, false, None, ttl));
+            // Fresh, or already running: never.
+            assert!(!list_fetch_due(true, false, None, ttl));
+            assert!(!list_fetch_due(false, true, None, ttl));
+            // Just failed: the whole point.
+            assert!(!list_fetch_due(
+                false,
+                false,
+                Some(Duration::from_millis(200)),
+                ttl
+            ));
+            assert!(!list_fetch_due(false, false, Some(ttl / 2), ttl));
+            // Past the cooldown it is re-tried, so a transient failure is not
+            // permanent either.
+            assert!(list_fetch_due(false, false, Some(ttl), ttl));
+            assert!(list_fetch_due(
+                false,
+                false,
+                Some(ttl + Duration::from_secs(1)),
+                ttl
+            ));
+            // Freshness and in-flight still outrank an expired cooldown.
+            assert!(!list_fetch_due(true, false, Some(ttl * 2), ttl));
+            assert!(!list_fetch_due(false, true, Some(ttl * 2), ttl));
+        }
+
+        /// The cooldown re-tries a permanently refused account every TTL, and
+        /// an error line each time is noise no log filter can undo. Same rule
+        /// as `report_reaper_reason_change`: once per reason, and again only
+        /// when the reason changes.
+        #[test]
+        fn a_repeated_list_failure_is_not_re_logged_at_error_level() {
+            let mut errors: HashMap<String, String> = HashMap::new();
+            assert!(list_error_is_news(&errors, "1111", "not permitted"));
+            remember_list_error(&mut errors, "1111", Some("not permitted".to_string()));
+            assert!(
+                !list_error_is_news(&errors, "1111", "not permitted"),
+                "the same reason twice is not news"
+            );
+            assert!(
+                list_error_is_news(&errors, "1111", "throttled"),
+                "a different reason is"
+            );
+            // Another account's failure is its own news.
+            assert!(list_error_is_news(&errors, "2222", "not permitted"));
+            // And a success clears the record, so the failure after it is news
+            // again — a permission fixed and re-broken must be reported.
+            remember_list_error(&mut errors, "1111", None);
+            assert!(list_error_is_news(&errors, "1111", "not permitted"));
+        }
+
+        /// Refresh clears `tg_list_loading`, so a reply already in flight when
+        /// it was pressed is claimed by nobody — applying it would cache
+        /// pre-Refresh rows with a fresh timestamp, which is Refresh answering
+        /// with stale data and calling it new. `remove` returning false is the
+        /// guard, and the handler must actually branch on it.
+        #[test]
+        fn a_reply_superseded_by_refresh_is_dropped() {
+            let mut loading: HashSet<String> = HashSet::new();
+            loading.insert("live:1111:us-east-1:targetgroup".to_string());
+            assert!(
+                loading.remove("live:1111:us-east-1:targetgroup"),
+                "the in-flight reply is claimed"
+            );
+            assert!(
+                !loading.remove("live:1111:us-east-1:targetgroup"),
+                "a Refresh-cleared set claims nothing"
+            );
+
+            let src = include_str!("ec2_manager_gui.rs");
+            let start = src
+                .find("ProcEvent::TargetGroupList {")
+                .and_then(|i| src[i..].find("=> {").map(|j| i + j))
+                .expect("the TargetGroupList handler arm");
+            let end = start
+                + src[start..]
+                    .find("ProcEvent::TargetGroupHealth")
+                    .expect("the arm that follows it");
+            let arm = &src[start..end];
+            assert!(
+                arm.contains("if !self.tg_list_loading.remove(&cache_key)"),
+                "the handler must apply a reply only while it is still claimed:\n{arm}"
+            );
+            // And the Refresh button must clear the set in the first place, or
+            // an account with a fetch in flight is skipped and never refetched.
+            let refresh = src
+                .find("if ui.button(\"Refresh\").clicked() {")
+                .map(|i| &src[i..i + 1400])
+                .expect("the target groups Refresh button");
+            for cleared in [
+                "self.tg_list_loading.clear()",
+                "self.tg_list_failures.clear()",
+            ] {
+                assert!(refresh.contains(cleared), "Refresh must run {cleared}");
+            }
+        }
+
+        /// The star marker and a warning are meant to be the pair that makes a
+        /// too-broad pattern visible. Without the warning a pattern matching a
+        /// whole account reads exactly like one matching three groups.
+        #[test]
+        fn the_priority_cap_says_when_it_truncated() {
+            let cap = resources::PRIORITY_HEALTH_MAX;
+            let mut warned: Option<usize> = None;
+
+            // Under or at the cap there is nothing to report.
+            assert_eq!(priority_truncation_warning(0, cap, &mut warned), None);
+            assert_eq!(priority_truncation_warning(cap, cap, &mut warned), None);
+            assert_eq!(warned, None);
+
+            let line = priority_truncation_warning(200, cap, &mut warned)
+                .expect("past the cap it must say so");
+            assert!(line.contains("200"), "it names how many matched: {line}");
+            assert!(line.contains(&cap.to_string()), "and the cap: {line}");
+
+            // Said once, not per frame — this is decided at render.
+            assert_eq!(priority_truncation_warning(200, cap, &mut warned), None);
+            // A changed count is news again.
+            assert!(priority_truncation_warning(201, cap, &mut warned).is_some());
+            // Dropping back under the cap clears the marker, so a later
+            // truncation is reported rather than swallowed.
+            assert_eq!(priority_truncation_warning(3, cap, &mut warned), None);
+            assert_eq!(warned, None);
+            assert!(priority_truncation_warning(201, cap, &mut warned).is_some());
+        }
+
+        /// The Details tab carries Copy All whatever it is showing. A section
+        /// still loading or failed must say which rather than be omitted: an
+        /// absent Tags heading in a pasted block reads as "this group has no
+        /// tags".
+        #[test]
+        fn copy_all_carries_the_whole_target_group_panel() {
+            let tg = TargetGroup {
+                arn: "arn:aws:elasticloadbalancing:us-east-1:1111:targetgroup/web/abc".to_string(),
+                name: "web".to_string(),
+                protocol: Some("HTTPS".to_string()),
+                port: Some(443),
+                target_type: "instance".to_string(),
+                vpc_id: Some("vpc-0123".to_string()),
+                load_balancer_arns: vec!["arn:aws:elb:lb/one".to_string()],
+                health_check: elb::HealthCheck {
+                    enabled: true,
+                    protocol: Some("HTTPS".to_string()),
+                    port: Some("traffic-port".to_string()),
+                    path: Some("/health".to_string()),
+                    interval_secs: Some(30),
+                    timeout_secs: Some(5),
+                    healthy_threshold: Some(3),
+                    unhealthy_threshold: Some(2),
+                    matcher: Some("200".to_string()),
+                },
+                account_id: "1111".to_string(),
+            };
+            let targets = Some(Ok(vec![Target {
+                id: "i-0abc".to_string(),
+                port: Some(443),
+                az: Some("us-east-1a".to_string()),
+                state: "unhealthy".to_string(),
+                reason: Some("Target.FailedHealthChecks".to_string()),
+                description: Some("Health checks failed".to_string()),
+            }]));
+            let attributes = Some(Ok(vec![(
+                "deregistration_delay.timeout_seconds".to_string(),
+                "300".to_string(),
+            )]));
+            let tags = Some(Ok(vec![("Env".to_string(), "prod".to_string())]));
+
+            let text = target_group_detail_text(&tg, &targets, &attributes, &tags);
+            // Identity and configuration.
+            for want in ["web", &tg.arn, "HTTPS:443", "instance", "vpc-0123", "1111"] {
+                assert!(text.contains(want), "missing {want} in:\n{text}");
+            }
+            assert!(text.contains("arn:aws:elb:lb/one"), "{text}");
+            // The health-check block.
+            for want in ["/health", "30s", "5s", "Unhealthy Threshold: 2", "200"] {
+                assert!(text.contains(want), "missing {want} in:\n{text}");
+            }
+            // The targets, with state AND reason — the reason is the whole
+            // point of copying an unhealthy group out.
+            assert!(text.contains("i-0abc"), "{text}");
+            assert!(text.contains("unhealthy"), "{text}");
+            assert!(text.contains("Target.FailedHealthChecks"), "{text}");
+            // Attributes and tags.
+            assert!(text.contains("deregistration_delay.timeout_seconds: 300"), "{text}");
+            assert!(text.contains("Env: prod"), "{text}");
+
+            // An unanswered or failed section names itself; nothing is
+            // silently omitted.
+            let pending = target_group_detail_text(&tg, &None, &None, &None);
+            assert_eq!(
+                pending.matches("(still loading)").count(),
+                3,
+                "targets, attributes and tags each say so:\n{pending}"
+            );
+            let failed = target_group_detail_text(
+                &tg,
+                &Some(Err("not permitted".to_string())),
+                &Some(Ok(Vec::new())),
+                &Some(Err("throttled".to_string())),
+            );
+            assert!(failed.contains("Error: not permitted"), "{failed}");
+            assert!(failed.contains("Error: throttled"), "{failed}");
+            assert!(
+                failed.contains("Attributes:\n  none"),
+                "an empty section is 'none', not absent:\n{failed}"
+            );
+        }
+
+        /// The tags message used to send `attributes: Ok(Vec::new())` — safe
+        /// only because the handler happened to look at `tags` first. This
+        /// event shape is the template the remaining resource kinds copy, so
+        /// no field may carry an answer its message does not have.
+        #[test]
+        fn the_detail_event_never_claims_an_answer_it_does_not_have() {
+            let src = include_str!("ec2_manager_gui.rs");
+            // Assembled, not written out: a literal here would match this very
+            // test. Comments are skipped for the same reason — the doc comment
+            // on the event names the shape it must never go back to, and that
+            // sentence is worth keeping. Same stance
+            // `the_probe_script_changes_nothing_on_the_box` takes.
+            let untruth = format!("attributes: {}(Vec::new())", "Ok");
+            let offender = src
+                .lines()
+                .find(|line| !line.trim_start().starts_with("//") && line.contains(&untruth));
+            assert!(
+                offender.is_none(),
+                "the tags message must carry `attributes: None`, not an empty Ok: {offender:?}"
+            );
+            let decl = src
+                .find("TargetGroupDetail {\n            arn: String,")
+                .map(|i| &src[i..i + 260])
+                .expect("the TargetGroupDetail event declaration");
+            assert!(
+                decl.contains(
+                    "attributes: Option<std::result::Result<Vec<(String, String)>, String>>"
+                ),
+                "attributes must be optional:\n{decl}"
+            );
         }
     }
 }
