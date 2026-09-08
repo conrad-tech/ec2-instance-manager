@@ -23726,11 +23726,29 @@ mod gui {
                                 } else {
                                     (*label).to_string()
                                 };
-                                let resp = ui.add_sized(
-                                    [width, TG_ROW_H],
-                                    egui::Button::new(egui::RichText::new(text).strong())
-                                        .frame(false),
+                                // Left-aligned, like the cells beneath it, and
+                                // NOT `add_sized`, which centres its widget in
+                                // the space it allocates. That mismatch is what
+                                // was left after the columns themselves were
+                                // fixed: every header floated to the middle of
+                                // its column while its values sat at the left
+                                // edge, so a wide column looked misaligned even
+                                // though its edges were exact. The allocated
+                                // rect is still the full cell, which is what
+                                // the drag handle below measures against.
+                                let cell = ui.allocate_ui_with_layout(
+                                    egui::vec2(width, TG_ROW_H),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(text).strong(),
+                                            )
+                                            .wrap_mode(egui::TextWrapMode::Truncate),
+                                        )
+                                    },
                                 );
+                                let resp = cell.response;
                                 if idx == TG_HEALTH_COL {
                                     if let Some(hover) = &health_hover {
                                         resp.clone().on_hover_text(hover.clone());
@@ -23776,74 +23794,99 @@ mod gui {
                             ui.end_row();
 
                             for (idx, tg) in rows.iter().enumerate() {
-
-                                let name = if is_priority.contains(&idx) {
-                                format!("★ {}", tg.name)
-                                } else {
-                                tg.name.clone()
-                                };
-                                tg_cell(ui, cw(0), TG_ROW_H, name)
-                                .on_hover_text(tg.name.clone())
-                                .context_menu(|ui| {
-                                if ui.button("See Details").clicked() {
-                                pending_detail = Some(tg.clone());
-                                ui.close();
-                                }
-                                });
+                                // The star gets a fixed slot of its own rather
+                                // than being glued onto the name. Prefixed, a
+                                // starred row's name started two characters
+                                // right of every other row's, so configuring a
+                                // priority list put a jag down the one column
+                                // people actually read.
+                                let starred = is_priority.contains(&idx);
+                                let name_cell = ui.allocate_ui_with_layout(
+                                    egui::vec2(cw(0), TG_ROW_H),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.x = 2.0;
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(TG_STAR_W, TG_ROW_H),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                if starred {
+                                                    ui.label("★");
+                                                }
+                                            },
+                                        );
+                                        ui.add(
+                                            egui::Label::new(tg.name.clone())
+                                                .wrap_mode(egui::TextWrapMode::Truncate)
+                                                .sense(egui::Sense::click()),
+                                        )
+                                    },
+                                );
+                                name_cell
+                                    .inner
+                                    .on_hover_text(tg.name.clone())
+                                    .context_menu(|ui| {
+                                        if ui.button("See Details").clicked() {
+                                            pending_detail = Some(tg.clone());
+                                            ui.close();
+                                        }
+                                    });
 
                                 tg_cell(ui, cw(1), TG_ROW_H, elb::protocol_port_label(tg));
 
                                 let cell = health
-                                .get(&tg.arn)
-                                .cloned()
-                                .unwrap_or(HealthCell::NotRequested);
+                                    .get(&tg.arn)
+                                    .cloned()
+                                    .unwrap_or(HealthCell::NotRequested);
                                 let text = health_cell_text(&cell);
                                 let colour = match &cell {
-                                HealthCell::Known(s) if s.total > 0 && s.healthy == s.total => {
-                                Some(egui::Color32::GREEN)
-                                }
-                                HealthCell::Known(s) if s.healthy == 0 && s.total > 0 => {
-                                Some(egui::Color32::RED)
-                                }
-                                // No targets registered is a fact, not a warning.
-                                // It fell through to the yellow catch-all because
-                                // both arms above require `total > 0`, so an empty
-                                // target group rendered as a coloured dash — and
-                                // yellow means "needs attention" everywhere else in
-                                // this app. It was read as the column failing to
-                                // load, which is the one thing it must not look
-                                // like.
-                                HealthCell::Known(s) if s.total == 0 => None,
-                                HealthCell::Known(_) => Some(egui::Color32::YELLOW),
-                                HealthCell::Failed(_) => Some(egui::Color32::RED),
-                                _ => None,
+                                    HealthCell::Known(s) if s.total > 0 && s.healthy == s.total => {
+                                        Some(egui::Color32::GREEN)
+                                    }
+                                    HealthCell::Known(s) if s.healthy == 0 && s.total > 0 => {
+                                        Some(egui::Color32::RED)
+                                    }
+                                    // No targets registered is a fact, not a
+                                    // warning. It fell through to the yellow
+                                    // catch-all because both arms above require
+                                    // `total > 0`, so an empty target group
+                                    // rendered as a coloured dash — and yellow
+                                    // means "needs attention" everywhere else
+                                    // in this app. It was read as the column
+                                    // failing to load, which is the one thing
+                                    // it must not look like.
+                                    HealthCell::Known(s) if s.total == 0 => None,
+                                    HealthCell::Known(_) => Some(egui::Color32::YELLOW),
+                                    HealthCell::Failed(_) => Some(egui::Color32::RED),
+                                    _ => None,
                                 };
                                 let rich = match colour {
-                                Some(c) => notification_text(ui, c, text),
-                                None => egui::RichText::new(text),
+                                    Some(c) => notification_text(ui, c, text),
+                                    None => egui::RichText::new(text),
                                 };
                                 let resp = tg_cell(ui, cw(2), TG_ROW_H, rich);
                                 if let HealthCell::Failed(detail) = &cell {
-                                resp.on_hover_text(detail.clone());
+                                    resp.on_hover_text(detail.clone());
                                 }
 
                                 // The health-check path, from the same
-                                // describe-target-groups reply the row itself came
-                                // from — so unlike Healthy/Total it is known the
-                                // moment the row exists and has no pending state. A
-                                // dash here is unambiguous for that reason: it means
-                                // this health check has no path (a TCP check), never
-                                // "no answer yet".
+                                // describe-target-groups reply the row itself
+                                // came from — so unlike Healthy/Total it is
+                                // known the moment the row exists and has no
+                                // pending state. A dash here is unambiguous for
+                                // that reason: it means this health check has
+                                // no path (a TCP check), never "no answer yet".
                                 tg_cell(
-                                ui,
-                                cw(3),
-                                TG_ROW_H,
-                                tg.health_check
-                                .path
-                                .clone()
-                                .unwrap_or_else(|| "—".to_string()),
+                                    ui,
+                                    cw(3),
+                                    TG_ROW_H,
+                                    tg.health_check
+                                        .path
+                                        .clone()
+                                        .unwrap_or_else(|| "—".to_string()),
                                 )
                                 .on_hover_text(tg_health_check_hover(tg));
+
                                 ui.end_row();
                             }
                         });
@@ -33385,6 +33428,13 @@ mod gui {
     /// purpose; neither needs to be exact, only stable.
     const TG_CHAR_W: f32 = 6.5;
 
+    /// The slot the priority star sits in, at the head of every Name cell.
+    ///
+    /// Fixed, and present whether or not the row is starred, so names all
+    /// start at the same x. Glued onto the name as a prefix instead, a
+    /// configured priority list put a two-character jag down the column.
+    const TG_STAR_W: f32 = 14.0;
+
     /// Horizontal gap between columns — the grid's own `spacing.x`.
     const TG_COL_GAP: f32 = 12.0;
 
@@ -33428,7 +33478,7 @@ mod gui {
             let cells = [
                 // The star is only on some rows, but every row must leave room
                 // for it or the column jumps when one appears.
-                text_w(&tg.name) + TG_CHAR_W * 2.0,
+                text_w(&tg.name) + TG_STAR_W,
                 text_w(&elb::protocol_port_label(tg)),
                 text_w("not permitted"),
                 text_w(tg.health_check.path.as_deref().unwrap_or("—")),
