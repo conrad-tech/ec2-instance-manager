@@ -177,6 +177,29 @@ mod gui {
         Log,
     }
 
+    /// What the Details tab is showing.
+    ///
+    /// Both variants are boxed: `Instance` is much the larger of the two, and
+    /// the enum gains four more variants as the remaining resource types land.
+    /// Boxing keeps `clippy::large_enum_variant` quiet and the
+    /// `Option<DetailSubject>` on `App` small.
+    #[derive(Clone, Debug)]
+    enum DetailSubject {
+        Instance(Box<Instance>),
+        TargetGroup(Box<TargetGroup>),
+    }
+
+    impl DetailSubject {
+        fn title(&self) -> String {
+            match self {
+                DetailSubject::Instance(i) => {
+                    i.name.clone().unwrap_or_else(|| "(unnamed)".to_string())
+                }
+                DetailSubject::TargetGroup(tg) => tg.name.clone(),
+            }
+        }
+    }
+
     /// The Inventory page's second tab row.
     ///
     /// `MainTab` is untouched: this lives *inside* the Inventory panel, so the
@@ -523,6 +546,15 @@ mod gui {
             arn: String,
             account_id: String,
             result: std::result::Result<Vec<Target>, FetchError>,
+        },
+        /// Attributes and tags for the target group open in the Details tab.
+        /// `tags` is `None` on the attributes message and `Some` on the tags
+        /// one, so the two arrive independently — a token that can read one
+        /// and not the other must leave the panel readable.
+        TargetGroupDetail {
+            arn: String,
+            attributes: std::result::Result<Vec<(String, String)>, String>,
+            tags: Option<std::result::Result<Vec<(String, String)>, String>>,
         },
         /// A Start / Stop / Restart run reached a new phase. Progress only:
         /// a run is over when `PowerDone` arrives, never on a phase.
@@ -5055,6 +5087,45 @@ mod gui {
         ui.label(rich)
     }
 
+    /// A pending / failed / empty / populated key-value section.
+    ///
+    /// Four states, all distinguishable: this is one section of a panel, and a
+    /// role that can describe a target group but not read its tags must still
+    /// see everything else.
+    fn render_pairs(
+        ui: &mut egui::Ui,
+        id: &str,
+        data: &Option<std::result::Result<Vec<(String, String)>, String>>,
+    ) {
+        match data {
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Fetching…");
+                });
+            }
+            Some(Err(err)) => {
+                note_label(ui, egui::Color32::RED, format!("Error: {err}"));
+            }
+            Some(Ok(pairs)) if pairs.is_empty() => {
+                ui.label("None");
+            }
+            Some(Ok(pairs)) => {
+                egui::Grid::new(id)
+                    .num_columns(2)
+                    .spacing([16.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for (k, v) in pairs {
+                            ui.strong(k);
+                            ui.label(v);
+                            ui.end_row();
+                        }
+                    });
+            }
+        }
+    }
+
     /// A notification-bar message. Bold under the light theme: the status
     /// colors (yellow especially, and the flashing variants, which spend
     /// half their cycle at low alpha) were picked against a dark panel and
@@ -7639,8 +7710,18 @@ mod gui {
         hidden_envs: std::collections::HashSet<String>,
         selected_saved_filter: String,
         selected_instance_id: String,
-        /// Instance shown in the Details tab
-        detail_instance: Option<Instance>,
+        /// Whatever the Details tab is showing — an instance or a target group.
+        detail_subject: Option<DetailSubject>,
+        /// The selected target group's registered targets and configuration,
+        /// each on its own event — a role that can describe a group but not
+        /// read its health, attributes or tags must still see what it can.
+        detail_tg_targets: Option<std::result::Result<Vec<Target>, String>>,
+        detail_tg_attributes: Option<std::result::Result<Vec<(String, String)>, String>>,
+        detail_tg_tags: Option<std::result::Result<Vec<(String, String)>, String>>,
+        /// The detail view's own filter over the target table — the global
+        /// search bar filters the *list*, and a group can hold hundreds of
+        /// targets.
+        detail_tg_filter: String,
         /// Volume info fetched for the Details tab
         detail_volumes: Vec<VolumeInfo>,
         detail_volumes_loading: bool,
@@ -8450,7 +8531,11 @@ mod gui {
                 hidden_envs: initial_hidden_envs,
                 selected_saved_filter: String::new(),
                 selected_instance_id: String::new(),
-                detail_instance: None,
+                detail_subject: None,
+                detail_tg_targets: None,
+                detail_tg_attributes: None,
+                detail_tg_tags: None,
+                detail_tg_filter: String::new(),
                 detail_volumes: Vec::new(),
                 detail_volumes_loading: false,
                 detail_volumes_error: None,
@@ -20099,6 +20184,16 @@ mod gui {
                                 arn.clone(),
                                 HealthCell::Known(elb::health_summary(&targets)),
                             );
+                            // The same event fills the detail view, so opening a
+                            // group already on screen costs no second call — but
+                            // only where that group is the one still open.
+                            let open = matches!(
+                                &self.detail_subject,
+                                Some(DetailSubject::TargetGroup(tg)) if tg.arn == arn
+                            );
+                            if open {
+                                self.detail_tg_targets = Some(Ok(targets.clone()));
+                            }
                             self.tg_targets.insert(arn, targets);
                         }
                         Err(FetchError::Denied) => {
@@ -20119,6 +20214,25 @@ mod gui {
                             self.tg_health.insert(arn, HealthCell::Failed(text));
                         }
                     },
+                    ProcEvent::TargetGroupDetail {
+                        arn,
+                        attributes,
+                        tags,
+                    } => {
+                        // Only apply to the group still on screen: a stale
+                        // reply from a group closed a moment ago must not
+                        // overwrite the one being read.
+                        let open = matches!(
+                            &self.detail_subject,
+                            Some(DetailSubject::TargetGroup(tg)) if tg.arn == arn
+                        );
+                        if open {
+                            match tags {
+                                Some(tags) => self.detail_tg_tags = Some(tags),
+                                None => self.detail_tg_attributes = Some(attributes),
+                            }
+                        }
+                    }
                     ProcEvent::PowerProgress { instance_id, phase } => {
                         // Only the run that owns the line may move it: a
                         // second instance's run must not overwrite the one
@@ -22887,7 +23001,7 @@ mod gui {
                                 .union(resp_ami.clone())
                                 .union(resp_tag.clone());
 
-                            let detail_instance_clone = instance.clone();
+                            let see_details_instance = instance.clone();
                             let filter_instance_clone = instance.clone();
                             let mut add_to_saved_filter: Option<(String, String, String)> = None;
                             let mut remove_from_saved_filter: Option<(String, Instance, String)> =
@@ -22968,8 +23082,10 @@ mod gui {
                                     }
                                 });
                                 if ui.button("See Details").clicked() {
-                                    let iid = detail_instance_clone.instance_id.clone();
-                                    self.detail_instance = Some(detail_instance_clone.clone());
+                                    let iid = see_details_instance.instance_id.clone();
+                                    self.detail_subject = Some(DetailSubject::Instance(Box::new(
+                                        see_details_instance.clone(),
+                                    )));
                                     self.detail_volumes.clear();
                                     self.detail_volumes_error = None;
                                     self.detail_volumes_loading = true;
@@ -23557,8 +23673,223 @@ mod gui {
             }
         }
 
-        /// Filled in by the detail view.
-        fn open_target_group_details(&mut self, _tg: TargetGroup) {}
+        /// Open a target group in the Details tab and start its detail calls.
+        ///
+        /// Health is reused from the table where the row has already been
+        /// answered — opening a group you can see costs no second call.
+        fn open_target_group_details(&mut self, tg: TargetGroup) {
+            self.detail_tg_attributes = None;
+            self.detail_tg_tags = None;
+            self.detail_tg_filter.clear();
+            self.detail_tg_targets = self.tg_targets.get(&tg.arn).cloned().map(Ok);
+            self.main_tab = MainTab::Details;
+
+            let region = self.region_scope();
+            let profile = self
+                .resource_pool_accounts()
+                .into_iter()
+                .find(|(_, account)| account == &tg.account_id)
+                .map(|(profile, _)| profile);
+
+            let Some(profile) = profile else {
+                // No context for this account, so nothing will ever post a
+                // result: say so rather than spin forever.
+                let err = format!("no AWS context for account {}", tg.account_id);
+                self.detail_tg_attributes = Some(Err(err.clone()));
+                self.detail_tg_tags = Some(Err(err.clone()));
+                if self.detail_tg_targets.is_none() {
+                    self.detail_tg_targets = Some(Err(err));
+                }
+                self.detail_subject = Some(DetailSubject::TargetGroup(Box::new(tg)));
+                return;
+            };
+
+            let need_health = self.detail_tg_targets.is_none();
+            let tx = self.proc_tx.clone();
+            let arn = tg.arn.clone();
+            let account_id = tg.account_id.clone();
+            std::thread::spawn(move || {
+                if need_health {
+                    let result = elb::fetch_target_health(&profile, &region, &arn);
+                    let _ = tx.send(ProcEvent::TargetGroupHealth {
+                        arn: arn.clone(),
+                        account_id: account_id.clone(),
+                        result,
+                    });
+                }
+                // Attributes first: the panel fills top-down, the same
+                // ordering the volumes/security-groups pair already uses.
+                let attributes = elb::fetch_target_group_attributes(&profile, &region, &arn);
+                let _ = tx.send(ProcEvent::TargetGroupDetail {
+                    arn: arn.clone(),
+                    attributes: attributes.map_err(|e| e.message()),
+                    tags: None,
+                });
+                let tags = elb::fetch_elb_tags(&profile, &region, &arn);
+                let _ = tx.send(ProcEvent::TargetGroupDetail {
+                    arn,
+                    attributes: Ok(Vec::new()),
+                    tags: Some(tags.map_err(|e| e.message())),
+                });
+            });
+
+            self.detail_subject = Some(DetailSubject::TargetGroup(Box::new(tg)));
+        }
+
+        fn render_target_group_details(
+            &mut self,
+            ui: &mut egui::Ui,
+            tg: TargetGroup,
+            title: &str,
+        ) {
+            ui.horizontal(|ui| {
+                ui.heading(title);
+                if ui.button("Close").clicked() {
+                    self.detail_subject = None;
+                    self.main_tab = MainTab::Inventory;
+                }
+            });
+            ui.separator();
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("tg_detail_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        let row = |ui: &mut egui::Ui, label: &str, value: String| {
+                            ui.strong(label);
+                            ui.label(value);
+                            ui.end_row();
+                        };
+                        row(ui, "ARN", tg.arn.clone());
+                        row(ui, "Protocol:Port", elb::protocol_port_label(&tg));
+                        row(ui, "Target Type", tg.target_type.clone());
+                        row(ui, "VPC", tg.vpc_id.clone().unwrap_or_else(|| "—".into()));
+                        row(ui, "Account", tg.account_id.clone());
+                        row(
+                            ui,
+                            "Load Balancers",
+                            if tg.load_balancer_arns.is_empty() {
+                                "none".to_string()
+                            } else {
+                                tg.load_balancer_arns.join("\n")
+                            },
+                        );
+                    });
+
+                let hc = &tg.health_check;
+                ui.add_space(12.0);
+                ui.heading("Health Check");
+                ui.separator();
+                egui::Grid::new("tg_hc_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        let dash = || "—".to_string();
+                        let row = |ui: &mut egui::Ui, label: &str, value: String| {
+                            ui.strong(label);
+                            ui.label(value);
+                            ui.end_row();
+                        };
+                        row(
+                            ui,
+                            "Enabled",
+                            if hc.enabled { "Yes" } else { "No" }.to_string(),
+                        );
+                        row(ui, "Protocol", hc.protocol.clone().unwrap_or_else(dash));
+                        row(ui, "Port", hc.port.clone().unwrap_or_else(dash));
+                        row(ui, "Path", hc.path.clone().unwrap_or_else(dash));
+                        row(
+                            ui,
+                            "Interval",
+                            hc.interval_secs.map_or_else(dash, |v| format!("{v}s")),
+                        );
+                        row(
+                            ui,
+                            "Timeout",
+                            hc.timeout_secs.map_or_else(dash, |v| format!("{v}s")),
+                        );
+                        row(
+                            ui,
+                            "Healthy Threshold",
+                            hc.healthy_threshold.map_or_else(dash, |v| v.to_string()),
+                        );
+                        row(
+                            ui,
+                            "Unhealthy Threshold",
+                            hc.unhealthy_threshold.map_or_else(dash, |v| v.to_string()),
+                        );
+                        row(ui, "Matcher", hc.matcher.clone().unwrap_or_else(dash));
+                    });
+
+                ui.add_space(12.0);
+                ui.heading("Targets");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Filter");
+                    ui.text_edit_singleline(&mut self.detail_tg_filter);
+                });
+                match &self.detail_tg_targets {
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Fetching targets…");
+                        });
+                    }
+                    Some(Err(err)) => {
+                        note_label(ui, egui::Color32::RED, format!("Error: {err}"));
+                    }
+                    Some(Ok(targets)) if targets.is_empty() => {
+                        ui.label("No targets registered");
+                    }
+                    Some(Ok(targets)) => {
+                        let needle = self.detail_tg_filter.to_ascii_lowercase();
+                        egui::Grid::new("tg_targets_grid")
+                            .num_columns(5)
+                            .spacing([12.0, 4.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for label in ["Target", "Port", "AZ", "State", "Reason"] {
+                                    ui.strong(label);
+                                }
+                                ui.end_row();
+                                for t in targets.iter().filter(|t| {
+                                    needle.is_empty()
+                                        || t.id.to_ascii_lowercase().contains(&needle)
+                                        || t.state.to_ascii_lowercase().contains(&needle)
+                                }) {
+                                    ui.label(&t.id);
+                                    ui.label(
+                                        t.port.map_or_else(|| "—".to_string(), |p| p.to_string()),
+                                    );
+                                    ui.label(t.az.clone().unwrap_or_else(|| "—".into()));
+                                    let color = match t.state.as_str() {
+                                        "healthy" => egui::Color32::GREEN,
+                                        "unhealthy" => egui::Color32::RED,
+                                        _ => egui::Color32::YELLOW,
+                                    };
+                                    note_label(ui, color, t.state.clone());
+                                    ui.label(t.reason.clone().unwrap_or_else(|| "—".into()))
+                                        .on_hover_text(t.description.clone().unwrap_or_default());
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                }
+
+                ui.add_space(12.0);
+                ui.heading("Attributes");
+                ui.separator();
+                render_pairs(ui, "tg_attrs_grid", &self.detail_tg_attributes);
+
+                ui.add_space(12.0);
+                ui.heading("Tags");
+                ui.separator();
+                render_pairs(ui, "tg_tags_grid", &self.detail_tg_tags);
+            });
+        }
 
         fn render_connections_panel(&mut self, ui: &mut egui::Ui) {
             let tabs_snapshot: Vec<(u64, String, String, bool)> = self
@@ -25618,13 +25949,29 @@ mod gui {
         }
 
         fn render_details_panel(&mut self, ui: &mut egui::Ui) {
-            let Some(instance) = self.detail_instance.clone() else {
-                ui.label("No instance selected. Right-click an instance and choose 'See Details'.");
-                return;
-            };
+            match self.detail_subject.clone() {
+                None => {
+                    ui.label("Nothing selected. Right-click a row and choose 'See Details'.");
+                }
+                // The heading is `DetailSubject::title` for either subject, so
+                // one rule names them and the two panels cannot drift.
+                Some(subject) => {
+                    let title = subject.title();
+                    match subject {
+                        DetailSubject::Instance(instance) => {
+                            self.render_instance_details(ui, *instance, &title);
+                        }
+                        DetailSubject::TargetGroup(tg) => {
+                            self.render_target_group_details(ui, *tg, &title);
+                        }
+                    }
+                }
+            }
+        }
 
+        fn render_instance_details(&mut self, ui: &mut egui::Ui, instance: Instance, title: &str) {
             ui.horizontal(|ui| {
-                ui.heading(instance.name.as_deref().unwrap_or("(unnamed)"));
+                ui.heading(title);
                 if ui.button("Copy All").clicked() {
                     let mut text = String::new();
                     text.push_str(&format!("Instance ID: {}\n", instance.instance_id));
@@ -25685,7 +26032,7 @@ mod gui {
                     }
                 }
                 if ui.button("Close").clicked() {
-                    self.detail_instance = None;
+                    self.detail_subject = None;
                     self.main_tab = MainTab::Inventory;
                 }
             });
@@ -26838,7 +27185,7 @@ mod gui {
                         {
                             self.main_tab = MainTab::Connections;
                         }
-                        if self.detail_instance.is_some() {
+                        if self.detail_subject.is_some() {
                             if ui
                                 .selectable_label(self.main_tab == MainTab::Details, "Details")
                                 .clicked()
@@ -37091,6 +37438,31 @@ mod gui {
             let mut inst = Instance::new(id.to_string(), "running".to_string());
             inst.name = Some(name.to_string());
             inst
+        }
+
+        /// The Details tab's heading names whatever is selected, and a target
+        /// group is named by its own name rather than by its ARN — the ARN is a
+        /// row in the panel, not a title.
+        #[test]
+        fn the_details_heading_names_its_subject() {
+            let named = named_instance("i-123", "web-01");
+            assert_eq!(DetailSubject::Instance(Box::new(named)).title(), "web-01");
+
+            // `named_instance` always sets a name, so the unnamed case is built
+            // directly — it is the one the heading has a fallback for.
+            let unnamed = Instance::new("i-456".to_string(), "running".to_string());
+            assert_eq!(
+                DetailSubject::Instance(Box::new(unnamed)).title(),
+                "(unnamed)"
+            );
+
+            let tg = TargetGroup {
+                name: "app-web".to_string(),
+                arn: "arn:aws:elasticloadbalancing:us-east-1:1111:targetgroup/app-web/abc"
+                    .to_string(),
+                ..Default::default()
+            };
+            assert_eq!(DetailSubject::TargetGroup(Box::new(tg)).title(), "app-web");
         }
 
         #[test]
