@@ -56,13 +56,23 @@ cargo clippy --features gui
 
 ## Build status
 
-As of 2026-08-04 (rustc 1.94.0), with the access-email integration restored and
-made automatic, the full build pipeline passes cleanly:
+As of 2026-09-08 (rustc 1.94.0), measured on `brandons_changes` after the
+Inventory resource sub-tabs (Target Groups, phase 1) landed — this line was
+stale for months (it read 356 tests / 21 warnings, both months out of date;
+the measured baseline immediately before this phase was 1019 tests / 23
+warnings):
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 356 tests pass, 0 fail (174 lib + 3 CLI + 179 GUI)
-- `cargo clippy --features gui` — no errors; 21 pre-existing style warnings
-  (derivable_impls on Mode, too_many_arguments on sim::make_instance,
-  collapsible_if / let_and_return / manual_is_multiple_of in the GUI)
+- `cargo test --features gui` — 1075 tests pass, 0 fail (657 lib + 3 CLI + 415 GUI)
+- `cargo clippy --features gui` — no errors; 23 pre-existing style warnings
+  (lib: derivable_impls on Mode, too_many_arguments on sim::make_instance,
+  three manual_is_multiple_of, one manual div_ceil; GUI: two more
+  too_many_arguments, manual case-insensitive ASCII comparison, manual
+  `Range::contains`, a clamp-like pattern, a simplifiable `map_or`, four
+  let_and_return, four collapsible_if, one unneeded `return`)
+- The Windows release cross-compile
+  (`ALLOW_NO_FORWARDS=1 CARGO_TARGET_DIR=/tmp/ec2m cargo build --release
+  --target x86_64-pc-windows-gnu --features gui`) — reverified 2026-09-08,
+  exit 0, zero warnings
 - Release targets — zero warnings on both Linux (x86_64-unknown-linux-gnu, via
   `build_binaries.sh`) and Windows (x86_64-pc-windows-gnu, built directly since
   the script aborts without `zip` — see below)
@@ -2143,6 +2153,119 @@ calls and the thread that sequences them are in the GUI binary.
   a disabled "Stop instance" invites a question whose answer the gates line
   already records. `the_power_menu_entries_stay_behind_the_allow_list` pins
   that the menu stays inside that `if` and that one place raises a request.
+
+### Inventory sub-tabs: the other AWS resource types
+
+The Inventory page carries a second tab row — `EC2 · Target Groups · Load
+Balancers · ASGs · S3 · Route 53` (`InventoryTab::all()`; Target Groups is
+second because it was the resource type phase 1 actually built, and the rest
+follow build order, not alphabetical or importance) — listing each resource
+type across the same multi-account pool the EC2 table draws from. `MainTab`
+is untouched: these live *inside* the Inventory panel, so the top-level bar
+stays at four entries rather than growing to nine. Read-only, every call a
+describe, so there is no `allowed_users` gate.
+
+Phase 1 built the scaffolding and Target Groups; the other four are the same
+shape — a `parse_*`/`fetch_*` pair, a `render_resource_panel` arm and a
+`DetailSubject` variant, with no scaffolding changes. The spec is
+`docs/superpowers/specs/2026-09-08-aws-resource-browser-design.md`.
+
+- **`filter::text_matches` is the shared search engine.** The
+  include/exclude matching was lifted out of `apply_filters` so every sub-tab
+  filters by the rules the user already types. `apply_filters` keeps its
+  emptiness guard: `searchable_text` allocates per instance and an empty
+  search box is the common case.
+- **Every column a table shows must be in that type's `*_searchable_text`.**
+  A visible column that is not searchable reads as "search is broken" — the
+  exact bug the EC2 Private DNS column had.
+- **S3 and Route 53 are global services and their cache keys carry no
+  region** (`resources::cache_key`). A region in either lists every bucket
+  once per region the user has visited. Pinned by
+  `a_global_kinds_key_carries_no_region`, which lands in the phase that has
+  no global type precisely so the phase that does cannot get it wrong.
+- **`classify_absent` is why an ordinary bucket does not look broken.** The
+  S3 API answers "this bucket has no lifecycle policy" by exiting non-zero,
+  and `run_capture` turns any non-zero exit into `Err`. Absent, denied and
+  broken are three different facts: reading them all as failures makes every
+  bucket look broken, and reading them all as "None" hides a permissions
+  hole — a bucket with no public-access block and one whose block you may
+  not read are not the same thing. Denial is checked first, so a future code
+  containing both is never filed as "nothing configured".
+- **`FetchError::from_stderr` keeps `Absent` as a failure.** Nothing in a
+  *list* call answers "nothing configured", so letting one become an empty
+  list would render as "no target groups in this account".
+- **Detail sections are separate events**, as `VolumeResult` and
+  `SecurityGroupResult` already are. A role that can describe a target group
+  but not read its tags must still see everything else.
+- **A stale reply cannot overwrite the open subject.** Every detail event
+  checks its ARN against `detail_subject` before applying, or a reply from a
+  group closed a moment ago lands in the one being read.
+- **The resource caches are 5 minutes** (`RESOURCE_TTL`), not the
+  inventory's 45 seconds. That one is short because the EC2 State column has
+  to be current; a bucket does not change on that timescale. Each sub-tab
+  has a Refresh button.
+- **`ProcEvent::TargetGroupList` carries the cache key stamped at spawn
+  time, and the handler must use it as-is rather than re-deriving it from
+  `region_scope()`.** Re-deriving it on arrival reads whatever region is
+  current *then*, so switching profile mid-flight would file one region's
+  groups under another region's key — exactly the mixing the table's own
+  key-scoped read exists to prevent.
+- **The list-error state is per account, `tg_list_errors: HashMap<String,
+  String>`, not a single `Option<String>`.** A note above the table names
+  which accounts failed to list while the rest still show their rows — an
+  `AccessDenied` in one account must not blank a pool that includes accounts
+  which answered fine.
+- **The table's header is drawn once, above the scroll area, and the columns
+  are fixed-width and truncating** (`tg_column_widths`, `tg_cell`) —
+  `ScrollArea::vertical()` with `show_rows`, deliberately **not** the
+  `ScrollArea::both()` plus user-resizable columns the sibling EC2 table
+  uses. Two reasons, both load-bearing: a header drawn inside the
+  virtualized region gets redrawn at the top of every visible slice and
+  pushes the rows down by its own height, desyncing the range `show_rows`
+  reports from the rows actually on screen — and that range is what decides
+  which visible rows get a health call; and a horizontally-scrolling body
+  under a fixed header would let the header slide out from under its own
+  columns. The inconsistency with the EC2 table is visible and deliberate —
+  do not "fix" it to match.
+
+#### The Healthy/Total column
+
+`describe-target-health` takes **exactly one target group per call** — there
+is no bulk form — so a whole-account fill is one call per group.
+
+- **Only the rows on screen are asked about.** The table renders through
+  `ScrollArea::show_rows`, which reports the visible range. 500 target
+  groups costs about 30 calls, and only reaches 500 if somebody scrolls past
+  every one, each fetched once and cached for `RESOURCE_TTL`.
+- **`health_requests` is pure and tested** because every way of getting it
+  wrong is expensive: without the `settled` check the table issues one call
+  per visible row on *every frame*, and without `denied_accounts` a role
+  that cannot read health issues one refused call per row for as long as
+  somebody scrolls. `MAX_HEALTH_IN_FLIGHT` is 6.
+- **A cell is marked `InFlight` before the thread is spawned**, for the
+  reason `ReaperInFlight` is claimed before its spawn: two frames landing
+  together would otherwise both pass the check.
+- **`resources.priority_target_groups` in features.json is a preference, not
+  a gate.** Configured names have their health fetched the moment the list
+  lands, wherever the table is scrolled, and carry a ★ so a pattern matching
+  nothing — or far more than intended — is visible. Case-insensitive
+  substring of the **name**, never the ARN, whose account id and random
+  suffix would match by accident. A blank pattern matches nothing rather
+  than everything (an empty string is a substring of everything — the same
+  trap as a blank forwards section marker), and the whole thing is capped at
+  `PRIORITY_HEALTH_MAX` (50) so a pattern like `prod` cannot unbound the
+  fill. It ships empty, with its example in the `_`-prefixed comment key —
+  a sample value in the live key fails `defaults_check` on this tree.
+- **Only `healthy` counts as healthy and the total is every registered
+  target.** A `draining` target during a deploy is neither; counting it
+  either way misreports the deploy. A group with nothing registered reads as
+  `—`, not `0/0` — having no targets is a different fact from having broken
+  ones.
+- **The first `AccessDenied` switches the column off for that account**, and
+  says so at warn level once.
+- **Sim mode has no resources of any of these kinds** and the sub-tabs say
+  so. Sim's promise is that it makes no AWS calls, and five fake generators
+  is real work for a mode that demos none of this.
 
 ### Instance search
 
