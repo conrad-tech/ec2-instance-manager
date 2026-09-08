@@ -42,7 +42,7 @@ cargo build --features gui
 
 # Run tests
 cargo test                  # lib + CLI tests
-cargo test --features gui   # all tests including GUI (415 GUI tests)
+cargo test --features gui   # all tests including GUI (425 GUI tests)
 
 # Clippy
 cargo clippy --features gui
@@ -56,19 +56,22 @@ cargo clippy --features gui
 
 ## Build status
 
-As of 2026-09-08 (rustc 1.94.0), measured on `brandons_changes` after the
-Inventory resource sub-tabs (Target Groups, phase 1) landed — this line was
-stale for months (it read 356 tests / 21 warnings, both months out of date;
-the measured baseline immediately before this phase was 1019 tests / 23
-warnings):
+As of 2026-09-08 (rustc 1.94.0), measured on `aws-resource-browser-phase1`
+after the Inventory resource sub-tabs (Target Groups, phase 1) landed and its
+final fix wave — this line was stale for months (it read 356 tests / 21
+warnings, both months out of date; the measured baseline immediately before
+this phase was 1019 tests / 23 warnings):
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 1075 tests pass, 0 fail (657 lib + 3 CLI + 415 GUI)
-- `cargo clippy --features gui` — no errors; 23 pre-existing style warnings
-  (lib: derivable_impls on Mode, too_many_arguments on sim::make_instance,
-  three manual_is_multiple_of, one manual div_ceil; GUI: two more
-  too_many_arguments, manual case-insensitive ASCII comparison, manual
+- `cargo test --features gui` — 1087 tests pass, 0 fail (659 lib + 3 CLI + 425 GUI)
+- `cargo clippy --features gui` — no errors; 23 pre-existing style warnings.
+  **That is a count of `^warning` lines, which is how the pre-branch baseline
+  was measured and why the two are comparable — it is 21 distinct lints (6 lib
+  + 15 GUI) plus the two per-crate "generated N warnings" summary lines.** The
+  21 are: lib — derivable_impls on Mode, too_many_arguments on
+  sim::make_instance, three manual_is_multiple_of, one manual div_ceil; GUI —
+  two more too_many_arguments, manual case-insensitive ASCII comparison, manual
   `Range::contains`, a clamp-like pattern, a simplifiable `map_or`, four
-  let_and_return, four collapsible_if, one unneeded `return`)
+  let_and_return, four collapsible_if, one unneeded `return`
 - The Windows release cross-compile
   (`ALLOW_NO_FORWARDS=1 CARGO_TARGET_DIR=/tmp/ec2m cargo build --release
   --target x86_64-pc-windows-gnu --features gui`) — reverified 2026-09-08,
