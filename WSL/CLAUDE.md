@@ -2168,10 +2168,49 @@ is untouched: these live *inside* the Inventory panel, so the top-level bar
 stays at four entries rather than growing to nine. Read-only, every call a
 describe, so there is no `allowed_users` gate.
 
-Phase 1 built the scaffolding and Target Groups; the other four are the same
-shape — a `parse_*`/`fetch_*` pair, a `render_resource_panel` arm and a
-`DetailSubject` variant, with no scaffolding changes. The spec is
+Phase 1 built the scaffolding and Target Groups; phase 2 added Load
+Balancers and changed no scaffolding at all, which is what the phasing was
+for. The remaining three are the same shape — a `parse_*`/`fetch_*` pair, a
+`render_resource_panel` arm and a `DetailSubject` variant. The spec is
 `docs/superpowers/specs/2026-09-08-aws-resource-browser-design.md`.
+
+#### Load Balancers (ALB and NLB)
+
+Columns are `Name · Type · Scheme · State · DNS name` — five, not the spec's
+seven, for the reason the Target Groups table is four: VPC and Account are
+true but rarely looked at, and both stay searchable and in the detail view.
+
+- **Type renders `ALB` / `NLB` / `GWLB`**, which is what anyone says out
+  loud, while `load_balancer_searchable_text` carries the API's own word too
+  — so typing `application` still finds it. A label that is not searchable
+  under the name the API uses is a search that looks broken.
+- **`active` is the one state with NO colour.** A table where every row is
+  coloured has said nothing; colouring this column is for the rare states.
+  `active_impaired` is amber *despite containing the word active* — it is
+  not a working load balancer, which is exactly what a
+  `starts_with("active")` would have called it, and there is a test saying
+  so.
+- **`State.Code` is nested**, not a top-level string. Reading it flat gives
+  every load balancer the same "unknown".
+- **A network load balancer has no security groups**, so the detail view
+  says `none` rather than a dash: a dash there reads as "could not tell".
+- **Listener rules arrive in two different shapes.** A rule made in the
+  console carries per-field config (`PathPatternConfig.Values`); one made by
+  Terraform often carries the old flat `Values`. Forward actions are the
+  same — a single `TargetGroupArn`, or the weighted
+  `ForwardConfig.TargetGroups` list. `describe_conditions` and
+  `forward_target_names` read both, because reading one makes half the rules
+  look like they do nothing.
+- **Rules sort by NUMERIC priority with the catch-all last.** Sorted as
+  strings, `10` comes before `2`; and `default` sorts last because that is
+  when it fires.
+- **A forward names its target group, not its ARN.** The ARN is a hundred
+  characters of which about ten carry the answer, and the panel is read
+  rather than parsed.
+- **Rules are their own `Result` per listener.** Reading them is a call per
+  listener, and a token that can list listeners but not their rules must
+  leave the listeners readable — the same rule the EC2 Details tab follows
+  for volumes and security groups.
 
 - **`filter::text_matches` is the shared search engine.** The
   include/exclude matching was lifted out of `apply_filters` so every sub-tab

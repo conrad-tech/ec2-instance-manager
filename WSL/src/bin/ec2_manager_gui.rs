@@ -34,7 +34,10 @@ mod gui {
     use ec2_manager::vault_iam::{self, VaultIamDeleteRequest, VaultIamRequest};
     use ec2_manager::connection_tabs::ConnectionTabs;
     use ec2_manager::diagnostics::run_diagnostics;
-    use ec2_manager::elb::{self, FetchError, HealthSummary, LoadBalancer, Target, TargetGroup};
+    use ec2_manager::elb::{
+        self, FetchError, HealthSummary, Listener, ListenerRule, LoadBalancer, Target,
+        TargetGroup,
+    };
     use ec2_manager::error::{AppError, Result};
     use ec2_manager::filter::{
         apply_filters, build_matchers, matching_tags, parse_tag_term, tag_term_matches,
@@ -187,6 +190,7 @@ mod gui {
     enum DetailSubject {
         Instance(Box<Instance>),
         TargetGroup(Box<TargetGroup>),
+        LoadBalancer(Box<LoadBalancer>),
     }
 
     impl DetailSubject {
@@ -196,8 +200,22 @@ mod gui {
                     i.name.clone().unwrap_or_else(|| "(unnamed)".to_string())
                 }
                 DetailSubject::TargetGroup(tg) => tg.name.clone(),
+                DetailSubject::LoadBalancer(lb) => lb.name.clone(),
             }
         }
+    }
+
+    /// One listener and its rules, as the load balancer detail view shows it.
+    ///
+    /// The rules are their own `Result` per listener: reading them is a call
+    /// per listener, and a token that can list listeners but not their rules
+    /// must leave the listeners themselves readable — the same reasoning that
+    /// keeps volumes and security groups on separate events in the EC2 Details
+    /// tab.
+    #[derive(Clone, Debug)]
+    struct ListenerDetail {
+        listener: Listener,
+        rules: std::result::Result<Vec<ListenerRule>, String>,
     }
 
     /// The Inventory page's second tab row.
@@ -571,6 +589,19 @@ mod gui {
         /// untruth, and no test would see it. This event shape is the template
         /// the remaining resource kinds copy, so it says what is true.
         TargetGroupDetail {
+            arn: String,
+            attributes: Option<std::result::Result<Vec<(String, String)>, String>>,
+            tags: Option<std::result::Result<Vec<(String, String)>, String>>,
+        },
+        /// One load balancer's listeners, each carrying its own rules.
+        LoadBalancerListeners {
+            arn: String,
+            result: std::result::Result<Vec<ListenerDetail>, String>,
+        },
+        /// A load balancer's attributes and tags, on the same honest shape as
+        /// `TargetGroupDetail`: each field is `Some` only on the message that
+        /// actually carries an answer about it.
+        LoadBalancerDetail {
             arn: String,
             attributes: Option<std::result::Result<Vec<(String, String)>, String>>,
             tags: Option<std::result::Result<Vec<(String, String)>, String>>,
@@ -7787,6 +7818,11 @@ mod gui {
         /// search bar filters the *list*, and a group can hold hundreds of
         /// targets.
         detail_tg_filter: String,
+        /// The open load balancer's listeners, attributes and tags — each on
+        /// its own event, so one refused permission does not blank the rest.
+        detail_lb_listeners: Option<std::result::Result<Vec<ListenerDetail>, String>>,
+        detail_lb_attributes: Option<std::result::Result<Vec<(String, String)>, String>>,
+        detail_lb_tags: Option<std::result::Result<Vec<(String, String)>, String>>,
         /// Volume info fetched for the Details tab
         detail_volumes: Vec<VolumeInfo>,
         detail_volumes_loading: bool,
@@ -8610,6 +8646,9 @@ mod gui {
                 detail_tg_attributes: None,
                 detail_tg_tags: None,
                 detail_tg_filter: String::new(),
+                detail_lb_listeners: None,
+                detail_lb_attributes: None,
+                detail_lb_tags: None,
                 detail_volumes: Vec::new(),
                 detail_volumes_loading: false,
                 detail_volumes_error: None,
@@ -20393,6 +20432,34 @@ mod gui {
                             }
                         }
                     }
+                    ProcEvent::LoadBalancerListeners { arn, result } => {
+                        // Only while this load balancer is still the one on
+                        // screen: a reply for one closed a moment ago must not
+                        // overwrite the one being read.
+                        if matches!(
+                            &self.detail_subject,
+                            Some(DetailSubject::LoadBalancer(lb)) if lb.arn == arn
+                        ) {
+                            self.detail_lb_listeners = Some(result);
+                        }
+                    }
+                    ProcEvent::LoadBalancerDetail {
+                        arn,
+                        attributes,
+                        tags,
+                    } => {
+                        if matches!(
+                            &self.detail_subject,
+                            Some(DetailSubject::LoadBalancer(lb)) if lb.arn == arn
+                        ) {
+                            if let Some(attributes) = attributes {
+                                self.detail_lb_attributes = Some(attributes);
+                            }
+                            if let Some(tags) = tags {
+                                self.detail_lb_tags = Some(tags);
+                            }
+                        }
+                    }
                     ProcEvent::TargetGroupDetail {
                         arn,
                         attributes,
@@ -23529,6 +23596,273 @@ mod gui {
             }
         }
 
+        /// Open a load balancer in the Details tab and start its detail calls.
+        ///
+        /// Three independent reads: the listeners (and a rules call per
+        /// listener), the attributes, and the tags. Each lands on its own
+        /// event, so a token that can read one and not another leaves the rest
+        /// of the panel readable.
+        fn open_load_balancer_details(&mut self, lb: LoadBalancer) {
+            self.detail_lb_listeners = None;
+            self.detail_lb_attributes = None;
+            self.detail_lb_tags = None;
+            self.main_tab = MainTab::Details;
+
+            let pool = self
+                .resource_pool_accounts()
+                .into_iter()
+                .find(|a| a.account_id == lb.account_id);
+            let Some(account) = pool else {
+                // No context for this account, so nothing will ever post a
+                // result: say so rather than spin on three spinners forever.
+                let err = format!("no AWS context for account {}", lb.account_id);
+                self.detail_lb_listeners = Some(Err(err.clone()));
+                self.detail_lb_attributes = Some(Err(err.clone()));
+                self.detail_lb_tags = Some(Err(err));
+                self.detail_subject = Some(DetailSubject::LoadBalancer(Box::new(lb)));
+                return;
+            };
+
+            let (profile, region) = (account.profile.clone(), account.region.clone());
+            let tx = self.proc_tx.clone();
+            let repaint = self.egui_ctx.clone();
+            let arn = lb.arn.clone();
+            std::thread::spawn(move || {
+                // Listeners first: they are what this panel exists to show.
+                let listeners = match elb::fetch_listeners(&profile, &region, &arn) {
+                    Ok(ls) => {
+                        // One rules call per listener, each keeping its own
+                        // failure rather than sinking the whole list.
+                        let detailed = ls
+                            .into_iter()
+                            .map(|listener| {
+                                let rules = elb::fetch_listener_rules(
+                                    &profile,
+                                    &region,
+                                    &listener.arn,
+                                )
+                                .map_err(|e| e.message());
+                                ListenerDetail { listener, rules }
+                            })
+                            .collect();
+                        Ok(detailed)
+                    }
+                    Err(e) => Err(e.message()),
+                };
+                let _ = tx.send(ProcEvent::LoadBalancerListeners {
+                    arn: arn.clone(),
+                    result: listeners,
+                });
+                if let Some(ctx) = &repaint {
+                    ctx.request_repaint();
+                }
+
+                let attributes =
+                    elb::fetch_load_balancer_attributes(&profile, &region, &arn)
+                        .map_err(|e| e.message());
+                let _ = tx.send(ProcEvent::LoadBalancerDetail {
+                    arn: arn.clone(),
+                    attributes: Some(attributes),
+                    tags: None,
+                });
+
+                let tags = elb::fetch_elb_tags(&profile, &region, &arn).map_err(|e| e.message());
+                let _ = tx.send(ProcEvent::LoadBalancerDetail {
+                    arn,
+                    // `None`, never an empty `Ok`: this message has no answer
+                    // about attributes and must not claim one.
+                    attributes: None,
+                    tags: Some(tags),
+                });
+                if let Some(ctx) = &repaint {
+                    ctx.request_repaint();
+                }
+            });
+
+            self.detail_subject = Some(DetailSubject::LoadBalancer(Box::new(lb)));
+        }
+
+        fn render_load_balancer_details(
+            &mut self,
+            ui: &mut egui::Ui,
+            lb: LoadBalancer,
+            title: &str,
+        ) {
+            ui.horizontal(|ui| {
+                ui.heading(title);
+                if ui.button("Copy All").clicked() {
+                    let text = load_balancer_detail_text(
+                        &lb,
+                        &self.detail_lb_listeners,
+                        &self.detail_lb_attributes,
+                        &self.detail_lb_tags,
+                    );
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(&text);
+                    }
+                }
+                if ui.button("Close").clicked() {
+                    self.detail_subject = None;
+                    self.main_tab = MainTab::Inventory;
+                }
+            });
+            ui.separator();
+
+            // One scroll area, and nothing inside it with a fixed height — the
+            // constraint the Jira ticket window records, for the reason it cost
+            // a layout bug there.
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("lb_detail_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        let row = |ui: &mut egui::Ui, label: &str, value: String| {
+                            ui.strong(label);
+                            ui.label(value);
+                            ui.end_row();
+                        };
+                        let dash = || "—".to_string();
+                        row(ui, "ARN", lb.arn.clone());
+                        ui.strong("DNS name");
+                        ui.horizontal(|ui| {
+                            Self::paint_copy_button(ui, &lb.dns_name, "Copy DNS name");
+                            ui.label(lb.dns_name.clone());
+                        });
+                        ui.end_row();
+                        row(ui, "Type", elb::load_balancer_kind_label(&lb));
+                        row(ui, "Scheme", lb.scheme.clone().unwrap_or_else(dash));
+                        row(ui, "State", lb.state.clone());
+                        row(ui, "VPC", lb.vpc_id.clone().unwrap_or_else(dash));
+                        row(ui, "Account", lb.account_id.clone());
+                        row(
+                            ui,
+                            "IP address type",
+                            lb.ip_address_type.clone().unwrap_or_else(dash),
+                        );
+                        row(
+                            ui,
+                            "Created",
+                            lb.created
+                                .as_deref()
+                                .map(format_aws_time_local)
+                                .unwrap_or_else(dash),
+                        );
+                        row(
+                            ui,
+                            "Availability zones",
+                            if lb.zones.is_empty() {
+                                dash()
+                            } else {
+                                lb.zones
+                                    .iter()
+                                    .map(|(z, s)| format!("{z} ({s})"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            },
+                        );
+                        row(
+                            ui,
+                            "Security groups",
+                            if lb.security_groups.is_empty() {
+                                // A network load balancer has none by design;
+                                // saying "none" is truer than a dash, which
+                                // reads as "could not tell".
+                                "none".to_string()
+                            } else {
+                                lb.security_groups.join(", ")
+                            },
+                        );
+                    });
+
+                ui.add_space(12.0);
+                ui.heading("Listeners");
+                ui.separator();
+                match &self.detail_lb_listeners {
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Fetching listeners…");
+                        });
+                    }
+                    Some(Err(err)) => {
+                        note_label(ui, egui::Color32::RED, format!("Error: {err}"));
+                    }
+                    Some(Ok(listeners)) if listeners.is_empty() => {
+                        ui.label("No listeners");
+                    }
+                    Some(Ok(listeners)) => {
+                        for detail in listeners {
+                            let l = &detail.listener;
+                            let port = l
+                                .port
+                                .map(|p| p.to_string())
+                                .unwrap_or_else(|| "—".to_string());
+                            let proto = l.protocol.clone().unwrap_or_else(|| "—".to_string());
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(format!("{proto}:{port}")).strong(),
+                            );
+                            ui.label(format!("default: {}", l.default_action));
+                            if let Some(policy) = &l.ssl_policy {
+                                ui.label(format!(
+                                    "TLS: {policy} · {} certificate(s)",
+                                    l.certificate_count
+                                ));
+                            }
+
+                            match &detail.rules {
+                                Err(err) => {
+                                    // The listener stays readable; only its
+                                    // rules are missing, and it says which.
+                                    note_label(
+                                        ui,
+                                        egui::Color32::RED,
+                                        format!("  rules: {err}"),
+                                    );
+                                }
+                                Ok(rules) if rules.is_empty() => {
+                                    ui.label("  no rules");
+                                }
+                                Ok(rules) => {
+                                    egui::Grid::new(("lb_rules", &l.arn))
+                                        .num_columns(3)
+                                        .spacing([12.0, 4.0])
+                                        .striped(true)
+                                        .show(ui, |ui| {
+                                            for h in ["Priority", "Conditions", "Action"] {
+                                                ui.strong(h);
+                                            }
+                                            ui.end_row();
+                                            for r in rules {
+                                                ui.label(&r.priority);
+                                                ui.label(if r.conditions.is_empty() {
+                                                    "—".to_string()
+                                                } else {
+                                                    r.conditions.join(" AND ")
+                                                });
+                                                ui.label(&r.action);
+                                                ui.end_row();
+                                            }
+                                        });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                ui.add_space(12.0);
+                ui.heading("Attributes");
+                ui.separator();
+                render_pairs(ui, "lb_attrs_grid", &self.detail_lb_attributes);
+
+                ui.add_space(12.0);
+                ui.heading("Tags");
+                ui.separator();
+                render_pairs(ui, "lb_tags_grid", &self.detail_lb_tags);
+            });
+        }
+
         /// Start a list fetch for any account whose load balancers are missing
         /// or stale.
         ///
@@ -23791,10 +24125,7 @@ mod gui {
                 self.lb_col_widths.insert(idx, w);
             }
             if let Some(lb) = pending_detail {
-                self.log_info(format!(
-                    "load balancer detail view is not built yet: {}",
-                    lb.name
-                ));
+                self.open_load_balancer_details(lb);
             }
         }
 
@@ -26675,6 +27006,9 @@ mod gui {
                         }
                         DetailSubject::TargetGroup(tg) => {
                             self.render_target_group_details(ui, *tg, &title);
+                        }
+                        DetailSubject::LoadBalancer(lb) => {
+                            self.render_load_balancer_details(ui, *lb, &title);
                         }
                     }
                 }
@@ -33973,6 +34307,109 @@ mod gui {
     /// Everything the target group detail view shows, as plain text for
     /// Copy All.
     ///
+    /// Everything the load balancer detail view shows, as plain text.
+    ///
+    /// Pure over exactly the state the panel renders from, so what is copied
+    /// and what is on screen cannot drift — the same contract
+    /// `target_group_detail_text` keeps.
+    ///
+    /// A section still loading, or one that failed, says which rather than
+    /// being omitted. An absent Tags heading in a pasted block reads as "this
+    /// load balancer has no tags", which is the silent-empty failure this
+    /// whole tab is built to avoid.
+    fn load_balancer_detail_text(
+        lb: &LoadBalancer,
+        listeners: &Option<std::result::Result<Vec<ListenerDetail>, String>>,
+        attributes: &Option<std::result::Result<Vec<(String, String)>, String>>,
+        tags: &Option<std::result::Result<Vec<(String, String)>, String>>,
+    ) -> String {
+        let dash = || "—".to_string();
+        let mut out = String::new();
+        out.push_str(&format!("Load balancer: {}\n", lb.name));
+        out.push_str(&format!("ARN: {}\n", lb.arn));
+        out.push_str(&format!("DNS name: {}\n", lb.dns_name));
+        out.push_str(&format!("Type: {}\n", elb::load_balancer_kind_label(lb)));
+        out.push_str(&format!(
+            "Scheme: {}\n",
+            lb.scheme.clone().unwrap_or_else(dash)
+        ));
+        out.push_str(&format!("State: {}\n", lb.state));
+        out.push_str(&format!(
+            "VPC: {}\n",
+            lb.vpc_id.clone().unwrap_or_else(dash)
+        ));
+        out.push_str(&format!("Account: {}\n", lb.account_id));
+        out.push_str(&format!(
+            "Availability zones: {}\n",
+            if lb.zones.is_empty() {
+                dash()
+            } else {
+                lb.zones
+                    .iter()
+                    .map(|(z, s)| format!("{z} ({s})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ));
+        out.push_str(&format!(
+            "Security groups: {}\n",
+            if lb.security_groups.is_empty() {
+                "none".to_string()
+            } else {
+                lb.security_groups.join(", ")
+            }
+        ));
+
+        out.push_str("\nListeners:\n");
+        match listeners {
+            None => out.push_str("  (still loading)\n"),
+            Some(Err(err)) => out.push_str(&format!("  Error: {err}\n")),
+            Some(Ok(ls)) if ls.is_empty() => out.push_str("  none\n"),
+            Some(Ok(ls)) => {
+                for d in ls {
+                    let proto = d.listener.protocol.clone().unwrap_or_else(dash);
+                    let port = d.listener.port.map(|p| p.to_string()).unwrap_or_else(dash);
+                    out.push_str(&format!(
+                        "  {proto}:{port} default: {}\n",
+                        d.listener.default_action
+                    ));
+                    match &d.rules {
+                        Err(err) => out.push_str(&format!("    rules: {err}\n")),
+                        Ok(rules) if rules.is_empty() => out.push_str("    no rules\n"),
+                        Ok(rules) => {
+                            for r in rules {
+                                let conds = if r.conditions.is_empty() {
+                                    dash()
+                                } else {
+                                    r.conditions.join(" AND ")
+                                };
+                                out.push_str(&format!(
+                                    "    [{}] {} -> {}\n",
+                                    r.priority, conds, r.action
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (heading, pairs) in [("Attributes", attributes), ("Tags", tags)] {
+            out.push_str(&format!("\n{heading}:\n"));
+            match pairs {
+                None => out.push_str("  (still loading)\n"),
+                Some(Err(err)) => out.push_str(&format!("  Error: {err}\n")),
+                Some(Ok(p)) if p.is_empty() => out.push_str("  none\n"),
+                Some(Ok(p)) => {
+                    for (k, v) in p {
+                        out.push_str(&format!("  {k}: {v}\n"));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Pure over exactly the state the panel renders from, so what is copied
     /// and what is on screen cannot drift — the instance panel builds its own
     /// text inline and has no such guarantee.
@@ -41170,6 +41607,57 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 "Could not list Target Groups: account 1111: not permitted; \
                  account 2222: throttled"
             );
+        }
+
+        /// Copy All names every section, including the ones that are still
+        /// loading or that failed.
+        ///
+        /// Omitting a failed section is the silent-empty failure this whole tab
+        /// is built to avoid: a pasted block with no Tags heading reads as
+        /// "this load balancer has no tags", when in fact nobody could read
+        /// them. A per-listener rules failure has to survive the same way, or
+        /// the paste claims a listener routes nothing.
+        #[test]
+        fn copy_all_says_which_sections_it_could_not_read() {
+            let lb = LoadBalancer {
+                name: "alpha-alb".to_string(),
+                arn: "arn:...:loadbalancer/app/alpha-alb/50dc".to_string(),
+                dns_name: "alpha-alb.example.com".to_string(),
+                kind: "application".to_string(),
+                state: "active".to_string(),
+                account_id: "111122223333".to_string(),
+                ..Default::default()
+            };
+
+            // Listeners read, but this one's rules were refused.
+            let listeners = Some(Ok(vec![ListenerDetail {
+                listener: ec2_manager::elb::Listener {
+                    protocol: Some("HTTPS".to_string()),
+                    port: Some(443),
+                    default_action: "forward -> app-web".to_string(),
+                    ..Default::default()
+                },
+                rules: Err("not permitted".to_string()),
+            }]));
+            let attributes = Some(Err("not permitted".to_string()));
+            let tags: Option<std::result::Result<Vec<(String, String)>, String>> = None;
+
+            let text = load_balancer_detail_text(&lb, &listeners, &attributes, &tags);
+
+            assert!(text.contains("alpha-alb"));
+            assert!(text.contains("HTTPS:443"));
+            assert!(text.contains("forward -> app-web"));
+            // The refused rules are named, not dropped.
+            assert!(text.contains("rules: not permitted"), "{text}");
+            // A failed section says so.
+            assert!(text.contains("Attributes:"), "{text}");
+            assert!(text.contains("Error: not permitted"), "{text}");
+            // And one still in flight says that rather than reading as empty.
+            assert!(text.contains("Tags:"), "{text}");
+            assert!(text.contains("(still loading)"), "{text}");
+            // A network load balancer's absent security groups say "none",
+            // which is truer than a dash — a dash reads as "could not tell".
+            assert!(text.contains("Security groups: none"), "{text}");
         }
 
         /// `active` is the one state that gets no colour.
