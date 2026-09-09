@@ -13853,6 +13853,39 @@ mod gui {
                                 ui.end_row();
                             });
                         ui.add_space(6.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label("Colour:");
+                            let id = dlg.rows[idx].profile_id.clone();
+                            let shown = dlg
+                                .colors
+                                .get(&id)
+                                .and_then(|hex| parse_hex_color(hex))
+                                .or_else(|| self.account_color_map.get(&id).copied())
+                                .unwrap_or(egui::Color32::GRAY);
+                            let mut rgb = [
+                                shown.r() as f32 / 255.0,
+                                shown.g() as f32 / 255.0,
+                                shown.b() as f32 / 255.0,
+                            ];
+                            if ui.color_edit_button_rgb(&mut rgb).changed() {
+                                let picked = egui::Color32::from_rgb(
+                                    (rgb[0] * 255.0).round() as u8,
+                                    (rgb[1] * 255.0).round() as u8,
+                                    (rgb[2] * 255.0).round() as u8,
+                                );
+                                dlg.colors.insert(id.clone(), color32_to_hex(picked));
+                            }
+                            if ui
+                                .button("Reset")
+                                .on_hover_text("Back to the automatic colour")
+                                .clicked()
+                            {
+                                dlg.colors.remove(&id);
+                            }
+                        });
+                        ui.add_space(6.0);
+
                         ui.label("Environments:");
                         let account_id = dlg.rows[idx].profile_id.clone();
                         let mut remove: Option<usize> = None;
@@ -14003,7 +14036,8 @@ mod gui {
             }
 
             self.config.user_environments = dlg.environments.clone();
-            self.config.account_colors = dlg.colors.clone();
+            self.config.account_colors =
+                frozen_colors(&dlg.rows, &self.account_color_map, &dlg.colors);
 
             self.rebuild_account_colors();
             let _ = self.config.save();
@@ -31539,7 +31573,7 @@ mod gui {
                     }
                 }
 
-                // Color picker window (opened from Edit menu or right-click tab)
+                // Color picker window (opened by right-clicking a connection tab)
                 if self.color_picker_profile.is_some() {
                     let profile_id = self.color_picker_profile.clone().unwrap_or_default();
 
@@ -31695,64 +31729,6 @@ mod gui {
                                         let _ = self.config.save();
                                         ui.close();
                                     }
-                                }
-                            });
-                            ui.menu_button("Environment Colors", |ui| {
-                                ui.label("Click an account to edit its color:");
-                                ui.separator();
-
-                                // One row per account, alphabetical, with
-                                // its base color swatch.
-                                let mut accounts: Vec<(String, String, egui::Color32)> =
-                                    self.config.profiles.iter()
-                                        .map(|p| {
-                                            let color = self
-                                                .account_color_map
-                                                .get(&p.profile_id)
-                                                .copied()
-                                                .unwrap_or(egui::Color32::GRAY);
-                                            (
-                                                p.profile_id.clone(),
-                                                p.display_name.clone(),
-                                                color,
-                                            )
-                                        })
-                                        .collect();
-                                accounts.sort_by(|a, b| {
-                                    a.1.to_ascii_lowercase()
-                                        .cmp(&b.1.to_ascii_lowercase())
-                                });
-
-                                let mut pick: Option<(String, egui::Color32)> = None;
-                                for (pid, name, color) in &accounts {
-                                    ui.horizontal(|ui| {
-                                        let (rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(12.0, 12.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        ui.painter()
-                                            .circle_filled(rect.center(), 6.0, *color);
-                                        if ui.button(name.as_str()).clicked() {
-                                            pick = Some((pid.clone(), *color));
-                                        }
-                                    });
-                                }
-                                if let Some((pid, color)) = pick {
-                                    self.tab_color_picker_rgb = [
-                                        color.r() as f32 / 255.0,
-                                        color.g() as f32 / 255.0,
-                                        color.b() as f32 / 255.0,
-                                    ];
-                                    self.color_picker_profile = Some(pid);
-                                    ui.close();
-                                }
-
-                                ui.separator();
-                                if ui.button("Reset All to Defaults").clicked() {
-                                    self.config.account_colors.clear();
-                                    self.rebuild_account_colors();
-                                    let _ = self.config.save();
-                                    ui.close();
                                 }
                             });
                             if ui.button("File Browser Defaults...").clicked() {
@@ -35669,6 +35645,32 @@ mod gui {
                 arrangement_editable: true,
             })
             .collect()
+    }
+
+    /// The colour map to store when an order is saved.
+    ///
+    /// `build_account_color_map` assigns palette colours **by index in sorted
+    /// order**, so moving one account repaints every account that never chose
+    /// a colour. Freezing what each is currently showing makes reordering
+    /// change only the order. An explicit choice is passed through untouched
+    /// rather than re-derived from the rendered swatch, which would be a
+    /// silent rewrite of the user's own hex; an account with nothing rendered
+    /// yet contributes nothing, since a wrong frozen colour is permanent.
+    fn frozen_colors(
+        rows: &[ManageAccountRow],
+        current: &HashMap<String, egui::Color32>,
+        existing: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, String> {
+        let mut out = existing.clone();
+        for row in rows {
+            if out.contains_key(&row.profile_id) {
+                continue;
+            }
+            if let Some(color) = current.get(&row.profile_id) {
+                out.insert(row.profile_id.clone(), color32_to_hex(*color));
+            }
+        }
+        out
     }
 
     /// Why an environment name cannot be added, or `None` if it can.
@@ -48697,6 +48699,71 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         fn the_same_name_under_another_account_is_allowed() {
             let existing = [ue("111", "DEV1")];
             assert!(environment_name_problem("DEV1", &existing, "999").is_none());
+        }
+
+        /// Palette colours are assigned by position, so without freezing, moving one
+        /// account repaints every other account that never chose a colour.
+        #[test]
+        fn saving_an_order_freezes_the_colour_every_account_is_showing() {
+            let rows = vec![
+                ManageAccountRow {
+                    profile_id: "111".to_string(),
+                    display_name: "Dev".to_string(),
+                    region: String::new(),
+                    identity_editable: false,
+                    arrangement_editable: true,
+                },
+                ManageAccountRow {
+                    profile_id: "999".to_string(),
+                    display_name: "Sandbox".to_string(),
+                    region: String::new(),
+                    identity_editable: true,
+                    arrangement_editable: true,
+                },
+            ];
+            let mut current = HashMap::new();
+            current.insert("111".to_string(), egui::Color32::from_rgb(0x2e, 0xa0, 0x43));
+            current.insert("999".to_string(), egui::Color32::from_rgb(0xc8, 0x28, 0x28));
+
+            let frozen = frozen_colors(&rows, &current, &BTreeMap::new());
+
+            assert_eq!(frozen.get("111").map(String::as_str), Some("#2ea043"));
+            assert_eq!(frozen.get("999").map(String::as_str), Some("#c82828"));
+        }
+
+        /// A colour the user picked explicitly is left exactly as they wrote it --
+        /// re-deriving it from the rendered swatch would be a silent rewrite.
+        #[test]
+        fn an_explicitly_chosen_colour_is_not_overwritten_by_the_freeze() {
+            let rows = vec![ManageAccountRow {
+                profile_id: "111".to_string(),
+                display_name: "Dev".to_string(),
+                region: String::new(),
+                identity_editable: false,
+                arrangement_editable: true,
+            }];
+            let mut current = HashMap::new();
+            current.insert("111".to_string(), egui::Color32::from_rgb(1, 2, 3));
+            let mut existing = BTreeMap::new();
+            existing.insert("111".to_string(), "#ABCDEF".to_string());
+
+            let frozen = frozen_colors(&rows, &current, &existing);
+            assert_eq!(frozen.get("111").map(String::as_str), Some("#ABCDEF"));
+        }
+
+        /// An account with no rendered colour yet contributes nothing rather than a
+        /// guess -- a wrong frozen colour is permanent.
+        #[test]
+        fn an_account_with_no_rendered_colour_is_left_alone() {
+            let rows = vec![ManageAccountRow {
+                profile_id: "111".to_string(),
+                display_name: "Dev".to_string(),
+                region: String::new(),
+                identity_editable: false,
+                arrangement_editable: true,
+            }];
+            let frozen = frozen_colors(&rows, &HashMap::new(), &BTreeMap::new());
+            assert!(frozen.is_empty());
         }
     }
 }
