@@ -2242,6 +2242,32 @@ true but rarely looked at, and both stay searchable and in the detail view.
 - **A stale reply cannot overwrite the open subject.** Every detail event
   checks its ARN against `detail_subject` before applying, or a reply from a
   group closed a moment ago lands in the one being read.
+- **Both edges of an auth change reach these tabs**, through
+  `forget_resources_for_profile`, and both matter. On **expiry** the lists
+  are five-minute cached and the tables read them happily, so an expired
+  session went on showing a full list of target groups as though it were
+  current — stale data that looks live is worse than none. On
+  **re-authentication** three things would otherwise hold the refetch back
+  until somebody pressed Refresh: the cached list itself, the
+  `*_list_failures` cooldown, and — the subtle one — `tg_denied_accounts`,
+  which switches the whole Healthy/Total column off for an account after one
+  `AccessDenied`, which is exactly what an expired token produces.
+- **An unauthenticated account is a wait, not an error.** `ensure_*` skips
+  it entirely, the same stance `start_port_tunnel` takes: fetching anyway
+  spends an `aws` invocation to be told no and files the refusal as a list
+  error the user then has to clear by hand. The tab says
+  `Waiting for credentials: <account>` in **amber**, its own line rather
+  than folded into the red error banner — an expired session and a failed
+  call are different problems, and the first resolves itself.
+- **Auth is read live from `profile_auth_infos`, never from the
+  `AwsContext`.** A context built while the session was good still carries
+  `AuthStatus::Ok` long after it expired, which is precisely how an expired
+  login went on being asked for target groups.
+- **What gets thrown away is decided by field, not substring**
+  (`cache_key_is_for_account`, `arn_is_for_account`). An account id is
+  twelve digits and can appear inside another field by coincidence; a
+  substring match would either drop another account's cache or fail to drop
+  the right one, and both failures are silent.
 - **The resource caches are 5 minutes** (`RESOURCE_TTL`), not the
   inventory's 45 seconds. That one is short because the EC2 State column has
   to be current; a bucket does not change on that timescale. Each sub-tab

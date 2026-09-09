@@ -9190,6 +9190,7 @@ mod gui {
                             ));
                             self.prime_cache_from_disk(pid);
                         }
+                        self.forget_resources_for_profile(pid, "auth restored");
                         self.refresh_profile(pid, true);
                     } else {
                         // Already authenticated and merely re-issued — which
@@ -9668,6 +9669,65 @@ mod gui {
 
         /// Handle a profile whose auth has expired: save cache to disk,
         /// clear from active display, and show a message.
+        /// Throw away everything the resource sub-tabs hold for one
+        /// account, and every error and denial recorded against it.
+        ///
+        /// Called on BOTH edges of an auth change, and both matter:
+        ///
+        /// - **Expired.** The lists are cached for five minutes and the tables
+        ///   read them happily, so an expired session went on showing a full
+        ///   list of target groups as though it were current. Stale data that
+        ///   looks live is worse than no data.
+        /// - **Re-authenticated.** `tg_denied_accounts` switches the whole
+        ///   Healthy/Total column off for an account after one `AccessDenied`,
+        ///   and an expired token produces exactly that — so the column stayed
+        ///   off after signing back in. `*_list_failures` is a cooldown that
+        ///   would likewise hold the refetch back for five minutes. Both have
+        ///   to go, or the user has to press Refresh, which is what they had
+        ///   to do.
+        fn forget_resources_for_account(&mut self, account: &str, why: &str) {
+            let before = self.target_groups.len() + self.load_balancers.len();
+            self.target_groups
+                .retain(|k, _| !cache_key_is_for_account(k, account));
+            self.load_balancers
+                .retain(|k, _| !cache_key_is_for_account(k, account));
+            for set in [&mut self.tg_list_loading, &mut self.lb_list_loading] {
+                set.retain(|k| !cache_key_is_for_account(k, account));
+            }
+            for map in [&mut self.tg_list_failures, &mut self.lb_list_failures] {
+                map.retain(|k, _| !cache_key_is_for_account(k, account));
+            }
+            for map in [&mut self.tg_list_errors, &mut self.lb_list_errors] {
+                map.remove(account);
+            }
+            self.tg_health
+                .retain(|arn, _| !arn_is_for_account(arn, account));
+            self.tg_targets
+                .retain(|arn, _| !arn_is_for_account(arn, account));
+            self.tg_denied_accounts.remove(account);
+            let after = self.target_groups.len() + self.load_balancers.len();
+            if before != after || !why.is_empty() {
+                self.log_info(format!(
+                    "resources: dropped everything cached for account {account} ({why})"
+                ));
+            }
+        }
+
+        /// The account id a profile resolves to, if its context is known.
+        fn account_id_for_profile(&self, profile_id: &str) -> Option<String> {
+            self.profile_inventory_cache
+                .get(profile_id)
+                .and_then(|(_, ctx)| ctx.account_id.clone())
+                .filter(|a| !a.is_empty())
+        }
+
+        /// Both edges of an auth change reach the resource tabs through here.
+        fn forget_resources_for_profile(&mut self, profile_id: &str, why: &str) {
+            if let Some(account) = self.account_id_for_profile(profile_id) {
+                self.forget_resources_for_account(&account, why);
+            }
+        }
+
         fn handle_profile_expired(&mut self, profile_id: &str) {
             let display = self
                 .config
@@ -9681,6 +9741,9 @@ mod gui {
             self.log_warn(format!(
                 "auth expired for {display} ({profile_id})"
             ));
+            // The resource lists are cached for five minutes and would go on
+            // being rendered as though current.
+            self.forget_resources_for_profile(profile_id, "auth expired");
 
             // Save current instances to disk cache before clearing
             if let Some((inv, ctx)) = self.profile_inventory_cache.get(profile_id) {
@@ -23871,6 +23934,13 @@ mod gui {
         fn ensure_load_balancers(&mut self) {
             let mode = self.options.mode.as_str().to_string();
             for account in self.resource_pool_accounts() {
+                // Not an error, a wait. `poll_port_tunnels` starts its tunnel
+                // the moment an account is authorized and says nothing in the
+                // meantime; this is the same, and it is what stops an expired
+                // session filling the error banner with refusals.
+                if !account.authed {
+                    continue;
+                }
                 let key = account.cache_key(ResourceKind::LoadBalancer, &mode);
                 let fresh = self
                     .load_balancers
@@ -23979,6 +24049,17 @@ mod gui {
                     egui::Color32::RED,
                     format!("Could not list Load Balancers: {detail}"),
                 );
+            }
+
+            // Amber, not red: an expired session is not a failure, it is a
+            // wait, and it clears itself when the credentials are renewed.
+            let waiting = waiting_for_auth_note(&self.resource_pool_accounts());
+            if let Some(note) = &waiting {
+                note_label(ui, egui::Color32::YELLOW, note.clone());
+                // The credentials watcher runs off a file-modified poll, not
+                // the frame loop, so this note would otherwise sit there until
+                // something else happened to redraw.
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
             }
 
             if !self.lb_list_loading.is_empty() {
@@ -24137,6 +24218,13 @@ mod gui {
         fn ensure_target_groups(&mut self) {
             let mode = self.options.mode.as_str().to_string();
             for account in self.resource_pool_accounts() {
+                // Not an error, a wait. `poll_port_tunnels` starts its tunnel
+                // the moment an account is authorized and says nothing in the
+                // meantime; this is the same, and it is what stops an expired
+                // session filling the error banner with refusals.
+                if !account.authed {
+                    continue;
+                }
                 let key = account.cache_key(ResourceKind::TargetGroup, &mode);
                 let fresh = self
                     .target_groups
@@ -24188,6 +24276,19 @@ mod gui {
         /// `instance_pool` uses for the EC2 table.
         fn resource_pool_accounts(&self) -> Vec<PoolAccount> {
             let mut out: Vec<PoolAccount> = Vec::new();
+            // The live answer, not the one baked into the context when it
+            // was built: a session that expired since then still carries
+            // `AuthStatus::Ok` in its `AwsContext`, which is exactly how an
+            // expired login went on being asked for target groups.
+            let authed_now = |profile: &str| -> bool {
+                self.profile_auth_infos
+                    .iter()
+                    .find(|a| a.profile_id == profile)
+                    .map(|a| a.auth_status == AuthStatus::Ok)
+                    // Sim fakes its credentials, and an unknown profile is not
+                    // evidence of expiry.
+                    .unwrap_or(self.options.mode == Mode::Sim)
+            };
             let mut push = |ctx: &AwsContext| {
                 let account_id = ctx.account_id.clone().unwrap_or_default();
                 if account_id.is_empty() {
@@ -24195,6 +24296,8 @@ mod gui {
                 }
                 if !out.iter().any(|a| a.account_id == account_id) {
                     out.push(PoolAccount {
+                        authed: self.options.mode == Mode::Sim
+                            || authed_now(&ctx.profile.to_string()),
                         profile: ctx.profile.to_string(),
                         account_id,
                         region: ctx.region.clone(),
@@ -24318,6 +24421,17 @@ mod gui {
                     egui::Color32::RED,
                     format!("Could not list Target Groups: {detail}"),
                 );
+            }
+
+            // Amber, not red: an expired session is not a failure, it is a
+            // wait, and it clears itself when the credentials are renewed.
+            let waiting = waiting_for_auth_note(&self.resource_pool_accounts());
+            if let Some(note) = &waiting {
+                note_label(ui, egui::Color32::YELLOW, note.clone());
+                // The credentials watcher runs off a file-modified poll, not
+                // the frame loop, so this note would otherwise sit there until
+                // something else happened to redraw.
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
             }
 
             // Which rows the configured priority list claims, capped. Computed
@@ -33886,6 +34000,27 @@ mod gui {
         }
     }
 
+    /// The note naming accounts whose credentials are not usable, if any.
+    ///
+    /// Its own line rather than folded into the error banner: "your session
+    /// expired" and "this call failed" are different problems with different
+    /// remedies, and the first resolves itself the moment `fed up` lands.
+    fn waiting_for_auth_note(accounts: &[PoolAccount]) -> Option<String> {
+        let mut waiting: Vec<&str> = accounts
+            .iter()
+            .filter(|a| !a.authed)
+            .map(|a| a.account_id.as_str())
+            .collect();
+        if waiting.is_empty() {
+            return None;
+        }
+        waiting.sort_unstable();
+        Some(format!(
+            "Waiting for credentials: {}. The list refreshes itself once they are renewed.",
+            waiting.join(", ")
+        ))
+    }
+
     /// What an empty resource table says about itself.
     ///
     /// "Nothing here", "still loading" and "the call failed" must never look
@@ -33919,6 +34054,13 @@ mod gui {
         profile: String,
         account_id: String,
         region: String,
+        /// Whether this account's credentials are usable right now.
+        ///
+        /// An unauthenticated account is a **wait, not an error** — the same
+        /// stance `start_port_tunnel` takes. Fetching anyway spends an `aws`
+        /// invocation to be told no, and files the refusal as a list error the
+        /// user then has to clear by hand.
+        authed: bool,
     }
 
     impl PoolAccount {
@@ -33928,6 +34070,26 @@ mod gui {
         fn cache_key(&self, kind: ResourceKind, mode: &str) -> String {
             resources::cache_key(kind, mode, &self.account_id, &self.region)
         }
+    }
+
+    /// Does this resource cache key belong to `account`?
+    ///
+    /// The key is `mode:account:region:kind`, or `mode:account:kind` for a
+    /// global service, so the account is always the second field. Matched by
+    /// field rather than as a substring: an account id is twelve digits and
+    /// could appear inside another field by coincidence, and this decides what
+    /// gets thrown away when credentials change.
+    fn cache_key_is_for_account(key: &str, account: &str) -> bool {
+        key.split(':').nth(1) == Some(account)
+    }
+
+    /// Does this ARN belong to `account`?
+    ///
+    /// `arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/…` —
+    /// the account is the fifth field. Same reasoning as above: matched by
+    /// field, not by substring.
+    fn arn_is_for_account(arn: &str, account: &str) -> bool {
+        arn.split(':').nth(4) == Some(account)
     }
 
     /// The cache keys belonging to the accounts currently in the pool.
@@ -41609,6 +41771,80 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             );
         }
 
+        /// What gets thrown away when credentials change is decided by field,
+        /// not by substring.
+        ///
+        /// An account id is twelve digits and can appear inside a region-free
+        /// key, an ARN's resource path, or another account's id by
+        /// coincidence. A substring match would either drop another account's
+        /// cache or fail to drop the right one, and both failures are silent.
+        #[test]
+        fn a_cache_key_and_an_arn_belong_to_an_account_by_field() {
+            // mode:account:region:kind, and mode:account:kind when global.
+            assert!(cache_key_is_for_account(
+                "live:111122223333:us-east-1:targetgroup",
+                "111122223333"
+            ));
+            assert!(cache_key_is_for_account(
+                "live:111122223333:bucket",
+                "111122223333"
+            ));
+            assert!(!cache_key_is_for_account(
+                "live:444455556666:us-east-1:targetgroup",
+                "111122223333"
+            ));
+            // The mode field is never mistaken for the account.
+            assert!(!cache_key_is_for_account(
+                "live:444455556666:us-east-1:targetgroup",
+                "live"
+            ));
+
+            // arn:aws:<service>:<region>:<account>:<resource>
+            let arn = "arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/app/abc";
+            assert!(arn_is_for_account(arn, "111122223333"));
+            assert!(!arn_is_for_account(arn, "444455556666"));
+            // The region sits one field earlier and must not match.
+            assert!(!arn_is_for_account(arn, "us-east-1"));
+        }
+
+        /// An expired session is a wait, and says so in its own words.
+        ///
+        /// Folded into the red error banner it would read as a failure the user
+        /// has to do something about; it is neither. It names the accounts,
+        /// because with a multi-account pool "waiting for credentials" without
+        /// saying whose is not a diagnosis.
+        #[test]
+        fn the_waiting_note_names_the_accounts_and_only_appears_when_needed() {
+            let account = |id: &str, authed: bool| PoolAccount {
+                profile: format!("p-{id}"),
+                account_id: id.to_string(),
+                region: "us-east-1".to_string(),
+                authed,
+            };
+
+            // Everything authenticated: no note at all.
+            assert_eq!(
+                waiting_for_auth_note(&[account("1111", true), account("2222", true)]),
+                None
+            );
+
+            // One expired among several: named, and the healthy one is not.
+            let note = waiting_for_auth_note(&[account("2222", true), account("1111", false)])
+                .expect("a note");
+            assert!(note.contains("1111"), "{note}");
+            assert!(!note.contains("2222"), "{note}");
+            // And it says the wait resolves itself, since it does.
+            assert!(note.contains("refreshes itself"), "{note}");
+
+            // Sorted, so the same set of accounts always reads the same way.
+            let two = waiting_for_auth_note(&[account("2222", false), account("1111", false)])
+                .expect("a note");
+            assert!(
+                two.find("1111") < two.find("2222"),
+                "accounts should be sorted: {two}"
+            );
+        }
+
         /// Copy All names every section, including the ones that are still
         /// loading or that failed.
         ///
@@ -41835,6 +42071,8 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 profile: format!("profile-{account_id}"),
                 account_id: account_id.to_string(),
                 region: region.to_string(),
+                // These cases are about region keying, not credentials.
+                authed: true,
             }
         }
 
