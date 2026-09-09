@@ -8077,6 +8077,17 @@ mod gui {
         zone_list_errors: HashMap<String, String>,
         zone_list_failures: HashMap<String, Instant>,
         zone_col_widths: HashMap<usize, f32>,
+        /// Which column each resource table is sorted by, and which way.
+        ///
+        /// Per kind, because the five tables have nothing to do with each
+        /// other — sorting Load Balancers by State must not re-sort Target
+        /// Groups by whatever their third column happens to be. Absent means
+        /// the table's own default order (name, then the id that breaks a
+        /// tie), which is what it had before any of this existed.
+        ///
+        /// Session state, like the column widths beside it: a sort chosen a
+        /// month ago is not what should greet somebody.
+        resource_sorts: HashMap<ResourceKind, ResourceSort>,
         /// Which resource sub-tab was showing last frame, so entering one can
         /// be told from staying on it. `None` while the EC2 tab is showing, so
         /// coming back from it counts as entering.
@@ -8942,6 +8953,7 @@ mod gui {
                 zone_list_errors: HashMap::new(),
                 zone_list_failures: HashMap::new(),
                 zone_col_widths: HashMap::new(),
+                resource_sorts: HashMap::new(),
                 last_resource_tab: None,
                 // `features` is the local in `App::new`, the same one
                 // `instance_power_enabled` below is resolved from.
@@ -24757,12 +24769,18 @@ mod gui {
                     )
                 })
                 .collect();
+            // The default order first, and ALWAYS — the chosen column is
+            // then applied with a stable sort, so rows that tie on it keep
+            // this order instead of shuffling between frames.
             rows.sort_by(|a, b| {
                 a.name
                     .to_ascii_lowercase()
                     .cmp(&b.name.to_ascii_lowercase())
                     .then_with(|| a.account_id.cmp(&b.account_id))
             });
+            if let Some(sort) = self.resource_sort(ResourceKind::LoadBalancer) {
+                sort_resource_rows(&mut rows, sort, cmp_load_balancers);
+            }
             rows
         }
 
@@ -24839,6 +24857,8 @@ mod gui {
 
             let auto = lb_auto_widths(&rows);
             let overrides = self.lb_col_widths.clone();
+            let sort = self.resource_sort(ResourceKind::LoadBalancer);
+            let mut pending_sort: Option<usize> = None;
             let mut pending_detail: Option<LoadBalancer> = None;
             let mut pending_width: Option<(usize, f32)> = None;
 
@@ -24862,53 +24882,14 @@ mod gui {
                         .min_col_width(0.0)
                         .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
                         .show(ui, |ui| {
-                            for (idx, label) in LB_COLUMN_LABELS.iter().enumerate() {
-                                let width = cw(idx);
-                                let cell = ui.allocate_ui_with_layout(
-                                    egui::vec2(width, TG_ROW_H),
-                                    egui::Layout::left_to_right(egui::Align::Center),
-                                    |ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(*label).strong(),
-                                            )
-                                            .wrap_mode(egui::TextWrapMode::Truncate),
-                                        )
-                                    },
-                                );
-                                let resp = cell.response;
-                                let drag_id = ui.id().with(("lb_col_resize", idx));
-                                let near_right = ui.input(|i| {
-                                    i.pointer.hover_pos().is_some_and(|pos| {
-                                        resp.rect.contains(pos)
-                                            && pos.x > resp.rect.right() - 8.0
-                                    })
-                                });
-                                if near_right || ui.ctx().is_being_dragged(drag_id) {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
-                                    let x = resp.rect.right();
-                                    ui.painter().line_segment(
-                                        [
-                                            egui::pos2(x, resp.rect.top()),
-                                            egui::pos2(x, resp.rect.bottom()),
-                                        ],
-                                        egui::Stroke::new(2.0, ui.visuals().text_color()),
-                                    );
-                                    let drag = ui.interact(
-                                        egui::Rect::from_min_size(
-                                            resp.rect.right_top() - egui::vec2(8.0, 0.0),
-                                            egui::vec2(16.0, resp.rect.height()),
-                                        ),
-                                        drag_id,
-                                        egui::Sense::drag(),
-                                    );
-                                    if drag.dragged() {
-                                        pending_width = Some((
-                                            idx,
-                                            (width + drag.drag_delta().x).max(TG_COL_MIN_W),
-                                        ));
-                                    }
-                                }
+                            let labels: Vec<String> =
+                                LB_COLUMN_LABELS.iter().map(|l| (*l).to_string()).collect();
+                            let (clicked, resized) = render_resource_header(
+                                ui, "lb_col_resize", &labels, None, sort, &cw,
+                            );
+                            pending_sort = clicked;
+                            if resized.is_some() {
+                                pending_width = resized;
                             }
                             ui.end_row();
 
@@ -25005,6 +24986,9 @@ mod gui {
                     ui.add_space(20.0);
                 });
 
+            if let Some(column) = pending_sort {
+                self.toggle_resource_sort(ResourceKind::LoadBalancer, column);
+            }
             if let Some((idx, w)) = pending_width {
                 self.lb_col_widths.insert(idx, w);
             }
@@ -25322,6 +25306,33 @@ mod gui {
 
 
 
+
+        /// How one resource table is sorted, if the user has picked.
+        fn resource_sort(&self, kind: ResourceKind) -> Option<ResourceSort> {
+            self.resource_sorts.get(&kind).copied()
+        }
+
+        /// A header was clicked.
+        ///
+        /// Clicking the column already sorted flips the direction; clicking a
+        /// different one starts it ascending. **Exactly what the EC2 header
+        /// does** — including that a third click does not clear back to the
+        /// default order, because inventing a variation on the table beside it
+        /// is how two tables in one app come to behave differently.
+        fn toggle_resource_sort(&mut self, kind: ResourceKind, column: usize) {
+            let next = match self.resource_sorts.get(&kind) {
+                Some(current) if current.column == column => ResourceSort {
+                    column,
+                    direction: current.direction.toggle(),
+                },
+                _ => ResourceSort {
+                    column,
+                    direction: SortDirection::Ascending,
+                },
+            };
+            self.resource_sorts.insert(kind, next);
+        }
+
         /// Start a list fetch for any account whose hosted zones are missing
         /// or stale.
         ///
@@ -25420,6 +25431,9 @@ mod gui {
                     // pair swap places between visits.
                     .then_with(|| a.id.cmp(&b.id))
             });
+            if let Some(sort) = self.resource_sort(ResourceKind::HostedZone) {
+                sort_resource_rows(&mut rows, sort, cmp_hosted_zones);
+            }
             rows
         }
 
@@ -25496,6 +25510,8 @@ mod gui {
 
             let auto = zone_auto_widths(&rows);
             let overrides = self.zone_col_widths.clone();
+            let sort = self.resource_sort(ResourceKind::HostedZone);
+            let mut pending_sort: Option<usize> = None;
             let mut pending_detail: Option<HostedZone> = None;
             let mut pending_width: Option<(usize, f32)> = None;
 
@@ -25513,53 +25529,14 @@ mod gui {
                         .min_col_width(0.0)
                         .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
                         .show(ui, |ui| {
-                            for (idx, label) in ZONE_COLUMN_LABELS.iter().enumerate() {
-                                let width = cw(idx);
-                                let cell = ui.allocate_ui_with_layout(
-                                    egui::vec2(width, TG_ROW_H),
-                                    egui::Layout::left_to_right(egui::Align::Center),
-                                    |ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(*label).strong(),
-                                            )
-                                            .wrap_mode(egui::TextWrapMode::Truncate),
-                                        )
-                                    },
-                                );
-                                let resp = cell.response;
-                                let drag_id = ui.id().with(("zone_col_resize", idx));
-                                let near_right = ui.input(|i| {
-                                    i.pointer.hover_pos().is_some_and(|pos| {
-                                        resp.rect.contains(pos)
-                                            && pos.x > resp.rect.right() - 8.0
-                                    })
-                                });
-                                if near_right || ui.ctx().is_being_dragged(drag_id) {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
-                                    let x = resp.rect.right();
-                                    ui.painter().line_segment(
-                                        [
-                                            egui::pos2(x, resp.rect.top()),
-                                            egui::pos2(x, resp.rect.bottom()),
-                                        ],
-                                        egui::Stroke::new(2.0, ui.visuals().text_color()),
-                                    );
-                                    let drag = ui.interact(
-                                        egui::Rect::from_min_size(
-                                            resp.rect.right_top() - egui::vec2(8.0, 0.0),
-                                            egui::vec2(16.0, resp.rect.height()),
-                                        ),
-                                        drag_id,
-                                        egui::Sense::drag(),
-                                    );
-                                    if drag.dragged() {
-                                        pending_width = Some((
-                                            idx,
-                                            (width + drag.drag_delta().x).max(TG_COL_MIN_W),
-                                        ));
-                                    }
-                                }
+                            let labels: Vec<String> =
+                                ZONE_COLUMN_LABELS.iter().map(|l| (*l).to_string()).collect();
+                            let (clicked, resized) = render_resource_header(
+                                ui, "zone_col_resize", &labels, None, sort, &cw,
+                            );
+                            pending_sort = clicked;
+                            if resized.is_some() {
+                                pending_width = resized;
                             }
                             ui.end_row();
 
@@ -25633,6 +25610,9 @@ mod gui {
                     ui.add_space(20.0);
                 });
 
+            if let Some(column) = pending_sort {
+                self.toggle_resource_sort(ResourceKind::HostedZone, column);
+            }
             if let Some((idx, w)) = pending_width {
                 self.zone_col_widths.insert(idx, w);
             }
@@ -25999,12 +25979,17 @@ mod gui {
                     )
                 })
                 .collect();
+            // The default order first, and ALWAYS — see
+            // `filtered_load_balancers`.
             rows.sort_by(|a, b| {
                 a.name
                     .to_ascii_lowercase()
                     .cmp(&b.name.to_ascii_lowercase())
                     .then_with(|| a.account_id.cmp(&b.account_id))
             });
+            if let Some(sort) = self.resource_sort(ResourceKind::Bucket) {
+                sort_resource_rows(&mut rows, sort, cmp_buckets);
+            }
             rows
         }
 
@@ -26078,6 +26063,8 @@ mod gui {
 
             let auto = bucket_auto_widths(&rows);
             let overrides = self.bucket_col_widths.clone();
+            let sort = self.resource_sort(ResourceKind::Bucket);
+            let mut pending_sort: Option<usize> = None;
             let mut pending_detail: Option<Bucket> = None;
             let mut pending_width: Option<(usize, f32)> = None;
 
@@ -26095,53 +26082,14 @@ mod gui {
                         .min_col_width(0.0)
                         .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
                         .show(ui, |ui| {
-                            for (idx, label) in BUCKET_COLUMN_LABELS.iter().enumerate() {
-                                let width = cw(idx);
-                                let cell = ui.allocate_ui_with_layout(
-                                    egui::vec2(width, TG_ROW_H),
-                                    egui::Layout::left_to_right(egui::Align::Center),
-                                    |ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(*label).strong(),
-                                            )
-                                            .wrap_mode(egui::TextWrapMode::Truncate),
-                                        )
-                                    },
-                                );
-                                let resp = cell.response;
-                                let drag_id = ui.id().with(("bucket_col_resize", idx));
-                                let near_right = ui.input(|i| {
-                                    i.pointer.hover_pos().is_some_and(|pos| {
-                                        resp.rect.contains(pos)
-                                            && pos.x > resp.rect.right() - 8.0
-                                    })
-                                });
-                                if near_right || ui.ctx().is_being_dragged(drag_id) {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
-                                    let x = resp.rect.right();
-                                    ui.painter().line_segment(
-                                        [
-                                            egui::pos2(x, resp.rect.top()),
-                                            egui::pos2(x, resp.rect.bottom()),
-                                        ],
-                                        egui::Stroke::new(2.0, ui.visuals().text_color()),
-                                    );
-                                    let drag = ui.interact(
-                                        egui::Rect::from_min_size(
-                                            resp.rect.right_top() - egui::vec2(8.0, 0.0),
-                                            egui::vec2(16.0, resp.rect.height()),
-                                        ),
-                                        drag_id,
-                                        egui::Sense::drag(),
-                                    );
-                                    if drag.dragged() {
-                                        pending_width = Some((
-                                            idx,
-                                            (width + drag.drag_delta().x).max(TG_COL_MIN_W),
-                                        ));
-                                    }
-                                }
+                            let labels: Vec<String> =
+                                BUCKET_COLUMN_LABELS.iter().map(|l| (*l).to_string()).collect();
+                            let (clicked, resized) = render_resource_header(
+                                ui, "bucket_col_resize", &labels, None, sort, &cw,
+                            );
+                            pending_sort = clicked;
+                            if resized.is_some() {
+                                pending_width = resized;
                             }
                             ui.end_row();
 
@@ -26203,6 +26151,9 @@ mod gui {
                     ui.add_space(20.0);
                 });
 
+            if let Some(column) = pending_sort {
+                self.toggle_resource_sort(ResourceKind::Bucket, column);
+            }
             if let Some((idx, w)) = pending_width {
                 self.bucket_col_widths.insert(idx, w);
             }
@@ -26413,12 +26364,17 @@ mod gui {
                     )
                 })
                 .collect();
+            // The default order first, and ALWAYS — see
+            // `filtered_load_balancers`.
             rows.sort_by(|a, b| {
                 a.name
                     .to_ascii_lowercase()
                     .cmp(&b.name.to_ascii_lowercase())
                     .then_with(|| a.account_id.cmp(&b.account_id))
             });
+            if let Some(sort) = self.resource_sort(ResourceKind::Asg) {
+                sort_resource_rows(&mut rows, sort, cmp_asgs);
+            }
             rows
         }
 
@@ -26495,6 +26451,8 @@ mod gui {
 
             let auto = asg_auto_widths(&rows);
             let overrides = self.asg_col_widths.clone();
+            let sort = self.resource_sort(ResourceKind::Asg);
+            let mut pending_sort: Option<usize> = None;
             let mut pending_detail: Option<AutoScalingGroup> = None;
             let mut pending_capacity: Option<AutoScalingGroup> = None;
             let mut pending_width: Option<(usize, f32)> = None;
@@ -26513,53 +26471,14 @@ mod gui {
                         .min_col_width(0.0)
                         .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
                         .show(ui, |ui| {
-                            for (idx, label) in ASG_COLUMN_LABELS.iter().enumerate() {
-                                let width = cw(idx);
-                                let cell = ui.allocate_ui_with_layout(
-                                    egui::vec2(width, TG_ROW_H),
-                                    egui::Layout::left_to_right(egui::Align::Center),
-                                    |ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(*label).strong(),
-                                            )
-                                            .wrap_mode(egui::TextWrapMode::Truncate),
-                                        )
-                                    },
-                                );
-                                let resp = cell.response;
-                                let drag_id = ui.id().with(("asg_col_resize", idx));
-                                let near_right = ui.input(|i| {
-                                    i.pointer.hover_pos().is_some_and(|pos| {
-                                        resp.rect.contains(pos)
-                                            && pos.x > resp.rect.right() - 8.0
-                                    })
-                                });
-                                if near_right || ui.ctx().is_being_dragged(drag_id) {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
-                                    let x = resp.rect.right();
-                                    ui.painter().line_segment(
-                                        [
-                                            egui::pos2(x, resp.rect.top()),
-                                            egui::pos2(x, resp.rect.bottom()),
-                                        ],
-                                        egui::Stroke::new(2.0, ui.visuals().text_color()),
-                                    );
-                                    let drag = ui.interact(
-                                        egui::Rect::from_min_size(
-                                            resp.rect.right_top() - egui::vec2(8.0, 0.0),
-                                            egui::vec2(16.0, resp.rect.height()),
-                                        ),
-                                        drag_id,
-                                        egui::Sense::drag(),
-                                    );
-                                    if drag.dragged() {
-                                        pending_width = Some((
-                                            idx,
-                                            (width + drag.drag_delta().x).max(TG_COL_MIN_W),
-                                        ));
-                                    }
-                                }
+                            let labels: Vec<String> =
+                                ASG_COLUMN_LABELS.iter().map(|l| (*l).to_string()).collect();
+                            let (clicked, resized) = render_resource_header(
+                                ui, "asg_col_resize", &labels, None, sort, &cw,
+                            );
+                            pending_sort = clicked;
+                            if resized.is_some() {
+                                pending_width = resized;
                             }
                             ui.end_row();
 
@@ -26640,6 +26559,9 @@ mod gui {
                     ui.add_space(20.0);
                 });
 
+            if let Some(column) = pending_sort {
+                self.toggle_resource_sort(ResourceKind::Asg, column);
+            }
             if let Some((idx, w)) = pending_width {
                 self.asg_col_widths.insert(idx, w);
             }
@@ -27231,12 +27153,24 @@ mod gui {
                 })
                 .cloned()
                 .collect();
+            // The default order first, and ALWAYS — the chosen column is
+            // then applied with a stable sort, so rows that tie on it keep
+            // this order instead of shuffling between frames.
             rows.sort_by(|a, b| {
                 a.name
                     .to_ascii_lowercase()
                     .cmp(&b.name.to_ascii_lowercase())
                     .then_with(|| a.account_id.cmp(&b.account_id))
             });
+            if let Some(sort) = self.resource_sort(ResourceKind::TargetGroup) {
+                // The only comparator needing more than the row itself: a
+                // group's Healthy/Total lives in `tg_health`, filled lazily by
+                // its own calls, not on the `TargetGroup`.
+                let health = &self.tg_health;
+                sort_resource_rows(&mut rows, sort, |a, b, column| {
+                    cmp_target_groups(a, b, column, health)
+                });
+            }
             rows
         }
 
@@ -27398,6 +27332,8 @@ mod gui {
             let health = self.tg_health.clone();
             let overrides = self.tg_col_widths.clone();
             let mut pending_detail: Option<TargetGroup> = None;
+            let sort = self.resource_sort(ResourceKind::TargetGroup);
+            let mut pending_sort: Option<usize> = None;
             let mut pending_width: Option<(usize, f32)> = None;
 
             // See the load balancer table: solid so it is visible when it
@@ -27416,77 +27352,35 @@ mod gui {
                         .min_col_width(0.0)
                         .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
                         .show(ui, |ui| {
-                            for (idx, label) in TG_COLUMN_LABELS.iter().enumerate() {
-                                let width = cw(idx);
-                                let text = if idx == TG_HEALTH_COL {
-                                    health_header.clone()
-                                } else {
-                                    (*label).to_string()
-                                };
-                                // Left-aligned, like the cells beneath it, and
-                                // NOT `add_sized`, which centres its widget in
-                                // the space it allocates. That mismatch is what
-                                // was left after the columns themselves were
-                                // fixed: every header floated to the middle of
-                                // its column while its values sat at the left
-                                // edge, so a wide column looked misaligned even
-                                // though its edges were exact. The allocated
-                                // rect is still the full cell, which is what
-                                // the drag handle below measures against.
-                                let cell = ui.allocate_ui_with_layout(
-                                    egui::vec2(width, TG_ROW_H),
-                                    egui::Layout::left_to_right(egui::Align::Center),
-                                    |ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(text).strong(),
-                                            )
-                                            .wrap_mode(egui::TextWrapMode::Truncate),
-                                        )
-                                    },
-                                );
-                                let resp = cell.response;
-                                if idx == TG_HEALTH_COL {
-                                    if let Some(hover) = &health_hover {
-                                        resp.clone().on_hover_text(hover.clone());
+                            // The health column's own label changes when
+                            // the column is switched off for an account, so
+                            // the labels are built rather than taken from the
+                            // constant — and its hover explains why.
+                            let labels: Vec<String> = TG_COLUMN_LABELS
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, label)| {
+                                    if idx == TG_HEALTH_COL {
+                                        health_header.clone()
+                                    } else {
+                                        (*label).to_string()
                                     }
-                                }
-
-                                // Drag the right edge to resize — the same
-                                // handle the EC2 table has, and the reason the
-                                // fixed-width compromise is no longer needed.
-                                let drag_id = ui.id().with(("tg_col_resize", idx));
-                                let near_right = ui.input(|i| {
-                                    i.pointer.hover_pos().is_some_and(|pos| {
-                                        resp.rect.contains(pos)
-                                            && pos.x > resp.rect.right() - 8.0
-                                    })
-                                });
-                                if near_right || ui.ctx().is_being_dragged(drag_id) {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
-                                    let x = resp.rect.right();
-                                    ui.painter().line_segment(
-                                        [
-                                            egui::pos2(x, resp.rect.top()),
-                                            egui::pos2(x, resp.rect.bottom()),
-                                        ],
-                                        egui::Stroke::new(2.0, ui.visuals().text_color()),
-                                    );
-                                    let drag = ui.interact(
-                                        egui::Rect::from_min_size(
-                                            resp.rect.right_top() - egui::vec2(8.0, 0.0),
-                                            egui::vec2(16.0, resp.rect.height()),
-                                        ),
-                                        drag_id,
-                                        egui::Sense::drag(),
-                                    );
-                                    if drag.dragged() {
-                                        pending_width = Some((
-                                            idx,
-                                            (width + drag.drag_delta().x).max(TG_COL_MIN_W),
-                                        ));
-                                    }
-                                }
+                                })
+                                .collect();
+                            let hover = health_hover
+                                .clone()
+                                .map(|text| (TG_HEALTH_COL, text));
+                            let (clicked, resized) = render_resource_header(
+                                ui,
+                                "tg_col_resize",
+                                &labels,
+                                hover,
+                                sort,
+                                &cw,
+                            );
+                            pending_sort = clicked;
+                            if resized.is_some() {
+                                pending_width = resized;
                             }
                             ui.end_row();
 
@@ -27616,6 +27510,9 @@ mod gui {
                     ui.add_space(20.0);
                 });
 
+            if let Some(column) = pending_sort {
+                self.toggle_resource_sort(ResourceKind::TargetGroup, column);
+            }
             if let Some((idx, w)) = pending_width {
                 self.tg_col_widths.insert(idx, w);
             }
@@ -37648,6 +37545,295 @@ mod gui {
 
 
 
+
+    /// One resource table's sort: which column, and which way.
+    ///
+    /// The column is an **index into that kind's `*_COLUMN_LABELS`**, which is
+    /// already how `*_col_widths` is keyed — one addressing scheme for the two
+    /// things a header cell owns, rather than a second enum per table.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct ResourceSort {
+        column: usize,
+        direction: SortDirection,
+    }
+
+    /// Draw one resource table's header row.
+    ///
+    /// **Shared by all five tables**, and that is the point: this is the sort
+    /// arrow, the click-to-sort, the pointing-hand cursor and the
+    /// drag-to-resize handle, and five copies of it is five chances for one
+    /// table to sort the other way on the first click or to lose its resize
+    /// handle in a later edit. It replaced five near-identical blocks.
+    ///
+    /// Returns `(column clicked to sort, column resized and its new width)`.
+    /// Neither is applied here — the caller owns `self` and this runs inside a
+    /// `Grid` closure that has already borrowed it.
+    fn render_resource_header(
+        ui: &mut egui::Ui,
+        salt: &'static str,
+        labels: &[String],
+        hover: Option<(usize, String)>,
+        sort: Option<ResourceSort>,
+        width_of: &dyn Fn(usize) -> f32,
+    ) -> (Option<usize>, Option<(usize, f32)>) {
+        let mut clicked: Option<usize> = None;
+        let mut resized: Option<(usize, f32)> = None;
+
+        for (idx, label) in labels.iter().enumerate() {
+            let width = width_of(idx);
+            // The arrow is ASCII (` ^` / ` v`), taken from the EC2 table's own
+            // `SortDirection::arrow`. egui's default font carries nothing from
+            // Unicode's Arrows block, and this file has shipped an empty box
+            // three separate times for forgetting that.
+            let arrow = match sort {
+                Some(s) if s.column == idx => s.direction.arrow(),
+                _ => "",
+            };
+
+            // Left-aligned, like the cells beneath it, and NOT `add_sized`,
+            // which centres its widget in the space it allocates. That
+            // mismatch is what was left after the columns themselves were
+            // fixed: every header floated to the middle of its column while
+            // its values sat at the left edge, so a wide column looked
+            // misaligned even though its edges were exact. The allocated rect
+            // is still the full cell, which is what the drag handle measures
+            // against.
+            let cell = ui.allocate_ui_with_layout(
+                egui::vec2(width, TG_ROW_H),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("{label}{arrow}")).strong(),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Truncate),
+                    )
+                },
+            );
+            let resp = cell.response;
+            if let Some((col, text)) = &hover {
+                if *col == idx {
+                    resp.clone().on_hover_text(text.clone());
+                }
+            }
+
+            // Drag the right edge to resize — the same handle the EC2 table
+            // has, and the reason the fixed-width compromise is no longer
+            // needed.
+            let drag_id = ui.id().with((salt, idx));
+            let near_right = ui.input(|i| {
+                i.pointer
+                    .hover_pos()
+                    .is_some_and(|pos| resp.rect.contains(pos) && pos.x > resp.rect.right() - 8.0)
+            });
+            if near_right || ui.ctx().is_being_dragged(drag_id) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+                let x = resp.rect.right();
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(x, resp.rect.top()),
+                        egui::pos2(x, resp.rect.bottom()),
+                    ],
+                    egui::Stroke::new(2.0, ui.visuals().text_color()),
+                );
+                let drag = ui.interact(
+                    egui::Rect::from_min_size(
+                        resp.rect.right_top() - egui::vec2(8.0, 0.0),
+                        egui::vec2(16.0, resp.rect.height()),
+                    ),
+                    drag_id,
+                    egui::Sense::drag(),
+                );
+                if drag.dragged() {
+                    resized = Some((idx, (width + drag.drag_delta().x).max(TG_COL_MIN_W)));
+                }
+            }
+
+            // Sensed over the whole cell, not just the glyphs: the header is
+            // what the user aims at. Sorting is suppressed while the pointer
+            // is in the resize zone, or letting go of a drag would also
+            // re-sort the table under it — the EC2 header guards the same way.
+            let click = ui.interact(
+                resp.rect,
+                resp.id.with("resource_header"),
+                egui::Sense::click(),
+            );
+            if !near_right {
+                if click.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if click.clicked() {
+                    clicked = Some(idx);
+                }
+            }
+        }
+
+        (clicked, resized)
+    }
+
+    /// Case-insensitive, because these names drift in case the same way
+    /// `MMODAL_ENV` does — and a table where `Alpha-Assets` sorts above every
+    /// lowercase name has stopped reading alphabetically.
+    fn cmp_str(a: &str, b: &str) -> std::cmp::Ordering {
+        a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())
+    }
+
+    /// Like [`cmp_str`], with **`None` last in ascending order**.
+    ///
+    /// `Option`'s own `Ord` puts `None` first, which would lead every
+    /// ascending sort with a block of blank cells — the rows that say the
+    /// least, at the top.
+    fn cmp_opt_str(a: Option<&str>, b: Option<&str>) -> std::cmp::Ordering {
+        match (a, b) {
+            (Some(a), Some(b)) => cmp_str(a, b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    }
+
+    /// Apply one column's ordering to rows already in their default order.
+    ///
+    /// **`sort_by` is stable and that is load-bearing**: the caller sorts by
+    /// name (and account, or id) first, so rows that tie on the chosen column
+    /// keep that order rather than shuffling between frames. A table that
+    /// reorders its own ties on every repaint is unreadable, and it is the
+    /// kind of thing that only shows up on a real account.
+    fn sort_resource_rows<T>(
+        rows: &mut [T],
+        sort: ResourceSort,
+        compare: impl Fn(&T, &T, usize) -> std::cmp::Ordering,
+    ) {
+        rows.sort_by(|a, b| {
+            let ord = compare(a, b, sort.column);
+            match sort.direction {
+                SortDirection::Ascending => ord,
+                SortDirection::Descending => ord.reverse(),
+            }
+        });
+    }
+
+    /// Where a Healthy/Total cell sorts.
+    ///
+    /// Ascending is **worst first**, which is the direction somebody sorting
+    /// this column actually wants. Three tiers, so the states that are not a
+    /// ratio never interleave with the ones that are:
+    ///
+    /// - `0` — has targets, ordered by the healthy fraction. `0/3` before
+    ///   `2/3` before `3/3`.
+    /// - `1` — nothing registered. Empty is not broken, and putting `no
+    ///   targets` among the ratios would rank it as perfectly healthy or as
+    ///   completely broken depending on which way you divide by zero.
+    /// - `2` — no answer: not requested, in flight, refused or failed. None
+    ///   of those is a fact about the target group, so none of them sorts as
+    ///   though it were one.
+    fn tg_health_sort_key(cell: Option<&HealthCell>) -> (u8, f64) {
+        match cell {
+            Some(HealthCell::Known(s)) if s.total > 0 => {
+                (0, s.healthy as f64 / s.total as f64)
+            }
+            Some(HealthCell::Known(_)) => (1, 0.0),
+            _ => (2, 0.0),
+        }
+    }
+
+    fn cmp_health_key(a: (u8, f64), b: (u8, f64)) -> std::cmp::Ordering {
+        a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1))
+    }
+
+    /// Compare two target groups on one of `TG_COLUMN_LABELS`.
+    fn cmp_target_groups(
+        a: &TargetGroup,
+        b: &TargetGroup,
+        column: usize,
+        health: &HashMap<String, HealthCell>,
+    ) -> std::cmp::Ordering {
+        match column {
+            0 => cmp_str(&a.name, &b.name),
+            // By protocol then PORT AS A NUMBER. The cell reads `HTTP:80`, and
+            // sorting that as text puts `HTTP:8080` above `HTTP:9` — which is
+            // the one thing a reader would notice immediately and the one
+            // thing a lexical sort gets wrong here.
+            1 => cmp_opt_str(a.protocol.as_deref(), b.protocol.as_deref())
+                .then_with(|| a.port.cmp(&b.port)),
+            2 => cmp_health_key(
+                tg_health_sort_key(health.get(&a.arn)),
+                tg_health_sort_key(health.get(&b.arn)),
+            ),
+            3 => cmp_opt_str(
+                a.health_check.path.as_deref(),
+                b.health_check.path.as_deref(),
+            ),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+
+    /// Compare two load balancers on one of `LB_COLUMN_LABELS`.
+    fn cmp_load_balancers(a: &LoadBalancer, b: &LoadBalancer, column: usize) -> std::cmp::Ordering {
+        match column {
+            0 => cmp_str(&a.name, &b.name),
+            // On the LABEL, not the API's word: the column reads `ALB`/`NLB`,
+            // and a sort that ordered by `application`/`network` behind the
+            // scenes would look arbitrary to whoever clicked it.
+            1 => cmp_str(
+                &elb::load_balancer_kind_label(a),
+                &elb::load_balancer_kind_label(b),
+            ),
+            2 => cmp_opt_str(a.scheme.as_deref(), b.scheme.as_deref()),
+            3 => cmp_str(&a.state, &b.state),
+            4 => cmp_str(&a.dns_name, &b.dns_name),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+
+    /// Compare two auto scaling groups on one of `ASG_COLUMN_LABELS`.
+    fn cmp_asgs(a: &AutoScalingGroup, b: &AutoScalingGroup, column: usize) -> std::cmp::Ordering {
+        match column {
+            0 => cmp_str(&a.name, &b.name),
+            // Numerically. These are the columns where a lexical sort is
+            // silently wrong — `10` above `2` — and they are the whole reason
+            // somebody sorts this table.
+            1 => a.desired_capacity.cmp(&b.desired_capacity),
+            2 => a.min_size.cmp(&b.min_size),
+            3 => a.max_size.cmp(&b.max_size),
+            4 => {
+                let (x, y) = (
+                    asg::instance_summary(&a.instances),
+                    asg::instance_summary(&b.instances),
+                );
+                // Serving first, then held: ascending puts the groups holding
+                // nothing at the top, which is what somebody sorting this
+                // column is looking for.
+                x.serving.cmp(&y.serving).then_with(|| x.total.cmp(&y.total))
+            }
+            5 => cmp_str(&a.health_check_type, &b.health_check_type),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+
+    /// Compare two buckets on one of `BUCKET_COLUMN_LABELS`.
+    fn cmp_buckets(a: &Bucket, b: &Bucket, column: usize) -> std::cmp::Ordering {
+        match column {
+            0 => cmp_str(&a.name, &b.name),
+            // The RAW timestamp, not the rendered one. These are ISO-8601, so
+            // lexical order is chronological order; the rendered form is
+            // local-time prose and sorting that puts April above January.
+            1 => cmp_opt_str(a.created.as_deref(), b.created.as_deref()),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+
+    /// Compare two hosted zones on one of `ZONE_COLUMN_LABELS`.
+    fn cmp_hosted_zones(a: &HostedZone, b: &HostedZone, column: usize) -> std::cmp::Ordering {
+        match column {
+            0 => cmp_str(&a.name, &b.name),
+            1 => cmp_str(&route53::zone_kind_label(a), &route53::zone_kind_label(b)),
+            2 => a.record_count.cmp(&b.record_count),
+            3 => cmp_str(&a.id, &b.id),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+
     /// The Route 53 table's columns.
     ///
     /// Four. The comment and the managing service are searchable and in the
@@ -46392,6 +46578,390 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 comment: None,
                 linked_service: None,
                 account_id: "111122223333".to_string(),
+            }
+        }
+
+
+        fn sorted<T: Clone>(
+            rows: &[T],
+            column: usize,
+            direction: SortDirection,
+            compare: impl Fn(&T, &T, usize) -> std::cmp::Ordering,
+        ) -> Vec<T> {
+            let mut out = rows.to_vec();
+            sort_resource_rows(&mut out, ResourceSort { column, direction }, compare);
+            out
+        }
+
+        /// Clicking the sorted column flips it; clicking a different one
+        /// starts ascending. **Exactly what the EC2 header does** — inventing
+        /// a variation on the table beside it is how two tables in one app
+        /// come to behave differently.
+        #[test]
+        fn a_header_click_toggles_its_own_column_and_resets_another() {
+            // The rule is pure over the previous state, so it is exercised
+            // without an `App`: same shape as `toggle_resource_sort`'s body.
+            let step = |current: Option<ResourceSort>, column: usize| match current {
+                Some(c) if c.column == column => ResourceSort {
+                    column,
+                    direction: c.direction.toggle(),
+                },
+                _ => ResourceSort {
+                    column,
+                    direction: SortDirection::Ascending,
+                },
+            };
+            let first = step(None, 2);
+            assert_eq!(first.direction, SortDirection::Ascending);
+            let second = step(Some(first), 2);
+            assert_eq!(second.direction, SortDirection::Descending);
+            // A third click keeps toggling rather than clearing back to the
+            // default order, which is what the EC2 header does.
+            assert_eq!(step(Some(second), 2).direction, SortDirection::Ascending);
+            // A different column always starts ascending, whichever way the
+            // last one was pointing.
+            assert_eq!(step(Some(second), 0).column, 0);
+            assert_eq!(step(Some(second), 0).direction, SortDirection::Ascending);
+        }
+
+        /// The arrow is ASCII. egui's default font carries nothing from
+        /// Unicode's Arrows block, and this file has shipped an empty box
+        /// three separate times for forgetting that.
+        #[test]
+        fn the_sort_arrow_uses_glyphs_the_font_can_actually_draw() {
+            for arrow in [
+                SortDirection::Ascending.arrow(),
+                SortDirection::Descending.arrow(),
+            ] {
+                assert!(
+                    arrow.chars().all(|c| c.is_ascii()),
+                    "{arrow:?} must be ASCII"
+                );
+            }
+            assert_ne!(
+                SortDirection::Ascending.arrow(),
+                SortDirection::Descending.arrow()
+            );
+        }
+
+        /// **Ties keep the default order.** The caller sorts by name first and
+        /// `sort_by` is stable, so rows equal on the chosen column do not
+        /// shuffle between frames — a table that reorders its own ties on
+        /// every repaint is unreadable.
+        #[test]
+        fn rows_that_tie_on_the_sorted_column_keep_their_default_order() {
+            // Three zones with the same record count, already in name order.
+            let rows = vec![
+                zone_row("alpha.com", "Z1"),
+                zone_row("beta.com", "Z2"),
+                zone_row("gamma.com", "Z3"),
+            ];
+            let asc = sorted(&rows, 2, SortDirection::Ascending, cmp_hosted_zones);
+            assert_eq!(
+                asc.iter().map(|z| z.id.as_str()).collect::<Vec<_>>(),
+                vec!["Z1", "Z2", "Z3"]
+            );
+        }
+
+        /// **Numeric columns sort numerically.** This is the one a lexical
+        /// sort gets silently wrong — `10` above `2` — and these are the
+        /// columns somebody sorts the ASG table for.
+        #[test]
+        fn asg_capacity_columns_sort_as_numbers_not_as_text() {
+            let mk = |name: &str, desired: i64, min: i64, max: i64| AutoScalingGroup {
+                name: name.to_string(),
+                desired_capacity: desired,
+                min_size: min,
+                max_size: max,
+                ..Default::default()
+            };
+            let rows = vec![mk("a", 2, 2, 9), mk("b", 10, 10, 100), mk("c", 9, 1, 20)];
+            for (column, expected) in [
+                (1, vec!["a", "c", "b"]),  // desired 2, 9, 10
+                (2, vec!["c", "a", "b"]),  // min 1, 2, 10
+                (3, vec!["a", "c", "b"]),  // max 9, 20, 100
+            ] {
+                let asc = sorted(&rows, column, SortDirection::Ascending, cmp_asgs);
+                assert_eq!(
+                    asc.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+                    expected,
+                    "column {column} did not sort numerically"
+                );
+            }
+        }
+
+        /// Descending is the ascending order reversed **where no two rows
+        /// tie**, which is the only case where that sentence is meaningful —
+        /// see the test below for what ties do.
+        #[test]
+        fn descending_is_the_exact_reverse_when_nothing_ties() {
+            // TWO rows, because Type has only two values: with three, that
+            // column cannot avoid a tie and would be testing stability
+            // instead of direction.
+            let mut rows = vec![zone_row("beta.com", "Z2"), zone_row("alpha.com", "Z1")];
+            rows[0].private = true;
+            rows[0].record_count = 200;
+            rows[1].record_count = 100;
+
+            for column in 0..ZONE_COLUMN_LABELS.len() {
+                let mut asc = sorted(&rows, column, SortDirection::Ascending, cmp_hosted_zones);
+                let desc = sorted(&rows, column, SortDirection::Descending, cmp_hosted_zones);
+                asc.reverse();
+                assert_eq!(
+                    asc.iter().map(|z| z.id.as_str()).collect::<Vec<_>>(),
+                    desc.iter().map(|z| z.id.as_str()).collect::<Vec<_>>(),
+                    "column {column}"
+                );
+            }
+        }
+
+        /// **Ties keep the default order in BOTH directions**, which is what
+        /// a stable sort buys and is the behaviour to want: flipping the
+        /// arrow on a column where every row reads the same must not scramble
+        /// rows that are equal. Reversing them would make the second click on
+        /// a low-cardinality column — Type, Scheme, State — look like it
+        /// shuffled the table at random.
+        #[test]
+        fn flipping_the_direction_does_not_scramble_rows_that_tie() {
+            // Every zone is Public, so column 1 ties for all three.
+            let rows = vec![
+                zone_row("alpha.com", "Z1"),
+                zone_row("beta.com", "Z2"),
+                zone_row("gamma.com", "Z3"),
+            ];
+            for direction in [SortDirection::Ascending, SortDirection::Descending] {
+                let out = sorted(&rows, 1, direction, cmp_hosted_zones);
+                assert_eq!(
+                    out.iter().map(|z| z.id.as_str()).collect::<Vec<_>>(),
+                    vec!["Z1", "Z2", "Z3"],
+                    "{direction:?} must leave equal rows where they were"
+                );
+            }
+        }
+
+        /// Names sort case-insensitively. These drift in case the same way
+        /// `MMODAL_ENV` does, and a table where `Alpha-Assets` sorts above
+        /// every lowercase name has stopped reading alphabetically.
+        #[test]
+        fn names_sort_without_regard_to_case() {
+            let rows = vec![bucket_row("zulu-logs"), bucket_row("Alpha-Assets")];
+            let asc = sorted(&rows, 0, SortDirection::Ascending, cmp_buckets);
+            assert_eq!(
+                asc.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+                vec!["Alpha-Assets", "zulu-logs"]
+            );
+        }
+
+        /// **`None` sorts last in ascending order.** `Option`'s own `Ord`
+        /// puts it first, which would lead every ascending sort with a block
+        /// of blank cells — the rows that say the least, at the top.
+        #[test]
+        fn a_missing_value_sorts_last_rather_than_first() {
+            assert_eq!(cmp_opt_str(None, Some("a")), std::cmp::Ordering::Greater);
+            assert_eq!(cmp_opt_str(Some("a"), None), std::cmp::Ordering::Less);
+            assert_eq!(cmp_opt_str(None, None), std::cmp::Ordering::Equal);
+
+            let mut with_none = bucket_row("no-date");
+            with_none.created = None;
+            let rows = vec![with_none, bucket_row("has-date")];
+            let asc = sorted(&rows, 1, SortDirection::Ascending, cmp_buckets);
+            assert_eq!(asc[0].name, "has-date");
+        }
+
+        /// The Created column sorts on the RAW timestamp. These are ISO-8601,
+        /// so lexical order is chronological order; sorting the *rendered*
+        /// local-time prose would put April above January.
+        #[test]
+        fn buckets_sort_by_the_raw_timestamp_not_the_rendered_one() {
+            let mut older = bucket_row("older");
+            older.created = Some("2019-11-30T00:00:00+00:00".to_string());
+            let mut newer = bucket_row("newer");
+            newer.created = Some("2021-02-01T00:00:00+00:00".to_string());
+            let asc = sorted(
+                &[newer, older],
+                1,
+                SortDirection::Ascending,
+                cmp_buckets,
+            );
+            assert_eq!(asc[0].name, "older");
+        }
+
+        /// Protocol:Port sorts by protocol then **port as a number**. The cell
+        /// reads `HTTP:80`, and as text `HTTP:8080` sorts above `HTTP:9` —
+        /// which is the one thing a reader notices immediately.
+        #[test]
+        fn a_target_groups_port_sorts_as_a_number() {
+            let mk = |name: &str, proto: &str, port: u16| TargetGroup {
+                name: name.to_string(),
+                protocol: Some(proto.to_string()),
+                port: Some(port),
+                ..Default::default()
+            };
+            let rows = vec![
+                mk("a", "HTTP", 8080),
+                mk("b", "HTTP", 9),
+                mk("c", "HTTP", 80),
+            ];
+            let health = HashMap::new();
+            let asc = sorted(&rows, 1, SortDirection::Ascending, |a, b, c| {
+                cmp_target_groups(a, b, c, &health)
+            });
+            assert_eq!(
+                asc.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+                vec!["b", "c", "a"]
+            );
+        }
+
+        /// **The health column sorts worst-first in three tiers**, so the
+        /// states that are not a ratio never interleave with the ones that
+        /// are: broken groups, then empty ones, then the ones that have not
+        /// answered. `no targets` is not the worst thing in the account and
+        /// `not permitted` is not a fact about the target group at all.
+        #[test]
+        fn the_health_column_sorts_worst_first_and_keeps_non_answers_out_of_the_ratios() {
+            let mk = |arn: &str| TargetGroup {
+                arn: arn.to_string(),
+                name: arn.to_string(),
+                ..Default::default()
+            };
+            let mut health = HashMap::new();
+            health.insert(
+                "full".to_string(),
+                HealthCell::Known(HealthSummary {
+                    healthy: 3,
+                    total: 3,
+                }),
+            );
+            health.insert(
+                "broken".to_string(),
+                HealthCell::Known(HealthSummary {
+                    healthy: 0,
+                    total: 3,
+                }),
+            );
+            health.insert(
+                "half".to_string(),
+                HealthCell::Known(HealthSummary {
+                    healthy: 1,
+                    total: 2,
+                }),
+            );
+            health.insert(
+                "empty".to_string(),
+                HealthCell::Known(HealthSummary {
+                    healthy: 0,
+                    total: 0,
+                }),
+            );
+            health.insert("denied".to_string(), HealthCell::Denied);
+            // "unasked" deliberately has no entry at all.
+
+            let rows: Vec<TargetGroup> = ["full", "broken", "half", "empty", "denied", "unasked"]
+                .iter()
+                .map(|a| mk(a))
+                .collect();
+            let asc = sorted(&rows, 2, SortDirection::Ascending, |a, b, c| {
+                cmp_target_groups(a, b, c, &health)
+            });
+            let order: Vec<&str> = asc.iter().map(|t| t.name.as_str()).collect();
+            assert_eq!(
+                order,
+                vec!["broken", "half", "full", "empty", "denied", "unasked"],
+                "worst ratios first, then empty, then the non-answers"
+            );
+        }
+
+        /// The Type column sorts on the LABEL the cell shows (`ALB`/`NLB`),
+        /// not on the API's word behind it — a sort ordering by
+        /// `application`/`network` would look arbitrary to whoever clicked it.
+        #[test]
+        fn load_balancers_sort_by_the_type_shown_not_the_api_spelling() {
+            let mk = |name: &str, kind: &str| LoadBalancer {
+                name: name.to_string(),
+                kind: kind.to_string(),
+                ..Default::default()
+            };
+            // By the API's words: application < gateway < network.
+            // By the labels shown: ALB < GWLB < NLB. Same here, so pick a
+            // pair where they disagree: `network` (NLB) vs `gateway` (GWLB).
+            let rows = vec![mk("net", "network"), mk("gw", "gateway")];
+            let asc = sorted(&rows, 1, SortDirection::Ascending, cmp_load_balancers);
+            assert_eq!(
+                asc.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+                vec!["gw", "net"],
+                "GWLB before NLB"
+            );
+        }
+
+        /// **Every column of every table is sortable**, and a column index
+        /// past the end is `Equal` rather than a panic — the index comes from
+        /// a header loop over that kind's own labels, but a table gaining a
+        /// column without gaining a comparator arm must degrade rather than
+        /// crash.
+        #[test]
+        fn every_resource_column_has_a_comparator_and_an_unknown_one_is_inert() {
+            let health = HashMap::new();
+            let tg = (TargetGroup::default(), TargetGroup::default());
+            for column in 0..TG_COLUMN_LABELS.len() {
+                cmp_target_groups(&tg.0, &tg.1, column, &health);
+            }
+            assert_eq!(
+                cmp_target_groups(&tg.0, &tg.1, 99, &health),
+                std::cmp::Ordering::Equal
+            );
+
+            let lb = (LoadBalancer::default(), LoadBalancer::default());
+            for column in 0..LB_COLUMN_LABELS.len() {
+                cmp_load_balancers(&lb.0, &lb.1, column);
+            }
+            assert_eq!(cmp_load_balancers(&lb.0, &lb.1, 99), std::cmp::Ordering::Equal);
+
+            let g = (AutoScalingGroup::default(), AutoScalingGroup::default());
+            for column in 0..ASG_COLUMN_LABELS.len() {
+                cmp_asgs(&g.0, &g.1, column);
+            }
+            assert_eq!(cmp_asgs(&g.0, &g.1, 99), std::cmp::Ordering::Equal);
+
+            let b = (Bucket::default(), Bucket::default());
+            for column in 0..BUCKET_COLUMN_LABELS.len() {
+                cmp_buckets(&b.0, &b.1, column);
+            }
+            assert_eq!(cmp_buckets(&b.0, &b.1, 99), std::cmp::Ordering::Equal);
+
+            let z = (HostedZone::default(), HostedZone::default());
+            for column in 0..ZONE_COLUMN_LABELS.len() {
+                cmp_hosted_zones(&z.0, &z.1, column);
+            }
+            assert_eq!(cmp_hosted_zones(&z.0, &z.1, 99), std::cmp::Ordering::Equal);
+        }
+
+        /// **One header renderer serves all five tables.** Five copies of that
+        /// loop is five chances for one table to sort the other way on the
+        /// first click, or to lose its resize handle in a later edit — which
+        /// is exactly how the five copies it replaced came to exist.
+        #[test]
+        fn every_resource_table_draws_its_header_through_the_shared_renderer() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            assert_eq!(
+                src.matches("render_resource_header(").count(),
+                // One definition, five call sites.
+                6,
+                "every resource table must draw its header through the shared renderer"
+            );
+            for func in [
+                "fn render_target_groups",
+                "fn render_load_balancers",
+                "fn render_asgs",
+                "fn render_buckets",
+                "fn render_hosted_zones",
+            ] {
+                let start = src.find(func).unwrap_or_else(|| panic!("{func}"));
+                let body = &src[start..start + 12000];
+                assert!(
+                    body.contains("render_resource_header("),
+                    "{func} must use the shared header renderer"
+                );
             }
         }
 

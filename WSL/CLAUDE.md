@@ -42,7 +42,7 @@ cargo build --features gui
 
 # Run tests
 cargo test                  # lib + CLI tests
-cargo test --features gui   # all tests including GUI (466 GUI tests)
+cargo test --features gui   # all tests including GUI (481 GUI tests)
 
 # Clippy
 cargo clippy --features gui
@@ -62,7 +62,7 @@ stale for months before phase 1 (it read 356 tests / 21 warnings, both months
 out of date; the measured baseline immediately before phase 1 was 1019 tests /
 23 warnings):
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 1217 tests pass, 0 fail (748 lib + 3 CLI + 466 GUI)
+- `cargo test --features gui` — 1232 tests pass, 0 fail (748 lib + 3 CLI + 481 GUI)
 - `cargo clippy --features gui` — no errors; 23 pre-existing style warnings.
   **That is a count of `^warning` lines, which is how the pre-branch baseline
   was measured and why the two are comparable — it is 21 distinct lints (6 lib
@@ -2595,6 +2595,73 @@ different reason (the loading set).
   `describe-tags`. Reading it flat yields no tags on every single zone, and
   `zone_tags_are_read_from_their_nested_home` asserts the flat shape does
   *not* accidentally work, or the nesting would be untested.
+
+
+#### Click a header to sort — all five tables
+
+Every resource table sorts by any of its columns, ascending or descending,
+by clicking the header. **Exactly what the EC2 table does**, including that
+a third click keeps toggling rather than clearing back to the default order:
+inventing a variation on the table beside it is how two tables in one app
+come to behave differently.
+
+- **One `render_resource_header` serves all five.** It owns the sort arrow,
+  the click, the pointing-hand cursor and the drag-to-resize handle. It
+  replaced five near-identical 45-line blocks, which is exactly the drift
+  risk it exists to remove — five copies is five chances for one table to
+  sort the other way on a first click, or to lose its resize handle in a
+  later edit. `every_resource_table_draws_its_header_through_the_shared_renderer`
+  pins the call count.
+- **Sorting is suppressed while the pointer is in the resize zone**, or
+  letting go of a column drag would also re-sort the table under it.
+- **The arrow is ASCII** (` ^` / ` v`), taken from `SortDirection::arrow`,
+  which the EC2 header already used. egui's default font carries nothing
+  from Unicode's Arrows block, and this file has shipped an empty box three
+  separate times for forgetting that;
+  `the_sort_arrow_uses_glyphs_the_font_can_actually_draw` is the cheap guard.
+- **`ResourceSort.column` is an index into that kind's `*_COLUMN_LABELS`**,
+  which is already how `*_col_widths` is keyed — one addressing scheme for
+  the two things a header cell owns, rather than a second enum per table. A
+  column index past the end compares `Equal` rather than panicking, so a
+  table that gains a column without gaining a comparator arm degrades.
+- **`resource_sorts` is keyed per `ResourceKind`.** The five tables have
+  nothing to do with each other, and sorting Load Balancers by State must
+  not re-sort Target Groups by whatever their third column happens to be.
+  Session state, like the column widths beside it.
+- **The default order is applied FIRST and always**, then the chosen column
+  on top of it with `sort_by`, which is stable. That is load-bearing: rows
+  tying on the chosen column keep the name order instead of shuffling
+  between frames, and a table that reorders its own ties on every repaint is
+  unreadable. It also means **flipping the direction does not scramble ties**
+  — the second click on a low-cardinality column (Type, Scheme, State) must
+  not look like it shuffled the table at random.
+- **Numeric columns sort as numbers.** ASG's Desired/Min/Max/Instances and
+  Route 53's Records; the lexical `10` above `2` is silently wrong and these
+  are the columns somebody sorts those tables for. So is a target group's
+  **port**: the cell reads `HTTP:80` and as text `HTTP:8080` sorts above
+  `HTTP:9`, so `cmp_target_groups` compares protocol then port as a number.
+- **S3's Created sorts on the RAW timestamp**, not the rendered one. The raw
+  values are ISO-8601 so lexical order is chronological order; sorting the
+  local-time prose the cell shows would put April above January.
+- **A column sorts by what the CELL shows, where the two differ.** Load
+  Balancer Type orders by `ALB`/`NLB`/`GWLB`, not by the API's
+  `application`/`network`/`gateway` behind it — a sort ordering by words
+  that are not on screen looks arbitrary to whoever clicked it.
+- **Names compare case-insensitively**, since they drift in case the same
+  way `MMODAL_ENV` does and a table where `Alpha-Assets` sorts above every
+  lowercase name has stopped reading alphabetically.
+- **`None` sorts LAST in ascending order** (`cmp_opt_str`). `Option`'s own
+  `Ord` puts it first, which would lead every ascending sort with a block of
+  blank cells — the rows that say the least, at the top.
+- **The Healthy/Total column sorts worst-first in three tiers**
+  (`tg_health_sort_key`), so the states that are not a ratio never
+  interleave with the ones that are: groups with targets ordered by the
+  healthy fraction, then `no targets`, then everything with no answer
+  (not requested, in flight, denied, failed). `no targets` is not the worst
+  thing in the account, and `not permitted` is not a fact about the target
+  group at all. It is also the one comparator needing more than the row
+  itself — a group's health lives in `tg_health`, filled lazily by its own
+  calls.
 
 - **`filter::text_matches` is the shared search engine.** The
   include/exclude matching was lifted out of `apply_filters` so every sub-tab
