@@ -205,32 +205,37 @@ impl AppConfig {
     pub fn load() -> Result<Self> {
         let Some(path) = Self::config_path() else {
             let mut cfg = Self::default();
-            let json_accounts = accounts::load_accounts();
-            if !json_accounts.is_empty() {
-                cfg.profiles = json_accounts;
-            }
+            cfg.apply_bundled_accounts();
             return Ok(cfg);
         };
 
         if !path.exists() {
             let mut cfg = Self::default();
-            let json_accounts = accounts::load_accounts();
-            if !json_accounts.is_empty() {
-                cfg.profiles = json_accounts;
-            }
+            cfg.apply_bundled_accounts();
             return Ok(cfg);
         }
 
         let raw = fs::read_to_string(path)?;
         let mut cfg = Self::parse(&raw);
-
-        // accounts.json takes precedence over profile_name.* entries in config.ini
-        let json_accounts = accounts::load_accounts();
-        if !json_accounts.is_empty() {
-            cfg.profiles = json_accounts;
-        }
+        cfg.apply_bundled_accounts();
 
         Ok(cfg)
+    }
+
+    /// Union the compiled-in `accounts.json` list with whatever `parse` read
+    /// out of `config.ini`.
+    ///
+    /// This used to be `cfg.profiles = accounts::load_accounts()`, which read
+    /// the user's own `profile_name.*` entries and then discarded them three
+    /// lines later -- so an account added by hand disappeared at the next
+    /// launch. See `accounts::merge_profiles` for which side wins what.
+    fn apply_bundled_accounts(&mut self) {
+        let bundled = accounts::load_accounts();
+        self.profiles = accounts::merge_profiles(
+            bundled,
+            &self.profiles.clone(),
+            &self.profile_orders,
+        );
     }
 
     pub fn save(&self) -> Result<()> {
@@ -2091,6 +2096,39 @@ mod tests {
     fn an_unreadable_profile_order_is_dropped() {
         let cfg = AppConfig::parse("profile_order.111=abc\nprofile_order.222=\nprofile_order.=3\n");
         assert!(cfg.profile_orders.is_empty());
+    }
+
+    /// The regression this whole feature rests on: config.ini's own profile
+    /// entries used to be parsed and then thrown away by load(), so an account
+    /// a user added vanished at the next launch.
+    #[test]
+    fn a_user_added_account_survives_the_bundled_list() {
+        let cfg = AppConfig::parse(
+            "profile_name.999=Sandbox\n\
+             profile_account_id.999=999\n\
+             profile_region.999=eu-west-1\n",
+        );
+        assert_eq!(cfg.profiles.len(), 1, "parse should read the user's entry");
+
+        let bundled = vec![ProfileConfig {
+            profile_id: "111".to_string(),
+            display_name: "Dev".to_string(),
+            account_id: "111".to_string(),
+            region: Some("us-east-1".to_string()),
+            sort_order: Some(1),
+            color: None,
+        }];
+
+        let merged =
+            crate::accounts::merge_profiles(bundled, &cfg.profiles, &cfg.profile_orders);
+
+        assert_eq!(merged.len(), 2);
+        let sandbox = merged
+            .iter()
+            .find(|p| p.profile_id == "999")
+            .expect("the user's account must survive");
+        assert_eq!(sandbox.display_name, "Sandbox");
+        assert_eq!(sandbox.region.as_deref(), Some("eu-west-1"));
     }
 
     #[test]
