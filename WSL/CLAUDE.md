@@ -42,7 +42,7 @@ cargo build --features gui
 
 # Run tests
 cargo test                  # lib + CLI tests
-cargo test --features gui   # all tests including GUI (458 GUI tests)
+cargo test --features gui   # all tests including GUI (466 GUI tests)
 
 # Clippy
 cargo clippy --features gui
@@ -57,12 +57,12 @@ cargo clippy --features gui
 ## Build status
 
 As of 2026-09-09 (rustc 1.94.0), measured on `aws-resource-browser-phase1`
-after the Inventory resource sub-tabs reached phase 4 (S3) — this line was
+after the Inventory resource sub-tabs were finished (phase 5, Route 53) — this line was
 stale for months before phase 1 (it read 356 tests / 21 warnings, both months
 out of date; the measured baseline immediately before phase 1 was 1019 tests /
 23 warnings):
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 1188 tests pass, 0 fail (727 lib + 3 CLI + 458 GUI)
+- `cargo test --features gui` — 1217 tests pass, 0 fail (748 lib + 3 CLI + 466 GUI)
 - `cargo clippy --features gui` — no errors; 23 pre-existing style warnings.
   **That is a count of `^warning` lines, which is how the pre-branch baseline
   was measured and why the two are comparable — it is 21 distinct lints (6 lib
@@ -2171,14 +2171,19 @@ stays at four entries rather than growing to nine.
 capacity edit — see "Editing ASG capacity" below, including why it has no
 `allowed_users` gate when every other write in this app does.
 
-Phase 1 built the scaffolding and Target Groups; phase 2 added Load
-Balancers and changed no scaffolding at all, which is what the phasing was
-for. Phase 3 (ASG) moved exactly one thing — see "The shared fetch plumbing"
-below. Phase 4 (S3) is the first **global** service and the first user of
-`classify_absent`, both of which phase 1 built the scaffolding for. Route 53
-is the last, and is the same shape: a `parse_*`/`fetch_*` pair, a
-`render_resource_panel` arm and a `DetailSubject` variant. The spec is
+**All five resource types are built.** Phase 1 built the scaffolding and
+Target Groups; phase 2 added Load Balancers and changed no scaffolding at
+all, which is what the phasing was for. Phase 3 (ASG) moved exactly one
+thing — see "The shared fetch plumbing" below. Phase 4 (S3) was the first
+**global** service and the first user of `classify_absent`, both of which
+phase 1 had built the scaffolding for; phase 5 (Route 53) is the second
+global one and inherited that unchanged. The spec is
 `docs/superpowers/specs/2026-09-08-aws-resource-browser-design.md`.
+
+`render_resource_panel` no longer has a "not built yet" fallback, and
+`every_inventory_sub_tab_is_built` pins that it stays gone: with every
+`ResourceKind` carrying its own arm the match is exhaustive, so a sixth
+resource type is a compile error rather than a tab that renders nothing.
 
 #### The shared fetch plumbing lives in `resources`, not in a resource module
 
@@ -2510,6 +2515,86 @@ the "not answered yet" a spinner renders.
   the public access block is the exact opposite of what an absence means.
   `a_refused_section_never_reads_as_an_absent_one` pins that refused and
   absent stay distinguishable in the copied text too, not only on screen.
+
+
+#### Route 53 hosted zones
+
+Columns are `Name · Type · Records · Zone ID` — four. The comment and the
+managing service are searchable and in the detail view but earn no column;
+the record count does, because it is the difference between a zone somebody
+uses and a zone somebody forgot to delete.
+
+**Route 53 is global, like S3**, so everything under "S3 buckets" about the
+region-less cache key applies here too — `current_hosted_zone_keys` dedupes
+for exactly the same reason, and `ensure_hosted_zones` is safe for the same
+different reason (the loading set).
+
+- **The API's id is `/hostedzone/Z1234567890ABC`; the id everyone else uses
+  is `Z1234567890ABC`.** `strip_zone_prefix` drops the prefix, because the
+  bare form is what the console shows, what Terraform state holds, and what
+  somebody pastes into a search box. The API accepts either as an argument,
+  so this is purely about what a human reads.
+- **Every name comes back fully qualified and octal-escaped.** `example.com.`
+  is the zone `example.com`, and **`\052.example.com.` is `*.example.com`** —
+  Route 53 escapes `*` and `@` along with everything non-printable. A
+  wildcard record rendered raw reads as a parse failure, and it is exactly
+  the record somebody opens a zone to find. `decode_dns_name` unescapes and
+  `display_name` also drops the trailing dot; the escapes are decoded **once,
+  at parse time**, so the detail view's filter matches what the row shows.
+  - A backslash that is not a three-digit octal escape is kept verbatim.
+    This is a name; dropping a character from it is worse than showing an
+    odd one.
+  - The root (`.`) keeps its dot — stripping it leaves an empty string,
+    which renders as a missing name rather than as the root.
+  - The search haystack carries the name **both ways**, so `example.com` and
+    `example.com.` both find the row.
+- **Two zones can share a name.** One public and one private for the same
+  domain is an ordinary split-horizon setup, so the zone id is the sort
+  tiebreak (or the pair swap places between visits) *and* the
+  `DetailSubject::key` (or two tabs collapse into one showing whichever was
+  opened last).
+- **An alias record has NO TTL and NO `ResourceRecords`.** It carries an
+  `AliasTarget` instead, and reading only `ResourceRecords` renders every
+  alias as an empty row — which is most of the interesting records in a real
+  zone, since an alias is how a load balancer gets pointed at. `record_value`
+  renders `ALIAS -> <target>`, deliberately distinct from a CNAME to the same
+  place: an alias is resolved by Route 53 at query time and is free, and a
+  CNAME is neither. The TTL cell then says **`alias`** rather than a dash — a
+  dash in a column of numbers reads as "we could not read it", and this
+  explains why there is nothing there.
+- **A record with neither an alias nor values says `no value`.** A blank cell
+  reads as a record pointing at nothing.
+- **The five routing policies live in five unrelated fields** — `Weight`,
+  `Failover`, `Region`, `GeoLocation`, `MultiValueAnswer` — so there is no
+  one field to render, and a record showing only its `SetIdentifier` says
+  nothing about *why* there are three records with one name. The cell carries
+  the policy **and** the identifier: the identifier alone does not say what
+  the policy is, and the policy alone does not say which of the three this
+  row is. The health check hangs off the hover, since it decides whether the
+  record is answered at all and has nowhere else to go.
+- **The records read is bounded at `RECORD_LIMIT` (500) and says when it was
+  cut short.** A busy zone holds thousands and every one is a row in a grid
+  inside one scroll area; a table silently showing the first 500 of 4000
+  answers "is this name in the zone?" wrongly. The truncation note is amber
+  and appears in the copied text too.
+- **The records table has its own filter box**, like the target group detail
+  view's target table: the global search bar filters the zone *list*, and a
+  zone can hold hundreds of records. The filter is written back to
+  `ZoneDetailState` after the scroll area closes, because the panel renders
+  from a clone of that state.
+- **Copy All takes every record, never the filtered view.** The filter box
+  narrows what is on screen while somebody hunts for one name; Copy All is
+  for taking the zone away with you, and silently copying a subset is the
+  kind of thing found out much later.
+- **The delegation section follows the zone kind.** A public zone has name
+  servers and a private one has VPCs, so the *heading* changes rather than a
+  section sitting there permanently empty — "Name servers: none" on a private
+  zone reads as a zone whose delegation failed. The name servers get one copy
+  button for the whole block, since they are handed to a registrar together.
+- **Zone tags are nested under `ResourceTagSet`**, unlike ELB's flat
+  `describe-tags`. Reading it flat yields no tags on every single zone, and
+  `zone_tags_are_read_from_their_nested_home` asserts the flat shape does
+  *not* accidentally work, or the nesting would be untested.
 
 - **`filter::text_matches` is the shared search engine.** The
   include/exclude matching was lifted out of `apply_filters` so every sub-tab

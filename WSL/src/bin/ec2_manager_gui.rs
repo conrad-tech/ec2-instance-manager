@@ -55,6 +55,7 @@ mod gui {
     use ec2_manager::power::{self, PowerAction, PowerPhase};
     use ec2_manager::profile_choice::profile_choice_path;
     use ec2_manager::resources::{self, ResourceKind};
+    use ec2_manager::route53::{self, HostedZone, RecordPage, ZoneDetail};
     use ec2_manager::s3::{self, Bucket, BucketFacts, BucketSection, SectionResult};
     use ec2_manager::terminal::{
         build_ssm_port_forward_args, build_ssm_session_args, dependency_status,
@@ -196,6 +197,7 @@ mod gui {
         LoadBalancer(Box<LoadBalancer>),
         Asg(Box<AutoScalingGroup>),
         Bucket(Box<Bucket>),
+        HostedZone(Box<HostedZone>),
     }
 
     /// One EC2 instance's Details tab state.
@@ -261,6 +263,11 @@ mod gui {
                 // globally unique across all of AWS, so the name IS the key —
                 // two accounts cannot hold the same one.
                 DetailSubject::Bucket(b) => b.name.clone(),
+                // The zone ID, not the name: two zones can share a name — one
+                // public and one private for the same domain is an ordinary
+                // split-horizon setup — and two tabs keyed on the name would
+                // be one tab showing whichever was opened last.
+                DetailSubject::HostedZone(z) => z.id.clone(),
             }
         }
 
@@ -273,6 +280,7 @@ mod gui {
                 DetailSubject::LoadBalancer(_) => "LB",
                 DetailSubject::Asg(_) => "ASG",
                 DetailSubject::Bucket(_) => "S3",
+                DetailSubject::HostedZone(_) => "DNS",
             }
         }
 
@@ -285,6 +293,7 @@ mod gui {
                 DetailSubject::LoadBalancer(lb) => lb.name.clone(),
                 DetailSubject::Asg(g) => g.name.clone(),
                 DetailSubject::Bucket(b) => b.name.clone(),
+                DetailSubject::HostedZone(z) => z.name.clone(),
             }
         }
     }
@@ -312,6 +321,19 @@ mod gui {
     #[derive(Clone, Debug, Default)]
     struct BucketDetailState {
         sections: HashMap<BucketSection, SectionResult>,
+    }
+
+    /// One hosted zone's Details tab state.
+    #[derive(Clone, Debug, Default)]
+    struct ZoneDetailState {
+        /// Name servers (public) or VPCs (private).
+        delegation: Option<std::result::Result<ZoneDetail, String>>,
+        records: Option<std::result::Result<RecordPage, String>>,
+        tags: Option<std::result::Result<Vec<(String, String)>, String>>,
+        /// The detail view's own filter over the records table — the global
+        /// search bar filters the *zone list*, and a zone can hold hundreds of
+        /// records. Same arrangement as `TgDetailState.filter`.
+        filter: String,
     }
 
     /// The Inventory page's second tab row.
@@ -739,6 +761,30 @@ mod gui {
             bucket: String,
             section: BucketSection,
             result: SectionResult,
+        },
+        /// One account's hosted zone list landed. Same shape as
+        /// `TargetGroupList`, including the cache key stamped at spawn — see
+        /// its comment for why the handler must not re-derive it. **Route 53
+        /// is global, so that key carries no region.**
+        HostedZoneList {
+            account_id: String,
+            cache_key: String,
+            result: std::result::Result<Vec<HostedZone>, FetchError>,
+        },
+        /// The three reads behind an open hosted zone detail tab.
+        ///
+        /// Three independent `Option`s on the same honest shape as
+        /// `TargetGroupDetail` and `AsgDetail`: each message carries `Some`
+        /// for exactly the one call it made and `None` for the others, so a
+        /// section with no answer yet is never blanked by a message that
+        /// knows nothing about it. They are three different API permissions,
+        /// and a role holding one and not the others must still see what it
+        /// can.
+        HostedZoneDetail {
+            zone_id: String,
+            delegation: Option<std::result::Result<ZoneDetail, String>>,
+            records: Option<std::result::Result<RecordPage, String>>,
+            tags: Option<std::result::Result<Vec<(String, String)>, String>>,
         },
         /// A capacity edit finished. `Ok` carries the sentence for the
         /// status line; `Err` carries the failure, which is also logged at
@@ -8024,6 +8070,13 @@ mod gui {
         bucket_list_errors: HashMap<String, String>,
         bucket_list_failures: HashMap<String, Instant>,
         bucket_col_widths: HashMap<usize, f32>,
+        /// Hosted zones per cache key. Global, like `buckets`, so the same
+        /// dedupe applies — see `current_hosted_zone_keys`.
+        hosted_zones: HashMap<String, (Instant, Vec<HostedZone>)>,
+        zone_list_loading: HashSet<String>,
+        zone_list_errors: HashMap<String, String>,
+        zone_list_failures: HashMap<String, Instant>,
+        zone_col_widths: HashMap<usize, f32>,
         /// Which resource sub-tab was showing last frame, so entering one can
         /// be told from staying on it. `None` while the EC2 tab is showing, so
         /// coming back from it counts as entering.
@@ -8061,6 +8114,7 @@ mod gui {
         lb_details: HashMap<String, LbDetailState>,
         asg_details: HashMap<String, AsgDetailState>,
         bucket_details: HashMap<String, BucketDetailState>,
+        zone_details: HashMap<String, ZoneDetailState>,
         /// The selected target group's registered targets and configuration,
         /// each on its own event — a role that can describe a group but not
         /// read its health, attributes or tags must still see what it can.
@@ -8883,6 +8937,11 @@ mod gui {
                 bucket_list_errors: HashMap::new(),
                 bucket_list_failures: HashMap::new(),
                 bucket_col_widths: HashMap::new(),
+                hosted_zones: HashMap::new(),
+                zone_list_loading: HashSet::new(),
+                zone_list_errors: HashMap::new(),
+                zone_list_failures: HashMap::new(),
+                zone_col_widths: HashMap::new(),
                 last_resource_tab: None,
                 // `features` is the local in `App::new`, the same one
                 // `instance_power_enabled` below is resolved from.
@@ -8901,6 +8960,7 @@ mod gui {
                 lb_details: HashMap::new(),
                 asg_details: HashMap::new(),
                 bucket_details: HashMap::new(),
+                zone_details: HashMap::new(),
                 local_port: 2222,
                 remote_port: 22,
                 message: String::new(),
@@ -9934,7 +9994,8 @@ mod gui {
             let before = self.target_groups.len()
                 + self.load_balancers.len()
                 + self.asgs.len()
-                + self.buckets.len();
+                + self.buckets.len()
+                + self.hosted_zones.len();
             self.target_groups
                 .retain(|k, _| !cache_key_is_for_account(k, account));
             self.load_balancers
@@ -9943,11 +10004,14 @@ mod gui {
                 .retain(|k, _| !cache_key_is_for_account(k, account));
             self.buckets
                 .retain(|k, _| !cache_key_is_for_account(k, account));
+            self.hosted_zones
+                .retain(|k, _| !cache_key_is_for_account(k, account));
             for set in [
                 &mut self.tg_list_loading,
                 &mut self.lb_list_loading,
                 &mut self.asg_list_loading,
                 &mut self.bucket_list_loading,
+                &mut self.zone_list_loading,
             ] {
                 set.retain(|k| !cache_key_is_for_account(k, account));
             }
@@ -9956,6 +10020,7 @@ mod gui {
                 &mut self.lb_list_failures,
                 &mut self.asg_list_failures,
                 &mut self.bucket_list_failures,
+                &mut self.zone_list_failures,
             ] {
                 map.retain(|k, _| !cache_key_is_for_account(k, account));
             }
@@ -9964,6 +10029,7 @@ mod gui {
                 &mut self.lb_list_errors,
                 &mut self.asg_list_errors,
                 &mut self.bucket_list_errors,
+                &mut self.zone_list_errors,
             ] {
                 map.remove(account);
             }
@@ -9975,7 +10041,8 @@ mod gui {
             let after = self.target_groups.len()
                 + self.load_balancers.len()
                 + self.asgs.len()
-                + self.buckets.len();
+                + self.buckets.len()
+                + self.hosted_zones.len();
             if before != after || !why.is_empty() {
                 self.log_info(format!(
                     "resources: dropped everything cached for account {account} ({why})"
@@ -20838,6 +20905,84 @@ mod gui {
                             }
                         }
                     }
+                    ProcEvent::HostedZoneList {
+                        account_id,
+                        cache_key,
+                        result,
+                    } => {
+                        // Applied only while this reply is still the one being
+                        // waited on: Refresh clears the set, and a reply that
+                        // was already in flight then must not land afterwards
+                        // stamped as fresh. Same rule as `TargetGroupList`.
+                        if !self.zone_list_loading.remove(&cache_key) {
+                            self.log_debug(format!(
+                                "hosted zones: dropping a reply for {cache_key} that \
+                                 Refresh already superseded"
+                            ));
+                            continue;
+                        }
+                        match result {
+                            Ok(zones) => {
+                                self.log_info(format!(
+                                    "hosted zones: {} in account {account_id}",
+                                    zones.len()
+                                ));
+                                self.zone_list_failures.remove(&cache_key);
+                                remember_list_error(
+                                    &mut self.zone_list_errors,
+                                    &account_id,
+                                    None,
+                                );
+                                self.hosted_zones.insert(cache_key, (Instant::now(), zones));
+                            }
+                            Err(err) => {
+                                let msg = err.message();
+                                let news = list_error_is_news(
+                                    &self.zone_list_errors,
+                                    &account_id,
+                                    &msg,
+                                );
+                                if news {
+                                    self.log_error(format!(
+                                        "hosted zones: account {account_id}: {msg}"
+                                    ));
+                                } else {
+                                    self.log_debug(format!(
+                                        "hosted zones: account {account_id}: {msg} \
+                                         (unchanged)"
+                                    ));
+                                }
+                                self.zone_list_failures.insert(cache_key, Instant::now());
+                                remember_list_error(
+                                    &mut self.zone_list_errors,
+                                    &account_id,
+                                    Some(msg),
+                                );
+                            }
+                        }
+                    }
+                    ProcEvent::HostedZoneDetail {
+                        zone_id,
+                        delegation,
+                        records,
+                        tags,
+                    } => {
+                        // Only into a tab that still exists, and only the
+                        // sections this message actually carries an answer
+                        // about — a `None` here means "this message says
+                        // nothing about that section", never "it is empty".
+                        if let Some(st) = self.zone_details.get_mut(&zone_id) {
+                            if let Some(delegation) = delegation {
+                                st.delegation = Some(delegation);
+                            }
+                            if let Some(records) = records {
+                                st.records = Some(records);
+                            }
+                            if let Some(tags) = tags {
+                                st.tags = Some(tags);
+                            }
+                        }
+                    }
                     ProcEvent::BucketDetail {
                         bucket,
                         section,
@@ -24187,8 +24332,9 @@ mod gui {
                     self.ensure_buckets();
                     self.render_buckets(ui);
                 }
-                other => {
-                    ui.label(format!("{} is not built yet.", other.label()));
+                ResourceKind::HostedZone => {
+                    self.ensure_hosted_zones();
+                    self.render_hosted_zones(ui);
                 }
             }
         }
@@ -24516,8 +24662,14 @@ mod gui {
                             }
                         }
                     }
-                    // Route 53 has no list yet.
-                    _ => {}
+                    ResourceKind::HostedZone => {
+                        if let Some((at, _)) = self.hosted_zones.get_mut(&key) {
+                            if selection_forces_refresh(at.elapsed(), RESOURCE_SELECT_FLOOR) {
+                                *at = stale;
+                                self.zone_list_failures.remove(&key);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -25168,6 +25320,591 @@ mod gui {
             }
         }
 
+
+
+        /// Start a list fetch for any account whose hosted zones are missing
+        /// or stale.
+        ///
+        /// **One account checked in two regions is ONE fetch here**, for the
+        /// reason `ensure_buckets` records: Route 53 is global, both pool
+        /// entries build the same cache key, and the loading set is what stops
+        /// the second one spawning a duplicate call.
+        fn ensure_hosted_zones(&mut self) {
+            let mode = self.options.mode.as_str().to_string();
+            for account in self.resource_pool_accounts() {
+                // Not an error, a wait — the same stance every other sub-tab
+                // takes, and what stops an expired session filling the error
+                // banner with refusals.
+                if !account.authed {
+                    continue;
+                }
+                let key = account.cache_key(ResourceKind::HostedZone, &mode);
+                let fresh = self
+                    .hosted_zones
+                    .get(&key)
+                    .is_some_and(|(at, _)| at.elapsed() <= resources::RESOURCE_TTL);
+                if !list_fetch_due(
+                    fresh,
+                    self.zone_list_loading.contains(&key),
+                    self.zone_list_failures.get(&key).map(Instant::elapsed),
+                    resources::RESOURCE_TTL,
+                ) {
+                    continue;
+                }
+                self.zone_list_loading.insert(key.clone());
+                let tx = self.proc_tx.clone();
+                let (p, r, a) = (
+                    account.profile.clone(),
+                    account.region.clone(),
+                    account.account_id.clone(),
+                );
+                let repaint = self.egui_ctx.clone();
+                std::thread::spawn(move || {
+                    let result = route53::fetch_hosted_zones(&p, &r, &a);
+                    let _ = tx.send(ProcEvent::HostedZoneList {
+                        account_id: a,
+                        cache_key: key,
+                        result,
+                    });
+                    if let Some(ctx) = &repaint {
+                        ctx.request_repaint();
+                    }
+                });
+            }
+        }
+
+        /// The cache keys of the accounts currently in the pool, **deduped**.
+        ///
+        /// Route 53 is global, so its key carries no region and one account
+        /// checked in two regions contributes the SAME key twice — see
+        /// `current_bucket_keys`, which records why reading the cache through
+        /// an undeduped list double-counts every row.
+        fn current_hosted_zone_keys(&self) -> Vec<String> {
+            let mode = self.options.mode.as_str().to_string();
+            let mut out: Vec<String> = Vec::new();
+            for account in self.resource_pool_accounts() {
+                let key = account.cache_key(ResourceKind::HostedZone, &mode);
+                if !out.contains(&key) {
+                    out.push(key);
+                }
+            }
+            out
+        }
+
+        /// The hosted zones the search box leaves visible, from every account
+        /// in the pool.
+        fn filtered_hosted_zones(&self) -> Vec<HostedZone> {
+            let (includes, excludes) = search_terms_from_rules(&self.search_rules);
+            let include_matchers = build_matchers(&includes);
+            let exclude_matchers = build_matchers(&excludes);
+
+            let mut rows: Vec<HostedZone> = self
+                .current_hosted_zone_keys()
+                .iter()
+                .filter_map(|k| self.hosted_zones.get(k))
+                .flat_map(|(_, zones)| zones.iter().cloned())
+                .filter(|z| {
+                    text_matches(
+                        &route53::hosted_zone_searchable_text(z),
+                        &include_matchers,
+                        &exclude_matchers,
+                    )
+                })
+                .collect();
+            rows.sort_by(|a, b| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+                    // Two zones CAN share a name — one public and one private
+                    // for the same domain — so the id breaks the tie or the
+                    // pair swap places between visits.
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            rows
+        }
+
+        fn render_hosted_zones(&mut self, ui: &mut egui::Ui) {
+            let rows = self.filtered_hosted_zones();
+            let total: usize = self
+                .current_hosted_zone_keys()
+                .iter()
+                .filter_map(|k| self.hosted_zones.get(k))
+                .map(|(_, zones)| zones.len())
+                .sum();
+
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "Hosted zones: {} filtered / {total} total",
+                    rows.len()
+                ));
+                if ui.button("Refresh").clicked() {
+                    self.hosted_zones.clear();
+                    self.zone_list_loading.clear();
+                    self.zone_list_errors.clear();
+                    self.zone_list_failures.clear();
+                }
+            });
+
+            // Named accounts that could not be listed, shown even when others
+            // returned rows: one AccessDenied must not blank a pool, and its
+            // absence must not be invisible either.
+            if let Some(detail) = list_error_detail(&self.zone_list_errors) {
+                note_label(
+                    ui,
+                    egui::Color32::RED,
+                    format!("Could not list Route 53: {detail}"),
+                );
+            }
+
+            // Amber, not red: an expired session is not a failure, it is a
+            // wait, and it clears itself when the credentials are renewed.
+            let waiting = waiting_for_auth_note(&self.resource_pool_accounts());
+            if let Some(note) = &waiting {
+                note_label(ui, egui::Color32::YELLOW, note.clone());
+                // The credentials watcher runs off a file-modified poll, not
+                // the frame loop, so this note would otherwise sit there until
+                // something else happened to redraw.
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
+            }
+
+            if !self.zone_list_loading.is_empty() {
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
+
+            // Wake up when the oldest cached list goes stale, so the TTL is a
+            // real interval rather than something re-checked only when the
+            // window happens to redraw.
+            if let Some(due) = next_list_refresh(
+                self.current_hosted_zone_keys()
+                    .iter()
+                    .filter_map(|k| self.hosted_zones.get(k))
+                    .map(|(at, _)| at.elapsed()),
+                resources::RESOURCE_TTL,
+            ) {
+                ui.ctx()
+                    .request_repaint_after(due.max(Duration::from_millis(200)));
+            }
+
+            if rows.is_empty() {
+                ui.label(resource_empty_note(
+                    ResourceKind::HostedZone,
+                    !self.zone_list_loading.is_empty(),
+                    list_error_detail(&self.zone_list_errors).as_deref(),
+                ));
+                return;
+            }
+
+            let auto = zone_auto_widths(&rows);
+            let overrides = self.zone_col_widths.clone();
+            let mut pending_detail: Option<HostedZone> = None;
+            let mut pending_width: Option<(usize, f32)> = None;
+
+            // Solid rather than the default floating bar, and only when there
+            // is something to scroll — the pair of reasons the Target Groups
+            // table records.
+            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+            egui::ScrollArea::both()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                .show(ui, |ui| {
+                    let cw =
+                        |idx: usize| -> f32 { overrides.get(&idx).copied().unwrap_or(auto[idx]) };
+                    egui::Grid::new("hosted_zone_grid")
+                        .striped(true)
+                        .min_col_width(0.0)
+                        .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
+                        .show(ui, |ui| {
+                            for (idx, label) in ZONE_COLUMN_LABELS.iter().enumerate() {
+                                let width = cw(idx);
+                                let cell = ui.allocate_ui_with_layout(
+                                    egui::vec2(width, TG_ROW_H),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(*label).strong(),
+                                            )
+                                            .wrap_mode(egui::TextWrapMode::Truncate),
+                                        )
+                                    },
+                                );
+                                let resp = cell.response;
+                                let drag_id = ui.id().with(("zone_col_resize", idx));
+                                let near_right = ui.input(|i| {
+                                    i.pointer.hover_pos().is_some_and(|pos| {
+                                        resp.rect.contains(pos)
+                                            && pos.x > resp.rect.right() - 8.0
+                                    })
+                                });
+                                if near_right || ui.ctx().is_being_dragged(drag_id) {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+                                    let x = resp.rect.right();
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(x, resp.rect.top()),
+                                            egui::pos2(x, resp.rect.bottom()),
+                                        ],
+                                        egui::Stroke::new(2.0, ui.visuals().text_color()),
+                                    );
+                                    let drag = ui.interact(
+                                        egui::Rect::from_min_size(
+                                            resp.rect.right_top() - egui::vec2(8.0, 0.0),
+                                            egui::vec2(16.0, resp.rect.height()),
+                                        ),
+                                        drag_id,
+                                        egui::Sense::drag(),
+                                    );
+                                    if drag.dragged() {
+                                        pending_width = Some((
+                                            idx,
+                                            (width + drag.drag_delta().x).max(TG_COL_MIN_W),
+                                        ));
+                                    }
+                                }
+                            }
+                            ui.end_row();
+
+                            for z in &rows {
+                                let name_cell = ui.allocate_ui_with_layout(
+                                    egui::vec2(cw(0), TG_ROW_H),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(z.name.clone())
+                                                .wrap_mode(egui::TextWrapMode::Truncate),
+                                        );
+                                    },
+                                );
+                                let r_name = ui
+                                    .interact(
+                                        name_cell.response.rect,
+                                        name_cell.response.id.with("zone_name"),
+                                        egui::Sense::click(),
+                                    )
+                                    .on_hover_text(zone_name_hover(z));
+
+                                let r_kind =
+                                    tg_cell(ui, cw(1), TG_ROW_H, route53::zone_kind_label(z));
+                                let r_count =
+                                    tg_cell(ui, cw(2), TG_ROW_H, z.record_count.to_string());
+
+                                // The zone ID is the field people copy out of
+                                // this table, so it carries the Inventory
+                                // table's own copy button.
+                                let id_cell = ui.allocate_ui_with_layout(
+                                    egui::vec2(cw(3), TG_ROW_H),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        Self::paint_copy_button(ui, &z.id, "Copy zone ID");
+                                        ui.add(
+                                            egui::Label::new(z.id.clone())
+                                                .wrap_mode(egui::TextWrapMode::Truncate),
+                                        )
+                                        .on_hover_text(z.id.clone());
+                                    },
+                                );
+
+                                // Everything except the ID cell, which holds
+                                // the copy button: unioning it would make a
+                                // click on that button also open the details.
+                                let row = r_name.union(r_kind).union(r_count);
+                                let hovered = row.hovered() || id_cell.response.hovered();
+                                if hovered {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    ui.painter().rect_filled(
+                                        row.rect.union(id_cell.response.rect),
+                                        0.0,
+                                        TG_ROW_HOVER,
+                                    );
+                                }
+                                if row.clicked() {
+                                    pending_detail = Some(z.clone());
+                                }
+                                row.context_menu(|ui| {
+                                    if ui.button("See Details").clicked() {
+                                        pending_detail = Some(z.clone());
+                                        ui.close();
+                                    }
+                                });
+
+                                ui.end_row();
+                            }
+                        });
+                    // Room under the last row, as the EC2 table has.
+                    ui.add_space(20.0);
+                });
+
+            if let Some((idx, w)) = pending_width {
+                self.zone_col_widths.insert(idx, w);
+            }
+            if let Some(z) = pending_detail {
+                self.open_hosted_zone_details(z);
+            }
+        }
+
+        /// Open a hosted zone in the Details tab and start its three reads.
+        ///
+        /// Records first: they are what the panel exists to show, and the
+        /// other two are a sentence each.
+        fn open_hosted_zone_details(&mut self, zone: HostedZone) {
+            // A fresh state for this tab; re-opening refetches.
+            self.zone_details
+                .insert(zone.id.clone(), ZoneDetailState::default());
+
+            let pool = self
+                .resource_pool_accounts()
+                .into_iter()
+                .find(|a| a.account_id == zone.account_id);
+            let Some(account) = pool else {
+                // No context for this account, so nothing will ever post a
+                // result: say so rather than spin on three spinners forever.
+                let err = format!("no AWS context for account {}", zone.account_id);
+                if let Some(st) = self.zone_details.get_mut(&zone.id) {
+                    st.delegation = Some(Err(err.clone()));
+                    st.records = Some(Err(err.clone()));
+                    st.tags = Some(Err(err));
+                }
+                self.focus_detail_tab(DetailSubject::HostedZone(Box::new(zone)));
+                return;
+            };
+
+            let (profile, region) = (account.profile.clone(), account.region.clone());
+            let tx = self.proc_tx.clone();
+            let repaint = self.egui_ctx.clone();
+            let zone_id = zone.id.clone();
+            std::thread::spawn(move || {
+                let wake = || {
+                    if let Some(ctx) = &repaint {
+                        ctx.request_repaint();
+                    }
+                };
+
+                let records = route53::fetch_record_sets(&profile, &region, &zone_id)
+                    .map_err(|e| e.message());
+                let _ = tx.send(ProcEvent::HostedZoneDetail {
+                    zone_id: zone_id.clone(),
+                    delegation: None,
+                    records: Some(records),
+                    tags: None,
+                });
+                wake();
+
+                let delegation = route53::fetch_zone_detail(&profile, &region, &zone_id)
+                    .map_err(|e| e.message());
+                let _ = tx.send(ProcEvent::HostedZoneDetail {
+                    zone_id: zone_id.clone(),
+                    delegation: Some(delegation),
+                    records: None,
+                    tags: None,
+                });
+                wake();
+
+                let tags =
+                    route53::fetch_zone_tags(&profile, &region, &zone_id).map_err(|e| e.message());
+                let _ = tx.send(ProcEvent::HostedZoneDetail {
+                    zone_id,
+                    // `None`, never an empty `Ok`: this message has no answer
+                    // about the other two sections and must not claim one.
+                    delegation: None,
+                    records: None,
+                    tags: Some(tags),
+                });
+                wake();
+            });
+
+            self.focus_detail_tab(DetailSubject::HostedZone(Box::new(zone)));
+        }
+
+        fn render_hosted_zone_details(
+            &mut self,
+            ui: &mut egui::Ui,
+            z: HostedZone,
+            title: &str,
+        ) {
+            let st = self.zone_details.get(&z.id).cloned().unwrap_or_default();
+            ui.horizontal(|ui| {
+                ui.heading(title);
+                if ui.button("Copy All").clicked() {
+                    let text = zone_detail_text(&z, &st.delegation, &st.records, &st.tags);
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(&text);
+                    }
+                }
+            });
+            ui.separator();
+
+            let mut filter = st.filter.clone();
+
+            // One scroll area, and nothing inside it with a fixed height — the
+            // constraint the Jira ticket window records, for the reason it cost
+            // a layout bug there.
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("zone_detail_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        let row = |ui: &mut egui::Ui, label: &str, value: String| {
+                            ui.strong(label);
+                            ui.label(value);
+                            ui.end_row();
+                        };
+                        ui.strong("Zone ID");
+                        ui.horizontal(|ui| {
+                            Self::paint_copy_button(ui, &z.id, "Copy zone ID");
+                            ui.label(&z.id);
+                        });
+                        ui.end_row();
+                        row(ui, "Name", z.name.clone());
+                        row(ui, "Type", route53::zone_kind_label(&z));
+                        row(ui, "Records", z.record_count.to_string());
+                        row(ui, "Account", z.account_id.clone());
+                        if let Some(comment) = &z.comment {
+                            row(ui, "Comment", comment.clone());
+                        }
+                        // Only where it is true. A zone AWS manages on your
+                        // behalf is not one a human edits, and saying so is
+                        // cheaper than somebody working it out from the
+                        // records.
+                        if let Some(service) = &z.linked_service {
+                            row(ui, "Managed by", service.clone());
+                        }
+                    });
+
+                ui.add_space(12.0);
+                // A private zone has VPCs and no name servers, and a public
+                // one the reverse — so the heading follows the zone rather
+                // than a section sitting there permanently empty.
+                ui.heading(if z.private { "Associated VPCs" } else { "Name servers" });
+                ui.separator();
+                match &st.delegation {
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Fetching…");
+                        });
+                    }
+                    Some(Err(err)) => {
+                        note_label(ui, egui::Color32::RED, format!("Error: {err}"));
+                    }
+                    Some(Ok(detail)) => {
+                        if z.private {
+                            if detail.vpcs.is_empty() {
+                                ui.label("None");
+                            } else {
+                                for (region, vpc) in &detail.vpcs {
+                                    ui.label(format!("{vpc} ({region})"));
+                                }
+                            }
+                        } else if detail.name_servers.is_empty() {
+                            ui.label("None");
+                        } else {
+                            // These are what a registrar is given, so they are
+                            // copied as a block rather than four at a time.
+                            let block = detail.name_servers.join("\n");
+                            ui.horizontal(|ui| {
+                                Self::paint_copy_button(ui, &block, "Copy all name servers");
+                                ui.label("name servers");
+                            });
+                            for ns in &detail.name_servers {
+                                ui.label(ns);
+                            }
+                        }
+                    }
+                }
+
+                ui.add_space(12.0);
+                ui.heading("Records");
+                ui.separator();
+                match &st.records {
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Fetching records…");
+                        });
+                    }
+                    Some(Err(err)) => {
+                        note_label(ui, egui::Color32::RED, format!("Error: {err}"));
+                    }
+                    Some(Ok(page)) if page.records.is_empty() => {
+                        ui.label("No records");
+                    }
+                    Some(Ok(page)) => {
+                        // A zone can hold hundreds; the global search box
+                        // filters the zone LIST, so the records get their own.
+                        ui.horizontal(|ui| {
+                            ui.label("Filter:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut filter)
+                                    .desired_width(220.0)
+                                    .hint_text("name, value, type…")
+                                    .id_salt(("zone_record_filter", &z.id)),
+                            );
+                        });
+                        let needle = filter.trim().to_ascii_lowercase();
+                        let shown: Vec<&route53::RecordSet> = page
+                            .records
+                            .iter()
+                            .filter(|r| {
+                                needle.is_empty()
+                                    || route53::record_searchable_text(r).contains(&needle)
+                            })
+                            .collect();
+
+                        // The cap has to be visible. A table silently showing
+                        // the first 500 of 4000 answers "is this name in the
+                        // zone?" wrongly.
+                        if page.truncated {
+                            note_label(
+                                ui,
+                                egui::Color32::YELLOW,
+                                format!(
+                                    "Showing the first {} records of {} — this zone is larger \
+                                     than this panel reads.",
+                                    page.records.len(),
+                                    z.record_count
+                                ),
+                            );
+                        }
+                        ui.label(format!(
+                            "{} of {} record(s)",
+                            shown.len(),
+                            page.records.len()
+                        ));
+
+                        egui::Grid::new("zone_records_grid")
+                            .num_columns(5)
+                            .spacing([12.0, 4.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for h in ["Name", "Type", "TTL", "Value", "Routing"] {
+                                    ui.strong(h);
+                                }
+                                ui.end_row();
+                                for r in shown {
+                                    ui.label(&r.name);
+                                    ui.label(&r.kind);
+                                    ui.label(route53::ttl_label(r));
+                                    ui.label(route53::record_value(r));
+                                    ui.label(record_routing_cell(r))
+                                        .on_hover_text(record_routing_hover(r));
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                }
+
+                ui.add_space(12.0);
+                ui.heading("Tags");
+                ui.separator();
+                render_pairs(ui, "zone_tags_grid", &st.tags);
+            });
+
+            // Written back after the scroll area closes, so the borrow of the
+            // cloned state above is finished before this `&mut self` write.
+            if let Some(state) = self.zone_details.get_mut(&z.id) {
+                state.filter = filter;
+            }
+        }
 
         /// Start a list fetch for any account whose buckets are missing or
         /// stale.
@@ -29401,6 +30138,15 @@ mod gui {
                         &self.hidden_envs,
                     )
                 }
+                DetailSubject::HostedZone(z) => {
+                    let profile_id = self.profile_id_for_account(&z.account_id)?;
+                    resource_env_color(
+                        &self.account_color_map,
+                        &profile_id,
+                        &z.name,
+                        &self.hidden_envs,
+                    )
+                }
             }
         }
 
@@ -29482,6 +30228,9 @@ mod gui {
                 DetailSubject::Bucket(_) => {
                     self.bucket_details.remove(&key);
                 }
+                DetailSubject::HostedZone(_) => {
+                    self.zone_details.remove(&key);
+                }
             }
             // Keep the active index inside the vec. Closing the tab left of the
             // active one would otherwise slide a different tab under the
@@ -29504,6 +30253,7 @@ mod gui {
             self.lb_details.clear();
             self.asg_details.clear();
             self.bucket_details.clear();
+            self.zone_details.clear();
             self.main_tab = MainTab::Inventory;
         }
 
@@ -29675,6 +30425,9 @@ mod gui {
                 }
                 DetailSubject::Bucket(b) => {
                     self.render_bucket_details(ui, *b, &title);
+                }
+                DetailSubject::HostedZone(z) => {
+                    self.render_hosted_zone_details(ui, *z, &title);
                 }
             }
         }
@@ -36673,6 +37426,9 @@ mod gui {
             // Same reason as the ASG arm: the label is a tab title, not a
             // noun that fits into a sentence.
             ResourceKind::Bucket => "No S3 buckets in the selected account(s).".to_string(),
+            ResourceKind::HostedZone => {
+                "No Route 53 hosted zones in the selected account(s).".to_string()
+            }
             other => format!("No {} in the selected account(s).", other.label()),
         }
     }
@@ -36892,6 +37648,189 @@ mod gui {
     }
 
 
+
+
+    /// The Route 53 table's columns.
+    ///
+    /// Four. The comment and the managing service are searchable and in the
+    /// detail view but earn no column — the same trade every other table
+    /// here made. Record count does earn one: it is the difference between a
+    /// zone somebody uses and a zone somebody forgot to delete.
+    const ZONE_COLUMN_LABELS: [&str; 4] = ["Name", "Type", "Records", "Zone ID"];
+
+    const ZONE_MIN_COL_W: [f32; 4] = [240.0, 80.0, 70.0, 200.0];
+    const ZONE_MAX_COL_W: [f32; 4] = [560.0, 100.0, 90.0, 260.0];
+
+    /// Each column sized to its widest cell and clamped, as every other table
+    /// here is.
+    fn zone_auto_widths(rows: &[HostedZone]) -> [f32; 4] {
+        let text_w = |s: &str| s.chars().count() as f32 * TG_CHAR_W + 8.0;
+        let mut out = [0.0f32; 4];
+        for (idx, label) in ZONE_COLUMN_LABELS.iter().enumerate() {
+            out[idx] = text_w(label) + 6.0;
+        }
+        for z in rows {
+            let cells = [
+                text_w(&z.name),
+                text_w(&route53::zone_kind_label(z)),
+                text_w(&z.record_count.to_string()),
+                // The copy button sits in this cell too.
+                text_w(&z.id) + COL_COPY_W,
+            ];
+            for (idx, w) in cells.iter().enumerate() {
+                out[idx] = out[idx].max(*w);
+            }
+        }
+        for idx in 0..out.len() {
+            out[idx] = out[idx].clamp(ZONE_MIN_COL_W[idx], ZONE_MAX_COL_W[idx]);
+        }
+        out
+    }
+
+    /// What the zone Name cell says on hover.
+    ///
+    /// The comment is where somebody wrote down what the zone is for, and it
+    /// is the field most likely to answer "why do we have this". It has no
+    /// column, so it lives here.
+    fn zone_name_hover(z: &HostedZone) -> String {
+        let mut out = z.name.clone();
+        if let Some(comment) = &z.comment {
+            out.push('\n');
+            out.push_str(comment);
+        }
+        if let Some(service) = &z.linked_service {
+            out.push_str("\nManaged by ");
+            out.push_str(service);
+        }
+        out
+    }
+
+    /// The Routing cell for one record.
+    ///
+    /// A simple record has no policy and gets an em dash. A record that has
+    /// one shows **the policy and its set identifier together**: the
+    /// identifier alone says nothing about why there are three records with
+    /// the same name, and the policy alone does not say which of the three
+    /// this row is.
+    fn record_routing_cell(r: &route53::RecordSet) -> String {
+        match (&r.routing, &r.set_identifier) {
+            (Some(policy), Some(id)) => format!("{policy} · {id}"),
+            (Some(policy), None) => policy.clone(),
+            (None, Some(id)) => id.clone(),
+            (None, None) => "—".to_string(),
+        }
+    }
+
+    /// The health check behind a record, which decides whether that record is
+    /// answered at all — and has nowhere else to go.
+    fn record_routing_hover(r: &route53::RecordSet) -> String {
+        match &r.health_check_id {
+            Some(id) => format!("Health check {id}"),
+            None => "No health check".to_string(),
+        }
+    }
+
+    /// Everything the hosted zone detail view shows, as plain text for Copy
+    /// All.
+    ///
+    /// Pure over exactly the state the panel renders from, so what is copied
+    /// and what is on screen cannot drift — the contract
+    /// `load_balancer_detail_text` keeps. A section still loading, or one that
+    /// failed, says which rather than being omitted.
+    ///
+    /// **The records are copied unfiltered.** The filter box narrows what is
+    /// on screen while somebody hunts for one name; Copy All is for taking
+    /// the zone away with you, and silently copying a filtered subset is the
+    /// kind of thing found out much later.
+    fn zone_detail_text(
+        z: &HostedZone,
+        delegation: &Option<std::result::Result<ZoneDetail, String>>,
+        records: &Option<std::result::Result<RecordPage, String>>,
+        tags: &Option<std::result::Result<Vec<(String, String)>, String>>,
+    ) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("Hosted zone: {}\n", z.name));
+        out.push_str(&format!("Zone ID: {}\n", z.id));
+        out.push_str(&format!("Type: {}\n", route53::zone_kind_label(z)));
+        out.push_str(&format!("Records: {}\n", z.record_count));
+        out.push_str(&format!("Account: {}\n", z.account_id));
+        if let Some(comment) = &z.comment {
+            out.push_str(&format!("Comment: {comment}\n"));
+        }
+        if let Some(service) = &z.linked_service {
+            out.push_str(&format!("Managed by: {service}\n"));
+        }
+
+        out.push_str(if z.private {
+            "\nAssociated VPCs:\n"
+        } else {
+            "\nName servers:\n"
+        });
+        match delegation {
+            None => out.push_str("  (still loading)\n"),
+            Some(Err(err)) => out.push_str(&format!("  Error: {err}\n")),
+            Some(Ok(detail)) => {
+                if z.private {
+                    if detail.vpcs.is_empty() {
+                        out.push_str("  none\n");
+                    } else {
+                        for (region, vpc) in &detail.vpcs {
+                            out.push_str(&format!("  {vpc} ({region})\n"));
+                        }
+                    }
+                } else if detail.name_servers.is_empty() {
+                    out.push_str("  none\n");
+                } else {
+                    for ns in &detail.name_servers {
+                        out.push_str(&format!("  {ns}\n"));
+                    }
+                }
+            }
+        }
+
+        out.push_str("\nRecords:\n");
+        match records {
+            None => out.push_str("  (still loading)\n"),
+            Some(Err(err)) => out.push_str(&format!("  Error: {err}\n")),
+            Some(Ok(page)) if page.records.is_empty() => out.push_str("  none\n"),
+            Some(Ok(page)) => {
+                if page.truncated {
+                    out.push_str(&format!(
+                        "  (the first {} of {} — this zone is larger than this panel reads)\n",
+                        page.records.len(),
+                        z.record_count
+                    ));
+                }
+                for r in &page.records {
+                    let routing = match record_routing_cell(r).as_str() {
+                        "—" => String::new(),
+                        other => format!("  [{other}]"),
+                    };
+                    out.push_str(&format!(
+                        "  {} {} {} {}{}\n",
+                        r.name,
+                        r.kind,
+                        route53::ttl_label(r),
+                        route53::record_value(r).replace('\n', ", "),
+                        routing,
+                    ));
+                }
+            }
+        }
+
+        out.push_str("\nTags:\n");
+        match tags {
+            None => out.push_str("  (still loading)\n"),
+            Some(Err(err)) => out.push_str(&format!("  Error: {err}\n")),
+            Some(Ok(pairs)) if pairs.is_empty() => out.push_str("  none\n"),
+            Some(Ok(pairs)) => {
+                for (k, v) in pairs {
+                    out.push_str(&format!("  {k} = {v}\n"));
+                }
+            }
+        }
+        out
+    }
 
     /// The S3 table's columns.
     ///
@@ -45427,6 +46366,227 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
 
 
+
+        fn zone_row(name: &str, id: &str) -> HostedZone {
+            HostedZone {
+                id: id.to_string(),
+                name: name.to_string(),
+                private: false,
+                record_count: 12,
+                comment: None,
+                linked_service: None,
+                account_id: "111122223333".to_string(),
+            }
+        }
+
+        /// Every column the table shows is sized from its own content and
+        /// clamped, or one pathological zone name pushes the rest off screen.
+        #[test]
+        fn zone_columns_are_sized_to_their_content_and_clamped() {
+            let narrow = zone_auto_widths(std::slice::from_ref(&zone_row("a.com", "Z1")));
+            for idx in 0..ZONE_COLUMN_LABELS.len() {
+                assert!(
+                    narrow[idx] >= ZONE_MIN_COL_W[idx],
+                    "column {idx} fell under its floor"
+                );
+            }
+            let long = zone_row(&format!("{}.com", "n".repeat(300)), "Z1");
+            let wide = zone_auto_widths(std::slice::from_ref(&long));
+            assert!(wide[0] > narrow[0], "a long name must widen its own column");
+            for idx in 0..ZONE_COLUMN_LABELS.len() {
+                assert!(
+                    wide[idx] <= ZONE_MAX_COL_W[idx],
+                    "column {idx} blew past its ceiling"
+                );
+            }
+            let empty = zone_auto_widths(&[]);
+            for idx in 0..ZONE_COLUMN_LABELS.len() {
+                assert!(empty[idx] >= ZONE_MIN_COL_W[idx]);
+            }
+        }
+
+        /// The comment is where somebody wrote down what a zone is for, and
+        /// it is the field most likely to answer "why do we have this". It
+        /// has no column, so it has to be in the hover.
+        #[test]
+        fn the_zone_hover_carries_the_comment_and_the_managing_service() {
+            let mut z = zone_row("example.com", "Z1");
+            assert_eq!(zone_name_hover(&z), "example.com");
+            z.comment = Some("public site".to_string());
+            z.linked_service = Some("servicediscovery.amazonaws.com".to_string());
+            let hover = zone_name_hover(&z);
+            assert!(hover.contains("public site"), "{hover}");
+            assert!(hover.contains("Managed by servicediscovery"), "{hover}");
+        }
+
+        /// The identifier alone says nothing about *why* there are three
+        /// records with one name; the policy alone does not say which of the
+        /// three this row is. The cell carries both.
+        #[test]
+        fn the_routing_cell_shows_the_policy_and_the_set_identifier_together() {
+            let weighted = ec2_manager::route53::RecordSet {
+                routing: Some("weighted 90".to_string()),
+                set_identifier: Some("east".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(record_routing_cell(&weighted), "weighted 90 · east");
+            // A simple record has neither and must not be given one.
+            assert_eq!(
+                record_routing_cell(&ec2_manager::route53::RecordSet::default()),
+                "—"
+            );
+        }
+
+        /// The health check decides whether a record is answered at all, and
+        /// there is nowhere else on the row for it.
+        #[test]
+        fn the_routing_hover_names_the_health_check() {
+            let checked = ec2_manager::route53::RecordSet {
+                health_check_id: Some("hc-123".to_string()),
+                ..Default::default()
+            };
+            assert!(record_routing_hover(&checked).contains("hc-123"));
+            assert_eq!(
+                record_routing_hover(&ec2_manager::route53::RecordSet::default()),
+                "No health check"
+            );
+        }
+
+        /// **Copy All takes the whole zone, never the filtered view.** The
+        /// filter box narrows what is on screen while somebody hunts for one
+        /// name; Copy All is for taking the zone away with you, and silently
+        /// copying a subset is the kind of thing found out much later.
+        ///
+        /// It is also what makes the function pure over the state rather than
+        /// over the widget, so what is copied and what is rendered cannot
+        /// drift.
+        #[test]
+        fn the_zone_copy_all_text_takes_every_record_and_names_every_section() {
+            let z = zone_row("example.com", "Z1234567890ABC");
+            let page = ec2_manager::route53::RecordPage {
+                records: vec![
+                    ec2_manager::route53::RecordSet {
+                        name: "example.com".to_string(),
+                        kind: "A".to_string(),
+                        alias_target: Some("alb-1.elb.amazonaws.com".to_string()),
+                        ..Default::default()
+                    },
+                    ec2_manager::route53::RecordSet {
+                        name: "api.example.com".to_string(),
+                        kind: "A".to_string(),
+                        ttl: Some(60),
+                        values: vec!["1.2.3.4".to_string()],
+                        set_identifier: Some("east".to_string()),
+                        routing: Some("weighted 90".to_string()),
+                        ..Default::default()
+                    },
+                ],
+                truncated: false,
+            };
+            // Delegation loaded, tags refused: both states have to survive
+            // into the text rather than the heading being dropped.
+            let text = zone_detail_text(
+                &z,
+                &Some(Ok(ec2_manager::route53::ZoneDetail {
+                    name_servers: vec!["ns-1.awsdns-01.com".to_string()],
+                    vpcs: Vec::new(),
+                })),
+                &Some(Ok(page)),
+                &Some(Err("not permitted".to_string())),
+            );
+            for needle in [
+                "Hosted zone: example.com",
+                "Zone ID: Z1234567890ABC",
+                "Name servers:",
+                "ns-1.awsdns-01.com",
+                "Records:",
+                "ALIAS -> alb-1.elb.amazonaws.com",
+                "api.example.com",
+                "[weighted 90 · east]",
+                "Tags:",
+                "Error: not permitted",
+            ] {
+                assert!(text.contains(needle), "missing {needle}:\n{text}");
+            }
+        }
+
+        /// A private zone has VPCs and no name servers, and the copied text
+        /// must say which it is — a "Name servers: none" block on a private
+        /// zone reads as a zone whose delegation failed.
+        #[test]
+        fn a_private_zone_copies_its_vpcs_under_their_own_heading() {
+            let mut z = zone_row("internal.example.com", "Z2");
+            z.private = true;
+            let text = zone_detail_text(
+                &z,
+                &Some(Ok(ec2_manager::route53::ZoneDetail {
+                    name_servers: Vec::new(),
+                    vpcs: vec![("us-east-1".to_string(), "vpc-3ac0fb5f".to_string())],
+                })),
+                &None,
+                &None,
+            );
+            assert!(text.contains("Associated VPCs:"), "{text}");
+            assert!(!text.contains("Name servers:"), "{text}");
+            assert!(text.contains("vpc-3ac0fb5f (us-east-1)"), "{text}");
+            assert!(text.contains("(still loading)"), "{text}");
+        }
+
+        /// A zone larger than `RECORD_LIMIT` must say so in the copied text
+        /// too, not only on screen: a pasted block that looks complete and is
+        /// not is worse than one that says it was cut short.
+        #[test]
+        fn a_truncated_zone_says_so_in_the_copied_text() {
+            let mut z = zone_row("big.example.com", "Z3");
+            z.record_count = 4000;
+            let text = zone_detail_text(
+                &z,
+                &None,
+                &Some(Ok(ec2_manager::route53::RecordPage {
+                    records: vec![ec2_manager::route53::RecordSet {
+                        name: "a.big.example.com".to_string(),
+                        kind: "A".to_string(),
+                        ttl: Some(60),
+                        values: vec!["1.2.3.4".to_string()],
+                        ..Default::default()
+                    }],
+                    truncated: true,
+                })),
+                &None,
+            );
+            assert!(text.contains("larger than this panel reads"), "{text}");
+            assert!(text.contains("of 4000"), "{text}");
+        }
+
+        /// **Every resource kind now has a real panel.** The sub-tab row is
+        /// built from `InventoryTab::all()`, so a kind with no arm in
+        /// `render_resource_panel` would be a tab that renders nothing — and
+        /// with the "not built yet" fallback gone, it would not even compile.
+        /// This pins that the fallback is really gone rather than quietly
+        /// re-added.
+        #[test]
+        fn every_inventory_sub_tab_is_built() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            assert!(
+                !src.contains("is not built yet"),
+                "the resource panel fallback should be gone: every kind has an arm now"
+            );
+            let start = src
+                .find("fn render_resource_panel(&mut self, ui: &mut egui::Ui, kind: ResourceKind) {")
+                .expect("render_resource_panel");
+            let body = &src[start..start + 2400];
+            for kind in [
+                "ResourceKind::TargetGroup",
+                "ResourceKind::LoadBalancer",
+                "ResourceKind::Asg",
+                "ResourceKind::Bucket",
+                "ResourceKind::HostedZone",
+            ] {
+                assert!(body.contains(kind), "render_resource_panel is missing {kind}");
+            }
+        }
+
         fn bucket_row(name: &str) -> Bucket {
             Bucket {
                 name: name.to_string(),
@@ -46236,6 +47396,10 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                         "self.bucket_list_loading.clear()",
                         "self.bucket_list_failures.clear()",
                     ],
+                ),
+                (
+                    "fn render_hosted_zones",
+                    ["self.zone_list_loading.clear()", "self.zone_list_failures.clear()"],
                 ),
             ] {
                 let body_start = src.find(func).unwrap_or_else(|| panic!("{func}"));
