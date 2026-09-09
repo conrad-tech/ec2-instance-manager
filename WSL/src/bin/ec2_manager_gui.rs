@@ -9,7 +9,7 @@ fn main() {
 
 #[cfg(feature = "gui")]
 mod gui {
-    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
     use std::fs;
     use std::io::{Read, Write};
 
@@ -51,6 +51,7 @@ mod gui {
     use ec2_manager::models::{
         AuthStatus, AwsContext, DependencyStatus, Instance, Inventory, Mode, PersonalScript,
         ProfileAuthInfo, ProfileConfig, SavedFilter, TerminalKind, TerminalOption,
+        UserEnvironment,
     };
     use ec2_manager::power::{self, PowerAction, PowerPhase};
     use ec2_manager::profile_choice::profile_choice_path;
@@ -1265,6 +1266,24 @@ mod gui {
         /// Bring the pem prompt back for this account and every environment
         /// under it — the only way to undo a "don't ask again".
         ask_again: bool,
+    }
+
+    /// Modal state for **Edit -> Manage Accounts…**. Holds a working copy;
+    /// nothing reaches `AppConfig` until Save, so Cancel is a real cancel.
+    struct ManageAccountsDialog {
+        /// Working copy of the account list, in display order. Reordering
+        /// moves entries here and is written out as `profile_order.<id>` on
+        /// Save.
+        rows: Vec<ManageAccountRow>,
+        /// Which row's detail form is open, as an index into `rows`.
+        selected: Option<usize>,
+        /// Working copy of every user-declared environment, all accounts.
+        environments: Vec<UserEnvironment>,
+        /// Working copy of the colour overrides, keyed by `profile_id`.
+        colors: BTreeMap<String, String>,
+        /// Set when the environment name box holds something unusable, so
+        /// Save can be refused with the reason on screen.
+        error: Option<String>,
     }
 
     /// Which of the three bastion user actions a dialog is running.
@@ -8261,6 +8280,8 @@ mod gui {
         pem_dialog: Option<PemDialog>,
         /// Active Settings "Update VS Code Pem" dialog, if any.
         settings_pem_dialog: Option<SettingsPemDialog>,
+        /// Active **Manage Accounts…** dialog, if any.
+        manage_accounts_dialog: Option<ManageAccountsDialog>,
         /// Whether the "File Browser Defaults" modal is open.
         show_file_browser_defaults: bool,
         /// When set, the Edit menu briefly flashes to draw the user's
@@ -9052,6 +9073,7 @@ mod gui {
                 last_ssh_poll_at: Instant::now(),
                 pem_dialog: None,
                 settings_pem_dialog: None,
+                manage_accounts_dialog: None,
                 show_file_browser_defaults: false,
                 edit_menu_flash_start: None,
                 create_user_dialog: None,
@@ -13718,6 +13740,207 @@ mod gui {
             } else if window_open && !do_cancel {
                 self.settings_pem_dialog = Some(dlg);
             }
+        }
+
+        /// Render the **Manage Accounts…** modal, if active.
+        ///
+        /// The dialog holds a working copy and writes nothing until Save, so
+        /// Cancel is a real cancel -- unlike the Environment Colors submenu
+        /// this replaces, which committed a colour the moment it was picked.
+        fn render_manage_accounts_dialog(&mut self, ctx: &egui::Context) {
+            let Some(mut dlg) = self.manage_accounts_dialog.take() else {
+                return;
+            };
+            let mut window_open = true;
+            let mut do_save = false;
+            let mut do_cancel = false;
+            let mut move_up: Option<usize> = None;
+            let mut move_down: Option<usize> = None;
+
+            egui::Window::new("Manage Accounts")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(560.0)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("Order decides how accounts appear in the legend and every dropdown.");
+                    ui.separator();
+
+                    egui::ScrollArea::vertical()
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            for idx in 0..dlg.rows.len() {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(idx > 0, egui::Button::new("^"))
+                                        .on_hover_text("Move up")
+                                        .clicked()
+                                    {
+                                        move_up = Some(idx);
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            idx + 1 < dlg.rows.len(),
+                                            egui::Button::new("v"),
+                                        )
+                                        .on_hover_text("Move down")
+                                        .clicked()
+                                    {
+                                        move_down = Some(idx);
+                                    }
+
+                                    let color = self
+                                        .account_color_map
+                                        .get(&dlg.rows[idx].profile_id)
+                                        .copied()
+                                        .unwrap_or(egui::Color32::GRAY);
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(12.0, 12.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(rect.center(), 6.0, color);
+
+                                    let label = format!(
+                                        "{}  ({})",
+                                        dlg.rows[idx].display_name,
+                                        dlg.rows[idx].profile_id
+                                    );
+                                    if ui
+                                        .selectable_label(dlg.selected == Some(idx), label)
+                                        .clicked()
+                                    {
+                                        dlg.selected = Some(idx);
+                                    }
+                                    if !dlg.rows[idx].identity_editable {
+                                        ui.weak("(built in)");
+                                    }
+                                });
+                            }
+                        });
+
+                    ui.separator();
+                    if let Some(idx) = dlg.selected {
+                        let editable = dlg.rows[idx].identity_editable;
+                        egui::Grid::new("manage_accounts_detail")
+                            .num_columns(2)
+                            .spacing([10.0, 8.0])
+                            .show(ui, |ui| {
+                                ui.label("Account Number:");
+                                ui.label(dlg.rows[idx].profile_id.clone());
+                                ui.end_row();
+
+                                ui.label("Account Name:");
+                                ui.add_enabled(
+                                    editable,
+                                    egui::TextEdit::singleline(
+                                        &mut dlg.rows[idx].display_name,
+                                    )
+                                    .desired_width(280.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("Region:");
+                                ui.add_enabled(
+                                    editable,
+                                    egui::TextEdit::singleline(&mut dlg.rows[idx].region)
+                                        .hint_text("us-east-1")
+                                        .desired_width(280.0),
+                                );
+                                ui.end_row();
+                            });
+                        if !editable {
+                            ui.weak(
+                                "Name and region come from the application's own account \
+                                 list and cannot be changed here. Colour and order can.",
+                            );
+                        }
+                    } else {
+                        ui.weak("Select an account to edit it.");
+                    }
+
+                    if let Some(err) = &dlg.error {
+                        ui.add_space(4.0);
+                        note_label(ui, egui::Color32::from_rgb(220, 80, 80), err);
+                    }
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            do_save = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+
+            if let Some(idx) = move_up {
+                dlg.rows.swap(idx - 1, idx);
+                dlg.selected = Some(idx - 1);
+            }
+            if let Some(idx) = move_down {
+                dlg.rows.swap(idx, idx + 1);
+                dlg.selected = Some(idx + 1);
+            }
+
+            if do_cancel || !window_open {
+                self.manage_accounts_dialog = None;
+                return;
+            }
+
+            if do_save {
+                self.apply_manage_accounts(&dlg);
+                self.manage_accounts_dialog = None;
+                return;
+            }
+
+            self.manage_accounts_dialog = Some(dlg);
+        }
+
+        /// Commit a Manage Accounts working copy.
+        ///
+        /// The order is written for **every** row, not only the moved ones:
+        /// a partial map would leave unmoved accounts falling back to their
+        /// bundled `sort_order`, which interleaves them with the explicit
+        /// positions rather than preserving what the list showed.
+        fn apply_manage_accounts(&mut self, dlg: &ManageAccountsDialog) {
+            for (idx, row) in dlg.rows.iter().enumerate() {
+                self.config
+                    .profile_orders
+                    .insert(row.profile_id.clone(), idx as u32);
+            }
+
+            // Every editable row, not only the selected one -- someone can
+            // edit three accounts before pressing Save, and only saving the
+            // last-clicked one would discard the other two without a word.
+            for row in dlg.rows.iter().filter(|r| r.identity_editable) {
+                let Some(p) = self
+                    .config
+                    .profiles
+                    .iter_mut()
+                    .find(|p| p.profile_id == row.profile_id)
+                else {
+                    continue;
+                };
+                let name = row.display_name.trim();
+                if !name.is_empty() {
+                    p.display_name = name.to_string();
+                }
+                let region = row.region.trim();
+                p.region = if region.is_empty() {
+                    None
+                } else {
+                    Some(region.to_string())
+                };
+            }
+
+            self.config.user_environments = dlg.environments.clone();
+            self.config.account_colors = dlg.colors.clone();
+
+            self.rebuild_account_colors();
+            let _ = self.config.save();
+            self.log_info("manage accounts: saved");
         }
 
         /// Render the "File Browser Defaults" modal, if open. This is a
@@ -31114,6 +31337,7 @@ mod gui {
                 self.render_port_forward_login_dialog(ctx);
                 self.render_hosts_prompt(ctx);
                 self.render_settings_pem_dialog(ctx);
+                self.render_manage_accounts_dialog(ctx);
                 self.render_file_browser_defaults_dialog(ctx);
                 self.render_create_user_dialog(ctx);
                 self.render_vault_iam_dialog(ctx);
@@ -31335,6 +31559,39 @@ mod gui {
                                     pem_path,
                                     ssh_user,
                                     ask_again: false,
+                                });
+                                ui.close();
+                            }
+                            if ui.button("Manage Accounts...").clicked() {
+                                let bundled_ids: Vec<String> =
+                                    ec2_manager::accounts::load_accounts()
+                                        .into_iter()
+                                        .map(|p| p.profile_id)
+                                        .collect();
+                                let mut rows = manage_accounts_rows(
+                                    &self.config.profiles,
+                                    &bundled_ids,
+                                );
+                                rows.sort_by(|a, b| {
+                                    let pa = self
+                                        .config
+                                        .profiles
+                                        .iter()
+                                        .find(|p| p.profile_id == a.profile_id);
+                                    let pb = self
+                                        .config
+                                        .profiles
+                                        .iter()
+                                        .find(|p| p.profile_id == b.profile_id);
+                                    profile_sort_key(pa, &a.profile_id)
+                                        .cmp(&profile_sort_key(pb, &b.profile_id))
+                                });
+                                self.manage_accounts_dialog = Some(ManageAccountsDialog {
+                                    rows,
+                                    selected: None,
+                                    environments: self.config.user_environments.clone(),
+                                    colors: self.config.account_colors.clone(),
+                                    error: None,
                                 });
                                 ui.close();
                             }
@@ -35305,6 +35562,44 @@ mod gui {
         } else {
             (u32::MAX, profile_id.to_ascii_lowercase())
         }
+    }
+
+    /// One row of the Manage Accounts list.
+    ///
+    /// The editable values live **here**, not on the dialog, so switching
+    /// rows cannot lose them: a single `edit_name` field on the dialog holds
+    /// only the selected row and is overwritten the moment another is
+    /// clicked, which silently discards the first edit.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ManageAccountRow {
+        profile_id: String,
+        display_name: String,
+        /// Empty means "no region set"; `resolve_region` then falls through
+        /// its own chain, which is the pre-existing behaviour.
+        region: String,
+        /// True for an account that exists only in `config.ini`. A bundled
+        /// account's label and region come from the binary, so an edit box
+        /// for them would be a control that silently does nothing.
+        identity_editable: bool,
+        /// Always true: colour and order are the user's on every account, or
+        /// a bundled one could never be moved.
+        arrangement_editable: bool,
+    }
+
+    fn manage_accounts_rows(
+        profiles: &[ProfileConfig],
+        bundled_ids: &[String],
+    ) -> Vec<ManageAccountRow> {
+        profiles
+            .iter()
+            .map(|p| ManageAccountRow {
+                profile_id: p.profile_id.clone(),
+                display_name: p.display_name.clone(),
+                region: p.region.clone().unwrap_or_default(),
+                identity_editable: !bundled_ids.contains(&p.profile_id),
+                arrangement_editable: true,
+            })
+            .collect()
     }
 
     /// The toolbar's `fed up` status line, or `None` when there is nothing
@@ -48222,6 +48517,54 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 ),
                 "attributes must be optional:\n{decl}"
             );
+        }
+
+        fn mp(id: &str, name: &str) -> ProfileConfig {
+            ProfileConfig {
+                profile_id: id.to_string(),
+                display_name: name.to_string(),
+                account_id: id.to_string(),
+                region: None,
+                sort_order: None,
+                color: None,
+            }
+        }
+
+        /// The merge rule made visible: a bundled account's label and region
+        /// come from the binary, so offering an edit box for them would be a
+        /// control that silently does nothing.
+        #[test]
+        fn only_a_user_account_offers_its_identity_for_editing() {
+            let profiles = vec![mp("111", "Dev"), mp("999", "Sandbox")];
+            let bundled = vec!["111".to_string()];
+
+            let rows = manage_accounts_rows(&profiles, &bundled);
+
+            assert_eq!(rows.len(), 2);
+            assert!(!rows[0].identity_editable, "bundled account is read-only");
+            assert!(rows[1].identity_editable, "user account is editable");
+        }
+
+        /// The editable values live on the row, so editing one account and
+        /// then clicking another cannot discard the first.
+        #[test]
+        fn each_row_carries_its_own_editable_values() {
+            let mut profiles = vec![mp("111", "Dev"), mp("999", "Sandbox")];
+            profiles[1].region = Some("eu-west-1".to_string());
+            let rows = manage_accounts_rows(&profiles, &["111".to_string()]);
+            assert_eq!(rows[0].region, "", "no region set reads as empty, not a guess");
+            assert_eq!(rows[1].region, "eu-west-1");
+            assert_eq!(rows[1].display_name, "Sandbox");
+        }
+
+        /// Colour and order are the user's on every account, bundled included
+        /// -- otherwise a bundled account could never be moved or recoloured.
+        #[test]
+        fn every_account_offers_colour_and_order() {
+            let profiles = vec![mp("111", "Dev"), mp("999", "Sandbox")];
+            let bundled = vec!["111".to_string()];
+            let rows = manage_accounts_rows(&profiles, &bundled);
+            assert!(rows.iter().all(|r| r.arrangement_editable));
         }
     }
 }
