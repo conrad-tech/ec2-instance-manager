@@ -26159,15 +26159,13 @@ mod gui {
                                             egui::Label::new(b.name.clone())
                                                 .wrap_mode(egui::TextWrapMode::Truncate),
                                         )
-                                        .on_hover_text(b.name.clone());
+                                        .on_hover_text(bucket_name_hover(b));
                                     },
                                 );
 
-                                let r_region =
-                                    tg_cell(ui, cw(1), TG_ROW_H, s3::region_label(b));
                                 let r_created = tg_cell(
                                     ui,
-                                    cw(2),
+                                    cw(1),
                                     TG_ROW_H,
                                     b.created
                                         .as_deref()
@@ -26178,7 +26176,7 @@ mod gui {
                                 // Everything except the name cell, which holds
                                 // the copy button: unioning it would make a
                                 // click on that button also open the details.
-                                let row = r_region.union(r_created);
+                                let row = r_created;
                                 let hovered = row.hovered() || name_cell.response.hovered();
                                 if hovered {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -37834,21 +37832,25 @@ mod gui {
 
     /// The S3 table's columns.
     ///
-    /// Three, because three is **everything `list-buckets` returns**. Size,
-    /// object count, whether it is public — none of those are in the list
-    /// reply, and each is a call per bucket. The table is a finder; the
-    /// detail view is where the configuration lives.
-    const BUCKET_COLUMN_LABELS: [&str; 3] = ["Name", "Region", "Created"];
+    /// Two. Three was **everything `list-buckets` returns** — size, object
+    /// count and whether a bucket is public are each a call per bucket and
+    /// none of them is in the list reply — and Region came out at the
+    /// maintainer's request on top of that, the same trade the Target Groups
+    /// table made when it dropped Type, VPC and Account. Nothing became
+    /// unreachable: the region is still matched by
+    /// `s3::bucket_searchable_text`, still repeated in the Name cell's hover,
+    /// and still a row in the detail view.
+    const BUCKET_COLUMN_LABELS: [&str; 2] = ["Name", "Created"];
 
-    const BUCKET_MIN_COL_W: [f32; 3] = [260.0, 110.0, 150.0];
-    const BUCKET_MAX_COL_W: [f32; 3] = [640.0, 150.0, 200.0];
+    const BUCKET_MIN_COL_W: [f32; 2] = [260.0, 150.0];
+    const BUCKET_MAX_COL_W: [f32; 2] = [640.0, 200.0];
 
     /// Each column sized to its widest cell and clamped, as every other table
     /// here is: sized to content with a horizontal scrollbar, never divided
     /// out of the window's width.
-    fn bucket_auto_widths(rows: &[Bucket]) -> [f32; 3] {
+    fn bucket_auto_widths(rows: &[Bucket]) -> [f32; 2] {
         let text_w = |s: &str| s.chars().count() as f32 * TG_CHAR_W + 8.0;
-        let mut out = [0.0f32; 3];
+        let mut out = [0.0f32; 2];
         for (idx, label) in BUCKET_COLUMN_LABELS.iter().enumerate() {
             out[idx] = text_w(label) + 6.0;
         }
@@ -37856,7 +37858,6 @@ mod gui {
             let cells = [
                 // The copy button sits in this cell too.
                 text_w(&b.name) + COL_COPY_W,
-                text_w(&s3::region_label(b)),
                 text_w(
                     &b.created
                         .as_deref()
@@ -37872,6 +37873,21 @@ mod gui {
             out[idx] = out[idx].clamp(BUCKET_MIN_COL_W[idx], BUCKET_MAX_COL_W[idx]);
         }
         out
+    }
+
+    /// What the bucket Name cell says on hover.
+    ///
+    /// The region and the account left the table; this is where they went, so
+    /// they are one hover away rather than gone. Same arrangement as
+    /// `tg_health_check_hover`, which carries the three columns the Target
+    /// Groups table dropped.
+    fn bucket_name_hover(b: &Bucket) -> String {
+        format!(
+            "{}\nRegion: {}\nAccount: {}",
+            b.name,
+            s3::region_label(b),
+            b.account_id
+        )
     }
 
     /// One section of a bucket's detail view.
@@ -46655,6 +46671,25 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 body.contains("if !out.contains(&key)"),
                 "current_bucket_keys must drop a key it already has:\n{body}"
             );
+        }
+
+        /// The region left the TABLE, not the feature. It is still matched
+        /// by the search box (pinned in `s3.rs`), still a row in the detail
+        /// view, and still one hover away — which is the whole basis on which
+        /// a column is allowed to be dropped here.
+        #[test]
+        fn the_region_survives_leaving_the_bucket_table() {
+            assert!(
+                !BUCKET_COLUMN_LABELS.contains(&"Region"),
+                "the Region column was removed on purpose"
+            );
+            let b = bucket_row("app-assets");
+            let hover = bucket_name_hover(&b);
+            assert!(hover.contains("us-east-1"), "{hover}");
+            assert!(hover.contains("111122223333"), "{hover}");
+            // And the detail view still states it outright.
+            let text = bucket_detail_text(&b, &HashMap::new());
+            assert!(text.contains("Region: us-east-1"), "{text}");
         }
 
         /// Every column the table shows is sized from its own content and
