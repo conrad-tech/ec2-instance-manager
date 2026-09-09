@@ -2390,6 +2390,35 @@ true but rarely looked at, and both stay searchable and in the detail view.
     (`tg_health_header(1)`) rather than against a magic constant, so the
     width cannot drift away from the string it exists to hold.
 
+#### Row highlight and environment colour
+
+- **A hovered row is washed over, not under.** `TG_ROW_HOVER` is painted
+  *after* the row is drawn, exactly as the EC2 table paints its own: it is
+  translucent so it tints rather than hides, and the row's rect is not known
+  until the row has been laid out. The load balancer table unions its DNS
+  cell's rect into the highlight even though that cell is deliberately not
+  part of the click response — the row is one thing to look at, even where it
+  is two things to click.
+- **The Details tab and its panel carry the environment's colour**, the way
+  the Connections tabs do, so a DEV1 target group and a DEV1 box read as the
+  same thing on both pages. An instance answers exactly, from its own
+  `MMODAL_ENV`, and resolves the profile through the same lookup the
+  Connections colouring makes — the same box must not be two colours in two
+  places.
+- **A target group and a load balancer have no environment tag**, so
+  `resource_env_color` reads the NAME instead: `app-dev1-tg` is a DEV1 thing.
+  That is a display hint and nothing else — it colours a heading, decides
+  nothing, and falls back to the account's own colour, which is always right
+  about the account even when it says nothing about the environment.
+  - **Longest environment wins**, or every DEV10 resource is coloured as
+    DEV1 — the same hazard the `@`-mention picker records for one label
+    prefixing another.
+  - **The environment list comes from the colour map's own keys**
+    (`<profile_id>:<env>`), so it is exactly what the legend already knows
+    and there is no second list to keep in step.
+  - **A hidden environment is skipped rather than matched**, so the colour
+    never contradicts the Exclude Env dropdown.
+
 #### The Healthy/Total column
 
 `describe-target-health` takes **exactly one target group per call** — there

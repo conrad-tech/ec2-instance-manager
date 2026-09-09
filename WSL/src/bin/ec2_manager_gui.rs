@@ -24408,8 +24408,18 @@ mod gui {
                                 // the copy button: unioning it would make a
                                 // click on that button also open the details.
                                 let row = r_name.union(r_kind).union(r_scheme).union(r_state);
-                                if row.hovered() || dns_cell.response.hovered() {
+                                let hovered = row.hovered() || dns_cell.response.hovered();
+                                if hovered {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    // The DNS cell is not part of the click
+                                    // response — it holds the copy button — but
+                                    // it is part of the row, so the highlight
+                                    // covers it.
+                                    ui.painter().rect_filled(
+                                        row.rect.union(dns_cell.response.rect),
+                                        0.0,
+                                        TG_ROW_HOVER,
+                                    );
                                 }
                                 if row.clicked() {
                                     pending_detail = Some(lb.clone());
@@ -24942,6 +24952,7 @@ mod gui {
                                     .union(r_path);
                                 if row.hovered() {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    ui.painter().rect_filled(row.rect, 0.0, TG_ROW_HOVER);
                                 }
                                 if row.clicked() {
                                     pending_detail = Some(tg.clone());
@@ -27421,6 +27432,83 @@ mod gui {
             }
         }
 
+        /// The environment colour for one Details tab, or `None` when the
+        /// account-colour feature is off.
+        ///
+        /// An instance answers exactly — it carries the tag — and matches what
+        /// its Connections tab is already coloured, which is the point: the
+        /// same box should not be two colours in two places. A target group or
+        /// load balancer has no tag, so the name is read instead and the
+        /// account's own colour is the fallback.
+        fn detail_subject_color(&self, subject: &DetailSubject) -> Option<egui::Color32> {
+            if !self.config.account_colors_enabled || self.account_color_map.is_empty() {
+                return None;
+            }
+            match subject {
+                DetailSubject::Instance(instance) => {
+                    let profile_id = self.profile_id_for_instance(&instance.instance_id)?;
+                    let env = instance_env(instance).map(|e| e.to_ascii_lowercase());
+                    match env {
+                        Some(env) if !self.hidden_envs.contains(&env) => self
+                            .account_color_map
+                            .get(&format!("{profile_id}:{env}"))
+                            .copied()
+                            .or_else(|| self.account_color_map.get(&profile_id).copied()),
+                        _ => self.account_color_map.get(&profile_id).copied(),
+                    }
+                }
+                DetailSubject::TargetGroup(tg) => {
+                    let profile_id = self.profile_id_for_account(&tg.account_id)?;
+                    resource_env_color(
+                        &self.account_color_map,
+                        &profile_id,
+                        &tg.name,
+                        &self.hidden_envs,
+                    )
+                }
+                DetailSubject::LoadBalancer(lb) => {
+                    let profile_id = self.profile_id_for_account(&lb.account_id)?;
+                    resource_env_color(
+                        &self.account_color_map,
+                        &profile_id,
+                        &lb.name,
+                        &self.hidden_envs,
+                    )
+                }
+            }
+        }
+
+        /// The configured profile that owns an account id.
+        fn profile_id_for_account(&self, account_id: &str) -> Option<String> {
+            self.config
+                .profiles
+                .iter()
+                .find(|p| p.account_id == account_id)
+                .map(|p| p.profile_id.clone())
+                // An account in the pool but not in accounts.json still has a
+                // cached context under its own profile id.
+                .or_else(|| {
+                    self.profile_inventory_cache
+                        .iter()
+                        .find(|(_, (_, ctx))| ctx.account_id.as_deref() == Some(account_id))
+                        .map(|(pid, _)| pid.clone())
+                })
+        }
+
+        /// The profile whose inventory holds an instance — the same lookup the
+        /// Connections tab colouring makes, so the two cannot disagree.
+        fn profile_id_for_instance(&self, instance_id: &str) -> Option<String> {
+            if find_instance(&self.inventory.instances, instance_id).is_some() {
+                if let Some(pid) = self.selected_profile.clone() {
+                    return Some(pid);
+                }
+            }
+            self.profile_inventory_cache
+                .iter()
+                .find(|(_, (inv, _))| find_instance(&inv.instances, instance_id).is_some())
+                .map(|(pid, _)| pid.clone())
+        }
+
         /// Open a subject in the Details tab strip, or bring its tab
         /// forward if it is already open.
         ///
@@ -27499,6 +27587,13 @@ mod gui {
             let mut close_all = false;
             let mut select: Option<usize> = None;
             let active = self.detail_active.min(self.detail_tabs.len() - 1);
+            // Resolved before the strip is drawn: the loop borrows
+            // `detail_tabs`, and `detail_subject_color` takes `&self`.
+            let colours: Vec<Option<egui::Color32>> = self
+                .detail_tabs
+                .iter()
+                .map(|s| self.detail_subject_color(s))
+                .collect();
 
             ui.horizontal_wrapped(|ui| {
                 for (idx, subject) in self.detail_tabs.iter().enumerate() {
@@ -27506,7 +27601,14 @@ mod gui {
                     // load balancer in front of it are routinely named the
                     // same thing, and two identical tabs are worse than none.
                     let label = format!("{}: {}", subject.kind_label(), subject.title());
-                    if ui.selectable_label(idx == active, label).clicked() {
+                    let mut text = egui::RichText::new(label);
+                    // The environment's own colour, as the Connections tabs
+                    // carry it — so a DEV1 target group and a DEV1 box read as
+                    // the same thing across both pages.
+                    if let Some(colour) = colours[idx] {
+                        text = text.color(colour);
+                    }
+                    if ui.selectable_label(idx == active, text).clicked() {
                         select = Some(idx);
                     }
                     if ui
@@ -27549,17 +27651,31 @@ mod gui {
             // rule names them and the panels cannot drift.
             let subject = self.detail_tabs[self.detail_active].clone();
             let title = subject.title();
-            match subject {
-                DetailSubject::Instance(instance) => {
-                    self.render_instance_details(ui, *instance, &title);
+            let colour = self.detail_subject_color(&subject);
+
+            // The whole panel sits in the environment's colour, the same shape
+            // the Connections page frames a tab with: a stroke in the colour
+            // over a barely-tinted ground. Without the account-colour feature
+            // it is a plain group, which is what it was.
+            let frame = match colour {
+                Some(c) => egui::Frame::group(ui.style()).stroke(egui::Stroke::new(2.0, c)).fill(
+                    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 10),
+                ),
+                None => egui::Frame::group(ui.style()),
+            };
+            frame.show(ui, |ui| {
+                match subject {
+                    DetailSubject::Instance(instance) => {
+                        self.render_instance_details(ui, *instance, &title);
+                    }
+                    DetailSubject::TargetGroup(tg) => {
+                        self.render_target_group_details(ui, *tg, &title);
+                    }
+                    DetailSubject::LoadBalancer(lb) => {
+                        self.render_load_balancer_details(ui, *lb, &title);
+                    }
                 }
-                DetailSubject::TargetGroup(tg) => {
-                    self.render_target_group_details(ui, *tg, &title);
-                }
-                DetailSubject::LoadBalancer(lb) => {
-                    self.render_load_balancer_details(ui, *lb, &title);
-                }
-            }
+            });
         }
 
         fn render_instance_details(&mut self, ui: &mut egui::Ui, instance: Instance, title: &str) {
@@ -34479,6 +34595,56 @@ mod gui {
         }
     }
 
+    /// The environments an account has a colour for, longest first.
+    ///
+    /// Read out of the colour map's own keys (`<profile_id>:<env>`), so the
+    /// set is exactly the environments the legend already knows about and
+    /// there is no second list to keep in step.
+    ///
+    /// Longest first because the match below is a substring one: `dev10` has
+    /// to win over `dev1`, or every DEV10 resource is coloured as DEV1.
+    fn account_environments(map: &HashMap<String, egui::Color32>, profile_id: &str) -> Vec<String> {
+        let prefix = format!("{profile_id}:");
+        let mut envs: Vec<String> = map
+            .keys()
+            .filter_map(|k| k.strip_prefix(&prefix).map(str::to_string))
+            .collect();
+        envs.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        envs
+    }
+
+    /// The colour for a resource that carries no `MMODAL_ENV` tag.
+    ///
+    /// A target group and a load balancer are not instances and have no
+    /// environment tag, so the environment is **inferred from the name** —
+    /// `app-dev1-tg` is a DEV1 thing. That is a display hint and nothing more:
+    /// it colours a heading, it decides nothing, and a name that mentions no
+    /// environment simply falls back to the account's own colour, which is
+    /// always right about the account even when it says nothing about the
+    /// environment.
+    ///
+    /// An environment the user has hidden is skipped rather than matched, so
+    /// the colour never contradicts the Exclude Env dropdown.
+    fn resource_env_color(
+        map: &HashMap<String, egui::Color32>,
+        profile_id: &str,
+        name: &str,
+        hidden: &HashSet<String>,
+    ) -> Option<egui::Color32> {
+        let hay = name.to_ascii_lowercase();
+        for env in account_environments(map, profile_id) {
+            if hidden.contains(&env) {
+                continue;
+            }
+            if hay.contains(&env) {
+                if let Some(c) = map.get(&format!("{profile_id}:{env}")) {
+                    return Some(*c);
+                }
+            }
+        }
+        map.get(profile_id).copied()
+    }
+
     /// The note naming accounts whose credentials are not usable, if any.
     ///
     /// Its own line rather than folded into the error banner: "your session
@@ -34831,6 +34997,13 @@ mod gui {
 
     /// Height of one row, header included. Matches the EC2 table's cells.
     const TG_ROW_H: f32 = 18.0;
+
+    /// The wash over a hovered row.
+    ///
+    /// Painted *over* the row, as the EC2 table paints its own: it is
+    /// translucent, so it tints rather than hides, and the row's rect is not
+    /// known until the row has been laid out.
+    const TG_ROW_HOVER: egui::Color32 = egui::Color32::from_rgba_premultiplied(12, 12, 12, 35);
 
     /// Roughly how wide one character is in the default proportional font.
     /// The EC2 table's `auto_size_columns` uses the same number for the same
@@ -42426,6 +42599,63 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert!(!arn_is_for_account(arn, "444455556666"));
             // The region sits one field earlier and must not match.
             assert!(!arn_is_for_account(arn, "us-east-1"));
+        }
+
+        /// A resource with no environment tag takes its colour from its name,
+        /// and the LONGEST environment wins.
+        ///
+        /// Target groups and load balancers are not instances and carry no
+        /// `MMODAL_ENV`, so the name is the only signal there is. Matching
+        /// shortest-first would colour every DEV10 resource as DEV1 — the same
+        /// hazard the `@`-mention picker records for one label prefixing
+        /// another. A name that mentions no environment falls back to the
+        /// account's own colour, which is always right about the account.
+        #[test]
+        fn a_resource_takes_the_longest_environment_its_name_mentions() {
+            let base = egui::Color32::from_rgb(1, 1, 1);
+            let dev1 = egui::Color32::from_rgb(2, 2, 2);
+            let dev10 = egui::Color32::from_rgb(3, 3, 3);
+            let mut map = HashMap::new();
+            map.insert("acct".to_string(), base);
+            map.insert("acct:dev1".to_string(), dev1);
+            map.insert("acct:dev10".to_string(), dev10);
+            let none: HashSet<String> = HashSet::new();
+
+            // dev10 must not be read as dev1.
+            assert_eq!(
+                resource_env_color(&map, "acct", "app-dev10-tg", &none),
+                Some(dev10)
+            );
+            assert_eq!(
+                resource_env_color(&map, "acct", "app-dev1-tg", &none),
+                Some(dev1)
+            );
+            // Case-insensitive, since these names are free text.
+            assert_eq!(
+                resource_env_color(&map, "acct", "APP-DEV1-TG", &none),
+                Some(dev1)
+            );
+            // No environment in the name: the account's own colour, not None.
+            assert_eq!(
+                resource_env_color(&map, "acct", "shared-alb", &none),
+                Some(base)
+            );
+            // An account with no colour at all yields none rather than a guess.
+            assert_eq!(resource_env_color(&map, "other", "app-dev1", &none), None);
+
+            // A hidden environment is skipped, so the colour never contradicts
+            // the Exclude Env dropdown — it falls back rather than insisting.
+            let mut hidden = HashSet::new();
+            hidden.insert("dev1".to_string());
+            assert_eq!(
+                resource_env_color(&map, "acct", "app-dev1-tg", &hidden),
+                Some(base)
+            );
+            // Hiding dev1 must not hide dev10.
+            assert_eq!(
+                resource_env_color(&map, "acct", "app-dev10-tg", &hidden),
+                Some(dev10)
+            );
         }
 
         /// An account whose profile cannot be resolved is NOT reported as
