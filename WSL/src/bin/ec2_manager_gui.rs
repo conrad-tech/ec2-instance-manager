@@ -11360,10 +11360,13 @@ mod gui {
             // Whichever endpoint is chosen must be one we forward, or the
             // request would leave through the machine's own network and
             // "verify" something this tunnel has nothing to do with.
-            let declared_host =
-                ec2_manager::accounts::vault_addr_for(&row.account_id, &row.env)
-                    .and_then(|addr| ec2_manager::probe::parse_endpoint(&addr))
-                    .map(|(host, _)| host);
+            let declared_host = ec2_manager::accounts::vault_addr_for(
+                &row.account_id,
+                &row.env,
+                &self.config.user_environments,
+            )
+            .and_then(|addr| ec2_manager::probe::parse_endpoint(&addr))
+            .map(|(host, _)| host);
             let Some(fwd) = row
                 .forwards
                 .iter()
@@ -13871,7 +13874,10 @@ mod gui {
                         inv.instances.iter().filter_map(instance_env).collect()
                     })
                     .unwrap_or_default();
-                let declared = ec2_manager::accounts::environments_for(&account_id);
+                let declared = ec2_manager::accounts::environments_for(
+                    &account_id,
+                    &self.config.user_environments,
+                );
                 rows.extend(ec2_manager::script_env::build(
                     &profile_id,
                     &display_name,
@@ -18108,8 +18114,12 @@ mod gui {
                 &mut secondary_id,
                 &mut secondary_query,
             );
-            let vault_addr =
-                ec2_manager::accounts::vault_addr_for(&env, &env_name).unwrap_or_default();
+            let vault_addr = ec2_manager::accounts::vault_addr_for(
+                &env,
+                &env_name,
+                &self.config.user_environments,
+            )
+            .unwrap_or_default();
             self.vault_iam_dialog = Some(VaultIamDialog {
                 delete,
                 confirm_delete: false,
@@ -18738,9 +18748,12 @@ mod gui {
                     &mut dlg.secondary_query,
                 );
                 if !dlg.vault_addr_edited {
-                    dlg.vault_addr =
-                        ec2_manager::accounts::vault_addr_for(&account, &env)
-                            .unwrap_or_default();
+                    dlg.vault_addr = ec2_manager::accounts::vault_addr_for(
+                        &account,
+                        &env,
+                        &self.config.user_environments,
+                    )
+                    .unwrap_or_default();
                 }
             }
 

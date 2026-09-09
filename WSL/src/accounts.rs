@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::config::AppConfig;
-use crate::models::ProfileConfig;
+use crate::models::{ProfileConfig, UserEnvironment};
 
 /// Compiled-in default account list from `assets/accounts.json`, obfuscated at
 /// build time (see [`crate::obf_core`]) so the account inventory does not sit
@@ -122,6 +122,12 @@ fn environments_in(json: &str, account_id: &str) -> Vec<AccountEnvironment> {
 ///
 /// Pass an empty `env` for accounts with no environment dimension (untagged
 /// instances) — that resolves straight to the account-level value.
+///
+/// `#[cfg(test)]`: superseded in production by [`vault_addr_in_with_user`],
+/// which does not call this — see that function's doc comment. Kept for its
+/// own tests, which pin the two-level precedence
+/// `vault_addr_in_with_user` must not collapse the wrong way.
+#[cfg(test)]
 fn vault_addr_in(json: &str, account_id: &str, env: &str) -> Option<String> {
     let Ok(entries) = serde_json::from_str::<Vec<AccountEntry>>(json) else {
         return None;
@@ -140,19 +146,97 @@ fn vault_addr_in(json: &str, account_id: &str, env: &str) -> Option<String> {
     non_blank(&entry.vault_addr)
 }
 
-/// Environments declared for an account in the bundled `accounts.json`.
+/// [`environments_in`] unioned with the user's own declarations.
 ///
-/// This is only half the list shown in the Scripts dialogs — see
-/// [`crate::script_env`], which unions it with the environments actually
-/// discovered in the account's inventory.
-pub fn environments_for(account_id: &str) -> Vec<AccountEnvironment> {
-    environments_in(&bundled_accounts(), account_id)
+/// Declared entries come first and keep their spelling and their Vault
+/// address: the same "bundled wins on identity" rule the profile merge uses,
+/// and the same case-insensitive comparison `env_eq` applies everywhere else,
+/// since both sides are typed by hand against a free-text tag.
+fn environments_in_with_user(
+    json: &str,
+    account_id: &str,
+    user: &[UserEnvironment],
+) -> Vec<AccountEnvironment> {
+    let mut envs = environments_in(json, account_id);
+    for u in user {
+        if u.account_id != account_id || u.name.trim().is_empty() {
+            continue;
+        }
+        if envs.iter().any(|e| env_eq(&e.name, &u.name)) {
+            continue;
+        }
+        envs.push(AccountEnvironment {
+            name: u.name.trim().to_string(),
+            vault_addr: non_blank(&u.vault_addr),
+        });
+    }
+    envs
 }
 
-/// Vault address to pre-fill for an account/environment pair, with the
-/// environment-level value taking precedence over the account-level one.
-pub fn vault_addr_for(account_id: &str, env: &str) -> Option<String> {
-    vault_addr_in(&bundled_accounts(), account_id, env)
+/// Vault address across four levels, most specific first:
+///
+/// 1. the environment's declared address in `accounts.json`,
+/// 2. the environment's address in the user's own declarations,
+/// 3. the account-wide declared address,
+/// 4. nothing.
+///
+/// **This deliberately does not call [`vault_addr_in`].** That function
+/// already collapses levels 1 and 3, so layering the user on top of it would
+/// put a user's *environment* address below the *account-wide* declaration --
+/// less specific beating more specific, and the opposite of the rule
+/// `vault_addr_env_level_beats_account_level` already pins.
+///
+/// Within a level the declared value wins, so a user entry supplies a missing
+/// address and never overrides a curated one. There is no user-side
+/// account-wide address: Manage Accounts attaches one per environment.
+fn vault_addr_in_with_user(
+    json: &str,
+    account_id: &str,
+    env: &str,
+    user: &[UserEnvironment],
+) -> Option<String> {
+    let entries = serde_json::from_str::<Vec<AccountEntry>>(json).ok();
+    let entry = entries.as_ref().and_then(|e| find_entry(e, account_id));
+
+    if !env.trim().is_empty() {
+        if let Some(declared) = entry
+            .and_then(|e| e.environments.as_ref())
+            .and_then(|envs| envs.iter().find(|e| env_eq(&e.name, env)))
+            .and_then(|e| non_blank(&e.vault_addr))
+        {
+            return Some(declared);
+        }
+        if let Some(from_user) = user
+            .iter()
+            .find(|u| u.account_id == account_id && env_eq(&u.name, env))
+            .and_then(|u| non_blank(&u.vault_addr))
+        {
+            return Some(from_user);
+        }
+    }
+
+    entry.and_then(|e| non_blank(&e.vault_addr))
+}
+
+/// Environments for an account: those declared in the bundled
+/// `accounts.json`, unioned with those the user added through Manage
+/// Accounts.
+///
+/// This is still only half the list shown in the Scripts dialogs -- see
+/// [`crate::script_env`], which unions it again with the environments
+/// actually discovered in the account's inventory.
+pub fn environments_for(account_id: &str, user: &[UserEnvironment]) -> Vec<AccountEnvironment> {
+    environments_in_with_user(&bundled_accounts(), account_id, user)
+}
+
+/// Vault address for an account/environment pair. Environment level beats
+/// account level, and within each the declared value beats the user's.
+pub fn vault_addr_for(
+    account_id: &str,
+    env: &str,
+    user: &[UserEnvironment],
+) -> Option<String> {
+    vault_addr_in_with_user(&bundled_accounts(), account_id, env, user)
 }
 
 /// Load the ordered account list.
@@ -481,5 +565,85 @@ mod tests {
         );
         assert_eq!(merged[0].profile_id, "111");
         assert_eq!(merged[1].profile_id, "999");
+    }
+
+    fn user_env(account: &str, name: &str, vault: Option<&str>) -> UserEnvironment {
+        UserEnvironment {
+            account_id: account.to_string(),
+            name: name.to_string(),
+            vault_addr: vault.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_user_environment_joins_the_declared_ones() {
+        let user = [user_env("111", "DEV3", None)];
+        let envs = environments_in_with_user(ENV_JSON, "111", &user);
+        let names: Vec<&str> = envs.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["DEV1", "DEV2", "DEV3"]);
+    }
+
+    /// The same rule as identity: the maintainer's declaration wins, and the
+    /// user's entry for the same name must not create a duplicate row.
+    #[test]
+    fn a_declared_environment_is_not_duplicated_by_a_user_one() {
+        let user = [user_env("111", "dev1", Some("https://vault.mine"))];
+        let envs = environments_in_with_user(ENV_JSON, "111", &user);
+        assert_eq!(envs.len(), 2, "dev1 and DEV1 are one environment");
+        assert_eq!(envs[0].name, "DEV1", "the declared spelling wins");
+        assert_eq!(
+            envs[0].vault_addr.as_deref(),
+            Some("https://vault.dev1"),
+            "the declared Vault address wins"
+        );
+    }
+
+    /// The four-level precedence, at the level that is easy to get backwards:
+    /// a user entry for an environment beats the account-wide declaration,
+    /// because it is more specific -- the same reason an environment-level
+    /// `vault_addr` already beats it.
+    #[test]
+    fn a_user_environment_beats_the_account_level_declaration() {
+        let user = [user_env("111", "DEV3", Some("https://vault.mine"))];
+        assert_eq!(
+            vault_addr_in_with_user(ENV_JSON, "111", "DEV3", &user).as_deref(),
+            Some("https://vault.mine"),
+            "the environment the user named is more specific than the account"
+        );
+    }
+
+    /// But a *declared* environment address still wins over the user's entry
+    /// for the same environment: bundled wins within a level.
+    #[test]
+    fn a_declared_environment_address_beats_a_user_one() {
+        let user = [user_env("111", "DEV1", Some("https://vault.mine"))];
+        assert_eq!(
+            vault_addr_in_with_user(ENV_JSON, "111", "DEV1", &user).as_deref(),
+            Some("https://vault.dev1")
+        );
+    }
+
+    /// And with no user entry at all, nothing changes from today: an undeclared
+    /// environment still falls back to the account-wide address.
+    #[test]
+    fn an_undeclared_environment_still_falls_back_to_the_account_level() {
+        assert_eq!(
+            vault_addr_in_with_user(ENV_JSON, "111", "DEV9", &[]).as_deref(),
+            Some("https://vault.acct")
+        );
+    }
+
+    /// An account with no bundled entry at all -- the discovered case -- gets
+    /// its environments entirely from the user.
+    #[test]
+    fn an_account_with_no_bundled_entry_uses_only_user_environments() {
+        let user = [user_env("999", "SBX", Some("https://vault.sbx"))];
+        let envs = environments_in_with_user(ENV_JSON, "999", &user);
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].name, "SBX");
+        assert_eq!(
+            vault_addr_in_with_user(ENV_JSON, "999", "SBX", &user).as_deref(),
+            Some("https://vault.sbx")
+        );
     }
 }
