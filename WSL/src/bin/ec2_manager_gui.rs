@@ -23873,10 +23873,6 @@ mod gui {
             lb: LoadBalancer,
             title: &str,
         ) {
-            // Set by this panel's own Close button and acted on at the end:
-            // closing mid-render would drop the very state the rest of this
-            // function is still reading.
-            let mut close_active = false;
             let st = self.lb_details.get(&lb.arn).cloned().unwrap_or_default();
             ui.horizontal(|ui| {
                 ui.heading(title);
@@ -23890,15 +23886,6 @@ mod gui {
                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
                         let _ = clipboard.set_text(&text);
                     }
-                }
-                if ui
-                    .button("Close")
-                    .on_hover_text("Close this tab")
-                    .clicked()
-                {
-                    // The panel being rendered is the active tab, so this and
-                    // the strip's ✖ close the same thing.
-                    close_active = true;
                 }
             });
             ui.separator();
@@ -24056,10 +24043,6 @@ mod gui {
                 ui.separator();
                 render_pairs(ui, "lb_tags_grid", &st.tags);
             });
-
-            if close_active {
-                self.close_detail_tab(self.detail_active);
-            }
         }
 
         /// Mark one kind's cached lists stale, so the next `ensure_*` refetches.
@@ -25188,10 +25171,6 @@ mod gui {
             tg: TargetGroup,
             title: &str,
         ) {
-            // Set by this panel's own Close button and acted on at the end:
-            // closing mid-render would drop the very state the rest of this
-            // function is still reading.
-            let mut close_active = false;
             let key = tg.arn.clone();
             let st = self.tg_details.get(&key).cloned().unwrap_or_default();
             // The filter box writes back at the end: the state is cloned out of
@@ -25211,15 +25190,6 @@ mod gui {
                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
                         let _ = clipboard.set_text(&text);
                     }
-                }
-                if ui
-                    .button("Close")
-                    .on_hover_text("Close this tab")
-                    .clicked()
-                {
-                    // The panel being rendered is the active tab, so this and
-                    // the strip's ✖ close the same thing.
-                    close_active = true;
                 }
             });
             ui.separator();
@@ -25368,10 +25338,6 @@ mod gui {
             // would be forgotten the moment anything else redrew.
             if filter != st.filter {
                 self.tg_details.entry(key).or_default().filter = filter;
-            }
-
-            if close_active {
-                self.close_detail_tab(self.detail_active);
             }
         }
 
@@ -27687,11 +27653,15 @@ mod gui {
                         select = Some(idx);
                     }
                 }
-                if self.detail_tabs.len() > 1
-                    && ui
-                        .button("Close All")
-                        .on_hover_text("Close every open detail tab")
-                        .clicked()
+                // Always present, and carrying its count, as the Connections
+                // toolbar's own Close All does. Hiding it below two tabs —
+                // which this did — makes a button people look for come and go,
+                // and "it disappeared" is indistinguishable from "it was
+                // removed".
+                if ui
+                    .button(format!("Close All ({})", self.detail_tabs.len()))
+                    .on_hover_text("Close every open detail tab")
+                    .clicked()
                 {
                     close_all = true;
                 }
@@ -27736,10 +27706,6 @@ mod gui {
         }
 
         fn render_instance_details(&mut self, ui: &mut egui::Ui, instance: Instance, title: &str) {
-            // Set by this panel's own Close button and acted on at the end:
-            // closing mid-render would drop the very state the rest of this
-            // function is still reading.
-            let mut close_active = false;
             // This tab's own state, not the app's: several details can be
             // open at once, so "the volumes" is a question about a tab.
             let st = self
@@ -27807,15 +27773,6 @@ mod gui {
                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
                         let _ = clipboard.set_text(&text);
                     }
-                }
-                if ui
-                    .button("Close")
-                    .on_hover_text("Close this tab")
-                    .clicked()
-                {
-                    // The panel being rendered is the active tab, so this and
-                    // the strip's ✖ close the same thing.
-                    close_active = true;
                 }
             });
             ui.separator();
@@ -27978,10 +27935,6 @@ mod gui {
                 }
 
             });
-
-            if close_active {
-                self.close_detail_tab(self.detail_active);
-            }
         }
 
         /// The **Jira Alerts** trace: the last five calls to the on-call
