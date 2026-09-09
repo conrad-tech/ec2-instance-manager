@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -172,6 +173,40 @@ pub fn load_accounts() -> Vec<ProfileConfig> {
         remove_stale_accounts_file(&path);
     }
     parse_accounts(&bundled_accounts())
+}
+
+/// Union the bundled account list with the user's, keyed on account id.
+///
+/// **Bundled wins on identity** -- label, region, colour. Those are curated by
+/// whoever ships the binary, and a stale local value must not override them.
+/// **The user wins on arrangement**: `orders` is layered over every row,
+/// bundled included, or a bundled account could never be moved and the
+/// reorder step would be pointless.
+///
+/// Colour is deliberately absent: `build_account_color_map` in the GUI
+/// already consults `config.account_colors` ahead of `ProfileConfig.color`,
+/// so the user already wins there with no code here.
+///
+/// Bundled rows keep their declared position; user-only rows follow, with
+/// whatever `sort_order` they carry (normally `None`, which
+/// `profile_sort_key` sorts last and alphabetically).
+pub fn merge_profiles(
+    bundled: Vec<ProfileConfig>,
+    user: &[ProfileConfig],
+    orders: &BTreeMap<String, u32>,
+) -> Vec<ProfileConfig> {
+    let mut merged = bundled;
+    for u in user {
+        if !merged.iter().any(|b| b.profile_id == u.profile_id) {
+            merged.push(u.clone());
+        }
+    }
+    for p in &mut merged {
+        if let Some(order) = orders.get(&p.profile_id) {
+            p.sort_order = Some(*order);
+        }
+    }
+    merged
 }
 
 #[cfg(test)]
@@ -371,5 +406,80 @@ mod tests {
             assert!(!p.display_name.is_empty(), "label field must not be empty");
             assert!(!p.account_id.is_empty(), "account_id field must not be empty");
         }
+    }
+
+    fn profile(id: &str, name: &str) -> ProfileConfig {
+        ProfileConfig {
+            profile_id: id.to_string(),
+            display_name: name.to_string(),
+            account_id: id.to_string(),
+            region: None,
+            sort_order: None,
+            color: None,
+        }
+    }
+
+    /// The maintainer curates label, region and colour; a stale local copy must
+    /// not override them.
+    #[test]
+    fn bundled_wins_on_identity() {
+        let mut bundled = profile("111", "Dev");
+        bundled.region = Some("us-east-1".to_string());
+        let mut user = profile("111", "my old name for it");
+        user.region = Some("eu-west-1".to_string());
+
+        let merged = merge_profiles(vec![bundled], &[user], &BTreeMap::new());
+
+        assert_eq!(merged.len(), 1, "one account id is one row");
+        assert_eq!(merged[0].display_name, "Dev");
+        assert_eq!(merged[0].region.as_deref(), Some("us-east-1"));
+    }
+
+    /// The point of the feature: an account the user added and nothing bundles
+    /// still appears.
+    #[test]
+    fn a_user_only_account_survives_the_merge() {
+        let merged = merge_profiles(
+            vec![profile("111", "Dev")],
+            &[profile("999", "Sandbox")],
+            &BTreeMap::new(),
+        );
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|p| p.profile_id == "999"));
+    }
+
+    /// Without this a bundled account could never be moved, which defeats the
+    /// reorder step entirely.
+    #[test]
+    fn a_user_order_overrides_the_bundled_sort_order() {
+        let mut bundled = profile("111", "Dev");
+        bundled.sort_order = Some(2);
+        let mut orders = BTreeMap::new();
+        orders.insert("111".to_string(), 7);
+
+        let merged = merge_profiles(vec![bundled], &[], &orders);
+        assert_eq!(merged[0].sort_order, Some(7));
+    }
+
+    /// An account the user never moved keeps whatever the bundled list said.
+    #[test]
+    fn an_unordered_account_keeps_its_bundled_sort_order() {
+        let mut bundled = profile("111", "Dev");
+        bundled.sort_order = Some(2);
+        let merged = merge_profiles(vec![bundled], &[], &BTreeMap::new());
+        assert_eq!(merged[0].sort_order, Some(2));
+    }
+
+    /// Bundled accounts keep their declared order; a user-only account has none
+    /// and falls to the end, where the reorder step can place it.
+    #[test]
+    fn user_only_accounts_come_after_the_bundled_ones() {
+        let merged = merge_profiles(
+            vec![profile("111", "Dev")],
+            &[profile("999", "Sandbox")],
+            &BTreeMap::new(),
+        );
+        assert_eq!(merged[0].profile_id, "111");
+        assert_eq!(merged[1].profile_id, "999");
     }
 }
