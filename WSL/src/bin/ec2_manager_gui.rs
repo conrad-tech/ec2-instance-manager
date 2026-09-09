@@ -1284,6 +1284,9 @@ mod gui {
         /// Set when the environment name box holds something unusable, so
         /// Save can be refused with the reason on screen.
         error: Option<String>,
+        /// New environment being typed, for the selected account.
+        new_env_name: String,
+        new_env_vault: String,
     }
 
     /// Which of the three bastion user actions a dialog is running.
@@ -13849,6 +13852,70 @@ mod gui {
                                 );
                                 ui.end_row();
                             });
+                        ui.add_space(6.0);
+                        ui.label("Environments:");
+                        let account_id = dlg.rows[idx].profile_id.clone();
+                        let mut remove: Option<usize> = None;
+                        for (i, env) in dlg.environments.iter().enumerate() {
+                            if env.account_id != account_id {
+                                continue;
+                            }
+                            ui.horizontal(|ui| {
+                                ui.monospace(&env.name);
+                                ui.weak(
+                                    env.vault_addr.as_deref().unwrap_or("(no Vault)"),
+                                );
+                                if ui.small_button("x").on_hover_text("Remove").clicked() {
+                                    remove = Some(i);
+                                }
+                            });
+                        }
+                        if let Some(i) = remove {
+                            dlg.environments.remove(i);
+                        }
+
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut dlg.new_env_name)
+                                    .hint_text("DEV1")
+                                    .desired_width(110.0),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut dlg.new_env_vault)
+                                    .hint_text("Vault address (optional)")
+                                    .desired_width(240.0),
+                            );
+                            if ui.button("Add Environment").clicked() {
+                                match environment_name_problem(
+                                    &dlg.new_env_name,
+                                    &dlg.environments,
+                                    &account_id,
+                                ) {
+                                    Some(problem) => dlg.error = Some(problem),
+                                    None => {
+                                        let vault = dlg.new_env_vault.trim();
+                                        dlg.environments.push(UserEnvironment {
+                                            account_id: account_id.clone(),
+                                            name: dlg.new_env_name.trim().to_string(),
+                                            vault_addr: if vault.is_empty() {
+                                                None
+                                            } else {
+                                                Some(vault.to_string())
+                                            },
+                                        });
+                                        dlg.new_env_name.clear();
+                                        dlg.new_env_vault.clear();
+                                        dlg.error = None;
+                                    }
+                                }
+                            }
+                        });
+                        ui.weak(
+                            "Environments found on this account's instances appear on \
+                             their own. Add one here to give it a Vault address, or to \
+                             name it before any instance carries the tag.",
+                        );
+
                         if !editable {
                             ui.weak(
                                 "Name and region come from the application's own account \
@@ -31592,6 +31659,8 @@ mod gui {
                                     environments: self.config.user_environments.clone(),
                                     colors: self.config.account_colors.clone(),
                                     error: None,
+                                    new_env_name: String::new(),
+                                    new_env_vault: String::new(),
                                 });
                                 ui.close();
                             }
@@ -35600,6 +35669,33 @@ mod gui {
                 arrangement_editable: true,
             })
             .collect()
+    }
+
+    /// Why an environment name cannot be added, or `None` if it can.
+    ///
+    /// Refused locally rather than accepted and lost: `|` is the field
+    /// separator in `account_env=`, so a name carrying one would come back
+    /// truncated on the next load, and a duplicate spelling would be two rows
+    /// for one environment since every match here is case-insensitive.
+    fn environment_name_problem(
+        name: &str,
+        existing: &[UserEnvironment],
+        account_id: &str,
+    ) -> Option<String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Some("Enter an environment name.".to_string());
+        }
+        if trimmed.contains('|') {
+            return Some("An environment name cannot contain '|'.".to_string());
+        }
+        if existing.iter().any(|e| {
+            e.account_id == account_id
+                && ec2_manager::script_env::env_eq(&e.name, trimmed)
+        }) {
+            return Some(format!("'{trimmed}' is already declared for this account."));
+        }
+        None
     }
 
     /// The toolbar's `fed up` status line, or `None` when there is nothing
@@ -48565,6 +48661,42 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let bundled = vec!["111".to_string()];
             let rows = manage_accounts_rows(&profiles, &bundled);
             assert!(rows.iter().all(|r| r.arrangement_editable));
+        }
+
+        fn ue(account: &str, name: &str) -> UserEnvironment {
+            UserEnvironment {
+                account_id: account.to_string(),
+                name: name.to_string(),
+                vault_addr: None,
+            }
+        }
+
+        /// A pipe is the field separator in `account_env=`, so a name carrying one
+        /// would be silently truncated on the next load.
+        #[test]
+        fn an_environment_name_cannot_contain_the_field_separator() {
+            let problem = environment_name_problem("DEV|1", &[], "111");
+            assert!(problem.is_some_and(|p| p.contains('|')));
+        }
+
+        #[test]
+        fn a_blank_environment_name_is_refused() {
+            assert!(environment_name_problem("   ", &[], "111").is_some());
+        }
+
+        /// Environment names are matched case-insensitively everywhere else, so two
+        /// spellings of one name would be two rows for one environment.
+        #[test]
+        fn a_duplicate_environment_name_is_refused_case_insensitively() {
+            let existing = [ue("111", "DEV1")];
+            assert!(environment_name_problem("dev1", &existing, "111").is_some());
+        }
+
+        /// The same name under a different account is a different environment.
+        #[test]
+        fn the_same_name_under_another_account_is_allowed() {
+            let existing = [ue("111", "DEV1")];
+            assert!(environment_name_problem("DEV1", &existing, "999").is_none());
         }
     }
 }
