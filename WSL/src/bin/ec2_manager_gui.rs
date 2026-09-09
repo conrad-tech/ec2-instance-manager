@@ -1281,10 +1281,24 @@ mod gui {
         environments: Vec<UserEnvironment>,
         /// Working copy of the colour overrides, keyed by `profile_id`.
         colors: BTreeMap<String, String>,
-        /// Set when the environment name box holds something unusable, so
-        /// Save can be refused with the reason on screen.
+        /// Accounts whose colour the user pressed **Reset** on.
+        ///
+        /// Removing the entry from `colors` is not enough: Save freezes a
+        /// colour for every rendered account from `account_color_map`, which
+        /// still holds the one just reset, so the id would be re-inserted with
+        /// the identical hex and Reset would do nothing. This is the record
+        /// that "back to the automatic colour" was asked for, so `frozen_colors`
+        /// can skip the id and `apply_manage_accounts` can drop it from
+        /// `account_colors`. Picking a colour again clears the id from here.
+        reset_colors: HashSet<String>,
+        /// Set when the **Add Environment** box holds a name that cannot be
+        /// used -- blank, carrying a `|`, or colliding with an environment
+        /// this account already has. It annotates that box: Save does **not**
+        /// consult it and is never refused because of it.
         error: Option<String>,
-        /// New environment being typed, for the selected account.
+        /// New environment being typed, for the selected account. Cleared
+        /// whenever the selection moves, or a name typed against one account
+        /// would be added to whichever account was clicked next.
         new_env_name: String,
         new_env_vault: String,
     }
@@ -13770,208 +13784,288 @@ mod gui {
                     ui.label("Order decides how accounts appear in the legend and every dropdown.");
                     ui.separator();
 
-                    egui::ScrollArea::vertical()
-                        .max_height(280.0)
-                        .show(ui, |ui| {
-                            for idx in 0..dlg.rows.len() {
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .add_enabled(idx > 0, egui::Button::new("^"))
-                                        .on_hover_text("Move up")
-                                        .clicked()
-                                    {
-                                        move_up = Some(idx);
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            idx + 1 < dlg.rows.len(),
-                                            egui::Button::new("v"),
-                                        )
-                                        .on_hover_text("Move down")
-                                        .clicked()
-                                    {
-                                        move_down = Some(idx);
-                                    }
-
-                                    let color = self
-                                        .account_color_map
-                                        .get(&dlg.rows[idx].profile_id)
-                                        .copied()
-                                        .unwrap_or(egui::Color32::GRAY);
-                                    let (rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(12.0, 12.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().circle_filled(rect.center(), 6.0, color);
-
-                                    let label = format!(
-                                        "{}  ({})",
-                                        dlg.rows[idx].display_name,
-                                        dlg.rows[idx].profile_id
-                                    );
-                                    if ui
-                                        .selectable_label(dlg.selected == Some(idx), label)
-                                        .clicked()
-                                    {
-                                        dlg.selected = Some(idx);
-                                    }
-                                    if !dlg.rows[idx].identity_editable {
-                                        ui.weak("(built in)");
-                                    }
-                                });
-                            }
-                        });
-
-                    ui.separator();
-                    if let Some(idx) = dlg.selected {
-                        let editable = dlg.rows[idx].identity_editable;
-                        egui::Grid::new("manage_accounts_detail")
-                            .num_columns(2)
-                            .spacing([10.0, 8.0])
-                            .show(ui, |ui| {
-                                ui.label("Account Number:");
-                                ui.label(dlg.rows[idx].profile_id.clone());
-                                ui.end_row();
-
-                                ui.label("Account Name:");
-                                ui.add_enabled(
-                                    editable,
-                                    egui::TextEdit::singleline(
-                                        &mut dlg.rows[idx].display_name,
-                                    )
-                                    .desired_width(280.0),
-                                );
-                                ui.end_row();
-
-                                ui.label("Region:");
-                                ui.add_enabled(
-                                    editable,
-                                    egui::TextEdit::singleline(&mut dlg.rows[idx].region)
-                                        .hint_text("us-east-1")
-                                        .desired_width(280.0),
-                                );
-                                ui.end_row();
-                            });
-                        ui.add_space(6.0);
-
-                        ui.horizontal(|ui| {
-                            ui.label("Colour:");
-                            let id = dlg.rows[idx].profile_id.clone();
-                            let shown = dlg
-                                .colors
-                                .get(&id)
-                                .and_then(|hex| parse_hex_color(hex))
-                                .or_else(|| self.account_color_map.get(&id).copied())
-                                .unwrap_or(egui::Color32::GRAY);
-                            let mut rgb = [
-                                shown.r() as f32 / 255.0,
-                                shown.g() as f32 / 255.0,
-                                shown.b() as f32 / 255.0,
-                            ];
-                            if ui.color_edit_button_rgb(&mut rgb).changed() {
-                                let picked = egui::Color32::from_rgb(
-                                    (rgb[0] * 255.0).round() as u8,
-                                    (rgb[1] * 255.0).round() as u8,
-                                    (rgb[2] * 255.0).round() as u8,
-                                );
-                                dlg.colors.insert(id.clone(), color32_to_hex(picked));
-                            }
-                            if ui
-                                .button("Reset")
-                                .on_hover_text("Back to the automatic colour")
-                                .clicked()
-                            {
-                                dlg.colors.remove(&id);
-                            }
-                        });
-                        ui.add_space(6.0);
-
-                        ui.label("Environments:");
-                        let account_id = dlg.rows[idx].profile_id.clone();
-                        let mut remove: Option<usize> = None;
-                        for (i, env) in dlg.environments.iter().enumerate() {
-                            if env.account_id != account_id {
-                                continue;
-                            }
+                    // ONE scroll area around the whole body, and nothing
+                    // inside it sets a fixed height.
+                    //
+                    // The detail pane grows with the selected account's
+                    // environments and this window is anchored CENTER_CENTER,
+                    // so it cannot be dragged: with the account list scrolling
+                    // on its own `max_height(280.0)` and the pane outside any
+                    // scroll area, Add Environment and the Save button went
+                    // past the bottom edge with no way to reach them. That is
+                    // verbatim the scar CLAUDE.md records for the Jira ticket
+                    // window, along with the other half of it -- an inner
+                    // ScrollArea carrying `max_height` reserves that height
+                    // empty or not, giving the window a floor it cannot shrink
+                    // past. One scrollbar, not two.
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for idx in 0..dlg.rows.len() {
                             ui.horizontal(|ui| {
-                                ui.monospace(&env.name);
-                                ui.weak(
-                                    env.vault_addr.as_deref().unwrap_or("(no Vault)"),
-                                );
-                                if ui.small_button("x").on_hover_text("Remove").clicked() {
-                                    remove = Some(i);
+                                if ui
+                                    .add_enabled(idx > 0, egui::Button::new("^"))
+                                    .on_hover_text("Move up")
+                                    .clicked()
+                                {
+                                    move_up = Some(idx);
                                 }
-                            });
-                        }
-                        if let Some(i) = remove {
-                            dlg.environments.remove(i);
-                        }
+                                if ui
+                                    .add_enabled(
+                                        idx + 1 < dlg.rows.len(),
+                                        egui::Button::new("v"),
+                                    )
+                                    .on_hover_text("Move down")
+                                    .clicked()
+                                {
+                                    move_down = Some(idx);
+                                }
 
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut dlg.new_env_name)
-                                    .hint_text("DEV1")
-                                    .desired_width(110.0),
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut dlg.new_env_vault)
-                                    .hint_text("Vault address (optional)")
-                                    .desired_width(240.0),
-                            );
-                            if ui.button("Add Environment").clicked() {
-                                match environment_name_problem(
-                                    &dlg.new_env_name,
-                                    &dlg.environments,
-                                    &account_id,
-                                ) {
-                                    Some(problem) => dlg.error = Some(problem),
-                                    None => {
-                                        let vault = dlg.new_env_vault.trim();
-                                        dlg.environments.push(UserEnvironment {
-                                            account_id: account_id.clone(),
-                                            name: dlg.new_env_name.trim().to_string(),
-                                            vault_addr: if vault.is_empty() {
-                                                None
-                                            } else {
-                                                Some(vault.to_string())
-                                            },
-                                        });
+                                let color = self
+                                    .account_color_map
+                                    .get(&dlg.rows[idx].profile_id)
+                                    .copied()
+                                    .unwrap_or(egui::Color32::GRAY);
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(12.0, 12.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(rect.center(), 6.0, color);
+
+                                let label = format!(
+                                    "{}  ({})",
+                                    dlg.rows[idx].display_name,
+                                    dlg.rows[idx].profile_id
+                                );
+                                if ui
+                                    .selectable_label(dlg.selected == Some(idx), label)
+                                    .clicked()
+                                {
+                                    // A half-typed environment belongs to
+                                    // the account it was typed against.
+                                    // Carried across, "DEV1" typed for A
+                                    // and Added after clicking B attaches
+                                    // to B; and the error line would
+                                    // describe an account no longer shown.
+                                    if dlg.selected != Some(idx) {
                                         dlg.new_env_name.clear();
                                         dlg.new_env_vault.clear();
                                         dlg.error = None;
                                     }
+                                    dlg.selected = Some(idx);
                                 }
+                                if !dlg.rows[idx].identity_editable {
+                                    ui.weak("(built in)");
+                                }
+                            });
+                        }
+
+                        ui.separator();
+                        if let Some(idx) = dlg.selected {
+                            let editable = dlg.rows[idx].identity_editable;
+                            egui::Grid::new("manage_accounts_detail")
+                                .num_columns(2)
+                                .spacing([10.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.label("Account Number:");
+                                    ui.label(dlg.rows[idx].profile_id.clone());
+                                    ui.end_row();
+
+                                    ui.label("Account Name:");
+                                    ui.add_enabled(
+                                        editable,
+                                        egui::TextEdit::singleline(
+                                            &mut dlg.rows[idx].display_name,
+                                        )
+                                        .desired_width(280.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Region:");
+                                    ui.add_enabled(
+                                        editable,
+                                        egui::TextEdit::singleline(&mut dlg.rows[idx].region)
+                                            .hint_text("us-east-1")
+                                            .desired_width(280.0),
+                                    );
+                                    ui.end_row();
+                                });
+
+                            // Clearing the name box keeps the saved name --
+                            // the region box clears its override, so the two
+                            // rules differ and the difference must be said
+                            // rather than left to be discovered after a Save
+                            // that appears to have done nothing.
+                            if editable && dlg.rows[idx].display_name.trim().is_empty() {
+                                let saved = self
+                                    .config
+                                    .profiles
+                                    .iter()
+                                    .find(|p| p.profile_id == dlg.rows[idx].profile_id)
+                                    .map(|p| p.display_name.clone())
+                                    .unwrap_or_default();
+                                note_label(
+                                    ui,
+                                    egui::Color32::from_rgb(220, 150, 60),
+                                    format!(
+                                        "An account name cannot be blank. Save will keep \
+                                         '{saved}'."
+                                    ),
+                                );
+                            }
+                            ui.add_space(6.0);
+
+                            ui.horizontal(|ui| {
+                                ui.label("Colour:");
+                                let id = dlg.rows[idx].profile_id.clone();
+                                let shown = dlg
+                                    .colors
+                                    .get(&id)
+                                    .and_then(|hex| parse_hex_color(hex))
+                                    .or_else(|| self.account_color_map.get(&id).copied())
+                                    .unwrap_or(egui::Color32::GRAY);
+                                let mut rgb = [
+                                    shown.r() as f32 / 255.0,
+                                    shown.g() as f32 / 255.0,
+                                    shown.b() as f32 / 255.0,
+                                ];
+                                if ui.color_edit_button_rgb(&mut rgb).changed() {
+                                    let picked = egui::Color32::from_rgb(
+                                        (rgb[0] * 255.0).round() as u8,
+                                        (rgb[1] * 255.0).round() as u8,
+                                        (rgb[2] * 255.0).round() as u8,
+                                    );
+                                    dlg.colors.insert(id.clone(), color32_to_hex(picked));
+                                    // Picking again undoes the reset, or Save
+                                    // would drop the colour just chosen.
+                                    dlg.reset_colors.remove(&id);
+                                }
+                                if ui
+                                    .button("Reset")
+                                    .on_hover_text(
+                                        "Back to the automatic colour -- the palette \
+                                         colour for this account's position",
+                                    )
+                                    .clicked()
+                                {
+                                    dlg.colors.remove(&id);
+                                    // Dropping it from the working copy is not
+                                    // enough: Save freezes a colour for every
+                                    // rendered account from `account_color_map`,
+                                    // which still holds this one, so it would be
+                                    // put straight back with the same hex.
+                                    dlg.reset_colors.insert(id.clone());
+                                }
+                            });
+                            ui.add_space(6.0);
+
+                            ui.label("Environments:");
+                            let account_id = dlg.rows[idx].profile_id.clone();
+
+                            // The bundled declarations, shown read-only above
+                            // the user's own. Left off the list, a user can
+                            // type a name `accounts.json` already declares:
+                            // `environments_in_with_user` then drops the
+                            // duplicate row and `vault_addr_in_with_user`
+                            // prefers the declared address, so the typed
+                            // address is silently ignored while the dialog
+                            // still shows it.
+                            let bundled_envs =
+                                ec2_manager::accounts::environments_for(&account_id, &[]);
+                            for env in &bundled_envs {
+                                ui.horizontal(|ui| {
+                                    ui.monospace(&env.name);
+                                    ui.weak(
+                                        env.vault_addr.as_deref().unwrap_or("(no Vault)"),
+                                    );
+                                    ui.weak("(built in)");
+                                });
+                            }
+
+                            let mut remove: Option<usize> = None;
+                            for (i, env) in dlg.environments.iter().enumerate() {
+                                if env.account_id != account_id {
+                                    continue;
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.monospace(&env.name);
+                                    ui.weak(
+                                        env.vault_addr.as_deref().unwrap_or("(no Vault)"),
+                                    );
+                                    if ui.small_button("x").on_hover_text("Remove").clicked() {
+                                        remove = Some(i);
+                                    }
+                                });
+                            }
+                            if let Some(i) = remove {
+                                dlg.environments.remove(i);
+                            }
+
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut dlg.new_env_name)
+                                        .hint_text("DEV1")
+                                        .desired_width(110.0),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut dlg.new_env_vault)
+                                        .hint_text("Vault address (optional)")
+                                        .desired_width(240.0),
+                                );
+                                if ui.button("Add Environment").clicked() {
+                                    match environment_name_problem(
+                                        &dlg.new_env_name,
+                                        &dlg.environments,
+                                        &bundled_envs,
+                                        &account_id,
+                                    ) {
+                                        Some(problem) => dlg.error = Some(problem),
+                                        None => {
+                                            let vault = dlg.new_env_vault.trim();
+                                            dlg.environments.push(UserEnvironment {
+                                                account_id: account_id.clone(),
+                                                name: dlg.new_env_name.trim().to_string(),
+                                                vault_addr: if vault.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(vault.to_string())
+                                                },
+                                            });
+                                            dlg.new_env_name.clear();
+                                            dlg.new_env_vault.clear();
+                                            dlg.error = None;
+                                        }
+                                    }
+                                }
+                            });
+                            ui.weak(
+                                "Environments found on this account's instances appear on \
+                                 their own. Add one here to give it a Vault address, or to \
+                                 name it before any instance carries the tag.",
+                            );
+
+                            if !editable {
+                                ui.weak(
+                                    "Name and region come from the application's own account \
+                                     list and cannot be changed here. Colour and order can.",
+                                );
+                            }
+                        } else {
+                            ui.weak("Select an account to edit it.");
+                        }
+
+                        if let Some(err) = &dlg.error {
+                            ui.add_space(4.0);
+                            note_label(ui, egui::Color32::from_rgb(220, 80, 80), err);
+                        }
+
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("Save").clicked() {
+                                do_save = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                do_cancel = true;
                             }
                         });
-                        ui.weak(
-                            "Environments found on this account's instances appear on \
-                             their own. Add one here to give it a Vault address, or to \
-                             name it before any instance carries the tag.",
-                        );
-
-                        if !editable {
-                            ui.weak(
-                                "Name and region come from the application's own account \
-                                 list and cannot be changed here. Colour and order can.",
-                            );
-                        }
-                    } else {
-                        ui.weak("Select an account to edit it.");
-                    }
-
-                    if let Some(err) = &dlg.error {
-                        ui.add_space(4.0);
-                        note_label(ui, egui::Color32::from_rgb(220, 80, 80), err);
-                    }
-
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        if ui.button("Save").clicked() {
-                            do_save = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            do_cancel = true;
-                        }
                     });
                 });
 
@@ -14004,16 +14098,51 @@ mod gui {
         /// a partial map would leave unmoved accounts falling back to their
         /// bundled `sort_order`, which interleaves them with the explicit
         /// positions rather than preserving what the list showed.
+        ///
+        /// The colours are frozen **before** the resort, and that ordering is
+        /// load-bearing: `frozen_colors` reads `account_color_map` as it stands
+        /// now, so every account keeps the colour it was showing when the user
+        /// pressed Save.
         fn apply_manage_accounts(&mut self, dlg: &ManageAccountsDialog) {
+            // Freeze first, off the pre-existing map, then resort.
+            self.config.account_colors = frozen_colors(
+                &dlg.rows,
+                &self.account_color_map,
+                &dlg.colors,
+                &dlg.reset_colors,
+            );
+            // The second half of the same rule, stated where the config is
+            // written: a colour the user reset must not survive as a stored
+            // hex. `frozen_colors` already leaves it out of what it returns,
+            // and saying it twice is cheap next to a reset that silently does
+            // nothing -- which is exactly what shipped.
+            for id in &dlg.reset_colors {
+                self.config.account_colors.remove(id);
+            }
+
             for (idx, row) in dlg.rows.iter().enumerate() {
                 self.config
                     .profile_orders
                     .insert(row.profile_id.clone(), idx as u32);
+                // `profile_orders` is only projected onto `sort_order` by
+                // `accounts::merge_profiles`, which runs once from
+                // `AppConfig::load`. Without this the reorder is stored and
+                // takes effect at the *next* launch, so Save appeared to do
+                // nothing at all -- `profile_sort_key` reads `sort_order`.
+                if let Some(p) = self
+                    .config
+                    .profiles
+                    .iter_mut()
+                    .find(|p| p.profile_id == row.profile_id)
+                {
+                    p.sort_order = Some(idx as u32);
+                }
             }
 
             // Every editable row, not only the selected one -- someone can
             // edit three accounts before pressing Save, and only saving the
             // last-clicked one would discard the other two without a word.
+            let mut blank_names: Vec<String> = Vec::new();
             for row in dlg.rows.iter().filter(|r| r.identity_editable) {
                 let Some(p) = self
                     .config
@@ -14024,7 +14153,12 @@ mod gui {
                     continue;
                 };
                 let name = row.display_name.trim();
-                if !name.is_empty() {
+                if name.is_empty() {
+                    // The saved name is kept -- an account with no label is
+                    // unpickable in every dropdown. Said out loud, because a
+                    // cleared box that quietly reverts reads as a failed save.
+                    blank_names.push(row.profile_id.clone());
+                } else {
                     p.display_name = name.to_string();
                 }
                 let region = row.region.trim();
@@ -14036,12 +14170,24 @@ mod gui {
             }
 
             self.config.user_environments = dlg.environments.clone();
-            self.config.account_colors =
-                frozen_colors(&dlg.rows, &self.account_color_map, &dlg.colors);
 
             self.rebuild_account_colors();
-            let _ = self.config.save();
+            if let Err(err) = self.config.save() {
+                self.message = format!("error: manage accounts not saved: {err}");
+                self.log_error(self.message.clone());
+                return;
+            }
             self.log_info("manage accounts: saved");
+            if blank_names.is_empty() {
+                self.message = "Accounts saved.".to_string();
+            } else {
+                self.message = format!(
+                    "Accounts saved. An account name cannot be blank, so {} kept the \
+                     name it had.",
+                    blank_names.join(", ")
+                );
+                self.log_warn(self.message.clone());
+            }
         }
 
         /// Render the "File Browser Defaults" modal, if open. This is a
@@ -31692,6 +31838,7 @@ mod gui {
                                     selected: None,
                                     environments: self.config.user_environments.clone(),
                                     colors: self.config.account_colors.clone(),
+                                    reset_colors: HashSet::new(),
                                     error: None,
                                     new_env_name: String::new(),
                                     new_env_vault: String::new(),
@@ -35656,14 +35803,23 @@ mod gui {
     /// rather than re-derived from the rendered swatch, which would be a
     /// silent rewrite of the user's own hex; an account with nothing rendered
     /// yet contributes nothing, since a wrong frozen colour is permanent.
+    ///
+    /// `reset` is the escape hatch, and it has to be honoured **here**: the
+    /// freeze is otherwise one-way, since every rendered account gets an
+    /// explicit hex on the first Save and `current` still holds the colour the
+    /// user just asked to be rid of. An id in `reset` is dropped from the
+    /// result and never re-frozen, so "back to the automatic colour" means the
+    /// palette colour for the account's new position.
     fn frozen_colors(
         rows: &[ManageAccountRow],
         current: &HashMap<String, egui::Color32>,
         existing: &BTreeMap<String, String>,
+        reset: &HashSet<String>,
     ) -> BTreeMap<String, String> {
         let mut out = existing.clone();
+        out.retain(|id, _| !reset.contains(id));
         for row in rows {
-            if out.contains_key(&row.profile_id) {
+            if reset.contains(&row.profile_id) || out.contains_key(&row.profile_id) {
                 continue;
             }
             if let Some(color) = current.get(&row.profile_id) {
@@ -35679,9 +35835,16 @@ mod gui {
     /// separator in `account_env=`, so a name carrying one would come back
     /// truncated on the next load, and a duplicate spelling would be two rows
     /// for one environment since every match here is case-insensitive.
+    ///
+    /// `bundled` is the account's declarations from `accounts.json`, and a
+    /// collision with one of those is refused for a reason the user cannot
+    /// otherwise see: `environments_in_with_user` drops the duplicate row and
+    /// `vault_addr_in_with_user` prefers the declared address, so the entry
+    /// would sit in the dialog showing a Vault address nothing ever uses.
     fn environment_name_problem(
         name: &str,
         existing: &[UserEnvironment],
+        bundled: &[ec2_manager::accounts::AccountEnvironment],
         account_id: &str,
     ) -> Option<String> {
         let trimmed = name.trim();
@@ -35696,6 +35859,15 @@ mod gui {
                 && ec2_manager::script_env::env_eq(&e.name, trimmed)
         }) {
             return Some(format!("'{trimmed}' is already declared for this account."));
+        }
+        if bundled
+            .iter()
+            .any(|e| ec2_manager::script_env::env_eq(&e.name, trimmed))
+        {
+            return Some(format!(
+                "'{trimmed}' is built in for this account; its Vault address comes \
+                 from the application's own list and cannot be changed here."
+            ));
         }
         None
     }
@@ -48677,13 +48849,13 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         /// would be silently truncated on the next load.
         #[test]
         fn an_environment_name_cannot_contain_the_field_separator() {
-            let problem = environment_name_problem("DEV|1", &[], "111");
+            let problem = environment_name_problem("DEV|1", &[], &[], "111");
             assert!(problem.is_some_and(|p| p.contains('|')));
         }
 
         #[test]
         fn a_blank_environment_name_is_refused() {
-            assert!(environment_name_problem("   ", &[], "111").is_some());
+            assert!(environment_name_problem("   ", &[], &[], "111").is_some());
         }
 
         /// Environment names are matched case-insensitively everywhere else, so two
@@ -48691,14 +48863,14 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         #[test]
         fn a_duplicate_environment_name_is_refused_case_insensitively() {
             let existing = [ue("111", "DEV1")];
-            assert!(environment_name_problem("dev1", &existing, "111").is_some());
+            assert!(environment_name_problem("dev1", &existing, &[], "111").is_some());
         }
 
         /// The same name under a different account is a different environment.
         #[test]
         fn the_same_name_under_another_account_is_allowed() {
             let existing = [ue("111", "DEV1")];
-            assert!(environment_name_problem("DEV1", &existing, "999").is_none());
+            assert!(environment_name_problem("DEV1", &existing, &[], "999").is_none());
         }
 
         /// Palette colours are assigned by position, so without freezing, moving one
@@ -48725,7 +48897,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             current.insert("111".to_string(), egui::Color32::from_rgb(0x2e, 0xa0, 0x43));
             current.insert("999".to_string(), egui::Color32::from_rgb(0xc8, 0x28, 0x28));
 
-            let frozen = frozen_colors(&rows, &current, &BTreeMap::new());
+            let frozen = frozen_colors(&rows, &current, &BTreeMap::new(), &HashSet::new());
 
             assert_eq!(frozen.get("111").map(String::as_str), Some("#2ea043"));
             assert_eq!(frozen.get("999").map(String::as_str), Some("#c82828"));
@@ -48747,8 +48919,90 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let mut existing = BTreeMap::new();
             existing.insert("111".to_string(), "#ABCDEF".to_string());
 
-            let frozen = frozen_colors(&rows, &current, &existing);
+            let frozen = frozen_colors(&rows, &current, &existing, &HashSet::new());
             assert_eq!(frozen.get("111").map(String::as_str), Some("#ABCDEF"));
+        }
+
+        /// The bundled list already declares the name, so adding it again is a
+        /// row that shows a Vault address nothing will ever use:
+        /// `environments_in_with_user` drops the duplicate and
+        /// `vault_addr_in_with_user` prefers the declared address.
+        #[test]
+        fn an_environment_the_bundled_list_declares_is_refused() {
+            let bundled = [ec2_manager::accounts::AccountEnvironment {
+                name: "DEV1".to_string(),
+                vault_addr: Some("https://vault.dev1".to_string()),
+            }];
+            // Case-insensitively, like every other environment comparison.
+            let problem = environment_name_problem("dev1 ", &[], &bundled, "111");
+            assert!(
+                problem.is_some_and(|p| p.contains("built in")),
+                "a name the application already declares must be refused"
+            );
+            // A name it does not declare is still fine.
+            assert!(environment_name_problem("DEV9", &[], &bundled, "111").is_none());
+        }
+
+        /// Reset must genuinely put an account back on its automatic colour.
+        ///
+        /// Removing the entry from the working copy is not enough: the freeze
+        /// fills every row that has no entry from `account_color_map`, which
+        /// still holds the colour just reset, so the id came straight back with
+        /// the identical hex and Reset did nothing at all. And since one Save
+        /// makes every rendered account explicit, this is the only way back --
+        /// the "Reset All to Defaults" the retired Environment Colors submenu
+        /// carried went with it.
+        #[test]
+        fn a_reset_colour_is_not_re_frozen_and_the_stored_one_is_dropped() {
+            let rows = vec![ManageAccountRow {
+                profile_id: "111".to_string(),
+                display_name: "Dev".to_string(),
+                region: String::new(),
+                identity_editable: false,
+                arrangement_editable: true,
+            }];
+            let mut current = HashMap::new();
+            current.insert("111".to_string(), egui::Color32::from_rgb(0x2e, 0xa0, 0x43));
+            let mut existing = BTreeMap::new();
+            existing.insert("111".to_string(), "#ABCDEF".to_string());
+            let reset: HashSet<String> = ["111".to_string()].into_iter().collect();
+
+            let frozen = frozen_colors(&rows, &current, &existing, &reset);
+
+            assert!(
+                !frozen.contains_key("111"),
+                "Reset must drop the stored colour, not re-freeze the rendered one"
+            );
+        }
+
+        /// A reset on one account leaves every other account's freeze alone.
+        #[test]
+        fn a_reset_touches_only_the_account_it_was_pressed_on() {
+            let rows = vec![
+                ManageAccountRow {
+                    profile_id: "111".to_string(),
+                    display_name: "Dev".to_string(),
+                    region: String::new(),
+                    identity_editable: false,
+                    arrangement_editable: true,
+                },
+                ManageAccountRow {
+                    profile_id: "999".to_string(),
+                    display_name: "Sandbox".to_string(),
+                    region: String::new(),
+                    identity_editable: true,
+                    arrangement_editable: true,
+                },
+            ];
+            let mut current = HashMap::new();
+            current.insert("111".to_string(), egui::Color32::from_rgb(1, 2, 3));
+            current.insert("999".to_string(), egui::Color32::from_rgb(4, 5, 6));
+            let reset: HashSet<String> = ["111".to_string()].into_iter().collect();
+
+            let frozen = frozen_colors(&rows, &current, &BTreeMap::new(), &reset);
+
+            assert!(!frozen.contains_key("111"));
+            assert_eq!(frozen.get("999").map(String::as_str), Some("#040506"));
         }
 
         /// An account with no rendered colour yet contributes nothing rather than a
@@ -48762,7 +49016,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 identity_editable: false,
                 arrangement_editable: true,
             }];
-            let frozen = frozen_colors(&rows, &HashMap::new(), &BTreeMap::new());
+            let frozen = frozen_colors(&rows, &HashMap::new(), &BTreeMap::new(), &HashSet::new());
             assert!(frozen.is_empty());
         }
     }

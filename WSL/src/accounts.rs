@@ -117,35 +117,6 @@ fn environments_in(json: &str, account_id: &str) -> Vec<AccountEnvironment> {
         .unwrap_or_default()
 }
 
-/// Vault address for an environment: the environment's own value if it
-/// declares one, otherwise the account-level value, otherwise `None`.
-///
-/// Pass an empty `env` for accounts with no environment dimension (untagged
-/// instances) — that resolves straight to the account-level value.
-///
-/// `#[cfg(test)]`: superseded in production by [`vault_addr_in_with_user`],
-/// which does not call this — see that function's doc comment. Kept for its
-/// own tests, which pin the two-level precedence
-/// `vault_addr_in_with_user` must not collapse the wrong way.
-#[cfg(test)]
-fn vault_addr_in(json: &str, account_id: &str, env: &str) -> Option<String> {
-    let Ok(entries) = serde_json::from_str::<Vec<AccountEntry>>(json) else {
-        return None;
-    };
-    let entry = find_entry(&entries, account_id)?;
-    if !env.trim().is_empty() {
-        let from_env = entry
-            .environments
-            .as_ref()
-            .and_then(|envs| envs.iter().find(|e| env_eq(&e.name, env)))
-            .and_then(|e| non_blank(&e.vault_addr));
-        if from_env.is_some() {
-            return from_env;
-        }
-    }
-    non_blank(&entry.vault_addr)
-}
-
 /// [`environments_in`] unioned with the user's own declarations.
 ///
 /// Declared entries come first and keep their spelling and their Vault
@@ -180,11 +151,17 @@ fn environments_in_with_user(
 /// 3. the account-wide declared address,
 /// 4. nothing.
 ///
-/// **This deliberately does not call [`vault_addr_in`].** That function
-/// already collapses levels 1 and 3, so layering the user on top of it would
-/// put a user's *environment* address below the *account-wide* declaration --
-/// less specific beating more specific, and the opposite of the rule
-/// `vault_addr_env_level_beats_account_level` already pins.
+/// **All four levels are resolved here, in one pass.** There used to be a
+/// second, bundled-only resolver alongside this one; it collapsed levels 1
+/// and 3, so layering the user on top of it would have put a user's
+/// *environment* address below the *account-wide* declaration -- less
+/// specific beating more specific, and the opposite of the rule
+/// `vault_addr_env_level_beats_account_level` pins. That resolver was
+/// `#[cfg(test)]`, which made it worse than redundant: three of its tests
+/// pinned precedence rules nothing in production exercised, so this function
+/// could have broken any of them with the suite still green. It is gone, and
+/// those tests call this one with an empty user slice -- the precedence they
+/// pin is now the precedence production runs.
 ///
 /// Within a level the declared value wins, so a user entry supplies a missing
 /// address and never overrides a curated one. There is no user-side
@@ -396,7 +373,7 @@ mod tests {
     #[test]
     fn vault_addr_env_level_beats_account_level() {
         assert_eq!(
-            vault_addr_in(ENV_JSON, "111", "DEV1").as_deref(),
+            vault_addr_in_with_user(ENV_JSON, "111", "DEV1", &[]).as_deref(),
             Some("https://vault.dev1")
         );
     }
@@ -405,13 +382,13 @@ mod tests {
     fn vault_addr_falls_back_to_account_level() {
         // DEV2 declares no vault_addr of its own.
         assert_eq!(
-            vault_addr_in(ENV_JSON, "111", "DEV2").as_deref(),
+            vault_addr_in_with_user(ENV_JSON, "111", "DEV2", &[]).as_deref(),
             Some("https://vault.acct")
         );
         // An environment name that isn't declared at all still gets the
         // account-level value — it may have been discovered from a tag.
         assert_eq!(
-            vault_addr_in(ENV_JSON, "111", "DEV9").as_deref(),
+            vault_addr_in_with_user(ENV_JSON, "111", "DEV9", &[]).as_deref(),
             Some("https://vault.acct")
         );
     }
@@ -420,7 +397,7 @@ mod tests {
     fn vault_addr_matches_env_case_insensitively() {
         // accounts.json says "DEV1"; the MMODAL_ENV tag may say "dev1 ".
         assert_eq!(
-            vault_addr_in(ENV_JSON, "111", "dev1 ").as_deref(),
+            vault_addr_in_with_user(ENV_JSON, "111", "dev1 ", &[]).as_deref(),
             Some("https://vault.dev1")
         );
     }
@@ -429,20 +406,25 @@ mod tests {
     fn vault_addr_empty_env_uses_account_level() {
         // Untagged single-environment account: no env dimension at all.
         assert_eq!(
-            vault_addr_in(ENV_JSON, "222", "").as_deref(),
+            vault_addr_in_with_user(ENV_JSON, "222", "", &[]).as_deref(),
             Some("https://vault.prod")
         );
     }
 
     #[test]
     fn vault_addr_absent_yields_none() {
-        assert_eq!(vault_addr_in(r#"[{"label":"A","account_id":"1"}]"#, "1", ""), None);
+        assert_eq!(vault_addr_in_with_user(r#"[{"label":"A","account_id":"1"}]"#, "1", "", &[]), None);
         // Blank string is treated as absent, not as an empty address.
         assert_eq!(
-            vault_addr_in(r#"[{"label":"A","account_id":"1","vault_addr":"  "}]"#, "1", ""),
+            vault_addr_in_with_user(
+                r#"[{"label":"A","account_id":"1","vault_addr":"  "}]"#,
+                "1",
+                "",
+                &[]
+            ),
             None
         );
-        assert_eq!(vault_addr_in(ENV_JSON, "unknown", ""), None);
+        assert_eq!(vault_addr_in_with_user(ENV_JSON, "unknown", "", &[]), None);
     }
 
     #[test]
@@ -452,7 +434,7 @@ mod tests {
         let profiles = parse_accounts(json);
         assert_eq!(profiles.len(), 1);
         assert!(environments_in(json, "123").is_empty());
-        assert_eq!(vault_addr_in(json, "123", ""), None);
+        assert_eq!(vault_addr_in_with_user(json, "123", "", &[]), None);
     }
 
     #[test]

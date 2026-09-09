@@ -1192,7 +1192,23 @@ impl AppConfig {
             }
         }
 
-        for profile in &self.profiles {
+        // Only the user's own accounts. A bundled account written here would
+        // be read back by `merge_profiles` and kept even after it was dropped
+        // from `assets/accounts.json` -- resurrecting a retired account
+        // permanently, under its last-known label, where it shows in every
+        // dropdown and fails with credential errors that read as an auth
+        // problem. Skipping them also keeps a plaintext inventory of our AWS
+        // accounts out of `config.ini`, which is the same thing
+        // `accounts::remove_stale_accounts_file` exists to defend.
+        let bundled_ids: Vec<String> = accounts::load_accounts()
+            .into_iter()
+            .map(|p| p.profile_id)
+            .collect();
+        for profile in self
+            .profiles
+            .iter()
+            .filter(|p| !bundled_ids.contains(&p.profile_id))
+        {
             lines.push(format!(
                 "profile_name.{}={}",
                 profile.profile_id, profile.display_name
@@ -2129,6 +2145,61 @@ mod tests {
             .expect("the user's account must survive");
         assert_eq!(sandbox.display_name, "Sandbox");
         assert_eq!(sandbox.region.as_deref(), Some("eu-west-1"));
+    }
+
+    /// A bundled account must never be written back to `config.ini`.
+    ///
+    /// `to_text` used to write `profile_name.*` for every profile, which was
+    /// inert while `load` replaced the list wholesale. Now that
+    /// `merge_profiles` reads those entries back and keeps any id the bundled
+    /// list does not carry, an account retired from a future
+    /// `assets/accounts.json` would resurrect on every user's machine and
+    /// never go away.
+    #[test]
+    fn to_text_writes_user_accounts_and_never_bundled_ones() {
+        let bundled = crate::accounts::load_accounts();
+        assert!(
+            !bundled.is_empty(),
+            "the bundled list must not be empty, or this test asserts nothing"
+        );
+        let mut cfg = AppConfig::default();
+        cfg.profiles = bundled.clone();
+        cfg.profiles.push(ProfileConfig {
+            profile_id: "999999999999".to_string(),
+            display_name: "Sandbox".to_string(),
+            account_id: "999999999999".to_string(),
+            region: Some("eu-west-1".to_string()),
+            sort_order: None,
+            color: None,
+        });
+
+        let text = cfg.to_text();
+
+        assert!(
+            text.contains("profile_name.999999999999=Sandbox"),
+            "a user-only account must still round trip"
+        );
+        assert!(
+            text.contains("profile_region.999999999999=eu-west-1"),
+            "a user-only account's region must still round trip"
+        );
+        for b in &bundled {
+            assert!(
+                !text.contains(&format!("profile_name.{}=", b.profile_id)),
+                "bundled account {} must not be written back to config.ini",
+                b.profile_id
+            );
+            assert!(
+                !text.contains(&format!("profile_account_id.{}=", b.profile_id)),
+                "bundled account {} must not be written back to config.ini",
+                b.profile_id
+            );
+            assert!(
+                !text.contains(&format!("profile_region.{}=", b.profile_id)),
+                "bundled account {} must not be written back to config.ini",
+                b.profile_id
+            );
+        }
     }
 
     #[test]
