@@ -2297,6 +2297,26 @@ true but rarely looked at, and both stay searchable and in the detail view.
   twelve digits and can appear inside another field by coincidence; a
   substring match would either drop another account's cache or fail to drop
   the right one, and both failures are silent.
+- **The five-minute TTL is only an interval because something asks to be
+  woken at it.** `ensure_*` re-checks staleness every frame, but egui draws a
+  frame only when something happens — so on an idle window "refreshes every
+  five minutes" quietly meant "refreshes the next time you touch it".
+  `next_list_refresh` returns the SOONEST expiry among the pooled accounts and
+  the table requests a repaint at exactly that offset. One stale account is
+  reason enough to wake; waking early costs a frame, waking late costs the
+  refresh. This is the third time this exact mistake has been made here — see
+  the tunnel banner and the power status line.
+- **Entering a sub-tab refetches; staying on it does not.** `last_resource_tab`
+  is what tells the two apart, and it resets when the EC2 tab is shown so
+  coming back counts as entering. `RESOURCE_SELECT_FLOOR` (30s) keeps flipping
+  between Target Groups and Load Balancers free — with several accounts pooled
+  that would otherwise be a call per account per flip — while a deliberate
+  visit is still current.
+- **`expire_resource_lists` backdates the entry rather than removing it.**
+  Removing blanks the table until the reply lands, and a list that flashes
+  empty on every visit reads as "there is nothing here". It clears that key's
+  recorded failure at the same time: that is a cooldown, and it would
+  otherwise hold off the very refetch the user just asked for by clicking in.
 - **The resource caches are 5 minutes** (`RESOURCE_TTL`), not the
   inventory's 45 seconds. That one is short because the EC2 State column has
   to be current; a bucket does not change on that timescale. Each sub-tab

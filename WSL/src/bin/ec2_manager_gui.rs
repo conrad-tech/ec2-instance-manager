@@ -7851,6 +7851,10 @@ mod gui {
         lb_list_errors: HashMap<String, String>,
         lb_list_failures: HashMap<String, Instant>,
         lb_col_widths: HashMap<usize, f32>,
+        /// Which resource sub-tab was showing last frame, so entering one can
+        /// be told from staying on it. `None` while the EC2 tab is showing, so
+        /// coming back from it counts as entering.
+        last_resource_tab: Option<ResourceKind>,
         /// `resources.priority_target_groups`, read once at startup.
         ///
         /// There is **no `self.features`** on this struct: `App::new` holds
@@ -8691,6 +8695,7 @@ mod gui {
                 lb_list_errors: HashMap::new(),
                 lb_list_failures: HashMap::new(),
                 lb_col_widths: HashMap::new(),
+                last_resource_tab: None,
                 // `features` is the local in `App::new`, the same one
                 // `instance_power_enabled` below is resolved from.
                 tg_priority_patterns: features.resources.priority_target_groups.clone(),
@@ -23053,6 +23058,9 @@ mod gui {
                 self.render_resource_panel(ui, kind);
                 return;
             }
+            // Back on EC2, so the next resource sub-tab opened counts as
+            // entering rather than as staying.
+            self.last_resource_tab = None;
 
             egui::ScrollArea::both()
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
@@ -23749,6 +23757,14 @@ mod gui {
                 ui.label(sim_resource_note(kind));
                 return;
             }
+            // Entering a sub-tab means "show me what is true now". Staying
+            // on it does not, or every frame would refetch.
+            let entering = self.last_resource_tab != Some(kind);
+            self.last_resource_tab = Some(kind);
+            if entering {
+                self.expire_resource_lists(kind);
+            }
+
             match kind {
                 ResourceKind::TargetGroup => {
                     self.ensure_target_groups();
@@ -24046,6 +24062,54 @@ mod gui {
             }
         }
 
+        /// Mark one kind's cached lists stale, so the next `ensure_*` refetches.
+        ///
+        /// Backdated rather than removed, deliberately: removing the entry
+        /// blanks the table until the reply lands, and a list that flashes
+        /// empty on every visit reads as "there is nothing here". The rows stay
+        /// on screen and are replaced when the new ones arrive.
+        ///
+        /// A recorded failure is cleared at the same time. It is a cooldown, and
+        /// it would otherwise hold off the very refetch the user just asked for
+        /// by clicking into the tab.
+        fn expire_resource_lists(&mut self, kind: ResourceKind) {
+            let stale = match Instant::now().checked_sub(resources::RESOURCE_TTL) {
+                Some(t) => t,
+                // No monotonic clock far enough back — only reachable moments
+                // after boot. Leaving the entry fresh costs one skipped
+                // refresh, which is the harmless direction.
+                None => return,
+            };
+            let mode = self.options.mode.as_str().to_string();
+            let keys: Vec<String> = self
+                .resource_pool_accounts()
+                .iter()
+                .map(|a| a.cache_key(kind, &mode))
+                .collect();
+            for key in keys {
+                match kind {
+                    ResourceKind::TargetGroup => {
+                        if let Some((at, _)) = self.target_groups.get_mut(&key) {
+                            if selection_forces_refresh(at.elapsed(), RESOURCE_SELECT_FLOOR) {
+                                *at = stale;
+                                self.tg_list_failures.remove(&key);
+                            }
+                        }
+                    }
+                    ResourceKind::LoadBalancer => {
+                        if let Some((at, _)) = self.load_balancers.get_mut(&key) {
+                            if selection_forces_refresh(at.elapsed(), RESOURCE_SELECT_FLOOR) {
+                                *at = stale;
+                                self.lb_list_failures.remove(&key);
+                            }
+                        }
+                    }
+                    // The other three have no list yet.
+                    _ => {}
+                }
+            }
+        }
+
         /// Start a list fetch for any account whose load balancers are missing
         /// or stale.
         ///
@@ -24184,6 +24248,20 @@ mod gui {
 
             if !self.lb_list_loading.is_empty() {
                 ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
+
+            // Wake up when the oldest cached list goes stale, so the TTL is
+            // a real interval rather than something re-checked only when the
+            // window happens to redraw.
+            if let Some(due) = next_list_refresh(
+                self.current_load_balancer_keys()
+                    .iter()
+                    .filter_map(|k| self.load_balancers.get(k))
+                    .map(|(at, _)| at.elapsed()),
+                resources::RESOURCE_TTL,
+            ) {
+                ui.ctx()
+                    .request_repaint_after(due.max(Duration::from_millis(200)));
             }
 
             if rows.is_empty() {
@@ -24550,6 +24628,20 @@ mod gui {
                 || self.tg_health.values().any(|c| *c == HealthCell::InFlight)
             {
                 ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
+
+            // Wake up when the oldest cached list goes stale, so the TTL is
+            // a real interval rather than something re-checked only when the
+            // window happens to redraw.
+            if let Some(due) = next_list_refresh(
+                self.current_target_group_keys()
+                    .iter()
+                    .filter_map(|k| self.target_groups.get(k))
+                    .map(|(at, _)| at.elapsed()),
+                resources::RESOURCE_TTL,
+            ) {
+                ui.ctx()
+                    .request_repaint_after(due.max(Duration::from_millis(200)));
             }
 
             let error_detail = list_error_detail(&self.tg_list_errors);
@@ -34484,6 +34576,35 @@ mod gui {
     ///
     /// Pure and separate from the loop, because every way of getting it wrong
     /// is a subprocess storm rather than a wrong pixel.
+    /// How long until the soonest-expiring cached list goes stale.
+    ///
+    /// This is what makes the five-minute TTL an actual interval. `ensure_*`
+    /// re-checks the TTL on every frame, but egui only draws a frame when
+    /// something happens — so on an idle window nothing was re-checked until
+    /// the user moved the mouse, and "refreshes every five minutes" quietly
+    /// meant "refreshes next time you touch it". The caller asks for a repaint
+    /// at exactly this offset. Same mistake the tunnel banner and the power
+    /// status line each made and fixed.
+    ///
+    /// `None` when there is nothing cached: `ensure_*` fetches immediately in
+    /// that case and its own in-flight repaint takes over.
+    fn next_list_refresh(ages: impl Iterator<Item = Duration>, ttl: Duration) -> Option<Duration> {
+        ages.map(|age| ttl.saturating_sub(age)).min()
+    }
+
+    /// Does entering a sub-tab refetch, or is what is on screen recent enough?
+    ///
+    /// Selecting the tab should mean "show me what is true now", but with
+    /// several accounts pooled, flipping between Target Groups and Load
+    /// Balancers would otherwise cost a call per account per flip. The floor
+    /// keeps tab-flipping free while still making a deliberate visit current.
+    fn selection_forces_refresh(age: Duration, floor: Duration) -> bool {
+        age >= floor
+    }
+
+    /// The floor for `selection_forces_refresh`.
+    const RESOURCE_SELECT_FLOOR: Duration = Duration::from_secs(30);
+
     fn list_fetch_due(
         fresh: bool,
         in_flight: bool,
@@ -42135,6 +42256,65 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 "Could not list Target Groups: account 1111: not permitted; \
                  account 2222: throttled"
             );
+        }
+
+        /// The TTL only becomes an interval if something asks to be woken at
+        /// it.
+        ///
+        /// `ensure_*` re-checks staleness every frame, but egui draws a frame
+        /// only when something happens — so on an idle window "refreshes every
+        /// five minutes" quietly meant "refreshes next time you touch it". The
+        /// answer is the SOONEST expiry, not the average or the newest: one
+        /// stale account is reason enough to wake, and waking early costs a
+        /// frame while waking late costs the refresh.
+        #[test]
+        fn the_next_refresh_is_the_soonest_one_due() {
+            let ttl = Duration::from_secs(300);
+
+            // Several accounts, different ages: the oldest decides.
+            let ages = [
+                Duration::from_secs(10),
+                Duration::from_secs(280),
+                Duration::from_secs(100),
+            ];
+            assert_eq!(
+                next_list_refresh(ages.into_iter(), ttl),
+                Some(Duration::from_secs(20))
+            );
+
+            // Already past the TTL: due now, not a negative that would wrap.
+            let stale = [Duration::from_secs(400), Duration::from_secs(10)];
+            assert_eq!(
+                next_list_refresh(stale.into_iter(), ttl),
+                Some(Duration::ZERO)
+            );
+
+            // Nothing cached: `ensure_*` fetches immediately and its own
+            // in-flight repaint takes over, so there is nothing to schedule.
+            assert_eq!(next_list_refresh(std::iter::empty(), ttl), None);
+        }
+
+        /// Entering a sub-tab refetches, but flipping between two does not.
+        ///
+        /// "Select the tab" should mean "show me what is true now". With
+        /// several accounts pooled, though, flipping between Target Groups and
+        /// Load Balancers would cost a call per account per flip, so a short
+        /// floor keeps that free while a deliberate visit is still current.
+        #[test]
+        fn entering_a_tab_refetches_unless_it_was_just_looked_at() {
+            let floor = RESOURCE_SELECT_FLOOR;
+            // Just flipped away and back.
+            assert!(!selection_forces_refresh(Duration::from_secs(2), floor));
+            assert!(!selection_forces_refresh(
+                floor - Duration::from_millis(1),
+                floor
+            ));
+            // Exactly at the floor counts as due: the boundary belongs to the
+            // refresh, since the cost of one extra call is far below the cost
+            // of showing something stale as current.
+            assert!(selection_forces_refresh(floor, floor));
+            // A deliberate visit after doing something else.
+            assert!(selection_forces_refresh(Duration::from_secs(120), floor));
         }
 
         /// Closing a tab must leave the selection on the tab the user was
