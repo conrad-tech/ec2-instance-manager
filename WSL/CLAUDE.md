@@ -2288,10 +2288,23 @@ true but rarely looked at, and both stay searchable and in the detail view.
   `Waiting for credentials: <account>` in **amber**, its own line rather
   than folded into the red error banner — an expired session and a failed
   call are different problems, and the first resolves itself.
-- **Auth is read live from `profile_auth_infos`, never from the
-  `AwsContext`.** A context built while the session was good still carries
-  `AuthStatus::Ok` long after it expired, which is precisely how an expired
-  login went on being asked for target groups.
+- **Auth is read live from `profile_auth_infos`, keyed by PROFILE ID.**
+  `AwsContext.profile` is the AWS CLI profile *name*, which
+  `build_context_with_profile` resolves out of the id via
+  `find_profile_by_account_id`; `ProfileAuthInfo.profile_id` is the config's
+  id. **They are different strings**, and looking one up by the other matched
+  nothing, reported every account as expired, and took both resource tabs
+  dark — telling the user to renew credentials that were fine, while the EC2
+  inventory carried on because it resolves the id correctly. The selected
+  account's id is `selected_profile`; a pooled one's is the key its inventory
+  is cached under.
+- **An account whose profile cannot be resolved falls back to the context's
+  own status, never to "expired"** (`pool_account_is_authed`). The two errors
+  are not symmetric: guessing "authenticated" costs one refused call that the
+  error banner then names, while guessing "expired" hides the whole feature
+  and blames the user's credentials. The live answer is still preferred where
+  it resolves, because a context built while the session was good carries
+  `AuthStatus::Ok` long after it expired.
 - **What gets thrown away is decided by field, not substring**
   (`cache_key_is_for_account`, `arn_is_for_account`). An account id is
   twelve digits and can appear inside another field by coincidence; a

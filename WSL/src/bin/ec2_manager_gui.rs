@@ -24505,40 +24505,44 @@ mod gui {
         /// `instance_pool` uses for the EC2 table.
         fn resource_pool_accounts(&self) -> Vec<PoolAccount> {
             let mut out: Vec<PoolAccount> = Vec::new();
-            // The live answer, not the one baked into the context when it
-            // was built: a session that expired since then still carries
-            // `AuthStatus::Ok` in its `AwsContext`, which is exactly how an
-            // expired login went on being asked for target groups.
-            let authed_now = |profile: &str| -> bool {
+            let sim = self.options.mode == Mode::Sim;
+            // Looked up by PROFILE ID, which is not the same string as
+            // `AwsContext.profile`. That field is the AWS CLI profile *name*,
+            // which `build_context_with_profile` resolves out of the id via
+            // `find_profile_by_account_id`; `ProfileAuthInfo.profile_id` is the
+            // config's id. Looking one up by the other matched nothing, so
+            // every account read as expired and both resource tabs went dark
+            // while the EC2 inventory — which resolves it correctly — carried
+            // on working.
+            let live = |pid: Option<&str>| -> Option<AuthStatus> {
+                let pid = pid?;
                 self.profile_auth_infos
                     .iter()
-                    .find(|a| a.profile_id == profile)
-                    .map(|a| a.auth_status == AuthStatus::Ok)
-                    // Sim fakes its credentials, and an unknown profile is not
-                    // evidence of expiry.
-                    .unwrap_or(self.options.mode == Mode::Sim)
+                    .find(|a| a.profile_id == pid)
+                    .map(|a| a.auth_status)
             };
-            let mut push = |ctx: &AwsContext| {
+            let mut push = |pid: Option<&str>, ctx: &AwsContext| {
                 let account_id = ctx.account_id.clone().unwrap_or_default();
                 if account_id.is_empty() {
                     return;
                 }
                 if !out.iter().any(|a| a.account_id == account_id) {
                     out.push(PoolAccount {
-                        authed: self.options.mode == Mode::Sim
-                            || authed_now(&ctx.profile.to_string()),
+                        authed: pool_account_is_authed(live(pid), ctx.auth_status, sim),
                         profile: ctx.profile.to_string(),
                         account_id,
                         region: ctx.region.clone(),
                     });
                 }
             };
+            // The selected account's id is `selected_profile`; a pooled one's
+            // is the key its inventory is cached under. Neither is `ctx.profile`.
             if let Some(ctx) = &self.context {
-                push(ctx);
+                push(self.selected_profile.as_deref(), ctx);
             }
             for pid in &self.multi_account_ids {
                 if let Some((_, ctx)) = self.profile_inventory_cache.get(pid) {
-                    push(ctx);
+                    push(Some(pid.as_str()), ctx);
                 }
             }
             out
@@ -34449,6 +34453,32 @@ mod gui {
         }
     }
 
+    /// Is this pooled account's session usable right now?
+    ///
+    /// The live answer where the profile could be resolved, and the context's
+    /// own status where it could not — **never a bare `false`**. That default
+    /// is what took both resource tabs dark: the live lookup was being made
+    /// with the wrong string, found nothing every time, and reported every
+    /// account as expired while the EC2 inventory kept working. Unresolvable
+    /// is not evidence of expiry, and the two errors are not symmetric —
+    /// guessing "authenticated" costs one refused call that the error banner
+    /// then names, while guessing "expired" hides the whole feature and tells
+    /// the user to go and fix credentials that were never broken.
+    fn pool_account_is_authed(
+        live: Option<AuthStatus>,
+        context_status: AuthStatus,
+        sim: bool,
+    ) -> bool {
+        if sim {
+            // Sim fakes its credentials and makes no calls anyway.
+            return true;
+        }
+        match live {
+            Some(status) => status == AuthStatus::Ok,
+            None => context_status == AuthStatus::Ok,
+        }
+    }
+
     /// The note naming accounts whose credentials are not usable, if any.
     ///
     /// Its own line rather than folded into the error banner: "your session
@@ -42396,6 +42426,48 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert!(!arn_is_for_account(arn, "444455556666"));
             // The region sits one field earlier and must not match.
             assert!(!arn_is_for_account(arn, "us-east-1"));
+        }
+
+        /// An account whose profile cannot be resolved is NOT reported as
+        /// expired.
+        ///
+        /// This is the regression itself. The live lookup was being made with
+        /// `AwsContext.profile` — the AWS CLI profile *name* — against
+        /// `ProfileAuthInfo.profile_id`, the config's id. Two different
+        /// strings, so it matched nothing, fell through to a bare `false`, and
+        /// reported every account as expired: both resource tabs went dark and
+        /// told the user to renew credentials that were fine, while the EC2
+        /// inventory carried on because it resolves the id correctly.
+        ///
+        /// The two errors are not symmetric. Guessing "authenticated" costs one
+        /// refused call that the error banner then names; guessing "expired"
+        /// hides the whole feature and blames the user's credentials.
+        #[test]
+        fn an_unresolvable_profile_is_not_treated_as_expired() {
+            // Resolved: the live answer wins, in both directions.
+            assert!(pool_account_is_authed(
+                Some(AuthStatus::Ok),
+                AuthStatus::Expired,
+                false
+            ));
+            assert!(!pool_account_is_authed(
+                Some(AuthStatus::Expired),
+                AuthStatus::Ok,
+                false
+            ));
+
+            // Unresolved: fall back to the context rather than to "expired".
+            assert!(pool_account_is_authed(None, AuthStatus::Ok, false));
+            assert!(!pool_account_is_authed(None, AuthStatus::Expired, false));
+            assert!(!pool_account_is_authed(None, AuthStatus::Missing, false));
+
+            // Sim never asks anyone for credentials.
+            assert!(pool_account_is_authed(None, AuthStatus::Expired, true));
+            assert!(pool_account_is_authed(
+                Some(AuthStatus::Expired),
+                AuthStatus::Expired,
+                true
+            ));
         }
 
         /// An expired session is a wait, and says so in its own words.
