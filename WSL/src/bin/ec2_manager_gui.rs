@@ -193,7 +193,63 @@ mod gui {
         LoadBalancer(Box<LoadBalancer>),
     }
 
+    /// One EC2 instance's Details tab state.
+    ///
+    /// Per subject rather than per app: the tab strip keeps several details
+    /// open at once, so "the volumes" is a question about a tab, not about the
+    /// application.
+    #[derive(Clone, Debug, Default)]
+    struct InstanceDetailState {
+        volumes: Vec<VolumeInfo>,
+        volumes_loading: bool,
+        volumes_error: Option<String>,
+        iam_role: Option<String>,
+        security_groups: Vec<SecurityGroupInfo>,
+        security_groups_loading: bool,
+        security_groups_error: Option<String>,
+    }
+
+    /// One target group's Details tab state.
+    #[derive(Clone, Debug, Default)]
+    struct TgDetailState {
+        targets: Option<std::result::Result<Vec<Target>, String>>,
+        attributes: Option<std::result::Result<Vec<(String, String)>, String>>,
+        tags: Option<std::result::Result<Vec<(String, String)>, String>>,
+        /// The detail view's own filter over the target table — the global
+        /// search bar filters the *list*, and a group can hold hundreds.
+        filter: String,
+    }
+
+    /// One load balancer's Details tab state.
+    #[derive(Clone, Debug, Default)]
+    struct LbDetailState {
+        listeners: Option<std::result::Result<Vec<ListenerDetail>, String>>,
+        attributes: Option<std::result::Result<Vec<(String, String)>, String>>,
+        tags: Option<std::result::Result<Vec<(String, String)>, String>>,
+    }
+
     impl DetailSubject {
+        /// What identifies this subject, and what its fetched state is keyed
+        /// on. Stable for the life of the tab: an ARN or an instance id, never
+        /// the name, which the fetch can change under it.
+        fn key(&self) -> String {
+            match self {
+                DetailSubject::Instance(i) => i.instance_id.clone(),
+                DetailSubject::TargetGroup(tg) => tg.arn.clone(),
+                DetailSubject::LoadBalancer(lb) => lb.arn.clone(),
+            }
+        }
+
+        /// A word for the tab strip, so two tabs with similar names are still
+        /// tellable apart.
+        fn kind_label(&self) -> &'static str {
+            match self {
+                DetailSubject::Instance(_) => "EC2",
+                DetailSubject::TargetGroup(_) => "TG",
+                DetailSubject::LoadBalancer(_) => "LB",
+            }
+        }
+
         fn title(&self) -> String {
             match self {
                 DetailSubject::Instance(i) => {
@@ -534,6 +590,10 @@ mod gui {
         Exited { tab_id: u64, code: i32 },
         Error { tab_id: u64, error: String },
         VolumeResult {
+            /// Which instance this answers about. The Details strip keeps
+            /// several tabs open, so a reply that does not say whose it is
+            /// cannot be filed — it used to land in the one slot there was.
+            instance_id: String,
             volumes: std::result::Result<Vec<VolumeInfo>, String>,
             iam_role: Option<String>,
         },
@@ -541,6 +601,7 @@ mod gui {
         /// API calls needing different IAM permissions, and an account that
         /// can read one but not the other must still see what it can.
         SecurityGroupResult {
+            instance_id: String,
             groups: std::result::Result<Vec<SecurityGroupInfo>, String>,
         },
         /// One account's target group list landed. Separate from the health
@@ -7807,32 +7868,31 @@ mod gui {
         selected_saved_filter: String,
         selected_instance_id: String,
         /// Whatever the Details tab is showing — an instance or a target group.
-        detail_subject: Option<DetailSubject>,
+        /// The Details tab strip, in the order the tabs were opened.
+        ///
+        /// Session state and deliberately not persisted: a tab left open a
+        /// month ago is not what somebody wants greeting them, and the fetched
+        /// contents would be stale anyway. Closing the app clears them, which
+        /// is what `Close All` and each tab's ✖ do explicitly.
+        detail_tabs: Vec<DetailSubject>,
+        /// Which of `detail_tabs` is showing. Always a valid index while the
+        /// vec is non-empty — `close_detail` is what keeps that true.
+        detail_active: usize,
+        /// Fetched state per tab, keyed by `DetailSubject::key`.
+        instance_details: HashMap<String, InstanceDetailState>,
+        tg_details: HashMap<String, TgDetailState>,
+        lb_details: HashMap<String, LbDetailState>,
         /// The selected target group's registered targets and configuration,
         /// each on its own event — a role that can describe a group but not
         /// read its health, attributes or tags must still see what it can.
-        detail_tg_targets: Option<std::result::Result<Vec<Target>, String>>,
-        detail_tg_attributes: Option<std::result::Result<Vec<(String, String)>, String>>,
-        detail_tg_tags: Option<std::result::Result<Vec<(String, String)>, String>>,
         /// The detail view's own filter over the target table — the global
         /// search bar filters the *list*, and a group can hold hundreds of
         /// targets.
-        detail_tg_filter: String,
         /// The open load balancer's listeners, attributes and tags — each on
         /// its own event, so one refused permission does not blank the rest.
-        detail_lb_listeners: Option<std::result::Result<Vec<ListenerDetail>, String>>,
-        detail_lb_attributes: Option<std::result::Result<Vec<(String, String)>, String>>,
-        detail_lb_tags: Option<std::result::Result<Vec<(String, String)>, String>>,
         /// Volume info fetched for the Details tab
-        detail_volumes: Vec<VolumeInfo>,
-        detail_volumes_loading: bool,
-        detail_volumes_error: Option<String>,
         /// IAM role fetched for the Details tab
-        detail_iam_role: Option<String>,
         /// Security groups fetched for the Details tab
-        detail_security_groups: Vec<SecurityGroupInfo>,
-        detail_security_groups_loading: bool,
-        detail_security_groups_error: Option<String>,
         local_port: u16,
         remote_port: u16,
 
@@ -8641,21 +8701,11 @@ mod gui {
                 hidden_envs: initial_hidden_envs,
                 selected_saved_filter: String::new(),
                 selected_instance_id: String::new(),
-                detail_subject: None,
-                detail_tg_targets: None,
-                detail_tg_attributes: None,
-                detail_tg_tags: None,
-                detail_tg_filter: String::new(),
-                detail_lb_listeners: None,
-                detail_lb_attributes: None,
-                detail_lb_tags: None,
-                detail_volumes: Vec::new(),
-                detail_volumes_loading: false,
-                detail_volumes_error: None,
-                detail_iam_role: None,
-                detail_security_groups: Vec::new(),
-                detail_security_groups_loading: false,
-                detail_security_groups_error: None,
+                detail_tabs: Vec::new(),
+                detail_active: 0,
+                instance_details: HashMap::new(),
+                tg_details: HashMap::new(),
+                lb_details: HashMap::new(),
                 local_port: 2222,
                 remote_port: 22,
                 message: String::new(),
@@ -20291,31 +20341,67 @@ mod gui {
                             .append_line(tab_id, format!("[exit] code={code}"));
                         self.connections.set_running(tab_id, false);
                     }
-                    ProcEvent::VolumeResult { volumes, iam_role } => {
-                        self.detail_volumes_loading = false;
-                        self.detail_iam_role = iam_role;
-                        match volumes {
-                            Ok(vols) => {
-                                self.log_info(format!("fetched {} volumes", vols.len()));
-                                self.detail_volumes = vols;
-                            }
-                            Err(err) => {
-                                self.log_error(format!("volume fetch failed: {err}"));
-                                self.detail_volumes_error = Some(err);
+                    ProcEvent::VolumeResult {
+                        instance_id,
+                        volumes,
+                        iam_role,
+                    } => {
+                        // Filed against the tab that asked. A tab closed while
+                        // this was in flight simply has no entry, and
+                        // `or_default` would resurrect one — so only an open
+                        // tab is written to.
+                        // The log line is built here and written after the
+                        // borrow ends: `log_*` takes `&mut self`, and the entry
+                        // is already mutably borrowed out of the map.
+                        let mut note: Option<(bool, String)> = None;
+                        if let Some(st) = self.instance_details.get_mut(&instance_id) {
+                            st.volumes_loading = false;
+                            st.iam_role = iam_role;
+                            match volumes {
+                                Ok(vols) => {
+                                    note = Some((false, format!("fetched {} volumes", vols.len())));
+                                    st.volumes = vols;
+                                }
+                                Err(err) => {
+                                    note = Some((true, format!("volume fetch failed: {err}")));
+                                    st.volumes_error = Some(err);
+                                }
                             }
                         }
+                        match note {
+                            Some((true, msg)) => self.log_error(msg),
+                            Some((false, msg)) => self.log_info(msg),
+                            None => {}
+                        }
                     }
-                    ProcEvent::SecurityGroupResult { groups } => {
-                        self.detail_security_groups_loading = false;
-                        match groups {
-                            Ok(sgs) => {
-                                self.log_info(format!("fetched {} security group(s)", sgs.len()));
-                                self.detail_security_groups = sgs;
+                    ProcEvent::SecurityGroupResult {
+                        instance_id,
+                        groups,
+                    } => {
+                        let mut note: Option<(bool, String)> = None;
+                        if let Some(st) = self.instance_details.get_mut(&instance_id) {
+                            st.security_groups_loading = false;
+                            match groups {
+                                Ok(sgs) => {
+                                    note = Some((
+                                        false,
+                                        format!("fetched {} security group(s)", sgs.len()),
+                                    ));
+                                    st.security_groups = sgs;
+                                }
+                                Err(err) => {
+                                    note = Some((
+                                        true,
+                                        format!("security group fetch failed: {err}"),
+                                    ));
+                                    st.security_groups_error = Some(err);
+                                }
                             }
-                            Err(err) => {
-                                self.log_error(format!("security group fetch failed: {err}"));
-                                self.detail_security_groups_error = Some(err);
-                            }
+                        }
+                        match note {
+                            Some((true, msg)) => self.log_error(msg),
+                            Some((false, msg)) => self.log_info(msg),
+                            None => {}
                         }
                     }
                     ProcEvent::TargetGroupList {
@@ -20435,15 +20521,13 @@ mod gui {
                         account_id,
                         result,
                     } => {
-                        // Asked once, before the outcome is examined: *every*
-                        // outcome has to leave the detail view somewhere, and
-                        // only a reply for the group still on screen may move
-                        // it — a stale reply from one closed a moment ago must
-                        // not overwrite the one being read.
-                        let open = matches!(
-                            &self.detail_subject,
-                            Some(DetailSubject::TargetGroup(tg)) if tg.arn == arn
-                        );
+                        // A tab, not THE tab: several details are open at
+                        // once now, and a reply belongs to the one that asked
+                        // whether or not it is the one on screen. An absent
+                        // entry means that tab was closed while this was in
+                        // flight, and the reply is dropped rather than
+                        // resurrecting it.
+                        let open = self.tg_details.contains_key(&arn);
                         match result {
                             Ok(targets) => {
                                 self.tg_health.insert(
@@ -20454,7 +20538,8 @@ mod gui {
                                 // opening a group already on screen costs no
                                 // second call.
                                 if open {
-                                    self.detail_tg_targets = Some(Ok(targets.clone()));
+                                    self.tg_details.entry(arn.clone()).or_default().targets =
+                                        Some(Ok(targets.clone()));
                                 }
                                 self.tg_targets.insert(arn, targets);
                             }
@@ -20467,7 +20552,7 @@ mod gui {
                                 // renders `Denied`; the detail view must not be
                                 // the one place that disappears.
                                 if open {
-                                    self.detail_tg_targets =
+                                    self.tg_details.entry(arn.clone()).or_default().targets =
                                         Some(Err(detail_health_message(&err)));
                                 }
                                 match err {
@@ -20496,14 +20581,11 @@ mod gui {
                         }
                     }
                     ProcEvent::LoadBalancerListeners { arn, result } => {
-                        // Only while this load balancer is still the one on
-                        // screen: a reply for one closed a moment ago must not
-                        // overwrite the one being read.
-                        if matches!(
-                            &self.detail_subject,
-                            Some(DetailSubject::LoadBalancer(lb)) if lb.arn == arn
-                        ) {
-                            self.detail_lb_listeners = Some(result);
+                        // Only into a tab that still exists: a reply for one
+                        // closed while it was in flight is dropped rather than
+                        // resurrecting the tab's state.
+                        if let Some(st) = self.lb_details.get_mut(&arn) {
+                            st.listeners = Some(result);
                         }
                     }
                     ProcEvent::LoadBalancerDetail {
@@ -20511,15 +20593,12 @@ mod gui {
                         attributes,
                         tags,
                     } => {
-                        if matches!(
-                            &self.detail_subject,
-                            Some(DetailSubject::LoadBalancer(lb)) if lb.arn == arn
-                        ) {
+                        if let Some(st) = self.lb_details.get_mut(&arn) {
                             if let Some(attributes) = attributes {
-                                self.detail_lb_attributes = Some(attributes);
+                                st.attributes = Some(attributes);
                             }
                             if let Some(tags) = tags {
-                                self.detail_lb_tags = Some(tags);
+                                st.tags = Some(tags);
                             }
                         }
                     }
@@ -20528,23 +20607,18 @@ mod gui {
                         attributes,
                         tags,
                     } => {
-                        // Only apply to the group still on screen: a stale
-                        // reply from a group closed a moment ago must not
-                        // overwrite the one being read.
-                        let open = matches!(
-                            &self.detail_subject,
-                            Some(DetailSubject::TargetGroup(tg)) if tg.arn == arn
-                        );
-                        if open {
+                        // Only into a tab that still exists — a reply for
+                        // one closed while it was in flight is dropped.
+                        if let Some(st) = self.tg_details.get_mut(&arn) {
                             // Whichever the message actually carries, and
                             // only that one. Not an if/else on `tags`: the
                             // two fields are independent answers, and a
                             // message that grew both would apply both.
                             if let Some(attributes) = attributes {
-                                self.detail_tg_attributes = Some(attributes);
+                                st.attributes = Some(attributes);
                             }
                             if let Some(tags) = tags {
-                                self.detail_tg_tags = Some(tags);
+                                st.tags = Some(tags);
                             }
                         }
                     }
@@ -23053,6 +23127,11 @@ mod gui {
                         let account_scope = self.account_scope();
                         let region_scope = self.region_scope();
                         let mut pending_connect: Option<String> = None;
+                        // Opening a Details tab is a `&mut self` call and the
+                        // loop below borrows `self.filtered`, so it is applied
+                        // after the grid — the same shape as every other
+                        // `pending_*` here.
+                        let mut pending_detail_tab: Option<DetailSubject> = None;
                         let mut pending_open_vscode: Option<Instance> = None;
                         let mut pending_power: Option<(Instance, PowerAction)> = None;
                         // Read out of `self` before the grid closure, which
@@ -23408,17 +23487,26 @@ mod gui {
                                 });
                                 if ui.button("See Details").clicked() {
                                     let iid = see_details_instance.instance_id.clone();
-                                    self.detail_subject = Some(DetailSubject::Instance(Box::new(
+                                    // Deferred to after the row loop, which
+                                    // holds `self.filtered` borrowed: a
+                                    // `&mut self` call here does not compile,
+                                    // which is the same constraint the comment
+                                    // below records about `context_for_instance`.
+                                    pending_detail_tab = Some(DetailSubject::Instance(Box::new(
                                         see_details_instance.clone(),
                                     )));
-                                    self.detail_volumes.clear();
-                                    self.detail_volumes_error = None;
-                                    self.detail_volumes_loading = true;
-                                    self.detail_iam_role = None;
-                                    self.detail_security_groups.clear();
-                                    self.detail_security_groups_error = None;
-                                    self.detail_security_groups_loading = true;
-                                    self.main_tab = MainTab::Details;
+                                    // A fresh state for this tab. Re-opening an
+                                    // instance whose tab is already there
+                                    // refetches, which is what clicking again
+                                    // is for.
+                                    self.instance_details.insert(
+                                        iid.clone(),
+                                        InstanceDetailState {
+                                            volumes_loading: true,
+                                            security_groups_loading: true,
+                                            ..Default::default()
+                                        },
+                                    );
                                     // Fetch volumes in background.
                                     // Deliberately not `context_for_instance`:
                                     // this closure already borrows `self`
@@ -23438,20 +23526,32 @@ mod gui {
                                                 fetch_instance_extras(&ctx.profile, &ctx.region, &iid);
                                             // Volumes first: they are the cheaper
                                             // call and the panel fills top-down.
-                                            let _ = tx.send(ProcEvent::VolumeResult { volumes: result, iam_role: iam });
+                                            let _ = tx.send(ProcEvent::VolumeResult {
+                                                instance_id: iid.clone(),
+                                                volumes: result,
+                                                iam_role: iam,
+                                            });
                                             let groups =
                                                 fetch_security_groups(&ctx.profile, &ctx.region, &sg_ids);
-                                            let _ = tx.send(ProcEvent::SecurityGroupResult { groups });
+                                            let _ = tx.send(ProcEvent::SecurityGroupResult {
+                                                instance_id: iid,
+                                                groups,
+                                            });
                                         });
                                     } else {
                                         // No account context for this instance, so
                                         // nothing will ever post a result: say so
                                         // rather than spin forever.
-                                        self.detail_volumes_loading = false;
-                                        self.detail_security_groups_loading = false;
-                                        let err = "no AWS context for this instance".to_string();
-                                        self.detail_volumes_error = Some(err.clone());
-                                        self.detail_security_groups_error = Some(err);
+                                        // Nothing will ever post a result,
+                                        // so say so rather than spin forever.
+                                        let err =
+                                            "no AWS context for this instance".to_string();
+                                        if let Some(st) = self.instance_details.get_mut(&iid) {
+                                            st.volumes_loading = false;
+                                            st.security_groups_loading = false;
+                                            st.volumes_error = Some(err.clone());
+                                            st.security_groups_error = Some(err);
+                                        }
                                     }
                                     ui.close();
                                 }
@@ -23556,6 +23656,11 @@ mod gui {
                             self.request_instance_power(&instance, action);
                         }
 
+                        // Applied after the grid, for the reason it was
+                        // collected there: the loop holds `self.filtered`.
+                        if let Some(subject) = pending_detail_tab {
+                            self.focus_detail_tab(subject);
+                        }
                         if let Some(instance_id) = pending_fav_toggle {
                             let enabled = self.config.toggle_favorite(
                                 &account_scope,
@@ -23666,10 +23771,9 @@ mod gui {
         /// event, so a token that can read one and not another leaves the rest
         /// of the panel readable.
         fn open_load_balancer_details(&mut self, lb: LoadBalancer) {
-            self.detail_lb_listeners = None;
-            self.detail_lb_attributes = None;
-            self.detail_lb_tags = None;
-            self.main_tab = MainTab::Details;
+            // A fresh state for this tab; re-opening refetches.
+            self.lb_details
+                .insert(lb.arn.clone(), LbDetailState::default());
 
             let pool = self
                 .resource_pool_accounts()
@@ -23679,10 +23783,12 @@ mod gui {
                 // No context for this account, so nothing will ever post a
                 // result: say so rather than spin on three spinners forever.
                 let err = format!("no AWS context for account {}", lb.account_id);
-                self.detail_lb_listeners = Some(Err(err.clone()));
-                self.detail_lb_attributes = Some(Err(err.clone()));
-                self.detail_lb_tags = Some(Err(err));
-                self.detail_subject = Some(DetailSubject::LoadBalancer(Box::new(lb)));
+                if let Some(st) = self.lb_details.get_mut(&lb.arn) {
+                    st.listeners = Some(Err(err.clone()));
+                    st.attributes = Some(Err(err.clone()));
+                    st.tags = Some(Err(err));
+                }
+                self.focus_detail_tab(DetailSubject::LoadBalancer(Box::new(lb)));
                 return;
             };
 
@@ -23742,7 +23848,7 @@ mod gui {
                 }
             });
 
-            self.detail_subject = Some(DetailSubject::LoadBalancer(Box::new(lb)));
+            self.focus_detail_tab(DetailSubject::LoadBalancer(Box::new(lb)));
         }
 
         fn render_load_balancer_details(
@@ -23751,22 +23857,32 @@ mod gui {
             lb: LoadBalancer,
             title: &str,
         ) {
+            // Set by this panel's own Close button and acted on at the end:
+            // closing mid-render would drop the very state the rest of this
+            // function is still reading.
+            let mut close_active = false;
+            let st = self.lb_details.get(&lb.arn).cloned().unwrap_or_default();
             ui.horizontal(|ui| {
                 ui.heading(title);
                 if ui.button("Copy All").clicked() {
                     let text = load_balancer_detail_text(
                         &lb,
-                        &self.detail_lb_listeners,
-                        &self.detail_lb_attributes,
-                        &self.detail_lb_tags,
+                        &st.listeners,
+                        &st.attributes,
+                        &st.tags,
                     );
                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
                         let _ = clipboard.set_text(&text);
                     }
                 }
-                if ui.button("Close").clicked() {
-                    self.detail_subject = None;
-                    self.main_tab = MainTab::Inventory;
+                if ui
+                    .button("Close")
+                    .on_hover_text("Close this tab")
+                    .clicked()
+                {
+                    // The panel being rendered is the active tab, so this and
+                    // the strip's ✖ close the same thing.
+                    close_active = true;
                 }
             });
             ui.separator();
@@ -23841,7 +23957,7 @@ mod gui {
                 ui.add_space(12.0);
                 ui.heading("Listeners");
                 ui.separator();
-                match &self.detail_lb_listeners {
+                match &st.listeners {
                     None => {
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -23917,13 +24033,17 @@ mod gui {
                 ui.add_space(12.0);
                 ui.heading("Attributes");
                 ui.separator();
-                render_pairs(ui, "lb_attrs_grid", &self.detail_lb_attributes);
+                render_pairs(ui, "lb_attrs_grid", &st.attributes);
 
                 ui.add_space(12.0);
                 ui.heading("Tags");
                 ui.separator();
-                render_pairs(ui, "lb_tags_grid", &self.detail_lb_tags);
+                render_pairs(ui, "lb_tags_grid", &st.tags);
             });
+
+            if close_active {
+                self.close_detail_tab(self.detail_active);
+            }
         }
 
         /// Start a list fetch for any account whose load balancers are missing
@@ -24852,21 +24972,28 @@ mod gui {
         /// Health is reused from the table where the row has already been
         /// answered — opening a group you can see costs no second call.
         fn open_target_group_details(&mut self, tg: TargetGroup) {
-            self.detail_tg_attributes = None;
-            self.detail_tg_tags = None;
-            self.detail_tg_filter.clear();
-            self.detail_tg_targets = self.tg_targets.get(&tg.arn).cloned().map(Ok);
+            // A fresh state for this tab, seeded with whatever the table
+            // already knows: opening a group whose health is cached costs no
+            // second call.
+            self.tg_details.insert(
+                tg.arn.clone(),
+                TgDetailState {
+                    targets: self.tg_targets.get(&tg.arn).cloned().map(Ok),
+                    ..Default::default()
+                },
+            );
+            let seeded = self.tg_details[&tg.arn].targets.is_some();
             // An account that has already refused DescribeTargetHealth will
             // refuse again, and the warn line is rate-limited by that set's
             // own `insert` — so a second call would fail in silence and the
             // only symptom would be a Targets section that never ends. Say so
             // here instead. The attributes and tags calls are separate
             // permissions and still run.
-            if self.detail_tg_targets.is_none() && self.tg_denied_accounts.contains(&tg.account_id)
+            if !seeded && self.tg_denied_accounts.contains(&tg.account_id)
             {
-                self.detail_tg_targets = Some(Err(detail_health_message(&FetchError::Denied)));
+                self.tg_details.entry(tg.arn.clone()).or_default().targets =
+                    Some(Err(detail_health_message(&FetchError::Denied)));
             }
-            self.main_tab = MainTab::Details;
 
             // The group's *own* account's profile and region. Taking the
             // region from the selected context aims every detail call for a
@@ -24884,12 +25011,14 @@ mod gui {
                 // No context for this account, so nothing will ever post a
                 // result: say so rather than spin forever.
                 let err = format!("no AWS context for account {}", tg.account_id);
-                self.detail_tg_attributes = Some(Err(err.clone()));
-                self.detail_tg_tags = Some(Err(err.clone()));
-                if self.detail_tg_targets.is_none() {
-                    self.detail_tg_targets = Some(Err(err));
+                if let Some(st) = self.tg_details.get_mut(&tg.arn) {
+                    st.attributes = Some(Err(err.clone()));
+                    st.tags = Some(Err(err.clone()));
+                    if st.targets.is_none() {
+                        st.targets = Some(Err(err));
+                    }
                 }
-                self.detail_subject = Some(DetailSubject::TargetGroup(Box::new(tg)));
+                self.focus_detail_tab(DetailSubject::TargetGroup(Box::new(tg)));
                 return;
             };
 
@@ -24897,7 +25026,11 @@ mod gui {
             // that fills this panel, so opening the row must not start a
             // second one for the same group.
             let health_in_flight = self.tg_health.get(&tg.arn) == Some(&HealthCell::InFlight);
-            let need_health = self.detail_tg_targets.is_none() && !health_in_flight;
+            let need_health = self
+                .tg_details
+                .get(&tg.arn)
+                .is_none_or(|st| st.targets.is_none())
+                && !health_in_flight;
             if need_health {
                 // Claimed *before* the spawn, the rule `spawn_health_requests`
                 // already follows: two claims landing together would otherwise
@@ -24939,7 +25072,7 @@ mod gui {
                 }
             });
 
-            self.detail_subject = Some(DetailSubject::TargetGroup(Box::new(tg)));
+            self.focus_detail_tab(DetailSubject::TargetGroup(Box::new(tg)));
         }
 
         fn render_target_group_details(
@@ -24948,6 +25081,15 @@ mod gui {
             tg: TargetGroup,
             title: &str,
         ) {
+            // Set by this panel's own Close button and acted on at the end:
+            // closing mid-render would drop the very state the rest of this
+            // function is still reading.
+            let mut close_active = false;
+            let key = tg.arn.clone();
+            let st = self.tg_details.get(&key).cloned().unwrap_or_default();
+            // The filter box writes back at the end: the state is cloned out of
+            // the map so the panel can borrow `self` freely while rendering.
+            let mut filter = st.filter.clone();
             ui.horizontal(|ui| {
                 ui.heading(title);
                 // The Details tab carries Copy All whatever it is showing, and
@@ -24955,17 +25097,22 @@ mod gui {
                 if ui.button("Copy All").clicked() {
                     let text = target_group_detail_text(
                         &tg,
-                        &self.detail_tg_targets,
-                        &self.detail_tg_attributes,
-                        &self.detail_tg_tags,
+                        &st.targets,
+                        &st.attributes,
+                        &st.tags,
                     );
                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
                         let _ = clipboard.set_text(&text);
                     }
                 }
-                if ui.button("Close").clicked() {
-                    self.detail_subject = None;
-                    self.main_tab = MainTab::Inventory;
+                if ui
+                    .button("Close")
+                    .on_hover_text("Close this tab")
+                    .clicked()
+                {
+                    // The panel being rendered is the active tab, so this and
+                    // the strip's ✖ close the same thing.
+                    close_active = true;
                 }
             });
             ui.separator();
@@ -25048,9 +25195,9 @@ mod gui {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Filter");
-                    ui.text_edit_singleline(&mut self.detail_tg_filter);
+                    ui.text_edit_singleline(&mut filter);
                 });
-                match &self.detail_tg_targets {
+                match &st.targets {
                     None => {
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -25064,7 +25211,7 @@ mod gui {
                         ui.label("No targets registered");
                     }
                     Some(Ok(targets)) => {
-                        let needle = self.detail_tg_filter.to_ascii_lowercase();
+                        let needle = filter.to_ascii_lowercase();
                         egui::Grid::new("tg_targets_grid")
                             .num_columns(5)
                             .spacing([12.0, 4.0])
@@ -25101,13 +25248,24 @@ mod gui {
                 ui.add_space(12.0);
                 ui.heading("Attributes");
                 ui.separator();
-                render_pairs(ui, "tg_attrs_grid", &self.detail_tg_attributes);
+                render_pairs(ui, "tg_attrs_grid", &st.attributes);
 
                 ui.add_space(12.0);
                 ui.heading("Tags");
                 ui.separator();
-                render_pairs(ui, "tg_tags_grid", &self.detail_tg_tags);
+                render_pairs(ui, "tg_tags_grid", &st.tags);
             });
+
+            // The filter box is the one piece of tab state the panel itself
+            // changes, so it goes back into the map. Without this, typing in it
+            // would be forgotten the moment anything else redrew.
+            if filter != st.filter {
+                self.tg_details.entry(key).or_default().filter = filter;
+            }
+
+            if close_active {
+                self.close_detail_tab(self.detail_active);
+            }
         }
 
         fn render_connections_panel(&mut self, ui: &mut egui::Ui) {
@@ -27167,31 +27325,159 @@ mod gui {
             }
         }
 
-        fn render_details_panel(&mut self, ui: &mut egui::Ui) {
-            match self.detail_subject.clone() {
-                None => {
-                    ui.label("Nothing selected. Right-click a row and choose 'See Details'.");
+        /// Open a subject in the Details tab strip, or bring its tab
+        /// forward if it is already open.
+        ///
+        /// Re-opening the same subject must NOT stack a second tab: clicking a
+        /// row twice is how people check they clicked the right one, and a
+        /// strip that grows on every click is a strip nobody keeps tidy. The
+        /// caller still refetches, which is the point of clicking again.
+        fn focus_detail_tab(&mut self, subject: DetailSubject) {
+            let key = subject.key();
+            if let Some(idx) = self.detail_tabs.iter().position(|t| t.key() == key) {
+                self.detail_tabs[idx] = subject;
+                self.detail_active = idx;
+            } else {
+                self.detail_tabs.push(subject);
+                self.detail_active = self.detail_tabs.len() - 1;
+            }
+            self.main_tab = MainTab::Details;
+        }
+
+        /// Close one tab and forget everything fetched for it.
+        ///
+        /// Dropping the state is the point: these tabs hold a whole account's
+        /// worth of targets, listeners and rules, and a strip somebody has been
+        /// opening and closing all afternoon would otherwise keep every one of
+        /// them alive for the life of the process.
+        fn close_detail_tab(&mut self, idx: usize) {
+            if idx >= self.detail_tabs.len() {
+                return;
+            }
+            let subject = self.detail_tabs.remove(idx);
+            let key = subject.key();
+            match subject {
+                DetailSubject::Instance(_) => {
+                    self.instance_details.remove(&key);
                 }
-                // The heading is `DetailSubject::title` for either subject, so
-                // one rule names them and the two panels cannot drift.
-                Some(subject) => {
-                    let title = subject.title();
-                    match subject {
-                        DetailSubject::Instance(instance) => {
-                            self.render_instance_details(ui, *instance, &title);
-                        }
-                        DetailSubject::TargetGroup(tg) => {
-                            self.render_target_group_details(ui, *tg, &title);
-                        }
-                        DetailSubject::LoadBalancer(lb) => {
-                            self.render_load_balancer_details(ui, *lb, &title);
-                        }
+                DetailSubject::TargetGroup(_) => {
+                    self.tg_details.remove(&key);
+                }
+                DetailSubject::LoadBalancer(_) => {
+                    self.lb_details.remove(&key);
+                }
+            }
+            // Keep the active index inside the vec. Closing the tab left of the
+            // active one would otherwise slide a different tab under the
+            // selection, and closing the last one would index past the end.
+            if self.detail_tabs.is_empty() {
+                self.detail_active = 0;
+                self.main_tab = MainTab::Inventory;
+            } else if self.detail_active >= self.detail_tabs.len() {
+                self.detail_active = self.detail_tabs.len() - 1;
+            } else if idx < self.detail_active {
+                self.detail_active -= 1;
+            }
+        }
+
+        fn close_all_detail_tabs(&mut self) {
+            self.detail_tabs.clear();
+            self.detail_active = 0;
+            self.instance_details.clear();
+            self.tg_details.clear();
+            self.lb_details.clear();
+            self.main_tab = MainTab::Inventory;
+        }
+
+        fn render_details_panel(&mut self, ui: &mut egui::Ui) {
+            if self.detail_tabs.is_empty() {
+                ui.label("Nothing selected. Click a row, or right-click it and choose 'See Details'.");
+                return;
+            }
+
+            // The tab strip, in the order the tabs were opened. Several
+            // subjects stay open at once — the Connections page's shape,
+            // because the question people ask of this page is "how does this
+            // one compare with that one", which one slot cannot answer.
+            let mut close: Option<usize> = None;
+            let mut close_all = false;
+            let mut select: Option<usize> = None;
+            let active = self.detail_active.min(self.detail_tabs.len() - 1);
+
+            ui.horizontal_wrapped(|ui| {
+                for (idx, subject) in self.detail_tabs.iter().enumerate() {
+                    // The kind prefix earns its place: a target group and the
+                    // load balancer in front of it are routinely named the
+                    // same thing, and two identical tabs are worse than none.
+                    let label = format!("{}: {}", subject.kind_label(), subject.title());
+                    if ui.selectable_label(idx == active, label).clicked() {
+                        select = Some(idx);
                     }
+                    if ui
+                        .small_button("✖")
+                        .on_hover_text("Close this tab")
+                        .clicked()
+                    {
+                        close = Some(idx);
+                    }
+                    ui.separator();
+                }
+                if self.detail_tabs.len() > 1
+                    && ui
+                        .button("Close All")
+                        .on_hover_text("Close every open detail tab")
+                        .clicked()
+                {
+                    close_all = true;
+                }
+            });
+            ui.separator();
+
+            // Applied after the strip is drawn, never during: the loop borrows
+            // `self.detail_tabs`, and closing a tab inside it would be mutating
+            // the thing being iterated.
+            if close_all {
+                self.close_all_detail_tabs();
+                return;
+            }
+            if let Some(idx) = close {
+                self.close_detail_tab(idx);
+                return;
+            }
+            if let Some(idx) = select {
+                self.detail_active = idx;
+            }
+            self.detail_active = self.detail_active.min(self.detail_tabs.len() - 1);
+
+            // The heading is `DetailSubject::title` for every subject, so one
+            // rule names them and the panels cannot drift.
+            let subject = self.detail_tabs[self.detail_active].clone();
+            let title = subject.title();
+            match subject {
+                DetailSubject::Instance(instance) => {
+                    self.render_instance_details(ui, *instance, &title);
+                }
+                DetailSubject::TargetGroup(tg) => {
+                    self.render_target_group_details(ui, *tg, &title);
+                }
+                DetailSubject::LoadBalancer(lb) => {
+                    self.render_load_balancer_details(ui, *lb, &title);
                 }
             }
         }
 
         fn render_instance_details(&mut self, ui: &mut egui::Ui, instance: Instance, title: &str) {
+            // Set by this panel's own Close button and acted on at the end:
+            // closing mid-render would drop the very state the rest of this
+            // function is still reading.
+            let mut close_active = false;
+            // This tab's own state, not the app's: several details can be
+            // open at once, so "the volumes" is a question about a tab.
+            let st = self
+                .instance_details
+                .get(&instance.instance_id)
+                .cloned()
+                .unwrap_or_default();
             ui.horizontal(|ui| {
                 ui.heading(title);
                 if ui.button("Copy All").clicked() {
@@ -27205,20 +27491,20 @@ mod gui {
                     text.push_str(&format!("Private DNS: {}\n", instance.private_dns.as_deref().unwrap_or("-")));
                     text.push_str(&format!("AZ: {}\n", instance.az.as_deref().unwrap_or("-")));
                     text.push_str(&format!("Environment: {}\n", instance_env(&instance).unwrap_or_else(|| "-".to_string())));
-                    text.push_str(&format!("IAM Role: {}\n", self.detail_iam_role.as_deref().unwrap_or("-")));
+                    text.push_str(&format!("IAM Role: {}\n", st.iam_role.as_deref().unwrap_or("-")));
                     text.push_str(&format!("ASG: {}\n", instance.asg.as_deref().unwrap_or("-")));
                     text.push_str(&format!("SSM Managed: {}\n", if instance.ssm_managed { "Yes" } else { "No" }));
                     text.push_str(&format!("Launch Time: {}\n", instance.launch_time.as_deref().map(format_aws_time_local).unwrap_or_else(|| "-".to_string())));
-                    if !self.detail_volumes.is_empty() {
+                    if !st.volumes.is_empty() {
                         text.push_str("\nVolumes:\n");
-                        for vol in &self.detail_volumes {
+                        for vol in &st.volumes {
                             text.push_str(&format!("  {} | {} | {} | {} | {} | {}\n",
                                 vol.volume_id, vol.size_gb, vol.volume_type, vol.device, vol.state, format_aws_time_local(&vol.attach_time)));
                         }
                     }
-                    if !self.detail_security_groups.is_empty() {
+                    if !st.security_groups.is_empty() {
                         text.push_str("\nSecurity Groups:\n");
-                        for sg in &self.detail_security_groups {
+                        for sg in &st.security_groups {
                             text.push_str(&format!("  {} ({})", sg.group_name, sg.group_id));
                             if !sg.description.is_empty() {
                                 text.push_str(&format!(" - {}", sg.description));
@@ -27253,9 +27539,14 @@ mod gui {
                         let _ = clipboard.set_text(&text);
                     }
                 }
-                if ui.button("Close").clicked() {
-                    self.detail_subject = None;
-                    self.main_tab = MainTab::Inventory;
+                if ui
+                    .button("Close")
+                    .on_hover_text("Close this tab")
+                    .clicked()
+                {
+                    // The panel being rendered is the active tab, so this and
+                    // the strip's ✖ close the same thing.
+                    close_active = true;
                 }
             });
             ui.separator();
@@ -27280,8 +27571,8 @@ mod gui {
                         row(ui, "Private DNS", instance.private_dns.as_deref().unwrap_or("-"));
                         row(ui, "Availability Zone", instance.az.as_deref().unwrap_or("-"));
                         row(ui, "Environment", &instance_env(&instance).unwrap_or_else(|| "-".to_string()));
-                        row(ui, "IAM Role", self.detail_iam_role.as_deref().unwrap_or(
-                            if self.detail_volumes_loading { "loading..." } else { "-" }
+                        row(ui, "IAM Role", st.iam_role.as_deref().unwrap_or(
+                            if st.volumes_loading { "loading..." } else { "-" }
                         ));
                         row(ui, "Auto Scaling Group", instance.asg.as_deref().unwrap_or("-"));
                         row(ui, "SSM Managed", if instance.ssm_managed { "Yes" } else { "No" });
@@ -27310,14 +27601,14 @@ mod gui {
                 ui.add_space(12.0);
                 ui.heading("Volumes");
                 ui.separator();
-                if self.detail_volumes_loading {
+                if st.volumes_loading {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label("Fetching volumes...");
                     });
-                } else if let Some(err) = &self.detail_volumes_error {
+                } else if let Some(err) = &st.volumes_error {
                     note_label(ui, egui::Color32::RED, format!("Error: {err}"));
-                } else if self.detail_volumes.is_empty() {
+                } else if st.volumes.is_empty() {
                     ui.label("No volumes found");
                 } else {
                     egui::Grid::new("detail_volumes_grid")
@@ -27332,7 +27623,7 @@ mod gui {
                             ui.strong("State");
                             ui.strong("Attached");
                             ui.end_row();
-                            for vol in &self.detail_volumes {
+                            for vol in &st.volumes {
                                 ui.label(&vol.volume_id);
                                 ui.label(&vol.size_gb);
                                 ui.label(&vol.volume_type);
@@ -27348,17 +27639,17 @@ mod gui {
                 ui.add_space(12.0);
                 ui.heading("Security Groups");
                 ui.separator();
-                if self.detail_security_groups_loading {
+                if st.security_groups_loading {
                     ui.horizontal(|ui| {
                         ui.spinner();
                         ui.label("Fetching security groups...");
                     });
-                } else if let Some(err) = &self.detail_security_groups_error {
+                } else if let Some(err) = &st.security_groups_error {
                     note_label(ui, egui::Color32::RED, format!("Error: {err}"));
-                } else if self.detail_security_groups.is_empty() {
+                } else if st.security_groups.is_empty() {
                     ui.label("No security groups found");
                 } else {
-                    for sg in &self.detail_security_groups {
+                    for sg in &st.security_groups {
                         ui.add_space(6.0);
                         ui.strong(format!("{} ({})", sg.group_name, sg.group_id));
                         if !sg.description.is_empty() {
@@ -27418,6 +27709,10 @@ mod gui {
                 }
 
             });
+
+            if close_active {
+                self.close_detail_tab(self.detail_active);
+            }
         }
 
         /// The **Jira Alerts** trace: the last five calls to the on-call
@@ -28407,7 +28702,7 @@ mod gui {
                         {
                             self.main_tab = MainTab::Connections;
                         }
-                        if self.detail_subject.is_some() {
+                        if !self.detail_tabs.is_empty() {
                             if ui
                                 .selectable_label(self.main_tab == MainTab::Details, "Details")
                                 .clicked()
@@ -41840,6 +42135,51 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 "Could not list Target Groups: account 1111: not permitted; \
                  account 2222: throttled"
             );
+        }
+
+        /// Closing a tab must leave the selection on the tab the user was
+        /// looking at.
+        ///
+        /// This is the arithmetic every tab strip gets wrong. Closing a tab to
+        /// the LEFT of the active one slides a different subject under the
+        /// selection without anything appearing to happen — the worst kind of
+        /// wrong, because the panel then shows one thing while the user
+        /// believes they are looking at another. Closing the last tab indexes
+        /// past the end.
+        ///
+        /// Mirrors `close_detail_tab`'s index rules; kept pure here because
+        /// exercising the real one needs a constructed `App`.
+        #[test]
+        fn closing_a_detail_tab_keeps_the_selection_where_it_was() {
+            // (tabs, active, closed) -> (remaining, active)
+            let close = |len: usize, active: usize, idx: usize| -> (usize, usize) {
+                let len = len - 1;
+                let active = if len == 0 {
+                    0
+                } else if active >= len {
+                    len - 1
+                } else if idx < active {
+                    active - 1
+                } else {
+                    active
+                };
+                (len, active)
+            };
+
+            // Closing one to the LEFT of the active tab: the same subject must
+            // stay selected, so the index steps back with it.
+            assert_eq!(close(3, 2, 0), (2, 1));
+            // Closing one to the RIGHT: nothing moves.
+            assert_eq!(close(3, 0, 2), (2, 0));
+            // Closing the active tab itself, mid-strip: the one that slid into
+            // its place is selected.
+            assert_eq!(close(3, 1, 1), (2, 1));
+            // Closing the active LAST tab: fall back to the new last, never
+            // past the end.
+            assert_eq!(close(3, 2, 2), (2, 1));
+            // Closing the only tab: back to zero, and the caller leaves the
+            // Details page.
+            assert_eq!(close(1, 0, 0), (0, 0));
         }
 
         /// What gets thrown away when credentials change is decided by field,

@@ -2236,6 +2236,35 @@ true but rarely looked at, and both stay searchable and in the detail view.
 - **`FetchError::from_stderr` keeps `Absent` as a failure.** Nothing in a
   *list* call answers "nothing configured", so letting one become an empty
   list would render as "no target groups in this account".
+- **The Details tab keeps several subjects open at once**, as the
+  Connections page does — a strip of tabs, each with a ✖, plus Close All once
+  there are two. Session state only: closing the app clears them, and the
+  fetched contents would be stale anyway.
+  - **State is per tab, keyed by `DetailSubject::key`** (an ARN, or an
+    instance id) in `instance_details` / `tg_details` / `lb_details`. It was
+    one slot per app, which is why this needed a refactor rather than a
+    strip: "the volumes" is a question about a tab, not about the
+    application.
+  - **`VolumeResult` and `SecurityGroupResult` had to start naming their
+    instance.** They carried no id at all, because there was only ever one
+    place to put them; with several tabs open a reply that does not say whose
+    it is cannot be filed.
+  - **A reply is written only into a tab that still exists** — `get_mut`, not
+    `entry().or_default()`. Closing a tab drops its state, and a reply still
+    in flight must not resurrect it.
+  - **Closing a tab to the LEFT of the active one steps the index back.**
+    Without that a different subject slides under the selection with nothing
+    appearing to happen, which is the worst kind of wrong: the panel shows
+    one thing while the user believes they are looking at another.
+    `closing_a_detail_tab_keeps_the_selection_where_it_was` pins every case.
+  - **Re-opening a subject already open focuses its tab rather than stacking
+    a second.** Clicking a row twice is how people check they clicked the
+    right one; the caller still refetches.
+  - **The strip's actions are applied after it is drawn**, never during — the
+    loop borrows `detail_tabs`, and closing a tab inside it would mutate what
+    is being iterated. The EC2 row's See Details defers the same way, into
+    `pending_detail_tab`, because that loop holds `self.filtered` borrowed and
+    a `&mut self` call there does not compile.
 - **Detail sections are separate events**, as `VolumeResult` and
   `SecurityGroupResult` already are. A role that can describe a target group
   but not read its tags must still see everything else.
