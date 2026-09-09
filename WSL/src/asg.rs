@@ -743,9 +743,483 @@ pub fn fetch_scaling_activities(
     Ok(parse_scaling_activities(&raw))
 }
 
+
+// ------------------------------------------------------------ capacity edit
+
+/// A proposed min / desired / max for a group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapacityEdit {
+    pub min: i64,
+    pub desired: i64,
+    pub max: i64,
+}
+
+/// Why a proposed capacity cannot be sent.
+///
+/// Every one of these is decided **locally, before the confirmation is even
+/// enabled**, rather than by letting AWS reject the call. Two reasons, and the
+/// second is the one that matters: a `ValidationError` arrives seconds later
+/// from a subprocess, after the user has already agreed to something, and it
+/// names the API's field rather than the box they typed in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CapacityProblem {
+    /// The field named did not parse as a whole number.
+    NotANumber(&'static str),
+    Negative(&'static str),
+    MinAboveMax,
+    DesiredBelowMin,
+    DesiredAboveMax,
+    /// Nothing would change. Refused rather than sent: an update that changes
+    /// nothing is still a write against a live group.
+    NoChange,
+}
+
+impl CapacityProblem {
+    /// The sentence to put under the boxes.
+    pub fn message(&self) -> String {
+        match self {
+            Self::NotANumber(field) => format!("{field} must be a whole number"),
+            Self::Negative(field) => format!("{field} cannot be negative"),
+            Self::MinAboveMax => "min cannot be above max".to_string(),
+            Self::DesiredBelowMin => "desired cannot be below min".to_string(),
+            Self::DesiredAboveMax => "desired cannot be above max".to_string(),
+            Self::NoChange => "these are already the group's values".to_string(),
+        }
+    }
+}
+
+/// Read the three boxes.
+///
+/// Blank is refused rather than defaulted: an empty Desired box silently
+/// meaning zero is one keystroke away from scaling a group to nothing.
+pub fn parse_capacity(
+    min: &str,
+    desired: &str,
+    max: &str,
+) -> std::result::Result<CapacityEdit, CapacityProblem> {
+    let read = |raw: &str, field: &'static str| -> std::result::Result<i64, CapacityProblem> {
+        let value: i64 = raw
+            .trim()
+            .parse()
+            .map_err(|_| CapacityProblem::NotANumber(field))?;
+        if value < 0 {
+            return Err(CapacityProblem::Negative(field));
+        }
+        Ok(value)
+    };
+    Ok(CapacityEdit {
+        min: read(min, "min")?,
+        desired: read(desired, "desired")?,
+        max: read(max, "max")?,
+    })
+}
+
+/// What is wrong with this edit against that group, if anything.
+///
+/// The ordering is deliberate: the min/max relationship is reported before
+/// desired's place inside it, because "min cannot be above max" is the fault
+/// somebody actually made and "desired cannot be below min" would be a
+/// confusing way of saying the same thing.
+pub fn check_capacity(current: &AutoScalingGroup, edit: CapacityEdit) -> Option<CapacityProblem> {
+    if edit.min > edit.max {
+        return Some(CapacityProblem::MinAboveMax);
+    }
+    if edit.desired < edit.min {
+        return Some(CapacityProblem::DesiredBelowMin);
+    }
+    if edit.desired > edit.max {
+        return Some(CapacityProblem::DesiredAboveMax);
+    }
+    if edit.min == current.min_size
+        && edit.desired == current.desired_capacity
+        && edit.max == current.max_size
+    {
+        return Some(CapacityProblem::NoChange);
+    }
+    None
+}
+
+/// The fields this edit actually moves, as `desired 3 -> 5`.
+///
+/// Only the ones that differ. Restating the two that are unchanged buries the
+/// one that is, and the confirmation exists to make that one impossible to
+/// miss.
+pub fn capacity_changes(current: &AutoScalingGroup, edit: CapacityEdit) -> Vec<String> {
+    let mut out = Vec::new();
+    for (label, from, to) in [
+        ("min", current.min_size, edit.min),
+        ("desired", current.desired_capacity, edit.desired),
+        ("max", current.max_size, edit.max),
+    ] {
+        if from != to {
+            out.push(format!("{label} {from} -> {to}"));
+        }
+    }
+    out
+}
+
+/// What this edit does to the running instances.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapacityEffect {
+    Launches(i64),
+    /// The destructive direction, and the one the dialog must say out loud.
+    Terminates(i64),
+    /// Desired moved, but the group already holds that many — so nothing
+    /// starts or stops.
+    AlreadyThere,
+}
+
+impl CapacityEffect {
+    pub fn message(&self) -> String {
+        match self {
+            Self::Launches(n) => format!("this launches {n} instance(s)"),
+            Self::Terminates(n) => format!("this TERMINATES {n} instance(s)"),
+            Self::AlreadyThere => {
+                "the group already holds that many instances, so nothing starts or stops"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// What an edit will do to the running instances, or `None` when it moves
+/// nothing.
+///
+/// Measured against the instances the group **actually holds**, not against
+/// its current desired capacity: those two disagree exactly when a group is
+/// mid-scale, and it is the real count AWS reconciles to.
+///
+/// `None` when desired is unchanged. A group that is already short of its
+/// desired capacity is already launching instances, and reporting that as the
+/// consequence of a min/max edit would blame this change for something it did
+/// not cause.
+pub fn capacity_effect(current: &AutoScalingGroup, edit: CapacityEdit) -> Option<CapacityEffect> {
+    if edit.desired == current.desired_capacity {
+        return None;
+    }
+    let held = current.instances.len() as i64;
+    Some(match edit.desired.cmp(&held) {
+        std::cmp::Ordering::Greater => CapacityEffect::Launches(edit.desired - held),
+        std::cmp::Ordering::Less => CapacityEffect::Terminates(held - edit.desired),
+        std::cmp::Ordering::Equal => CapacityEffect::AlreadyThere,
+    })
+}
+
+/// Set a group's min, desired and max.
+///
+/// **The one write in this module**, and the only call here that changes
+/// anything in AWS. Everything else is a describe.
+///
+/// All three values are always sent, even the ones that did not change.
+/// Sending a subset hands the outcome to AWS's own coupling rules — raising
+/// `MinSize` without naming a desired capacity silently raises the desired
+/// capacity to match, and lowering `MaxSize` silently lowers it — so what
+/// landed would not be what the confirmation showed. With all three named,
+/// an inconsistent set is a hard `ValidationError` rather than a silent
+/// change, and `check_capacity` has already refused it anyway.
+pub fn set_capacity(
+    profile: &str,
+    region: &str,
+    group_name: &str,
+    edit: CapacityEdit,
+) -> std::result::Result<(), FetchError> {
+    let (min, desired, max) = (
+        edit.min.to_string(),
+        edit.desired.to_string(),
+        edit.max.to_string(),
+    );
+    run(
+        profile,
+        region,
+        &[
+            "autoscaling",
+            "update-auto-scaling-group",
+            "--auto-scaling-group-name",
+            group_name,
+            "--min-size",
+            &min,
+            "--desired-capacity",
+            &desired,
+            "--max-size",
+            &max,
+        ],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    fn sized(min: i64, desired: i64, max: i64, held: usize) -> AutoScalingGroup {
+        AutoScalingGroup {
+            name: "app".to_string(),
+            min_size: min,
+            desired_capacity: desired,
+            max_size: max,
+            instances: (0..held)
+                .map(|i| AsgInstance {
+                    instance_id: format!("i-{i}"),
+                    lifecycle_state: "InService".to_string(),
+                    health_status: "Healthy".to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Blank is refused rather than defaulted. An empty Desired box silently
+    /// meaning zero is one keystroke away from scaling a group to nothing.
+    #[test]
+    fn a_blank_or_junk_capacity_box_is_refused_by_name() {
+        assert_eq!(
+            parse_capacity("", "3", "8"),
+            Err(CapacityProblem::NotANumber("min"))
+        );
+        assert_eq!(
+            parse_capacity("2", "  ", "8"),
+            Err(CapacityProblem::NotANumber("desired"))
+        );
+        assert_eq!(
+            parse_capacity("2", "3", "eight"),
+            Err(CapacityProblem::NotANumber("max"))
+        );
+        // The message names the box the user typed in, not the API's field.
+        assert!(CapacityProblem::NotANumber("desired")
+            .message()
+            .contains("desired"));
+    }
+
+    /// Surrounding whitespace is ordinary in a typed box.
+    #[test]
+    fn a_capacity_box_tolerates_surrounding_space() {
+        assert_eq!(
+            parse_capacity(" 2 ", "3", "8 "),
+            Ok(CapacityEdit {
+                min: 2,
+                desired: 3,
+                max: 8
+            })
+        );
+    }
+
+    #[test]
+    fn a_negative_capacity_is_refused_by_name() {
+        assert_eq!(
+            parse_capacity("-1", "3", "8"),
+            Err(CapacityProblem::Negative("min"))
+        );
+    }
+
+    /// Every inconsistent combination is refused locally, so the dialog says
+    /// which box is wrong instead of a subprocess `ValidationError` arriving
+    /// seconds after the user already agreed to it.
+    #[test]
+    fn an_inconsistent_capacity_is_refused_before_it_is_sent() {
+        let g = sized(2, 3, 8, 3);
+        assert_eq!(
+            check_capacity(
+                &g,
+                CapacityEdit {
+                    min: 9,
+                    desired: 3,
+                    max: 8
+                }
+            ),
+            Some(CapacityProblem::MinAboveMax)
+        );
+        assert_eq!(
+            check_capacity(
+                &g,
+                CapacityEdit {
+                    min: 4,
+                    desired: 3,
+                    max: 8
+                }
+            ),
+            Some(CapacityProblem::DesiredBelowMin)
+        );
+        assert_eq!(
+            check_capacity(
+                &g,
+                CapacityEdit {
+                    min: 2,
+                    desired: 9,
+                    max: 8
+                }
+            ),
+            Some(CapacityProblem::DesiredAboveMax)
+        );
+    }
+
+    /// "min cannot be above max" is the fault somebody actually made;
+    /// reporting the same input as "desired cannot be below min" would be a
+    /// confusing way of saying it. The ordering is what decides that.
+    #[test]
+    fn min_above_max_is_reported_ahead_of_desireds_place_inside_it() {
+        let g = sized(2, 3, 8, 3);
+        // Both are true of this input: min > max, AND desired > max.
+        assert_eq!(
+            check_capacity(
+                &g,
+                CapacityEdit {
+                    min: 9,
+                    desired: 9,
+                    max: 1
+                }
+            ),
+            Some(CapacityProblem::MinAboveMax)
+        );
+    }
+
+    /// An update that changes nothing is still a write against a live group.
+    #[test]
+    fn an_edit_that_changes_nothing_is_refused() {
+        let g = sized(2, 3, 8, 3);
+        assert_eq!(
+            check_capacity(
+                &g,
+                CapacityEdit {
+                    min: 2,
+                    desired: 3,
+                    max: 8
+                }
+            ),
+            Some(CapacityProblem::NoChange)
+        );
+    }
+
+    #[test]
+    fn a_legal_edit_passes() {
+        let g = sized(2, 3, 8, 3);
+        assert_eq!(
+            check_capacity(
+                &g,
+                CapacityEdit {
+                    min: 0,
+                    desired: 5,
+                    max: 10
+                }
+            ),
+            None
+        );
+    }
+
+    /// Only the fields that move are listed. Restating the unchanged two
+    /// buries the one that changed, which is the whole point of the line.
+    #[test]
+    fn the_change_list_names_only_what_moves() {
+        let g = sized(2, 3, 8, 3);
+        assert_eq!(
+            capacity_changes(
+                &g,
+                CapacityEdit {
+                    min: 2,
+                    desired: 5,
+                    max: 10
+                }
+            ),
+            vec!["desired 3 -> 5".to_string(), "max 8 -> 10".to_string()]
+        );
+    }
+
+    /// The destructive direction has to be said out loud: "desired 5 -> 2"
+    /// without "this terminates 3 instances" understates what is about to
+    /// happen.
+    #[test]
+    fn scaling_down_says_it_terminates_instances() {
+        let g = sized(0, 5, 10, 5);
+        assert_eq!(
+            capacity_effect(
+                &g,
+                CapacityEdit {
+                    min: 0,
+                    desired: 2,
+                    max: 10
+                }
+            ),
+            Some(CapacityEffect::Terminates(3))
+        );
+        assert!(CapacityEffect::Terminates(3)
+            .message()
+            .contains("TERMINATES"));
+    }
+
+    #[test]
+    fn scaling_up_says_it_launches_instances() {
+        let g = sized(0, 2, 10, 2);
+        assert_eq!(
+            capacity_effect(
+                &g,
+                CapacityEdit {
+                    min: 0,
+                    desired: 5,
+                    max: 10
+                }
+            ),
+            Some(CapacityEffect::Launches(3))
+        );
+    }
+
+    /// Measured against what the group ACTUALLY holds, not against its
+    /// current desired capacity. The two disagree exactly when a group is
+    /// mid-scale, and the real count is what AWS reconciles to: a group
+    /// desiring 5 but holding 2 needs three more, not none.
+    #[test]
+    fn the_effect_counts_the_instances_the_group_really_holds() {
+        let mid_scale = sized(0, 5, 10, 2);
+        assert_eq!(
+            capacity_effect(
+                &mid_scale,
+                CapacityEdit {
+                    min: 0,
+                    desired: 6,
+                    max: 10
+                }
+            ),
+            Some(CapacityEffect::Launches(4))
+        );
+    }
+
+    /// A min/max-only edit starts and stops nothing, and must not claim
+    /// otherwise. A group already short of desired is already launching
+    /// instances; blaming this edit for that would be a lie the confirmation
+    /// tells.
+    #[test]
+    fn an_edit_that_leaves_desired_alone_reports_no_instance_effect() {
+        let mid_scale = sized(0, 5, 10, 2);
+        assert_eq!(
+            capacity_effect(
+                &mid_scale,
+                CapacityEdit {
+                    min: 1,
+                    desired: 5,
+                    max: 20
+                }
+            ),
+            None
+        );
+    }
+
+    /// Desired moved onto the count the group already holds: honest about
+    /// there being nothing to do, rather than reporting a launch of zero.
+    #[test]
+    fn moving_desired_onto_the_held_count_starts_and_stops_nothing() {
+        let g = sized(0, 5, 10, 3);
+        assert_eq!(
+            capacity_effect(
+                &g,
+                CapacityEdit {
+                    min: 0,
+                    desired: 3,
+                    max: 10
+                }
+            ),
+            Some(CapacityEffect::AlreadyThere)
+        );
+    }
 
     /// A real `describe-auto-scaling-groups` payload: a launch-template group
     /// attached to a target group with a mix of instance states, and a

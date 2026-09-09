@@ -42,7 +42,7 @@ cargo build --features gui
 
 # Run tests
 cargo test                  # lib + CLI tests
-cargo test --features gui   # all tests including GUI (451 GUI tests)
+cargo test --features gui   # all tests including GUI (453 GUI tests)
 
 # Clippy
 cargo clippy --features gui
@@ -62,7 +62,7 @@ stale for months before phase 1 (it read 356 tests / 21 warnings, both months
 out of date; the measured baseline immediately before phase 1 was 1019 tests /
 23 warnings):
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 1146 tests pass, 0 fail (692 lib + 3 CLI + 451 GUI)
+- `cargo test --features gui` — 1161 tests pass, 0 fail (705 lib + 3 CLI + 453 GUI)
 - `cargo clippy --features gui` — no errors; 23 pre-existing style warnings.
   **That is a count of `^warning` lines, which is how the pre-branch baseline
   was measured and why the two are comparable — it is 21 distinct lints (6 lib
@@ -2165,8 +2165,11 @@ second because it was the resource type phase 1 actually built, and the rest
 follow build order, not alphabetical or importance) — listing each resource
 type across the same multi-account pool the EC2 table draws from. `MainTab`
 is untouched: these live *inside* the Inventory panel, so the top-level bar
-stays at four entries rather than growing to nine. Read-only, every call a
-describe, so there is no `allowed_users` gate.
+stays at four entries rather than growing to nine.
+
+**Almost every call here is a describe.** The one exception is the ASG
+capacity edit — see "Editing ASG capacity" below, including why it has no
+`allowed_users` gate when every other write in this app does.
 
 Phase 1 built the scaffolding and Target Groups; phase 2 added Load
 Balancers and changed no scaffolding at all, which is what the phasing was
@@ -2305,6 +2308,98 @@ still in the detail view — the same trade the other two tables made.
 - **`resource_empty_note` has its own ASG arm**: "No ASG in the selected
   account(s)" reads as a typo. `ResourceKind::label` is a tab title, not a noun
   that fits into a sentence.
+
+#### Editing ASG capacity (the one write in the resource browser)
+
+**Edit capacity…** — on the ASG row's right-click menu and beside Copy All in
+its detail panel — sets a group's min, desired and max in one
+`update-auto-scaling-group`. Everything else under Inventory sub-tabs is a
+describe; this launches and terminates real instances.
+
+**It has NO features.json gate, at the maintainer's explicit request**, unlike
+`instance_power` (which needs `enabled: true` *and* `allowed_users`) and every
+other write in this app. That decision was made knowingly and the consequence
+is the whole reason the rest of this section is written the way it is: **the
+confirmation dialog is the entire guard**, so it is not decoration and must
+not be simplified into a bare Apply button. If a gate is ever wanted, it is
+`asg_capacity` in features.json plus a `Features::` accessor, and it belongs
+in front of both entry points (`request_asg_capacity` is the one chokepoint).
+
+- **Apply needs a clean set of numbers AND a separate tick**, and the tick
+  **names the group** — the moment somebody notices they are aimed at the
+  wrong one has to be before the click, not after.
+  `the_capacity_apply_button_needs_the_tick_as_well_as_valid_numbers` pins all
+  three, because with no allow-list in front of the feature that checkbox is
+  the only thing standing in front of a live scale-in.
+- **`asg::set_capacity` has exactly ONE call site**, inside
+  `start_asg_capacity_run`, which re-parses and re-checks before it spawns.
+  `a_capacity_change_is_only_ever_sent_from_the_confirmed_path` pins the count
+  *and* the ordering, in the shape of
+  `nothing_here_ever_calls_reboot_instances` — a second call site added later
+  (a "scale to zero" menu entry, say) would bypass the confirmation and
+  nothing else in the suite would notice. Both scans read only the half of
+  the file above `mod tests {`, since each test quotes the very strings it is
+  counting.
+- **All three values are always sent, even the unchanged ones.** Sending a
+  subset hands the outcome to AWS's own coupling rules: raising `MinSize`
+  without naming a desired capacity silently raises desired to match, and
+  lowering `MaxSize` silently lowers it. What landed would then not be what
+  the dialog showed. With all three named an inconsistent set is a hard
+  `ValidationError` instead of a silent change — and `check_capacity` has
+  already refused it locally anyway.
+- **Every refusal is decided locally, before Apply enables.** A
+  `ValidationError` arrives seconds later out of a subprocess, after the user
+  already agreed to something, and it names the API's field rather than the
+  box they typed in. `CapacityProblem` names the box.
+- **`min > max` is reported ahead of desired's place inside it.** Both are
+  true of `min 9, desired 9, max 1`, and "min cannot be above max" is the
+  fault somebody actually made; the ordering in `check_capacity` is what
+  decides that.
+- **A blank box is refused, never defaulted.** An empty Desired silently
+  meaning zero is one keystroke away from scaling a group to nothing.
+- **An edit that changes nothing is refused** (`NoChange`). It is still a
+  write against a live group.
+- **The dialog says how many instances start or stop**, and terminating is
+  coloured as the destructive direction. "desired 5 -> 2" without "this
+  TERMINATES 3 instances" understates what is about to happen.
+  - **`capacity_effect` counts the instances the group ACTUALLY HOLDS**, not
+    its current desired capacity. Those two disagree exactly when a group is
+    mid-scale, and the real count is what AWS reconciles to.
+  - **It returns `None` when desired is unchanged.** A group already short of
+    desired is already launching instances; reporting that as the consequence
+    of a min/max-only edit would blame this change for something it did not
+    cause.
+- **Live mode only**, refused on `options.mode` rather than on credentials —
+  sim fakes `auth_status: Ok`. The ASG sub-tab renders the sim note instead of
+  a table so there is no row to reach this from today, but that is a fact
+  about the render, not a guarantee, and `request_asg_capacity` is the
+  guarantee.
+- **An unauthorized account is refused up front** rather than spending an
+  `aws` invocation to be told no.
+- **`asg_capacity_in_flight` is claimed before the spawn**, for the reason
+  `ReaperInFlight` and `power_in_flight` are: two clicks landing in one frame
+  would otherwise both pass the check. The worker clears its own ARN as well
+  as the event handler, so a send that fails while the app is closing cannot
+  leave a group permanently claimed.
+- **A landed edit backdates that account's cached list** rather than removing
+  it, and clears its recorded failure. The table is showing the numbers the
+  edit was called with, which are wrong the moment it lands; removing the
+  entry would blank the table until the reply arrives, and a list that flashes
+  empty reads as "there is nothing here". The failure record is a cooldown and
+  would otherwise hold off the very refetch this just earned.
+- **The status line is drawn wherever the Start/Stop/Restart one is** — the
+  shared Inventory row (so it survives clicking to another sub-tab) and the
+  top of the ASG detail panel (so an edit started from there reports itself
+  without going back). Success auto-hides after `ASG_CAPACITY_OK_BANNER`, a
+  failure waits to be dismissed, and expiry is judged **at render** with
+  `request_repaint_after` for the instant it falls due. That mistake — a timer
+  merely *checked* on a frame, firing whenever the next frame happens to
+  occur — has now been made and fixed five times in this file.
+- Both entry points defer: the row menu writes into `pending_capacity` and
+  applies it after the table is drawn, and the detail panel's button sets a
+  flag read after its `ui.horizontal` closes. The row loop borrows `rows` and
+  the header closure borrows `ui`, so a `&mut self` call in either place does
+  not compile.
 
 - **`filter::text_matches` is the shared search engine.** The
   include/exclude matching was lifted out of `apply_filters` so every sub-tab

@@ -28,7 +28,7 @@ mod gui {
 
     use ec2_manager::alerts;
     use ec2_manager::asg::{
-        self, AutoScalingGroup, ScalingActivity, ScalingPolicy, ScheduledAction,
+        self, AutoScalingGroup, CapacityEffect, ScalingActivity, ScalingPolicy, ScheduledAction,
     };
     use ec2_manager::aws_context::build_context_with_profile;
     use ec2_manager::config::AppConfig;
@@ -698,6 +698,17 @@ mod gui {
             policies: Option<std::result::Result<Vec<ScalingPolicy>, String>>,
             scheduled: Option<std::result::Result<Vec<ScheduledAction>, String>>,
             activities: Option<std::result::Result<Vec<ScalingActivity>, String>>,
+        },
+        /// A capacity edit finished. `Ok` carries the sentence for the
+        /// status line; `Err` carries the failure, which is also logged at
+        /// error level.
+        AsgCapacityDone {
+            arn: String,
+            name: String,
+            /// The list this group came from, so the handler can expire
+            /// exactly that one rather than every account's.
+            cache_key: String,
+            result: std::result::Result<String, String>,
         },
         /// One load balancer's listeners, each carrying its own rules.
         LoadBalancerListeners {
@@ -1481,6 +1492,58 @@ mod gui {
         /// dialog can say what it is acting on.
         state: String,
     }
+
+    /// A capacity edit the user has typed and not yet agreed to.
+    ///
+    /// The profile, region and cache key are captured **here**, at click time,
+    /// rather than looked up on confirm: the list refreshes on its own five
+    /// minute clock and can do so underneath an open dialog, and the account
+    /// the row belonged to when it was clicked is the one the edit was meant
+    /// for. Same reasoning as `PowerConfirm`.
+    ///
+    /// `current` is the whole group as it stood when the dialog opened — the
+    /// confirmation needs it to say what it is changing *from*, and
+    /// `asg::capacity_effect` needs the instances it actually holds.
+    struct AsgCapacityEdit {
+        arn: String,
+        name: String,
+        account_id: String,
+        profile: String,
+        region: String,
+        /// Which cached list to expire once the edit lands, so the table
+        /// stops showing the numbers it was called with.
+        cache_key: String,
+        current: Box<AutoScalingGroup>,
+        min: String,
+        desired: String,
+        max: String,
+        /// Ticked before Apply enables. There is no undo on the other side of
+        /// this button, and it is the only thing standing in front of it.
+        confirmed: bool,
+    }
+
+    /// The capacity-edit status line, shown wherever the Start / Stop /
+    /// Restart one is.
+    ///
+    /// Same shape and the same rules as [`PowerStatus`], deliberately: an
+    /// action that takes seconds and changes a live group must report itself
+    /// the way the app's other one already does.
+    struct AsgCapacityStatus {
+        name: String,
+        text: String,
+        state: ScriptState,
+        /// When a finished line was raised, for the auto-hide. `None` while
+        /// the call is still in flight.
+        settled_at: Option<Instant>,
+    }
+
+    /// How long a finished capacity line stays up before hiding itself.
+    ///
+    /// The same interval as [`POWER_OK_BANNER`] and for the same reason — a
+    /// green line saying a thing worked is noise once it has been read, and a
+    /// red one is not — but its own constant, because nothing says the two
+    /// have to move together.
+    const ASG_CAPACITY_OK_BANNER: Duration = Duration::from_secs(30);
 
     /// The Start / Stop / Restart status line above the inventory table.
     struct PowerStatus {
@@ -7903,6 +7966,14 @@ mod gui {
         asg_list_errors: HashMap<String, String>,
         asg_list_failures: HashMap<String, Instant>,
         asg_col_widths: HashMap<usize, f32>,
+        /// The open capacity dialog, if any. Boxed: it carries a whole
+        /// `AutoScalingGroup` and this is a field on a large struct.
+        asg_capacity_edit: Option<Box<AsgCapacityEdit>>,
+        /// ARNs with a capacity call in flight, claimed before the spawn for
+        /// the reason `power_in_flight` is: two clicks landing in one frame
+        /// would otherwise both pass the check.
+        asg_capacity_in_flight: Arc<Mutex<HashSet<String>>>,
+        asg_capacity_status: Option<AsgCapacityStatus>,
         /// Which resource sub-tab was showing last frame, so entering one can
         /// be told from staying on it. `None` while the EC2 tab is showing, so
         /// coming back from it counts as entering.
@@ -8753,6 +8824,9 @@ mod gui {
                 asg_list_errors: HashMap::new(),
                 asg_list_failures: HashMap::new(),
                 asg_col_widths: HashMap::new(),
+                asg_capacity_edit: None,
+                asg_capacity_in_flight: Arc::new(Mutex::new(HashSet::new())),
+                asg_capacity_status: None,
                 last_resource_tab: None,
                 // `features` is the local in `App::new`, the same one
                 // `instance_power_enabled` below is resolved from.
@@ -17112,6 +17186,7 @@ mod gui {
                 || self.pat_dialog.is_some()
                 || self.pending_script_delete.is_some()
                 || self.power_confirm.is_some()
+                || self.asg_capacity_edit.is_some()
                 || (self.default_scripts.is_empty()
                     && self.config.personal_scripts.is_empty())
             {
@@ -20642,6 +20717,56 @@ mod gui {
                             }
                         }
                     }
+                    ProcEvent::AsgCapacityDone {
+                        arn,
+                        name,
+                        cache_key,
+                        result,
+                    } => {
+                        // The worker clears this too; doing it here as well
+                        // means a send that fails — the app closing mid-call
+                        // — cannot leave the group permanently claimed.
+                        if let Ok(mut guard) = self.asg_capacity_in_flight.lock() {
+                            guard.remove(&arn);
+                        }
+                        match result {
+                            Ok(text) => {
+                                self.log_warn(format!("asg capacity {name}: {text}"));
+                                self.asg_capacity_status = Some(AsgCapacityStatus {
+                                    name,
+                                    text,
+                                    state: ScriptState::Ok,
+                                    settled_at: Some(Instant::now()),
+                                });
+                                // The table is now showing the numbers the
+                                // edit was called with, which are wrong the
+                                // moment it lands. Backdating rather than
+                                // removing keeps the rows on screen until the
+                                // new ones arrive — a list that flashes empty
+                                // reads as "there is nothing here" — and the
+                                // recorded failure has to go with it, or the
+                                // cooldown holds off the very refetch this
+                                // just earned.
+                                if let Some(stale) =
+                                    Instant::now().checked_sub(resources::RESOURCE_TTL)
+                                {
+                                    if let Some((at, _)) = self.asgs.get_mut(&cache_key) {
+                                        *at = stale;
+                                    }
+                                }
+                                self.asg_list_failures.remove(&cache_key);
+                            }
+                            Err(err) => {
+                                self.log_error(format!("asg capacity {name}: {err}"));
+                                self.asg_capacity_status = Some(AsgCapacityStatus {
+                                    name,
+                                    text: err,
+                                    state: ScriptState::Failed,
+                                    settled_at: Some(Instant::now()),
+                                });
+                            }
+                        }
+                    }
                     ProcEvent::AsgDetail {
                         arn,
                         policies,
@@ -23170,6 +23295,10 @@ mod gui {
             // judged — the moment somebody clicked Target Groups, and the zoom
             // buttons vanished from a page that still has a table to zoom.
             self.render_power_status(ui);
+            // Beside the power line and for the same reason: an action that
+            // changes a live group must keep reporting itself after the user
+            // clicks away to another sub-tab.
+            self.render_asg_capacity_status(ui);
             // The count line is the one EC2-only part of this row: each
             // resource tab prints its own.
             let on_ec2 = self.inventory_tab == InventoryTab::Ec2;
@@ -24588,6 +24717,312 @@ mod gui {
         }
 
 
+
+        /// "Edit capacity…" was picked, from the row menu or the detail panel.
+        /// Raises the dialog; nothing reaches AWS until it is agreed to.
+        fn request_asg_capacity(&mut self, group: &AutoScalingGroup) {
+            if self
+                .asg_capacity_in_flight
+                .lock()
+                .map(|g| g.contains(&group.arn))
+                .unwrap_or(false)
+            {
+                self.message = format!("{}: a capacity change is already running", group.name);
+                self.log_warn(self.message.clone());
+                return;
+            }
+            // Sim fakes `auth_status: Ok`, so this is refused on the MODE, not
+            // on the credentials — the same stance `request_instance_power`
+            // takes. Sim's whole promise is that it makes no real AWS calls,
+            // and resizing a production group out of the mode that says it
+            // touches nothing is the one failure this must not have. The ASG
+            // sub-tab shows the sim note instead of a table, so there is no
+            // row to reach this from today; that is a fact about the render,
+            // not a guarantee, and this is the guarantee.
+            if self.options.mode != Mode::Live {
+                self.message = "Editing capacity is Live-mode only (this profile is Sim)"
+                    .to_string();
+                self.log_warn(self.message.clone());
+                return;
+            }
+            let mode = self.options.mode.as_str().to_string();
+            let pool = self
+                .resource_pool_accounts()
+                .into_iter()
+                .find(|a| a.account_id == group.account_id);
+            let Some(account) = pool else {
+                self.message = format!("no AWS context for account {}", group.account_id);
+                self.log_error(self.message.clone());
+                return;
+            };
+            if !account.authed {
+                self.message = format!(
+                    "account {} is not authorized — renew credentials first",
+                    group.account_id
+                );
+                self.log_warn(self.message.clone());
+                return;
+            }
+            self.asg_capacity_edit = Some(Box::new(AsgCapacityEdit {
+                arn: group.arn.clone(),
+                name: group.name.clone(),
+                account_id: group.account_id.clone(),
+                profile: account.profile.clone(),
+                region: account.region.clone(),
+                cache_key: account.cache_key(ResourceKind::Asg, &mode),
+                current: Box::new(group.clone()),
+                // Prefilled with what the group holds now, so the common edit
+                // — move one number — is one keystroke rather than three.
+                min: group.min_size.to_string(),
+                desired: group.desired_capacity.to_string(),
+                max: group.max_size.to_string(),
+                confirmed: false,
+            }));
+        }
+
+        /// The capacity dialog. It is the only thing standing in front of a
+        /// live scale-in, so it does real work: it says what changes, it says
+        /// how many instances start or stop, it refuses an inconsistent set
+        /// locally, and Apply stays disabled until a separate box is ticked.
+        fn render_asg_capacity_dialog(&mut self, ctx: &egui::Context) {
+            let Some(mut pending) = self.asg_capacity_edit.take() else {
+                return;
+            };
+            let mut window_open = true;
+            let mut do_apply = false;
+            let mut do_cancel = false;
+
+            egui::Window::new("Edit auto scaling group capacity")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(egui::RichText::new(&pending.name).strong());
+                    ui.label(format!(
+                        "Account {} · region {}",
+                        pending.account_id, pending.region
+                    ));
+                    ui.add_space(4.0);
+                    ui.label(format!(
+                        "Now: min {} · desired {} · max {} · holding {} instance(s)",
+                        pending.current.min_size,
+                        pending.current.desired_capacity,
+                        pending.current.max_size,
+                        pending.current.instances.len(),
+                    ));
+                    ui.add_space(8.0);
+
+                    ui.horizontal(|ui| {
+                        for (label, field) in [
+                            ("Min", &mut pending.min),
+                            ("Desired", &mut pending.desired),
+                            ("Max", &mut pending.max),
+                        ] {
+                            ui.label(label);
+                            ui.add(
+                                egui::TextEdit::singleline(field)
+                                    .desired_width(60.0)
+                                    .id_salt(("asg_capacity", label)),
+                            );
+                        }
+                    });
+                    ui.add_space(6.0);
+
+                    // Parsed and checked every frame, so the dialog answers
+                    // while the user is still typing rather than at Apply.
+                    let problem = match asg::parse_capacity(
+                        &pending.min,
+                        &pending.desired,
+                        &pending.max,
+                    ) {
+                        Err(problem) => Some(problem),
+                        Ok(edit) => asg::check_capacity(&pending.current, edit),
+                    };
+                    let edit = asg::parse_capacity(&pending.min, &pending.desired, &pending.max)
+                        .ok()
+                        .filter(|_| problem.is_none());
+
+                    match (&problem, edit) {
+                        (Some(problem), _) => {
+                            note_label(
+                                ui,
+                                ui.visuals().error_fg_color,
+                                problem.message(),
+                            );
+                        }
+                        (None, Some(edit)) => {
+                            ui.label(
+                                egui::RichText::new(
+                                    asg::capacity_changes(&pending.current, edit).join(" · "),
+                                )
+                                .strong(),
+                            );
+                            if let Some(effect) = asg::capacity_effect(&pending.current, edit) {
+                                // Terminating is the destructive direction and
+                                // is coloured as such; launching costs money
+                                // and is worth seeing, but it is not the one
+                                // somebody regrets.
+                                let colour = match effect {
+                                    CapacityEffect::Terminates(_) => ui.visuals().error_fg_color,
+                                    CapacityEffect::Launches(_) => ui.visuals().warn_fg_color,
+                                    CapacityEffect::AlreadyThere => ui.visuals().weak_text_color(),
+                                };
+                                note_label(ui, colour, effect.message());
+                            }
+                        }
+                        (None, None) => {}
+                    }
+
+                    ui.add_space(8.0);
+                    // A separate tick, not a bare Apply. This is the whole
+                    // guard on a live scale-in, and it names the group so the
+                    // moment somebody notices they are aimed at the wrong one
+                    // is before the click rather than after.
+                    ui.checkbox(
+                        &mut pending.confirmed,
+                        format!("Yes, apply this to {}", pending.name),
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let ready = problem.is_none() && pending.confirmed;
+                        if ui
+                            .add_enabled(ready, egui::Button::new("Apply"))
+                            .on_disabled_hover_text(
+                                "Fix the values above and tick the box to enable this",
+                            )
+                            .clicked()
+                        {
+                            do_apply = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+
+            if do_apply {
+                self.start_asg_capacity_run(*pending);
+            } else if !do_cancel && window_open {
+                self.asg_capacity_edit = Some(pending);
+            }
+        }
+
+        /// Spawn the worker for an agreed capacity edit.
+        fn start_asg_capacity_run(&mut self, pending: AsgCapacityEdit) {
+            // Re-read rather than trusting what the dialog last rendered: the
+            // boxes are free text and this is the last point before a live
+            // write. A refusal here would be a bug, so it is logged as one.
+            let edit = match asg::parse_capacity(&pending.min, &pending.desired, &pending.max) {
+                Ok(edit) if asg::check_capacity(&pending.current, edit).is_none() => edit,
+                _ => {
+                    self.log_error(format!(
+                        "asg capacity {}: refused at the last check — the dialog should not \
+                         have enabled Apply",
+                        pending.name
+                    ));
+                    return;
+                }
+            };
+
+            // Claimed before the spawn, for the reason `power_in_flight` is.
+            // Scoped so the guard is dropped before any `&mut self` logging.
+            let claimed = match self.asg_capacity_in_flight.lock() {
+                Ok(mut guard) => guard.insert(pending.arn.clone()),
+                Err(_) => false,
+            };
+            if !claimed {
+                self.log_warn(format!(
+                    "{}: a capacity change is already running, refusing to start another",
+                    pending.name
+                ));
+                return;
+            }
+
+            let summary = asg::capacity_changes(&pending.current, edit).join(", ");
+            self.log_warn(format!(
+                "asg capacity {}: {summary} requested by the user (account {} region {})",
+                pending.name, pending.account_id, pending.region,
+            ));
+            self.asg_capacity_status = Some(AsgCapacityStatus {
+                name: pending.name.clone(),
+                text: format!("applying {summary}…"),
+                state: ScriptState::Running,
+                settled_at: None,
+            });
+
+            let AsgCapacityEdit {
+                arn,
+                name,
+                profile,
+                region,
+                cache_key,
+                ..
+            } = pending;
+            let tx = self.proc_tx.clone();
+            let egui_ctx = self.egui_ctx.clone();
+            let in_flight = Arc::clone(&self.asg_capacity_in_flight);
+            std::thread::spawn(move || {
+                let result = asg::set_capacity(&profile, &region, &name, edit)
+                    .map(|()| format!("applied {summary}"))
+                    .map_err(|e| e.message());
+                if let Ok(mut guard) = in_flight.lock() {
+                    guard.remove(&arn);
+                }
+                let _ = tx.send(ProcEvent::AsgCapacityDone {
+                    arn,
+                    name,
+                    cache_key,
+                    result,
+                });
+                if let Some(c) = &egui_ctx {
+                    c.request_repaint();
+                }
+            });
+        }
+
+        /// The capacity status line, drawn wherever the Start / Stop /
+        /// Restart one is.
+        ///
+        /// A finished success hides itself after [`ASG_CAPACITY_OK_BANNER`]; a
+        /// failure stays until dismissed. Expiry is judged here, at render,
+        /// with a repaint requested for the instant it falls due — egui only
+        /// redraws when something happens, so a timer merely *checked* on a
+        /// frame fires whenever the next frame happens to occur. That mistake
+        /// has been made four times in this file already.
+        fn render_asg_capacity_status(&mut self, ui: &mut egui::Ui) {
+            let Some(status) = self.asg_capacity_status.as_ref() else {
+                return;
+            };
+            if status.state == ScriptState::Ok {
+                if let Some(at) = status.settled_at {
+                    let age = at.elapsed();
+                    if age >= ASG_CAPACITY_OK_BANNER {
+                        self.asg_capacity_status = None;
+                        return;
+                    }
+                    ui.ctx().request_repaint_after(ASG_CAPACITY_OK_BANNER - age);
+                }
+            }
+            let color = match status.state {
+                ScriptState::Running => ui.visuals().warn_fg_color,
+                ScriptState::Failed => ui.visuals().error_fg_color,
+                ScriptState::Ok => egui::Color32::from_rgb(0x4c, 0xaf, 0x50),
+            };
+            let mut dismiss = false;
+            ui.horizontal(|ui| {
+                note_label(ui, color, format!("{} · {}", status.name, status.text));
+                // Only a failure is something to dismiss; a green line clears
+                // itself.
+                if status.state == ScriptState::Failed && ui.button("\u{2716}").clicked() {
+                    dismiss = true;
+                }
+            });
+            if dismiss {
+                self.asg_capacity_status = None;
+            }
+        }
+
         /// Start a list fetch for any account whose auto scaling groups are
         /// missing or stale.
         ///
@@ -24753,6 +25188,7 @@ mod gui {
             let auto = asg_auto_widths(&rows);
             let overrides = self.asg_col_widths.clone();
             let mut pending_detail: Option<AutoScalingGroup> = None;
+            let mut pending_capacity: Option<AutoScalingGroup> = None;
             let mut pending_width: Option<(usize, f32)> = None;
 
             // Solid rather than the default floating bar, and only when there
@@ -24875,6 +25311,18 @@ mod gui {
                                         pending_detail = Some(g.clone());
                                         ui.close();
                                     }
+                                    if ui
+                                        .button("Edit capacity…")
+                                        .on_hover_text(
+                                            "Change min, desired and max. Raising desired \
+                                             launches instances and lowering it terminates \
+                                             them; you are asked to confirm first.",
+                                        )
+                                        .clicked()
+                                    {
+                                        pending_capacity = Some(g.clone());
+                                        ui.close();
+                                    }
                                 });
 
                                 ui.end_row();
@@ -24889,6 +25337,11 @@ mod gui {
             }
             if let Some(g) = pending_detail {
                 self.open_asg_details(g);
+            }
+            // Applied after the table is drawn, never during: the row loop
+            // borrows `rows`, and raising the dialog is a `&mut self` call.
+            if let Some(g) = pending_capacity {
+                self.request_asg_capacity(&g);
             }
         }
 
@@ -24983,6 +25436,7 @@ mod gui {
             title: &str,
         ) {
             let st = self.asg_details.get(&g.arn).cloned().unwrap_or_default();
+            let mut edit_capacity = false;
             ui.horizontal(|ui| {
                 ui.heading(title);
                 if ui.button("Copy All").clicked() {
@@ -24991,7 +25445,27 @@ mod gui {
                         let _ = clipboard.set_text(&text);
                     }
                 }
+                // The second entry point, because this panel is where the
+                // current numbers are actually being read — going back to the
+                // table to right-click the row you are already looking at is
+                // a step that exists only because the table came first.
+                if ui
+                    .button("Edit capacity…")
+                    .on_hover_text(
+                        "Change min, desired and max. Raising desired launches instances \
+                         and lowering it terminates them; you are asked to confirm first.",
+                    )
+                    .clicked()
+                {
+                    edit_capacity = true;
+                }
             });
+            // Raised after the row is drawn, so the borrow of `ui` above is
+            // finished before this `&mut self` call.
+            if edit_capacity {
+                self.request_asg_capacity(&g);
+            }
+            self.render_asg_capacity_status(ui);
             ui.separator();
 
             // One scroll area, and nothing inside it with a fixed height — the
@@ -29398,6 +29872,7 @@ mod gui {
                 self.render_script_editor(ctx);
                 self.render_script_delete_confirm(ctx);
                 self.render_power_confirm(ctx);
+                self.render_asg_capacity_dialog(ctx);
                 self.render_pat_dialog(ctx);
                 self.render_script_result_popup(ctx);
                 self.render_alerts_window(ctx);
@@ -44168,6 +44643,90 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 health_status: health.to_string(),
                 ..Default::default()
             }
+        }
+
+
+        /// **The only write in the resource browser reaches AWS from exactly
+        /// one place, and that place re-checks the numbers first.**
+        ///
+        /// A source scan, in the shape of
+        /// `nothing_here_ever_calls_reboot_instances`, because what is being
+        /// pinned is reachability rather than a value: the dialog's Apply
+        /// button is the guard, and a second call site added later — a
+        /// "quick scale to zero" menu entry, say — would bypass the
+        /// confirmation entirely and nothing else in the suite would notice.
+        #[test]
+        fn a_capacity_change_is_only_ever_sent_from_the_confirmed_path() {
+            // The SHIPPING half of the file only: this test names the very
+            // function it is counting, several times, and would otherwise
+            // find its own assertions.
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            assert_eq!(
+                src.matches("asg::set_capacity(").count(),
+                1,
+                "asg::set_capacity must have exactly one call site"
+            );
+
+            let start = src
+                .find("fn start_asg_capacity_run(&mut self, pending: AsgCapacityEdit) {")
+                .expect("start_asg_capacity_run");
+            let end = src[start..]
+                .find("\n        /// The capacity status line")
+                .map(|i| start + i)
+                .expect("the function that follows it");
+            let body = &src[start..end];
+            assert!(
+                body.contains("asg::set_capacity("),
+                "the one call site must be inside start_asg_capacity_run"
+            );
+            // The last look before a live write. The boxes are free text and
+            // the dialog is the only thing that validated them; a refusal here
+            // would be a bug, which is why it is logged as one rather than
+            // silently skipped.
+            assert!(
+                body.contains("asg::parse_capacity(") && body.contains("asg::check_capacity("),
+                "start_asg_capacity_run must re-validate before it spawns"
+            );
+            let check = body.find("asg::check_capacity(").expect("the re-check");
+            let send = body.find("asg::set_capacity(").expect("the send");
+            assert!(check < send, "the re-check must come before the send");
+        }
+
+        /// Apply is gated on BOTH a clean set of numbers and a separate tick.
+        ///
+        /// With no `allowed_users` gate in front of this feature, that
+        /// checkbox is the entire guard on a live scale-in — so it is pinned
+        /// here rather than left to whoever next edits the dialog.
+        #[test]
+        fn the_capacity_apply_button_needs_the_tick_as_well_as_valid_numbers() {
+            // Same reason as above: this test quotes the lines it is looking
+            // for, so it must not be allowed to find itself.
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let start = src
+                .find("fn render_asg_capacity_dialog(&mut self, ctx: &egui::Context) {")
+                .expect("render_asg_capacity_dialog");
+            let end = src[start..]
+                .find("\n        /// Spawn the worker for an agreed capacity edit.")
+                .map(|i| start + i)
+                .expect("the function that follows it");
+            let body = &src[start..end];
+            assert!(
+                body.contains("let ready = problem.is_none() && pending.confirmed;"),
+                "Apply must require both a clean check and the tick"
+            );
+            assert!(
+                body.contains("add_enabled(ready, egui::Button::new(\"Apply\"))"),
+                "the Apply button must be driven by that `ready`"
+            );
+            // The tick names the group, so the moment somebody notices they
+            // are aimed at the wrong one is before the click rather than
+            // after.
+            assert!(
+                body.contains("format!(\"Yes, apply this to {}\", pending.name)"),
+                "the confirmation tick must name the group"
+            );
         }
 
         /// A group holding what it was asked to hold is the boring answer and
