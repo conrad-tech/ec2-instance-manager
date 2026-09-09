@@ -32,6 +32,11 @@ pub struct AppConfig {
     pub ui_scale: Option<f32>,
     pub account_colors_enabled: bool,
     pub account_colors: BTreeMap<String, String>,
+    /// Display order per account, keyed by `profile_id`. Written by Manage
+    /// Accounts and layered over `accounts.json`'s own `sort_order` during
+    /// the merge, so a bundled account can be moved without editing the
+    /// asset. Absent means "wherever the bundled list put it".
+    pub profile_orders: BTreeMap<String, u32>,
     pub reset_filter_on_profile_switch: bool,
     /// Environment names excluded from the color legend
     pub excluded_envs: Vec<String>,
@@ -143,6 +148,7 @@ impl Default for AppConfig {
             ui_scale: None,
             account_colors_enabled: true,
             account_colors: BTreeMap::new(),
+            profile_orders: BTreeMap::new(),
             reset_filter_on_profile_switch: true,
             excluded_envs: Vec::new(),
             shared_env_default_applied: false,
@@ -793,6 +799,15 @@ impl AppConfig {
                 continue;
             }
 
+            if let Some(rest) = key.strip_prefix("profile_order.") {
+                if !rest.is_empty() {
+                    if let Ok(order) = value.parse::<u32>() {
+                        cfg.profile_orders.insert(rest.to_string(), order);
+                    }
+                }
+                continue;
+            }
+
             if let Some(rest) = key.strip_prefix("account_region.") {
                 if !rest.is_empty() && !value.is_empty() {
                     cfg.account_regions
@@ -1203,6 +1218,10 @@ impl AppConfig {
 
         for (profile, color) in &self.account_colors {
             lines.push(format!("account_color.{profile}={color}"));
+        }
+
+        for (profile, order) in &self.profile_orders {
+            lines.push(format!("profile_order.{profile}={order}"));
         }
 
         for (account, region) in &self.account_regions {
@@ -2008,5 +2027,25 @@ mod tests {
         assert!(saved[0].exclude_terms.is_empty());
         assert_eq!(saved[0].states, vec!["running"]);
         assert!(saved[0].only_ssm_managed);
+    }
+
+    #[test]
+    fn profile_order_round_trips_through_config_text() {
+        let cfg = AppConfig::parse("profile_order.111=2\nprofile_order.222=0\n");
+        assert_eq!(cfg.profile_orders.get("111"), Some(&2));
+        assert_eq!(cfg.profile_orders.get("222"), Some(&0));
+
+        let text = cfg.to_text();
+        let again = AppConfig::parse(&text);
+        assert_eq!(again.profile_orders, cfg.profile_orders);
+    }
+
+    /// A non-numeric or blank order is dropped rather than defaulting to 0 --
+    /// 0 is a real position (first), so guessing it would silently reorder the
+    /// list on a typo.
+    #[test]
+    fn an_unreadable_profile_order_is_dropped() {
+        let cfg = AppConfig::parse("profile_order.111=abc\nprofile_order.222=\nprofile_order.=3\n");
+        assert!(cfg.profile_orders.is_empty());
     }
 }
