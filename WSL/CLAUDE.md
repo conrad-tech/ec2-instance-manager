@@ -42,7 +42,7 @@ cargo build --features gui
 
 # Run tests
 cargo test                  # lib + CLI tests
-cargo test --features gui   # all tests including GUI (453 GUI tests)
+cargo test --features gui   # all tests including GUI (458 GUI tests)
 
 # Clippy
 cargo clippy --features gui
@@ -57,12 +57,12 @@ cargo clippy --features gui
 ## Build status
 
 As of 2026-09-09 (rustc 1.94.0), measured on `aws-resource-browser-phase1`
-after the Inventory resource sub-tabs reached phase 3 (ASG) — this line was
+after the Inventory resource sub-tabs reached phase 4 (S3) — this line was
 stale for months before phase 1 (it read 356 tests / 21 warnings, both months
 out of date; the measured baseline immediately before phase 1 was 1019 tests /
 23 warnings):
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 1161 tests pass, 0 fail (705 lib + 3 CLI + 453 GUI)
+- `cargo test --features gui` — 1188 tests pass, 0 fail (727 lib + 3 CLI + 458 GUI)
 - `cargo clippy --features gui` — no errors; 23 pre-existing style warnings.
   **That is a count of `^warning` lines, which is how the pre-branch baseline
   was measured and why the two are comparable — it is 21 distinct lints (6 lib
@@ -2174,7 +2174,9 @@ capacity edit — see "Editing ASG capacity" below, including why it has no
 Phase 1 built the scaffolding and Target Groups; phase 2 added Load
 Balancers and changed no scaffolding at all, which is what the phasing was
 for. Phase 3 (ASG) moved exactly one thing — see "The shared fetch plumbing"
-below. The remaining two are the same shape: a `parse_*`/`fetch_*` pair, a
+below. Phase 4 (S3) is the first **global** service and the first user of
+`classify_absent`, both of which phase 1 built the scaffolding for. Route 53
+is the last, and is the same shape: a `parse_*`/`fetch_*` pair, a
 `render_resource_panel` arm and a `DetailSubject` variant. The spec is
 `docs/superpowers/specs/2026-09-08-aws-resource-browser-design.md`.
 
@@ -2400,6 +2402,114 @@ in front of both entry points (`request_asg_capacity` is the one chokepoint).
   flag read after its `ui.horizontal` closes. The row loop borrows `rows` and
   the header closure borrows `ui`, so a `&mut self` call in either place does
   not compile.
+
+
+#### S3 buckets
+
+Columns are `Name · Region · Created` — three, because three is **everything
+`list-buckets` returns**. Size, object count, whether it is public: none of
+those are in the list reply and each is a call per bucket. The table is a
+finder; the detail view is where the configuration lives. **Object contents
+are out of scope** — this browses configuration and never lists or reads
+objects.
+
+- **S3 is global, and that is not a detail.** `list-buckets` returns the same
+  answer whichever region the CLI is pointed at, so `resources::cache_key`
+  omits the region (`ResourceKind::is_global`) — otherwise every bucket is
+  listed once per region the user has visited. The knock-on is the trap:
+  **one account checked in two regions produces the SAME cache key twice**,
+  where a regional kind would produce two distinct ones. So
+  `current_bucket_keys` **dedupes**, and without it every bucket is counted
+  twice in the total and rendered twice in the table.
+  `one_account_in_two_regions_is_one_bucket_list_but_two_target_group_lists`
+  pins the property that makes the dedupe necessary and
+  `the_bucket_key_list_dedupes` pins that it is actually written. `ensure_buckets`
+  is safe for a different reason — the first pass inserts the key into
+  `bucket_list_loading` and the second finds it there — and that is noted in
+  its doc comment so it does not get "simplified" away.
+- **`BucketRegion` is read from the list where the CLI provides it and left
+  blank where it does not.** It arrived in `ListBuckets` relatively recently;
+  an older CLI omits it. The alternative — one `get-bucket-location` per
+  bucket — turns opening the tab into a call per row on an account with
+  hundreds of buckets, which is the trap the Target Groups health column
+  already records. The cell then reads **`not reported`**, in words: a dash in
+  a column whose other values are region names reads as "this bucket has no
+  region", which is not a thing a bucket can be.
+- **A bucket is addressed in its OWN region.** Several `s3api` calls answer a
+  bucket in another region with `PermanentRedirect` rather than following it,
+  so pointing every detail call at the account's configured region fails on
+  exactly the buckets that are not in it — and a redirect reads like a
+  permissions problem. `Bucket::call_region` falls back to the account's
+  region when the CLI reported none, which is what the call would have used
+  anyway.
+- **The bucket NAME is the Details tab key**, not an ARN. The list reply
+  carries no ARN, and a bucket name is globally unique across all of AWS, so
+  two accounts cannot collide.
+
+##### The eight detail sections, and why `classify_absent` exists
+
+Each section is one `s3api` call on its own `ProcEvent::BucketDetail`
+message. They are eight separate IAM permissions, and a role that can read
+the tags but not the policy must still see the tags — the EC2 Details tab's
+volumes/security-groups rule taken to its conclusion. `BucketDetailState`
+holds them in a `HashMap<BucketSection, SectionResult>` rather than eight
+`Option` fields: eight fields on the struct plus eight on the event is where
+a section quietly gets wired to the wrong slot, and an absent key is exactly
+the "not answered yet" a spinner renders.
+
+- **`SectionResult` has four variants and they must never render alike.**
+  This is what `resources::classify_absent` was built in phase 1 for. The S3
+  API reports "this bucket has no lifecycle policy" by exiting **non-zero**
+  (`NoSuchBucketPolicy`, `NoSuchLifecycleConfiguration`, `NoSuchTagSet`,
+  `ServerSideEncryptionConfigurationNotFoundError`,
+  `NoSuchPublicAccessBlockConfiguration`), so reading every failure as an
+  error makes an ordinary bucket look broken — and reading every failure as
+  "None" hides a permissions hole. **`fetch_section` re-classifies**:
+  `FetchError::from_stderr` deliberately keeps the absent codes as failures,
+  because a *list* call has no "nothing configured" answer, and this is the
+  one caller for which they do.
+- **Public access is rendered FIRST**, and its absence is the one absence in
+  this panel that is not benign. No public access block means nothing at the
+  bucket level stops it being made public, so `BucketSection::absent_note`
+  returns a worrying flag for that section and only that one — the rest are
+  an ordinary bucket and must not be dressed up as a problem.
+  `an_absent_public_access_block_is_the_one_worrying_absence` pins both
+  halves.
+- **Anything short of all four flags is worrying, and the note names the ones
+  that are OFF.** They are not independent safeguards partly covering for
+  each other — public policies blocked with public ACLs allowed is a
+  reachable bucket — and "3 of 4" reads as mostly fine.
+- **A missing flag is read as `false`, never as absent.** The API omits a flag
+  it has never been given a value for; defaulting that to "blocked" reports a
+  bucket as protected by a setting nobody ever set.
+- **`BucketFacts::Verdict` exists for exactly one section.** Four booleans is
+  not an answer to "can this bucket be made public", and that question is the
+  one thing on this panel somebody is actually checking. Every other section
+  genuinely is just rows.
+- **The bucket policy arrives as a JSON string INSIDE a JSON object**, so the
+  raw reply is one escaped line. It is re-parsed and pretty-printed; a policy
+  that will not re-parse is shown verbatim rather than dropped, since it is
+  the document somebody opened the panel to read.
+- **`get-bucket-logging` reports "off" with a SUCCESS and an empty object**,
+  unlike its neighbours which report it by failing. The parser turns that into
+  the same `Absent` everything else produces.
+- **Versioning's empty reply is `Never enabled`, not absent.** It is the one
+  section where "nothing configured" is a real reportable state of the bucket,
+  and a bucket that never had versioning is a different thing from one where
+  it was enabled and then `Suspended`.
+- **A lifecycle rule always states its scope, including "whole bucket".** A
+  rule expiring everything after 30 days and one expiring `logs/` after 30
+  days are very different rules, and omitting the scope when there is none
+  renders the dangerous one as the safe one. The filter is `Filter` on a v2
+  rule and a bare `Prefix` on a v1 one and a real account has both, so reading
+  only one shows half the rules as bucket-wide when they are not. An unnamed
+  rule renders as `(unnamed)` — legal, common, and an empty key column reads
+  as a rendering fault.
+- **Copy All renders every section, including the empty ones.** An absent
+  heading in a pasted block reads as "this bucket has none of that", which for
+  the public access block is the exact opposite of what an absence means.
+  `a_refused_section_never_reads_as_an_absent_one` pins that refused and
+  absent stay distinguishable in the copied text too, not only on screen.
 
 - **`filter::text_matches` is the shared search engine.** The
   include/exclude matching was lifted out of `apply_filters` so every sub-tab

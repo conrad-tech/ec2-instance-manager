@@ -55,6 +55,7 @@ mod gui {
     use ec2_manager::power::{self, PowerAction, PowerPhase};
     use ec2_manager::profile_choice::profile_choice_path;
     use ec2_manager::resources::{self, ResourceKind};
+    use ec2_manager::s3::{self, Bucket, BucketFacts, BucketSection, SectionResult};
     use ec2_manager::terminal::{
         build_ssm_port_forward_args, build_ssm_session_args, dependency_status,
         discover_terminals, pick_default_terminal,
@@ -194,6 +195,7 @@ mod gui {
         TargetGroup(Box<TargetGroup>),
         LoadBalancer(Box<LoadBalancer>),
         Asg(Box<AutoScalingGroup>),
+        Bucket(Box<Bucket>),
     }
 
     /// One EC2 instance's Details tab state.
@@ -255,6 +257,10 @@ mod gui {
                 DetailSubject::TargetGroup(tg) => tg.arn.clone(),
                 DetailSubject::LoadBalancer(lb) => lb.arn.clone(),
                 DetailSubject::Asg(g) => g.arn.clone(),
+                // A bucket has no ARN in its list reply and its name is
+                // globally unique across all of AWS, so the name IS the key —
+                // two accounts cannot hold the same one.
+                DetailSubject::Bucket(b) => b.name.clone(),
             }
         }
 
@@ -266,6 +272,7 @@ mod gui {
                 DetailSubject::TargetGroup(_) => "TG",
                 DetailSubject::LoadBalancer(_) => "LB",
                 DetailSubject::Asg(_) => "ASG",
+                DetailSubject::Bucket(_) => "S3",
             }
         }
 
@@ -277,6 +284,7 @@ mod gui {
                 DetailSubject::TargetGroup(tg) => tg.name.clone(),
                 DetailSubject::LoadBalancer(lb) => lb.name.clone(),
                 DetailSubject::Asg(g) => g.name.clone(),
+                DetailSubject::Bucket(b) => b.name.clone(),
             }
         }
     }
@@ -292,6 +300,18 @@ mod gui {
     struct ListenerDetail {
         listener: Listener,
         rules: std::result::Result<Vec<ListenerRule>, String>,
+    }
+
+    /// One bucket's Details tab state.
+    ///
+    /// A map rather than a field per section: there are eight of them, they
+    /// are all the same shape, and eight `Option`s on one struct — plus eight
+    /// on the event that fills them — is where a section quietly gets wired to
+    /// the wrong slot. An absent key is "not answered yet", which is exactly
+    /// the state a spinner renders.
+    #[derive(Clone, Debug, Default)]
+    struct BucketDetailState {
+        sections: HashMap<BucketSection, SectionResult>,
     }
 
     /// The Inventory page's second tab row.
@@ -698,6 +718,27 @@ mod gui {
             policies: Option<std::result::Result<Vec<ScalingPolicy>, String>>,
             scheduled: Option<std::result::Result<Vec<ScheduledAction>, String>>,
             activities: Option<std::result::Result<Vec<ScalingActivity>, String>>,
+        },
+        /// One account's bucket list landed. Same shape as
+        /// `TargetGroupList`, including the cache key stamped at spawn — see
+        /// its comment for why the handler must not re-derive it. **S3 is
+        /// global, so that key carries no region.**
+        BucketList {
+            account_id: String,
+            cache_key: String,
+            result: std::result::Result<Vec<Bucket>, FetchError>,
+        },
+        /// One section of one bucket's configuration.
+        ///
+        /// One message per section rather than one carrying all eight: each
+        /// is a separate `s3api` call needing its own IAM permission, and a
+        /// role that can read the tags but not the policy must still see the
+        /// tags. `SectionResult` carries the absent / denied / failed
+        /// distinction the S3 API forces on us — see `s3.rs`'s header.
+        BucketDetail {
+            bucket: String,
+            section: BucketSection,
+            result: SectionResult,
         },
         /// A capacity edit finished. `Ok` carries the sentence for the
         /// status line; `Err` carries the failure, which is also logged at
@@ -7974,6 +8015,15 @@ mod gui {
         /// would otherwise both pass the check.
         asg_capacity_in_flight: Arc<Mutex<HashSet<String>>>,
         asg_capacity_status: Option<AsgCapacityStatus>,
+        /// Buckets per cache key — the same arrangement as the other lists,
+        /// except that S3 is global so the key carries no region and one
+        /// account checked in two regions maps to ONE entry. See
+        /// `current_bucket_keys`, which is where that stops being invisible.
+        buckets: HashMap<String, (Instant, Vec<Bucket>)>,
+        bucket_list_loading: HashSet<String>,
+        bucket_list_errors: HashMap<String, String>,
+        bucket_list_failures: HashMap<String, Instant>,
+        bucket_col_widths: HashMap<usize, f32>,
         /// Which resource sub-tab was showing last frame, so entering one can
         /// be told from staying on it. `None` while the EC2 tab is showing, so
         /// coming back from it counts as entering.
@@ -8010,6 +8060,7 @@ mod gui {
         tg_details: HashMap<String, TgDetailState>,
         lb_details: HashMap<String, LbDetailState>,
         asg_details: HashMap<String, AsgDetailState>,
+        bucket_details: HashMap<String, BucketDetailState>,
         /// The selected target group's registered targets and configuration,
         /// each on its own event — a role that can describe a group but not
         /// read its health, attributes or tags must still see what it can.
@@ -8827,6 +8878,11 @@ mod gui {
                 asg_capacity_edit: None,
                 asg_capacity_in_flight: Arc::new(Mutex::new(HashSet::new())),
                 asg_capacity_status: None,
+                buckets: HashMap::new(),
+                bucket_list_loading: HashSet::new(),
+                bucket_list_errors: HashMap::new(),
+                bucket_list_failures: HashMap::new(),
+                bucket_col_widths: HashMap::new(),
                 last_resource_tab: None,
                 // `features` is the local in `App::new`, the same one
                 // `instance_power_enabled` below is resolved from.
@@ -8844,6 +8900,7 @@ mod gui {
                 tg_details: HashMap::new(),
                 lb_details: HashMap::new(),
                 asg_details: HashMap::new(),
+                bucket_details: HashMap::new(),
                 local_port: 2222,
                 remote_port: 22,
                 message: String::new(),
@@ -9874,18 +9931,23 @@ mod gui {
         ///   to go, or the user has to press Refresh, which is what they had
         ///   to do.
         fn forget_resources_for_account(&mut self, account: &str, why: &str) {
-            let before =
-                self.target_groups.len() + self.load_balancers.len() + self.asgs.len();
+            let before = self.target_groups.len()
+                + self.load_balancers.len()
+                + self.asgs.len()
+                + self.buckets.len();
             self.target_groups
                 .retain(|k, _| !cache_key_is_for_account(k, account));
             self.load_balancers
                 .retain(|k, _| !cache_key_is_for_account(k, account));
             self.asgs
                 .retain(|k, _| !cache_key_is_for_account(k, account));
+            self.buckets
+                .retain(|k, _| !cache_key_is_for_account(k, account));
             for set in [
                 &mut self.tg_list_loading,
                 &mut self.lb_list_loading,
                 &mut self.asg_list_loading,
+                &mut self.bucket_list_loading,
             ] {
                 set.retain(|k| !cache_key_is_for_account(k, account));
             }
@@ -9893,6 +9955,7 @@ mod gui {
                 &mut self.tg_list_failures,
                 &mut self.lb_list_failures,
                 &mut self.asg_list_failures,
+                &mut self.bucket_list_failures,
             ] {
                 map.retain(|k, _| !cache_key_is_for_account(k, account));
             }
@@ -9900,6 +9963,7 @@ mod gui {
                 &mut self.tg_list_errors,
                 &mut self.lb_list_errors,
                 &mut self.asg_list_errors,
+                &mut self.bucket_list_errors,
             ] {
                 map.remove(account);
             }
@@ -9908,8 +9972,10 @@ mod gui {
             self.tg_targets
                 .retain(|arn, _| !arn_is_for_account(arn, account));
             self.tg_denied_accounts.remove(account);
-            let after =
-                self.target_groups.len() + self.load_balancers.len() + self.asgs.len();
+            let after = self.target_groups.len()
+                + self.load_balancers.len()
+                + self.asgs.len()
+                + self.buckets.len();
             if before != after || !why.is_empty() {
                 self.log_info(format!(
                     "resources: dropped everything cached for account {account} ({why})"
@@ -20717,6 +20783,73 @@ mod gui {
                             }
                         }
                     }
+                    ProcEvent::BucketList {
+                        account_id,
+                        cache_key,
+                        result,
+                    } => {
+                        // Applied only while this reply is still the one being
+                        // waited on: Refresh clears the set, and a reply that
+                        // was already in flight then must not land afterwards
+                        // stamped as fresh. Same rule as `TargetGroupList`.
+                        if !self.bucket_list_loading.remove(&cache_key) {
+                            self.log_debug(format!(
+                                "buckets: dropping a reply for {cache_key} that Refresh \
+                                 already superseded"
+                            ));
+                            continue;
+                        }
+                        match result {
+                            Ok(buckets) => {
+                                self.log_info(format!(
+                                    "buckets: {} in account {account_id}",
+                                    buckets.len()
+                                ));
+                                self.bucket_list_failures.remove(&cache_key);
+                                remember_list_error(
+                                    &mut self.bucket_list_errors,
+                                    &account_id,
+                                    None,
+                                );
+                                self.buckets.insert(cache_key, (Instant::now(), buckets));
+                            }
+                            Err(err) => {
+                                let msg = err.message();
+                                let news = list_error_is_news(
+                                    &self.bucket_list_errors,
+                                    &account_id,
+                                    &msg,
+                                );
+                                if news {
+                                    self.log_error(format!(
+                                        "buckets: account {account_id}: {msg}"
+                                    ));
+                                } else {
+                                    self.log_debug(format!(
+                                        "buckets: account {account_id}: {msg} (unchanged)"
+                                    ));
+                                }
+                                self.bucket_list_failures.insert(cache_key, Instant::now());
+                                remember_list_error(
+                                    &mut self.bucket_list_errors,
+                                    &account_id,
+                                    Some(msg),
+                                );
+                            }
+                        }
+                    }
+                    ProcEvent::BucketDetail {
+                        bucket,
+                        section,
+                        result,
+                    } => {
+                        // Only into a tab that still exists: a reply for one
+                        // closed while it was in flight is dropped rather than
+                        // resurrecting the tab's state.
+                        if let Some(st) = self.bucket_details.get_mut(&bucket) {
+                            st.sections.insert(section, result);
+                        }
+                    }
                     ProcEvent::AsgCapacityDone {
                         arn,
                         name,
@@ -24050,6 +24183,10 @@ mod gui {
                     self.ensure_asgs();
                     self.render_asgs(ui);
                 }
+                ResourceKind::Bucket => {
+                    self.ensure_buckets();
+                    self.render_buckets(ui);
+                }
                 other => {
                     ui.label(format!("{} is not built yet.", other.label()));
                 }
@@ -24371,7 +24508,15 @@ mod gui {
                             }
                         }
                     }
-                    // The other two have no list yet.
+                    ResourceKind::Bucket => {
+                        if let Some((at, _)) = self.buckets.get_mut(&key) {
+                            if selection_forces_refresh(at.elapsed(), RESOURCE_SELECT_FLOOR) {
+                                *at = stale;
+                                self.bucket_list_failures.remove(&key);
+                            }
+                        }
+                    }
+                    // Route 53 has no list yet.
                     _ => {}
                 }
             }
@@ -25021,6 +25166,434 @@ mod gui {
             if dismiss {
                 self.asg_capacity_status = None;
             }
+        }
+
+
+        /// Start a list fetch for any account whose buckets are missing or
+        /// stale.
+        ///
+        /// **One account checked in two regions is ONE fetch here, not two.**
+        /// S3 is global, so both pool entries build the same cache key; the
+        /// first pass through this loop inserts it into `bucket_list_loading`
+        /// and the second finds it there and skips. That is not incidental —
+        /// without the loading set this would spawn two identical
+        /// `list-buckets` calls per refresh.
+        fn ensure_buckets(&mut self) {
+            let mode = self.options.mode.as_str().to_string();
+            for account in self.resource_pool_accounts() {
+                // Not an error, a wait — the same stance every other sub-tab
+                // takes, and what stops an expired session filling the error
+                // banner with refusals.
+                if !account.authed {
+                    continue;
+                }
+                let key = account.cache_key(ResourceKind::Bucket, &mode);
+                let fresh = self
+                    .buckets
+                    .get(&key)
+                    .is_some_and(|(at, _)| at.elapsed() <= resources::RESOURCE_TTL);
+                if !list_fetch_due(
+                    fresh,
+                    self.bucket_list_loading.contains(&key),
+                    self.bucket_list_failures.get(&key).map(Instant::elapsed),
+                    resources::RESOURCE_TTL,
+                ) {
+                    continue;
+                }
+                self.bucket_list_loading.insert(key.clone());
+                let tx = self.proc_tx.clone();
+                let (p, r, a) = (
+                    account.profile.clone(),
+                    account.region.clone(),
+                    account.account_id.clone(),
+                );
+                let repaint = self.egui_ctx.clone();
+                std::thread::spawn(move || {
+                    let result = s3::fetch_buckets(&p, &r, &a);
+                    let _ = tx.send(ProcEvent::BucketList {
+                        account_id: a,
+                        cache_key: key,
+                        result,
+                    });
+                    if let Some(ctx) = &repaint {
+                        ctx.request_repaint();
+                    }
+                });
+            }
+        }
+
+        /// The cache keys of the accounts currently in the pool, **deduped**.
+        ///
+        /// The dedupe is load-bearing here and nowhere else. A regional kind's
+        /// key carries its region, so one account checked in two regions
+        /// yields two distinct keys and two distinct lists. S3 is global and
+        /// its key does not, so the same account contributes the SAME key
+        /// twice — and reading the cache through it would count every bucket
+        /// twice in the total and render every row twice in the table.
+        fn current_bucket_keys(&self) -> Vec<String> {
+            let mode = self.options.mode.as_str().to_string();
+            let mut out: Vec<String> = Vec::new();
+            for account in self.resource_pool_accounts() {
+                let key = account.cache_key(ResourceKind::Bucket, &mode);
+                if !out.contains(&key) {
+                    out.push(key);
+                }
+            }
+            out
+        }
+
+        /// The buckets the search box leaves visible, from every account in
+        /// the pool.
+        fn filtered_buckets(&self) -> Vec<Bucket> {
+            let (includes, excludes) = search_terms_from_rules(&self.search_rules);
+            let include_matchers = build_matchers(&includes);
+            let exclude_matchers = build_matchers(&excludes);
+
+            let mut rows: Vec<Bucket> = self
+                .current_bucket_keys()
+                .iter()
+                .filter_map(|k| self.buckets.get(k))
+                .flat_map(|(_, buckets)| buckets.iter().cloned())
+                .filter(|b| {
+                    text_matches(
+                        &s3::bucket_searchable_text(b),
+                        &include_matchers,
+                        &exclude_matchers,
+                    )
+                })
+                .collect();
+            rows.sort_by(|a, b| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+                    .then_with(|| a.account_id.cmp(&b.account_id))
+            });
+            rows
+        }
+
+        fn render_buckets(&mut self, ui: &mut egui::Ui) {
+            let rows = self.filtered_buckets();
+            let total: usize = self
+                .current_bucket_keys()
+                .iter()
+                .filter_map(|k| self.buckets.get(k))
+                .map(|(_, buckets)| buckets.len())
+                .sum();
+
+            ui.horizontal(|ui| {
+                ui.label(format!("Buckets: {} filtered / {total} total", rows.len()));
+                if ui.button("Refresh").clicked() {
+                    self.buckets.clear();
+                    self.bucket_list_loading.clear();
+                    self.bucket_list_errors.clear();
+                    self.bucket_list_failures.clear();
+                }
+            });
+
+            // Named accounts that could not be listed, shown even when others
+            // returned rows: one AccessDenied must not blank a pool, and its
+            // absence must not be invisible either.
+            if let Some(detail) = list_error_detail(&self.bucket_list_errors) {
+                note_label(
+                    ui,
+                    egui::Color32::RED,
+                    format!("Could not list S3: {detail}"),
+                );
+            }
+
+            // Amber, not red: an expired session is not a failure, it is a
+            // wait, and it clears itself when the credentials are renewed.
+            let waiting = waiting_for_auth_note(&self.resource_pool_accounts());
+            if let Some(note) = &waiting {
+                note_label(ui, egui::Color32::YELLOW, note.clone());
+                // The credentials watcher runs off a file-modified poll, not
+                // the frame loop, so this note would otherwise sit there until
+                // something else happened to redraw.
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
+            }
+
+            if !self.bucket_list_loading.is_empty() {
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
+
+            // Wake up when the oldest cached list goes stale, so the TTL is a
+            // real interval rather than something re-checked only when the
+            // window happens to redraw.
+            if let Some(due) = next_list_refresh(
+                self.current_bucket_keys()
+                    .iter()
+                    .filter_map(|k| self.buckets.get(k))
+                    .map(|(at, _)| at.elapsed()),
+                resources::RESOURCE_TTL,
+            ) {
+                ui.ctx()
+                    .request_repaint_after(due.max(Duration::from_millis(200)));
+            }
+
+            if rows.is_empty() {
+                ui.label(resource_empty_note(
+                    ResourceKind::Bucket,
+                    !self.bucket_list_loading.is_empty(),
+                    list_error_detail(&self.bucket_list_errors).as_deref(),
+                ));
+                return;
+            }
+
+            let auto = bucket_auto_widths(&rows);
+            let overrides = self.bucket_col_widths.clone();
+            let mut pending_detail: Option<Bucket> = None;
+            let mut pending_width: Option<(usize, f32)> = None;
+
+            // Solid rather than the default floating bar, and only when there
+            // is something to scroll — the pair of reasons the Target Groups
+            // table records.
+            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+            egui::ScrollArea::both()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                .show(ui, |ui| {
+                    let cw =
+                        |idx: usize| -> f32 { overrides.get(&idx).copied().unwrap_or(auto[idx]) };
+                    egui::Grid::new("bucket_grid")
+                        .striped(true)
+                        .min_col_width(0.0)
+                        .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
+                        .show(ui, |ui| {
+                            for (idx, label) in BUCKET_COLUMN_LABELS.iter().enumerate() {
+                                let width = cw(idx);
+                                let cell = ui.allocate_ui_with_layout(
+                                    egui::vec2(width, TG_ROW_H),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(*label).strong(),
+                                            )
+                                            .wrap_mode(egui::TextWrapMode::Truncate),
+                                        )
+                                    },
+                                );
+                                let resp = cell.response;
+                                let drag_id = ui.id().with(("bucket_col_resize", idx));
+                                let near_right = ui.input(|i| {
+                                    i.pointer.hover_pos().is_some_and(|pos| {
+                                        resp.rect.contains(pos)
+                                            && pos.x > resp.rect.right() - 8.0
+                                    })
+                                });
+                                if near_right || ui.ctx().is_being_dragged(drag_id) {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+                                    let x = resp.rect.right();
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(x, resp.rect.top()),
+                                            egui::pos2(x, resp.rect.bottom()),
+                                        ],
+                                        egui::Stroke::new(2.0, ui.visuals().text_color()),
+                                    );
+                                    let drag = ui.interact(
+                                        egui::Rect::from_min_size(
+                                            resp.rect.right_top() - egui::vec2(8.0, 0.0),
+                                            egui::vec2(16.0, resp.rect.height()),
+                                        ),
+                                        drag_id,
+                                        egui::Sense::drag(),
+                                    );
+                                    if drag.dragged() {
+                                        pending_width = Some((
+                                            idx,
+                                            (width + drag.drag_delta().x).max(TG_COL_MIN_W),
+                                        ));
+                                    }
+                                }
+                            }
+                            ui.end_row();
+
+                            for b in &rows {
+                                // The one field people copy out of this table,
+                                // so it carries the Inventory table's own copy
+                                // button rather than making somebody select
+                                // text out of a truncating cell.
+                                let name_cell = ui.allocate_ui_with_layout(
+                                    egui::vec2(cw(0), TG_ROW_H),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        Self::paint_copy_button(ui, &b.name, "Copy bucket name");
+                                        ui.add(
+                                            egui::Label::new(b.name.clone())
+                                                .wrap_mode(egui::TextWrapMode::Truncate),
+                                        )
+                                        .on_hover_text(b.name.clone());
+                                    },
+                                );
+
+                                let r_region =
+                                    tg_cell(ui, cw(1), TG_ROW_H, s3::region_label(b));
+                                let r_created = tg_cell(
+                                    ui,
+                                    cw(2),
+                                    TG_ROW_H,
+                                    b.created
+                                        .as_deref()
+                                        .map(format_aws_time_local)
+                                        .unwrap_or_else(|| "—".to_string()),
+                                );
+
+                                // Everything except the name cell, which holds
+                                // the copy button: unioning it would make a
+                                // click on that button also open the details.
+                                let row = r_region.union(r_created);
+                                let hovered = row.hovered() || name_cell.response.hovered();
+                                if hovered {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    ui.painter().rect_filled(
+                                        row.rect.union(name_cell.response.rect),
+                                        0.0,
+                                        TG_ROW_HOVER,
+                                    );
+                                }
+                                if row.clicked() {
+                                    pending_detail = Some(b.clone());
+                                }
+                                row.context_menu(|ui| {
+                                    if ui.button("See Details").clicked() {
+                                        pending_detail = Some(b.clone());
+                                        ui.close();
+                                    }
+                                });
+
+                                ui.end_row();
+                            }
+                        });
+                    // Room under the last row, as the EC2 table has.
+                    ui.add_space(20.0);
+                });
+
+            if let Some((idx, w)) = pending_width {
+                self.bucket_col_widths.insert(idx, w);
+            }
+            if let Some(b) = pending_detail {
+                self.open_bucket_details(b);
+            }
+        }
+
+        /// Open a bucket in the Details tab and start its eight section reads.
+        ///
+        /// **Eight calls, each on its own message.** They are eight separate
+        /// `s3api` operations needing eight separate IAM permissions, and a
+        /// role that can read the tags but not the policy must still see the
+        /// tags — the same rule the EC2 Details tab follows for volumes and
+        /// security groups, taken to its conclusion.
+        ///
+        /// They run sequentially in one thread and report as they land, so the
+        /// panel fills top-down rather than after the slowest one. Public
+        /// access is read first because it is the section rendered first, and
+        /// the section somebody opened the bucket to read.
+        fn open_bucket_details(&mut self, bucket: Bucket) {
+            // A fresh state for this tab; re-opening refetches.
+            self.bucket_details
+                .insert(bucket.name.clone(), BucketDetailState::default());
+
+            let pool = self
+                .resource_pool_accounts()
+                .into_iter()
+                .find(|a| a.account_id == bucket.account_id);
+            let Some(account) = pool else {
+                // No context for this account, so nothing will ever post a
+                // result: say so rather than spin on eight spinners forever.
+                let err = format!("no AWS context for account {}", bucket.account_id);
+                if let Some(st) = self.bucket_details.get_mut(&bucket.name) {
+                    for section in BucketSection::all() {
+                        st.sections
+                            .insert(section, SectionResult::Failed(err.clone()));
+                    }
+                }
+                self.focus_detail_tab(DetailSubject::Bucket(Box::new(bucket)));
+                return;
+            };
+
+            let profile = account.profile.clone();
+            // The bucket's OWN region, falling back to the account's. Several
+            // `s3api` calls answer a bucket in another region with
+            // `PermanentRedirect` rather than following it, so this is what
+            // stops every bucket outside the account's configured region
+            // reporting eight failures that read like a permissions problem.
+            let region = bucket.call_region(&account.region).to_string();
+            let tx = self.proc_tx.clone();
+            let repaint = self.egui_ctx.clone();
+            let name = bucket.name.clone();
+            std::thread::spawn(move || {
+                for section in BucketSection::all() {
+                    let result = s3::fetch_section(&profile, &region, &name, section);
+                    let _ = tx.send(ProcEvent::BucketDetail {
+                        bucket: name.clone(),
+                        section,
+                        result,
+                    });
+                    // Every section wakes the UI. A worker that fills a panel
+                    // and never asks for a repaint is the bug the target group
+                    // health column shipped with: the first row landed because
+                    // something else happened to redraw, and the rest sat
+                    // there.
+                    if let Some(ctx) = &repaint {
+                        ctx.request_repaint();
+                    }
+                }
+            });
+
+            self.focus_detail_tab(DetailSubject::Bucket(Box::new(bucket)));
+        }
+
+        fn render_bucket_details(&mut self, ui: &mut egui::Ui, b: Bucket, title: &str) {
+            let st = self.bucket_details.get(&b.name).cloned().unwrap_or_default();
+            ui.horizontal(|ui| {
+                ui.heading(title);
+                if ui.button("Copy All").clicked() {
+                    let text = bucket_detail_text(&b, &st.sections);
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(&text);
+                    }
+                }
+            });
+            ui.separator();
+
+            // One scroll area, and nothing inside it with a fixed height — the
+            // constraint the Jira ticket window records, for the reason it cost
+            // a layout bug there.
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("bucket_detail_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Name");
+                        ui.horizontal(|ui| {
+                            Self::paint_copy_button(ui, &b.name, "Copy bucket name");
+                            ui.label(&b.name);
+                        });
+                        ui.end_row();
+                        ui.strong("Region");
+                        ui.label(s3::region_label(&b));
+                        ui.end_row();
+                        ui.strong("Account");
+                        ui.label(&b.account_id);
+                        ui.end_row();
+                        ui.strong("Created");
+                        ui.label(
+                            b.created
+                                .as_deref()
+                                .map(format_aws_time_local)
+                                .unwrap_or_else(|| "—".to_string()),
+                        );
+                        ui.end_row();
+                    });
+
+                for section in BucketSection::all() {
+                    ui.add_space(12.0);
+                    ui.heading(section.label());
+                    ui.separator();
+                    render_bucket_section(ui, section, st.sections.get(&section));
+                }
+            });
         }
 
         /// Start a list fetch for any account whose auto scaling groups are
@@ -28819,6 +29392,15 @@ mod gui {
                         ),
                     }
                 }
+                DetailSubject::Bucket(b) => {
+                    let profile_id = self.profile_id_for_account(&b.account_id)?;
+                    resource_env_color(
+                        &self.account_color_map,
+                        &profile_id,
+                        &b.name,
+                        &self.hidden_envs,
+                    )
+                }
             }
         }
 
@@ -28897,6 +29479,9 @@ mod gui {
                 DetailSubject::Asg(_) => {
                     self.asg_details.remove(&key);
                 }
+                DetailSubject::Bucket(_) => {
+                    self.bucket_details.remove(&key);
+                }
             }
             // Keep the active index inside the vec. Closing the tab left of the
             // active one would otherwise slide a different tab under the
@@ -28918,6 +29503,7 @@ mod gui {
             self.tg_details.clear();
             self.lb_details.clear();
             self.asg_details.clear();
+            self.bucket_details.clear();
             self.main_tab = MainTab::Inventory;
         }
 
@@ -29086,6 +29672,9 @@ mod gui {
                 }
                 DetailSubject::Asg(g) => {
                     self.render_asg_details(ui, *g, &title);
+                }
+                DetailSubject::Bucket(b) => {
+                    self.render_bucket_details(ui, *b, &title);
                 }
             }
         }
@@ -36081,6 +36670,9 @@ mod gui {
             ResourceKind::Asg => {
                 "No auto scaling groups in the selected account(s).".to_string()
             }
+            // Same reason as the ASG arm: the label is a tab title, not a
+            // noun that fits into a sentence.
+            ResourceKind::Bucket => "No S3 buckets in the selected account(s).".to_string(),
             other => format!("No {} in the selected account(s).", other.label()),
         }
     }
@@ -36299,6 +36891,194 @@ mod gui {
         }
     }
 
+
+
+    /// The S3 table's columns.
+    ///
+    /// Three, because three is **everything `list-buckets` returns**. Size,
+    /// object count, whether it is public — none of those are in the list
+    /// reply, and each is a call per bucket. The table is a finder; the
+    /// detail view is where the configuration lives.
+    const BUCKET_COLUMN_LABELS: [&str; 3] = ["Name", "Region", "Created"];
+
+    const BUCKET_MIN_COL_W: [f32; 3] = [260.0, 110.0, 150.0];
+    const BUCKET_MAX_COL_W: [f32; 3] = [640.0, 150.0, 200.0];
+
+    /// Each column sized to its widest cell and clamped, as every other table
+    /// here is: sized to content with a horizontal scrollbar, never divided
+    /// out of the window's width.
+    fn bucket_auto_widths(rows: &[Bucket]) -> [f32; 3] {
+        let text_w = |s: &str| s.chars().count() as f32 * TG_CHAR_W + 8.0;
+        let mut out = [0.0f32; 3];
+        for (idx, label) in BUCKET_COLUMN_LABELS.iter().enumerate() {
+            out[idx] = text_w(label) + 6.0;
+        }
+        for b in rows {
+            let cells = [
+                // The copy button sits in this cell too.
+                text_w(&b.name) + COL_COPY_W,
+                text_w(&s3::region_label(b)),
+                text_w(
+                    &b.created
+                        .as_deref()
+                        .map(format_aws_time_local)
+                        .unwrap_or_else(|| "—".to_string()),
+                ),
+            ];
+            for (idx, w) in cells.iter().enumerate() {
+                out[idx] = out[idx].max(*w);
+            }
+        }
+        for idx in 0..out.len() {
+            out[idx] = out[idx].clamp(BUCKET_MIN_COL_W[idx], BUCKET_MAX_COL_W[idx]);
+        }
+        out
+    }
+
+    /// One section of a bucket's detail view.
+    ///
+    /// **Four states that must never look alike**, which is the whole reason
+    /// `SectionResult` has four variants: not answered yet, nothing
+    /// configured, refused, and failed. The S3 API reports "nothing
+    /// configured" by *failing*, so rendering an absence as an error makes
+    /// every ordinary bucket look broken — and rendering a refusal as an
+    /// absence hides a permissions hole, which is worse.
+    fn render_bucket_section(
+        ui: &mut egui::Ui,
+        section: BucketSection,
+        result: Option<&SectionResult>,
+    ) {
+        let Some(result) = result else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Fetching…");
+            });
+            return;
+        };
+        match result {
+            SectionResult::Absent => {
+                let (note, worrying) = section.absent_note();
+                if worrying {
+                    // The public access block, and only it. Everything else
+                    // being absent is an ordinary bucket.
+                    note_label(ui, ui.visuals().warn_fg_color, note);
+                } else {
+                    ui.label(note);
+                }
+            }
+            SectionResult::Denied => {
+                // NOT the same as absent, and it must not read like it: a
+                // bucket with no public-access block and one whose block you
+                // may not read are different facts.
+                note_label(ui, ui.visuals().warn_fg_color, "not permitted");
+            }
+            SectionResult::Failed(err) => {
+                note_label(ui, ui.visuals().error_fg_color, format!("Error: {err}"));
+            }
+            SectionResult::Facts(facts) => render_bucket_facts(ui, section, facts),
+        }
+    }
+
+    fn render_bucket_facts(ui: &mut egui::Ui, section: BucketSection, facts: &BucketFacts) {
+        match facts {
+            BucketFacts::Pairs(pairs) => bucket_pairs_grid(ui, section, pairs),
+            BucketFacts::Verdict {
+                note,
+                worrying,
+                pairs,
+            } => {
+                let colour = if *worrying {
+                    ui.visuals().warn_fg_color
+                } else {
+                    // The reassuring answer gets no colour: a panel where
+                    // every line is coloured has said nothing, and the point
+                    // of colouring this one is that the bad answer stands out.
+                    ui.visuals().text_color()
+                };
+                note_label(ui, colour, note.clone());
+                bucket_pairs_grid(ui, section, pairs);
+            }
+            BucketFacts::Document(text) => {
+                ui.horizontal(|ui| {
+                    Ec2GuiApp::paint_copy_button(ui, text, "Copy the policy");
+                    ui.label("policy document");
+                });
+                // Monospace and selectable. A bucket policy is read closely
+                // and often pasted somewhere else, and the copy button is
+                // there because selecting several hundred lines by hand is
+                // not a reasonable way to get it.
+                ui.add(egui::Label::new(egui::RichText::new(text).monospace()).wrap());
+            }
+        }
+    }
+
+    fn bucket_pairs_grid(ui: &mut egui::Ui, section: BucketSection, pairs: &[(String, String)]) {
+        egui::Grid::new(("bucket_section", section.label()))
+            .num_columns(2)
+            .spacing([16.0, 4.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for (k, v) in pairs {
+                    ui.strong(k);
+                    ui.label(v);
+                    ui.end_row();
+                }
+            });
+    }
+
+    /// Everything the bucket detail view shows, as plain text for Copy All.
+    ///
+    /// Pure over exactly the state the panel renders from, so what is copied
+    /// and what is on screen cannot drift — the contract
+    /// `load_balancer_detail_text` keeps. **Every section appears, including
+    /// the empty ones**: an absent heading in a pasted block reads as "this
+    /// bucket has none of that", and for the public access block that would
+    /// be the exact opposite of what an absence means.
+    fn bucket_detail_text(
+        b: &Bucket,
+        sections: &HashMap<BucketSection, SectionResult>,
+    ) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("Bucket: {}\n", b.name));
+        out.push_str(&format!("Region: {}\n", s3::region_label(b)));
+        out.push_str(&format!("Account: {}\n", b.account_id));
+        out.push_str(&format!(
+            "Created: {}\n",
+            b.created
+                .as_deref()
+                .map(format_aws_time_local)
+                .unwrap_or_else(|| "—".to_string())
+        ));
+
+        for section in BucketSection::all() {
+            out.push_str(&format!("\n{}:\n", section.label()));
+            match sections.get(&section) {
+                None => out.push_str("  (still loading)\n"),
+                Some(SectionResult::Absent) => {
+                    out.push_str(&format!("  {}\n", section.absent_note().0));
+                }
+                Some(SectionResult::Denied) => out.push_str("  not permitted\n"),
+                Some(SectionResult::Failed(err)) => out.push_str(&format!("  Error: {err}\n")),
+                Some(SectionResult::Facts(BucketFacts::Pairs(pairs))) => {
+                    for (k, v) in pairs {
+                        out.push_str(&format!("  {k}: {v}\n"));
+                    }
+                }
+                Some(SectionResult::Facts(BucketFacts::Verdict { note, pairs, .. })) => {
+                    out.push_str(&format!("  {note}\n"));
+                    for (k, v) in pairs {
+                        out.push_str(&format!("  {k}: {v}\n"));
+                    }
+                }
+                Some(SectionResult::Facts(BucketFacts::Document(doc))) => {
+                    for line in doc.lines() {
+                        out.push_str(&format!("  {line}\n"));
+                    }
+                }
+            }
+        }
+        out
+    }
 
     /// The ASG table's columns.
     ///
@@ -44646,6 +45426,167 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         }
 
 
+
+        fn bucket_row(name: &str) -> Bucket {
+            Bucket {
+                name: name.to_string(),
+                created: Some("2020-01-15T10:30:00+00:00".to_string()),
+                region: "us-east-1".to_string(),
+                account_id: "111122223333".to_string(),
+            }
+        }
+
+        /// **The dedupe in `current_bucket_keys` is load-bearing, and it is
+        /// load-bearing ONLY for a global service.**
+        ///
+        /// A regional kind's cache key carries its region, so one account
+        /// checked in two regions yields two distinct keys and two distinct
+        /// lists. S3's key does not carry a region — that is the whole point
+        /// of `ResourceKind::is_global` — so the same account contributes the
+        /// SAME key twice, and reading the cache through an undeduped list
+        /// counts every bucket twice in the total and renders every row twice
+        /// in the table.
+        ///
+        /// Pinned against `resources::cache_key` directly rather than through
+        /// a constructed `App`, because what is being checked is the property
+        /// of the key that makes the dedupe necessary.
+        #[test]
+        fn one_account_in_two_regions_is_one_bucket_list_but_two_target_group_lists() {
+            let east = ec2_manager::resources::cache_key(
+                ResourceKind::Bucket,
+                "live",
+                "111122223333",
+                "us-east-1",
+            );
+            let west = ec2_manager::resources::cache_key(
+                ResourceKind::Bucket,
+                "live",
+                "111122223333",
+                "eu-west-2",
+            );
+            assert_eq!(east, west, "a global kind must collapse to one key");
+
+            let tg_east = ec2_manager::resources::cache_key(
+                ResourceKind::TargetGroup,
+                "live",
+                "111122223333",
+                "us-east-1",
+            );
+            let tg_west = ec2_manager::resources::cache_key(
+                ResourceKind::TargetGroup,
+                "live",
+                "111122223333",
+                "eu-west-2",
+            );
+            assert_ne!(tg_east, tg_west, "a regional kind must not");
+        }
+
+        /// And the dedupe itself is actually written, since the property
+        /// above only says why it is needed.
+        #[test]
+        fn the_bucket_key_list_dedupes() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let start = src
+                .find("fn current_bucket_keys(&self) -> Vec<String> {")
+                .expect("current_bucket_keys");
+            let body = &src[start..start + 700];
+            assert!(
+                body.contains("if !out.contains(&key)"),
+                "current_bucket_keys must drop a key it already has:\n{body}"
+            );
+        }
+
+        /// Every column the table shows is sized from its own content and
+        /// clamped, or one pathological bucket name pushes the rest off
+        /// screen.
+        #[test]
+        fn bucket_columns_are_sized_to_their_content_and_clamped() {
+            let narrow = bucket_auto_widths(std::slice::from_ref(&bucket_row("a")));
+            for idx in 0..BUCKET_COLUMN_LABELS.len() {
+                assert!(
+                    narrow[idx] >= BUCKET_MIN_COL_W[idx],
+                    "column {idx} fell under its floor"
+                );
+            }
+            let long = bucket_row(&"n".repeat(300));
+            let wide = bucket_auto_widths(std::slice::from_ref(&long));
+            assert!(wide[0] > narrow[0], "a long name must widen its own column");
+            for idx in 0..BUCKET_COLUMN_LABELS.len() {
+                assert!(
+                    wide[idx] <= BUCKET_MAX_COL_W[idx],
+                    "column {idx} blew past its ceiling"
+                );
+            }
+            let empty = bucket_auto_widths(&[]);
+            for idx in 0..BUCKET_COLUMN_LABELS.len() {
+                assert!(empty[idx] >= BUCKET_MIN_COL_W[idx]);
+            }
+        }
+
+        /// Copy All renders every section, **including the empty ones**. An
+        /// absent heading in a pasted block reads as "this bucket has none of
+        /// that" — and for the public access block that is the exact opposite
+        /// of what an absence means.
+        #[test]
+        fn the_bucket_copy_all_text_never_omits_a_section() {
+            let b = bucket_row("app-assets");
+            let mut sections = HashMap::new();
+            // One of each of the four outcomes, so the block has to tell them
+            // apart in text as well as on screen.
+            sections.insert(BucketSection::PublicAccess, SectionResult::Absent);
+            sections.insert(BucketSection::Policy, SectionResult::Denied);
+            sections.insert(
+                BucketSection::Tags,
+                SectionResult::Failed("Rate exceeded".to_string()),
+            );
+            sections.insert(
+                BucketSection::Versioning,
+                SectionResult::Facts(BucketFacts::Pairs(vec![(
+                    "Status".to_string(),
+                    "Enabled".to_string(),
+                )])),
+            );
+            // Lifecycle deliberately left out entirely: still in flight.
+
+            let text = bucket_detail_text(&b, &sections);
+            for section in BucketSection::all() {
+                assert!(
+                    text.contains(&format!("\n{}:\n", section.label())),
+                    "missing the {} heading:\n{text}",
+                    section.label()
+                );
+            }
+            assert!(text.contains("Bucket: app-assets"), "{text}");
+            // The worrying absence keeps its own words rather than a bare
+            // "None".
+            assert!(text.contains("made public"), "{text}");
+            assert!(text.contains("not permitted"), "{text}");
+            assert!(text.contains("Error: Rate exceeded"), "{text}");
+            assert!(text.contains("Status: Enabled"), "{text}");
+            assert!(text.contains("(still loading)"), "{text}");
+        }
+
+        /// Refused and absent must not read alike in the copied text either.
+        /// A bucket with no public-access block and one whose block you may
+        /// not read are different facts, and that distinction is the whole
+        /// reason `classify_absent` exists.
+        #[test]
+        fn a_refused_section_never_reads_as_an_absent_one() {
+            let b = bucket_row("app-assets");
+            let mut denied = HashMap::new();
+            denied.insert(BucketSection::PublicAccess, SectionResult::Denied);
+            let denied_text = bucket_detail_text(&b, &denied);
+
+            let mut absent = HashMap::new();
+            absent.insert(BucketSection::PublicAccess, SectionResult::Absent);
+            let absent_text = bucket_detail_text(&b, &absent);
+
+            assert_ne!(denied_text, absent_text);
+            assert!(denied_text.contains("not permitted"));
+            assert!(!denied_text.contains("made public"));
+        }
+
         /// **The only write in the resource browser reaches AWS from exactly
         /// one place, and that place re-checks the numbers first.**
         ///
@@ -45288,6 +46229,13 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 (
                     "fn render_asgs",
                     ["self.asg_list_loading.clear()", "self.asg_list_failures.clear()"],
+                ),
+                (
+                    "fn render_buckets",
+                    [
+                        "self.bucket_list_loading.clear()",
+                        "self.bucket_list_failures.clear()",
+                    ],
                 ),
             ] {
                 let body_start = src.find(func).unwrap_or_else(|| panic!("{func}"));
