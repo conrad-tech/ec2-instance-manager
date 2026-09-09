@@ -6,7 +6,7 @@ use crate::accounts;
 use crate::error::Result;
 use crate::models::{
     Mode, PersonalScript, PortForwardPreset, ProfileConfig, RecentConnection, SavedFilter,
-    TagMapping,
+    TagMapping, UserEnvironment,
 };
 use crate::util::{home_dir, split_csv};
 
@@ -26,6 +26,10 @@ pub struct AppConfig {
     pub saved_filters: BTreeMap<String, Vec<SavedFilter>>,
     pub port_forward_presets: Vec<PortForwardPreset>,
     pub profiles: Vec<ProfileConfig>,
+    /// Environments the user declared through Manage Accounts, unioned with
+    /// the ones `accounts.json` declares. Repeated-key list form, since one
+    /// account has several.
+    pub user_environments: Vec<UserEnvironment>,
     pub last_selected_profile: Option<String>,
     pub theme: Option<String>,
     pub scroll_sensitivity: Option<f32>,
@@ -142,6 +146,7 @@ impl Default for AppConfig {
                 },
             ],
             profiles: Vec::new(),
+            user_environments: Vec::new(),
             last_selected_profile: None,
             theme: None,
             scroll_sensitivity: None,
@@ -997,6 +1002,11 @@ impl AppConfig {
                         cfg.personal_scripts.push(script);
                     }
                 }
+                "account_env" => {
+                    if let Some(env) = parse_account_env(value) {
+                        cfg.user_environments.push(env);
+                    }
+                }
                 "git_pat" => {
                     cfg.git_pat = decode_b64(value).filter(|t| !t.is_empty());
                 }
@@ -1276,6 +1286,15 @@ impl AppConfig {
             ));
         }
 
+        for env in &self.user_environments {
+            lines.push(format!(
+                "account_env={}|{}|{}",
+                env.account_id,
+                env.name,
+                env.vault_addr.as_deref().unwrap_or("")
+            ));
+        }
+
         if let Some(pat) = self.git_pat.as_deref().filter(|p| !p.is_empty()) {
             lines.push(format!("git_pat={}", encode_b64(pat)));
         }
@@ -1313,6 +1332,31 @@ fn parse_personal_script(raw: &str) -> Option<PersonalScript> {
         return None;
     }
     Some(PersonalScript { name, hotkey, body })
+}
+
+/// `<account id>|<ENV>|<vault addr>`.
+///
+/// Split into exactly three, so a Vault address containing `|` survives; the
+/// environment name cannot, which is why Manage Accounts refuses one. An
+/// entry missing either of the first two fields is dropped -- it would render
+/// as a blank, unselectable dropdown row.
+fn parse_account_env(raw: &str) -> Option<UserEnvironment> {
+    let mut parts = raw.splitn(3, '|');
+    let account_id = parts.next()?.trim();
+    let name = parts.next()?.trim();
+    if account_id.is_empty() || name.is_empty() {
+        return None;
+    }
+    let vault_addr = parts
+        .next()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    Some(UserEnvironment {
+        account_id: account_id.to_string(),
+        name: name.to_string(),
+        vault_addr,
+    })
 }
 
 fn parse_recent(raw: &str) -> Option<RecentConnection> {
@@ -2047,5 +2091,33 @@ mod tests {
     fn an_unreadable_profile_order_is_dropped() {
         let cfg = AppConfig::parse("profile_order.111=abc\nprofile_order.222=\nprofile_order.=3\n");
         assert!(cfg.profile_orders.is_empty());
+    }
+
+    #[test]
+    fn account_env_round_trips_through_config_text() {
+        let cfg = AppConfig::parse(
+            "account_env=111|DEV1|https://vault.dev1:8200\naccount_env=111|DEV2|\n",
+        );
+        assert_eq!(cfg.user_environments.len(), 2);
+        assert_eq!(cfg.user_environments[0].account_id, "111");
+        assert_eq!(cfg.user_environments[0].name, "DEV1");
+        assert_eq!(
+            cfg.user_environments[0].vault_addr.as_deref(),
+            Some("https://vault.dev1:8200")
+        );
+        // A blank Vault address is None, not Some(""), so every consumer can
+        // ask one question instead of two.
+        assert_eq!(cfg.user_environments[1].vault_addr, None);
+
+        let again = AppConfig::parse(&cfg.to_text());
+        assert_eq!(again.user_environments, cfg.user_environments);
+    }
+
+    /// An entry naming no account or no environment is unusable -- it would
+    /// render as a blank, unselectable dropdown row.
+    #[test]
+    fn an_incomplete_account_env_is_skipped() {
+        let cfg = AppConfig::parse("account_env=|DEV1|\naccount_env=111||\naccount_env=111\n");
+        assert!(cfg.user_environments.is_empty());
     }
 }

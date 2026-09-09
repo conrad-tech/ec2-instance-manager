@@ -214,6 +214,22 @@ pub struct ProfileConfig {
     pub color: Option<String>,
 }
 
+/// One environment a user declared for an account through Manage Accounts,
+/// as opposed to one the maintainer declared in `assets/accounts.json`.
+///
+/// Environments are also discovered from instance tags at render time (see
+/// `script_env::build`), so this exists for what a tag cannot supply: a
+/// Vault address, or a name recorded before any instance carries the tag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserEnvironment {
+    pub account_id: String,
+    /// The `MMODAL_ENV` tag value. Free text, compared case-insensitively
+    /// everywhere it is matched.
+    pub name: String,
+    /// Blank in the file means `None` here, so consumers ask one question.
+    pub vault_addr: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileAuthInfo {
     pub profile_id: String,
