@@ -2311,7 +2311,7 @@ still in the detail view — the same trade the other two tables made.
 
 #### Editing ASG capacity (the one write in the resource browser)
 
-**Edit capacity…** — on the ASG row's right-click menu and beside Copy All in
+**Edit Capacity** — on the ASG row's right-click menu and beside Copy All in
 its detail panel — sets a group's min, desired and max in one
 `update-auto-scaling-group`. Everything else under Inventory sub-tabs is a
 describe; this launches and terminates real instances.

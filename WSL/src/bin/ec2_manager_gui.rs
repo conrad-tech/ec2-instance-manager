@@ -24718,7 +24718,7 @@ mod gui {
 
 
 
-        /// "Edit capacity…" was picked, from the row menu or the detail panel.
+        /// "Edit Capacity" was picked, from the row menu or the detail panel.
         /// Raises the dialog; nothing reaches AWS until it is agreed to.
         fn request_asg_capacity(&mut self, group: &AutoScalingGroup) {
             if self
@@ -25312,7 +25312,7 @@ mod gui {
                                         ui.close();
                                     }
                                     if ui
-                                        .button("Edit capacity…")
+                                        .button("Edit Capacity")
                                         .on_hover_text(
                                             "Change min, desired and max. Raising desired \
                                              launches instances and lowering it terminates \
@@ -25450,7 +25450,7 @@ mod gui {
                 // table to right-click the row you are already looking at is
                 // a step that exists only because the table came first.
                 if ui
-                    .button("Edit capacity…")
+                    .button("Edit Capacity")
                     .on_hover_text(
                         "Change min, desired and max. Raising desired launches instances \
                          and lowering it terminates them; you are asked to confirm first.",
