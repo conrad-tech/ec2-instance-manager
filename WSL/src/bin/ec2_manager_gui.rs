@@ -24080,8 +24080,18 @@ mod gui {
             let mut pending_detail: Option<LoadBalancer> = None;
             let mut pending_width: Option<(usize, f32)> = None;
 
+            // Solid rather than the default floating bar, and only when
+            // there is something to scroll. Both halves are needed together:
+            // a floating bar's `dormant_*_opacity` is 0.0, so it is invisible
+            // until hovered and the table reads as unscrollable -- the trap
+            // the pem dropdown already records -- while AlwaysVisible put a
+            // bar under every table whether or not it did anything, and that
+            // bar sits over the last row.
+            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
             egui::ScrollArea::both()
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .scroll_bar_visibility(
+                    egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                )
                 .show(ui, |ui| {
                     let cw =
                         |idx: usize| -> f32 { overrides.get(&idx).copied().unwrap_or(auto[idx]) };
@@ -24147,24 +24157,22 @@ mod gui {
                                     |ui| {
                                         ui.add(
                                             egui::Label::new(lb.name.clone())
-                                                .wrap_mode(egui::TextWrapMode::Truncate)
-                                                .sense(egui::Sense::click()),
-                                        )
+                                                .wrap_mode(egui::TextWrapMode::Truncate),
+                                        );
                                     },
                                 );
-                                name_cell
-                                    .inner
-                                    .on_hover_text(lb.name.clone())
-                                    .context_menu(|ui| {
-                                        if ui.button("See Details").clicked() {
-                                            pending_detail = Some(lb.clone());
-                                            ui.close();
-                                        }
-                                    });
+                                let r_name = ui
+                                    .interact(
+                                        name_cell.response.rect,
+                                        name_cell.response.id.with("lb_name"),
+                                        egui::Sense::click(),
+                                    )
+                                    .on_hover_text(lb.name.clone());
 
-                                tg_cell(ui, cw(1), TG_ROW_H, elb::load_balancer_kind_label(lb))
-                                    .on_hover_text(lb.kind.clone());
-                                tg_cell(
+                                let r_kind =
+                                    tg_cell(ui, cw(1), TG_ROW_H, elb::load_balancer_kind_label(lb))
+                                        .on_hover_text(lb.kind.clone());
+                                let r_scheme = tg_cell(
                                     ui,
                                     cw(2),
                                     TG_ROW_H,
@@ -24175,13 +24183,13 @@ mod gui {
                                     Some(c) => notification_text(ui, c, lb.state.clone()),
                                     None => egui::RichText::new(lb.state.clone()),
                                 };
-                                tg_cell(ui, cw(3), TG_ROW_H, state);
+                                let r_state = tg_cell(ui, cw(3), TG_ROW_H, state);
 
                                 // The one field people copy out of this table,
                                 // so it carries the Inventory table's own copy
                                 // button rather than making somebody select
                                 // text out of a truncating cell.
-                                ui.allocate_ui_with_layout(
+                                let dns_cell = ui.allocate_ui_with_layout(
                                     egui::vec2(cw(4), TG_ROW_H),
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
@@ -24197,9 +24205,32 @@ mod gui {
                                         .on_hover_text(lb.dns_name.clone());
                                     },
                                 );
+
+                                // Everything except the DNS cell, which holds
+                                // the copy button: unioning it would make a
+                                // click on that button also open the details.
+                                let row = r_name.union(r_kind).union(r_scheme).union(r_state);
+                                if row.hovered() || dns_cell.response.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if row.clicked() {
+                                    pending_detail = Some(lb.clone());
+                                }
+                                row.context_menu(|ui| {
+                                    if ui.button("See Details").clicked() {
+                                        pending_detail = Some(lb.clone());
+                                        ui.close();
+                                    }
+                                });
+
                                 ui.end_row();
                             }
                         });
+                    // Room under the last row, as the EC2 table has.
+                    // Without it the horizontal scrollbar, which is
+                    // always visible and drawn over the viewport's
+                    // bottom edge, sits on top of the final row.
+                    ui.add_space(20.0);
                 });
 
             if let Some((idx, w)) = pending_width {
@@ -24501,8 +24532,13 @@ mod gui {
             let mut pending_detail: Option<TargetGroup> = None;
             let mut pending_width: Option<(usize, f32)> = None;
 
+            // See the load balancer table: solid so it is visible when it
+            // appears, and only present when it has something to do.
+            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
             egui::ScrollArea::both()
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .scroll_bar_visibility(
+                    egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                )
                 .show(ui, |ui| {
                     let cw = |idx: usize| -> f32 {
                         overrides.get(&idx).copied().unwrap_or(auto[idx])
@@ -24610,22 +24646,19 @@ mod gui {
                                         );
                                         ui.add(
                                             egui::Label::new(tg.name.clone())
-                                                .wrap_mode(egui::TextWrapMode::Truncate)
-                                                .sense(egui::Sense::click()),
-                                        )
+                                                .wrap_mode(egui::TextWrapMode::Truncate),
+                                        );
                                     },
                                 );
-                                name_cell
-                                    .inner
-                                    .on_hover_text(tg.name.clone())
-                                    .context_menu(|ui| {
-                                        if ui.button("See Details").clicked() {
-                                            pending_detail = Some(tg.clone());
-                                            ui.close();
-                                        }
-                                    });
+                                let r_name = ui
+                                    .interact(
+                                        name_cell.response.rect,
+                                        name_cell.response.id.with("tg_name"),
+                                        egui::Sense::click(),
+                                    )
+                                    .on_hover_text(tg.name.clone());
 
-                                tg_cell(ui, cw(1), TG_ROW_H, elb::protocol_port_label(tg));
+                                let r_proto = tg_cell(ui, cw(1), TG_ROW_H, elb::protocol_port_label(tg));
 
                                 let cell = health
                                     .get(&tg.arn)
@@ -24657,9 +24690,9 @@ mod gui {
                                     Some(c) => notification_text(ui, c, text),
                                     None => egui::RichText::new(text),
                                 };
-                                let resp = tg_cell(ui, cw(2), TG_ROW_H, rich);
+                                let mut r_health = tg_cell(ui, cw(2), TG_ROW_H, rich);
                                 if let HealthCell::Failed(detail) = &cell {
-                                    resp.on_hover_text(detail.clone());
+                                    r_health = r_health.on_hover_text(detail.clone());
                                 }
 
                                 // The health-check path, from the same
@@ -24669,7 +24702,7 @@ mod gui {
                                 // pending state. A dash here is unambiguous for
                                 // that reason: it means this health check has
                                 // no path (a TCP check), never "no answer yet".
-                                tg_cell(
+                                let r_path = tg_cell(
                                     ui,
                                     cw(3),
                                     TG_ROW_H,
@@ -24680,9 +24713,38 @@ mod gui {
                                 )
                                 .on_hover_text(tg_health_check_hover(tg));
 
+                                // The row, not one cell of it. egui's `Grid`
+                                // has no row-level response, so the EC2 table
+                                // unions its cells' — the same reason the
+                                // Alerts window puts its menu on every cell.
+                                // Attached to the Name cell alone, the target
+                                // was whichever column the user happened to
+                                // aim at.
+                                let row = r_name
+                                    .union(r_proto)
+                                    .union(r_health)
+                                    .union(r_path);
+                                if row.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if row.clicked() {
+                                    pending_detail = Some(tg.clone());
+                                }
+                                row.context_menu(|ui| {
+                                    if ui.button("See Details").clicked() {
+                                        pending_detail = Some(tg.clone());
+                                        ui.close();
+                                    }
+                                });
+
                                 ui.end_row();
                             }
                         });
+                    // Room under the last row, as the EC2 table has.
+                    // Without it the horizontal scrollbar, which is
+                    // always visible and drawn over the viewport's
+                    // bottom edge, sits on top of the final row.
+                    ui.add_space(20.0);
                 });
 
             if let Some((idx, w)) = pending_width {
@@ -34458,12 +34520,21 @@ mod gui {
         height: f32,
         text: impl Into<egui::RichText>,
     ) -> egui::Response {
-        ui.allocate_ui_with_layout(
+        let cell = ui.allocate_ui_with_layout(
             egui::vec2(width, height),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| ui.add(egui::Label::new(text.into()).wrap_mode(egui::TextWrapMode::Truncate)),
+        );
+        // The response covers the whole CELL, not just the glyphs in it.
+        // Returning the label's own response — which is what this did — meant a
+        // short value in a wide column left most of the row dead: no hover, no
+        // click, no menu. The row is what the user aims at, so the row is what
+        // has to be hittable.
+        ui.interact(
+            cell.response.rect,
+            cell.response.id.with("tg_cell"),
+            egui::Sense::click(),
         )
-        .inner
     }
 
     /// Everything the target group detail view shows, as plain text for
