@@ -27597,28 +27597,52 @@ mod gui {
 
             ui.horizontal_wrapped(|ui| {
                 for (idx, subject) in self.detail_tabs.iter().enumerate() {
-                    // The kind prefix earns its place: a target group and the
-                    // load balancer in front of it are routinely named the
-                    // same thing, and two identical tabs are worse than none.
-                    let label = format!("{}: {}", subject.kind_label(), subject.title());
-                    let mut text = egui::RichText::new(label);
-                    // The environment's own colour, as the Connections tabs
-                    // carry it — so a DEV1 target group and a DEV1 box read as
-                    // the same thing across both pages.
-                    if let Some(colour) = colours[idx] {
-                        text = text.color(colour);
-                    }
-                    if ui.selectable_label(idx == active, text).clicked() {
-                        select = Some(idx);
-                    }
-                    if ui
-                        .small_button("✖")
-                        .on_hover_text("Close this tab")
-                        .clicked()
-                    {
-                        close = Some(idx);
-                    }
-                    ui.separator();
+                    // The environment's colour goes on the TAB, exactly as a
+                    // Connections tab wears it: a stroke in the colour over a
+                    // barely-tinted ground, with a dot inside and the text left
+                    // in the theme's own colour. Colouring the text instead
+                    // fights the selected/hovered states egui already paints,
+                    // and framing the whole panel — which this did — puts a
+                    // border round the one thing whose identity was never in
+                    // question.
+                    let frame = match colours[idx] {
+                        Some(c) => egui::Frame::group(ui.style())
+                            .stroke(egui::Stroke::new(2.0, c))
+                            .fill(egui::Color32::from_rgba_unmultiplied(
+                                c.r(),
+                                c.g(),
+                                c.b(),
+                                25,
+                            )),
+                        None => egui::Frame::group(ui.style()),
+                    };
+                    frame.show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if let Some(c) = colours[idx] {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(8.0, 8.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(rect.center(), 4.0, c);
+                            }
+                            // The kind prefix earns its place: a target group
+                            // and the load balancer in front of it are
+                            // routinely named the same thing, and two identical
+                            // tabs are worse than none.
+                            let label =
+                                format!("{}: {}", subject.kind_label(), subject.title());
+                            if ui.selectable_label(idx == active, label).clicked() {
+                                select = Some(idx);
+                            }
+                            if ui
+                                .small_button("✖")
+                                .on_hover_text("Close this tab")
+                                .clicked()
+                            {
+                                close = Some(idx);
+                            }
+                        });
+                    });
                 }
                 if self.detail_tabs.len() > 1
                     && ui
@@ -27651,31 +27675,21 @@ mod gui {
             // rule names them and the panels cannot drift.
             let subject = self.detail_tabs[self.detail_active].clone();
             let title = subject.title();
-            let colour = self.detail_subject_color(&subject);
-
-            // The whole panel sits in the environment's colour, the same shape
-            // the Connections page frames a tab with: a stroke in the colour
-            // over a barely-tinted ground. Without the account-colour feature
-            // it is a plain group, which is what it was.
-            let frame = match colour {
-                Some(c) => egui::Frame::group(ui.style()).stroke(egui::Stroke::new(2.0, c)).fill(
-                    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 10),
-                ),
-                None => egui::Frame::group(ui.style()),
-            };
-            frame.show(ui, |ui| {
-                match subject {
-                    DetailSubject::Instance(instance) => {
-                        self.render_instance_details(ui, *instance, &title);
-                    }
-                    DetailSubject::TargetGroup(tg) => {
-                        self.render_target_group_details(ui, *tg, &title);
-                    }
-                    DetailSubject::LoadBalancer(lb) => {
-                        self.render_load_balancer_details(ui, *lb, &title);
-                    }
+            // The panel itself is deliberately unframed. The colour says
+            // *which* environment this tab is, and the tab is where that
+            // question is asked; a border round the whole body answers a
+            // question nobody had and boxes in the content.
+            match subject {
+                DetailSubject::Instance(instance) => {
+                    self.render_instance_details(ui, *instance, &title);
                 }
-            });
+                DetailSubject::TargetGroup(tg) => {
+                    self.render_target_group_details(ui, *tg, &title);
+                }
+                DetailSubject::LoadBalancer(lb) => {
+                    self.render_load_balancer_details(ui, *lb, &title);
+                }
+            }
         }
 
         fn render_instance_details(&mut self, ui: &mut egui::Ui, instance: Instance, title: &str) {

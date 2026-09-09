@@ -2399,9 +2399,13 @@ true but rarely looked at, and both stay searchable and in the detail view.
   cell's rect into the highlight even though that cell is deliberately not
   part of the click response — the row is one thing to look at, even where it
   is two things to click.
-- **The Details tab and its panel carry the environment's colour**, the way
-  the Connections tabs do, so a DEV1 target group and a DEV1 box read as the
-  same thing on both pages. An instance answers exactly, from its own
+- **The environment's colour goes on the TAB, not on the panel** — exactly
+  as a Connections tab wears it: a 2px stroke in the colour over a
+  barely-tinted ground, an 8px dot inside, and the text left in the theme's
+  own colour. Colouring the text fights the selected and hovered states egui
+  already paints, and framing the whole panel puts a border round the one
+  thing whose identity was never in question. Both were tried and both were
+  wrong; copy the Connections tab, do not invent a variation. An instance answers exactly, from its own
   `MMODAL_ENV`, and resolves the profile through the same lookup the
   Connections colouring makes — the same box must not be two colours in two
   places.
