@@ -5,12 +5,9 @@
 //! ALB and NLB only, both of which are `elbv2`.
 //!
 //! Parsing is pure and tested against captured payloads; the `fetch_*`
-//! functions are thin wrappers over `run_aws_cli`. That split is what keeps
-//! the GUI binary free of resource models, and what lets these be tested
+//! functions are thin wrappers over `resources::run_cli`. That split is what
+//! keeps the GUI binary free of resource models, and what lets these be tested
 //! without AWS.
-
-use crate::aws_cli::run_aws_cli;
-use crate::error::AppError;
 
 /// One target group, as the Target Groups sub-tab lists it.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -244,56 +241,15 @@ pub fn health_label(summary: HealthSummary) -> String {
     format!("{}/{}", summary.healthy, summary.total)
 }
 
-/// Why a fetch did not produce data.
+/// Re-exported so `elb::FetchError` keeps meaning what it always did.
 ///
-/// `Denied` is separate from `Failed` because the caller acts on it: the
-/// Healthy/Total column switches itself off for an account on the first
-/// denial, rather than issuing one refused call per row for as long as
-/// somebody keeps scrolling.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FetchError {
-    Denied,
-    Failed(String),
-}
+/// The type itself moved to `resources` when a second resource module needed
+/// it — see that module's header. This is not a distinct ELB error type and
+/// must never become one: "what a denial is" is a fact about the AWS CLI, not
+/// about load balancing.
+pub use crate::resources::FetchError;
 
-impl FetchError {
-    /// Classify a failed CLI invocation.
-    ///
-    /// `Absence::Absent` has no meaning for a list call — nothing here answers
-    /// "nothing configured" — so it is kept as a failure rather than silently
-    /// becoming an empty list, which would render as "no target groups in this
-    /// account".
-    pub fn from_stderr(stderr: &str) -> Self {
-        match crate::resources::classify_absent(stderr) {
-            crate::resources::Absence::Denied => Self::Denied,
-            crate::resources::Absence::Absent | crate::resources::Absence::Failed(_) => {
-                Self::Failed(stderr.trim().to_string())
-            }
-        }
-    }
-
-    /// The sentence to put on screen.
-    pub fn message(&self) -> String {
-        match self {
-            Self::Denied => "not permitted".to_string(),
-            Self::Failed(text) => text.clone(),
-        }
-    }
-}
-
-/// Map a `run_aws_cli` error onto a `FetchError`, keeping the API's own
-/// explanation — `CommandFailed` carries stderr, which is the thing worth
-/// reading.
-fn fetch_error(err: AppError) -> FetchError {
-    match err {
-        AppError::CommandFailed { stderr, .. } => FetchError::from_stderr(&stderr),
-        other => FetchError::Failed(other.to_string()),
-    }
-}
-
-fn run(profile: &str, region: &str, args: &[&str]) -> std::result::Result<String, FetchError> {
-    run_aws_cli(Some(profile), Some(region), args).map_err(fetch_error)
-}
+use crate::resources::run_cli as run;
 
 /// Every target group in one account and region.
 ///

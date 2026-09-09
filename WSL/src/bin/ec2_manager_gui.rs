@@ -27,6 +27,9 @@ mod gui {
     use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
     use ec2_manager::alerts;
+    use ec2_manager::asg::{
+        self, AutoScalingGroup, ScalingActivity, ScalingPolicy, ScheduledAction,
+    };
     use ec2_manager::aws_context::build_context_with_profile;
     use ec2_manager::config::AppConfig;
     use ec2_manager::credentials;
@@ -182,15 +185,15 @@ mod gui {
 
     /// What the Details tab is showing.
     ///
-    /// Both variants are boxed: `Instance` is much the larger of the two, and
-    /// the enum gains four more variants as the remaining resource types land.
-    /// Boxing keeps `clippy::large_enum_variant` quiet and the
-    /// `Option<DetailSubject>` on `App` small.
+    /// Every variant is boxed: `Instance` is much the larger of them, and the
+    /// enum gains the last two as S3 and Route 53 land. Boxing keeps
+    /// `clippy::large_enum_variant` quiet and the tab vec's element small.
     #[derive(Clone, Debug)]
     enum DetailSubject {
         Instance(Box<Instance>),
         TargetGroup(Box<TargetGroup>),
         LoadBalancer(Box<LoadBalancer>),
+        Asg(Box<AutoScalingGroup>),
     }
 
     /// One EC2 instance's Details tab state.
@@ -228,6 +231,20 @@ mod gui {
         tags: Option<std::result::Result<Vec<(String, String)>, String>>,
     }
 
+    /// One auto scaling group's Details tab state.
+    ///
+    /// Only the three *extra* reads live here. The instances, the tags, the
+    /// target groups and the suspended processes all arrive with the list
+    /// itself, so the panel's whole top half renders with no fetch at all —
+    /// which is why an ASG detail view fills instantly and a load balancer's
+    /// does not.
+    #[derive(Clone, Debug, Default)]
+    struct AsgDetailState {
+        policies: Option<std::result::Result<Vec<ScalingPolicy>, String>>,
+        scheduled: Option<std::result::Result<Vec<ScheduledAction>, String>>,
+        activities: Option<std::result::Result<Vec<ScalingActivity>, String>>,
+    }
+
     impl DetailSubject {
         /// What identifies this subject, and what its fetched state is keyed
         /// on. Stable for the life of the tab: an ARN or an instance id, never
@@ -237,6 +254,7 @@ mod gui {
                 DetailSubject::Instance(i) => i.instance_id.clone(),
                 DetailSubject::TargetGroup(tg) => tg.arn.clone(),
                 DetailSubject::LoadBalancer(lb) => lb.arn.clone(),
+                DetailSubject::Asg(g) => g.arn.clone(),
             }
         }
 
@@ -247,6 +265,7 @@ mod gui {
                 DetailSubject::Instance(_) => "EC2",
                 DetailSubject::TargetGroup(_) => "TG",
                 DetailSubject::LoadBalancer(_) => "LB",
+                DetailSubject::Asg(_) => "ASG",
             }
         }
 
@@ -257,6 +276,7 @@ mod gui {
                 }
                 DetailSubject::TargetGroup(tg) => tg.name.clone(),
                 DetailSubject::LoadBalancer(lb) => lb.name.clone(),
+                DetailSubject::Asg(g) => g.name.clone(),
             }
         }
     }
@@ -653,6 +673,31 @@ mod gui {
             arn: String,
             attributes: Option<std::result::Result<Vec<(String, String)>, String>>,
             tags: Option<std::result::Result<Vec<(String, String)>, String>>,
+        },
+        /// One account's auto scaling group list landed. Same shape as
+        /// `TargetGroupList`, including the cache key stamped at spawn — see
+        /// its comment for why the handler must not re-derive it.
+        AsgList {
+            account_id: String,
+            cache_key: String,
+            result: std::result::Result<Vec<AutoScalingGroup>, FetchError>,
+        },
+        /// The three extra reads behind an open ASG detail tab: scaling
+        /// policies, scheduled actions and recent activity.
+        ///
+        /// Three independent `Option`s on the same honest shape as
+        /// `TargetGroupDetail`: each message carries `Some` for exactly the
+        /// one call it made and `None` for the others, so a section that has
+        /// no answer yet is never blanked by a message that knows nothing
+        /// about it. They are three different API permissions —
+        /// `DescribePolicies`, `DescribeScheduledActions` and
+        /// `DescribeScalingActivities` — and a role holding one and not the
+        /// others must still see what it can.
+        AsgDetail {
+            arn: String,
+            policies: Option<std::result::Result<Vec<ScalingPolicy>, String>>,
+            scheduled: Option<std::result::Result<Vec<ScheduledAction>, String>>,
+            activities: Option<std::result::Result<Vec<ScalingActivity>, String>>,
         },
         /// One load balancer's listeners, each carrying its own rules.
         LoadBalancerListeners {
@@ -7851,6 +7896,13 @@ mod gui {
         lb_list_errors: HashMap<String, String>,
         lb_list_failures: HashMap<String, Instant>,
         lb_col_widths: HashMap<usize, f32>,
+        /// Auto scaling groups per cache key — the same arrangement as
+        /// `target_groups` and `load_balancers`, and for the same reasons.
+        asgs: HashMap<String, (Instant, Vec<AutoScalingGroup>)>,
+        asg_list_loading: HashSet<String>,
+        asg_list_errors: HashMap<String, String>,
+        asg_list_failures: HashMap<String, Instant>,
+        asg_col_widths: HashMap<usize, f32>,
         /// Which resource sub-tab was showing last frame, so entering one can
         /// be told from staying on it. `None` while the EC2 tab is showing, so
         /// coming back from it counts as entering.
@@ -7886,6 +7938,7 @@ mod gui {
         instance_details: HashMap<String, InstanceDetailState>,
         tg_details: HashMap<String, TgDetailState>,
         lb_details: HashMap<String, LbDetailState>,
+        asg_details: HashMap<String, AsgDetailState>,
         /// The selected target group's registered targets and configuration,
         /// each on its own event — a role that can describe a group but not
         /// read its health, attributes or tags must still see what it can.
@@ -8695,6 +8748,11 @@ mod gui {
                 lb_list_errors: HashMap::new(),
                 lb_list_failures: HashMap::new(),
                 lb_col_widths: HashMap::new(),
+                asgs: HashMap::new(),
+                asg_list_loading: HashSet::new(),
+                asg_list_errors: HashMap::new(),
+                asg_list_failures: HashMap::new(),
+                asg_col_widths: HashMap::new(),
                 last_resource_tab: None,
                 // `features` is the local in `App::new`, the same one
                 // `instance_power_enabled` below is resolved from.
@@ -8711,6 +8769,7 @@ mod gui {
                 instance_details: HashMap::new(),
                 tg_details: HashMap::new(),
                 lb_details: HashMap::new(),
+                asg_details: HashMap::new(),
                 local_port: 2222,
                 remote_port: 22,
                 message: String::new(),
@@ -9741,18 +9800,33 @@ mod gui {
         ///   to go, or the user has to press Refresh, which is what they had
         ///   to do.
         fn forget_resources_for_account(&mut self, account: &str, why: &str) {
-            let before = self.target_groups.len() + self.load_balancers.len();
+            let before =
+                self.target_groups.len() + self.load_balancers.len() + self.asgs.len();
             self.target_groups
                 .retain(|k, _| !cache_key_is_for_account(k, account));
             self.load_balancers
                 .retain(|k, _| !cache_key_is_for_account(k, account));
-            for set in [&mut self.tg_list_loading, &mut self.lb_list_loading] {
+            self.asgs
+                .retain(|k, _| !cache_key_is_for_account(k, account));
+            for set in [
+                &mut self.tg_list_loading,
+                &mut self.lb_list_loading,
+                &mut self.asg_list_loading,
+            ] {
                 set.retain(|k| !cache_key_is_for_account(k, account));
             }
-            for map in [&mut self.tg_list_failures, &mut self.lb_list_failures] {
+            for map in [
+                &mut self.tg_list_failures,
+                &mut self.lb_list_failures,
+                &mut self.asg_list_failures,
+            ] {
                 map.retain(|k, _| !cache_key_is_for_account(k, account));
             }
-            for map in [&mut self.tg_list_errors, &mut self.lb_list_errors] {
+            for map in [
+                &mut self.tg_list_errors,
+                &mut self.lb_list_errors,
+                &mut self.asg_list_errors,
+            ] {
                 map.remove(account);
             }
             self.tg_health
@@ -9760,7 +9834,8 @@ mod gui {
             self.tg_targets
                 .retain(|arn, _| !arn_is_for_account(arn, account));
             self.tg_denied_accounts.remove(account);
-            let after = self.target_groups.len() + self.load_balancers.len();
+            let after =
+                self.target_groups.len() + self.load_balancers.len() + self.asgs.len();
             if before != after || !why.is_empty() {
                 self.log_info(format!(
                     "resources: dropped everything cached for account {account} ({why})"
@@ -20521,6 +20596,74 @@ mod gui {
                             }
                         }
                     }
+                    ProcEvent::AsgList {
+                        account_id,
+                        cache_key,
+                        result,
+                    } => {
+                        // Applied only while this reply is still the one being
+                        // waited on: Refresh clears the set, and a reply that
+                        // was already in flight then must not land afterwards
+                        // stamped as fresh. Same rule as `TargetGroupList`.
+                        if !self.asg_list_loading.remove(&cache_key) {
+                            self.log_debug(format!(
+                                "asgs: dropping a reply for {cache_key} that Refresh \
+                                 already superseded"
+                            ));
+                            continue;
+                        }
+                        match result {
+                            Ok(groups) => {
+                                self.log_info(format!(
+                                    "asgs: {} in account {account_id}",
+                                    groups.len()
+                                ));
+                                self.asg_list_failures.remove(&cache_key);
+                                remember_list_error(&mut self.asg_list_errors, &account_id, None);
+                                self.asgs.insert(cache_key, (Instant::now(), groups));
+                            }
+                            Err(err) => {
+                                let msg = err.message();
+                                let news =
+                                    list_error_is_news(&self.asg_list_errors, &account_id, &msg);
+                                if news {
+                                    self.log_error(format!("asgs: account {account_id}: {msg}"));
+                                } else {
+                                    self.log_debug(format!(
+                                        "asgs: account {account_id}: {msg} (unchanged)"
+                                    ));
+                                }
+                                self.asg_list_failures.insert(cache_key, Instant::now());
+                                remember_list_error(
+                                    &mut self.asg_list_errors,
+                                    &account_id,
+                                    Some(msg),
+                                );
+                            }
+                        }
+                    }
+                    ProcEvent::AsgDetail {
+                        arn,
+                        policies,
+                        scheduled,
+                        activities,
+                    } => {
+                        // Only into a tab that still exists, and only the
+                        // sections this message actually carries an answer
+                        // about — a `None` here means "this message says
+                        // nothing about that section", never "it is empty".
+                        if let Some(st) = self.asg_details.get_mut(&arn) {
+                            if let Some(policies) = policies {
+                                st.policies = Some(policies);
+                            }
+                            if let Some(scheduled) = scheduled {
+                                st.scheduled = Some(scheduled);
+                            }
+                            if let Some(activities) = activities {
+                                st.activities = Some(activities);
+                            }
+                        }
+                    }
                     ProcEvent::TargetGroupHealth {
                         arn,
                         account_id,
@@ -23774,6 +23917,10 @@ mod gui {
                     self.ensure_load_balancers();
                     self.render_load_balancers(ui);
                 }
+                ResourceKind::Asg => {
+                    self.ensure_asgs();
+                    self.render_asgs(ui);
+                }
                 other => {
                     ui.label(format!("{} is not built yet.", other.label()));
                 }
@@ -24087,7 +24234,15 @@ mod gui {
                             }
                         }
                     }
-                    // The other three have no list yet.
+                    ResourceKind::Asg => {
+                        if let Some((at, _)) = self.asgs.get_mut(&key) {
+                            if selection_forces_refresh(at.elapsed(), RESOURCE_SELECT_FLOOR) {
+                                *at = stale;
+                                self.asg_list_failures.remove(&key);
+                            }
+                        }
+                    }
+                    // The other two have no list yet.
                     _ => {}
                 }
             }
@@ -24430,6 +24585,728 @@ mod gui {
             if let Some(lb) = pending_detail {
                 self.open_load_balancer_details(lb);
             }
+        }
+
+
+        /// Start a list fetch for any account whose auto scaling groups are
+        /// missing or stale.
+        ///
+        /// Mirrors `ensure_load_balancers`, failure cooldown included — without
+        /// it a permissions failure re-spawns an `aws` process every frame.
+        fn ensure_asgs(&mut self) {
+            let mode = self.options.mode.as_str().to_string();
+            for account in self.resource_pool_accounts() {
+                // Not an error, a wait — the same stance every other sub-tab
+                // takes, and what stops an expired session filling the error
+                // banner with refusals.
+                if !account.authed {
+                    continue;
+                }
+                let key = account.cache_key(ResourceKind::Asg, &mode);
+                let fresh = self
+                    .asgs
+                    .get(&key)
+                    .is_some_and(|(at, _)| at.elapsed() <= resources::RESOURCE_TTL);
+                if !list_fetch_due(
+                    fresh,
+                    self.asg_list_loading.contains(&key),
+                    self.asg_list_failures.get(&key).map(Instant::elapsed),
+                    resources::RESOURCE_TTL,
+                ) {
+                    continue;
+                }
+                self.asg_list_loading.insert(key.clone());
+                let tx = self.proc_tx.clone();
+                let (p, r, a) = (
+                    account.profile.clone(),
+                    account.region.clone(),
+                    account.account_id.clone(),
+                );
+                let repaint = self.egui_ctx.clone();
+                std::thread::spawn(move || {
+                    let result = asg::fetch_auto_scaling_groups(&p, &r, &a);
+                    let _ = tx.send(ProcEvent::AsgList {
+                        account_id: a,
+                        cache_key: key,
+                        result,
+                    });
+                    if let Some(ctx) = &repaint {
+                        ctx.request_repaint();
+                    }
+                });
+            }
+        }
+
+        /// The cache keys of the accounts currently in the pool.
+        fn current_asg_keys(&self) -> Vec<String> {
+            let mode = self.options.mode.as_str().to_string();
+            self.resource_pool_accounts()
+                .iter()
+                .map(|a| a.cache_key(ResourceKind::Asg, &mode))
+                .collect()
+        }
+
+        /// The auto scaling groups the search box leaves visible, from every
+        /// account in the pool.
+        ///
+        /// Reads only the current pool's keys, so an account since unchecked —
+        /// or a region since switched away from — does not leave its rows on
+        /// screen. The cache keeps them; only the display is scoped.
+        fn filtered_asgs(&self) -> Vec<AutoScalingGroup> {
+            let (includes, excludes) = search_terms_from_rules(&self.search_rules);
+            let include_matchers = build_matchers(&includes);
+            let exclude_matchers = build_matchers(&excludes);
+
+            let mut rows: Vec<AutoScalingGroup> = self
+                .current_asg_keys()
+                .iter()
+                .filter_map(|k| self.asgs.get(k))
+                .flat_map(|(_, groups)| groups.iter().cloned())
+                .filter(|g| {
+                    text_matches(
+                        &asg::asg_searchable_text(g),
+                        &include_matchers,
+                        &exclude_matchers,
+                    )
+                })
+                .collect();
+            rows.sort_by(|a, b| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+                    .then_with(|| a.account_id.cmp(&b.account_id))
+            });
+            rows
+        }
+
+        fn render_asgs(&mut self, ui: &mut egui::Ui) {
+            let rows = self.filtered_asgs();
+            let total: usize = self
+                .current_asg_keys()
+                .iter()
+                .filter_map(|k| self.asgs.get(k))
+                .map(|(_, groups)| groups.len())
+                .sum();
+
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "Auto scaling groups: {} filtered / {total} total",
+                    rows.len()
+                ));
+                if ui.button("Refresh").clicked() {
+                    self.asgs.clear();
+                    self.asg_list_loading.clear();
+                    self.asg_list_errors.clear();
+                    self.asg_list_failures.clear();
+                }
+            });
+
+            // Named accounts that could not be listed, shown even when others
+            // returned rows: one AccessDenied must not blank a pool, and its
+            // absence must not be invisible either.
+            if let Some(detail) = list_error_detail(&self.asg_list_errors) {
+                note_label(
+                    ui,
+                    egui::Color32::RED,
+                    format!("Could not list ASG: {detail}"),
+                );
+            }
+
+            // Amber, not red: an expired session is not a failure, it is a
+            // wait, and it clears itself when the credentials are renewed.
+            let waiting = waiting_for_auth_note(&self.resource_pool_accounts());
+            if let Some(note) = &waiting {
+                note_label(ui, egui::Color32::YELLOW, note.clone());
+                // The credentials watcher runs off a file-modified poll, not
+                // the frame loop, so this note would otherwise sit there until
+                // something else happened to redraw.
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
+            }
+
+            if !self.asg_list_loading.is_empty() {
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
+
+            // Wake up when the oldest cached list goes stale, so the TTL is a
+            // real interval rather than something re-checked only when the
+            // window happens to redraw.
+            if let Some(due) = next_list_refresh(
+                self.current_asg_keys()
+                    .iter()
+                    .filter_map(|k| self.asgs.get(k))
+                    .map(|(at, _)| at.elapsed()),
+                resources::RESOURCE_TTL,
+            ) {
+                ui.ctx()
+                    .request_repaint_after(due.max(Duration::from_millis(200)));
+            }
+
+            if rows.is_empty() {
+                ui.label(resource_empty_note(
+                    ResourceKind::Asg,
+                    !self.asg_list_loading.is_empty(),
+                    list_error_detail(&self.asg_list_errors).as_deref(),
+                ));
+                return;
+            }
+
+            let auto = asg_auto_widths(&rows);
+            let overrides = self.asg_col_widths.clone();
+            let mut pending_detail: Option<AutoScalingGroup> = None;
+            let mut pending_width: Option<(usize, f32)> = None;
+
+            // Solid rather than the default floating bar, and only when there
+            // is something to scroll — the pair of reasons the Target Groups
+            // table records.
+            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+            egui::ScrollArea::both()
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                .show(ui, |ui| {
+                    let cw =
+                        |idx: usize| -> f32 { overrides.get(&idx).copied().unwrap_or(auto[idx]) };
+                    egui::Grid::new("asg_grid")
+                        .striped(true)
+                        .min_col_width(0.0)
+                        .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
+                        .show(ui, |ui| {
+                            for (idx, label) in ASG_COLUMN_LABELS.iter().enumerate() {
+                                let width = cw(idx);
+                                let cell = ui.allocate_ui_with_layout(
+                                    egui::vec2(width, TG_ROW_H),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(*label).strong(),
+                                            )
+                                            .wrap_mode(egui::TextWrapMode::Truncate),
+                                        )
+                                    },
+                                );
+                                let resp = cell.response;
+                                let drag_id = ui.id().with(("asg_col_resize", idx));
+                                let near_right = ui.input(|i| {
+                                    i.pointer.hover_pos().is_some_and(|pos| {
+                                        resp.rect.contains(pos)
+                                            && pos.x > resp.rect.right() - 8.0
+                                    })
+                                });
+                                if near_right || ui.ctx().is_being_dragged(drag_id) {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
+                                    let x = resp.rect.right();
+                                    ui.painter().line_segment(
+                                        [
+                                            egui::pos2(x, resp.rect.top()),
+                                            egui::pos2(x, resp.rect.bottom()),
+                                        ],
+                                        egui::Stroke::new(2.0, ui.visuals().text_color()),
+                                    );
+                                    let drag = ui.interact(
+                                        egui::Rect::from_min_size(
+                                            resp.rect.right_top() - egui::vec2(8.0, 0.0),
+                                            egui::vec2(16.0, resp.rect.height()),
+                                        ),
+                                        drag_id,
+                                        egui::Sense::drag(),
+                                    );
+                                    if drag.dragged() {
+                                        pending_width = Some((
+                                            idx,
+                                            (width + drag.drag_delta().x).max(TG_COL_MIN_W),
+                                        ));
+                                    }
+                                }
+                            }
+                            ui.end_row();
+
+                            for g in &rows {
+                                let name_cell = ui.allocate_ui_with_layout(
+                                    egui::vec2(cw(0), TG_ROW_H),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(g.name.clone())
+                                                .wrap_mode(egui::TextWrapMode::Truncate),
+                                        );
+                                    },
+                                );
+                                let r_name = ui
+                                    .interact(
+                                        name_cell.response.rect,
+                                        name_cell.response.id.with("asg_name"),
+                                        egui::Sense::click(),
+                                    )
+                                    .on_hover_text(g.name.clone());
+
+                                let r_desired =
+                                    tg_cell(ui, cw(1), TG_ROW_H, g.desired_capacity.to_string());
+                                let r_min = tg_cell(ui, cw(2), TG_ROW_H, g.min_size.to_string());
+                                let r_max = tg_cell(ui, cw(3), TG_ROW_H, g.max_size.to_string());
+
+                                let summary = asg::instance_summary(&g.instances);
+                                let label = asg::instance_label(summary);
+                                let text = match asg_instances_colour(summary, g.desired_capacity)
+                                {
+                                    Some(c) => notification_text(ui, c, label),
+                                    None => egui::RichText::new(label),
+                                };
+                                let r_instances = tg_cell(ui, cw(4), TG_ROW_H, text)
+                                    .on_hover_text(asg_instances_hover(g));
+
+                                let r_health =
+                                    tg_cell(ui, cw(5), TG_ROW_H, g.health_check_type.clone())
+                                        .on_hover_text(asg_health_check_hover(g));
+
+                                let row = r_name
+                                    .union(r_desired)
+                                    .union(r_min)
+                                    .union(r_max)
+                                    .union(r_instances)
+                                    .union(r_health);
+                                if row.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    ui.painter().rect_filled(row.rect, 0.0, TG_ROW_HOVER);
+                                }
+                                if row.clicked() {
+                                    pending_detail = Some(g.clone());
+                                }
+                                row.context_menu(|ui| {
+                                    if ui.button("See Details").clicked() {
+                                        pending_detail = Some(g.clone());
+                                        ui.close();
+                                    }
+                                });
+
+                                ui.end_row();
+                            }
+                        });
+                    // Room under the last row, as the EC2 table has.
+                    ui.add_space(20.0);
+                });
+
+            if let Some((idx, w)) = pending_width {
+                self.asg_col_widths.insert(idx, w);
+            }
+            if let Some(g) = pending_detail {
+                self.open_asg_details(g);
+            }
+        }
+
+        /// Open an auto scaling group in the Details tab and start its three
+        /// extra reads.
+        ///
+        /// **The panel's whole top half needs no fetch at all** — the
+        /// instances, the tags, the target groups and the suspended processes
+        /// all arrived with the list. What is spawned here is only the three
+        /// things `describe-auto-scaling-groups` does not answer: the scaling
+        /// policies, the scheduled actions and the recent activity. Each lands
+        /// on its own message, so a role holding one of those permissions and
+        /// not the others leaves the rest of the panel readable.
+        fn open_asg_details(&mut self, group: AutoScalingGroup) {
+            // A fresh state for this tab; re-opening refetches.
+            self.asg_details
+                .insert(group.arn.clone(), AsgDetailState::default());
+
+            let pool = self
+                .resource_pool_accounts()
+                .into_iter()
+                .find(|a| a.account_id == group.account_id);
+            let Some(account) = pool else {
+                // No context for this account, so nothing will ever post a
+                // result: say so rather than spin on three spinners forever.
+                let err = format!("no AWS context for account {}", group.account_id);
+                if let Some(st) = self.asg_details.get_mut(&group.arn) {
+                    st.policies = Some(Err(err.clone()));
+                    st.scheduled = Some(Err(err.clone()));
+                    st.activities = Some(Err(err));
+                }
+                self.focus_detail_tab(DetailSubject::Asg(Box::new(group)));
+                return;
+            };
+
+            let (profile, region) = (account.profile.clone(), account.region.clone());
+            let tx = self.proc_tx.clone();
+            let repaint = self.egui_ctx.clone();
+            let arn = group.arn.clone();
+            // The three calls take the group's NAME, not its ARN, which is
+            // what the API accepts; the ARN is what the tab is keyed on.
+            let name = group.name.clone();
+            std::thread::spawn(move || {
+                let wake = || {
+                    if let Some(ctx) = &repaint {
+                        ctx.request_repaint();
+                    }
+                };
+
+                // Activity first: it is the section people open this panel
+                // for, and it answers "why did that happen".
+                let activities = asg::fetch_scaling_activities(&profile, &region, &name)
+                    .map_err(|e| e.message());
+                let _ = tx.send(ProcEvent::AsgDetail {
+                    arn: arn.clone(),
+                    policies: None,
+                    scheduled: None,
+                    activities: Some(activities),
+                });
+                wake();
+
+                let policies =
+                    asg::fetch_scaling_policies(&profile, &region, &name).map_err(|e| e.message());
+                let _ = tx.send(ProcEvent::AsgDetail {
+                    arn: arn.clone(),
+                    policies: Some(policies),
+                    scheduled: None,
+                    activities: None,
+                });
+                wake();
+
+                let scheduled = asg::fetch_scheduled_actions(&profile, &region, &name)
+                    .map_err(|e| e.message());
+                let _ = tx.send(ProcEvent::AsgDetail {
+                    arn,
+                    // `None`, never an empty `Ok`: this message has no answer
+                    // about the other two sections and must not claim one.
+                    policies: None,
+                    scheduled: Some(scheduled),
+                    activities: None,
+                });
+                wake();
+            });
+
+            self.focus_detail_tab(DetailSubject::Asg(Box::new(group)));
+        }
+
+        fn render_asg_details(
+            &mut self,
+            ui: &mut egui::Ui,
+            g: AutoScalingGroup,
+            title: &str,
+        ) {
+            let st = self.asg_details.get(&g.arn).cloned().unwrap_or_default();
+            ui.horizontal(|ui| {
+                ui.heading(title);
+                if ui.button("Copy All").clicked() {
+                    let text = asg_detail_text(&g, &st.policies, &st.scheduled, &st.activities);
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(&text);
+                    }
+                }
+            });
+            ui.separator();
+
+            // One scroll area, and nothing inside it with a fixed height — the
+            // constraint the Jira ticket window records, for the reason it cost
+            // a layout bug there.
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("asg_detail_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 6.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        let row = |ui: &mut egui::Ui, label: &str, value: String| {
+                            ui.strong(label);
+                            ui.label(value);
+                            ui.end_row();
+                        };
+                        let dash = || "—".to_string();
+                        row(ui, "ARN", g.arn.clone());
+                        row(ui, "Account", g.account_id.clone());
+                        row(ui, "Capacity", asg_capacity_label(&g));
+
+                        let summary = asg::instance_summary(&g.instances);
+                        ui.strong("Instances");
+                        let label = asg::instance_label(summary);
+                        match asg_instances_colour(summary, g.desired_capacity) {
+                            Some(c) => {
+                                note_label(ui, c, label);
+                            }
+                            None => {
+                                ui.label(label);
+                            }
+                        }
+                        ui.end_row();
+
+                        row(ui, "Health check", asg_health_check_hover(&g));
+                        row(ui, "Launch", g.launch_source.label());
+                        row(
+                            ui,
+                            "Availability zones",
+                            if g.availability_zones.is_empty() {
+                                dash()
+                            } else {
+                                g.availability_zones.join(", ")
+                            },
+                        );
+                        row(
+                            ui,
+                            "Subnets",
+                            if g.subnets.is_empty() {
+                                dash()
+                            } else {
+                                g.subnets.join(", ")
+                            },
+                        );
+                        row(
+                            ui,
+                            "Target groups",
+                            if g.target_group_arns.is_empty() {
+                                // Words, not a dash: an ASG attached to no
+                                // target group is an ordinary thing, and a
+                                // dash reads as "could not tell".
+                                "none".to_string()
+                            } else {
+                                g.target_group_arns
+                                    .iter()
+                                    .map(|a| asg::target_group_name_from_arn(a))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            },
+                        );
+                        if !g.load_balancer_names.is_empty() {
+                            // Classic ELB only. Absent for every group at this
+                            // site, so the row appears only where it is true
+                            // rather than saying "none" forever.
+                            row(ui, "Classic load balancers", g.load_balancer_names.join(", "));
+                        }
+                        row(
+                            ui,
+                            "Suspended processes",
+                            if g.suspended.is_empty() {
+                                "none".to_string()
+                            } else {
+                                g.suspended
+                                    .iter()
+                                    .map(|p| match &p.reason {
+                                        Some(r) => format!("{} ({r})", p.name),
+                                        None => p.name.clone(),
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            },
+                        );
+                        row(
+                            ui,
+                            "Termination policies",
+                            if g.termination_policies.is_empty() {
+                                dash()
+                            } else {
+                                g.termination_policies.join(", ")
+                            },
+                        );
+                        row(
+                            ui,
+                            "Default cooldown",
+                            g.default_cooldown_secs
+                                .map_or_else(dash, |s| format!("{s}s")),
+                        );
+                        row(
+                            ui,
+                            "Max instance lifetime",
+                            asg::max_instance_lifetime_label(g.max_instance_lifetime_secs),
+                        );
+                        row(
+                            ui,
+                            "Capacity rebalance",
+                            g.capacity_rebalance.map_or_else(dash, yes_no),
+                        );
+                        row(
+                            ui,
+                            "New instances protected",
+                            g.new_instances_protected.map_or_else(dash, yes_no),
+                        );
+                        row(
+                            ui,
+                            "Service-linked role",
+                            g.service_linked_role_arn.clone().unwrap_or_else(dash),
+                        );
+                        row(
+                            ui,
+                            "Created",
+                            g.created
+                                .as_deref()
+                                .map(format_aws_time_local)
+                                .unwrap_or_else(dash),
+                        );
+                        // Only while the group is being deleted, which is the
+                        // only time the API sets it. A permanent blank
+                        // "Status" row would read as a field we failed to
+                        // fill.
+                        if let Some(status) = &g.status {
+                            row(ui, "Status", status.clone());
+                        }
+                    });
+
+                ui.add_space(12.0);
+                ui.heading("Instances");
+                ui.separator();
+                if g.instances.is_empty() {
+                    ui.label("No instances");
+                } else {
+                    egui::Grid::new("asg_instances_grid")
+                        .num_columns(6)
+                        .spacing([12.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for h in [
+                                "Instance ID",
+                                "Type",
+                                "Zone",
+                                "Lifecycle",
+                                "Health",
+                                "Protected",
+                            ] {
+                                ui.strong(h);
+                            }
+                            ui.end_row();
+                            for i in &g.instances {
+                                ui.horizontal(|ui| {
+                                    Self::paint_copy_button(
+                                        ui,
+                                        &i.instance_id,
+                                        "Copy instance id",
+                                    );
+                                    ui.label(&i.instance_id);
+                                });
+                                ui.label(i.instance_type.as_deref().unwrap_or("—"));
+                                ui.label(i.availability_zone.as_deref().unwrap_or("—"));
+                                match asg_lifecycle_colour(&i.lifecycle_state) {
+                                    Some(c) => {
+                                        note_label(ui, c, i.lifecycle_state.clone());
+                                    }
+                                    None => {
+                                        ui.label(&i.lifecycle_state);
+                                    }
+                                }
+                                match asg_instance_health_colour(&i.health_status) {
+                                    Some(c) => {
+                                        note_label(ui, c, i.health_status.clone());
+                                    }
+                                    None => {
+                                        ui.label(&i.health_status);
+                                    }
+                                }
+                                ui.label(if i.protected_from_scale_in { "yes" } else { "no" });
+                                ui.end_row();
+                            }
+                        });
+                }
+
+                ui.add_space(12.0);
+                ui.heading("Scaling policies");
+                ui.separator();
+                if let Some(policies) = detail_section(ui, &st.policies, "scaling policies") {
+                    egui::Grid::new("asg_policies_grid")
+                        .num_columns(4)
+                        .spacing([12.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for h in ["Name", "Type", "Does", "Enabled"] {
+                                ui.strong(h);
+                            }
+                            ui.end_row();
+                            for policy in policies {
+                                ui.label(&policy.name);
+                                ui.label(&policy.policy_type);
+                                ui.label(&policy.summary);
+                                // Absent is not disabled — an API reply that
+                                // did not say must not be rendered as "no".
+                                ui.label(match policy.enabled {
+                                    Some(true) => "yes",
+                                    Some(false) => "no",
+                                    None => "—",
+                                });
+                                ui.end_row();
+                            }
+                        });
+                }
+
+                ui.add_space(12.0);
+                ui.heading("Scheduled actions");
+                ui.separator();
+                if let Some(actions) = detail_section(ui, &st.scheduled, "scheduled actions") {
+                    egui::Grid::new("asg_scheduled_grid")
+                        .num_columns(3)
+                        .spacing([12.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for h in ["Name", "When", "Sets"] {
+                                ui.strong(h);
+                            }
+                            ui.end_row();
+                            for action in actions {
+                                ui.label(&action.name);
+                                ui.label(scheduled_action_when(action));
+                                ui.label(scheduled_action_sets(action));
+                                ui.end_row();
+                            }
+                        });
+                }
+
+                ui.add_space(12.0);
+                ui.heading("Recent activity");
+                ui.separator();
+                if let Some(activities) = detail_section(ui, &st.activities, "recent activity") {
+                    egui::Grid::new("asg_activity_grid")
+                        .num_columns(3)
+                        .spacing([12.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for h in ["When", "Status", "What happened"] {
+                                ui.strong(h);
+                            }
+                            ui.end_row();
+                            for a in activities {
+                                ui.label(
+                                    a.start_time
+                                        .as_deref()
+                                        .map(format_aws_time_local)
+                                        .unwrap_or_else(|| "—".to_string()),
+                                );
+                                match asg_activity_colour(&a.status_code) {
+                                    Some(c) => {
+                                        note_label(ui, c, a.status_code.clone());
+                                    }
+                                    None => {
+                                        ui.label(&a.status_code);
+                                    }
+                                }
+                                // The cause is the whole point of this
+                                // section: "an instance was terminated" is not
+                                // an answer, "because a policy changed the
+                                // desired capacity from 3 to 2" is. It hangs
+                                // off the description as hover so the column
+                                // stays readable.
+                                ui.label(&a.description)
+                                    .on_hover_text(activity_hover(a));
+                                ui.end_row();
+                            }
+                        });
+                }
+
+                ui.add_space(12.0);
+                ui.heading("Tags");
+                ui.separator();
+                if g.tags.is_empty() {
+                    ui.label("None");
+                } else {
+                    egui::Grid::new("asg_tags_grid")
+                        .num_columns(3)
+                        .spacing([16.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for h in ["Key", "Value", "Propagates"] {
+                                ui.strong(h);
+                            }
+                            ui.end_row();
+                            for tag in &g.tags {
+                                ui.label(&tag.key);
+                                ui.label(&tag.value);
+                                ui.label(if tag.propagate_at_launch { "yes" } else { "no" });
+                                ui.end_row();
+                            }
+                        });
+                }
+            });
         }
 
         /// Start a list fetch for any account in the pool whose entry is
@@ -27441,6 +28318,33 @@ mod gui {
                         &self.hidden_envs,
                     )
                 }
+                // An ASG is the one resource here that DOES carry
+                // `MMODAL_ENV` — its tags arrive with the list — so it is
+                // answered exactly rather than guessed at from the name, the
+                // same way an instance is. The name stays the fallback for a
+                // group nobody tagged.
+                DetailSubject::Asg(g) => {
+                    let profile_id = self.profile_id_for_account(&g.account_id)?;
+                    let tagged = g
+                        .tags
+                        .iter()
+                        .find(|t| t.key.eq_ignore_ascii_case("MMODAL_ENV"))
+                        .map(|t| t.value.to_ascii_lowercase())
+                        .filter(|env| !env.is_empty() && !self.hidden_envs.contains(env));
+                    match tagged {
+                        Some(env) => self
+                            .account_color_map
+                            .get(&format!("{profile_id}:{env}"))
+                            .copied()
+                            .or_else(|| self.account_color_map.get(&profile_id).copied()),
+                        None => resource_env_color(
+                            &self.account_color_map,
+                            &profile_id,
+                            &g.name,
+                            &self.hidden_envs,
+                        ),
+                    }
+                }
             }
         }
 
@@ -27516,6 +28420,9 @@ mod gui {
                 DetailSubject::LoadBalancer(_) => {
                     self.lb_details.remove(&key);
                 }
+                DetailSubject::Asg(_) => {
+                    self.asg_details.remove(&key);
+                }
             }
             // Keep the active index inside the vec. Closing the tab left of the
             // active one would otherwise slide a different tab under the
@@ -27536,6 +28443,7 @@ mod gui {
             self.instance_details.clear();
             self.tg_details.clear();
             self.lb_details.clear();
+            self.asg_details.clear();
             self.main_tab = MainTab::Inventory;
         }
 
@@ -27701,6 +28609,9 @@ mod gui {
                 }
                 DetailSubject::LoadBalancer(lb) => {
                     self.render_load_balancer_details(ui, *lb, &title);
+                }
+                DetailSubject::Asg(g) => {
+                    self.render_asg_details(ui, *g, &title);
                 }
             }
         }
@@ -34690,6 +35601,11 @@ mod gui {
         }
         match kind {
             ResourceKind::TargetGroup => "No target groups in the selected account(s).".to_string(),
+            // "No ASG in the selected account(s)" reads as a typo. The label
+            // is a tab title, not a noun that fits into a sentence.
+            ResourceKind::Asg => {
+                "No auto scaling groups in the selected account(s).".to_string()
+            }
             other => format!("No {} in the selected account(s).", other.label()),
         }
     }
@@ -34906,6 +35822,435 @@ mod gui {
             // not broken, not finished, worth looking at.
             _ => Some(egui::Color32::YELLOW),
         }
+    }
+
+
+    /// The ASG table's columns.
+    ///
+    /// Six, and five of them narrow: what an operator reads off this table is
+    /// "is it holding what it is meant to hold", which is Desired against
+    /// Instances, with Min and Max saying whether it has room to move. The
+    /// launch template, the zones, the subnets, the target groups and the
+    /// account are all still searchable (`asg::asg_searchable_text`) and all
+    /// still in the detail view — the same trade the other two tables made.
+    const ASG_COLUMN_LABELS: [&str; 6] =
+        ["Name", "Desired", "Min", "Max", "Instances", "Health check"];
+
+    const ASG_MIN_COL_W: [f32; 6] = [200.0, 60.0, 45.0, 45.0, 100.0, 100.0];
+    const ASG_MAX_COL_W: [f32; 6] = [560.0, 70.0, 60.0, 60.0, 130.0, 130.0];
+
+    /// Each column sized to its widest cell and clamped — `tg_auto_widths` and
+    /// `lb_auto_widths` for the other tables, and the same reasoning: sized to
+    /// content with a horizontal scrollbar, never divided out of the window's
+    /// width.
+    fn asg_auto_widths(rows: &[AutoScalingGroup]) -> [f32; 6] {
+        let text_w = |s: &str| s.chars().count() as f32 * TG_CHAR_W + 8.0;
+        let mut out = [0.0f32; 6];
+        for (idx, label) in ASG_COLUMN_LABELS.iter().enumerate() {
+            out[idx] = text_w(label) + 6.0;
+        }
+        for g in rows {
+            let cells = [
+                text_w(&g.name),
+                text_w(&g.desired_capacity.to_string()),
+                text_w(&g.min_size.to_string()),
+                text_w(&g.max_size.to_string()),
+                text_w(&asg::instance_label(asg::instance_summary(&g.instances))),
+                text_w(&g.health_check_type),
+            ];
+            for (idx, w) in cells.iter().enumerate() {
+                out[idx] = out[idx].max(*w);
+            }
+        }
+        for idx in 0..out.len() {
+            out[idx] = out[idx].clamp(ASG_MIN_COL_W[idx], ASG_MAX_COL_W[idx]);
+        }
+        out
+    }
+
+    /// The colour for the Instances cell, or `None` to leave it alone.
+    ///
+    /// A group holding what it was asked to hold is the boring answer and gets
+    /// no colour at all — a table where every row is coloured has said
+    /// nothing, which is the rule `lb_state_colour` already follows.
+    ///
+    /// **A group scaled deliberately to zero is not a failure.** Desired 0 and
+    /// nothing running is exactly right, and colouring it red would paint
+    /// every overnight-scaled group as broken. Red is reserved for a group
+    /// that is *supposed* to be serving and has nothing serving at all; amber
+    /// is short of desired, which is either a deploy in progress or a group
+    /// that cannot fill itself, and both are worth a look.
+    fn asg_instances_colour(
+        summary: asg::InstanceSummary,
+        desired: i64,
+    ) -> Option<egui::Color32> {
+        let desired = desired.max(0) as usize;
+        if desired == 0 {
+            return None;
+        }
+        if summary.serving == 0 {
+            return Some(egui::Color32::RED);
+        }
+        if summary.serving < desired {
+            return Some(egui::Color32::YELLOW);
+        }
+        None
+    }
+
+    /// The breakdown behind the Instances cell.
+    ///
+    /// The cell is one fraction and deliberately hides *why* — an instance can
+    /// be missing from the numerator because it is unhealthy, because it is
+    /// still pending, or because it is on standby, and those are three
+    /// different situations. The hover says which, without a seventh column.
+    fn asg_instances_hover(g: &AutoScalingGroup) -> String {
+        let summary = asg::instance_summary(&g.instances);
+        if summary.total == 0 {
+            return format!(
+                "No instances registered · desired {}, min {}, max {}",
+                g.desired_capacity, g.min_size, g.max_size
+            );
+        }
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for i in &g.instances {
+            let key = format!("{} / {}", i.lifecycle_state, i.health_status);
+            match counts.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((key, 1)),
+            }
+        }
+        counts.sort();
+        let breakdown = counts
+            .iter()
+            .map(|(k, n)| format!("{k}: {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "{} serving of {} · desired {}\n{breakdown}",
+            summary.serving, summary.total, g.desired_capacity
+        )
+    }
+
+    /// What the Health check cell says on hover, and the detail grid's own
+    /// Health check row.
+    ///
+    /// The column shows only `EC2` or `ELB`, which is the part worth scanning;
+    /// the grace period is what actually explains a group that keeps replacing
+    /// instances, so it travels with it rather than earning a column.
+    fn asg_health_check_hover(g: &AutoScalingGroup) -> String {
+        match g.health_check_grace_secs {
+            Some(secs) => format!("{} · grace {secs}s", g.health_check_type),
+            None => g.health_check_type.clone(),
+        }
+    }
+
+    /// `3 (min 2, max 8)` — desired first, because desired is the number
+    /// somebody set and the other two only bound it.
+    fn asg_capacity_label(g: &AutoScalingGroup) -> String {
+        format!(
+            "{} (min {}, max {})",
+            g.desired_capacity, g.min_size, g.max_size
+        )
+    }
+
+    /// The colour for an instance's lifecycle state, or `None`.
+    ///
+    /// `InService` is the boring answer. Everything else — `Pending`,
+    /// `Terminating`, `Standby`, `Detaching` — is a transition worth seeing,
+    /// and none of them is a *failure*, so none of them is red.
+    fn asg_lifecycle_colour(state: &str) -> Option<egui::Color32> {
+        if state.eq_ignore_ascii_case("InService") {
+            None
+        } else {
+            Some(egui::Color32::YELLOW)
+        }
+    }
+
+    /// The colour for an instance's health status, or `None`.
+    ///
+    /// `Unhealthy` is red because it means the group is about to replace that
+    /// box. Anything the API grows later is amber rather than silent: an
+    /// unrecognised health status is not evidence of health.
+    fn asg_instance_health_colour(status: &str) -> Option<egui::Color32> {
+        if status.eq_ignore_ascii_case("Healthy") {
+            None
+        } else if status.eq_ignore_ascii_case("Unhealthy") {
+            Some(egui::Color32::RED)
+        } else {
+            Some(egui::Color32::YELLOW)
+        }
+    }
+
+    /// The colour for a scaling activity's status, or `None`.
+    fn asg_activity_colour(status: &str) -> Option<egui::Color32> {
+        match status {
+            "Successful" => None,
+            "Failed" | "Cancelled" => Some(egui::Color32::RED),
+            // WaitingForSpotInstanceId, InProgress, PreInService and whatever
+            // the API grows next: in flight, not finished, worth seeing.
+            _ => Some(egui::Color32::YELLOW),
+        }
+    }
+
+    /// When a scheduled action fires: its cron, or its one-off time.
+    ///
+    /// A recurring action's cron is in the group's `TimeZone` (UTC when it
+    /// declares none), and a cron read in the wrong zone is off by hours —
+    /// which is exactly the mistake somebody makes reading `0 22 * * *` as
+    /// local. So the zone is always written out beside it.
+    fn scheduled_action_when(action: &ScheduledAction) -> String {
+        if let Some(cron) = &action.recurrence {
+            let zone = action.time_zone.as_deref().unwrap_or("UTC");
+            return format!("{cron} ({zone})");
+        }
+        match (&action.start_time, &action.end_time) {
+            (Some(start), Some(end)) => format!(
+                "{} until {}",
+                format_aws_time_local(start),
+                format_aws_time_local(end)
+            ),
+            (Some(start), None) => format_aws_time_local(start),
+            _ => "—".to_string(),
+        }
+    }
+
+    /// What a scheduled action changes.
+    ///
+    /// Only the fields it actually sets: a scheduled action may set any subset
+    /// of the three, and rendering an unset one as `0` would describe an
+    /// action that scales the group to nothing.
+    fn scheduled_action_sets(action: &ScheduledAction) -> String {
+        let mut parts = Vec::new();
+        if let Some(v) = action.desired_capacity {
+            parts.push(format!("desired {v}"));
+        }
+        if let Some(v) = action.min_size {
+            parts.push(format!("min {v}"));
+        }
+        if let Some(v) = action.max_size {
+            parts.push(format!("max {v}"));
+        }
+        if parts.is_empty() {
+            return "—".to_string();
+        }
+        parts.join(", ")
+    }
+
+    /// The cause behind one scaling activity, plus its message if it failed.
+    fn activity_hover(a: &ScalingActivity) -> String {
+        let mut out = if a.cause.is_empty() {
+            "No cause reported".to_string()
+        } else {
+            a.cause.clone()
+        };
+        if let Some(msg) = &a.status_message {
+            out.push_str("\n\n");
+            out.push_str(msg);
+        }
+        out
+    }
+
+    /// `yes` / `no` for an API boolean.
+    fn yes_no(v: bool) -> String {
+        if v { "yes" } else { "no" }.to_string()
+    }
+
+    /// The not-yet / failed / empty preamble every fetched detail section
+    /// shares, returning the rows only when there are rows to draw.
+    ///
+    /// Four states and they must never look alike: still loading, refused,
+    /// genuinely empty, and here it is. Rendering any of the first three as
+    /// the last is the silent-empty failure this whole tab is built to avoid,
+    /// and three sections each writing that match by hand is three chances to
+    /// get one of them wrong.
+    fn detail_section<'a, T>(
+        ui: &mut egui::Ui,
+        data: &'a Option<std::result::Result<Vec<T>, String>>,
+        what: &str,
+    ) -> Option<&'a [T]> {
+        match data {
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("Fetching {what}…"));
+                });
+                None
+            }
+            Some(Err(err)) => {
+                note_label(ui, egui::Color32::RED, format!("Error: {err}"));
+                None
+            }
+            Some(Ok(rows)) if rows.is_empty() => {
+                ui.label(format!("No {what}"));
+                None
+            }
+            Some(Ok(rows)) => Some(rows),
+        }
+    }
+
+    /// Everything the ASG detail view shows, as plain text for Copy All.
+    ///
+    /// Pure over exactly the state the panel renders from, so what is copied
+    /// and what is on screen cannot drift — the contract
+    /// `load_balancer_detail_text` keeps. A section still loading, or one that
+    /// failed, says which rather than being omitted: an absent heading in a
+    /// pasted block reads as "this group has none".
+    fn asg_detail_text(
+        g: &AutoScalingGroup,
+        policies: &Option<std::result::Result<Vec<ScalingPolicy>, String>>,
+        scheduled: &Option<std::result::Result<Vec<ScheduledAction>, String>>,
+        activities: &Option<std::result::Result<Vec<ScalingActivity>, String>>,
+    ) -> String {
+        let dash = || "—".to_string();
+        let mut out = String::new();
+        out.push_str(&format!("Auto scaling group: {}\n", g.name));
+        out.push_str(&format!("ARN: {}\n", g.arn));
+        out.push_str(&format!("Account: {}\n", g.account_id));
+        out.push_str(&format!("Capacity: {}\n", asg_capacity_label(g)));
+        out.push_str(&format!(
+            "Instances: {}\n",
+            asg::instance_label(asg::instance_summary(&g.instances))
+        ));
+        out.push_str(&format!("Health check: {}\n", asg_health_check_hover(g)));
+        out.push_str(&format!("Launch: {}\n", g.launch_source.label()));
+        out.push_str(&format!(
+            "Availability zones: {}\n",
+            if g.availability_zones.is_empty() {
+                dash()
+            } else {
+                g.availability_zones.join(", ")
+            }
+        ));
+        out.push_str(&format!(
+            "Subnets: {}\n",
+            if g.subnets.is_empty() {
+                dash()
+            } else {
+                g.subnets.join(", ")
+            }
+        ));
+        out.push_str(&format!(
+            "Target groups: {}\n",
+            if g.target_group_arns.is_empty() {
+                "none".to_string()
+            } else {
+                g.target_group_arns
+                    .iter()
+                    .map(|a| asg::target_group_name_from_arn(a))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ));
+        out.push_str(&format!(
+            "Suspended processes: {}\n",
+            if g.suspended.is_empty() {
+                "none".to_string()
+            } else {
+                g.suspended
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ));
+        out.push_str(&format!(
+            "Max instance lifetime: {}\n",
+            asg::max_instance_lifetime_label(g.max_instance_lifetime_secs)
+        ));
+        out.push_str(&format!(
+            "Created: {}\n",
+            g.created
+                .as_deref()
+                .map(format_aws_time_local)
+                .unwrap_or_else(dash)
+        ));
+        if let Some(status) = &g.status {
+            out.push_str(&format!("Status: {status}\n"));
+        }
+
+        out.push_str("\nInstances:\n");
+        if g.instances.is_empty() {
+            out.push_str("  none\n");
+        } else {
+            for i in &g.instances {
+                out.push_str(&format!(
+                    "  {} {} {} {}/{}{}\n",
+                    i.instance_id,
+                    i.instance_type.as_deref().unwrap_or("—"),
+                    i.availability_zone.as_deref().unwrap_or("—"),
+                    i.lifecycle_state,
+                    i.health_status,
+                    if i.protected_from_scale_in {
+                        " (protected)"
+                    } else {
+                        ""
+                    },
+                ));
+            }
+        }
+
+        out.push_str("\nScaling policies:\n");
+        match policies {
+            None => out.push_str("  (still loading)\n"),
+            Some(Err(err)) => out.push_str(&format!("  Error: {err}\n")),
+            Some(Ok(ps)) if ps.is_empty() => out.push_str("  none\n"),
+            Some(Ok(ps)) => {
+                for p in ps {
+                    out.push_str(&format!(
+                        "  {} [{}] {}\n",
+                        p.name, p.policy_type, p.summary
+                    ));
+                }
+            }
+        }
+
+        out.push_str("\nScheduled actions:\n");
+        match scheduled {
+            None => out.push_str("  (still loading)\n"),
+            Some(Err(err)) => out.push_str(&format!("  Error: {err}\n")),
+            Some(Ok(actions)) if actions.is_empty() => out.push_str("  none\n"),
+            Some(Ok(actions)) => {
+                for a in actions {
+                    out.push_str(&format!(
+                        "  {} — {} — {}\n",
+                        a.name,
+                        scheduled_action_when(a),
+                        scheduled_action_sets(a)
+                    ));
+                }
+            }
+        }
+
+        out.push_str("\nRecent activity:\n");
+        match activities {
+            None => out.push_str("  (still loading)\n"),
+            Some(Err(err)) => out.push_str(&format!("  Error: {err}\n")),
+            Some(Ok(acts)) if acts.is_empty() => out.push_str("  none\n"),
+            Some(Ok(acts)) => {
+                for a in acts {
+                    out.push_str(&format!(
+                        "  [{}] {} {}\n    {}\n",
+                        a.status_code,
+                        a.start_time
+                            .as_deref()
+                            .map(format_aws_time_local)
+                            .unwrap_or_else(dash),
+                        a.description,
+                        activity_hover(a).replace('\n', "\n    "),
+                    ));
+                }
+            }
+        }
+
+        out.push_str("\nTags:\n");
+        if g.tags.is_empty() {
+            out.push_str("  none\n");
+        } else {
+            for t in &g.tags {
+                out.push_str(&format!("  {} = {}\n", t.key, t.value));
+            }
+        }
+        out
     }
 
     const TG_COLUMN_LABELS: [&str; 4] = ["Name", "Protocol:Port", "Healthy/Total", "Path"];
@@ -42799,6 +44144,266 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert!(text.contains("Security groups: none"), "{text}");
         }
 
+
+        fn asg_row(name: &str) -> AutoScalingGroup {
+            AutoScalingGroup {
+                arn: format!(
+                    "arn:aws:autoscaling:us-east-1:111122223333:autoScalingGroup:x:autoScalingGroupName/{name}"
+                ),
+                name: name.to_string(),
+                min_size: 2,
+                max_size: 8,
+                desired_capacity: 3,
+                health_check_type: "ELB".to_string(),
+                health_check_grace_secs: Some(300),
+                account_id: "111122223333".to_string(),
+                ..Default::default()
+            }
+        }
+
+        fn asg_instance(state: &str, health: &str) -> ec2_manager::asg::AsgInstance {
+            ec2_manager::asg::AsgInstance {
+                instance_id: format!("i-{state}{health}"),
+                lifecycle_state: state.to_string(),
+                health_status: health.to_string(),
+                ..Default::default()
+            }
+        }
+
+        /// A group holding what it was asked to hold is the boring answer and
+        /// gets no colour: a table where every row is coloured has said
+        /// nothing. Same rule `lb_state_colour` follows for `active`.
+        #[test]
+        fn a_full_asg_is_not_coloured() {
+            let summary = ec2_manager::asg::InstanceSummary {
+                serving: 3,
+                total: 3,
+            };
+            assert_eq!(asg_instances_colour(summary, 3), None);
+            // More than desired — mid scale-in — is still not a problem.
+            assert_eq!(asg_instances_colour(summary, 2), None);
+        }
+
+        /// A group scaled deliberately to zero is exactly right, not broken.
+        /// Colouring it would paint every overnight-scaled group red.
+        #[test]
+        fn a_group_scaled_to_zero_on_purpose_is_not_coloured() {
+            let empty = ec2_manager::asg::InstanceSummary::default();
+            assert_eq!(asg_instances_colour(empty, 0), None);
+        }
+
+        /// Nothing serving where something is supposed to be is the one red
+        /// case; short of desired is amber, since that is either a deploy in
+        /// progress or a group that cannot fill itself.
+        #[test]
+        fn an_asg_short_of_its_desired_capacity_says_so() {
+            let none = ec2_manager::asg::InstanceSummary {
+                serving: 0,
+                total: 2,
+            };
+            assert_eq!(asg_instances_colour(none, 3), Some(egui::Color32::RED));
+            let some = ec2_manager::asg::InstanceSummary {
+                serving: 1,
+                total: 3,
+            };
+            assert_eq!(asg_instances_colour(some, 3), Some(egui::Color32::YELLOW));
+        }
+
+        /// `InService` is the boring answer; every other lifecycle state is a
+        /// transition worth seeing, and none of them is a failure, so none is
+        /// red.
+        #[test]
+        fn only_an_unusual_lifecycle_state_is_coloured() {
+            assert_eq!(asg_lifecycle_colour("InService"), None);
+            assert_eq!(asg_lifecycle_colour("Pending"), Some(egui::Color32::YELLOW));
+            assert_eq!(
+                asg_lifecycle_colour("Terminating"),
+                Some(egui::Color32::YELLOW)
+            );
+        }
+
+        /// `Unhealthy` is red — the group is about to replace that box. A
+        /// status the API grows later is amber rather than silent: an
+        /// unrecognised health status is not evidence of health.
+        #[test]
+        fn an_unhealthy_instance_is_red_and_an_unknown_status_is_never_silent() {
+            assert_eq!(asg_instance_health_colour("Healthy"), None);
+            assert_eq!(
+                asg_instance_health_colour("Unhealthy"),
+                Some(egui::Color32::RED)
+            );
+            assert_eq!(
+                asg_instance_health_colour("something-new"),
+                Some(egui::Color32::YELLOW)
+            );
+        }
+
+        #[test]
+        fn only_an_unusual_activity_status_is_coloured() {
+            assert_eq!(asg_activity_colour("Successful"), None);
+            assert_eq!(asg_activity_colour("Failed"), Some(egui::Color32::RED));
+            assert_eq!(asg_activity_colour("Cancelled"), Some(egui::Color32::RED));
+            assert_eq!(
+                asg_activity_colour("InProgress"),
+                Some(egui::Color32::YELLOW)
+            );
+        }
+
+        /// A cron is read in the group's own zone, and a cron read in the
+        /// wrong one is off by hours — which is exactly the mistake somebody
+        /// makes reading `0 22 * * *` as local time. So the zone is always
+        /// written beside it, and a group that declares none says UTC rather
+        /// than saying nothing.
+        #[test]
+        fn a_recurring_action_always_names_its_timezone() {
+            let mut action = ScheduledAction {
+                name: "overnight".to_string(),
+                recurrence: Some("0 22 * * *".to_string()),
+                time_zone: Some("America/Chicago".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(
+                scheduled_action_when(&action),
+                "0 22 * * * (America/Chicago)"
+            );
+            action.time_zone = None;
+            assert!(scheduled_action_when(&action).ends_with("(UTC)"));
+        }
+
+        /// A scheduled action may set any subset of the three sizes, and
+        /// rendering an unset one as `0` would describe an action that scales
+        /// the group to nothing.
+        #[test]
+        fn a_scheduled_action_lists_only_what_it_actually_sets() {
+            let action = ScheduledAction {
+                name: "down".to_string(),
+                desired_capacity: Some(0),
+                ..Default::default()
+            };
+            // Zero IS set here, and must survive.
+            assert_eq!(scheduled_action_sets(&action), "desired 0");
+            assert_eq!(
+                scheduled_action_sets(&ScheduledAction::default()),
+                "—".to_string()
+            );
+        }
+
+        /// Every column the table shows has to be sized from its own content
+        /// and clamped, or one pathological name pushes the rest off screen.
+        #[test]
+        fn asg_columns_are_sized_to_their_content_and_clamped() {
+            let narrow = asg_auto_widths(std::slice::from_ref(&asg_row("a")));
+            for idx in 0..ASG_COLUMN_LABELS.len() {
+                assert!(
+                    narrow[idx] >= ASG_MIN_COL_W[idx],
+                    "column {idx} fell under its floor"
+                );
+            }
+            let long = asg_row(&"n".repeat(300));
+            let wide = asg_auto_widths(std::slice::from_ref(&long));
+            assert!(wide[0] > narrow[0], "a long name must widen its own column");
+            for idx in 0..ASG_COLUMN_LABELS.len() {
+                assert!(
+                    wide[idx] <= ASG_MAX_COL_W[idx],
+                    "column {idx} blew past its ceiling"
+                );
+            }
+            // No rows at all still yields a readable header row.
+            let empty = asg_auto_widths(&[]);
+            for idx in 0..ASG_COLUMN_LABELS.len() {
+                assert!(empty[idx] >= ASG_MIN_COL_W[idx]);
+            }
+        }
+
+        /// The Instances cell is one fraction and deliberately hides *why* an
+        /// instance is not counted. The hover is where that lives, so it has
+        /// to name every state actually present.
+        #[test]
+        fn the_instances_hover_breaks_the_fraction_down() {
+            let mut g = asg_row("app");
+            g.instances = vec![
+                asg_instance("InService", "Healthy"),
+                asg_instance("InService", "Unhealthy"),
+                asg_instance("Pending", "Healthy"),
+            ];
+            let hover = asg_instances_hover(&g);
+            assert!(hover.contains("1 serving of 3"), "{hover}");
+            assert!(hover.contains("desired 3"), "{hover}");
+            for state in ["InService / Healthy", "InService / Unhealthy", "Pending / Healthy"] {
+                assert!(hover.contains(state), "hover is missing {state}: {hover}");
+            }
+        }
+
+        /// An empty group's hover must still say what the group is *for*,
+        /// rather than reading as a group nothing is known about.
+        #[test]
+        fn an_empty_groups_hover_still_names_its_capacity() {
+            let hover = asg_instances_hover(&asg_row("app"));
+            assert!(hover.contains("No instances registered"), "{hover}");
+            assert!(hover.contains("desired 3"), "{hover}");
+        }
+
+        /// Copy All is pure over exactly the state the panel renders from, so
+        /// what is copied and what is on screen cannot drift. A section still
+        /// loading, or one that failed, says which rather than being omitted —
+        /// an absent heading in a pasted block reads as "this group has none".
+        #[test]
+        fn the_asg_copy_all_text_never_omits_a_section() {
+            let mut g = asg_row("app");
+            g.instances = vec![asg_instance("InService", "Healthy")];
+            g.tags = vec![ec2_manager::asg::AsgTag {
+                key: "MMODAL_ENV".to_string(),
+                value: "DEV1".to_string(),
+                propagate_at_launch: true,
+            }];
+
+            // One section loaded, one refused, one still in flight: all three
+            // headings have to be present and each has to say which it is.
+            let text = asg_detail_text(
+                &g,
+                &Some(Ok(vec![ScalingPolicy {
+                    name: "target-cpu".to_string(),
+                    policy_type: "TargetTrackingScaling".to_string(),
+                    summary: "ASGAverageCPUUtilization -> 60".to_string(),
+                    enabled: Some(true),
+                }])),
+                &Some(Err("not permitted".to_string())),
+                &None,
+            );
+            for heading in [
+                "Auto scaling group: app",
+                "Instances:",
+                "Scaling policies:",
+                "Scheduled actions:",
+                "Recent activity:",
+                "Tags:",
+            ] {
+                assert!(text.contains(heading), "missing {heading}:\n{text}");
+            }
+            assert!(text.contains("target-cpu"), "{text}");
+            assert!(text.contains("Error: not permitted"), "{text}");
+            assert!(text.contains("(still loading)"), "{text}");
+            assert!(text.contains("MMODAL_ENV = DEV1"), "{text}");
+        }
+
+        /// The capacity line puts desired first, because desired is the number
+        /// somebody set and the other two only bound it.
+        #[test]
+        fn the_capacity_label_leads_with_desired() {
+            assert_eq!(asg_capacity_label(&asg_row("app")), "3 (min 2, max 8)");
+        }
+
+        /// The column shows only `EC2` or `ELB`; the grace period is what
+        /// actually explains a group that keeps replacing instances, so it
+        /// travels with it rather than earning a column of its own.
+        #[test]
+        fn the_health_check_hover_carries_the_grace_period() {
+            assert_eq!(asg_health_check_hover(&asg_row("app")), "ELB · grace 300s");
+            let mut g = asg_row("app");
+            g.health_check_grace_secs = None;
+            assert_eq!(asg_health_check_hover(&g), "ELB");
+        }
+
         /// `active` is the one state that gets no colour.
         ///
         /// A table where every row is coloured has said nothing; the point of
@@ -43120,6 +44725,10 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 (
                     "fn render_load_balancers",
                     ["self.lb_list_loading.clear()", "self.lb_list_failures.clear()"],
+                ),
+                (
+                    "fn render_asgs",
+                    ["self.asg_list_loading.clear()", "self.asg_list_failures.clear()"],
                 ),
             ] {
                 let body_start = src.find(func).unwrap_or_else(|| panic!("{func}"));

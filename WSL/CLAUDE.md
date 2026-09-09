@@ -42,7 +42,7 @@ cargo build --features gui
 
 # Run tests
 cargo test                  # lib + CLI tests
-cargo test --features gui   # all tests including GUI (425 GUI tests)
+cargo test --features gui   # all tests including GUI (451 GUI tests)
 
 # Clippy
 cargo clippy --features gui
@@ -56,13 +56,13 @@ cargo clippy --features gui
 
 ## Build status
 
-As of 2026-09-08 (rustc 1.94.0), measured on `aws-resource-browser-phase1`
-after the Inventory resource sub-tabs (Target Groups, phase 1) landed and its
-final fix wave — this line was stale for months (it read 356 tests / 21
-warnings, both months out of date; the measured baseline immediately before
-this phase was 1019 tests / 23 warnings):
+As of 2026-09-09 (rustc 1.94.0), measured on `aws-resource-browser-phase1`
+after the Inventory resource sub-tabs reached phase 3 (ASG) — this line was
+stale for months before phase 1 (it read 356 tests / 21 warnings, both months
+out of date; the measured baseline immediately before phase 1 was 1019 tests /
+23 warnings):
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 1087 tests pass, 0 fail (659 lib + 3 CLI + 425 GUI)
+- `cargo test --features gui` — 1146 tests pass, 0 fail (692 lib + 3 CLI + 451 GUI)
 - `cargo clippy --features gui` — no errors; 23 pre-existing style warnings.
   **That is a count of `^warning` lines, which is how the pre-branch baseline
   was measured and why the two are comparable — it is 21 distinct lints (6 lib
@@ -74,7 +74,7 @@ this phase was 1019 tests / 23 warnings):
   let_and_return, four collapsible_if, one unneeded `return`
 - The Windows release cross-compile
   (`ALLOW_NO_FORWARDS=1 CARGO_TARGET_DIR=/tmp/ec2m cargo build --release
-  --target x86_64-pc-windows-gnu --features gui`) — reverified 2026-09-08,
+  --target x86_64-pc-windows-gnu --features gui`) — reverified 2026-09-09,
   exit 0, zero warnings
 - Release targets — zero warnings on both Linux (x86_64-unknown-linux-gnu, via
   `build_binaries.sh`) and Windows (x86_64-pc-windows-gnu, built directly since
@@ -2170,9 +2170,24 @@ describe, so there is no `allowed_users` gate.
 
 Phase 1 built the scaffolding and Target Groups; phase 2 added Load
 Balancers and changed no scaffolding at all, which is what the phasing was
-for. The remaining three are the same shape — a `parse_*`/`fetch_*` pair, a
+for. Phase 3 (ASG) moved exactly one thing — see "The shared fetch plumbing"
+below. The remaining two are the same shape: a `parse_*`/`fetch_*` pair, a
 `render_resource_panel` arm and a `DetailSubject` variant. The spec is
 `docs/superpowers/specs/2026-09-08-aws-resource-browser-design.md`.
+
+#### The shared fetch plumbing lives in `resources`, not in a resource module
+
+`FetchError` and `run_cli` started life in `elb.rs` and moved to
+`src/resources.rs` when `asg.rs` needed them. `elb` re-exports `FetchError`,
+so `elb::FetchError` still means what it always did, and **it must never
+become a distinct type again**: "what a denial is" is a fact about the AWS
+CLI, not about load balancing. A per-module copy would let one sub-tab treat
+an `AccessDenied` as an ordinary failure while its neighbour switched a column
+off, with nothing on screen saying why the two behaved differently.
+
+That is the one bit of the deferred C1 finding that was worth doing eagerly.
+The **cache and the multi-account pooling still live in the GUI file**, not in
+`resources` as the spec asks; phases 4 and 5 inherit that.
 
 #### Load Balancers (ALB and NLB)
 
@@ -2211,6 +2226,85 @@ true but rarely looked at, and both stay searchable and in the detail view.
   listener, and a token that can list listeners but not their rules must
   leave the listeners readable — the same rule the EC2 Details tab follows
   for volumes and security groups.
+
+
+#### ASG (auto scaling groups)
+
+Columns are `Name · Desired · Min · Max · Instances · Health check` — six, and
+five of them narrow. What an operator reads off this table is *is it holding
+what it is meant to hold*, which is Desired against Instances, with Min and
+Max saying whether it has room to move. The launch template, the zones, the
+subnets, the target groups and the account are all still searchable and all
+still in the detail view — the same trade the other two tables made.
+
+- **`describe-auto-scaling-groups` answers almost everything in ONE call.**
+  The instances with their lifecycle and health, the tags, the target group
+  ARNs and the suspended processes all arrive with the list. So unlike target
+  group health there is **no lazy per-row fetch and no priority list** — the
+  Instances column fills for free, and the detail panel's whole top half
+  renders with nothing in flight. Only three things need their own calls:
+  scaling policies, scheduled actions and recent activity.
+- **A mixed instances policy carries NO top-level `LaunchTemplate`.** An ASG
+  has three ways of naming where its instances come from — `LaunchTemplate`,
+  `MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification`, and the
+  legacy `LaunchConfigurationName` — and reading only the first leaves the
+  field blank on exactly the groups most worth looking at. `LaunchSource` is
+  an enum over all three, and a mixed policy is **labelled as one**: the
+  instance types actually launched come from the policy's overrides, not from
+  the template, so calling it a plain template would misdescribe the group.
+- **`VPCZoneIdentifier` is ONE comma-separated string, not a list.** Read as a
+  list it yields nothing; rendered raw it puts `subnet-a,subnet-b,subnet-c` in
+  a cell. The API has been seen emitting a trailing comma.
+- **`MaxInstanceLifetime: 0` means "no limit", not zero seconds.** Rendered
+  raw it says `0s` beside fields whose other values are days, which reads as
+  instances being replaced instantly.
+- **`Status` is set only while a group is being deleted.** The detail grid
+  shows that row only when it is present — a permanently blank Status row
+  reads as a field we failed to fill.
+- **Serving requires BOTH `InService` and `Healthy`.** An instance can be
+  `InService` and `Unhealthy` — that is precisely a box about to be replaced —
+  and `Healthy` while still `Pending`, which is one not carrying traffic yet.
+  Counting either as serving overstates the group in the direction that hides
+  an outage.
+- **A group scaled deliberately to zero is not a failure.** `asg_instances_colour`
+  returns `None` when desired is 0, or every overnight-scaled group would be
+  painted red. Red is only for a group that is supposed to be serving and has
+  nothing serving; amber is short of desired. A group holding what it was
+  asked to hold gets no colour at all — the same rule `lb_state_colour` follows
+  for `active`.
+- **An empty group reads `no instances`, in words** — not `0/0`, not a dash.
+  Same lesson as the Target Groups table's `no targets`: a dash in a column
+  whose other values are numbers reads as "we never got an answer".
+- **The Instances cell hides *why*, and the hover is where that lives.** An
+  instance can be missing from the numerator because it is unhealthy, because
+  it is pending, or because it is on standby, and those are three different
+  situations. `asg_instances_hover` breaks the fraction down by
+  lifecycle/health rather than the table growing a seventh column.
+- **A scheduled action's cron is always shown with its timezone**, defaulting
+  to UTC where the action declares none. A cron read in the wrong zone is off
+  by hours, which is exactly the mistake somebody makes reading `0 22 * * *`
+  as local. And `scheduled_action_sets` lists only the sizes the action
+  actually sets: an action may set any subset of the three, and rendering an
+  unset one as `0` would describe an action that scales the group to nothing.
+- **The activity section exists for the `Cause` field.** "An instance was
+  terminated" is not an answer; "because a target tracking policy changed the
+  desired capacity from 3 to 2" is. It hangs off the description as hover so
+  the column stays readable, and the read is bounded at the call
+  (`ACTIVITY_LIMIT`, `--max-items`) — the history goes back six weeks and a
+  group that flaps has thousands of entries.
+- **The three detail calls take the group's NAME**, not its ARN, which is what
+  the API accepts; the ARN is what the tab is keyed on.
+- **`detail_section` is the shared not-yet / failed / empty preamble.** Four
+  states that must never look alike — still loading, refused, genuinely empty,
+  and here it is — and three sections each writing that match by hand is three
+  chances to get one wrong.
+- **An ASG is the one resource here that carries `MMODAL_ENV`**, since its tags
+  come with the list, so `detail_subject_color` answers it exactly rather than
+  guessing from the name the way a target group and a load balancer have to.
+  The name stays the fallback for a group nobody tagged.
+- **`resource_empty_note` has its own ASG arm**: "No ASG in the selected
+  account(s)" reads as a typo. `ResourceKind::label` is a tab title, not a noun
+  that fits into a sentence.
 
 - **`filter::text_matches` is the shared search engine.** The
   include/exclude matching was lifted out of `apply_filters` so every sub-tab

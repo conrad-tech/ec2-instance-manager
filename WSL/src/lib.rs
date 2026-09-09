@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod alerts;
+pub mod asg;
 pub mod atlassian_http;
 pub mod aws_cli;
 pub mod aws_context;

@@ -1,10 +1,19 @@
 //! Scaffolding shared by every resource type in the Inventory sub-tabs.
 //!
-//! Pure: no AWS calls and no egui. Each resource module owns its own typed
-//! cache and its own parsing; what lives here is what all of them must agree
-//! on — how a cache key is shaped, how long a result is good for, how an
-//! error is classified, and which rows are worth fetching first.
+//! No egui, and one AWS call: [`run_cli`], the single place every resource
+//! fetch reaches the CLI. Each resource module owns its own typed cache and
+//! its own parsing; what lives here is what all of them must agree on — how a
+//! cache key is shaped, how long a result is good for, how an error is
+//! classified, and which rows are worth fetching first.
+//!
+//! `FetchError` and `run_cli` started out in `elb.rs`. They moved here the
+//! moment a second resource module needed them: a per-module copy of "what a
+//! denial is" would let one sub-tab treat an `AccessDenied` as an ordinary
+//! failure while its neighbour switched a column off, and nothing on screen
+//! would say why the two behaved differently.
 
+use crate::aws_cli::run_aws_cli;
+use crate::error::AppError;
 use std::time::Duration;
 
 /// How long a fetched resource list is good for.
@@ -207,9 +216,99 @@ pub fn classify_absent(stderr: &str) -> Absence {
     Absence::Failed(trimmed.to_string())
 }
 
+/// Why a fetch did not produce data.
+///
+/// `Denied` is separate from `Failed` because the caller acts on it: the
+/// Target Groups table's Healthy/Total column switches itself off for an
+/// account on the first denial, rather than issuing one refused call per row
+/// for as long as somebody keeps scrolling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FetchError {
+    Denied,
+    Failed(String),
+}
+
+impl FetchError {
+    /// Classify a failed CLI invocation.
+    ///
+    /// `Absence::Absent` has no meaning for a list call — nothing here answers
+    /// "nothing configured" — so it is kept as a failure rather than silently
+    /// becoming an empty list, which would render as "no target groups in this
+    /// account".
+    pub fn from_stderr(stderr: &str) -> Self {
+        match classify_absent(stderr) {
+            Absence::Denied => Self::Denied,
+            Absence::Absent | Absence::Failed(_) => Self::Failed(stderr.trim().to_string()),
+        }
+    }
+
+    /// The sentence to put on screen.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Denied => "not permitted".to_string(),
+            Self::Failed(text) => text.clone(),
+        }
+    }
+}
+
+/// Map a `run_aws_cli` error onto a `FetchError`, keeping the API's own
+/// explanation — `CommandFailed` carries stderr, which is the thing worth
+/// reading.
+fn fetch_error(err: AppError) -> FetchError {
+    match err {
+        AppError::CommandFailed { stderr, .. } => FetchError::from_stderr(&stderr),
+        other => FetchError::Failed(other.to_string()),
+    }
+}
+
+/// The one place a resource fetch reaches the AWS CLI.
+///
+/// Every `fetch_*` in every resource module goes through here, so the profile,
+/// the region and the error classification are decided once. A module that
+/// called `run_aws_cli` directly would be the module whose denials render
+/// differently from everybody else's.
+pub fn run_cli(
+    profile: &str,
+    region: &str,
+    args: &[&str],
+) -> std::result::Result<String, FetchError> {
+    run_aws_cli(Some(profile), Some(region), args).map_err(fetch_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A denial has to survive the trip through `FetchError`, or the
+    /// Healthy/Total column never switches itself off and every scrolled row
+    /// spends a refused call.
+    #[test]
+    fn a_fetch_error_keeps_the_denial_distinct_from_a_failure() {
+        assert_eq!(
+            FetchError::from_stderr(
+                "An error occurred (AccessDenied) when calling DescribeTargetHealth"
+            ),
+            FetchError::Denied
+        );
+        assert_eq!(FetchError::Denied.message(), "not permitted");
+        match FetchError::from_stderr("  Rate exceeded  ") {
+            FetchError::Failed(text) => assert_eq!(text, "Rate exceeded"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// "Nothing configured" is not an answer a *list* call can give, so an
+    /// absent code stays a failure here rather than becoming an empty list —
+    /// which would read as "this account has no target groups".
+    #[test]
+    fn an_absent_code_is_still_a_failure_for_a_list_call() {
+        assert!(matches!(
+            FetchError::from_stderr(
+                "An error occurred (NoSuchBucketPolicy) when calling GetBucketPolicy"
+            ),
+            FetchError::Failed(_)
+        ));
+    }
 
     /// Every one of these is the API saying "nothing is configured", not a
     /// failure. Rendering them as errors makes an ordinary bucket look broken.
