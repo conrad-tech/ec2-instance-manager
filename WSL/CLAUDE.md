@@ -2404,8 +2404,16 @@ true but rarely looked at, and both stay searchable and in the detail view.
   barely-tinted ground, an 8px dot inside, and the text left in the theme's
   own colour. Colouring the text fights the selected and hovered states egui
   already paints, and framing the whole panel puts a border round the one
-  thing whose identity was never in question. Both were tried and both were
-  wrong; copy the Connections tab, do not invent a variation. An instance answers exactly, from its own
+  thing whose identity was never in question.
+- **The label is a plain `Label`, never `selectable_label`.** That widget
+  paints egui's blue selection block behind the text, and the Connections
+  tabs deliberately do not have one: the coloured frame already says which
+  tab this is, and a second highlight in a colour that means nothing here
+  fights it. Selection is **weight and text colour** — `strong_text_color()`
+  plus bold when active, `widgets.hovered.text_color()` on hover — and the
+  whole tab is the click target, via a `scope_builder` sensing clicks.
+- Three variations on this were tried before reading what the Connections
+  tab actually does. **Copy it; do not invent a variation.** An instance answers exactly, from its own
   `MMODAL_ENV`, and resolves the profile through the same lookup the
   Connections colouring makes — the same box must not be two colours in two
   places.

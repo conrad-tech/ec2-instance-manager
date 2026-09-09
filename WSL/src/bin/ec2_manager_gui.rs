@@ -27616,33 +27616,76 @@ mod gui {
                             )),
                         None => egui::Frame::group(ui.style()),
                     };
-                    frame.show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if let Some(c) = colours[idx] {
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(8.0, 8.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().circle_filled(rect.center(), 4.0, c);
-                            }
-                            // The kind prefix earns its place: a target group
-                            // and the load balancer in front of it are
-                            // routinely named the same thing, and two identical
-                            // tabs are worse than none.
-                            let label =
-                                format!("{}: {}", subject.kind_label(), subject.title());
-                            if ui.selectable_label(idx == active, label).clicked() {
-                                select = Some(idx);
-                            }
-                            if ui
-                                .small_button("✖")
-                                .on_hover_text("Close this tab")
-                                .clicked()
-                            {
-                                close = Some(idx);
-                            }
-                        });
-                    });
+                    // The whole tab is the click target and the label is a
+                    // plain `Label`, exactly as a Connections tab is built.
+                    // `selectable_label` — which this used — paints egui's blue
+                    // selection block behind the text, and the Connections tabs
+                    // deliberately do not: the coloured frame already says
+                    // which tab this is, and a second highlight in a colour
+                    // that means nothing here fights it.
+                    let scope = ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .id_salt(("detail_tab", idx))
+                            .sense(egui::Sense::click()),
+                        |ui| {
+                            let hovered = ui.response().hovered();
+                            frame.show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if let Some(c) = colours[idx] {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(8.0, 8.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().circle_filled(rect.center(), 4.0, c);
+                                    }
+                                    // Selection is weight and text colour, the
+                                    // Connections tab's own vocabulary.
+                                    let text_color = if idx == active {
+                                        ui.visuals().strong_text_color()
+                                    } else if hovered {
+                                        ui.visuals().widgets.hovered.text_color()
+                                    } else {
+                                        ui.visuals().text_color()
+                                    };
+                                    // The kind prefix earns its place: a target
+                                    // group and the load balancer in front of it
+                                    // are routinely named the same thing, and
+                                    // two identical tabs are worse than none.
+                                    let label = format!(
+                                        "{}: {}",
+                                        subject.kind_label(),
+                                        subject.title()
+                                    );
+                                    let mut rich =
+                                        egui::RichText::new(label).color(text_color);
+                                    if idx == active {
+                                        rich = rich.strong();
+                                    }
+                                    ui.add(egui::Label::new(rich).selectable(false));
+                                    if ui
+                                        .small_button("✖")
+                                        .on_hover_text("Close this tab")
+                                        .clicked()
+                                    {
+                                        close = Some(idx);
+                                    }
+                                });
+                            });
+                        },
+                    );
+                    // A normal arrow over the tab, not a text caret.
+                    if scope
+                        .response
+                        .on_hover_cursor(egui::CursorIcon::Default)
+                        .clicked()
+                    {
+                        // Clicking ✖ also lands here, since the button sits
+                        // inside the sensed scope. Harmless: `close` is applied
+                        // first and returns, so the tab is shut rather than
+                        // selected — the same ordering the Connections strip
+                        // relies on.
+                        select = Some(idx);
+                    }
                 }
                 if self.detail_tabs.len() > 1
                     && ui
