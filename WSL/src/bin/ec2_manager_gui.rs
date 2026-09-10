@@ -27081,7 +27081,7 @@ mod gui {
 
 
 
-        /// The favourited ids for one kind, as a set to test rows against.
+        /// The favorited ids for one kind, as a set to test rows against.
         ///
         /// Read once per render rather than per row: `is_resource_favorite`
         /// walks a `Vec`, and a table of several hundred rows would walk it
@@ -27101,18 +27101,18 @@ mod gui {
 
         /// A row's star was clicked.
         ///
-        /// Saved immediately, like the EC2 table's own favourite toggle: a
-        /// favourite the user set and lost because the app closed without a
+        /// Saved immediately, like the EC2 table's own favorite toggle: a
+        /// favorite the user set and lost because the app closed without a
         /// later save is the kind of thing that quietly teaches somebody the
         /// feature does not work.
         fn toggle_resource_favorite(&mut self, kind: ResourceKind, id: &str) {
             let now = self.config.toggle_resource_favorite(kind.as_str(), id);
             self.log_info(format!(
-                "{} favourite {id}: {}",
+                "{} favorite {id}: {}",
                 kind.label(),
                 if now { "on" } else { "off" }
             ));
-            self.save_config_quietly("favourites");
+            self.save_config_quietly("favorites");
         }
 
         /// A header was clicked.
@@ -40075,7 +40075,13 @@ mod gui {
 
 
 
-    /// Column 0 of every resource table is the favourite star.
+    /// What the Favorite column's header says.
+    ///
+    /// The same word the EC2 table's header uses, named once so the two pages
+    /// cannot come to disagree about it.
+    const FAVORITE_HEADER: &str = "Favorite";
+
+    /// Column 0 of every resource table is the favorite star.
     ///
     /// The tables' own `*_COLUMN_LABELS` do **not** include it —
     /// `resource_header_labels` puts it in front at render time. That keeps
@@ -40087,26 +40093,34 @@ mod gui {
     /// it is a much larger edit for the same pixels.
     const RESOURCE_FAV_COL: usize = 0;
 
-    /// How wide the star column is. Fixed — a star does not vary in width, so
-    /// unlike every data column it is not resizable either.
-    const RESOURCE_FAV_W: f32 = 24.0;
+    /// How wide the Favorite column is.
+    ///
+    /// **`COL_FAV_W` itself, the EC2 table's own**, rather than a second
+    /// number that happens to match: the two columns are meant to be the same
+    /// column on two pages, and two constants is two things to keep in step.
+    /// It is wide enough for the header word, which is why the header can be
+    /// the word rather than a glyph.
+    ///
+    /// Fixed here, where EC2's is resizable — a star does not vary in width,
+    /// so there is nothing to drag it to.
+    const RESOURCE_FAV_W: f32 = COL_FAV_W;
 
-    /// A resource table's header labels: its own columns with the favourite
+    /// A resource table's header labels: its own columns with the favorite
     /// star in front.
     fn resource_header_labels(columns: impl IntoIterator<Item = String>) -> Vec<String> {
-        // A glyph rather than the word "Favorite": the column is 24px wide and
-        // the EC2 table's own header spells it out only because that column is
-        // 55px. The hollow star is what an unstarred row shows, so the header
-        // reads as "this column is the star".
-        let mut out = vec!["\u{2606}".to_string()];
+        // The WORD, exactly as the EC2 table's header spells it — not a glyph.
+        // A star in the header is read as a decoration on whatever column
+        // follows it rather than as a column of its own, which is precisely
+        // how it was read: as a star sitting next to "Name".
+        let mut out = vec![FAVORITE_HEADER.to_string()];
         out.extend(columns);
         out
     }
 
-    /// The favourite star for one row, in its own fixed slot.
+    /// The favorite star for one row, in its own fixed slot.
     ///
     /// An unframed button, exactly as the EC2 table's is: filled and yellow
-    /// when favourited, hollow when not. Returned rather than acted on,
+    /// when favorited, hollow when not. Returned rather than acted on,
     /// because every caller has to keep it OUT of the row's click response —
     /// starring a row must not also open its Details tab, the same reasoning
     /// that keeps the copy buttons out.
@@ -40122,9 +40136,9 @@ mod gui {
             |ui| {
                 ui.add(egui::Button::new(label).frame(false))
                     .on_hover_text(if is_favorite {
-                        "Remove from favourites"
+                        "Remove from favorites"
                     } else {
-                        "Add to favourites"
+                        "Add to favorites"
                     })
             },
         )
@@ -40319,7 +40333,7 @@ mod gui {
     ) {
         rows.sort_by(|a, b| {
             let ord = if sort.column == RESOURCE_FAV_COL {
-                // **Favourites first when ascending.** `false < true`, so the
+                // **Favorites first when ascending.** `false < true`, so the
                 // flags are compared the other way round: clicking the star
                 // header once has to bring the starred rows to the top, which
                 // is the only reason anybody clicks it.
@@ -49305,7 +49319,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         /// Sort by a DATA column, named 0-based as `*_COLUMN_LABELS` are.
         ///
-        /// The `+ 1` is the star: `ResourceSort.column` counts the favourite
+        /// The `+ 1` is the star: `ResourceSort.column` counts the favorite
         /// column at 0, and shifting here rather than in every test keeps them
         /// reading in the same terms as the comparators they exercise.
         fn sorted<T: Clone>(
@@ -49327,7 +49341,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             out
         }
 
-        /// Sort by the favourite column itself.
+        /// Sort by the favorite column itself.
         fn sorted_by_favorite<T: Clone>(
             rows: &[T],
             direction: SortDirection,
@@ -49341,7 +49355,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     direction,
                 },
                 favorite,
-                // Never reached: column 0 takes the favourite branch.
+                // Never reached: column 0 takes the favorite branch.
                 |_, _, _| std::cmp::Ordering::Equal,
             );
             out
@@ -49417,11 +49431,11 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         }
 
 
-        /// **Clicking the star header brings favourites to the TOP.** That is
+        /// **Clicking the star header brings favorites to the TOP.** That is
         /// the only reason anybody clicks it, and `false < true` means the
         /// naive comparison does the opposite.
         #[test]
-        fn sorting_by_the_star_puts_favourites_first() {
+        fn sorting_by_the_star_puts_favorites_first() {
             let rows = vec![
                 bucket_row("alpha"),
                 bucket_row("beta"),
@@ -49455,8 +49469,12 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             );
         }
 
-        /// The star sits at column 0 and every data column is one to its
+        /// The Favorite column sits at 0 and every data column is one to its
         /// right. Getting that mapping wrong sorts the wrong column, silently.
+        ///
+        /// It is headed with the WORD, as the EC2 table's is — a star in the
+        /// header reads as a decoration on the column after it rather than as
+        /// a column of its own, which is exactly how it was read.
         #[test]
         fn the_star_is_column_zero_and_the_data_columns_follow_it() {
             assert_eq!(RESOURCE_FAV_COL, 0);
@@ -49464,14 +49482,31 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 BUCKET_COLUMN_LABELS.iter().map(|l| (*l).to_string()),
             );
             assert_eq!(labels.len(), BUCKET_COLUMN_LABELS.len() + 1);
-            assert_eq!(labels[0], "\u{2606}");
+            assert_eq!(labels[0], "Favorite");
             for (idx, label) in BUCKET_COLUMN_LABELS.iter().enumerate() {
                 assert_eq!(&labels[idx + 1], label);
             }
         }
 
-        /// The star column is not resizable — it is a fixed 24px and dragging
-        /// an edge that cannot move is worse than having no edge to drag.
+
+        /// The Favorite column is the EC2 table's own width, because it is
+        /// meant to be the same column on two pages — and because the header
+        /// word has to fit in it.
+        #[test]
+        fn the_favorite_column_is_as_wide_as_the_ec2_one() {
+            assert_eq!(RESOURCE_FAV_W, COL_FAV_W);
+            // Wide enough for its own header at the table's own character
+            // width, with room to spare for the padding a strong label adds.
+            let word_w = FAVORITE_HEADER.chars().count() as f32 * TG_CHAR_W;
+            assert!(
+                RESOURCE_FAV_W > word_w,
+                "{RESOURCE_FAV_W} must fit {FAVORITE_HEADER:?} ({word_w})"
+            );
+        }
+
+        /// The Favorite column is not resizable — its width is fixed, and
+        /// dragging an edge that cannot move is worse than having no edge to
+        /// drag.
         #[test]
         fn the_star_column_has_no_resize_handle() {
             let whole = include_str!("ec2_manager_gui.rs");
@@ -49485,13 +49520,13 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 .expect("the function that follows it");
             assert!(
                 src[start..end].contains("let near_right = idx != RESOURCE_FAV_COL"),
-                "the star column must be excluded from the resize handle"
+                "the Favorite column must be excluded from the resize handle"
             );
         }
 
         /// **The priority star is gone from the Target Groups name cell.** It
         /// marked `resources.priority_target_groups` and was removed at the
-        /// maintainer's request; the favourite star now occupies that visual
+        /// maintainer's request; the favorite star now occupies that visual
         /// slot and means something the user set, not something a config file
         /// did. The priority list still decides which health calls go first —
         /// only its marker went — and the too-broad-pattern warning is now the

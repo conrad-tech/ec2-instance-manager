@@ -42,7 +42,7 @@ cargo build --features gui
 
 # Run tests
 cargo test                  # lib + CLI tests
-cargo test --features gui   # all tests including GUI (541 GUI tests)
+cargo test --features gui   # all tests including GUI (542 GUI tests)
 
 # Clippy
 cargo clippy --features gui
@@ -62,7 +62,7 @@ stale for months before phase 1 (it read 356 tests / 21 warnings, both months
 out of date; the measured baseline immediately before phase 1 was 1019 tests /
 23 warnings):
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 1361 tests pass, 0 fail (817 lib + 3 CLI + 541 GUI)
+- `cargo test --features gui` — 1362 tests pass, 0 fail (817 lib + 3 CLI + 542 GUI)
 - `cargo clippy --features gui` — no errors; 23 pre-existing style warnings.
   **That is a count of `^warning` lines, which is how the pre-branch baseline
   was measured and why the two are comparable — it is 21 distinct lints (6 lib
@@ -2675,15 +2675,20 @@ come to behave differently.
   itself — a group's health lives in `tg_health`, filled lazily by its own
   calls.
 
-#### The favourite star
+#### The favorite star
 
-Every resource table carries the same favourite star the EC2 table has, as
-its **first column**, clickable to toggle and sortable to bring favourites to
-the top.
+Every resource table carries the same favorite star the EC2 table has, as
+its **first column**, clickable to toggle and sortable to bring favorites to
+the top. **Headed with the word `Favorite`, as the EC2 one is** — a star in
+the header is read as a decoration on whatever column follows it rather than
+as a column of its own, which is exactly how it was read when it was a glyph.
+`RESOURCE_FAV_W` is `COL_FAV_W` itself rather than a number that happens to
+match: the two are meant to be the same column on two pages, and the width is
+what lets the header be a word.
 
 - **`resources.priority_target_groups` no longer draws a star.** It marked
   the configured priority list and was removed at the maintainer's request;
-  the favourite star now holds that visual slot and means something the user
+  the favorite star now holds that visual slot and means something the user
   set rather than something a config file did. The priority list still
   decides which health calls go first — only its marker went — so the
   too-broad-pattern warning is now the whole of how a bad pattern announces
@@ -2697,7 +2702,7 @@ the top.
   scope would be a key with nothing to disambiguate, and mixing the two would
   put resource ids in front of the instance filter.
   - Keyed by `ResourceKind::as_str`, the **cache-key fragment**, not the
-    sub-tab label — renaming a tab must not orphan somebody's favourites.
+    sub-tab label — renaming a tab must not orphan somebody's favorites.
   - Compared **case-sensitively**, unlike the instance one: S3 allows
     `Alpha-Assets` and `alpha-assets` to be two different buckets, and
     folding case would let starring one un-star the other.
@@ -2711,7 +2716,7 @@ the top.
   arrays and every `cw(n)` in their row loops was the alternative — a much
   larger edit for the same pixels, and five more places to get an index
   wrong.
-- **Ascending puts favourites at the TOP**, which is the only reason anybody
+- **Ascending puts favorites at the TOP**, which is the only reason anybody
   clicks that header — and `false < true`, so the flags are compared the
   other way round. The sort stays stable, so starring one row does not
   reshuffle the rest.
@@ -2722,7 +2727,7 @@ the top.
 - **The star column is fixed width and has no resize handle.** A star does
   not vary in width, and dragging an edge that cannot move is worse than
   having no edge to drag.
-- **A toggle saves immediately.** A favourite the user set and lost because
+- **A toggle saves immediately.** A favorite the user set and lost because
   the app closed without a later save is the kind of thing that quietly
   teaches somebody the feature does not work.
 - `resource_favorite_ids` reads the set once per render, not per row:

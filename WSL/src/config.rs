@@ -761,11 +761,11 @@ impl AppConfig {
         }
     }
 
-    /// Is this resource favourited?
+    /// Is this resource favorited?
     ///
     /// `kind` is `ResourceKind::as_str` — the same stable fragment the cache
     /// keys use, not the sub-tab's label, so renaming a tab cannot silently
-    /// orphan somebody's favourites.
+    /// orphan somebody's favorites.
     pub fn is_resource_favorite(&self, kind: &str, id: &str) -> bool {
         self.resource_favorites
             .get(kind)
@@ -773,7 +773,7 @@ impl AppConfig {
             .unwrap_or(false)
     }
 
-    /// Toggle it, returning whether it is now favourited.
+    /// Toggle it, returning whether it is now favorited.
     ///
     /// Compared **case-sensitively**, unlike the instance one. An instance id
     /// is hex and case-insensitive in practice; these are ARNs and bucket
@@ -792,7 +792,7 @@ impl AppConfig {
         }
     }
 
-    /// Every favourited id for one kind.
+    /// Every favorited id for one kind.
     pub fn resource_favorites_for(&self, kind: &str) -> Vec<String> {
         self.resource_favorites.get(kind).cloned().unwrap_or_default()
     }
@@ -1061,7 +1061,7 @@ impl AppConfig {
 
             // Checked BEFORE `favorite.`, which is a prefix of it — the
             // other way round, every `resource_favorite.asg=` line would be
-            // read as an instance favourite in an account called
+            // read as an instance favorite in an account called
             // `resource_favorite.asg`.
             if let Some(rest) = key.strip_prefix("resource_favorite.") {
                 if !rest.is_empty() {
@@ -2183,7 +2183,7 @@ mod tests {
         assert!(!cfg.is_resource_favorite("bucket", "alpha-assets"));
     }
 
-    /// The two favourite stores must not read each other's lines: one key is
+    /// The two favorite stores must not read each other's lines: one key is
     /// a prefix of the other, so the load order is load-bearing.
     #[test]
     fn resource_favorites_do_not_collide_with_instance_favorites() {
