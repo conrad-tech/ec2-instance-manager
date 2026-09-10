@@ -42,7 +42,7 @@ cargo build --features gui
 
 # Run tests
 cargo test                  # lib + CLI tests
-cargo test --features gui   # all tests including GUI (549 GUI tests)
+cargo test --features gui   # all tests including GUI (550 GUI tests)
 
 # Clippy
 cargo clippy --features gui
@@ -62,7 +62,7 @@ stale for months before phase 1 (it read 356 tests / 21 warnings, both months
 out of date; the measured baseline immediately before phase 1 was 1019 tests /
 23 warnings):
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 1369 tests pass, 0 fail (817 lib + 3 CLI + 549 GUI)
+- `cargo test --features gui` — 1370 tests pass, 0 fail (817 lib + 3 CLI + 550 GUI)
 - `cargo clippy --features gui` — no errors; 23 pre-existing style warnings.
   **That is a count of `^warning` lines, which is how the pre-branch baseline
   was measured and why the two are comparable — it is 21 distinct lints (6 lib
@@ -2764,9 +2764,20 @@ button, and the name stays clickable.
   otherwise clicking the button also opened the Details tab. On S3 that cost
   the table its most clickable column: the only way left to open a bucket was
   to click its date.
-- **It returns its `Response` now**, so the BUTTON's click is subtracted
-  (`copy_took_the_click`) instead of the whole cell being dropped. Every Name
-  cell is back in the row, S3's included.
+- **The row's click target now STARTS where the button ends**
+  (`name_cell_with_copy`), so the two rects are disjoint. Every Name cell is
+  back in the row, S3's included.
+- **A flag does not work here, and the first attempt used one.** The row and
+  the button shared a rect and the row's click was suppressed by a bool the
+  button set — which reads correctly and never fires: **egui hands an
+  overlapping `interact` rect the click ahead of a widget drawn earlier**, so
+  the button never saw its own click, the flag was never set, and pressing
+  copy opened the row and copied nothing. Disjoint rects is the mechanism;
+  `the_row_click_target_starts_where_the_copy_button_ends` pins it and also
+  asserts the flag has not come back.
+- The gap between the button and the text stays part of the row: it is not
+  the button, and a dead 8px stripe down the middle of the most clickable
+  column is its own small bug.
 - **A Name column reserves `COL_COPY_W`** in its `*_auto_widths`, or the
   button eats into the space the name was measured for and every name
   truncates early.
