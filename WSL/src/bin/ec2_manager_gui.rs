@@ -15056,6 +15056,25 @@ mod gui {
             }
 
             self.rebuild_account_colors();
+            // Ask who is authenticated again, now that the list has changed.
+            //
+            // `profile_auth_infos` is otherwise recomputed only at startup, on
+            // a credentials-file mtime change, and when a live profile's expiry
+            // passes -- none of which is "a profile was just added". So a
+            // freshly discovered account had no entry, `pool_account_is_authed`
+            // fell back to a context status that is not `Ok` for an account
+            // never selected, and the pool reported **"Waiting for
+            // credentials"** with the credentials sitting in the file the
+            // account was discovered from. It cleared only on a restart or the
+            // next `fed up`, which is what made it look intermittent.
+            //
+            // This says nothing about whether the account IS authenticated --
+            // `check_all_profiles_auth` reads the same file discovery just
+            // read, so an account whose credentials really have lapsed still
+            // reports as waiting and still goes through the normal `fed up`
+            // path, which reads the file directly rather than this cache.
+            self.profile_auth_infos =
+                credentials::check_all_profiles_auth(&self.config.profiles);
             if let Err(err) = self.config.save() {
                 self.message = format!("error: could not save accounts: {err}");
                 self.log_error(format!("discovery: save failed: {err}"));
@@ -50755,6 +50774,59 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         /// `script_env_label`, and `bastion_key`/`vscode_key` upper-case them
         /// to key config. A name typed in lower case was the one place that
         /// convention broke, so `dev` sat next to `DEV1` in the same list.
+        /// A newly added account must be asked about immediately.
+        ///
+        /// `profile_auth_infos` is recomputed at startup, on a credentials-file
+        /// mtime change, and when a live profile's expiry passes -- none of
+        /// which is "a profile was just added". A discovered account therefore
+        /// had no entry, `pool_account_is_authed` fell back to a context status
+        /// that is not `Ok` for an account never selected, and the pool read
+        /// **"Waiting for credentials"** with the credentials sitting in the
+        /// very file the account was discovered from.
+        ///
+        /// A source scan rather than a behavioural test: the save path takes
+        /// `&mut self` on a live `App`, and the mechanism it must not lose is
+        /// one call.
+        #[test]
+        fn the_discovery_save_asks_who_is_authenticated_again() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let start = src
+                .find("fn apply_discovery_wizard")
+                .expect("apply_discovery_wizard must exist");
+            // Bounded by the next sibling fn, not a byte count -- a fixed
+            // window silently stops covering the function as it grows, which
+            // is how a scan like this rots into passing vacuously.
+            let end = src[start..]
+                .find("\n        fn ")
+                .map(|i| start + i)
+                .unwrap_or(src.len());
+            // Comments are skipped, and that is load-bearing: the doc comment
+            // inside this very function names `check_all_profiles_auth` to
+            // explain why the call is there, so a scan that read prose matched
+            // the explanation and passed with the call deleted. Same stance
+            // `the_probe_script_changes_nothing_on_the_box` and
+            // `nothing_reads_the_env_tag_key_directly_any_more` already take.
+            let called = src[start..end]
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains("check_all_profiles_auth"));
+            assert!(
+                called,
+                "apply_discovery_wizard must recompute profile_auth_infos -- without it a \
+                 discovered account reads as waiting for credentials it already has"
+            );
+        }
+
+        /// The half that must NOT change: an account whose credentials really
+        /// have lapsed still reads as waiting, so the normal `fed up` path
+        /// still applies to it.
+        #[test]
+        fn a_genuinely_unauthenticated_account_still_reads_as_waiting() {
+            assert!(pool_account_is_authed(Some(AuthStatus::Ok), AuthStatus::Missing, false));
+            assert!(!pool_account_is_authed(Some(AuthStatus::Expired), AuthStatus::Ok, false));
+            assert!(!pool_account_is_authed(None, AuthStatus::Missing, false));
+        }
+
         #[test]
         fn a_typed_environment_name_is_stored_upper_case() {
             assert_eq!(normalized_env_name("  dev  "), "DEV");
