@@ -19846,6 +19846,16 @@ mod gui {
                     )
                 })
                 .collect();
+            // A selection the dropdown does not offer must not survive to
+            // Run — see `vault_iam_clear_unoffered_selection`. Runs every
+            // frame, so a selection that becomes unoffered later (the
+            // account list changes, Manage Accounts closes with the address
+            // removed) is caught too, not only on first open.
+            vault_iam_clear_unoffered_selection(
+                &environments,
+                &mut dlg.env_profile_id,
+                &mut dlg.env_name,
+            );
             let instances = self.env_instances(&dlg.env_profile_id, &dlg.env_name);
             let primary_filter = self.primary_bastion_filter.clone();
             let secondary_filter = self.secondary_bastion_filter.clone();
@@ -37557,6 +37567,33 @@ mod gui {
         }
     }
 
+    /// Clears a Vault IAM environment selection that is not one of the
+    /// (Vault-having) offered rows -- most often the auto-selected default
+    /// landing on a freshly-discovered account's still-unconfigured
+    /// environment, which `env_has_vault` has already excluded from the
+    /// dropdown.
+    ///
+    /// This is what keeps the dropdown and the dialog's own state agreeing
+    /// at all times rather than letting them disagree until Run: without it,
+    /// `do_run`'s `dlg.env_profile_id.is_empty()` guard saw a selection the
+    /// dropdown had already refused to offer, so filling in Role, Policy,
+    /// VAULT_ADDR and VAULT_TOKEN by hand -- without ever touching the
+    /// Environment combo -- reached Run against exactly the environment the
+    /// gate exists to withhold.
+    fn vault_iam_clear_unoffered_selection(
+        environments: &[ScriptEnv],
+        account_id: &mut String,
+        env: &mut String,
+    ) {
+        if !environments
+            .iter()
+            .any(|e| &e.account_id == account_id && &e.env == env)
+        {
+            account_id.clear();
+            env.clear();
+        }
+    }
+
     /// A one-line hint for an ssh failure, or `None` when the message is not
     /// one we recognise.
     ///
@@ -44394,6 +44431,67 @@ mod gui {
                 script_env_label_with_auth(&env_row("", "Prod"), AuthStatus::Missing),
                 "Prod — not authenticated"
             );
+        }
+
+        /// A selection that is one of the offered (Vault-having) rows must
+        /// survive untouched — this must not reset a selection the user (or
+        /// `load_bastion_pair`) legitimately made.
+        #[test]
+        fn an_offered_vault_iam_selection_is_left_alone() {
+            let environments = vec![env_row("DEV1", "DEV1")];
+            let mut account_id = "111".to_string();
+            let mut env = "DEV1".to_string();
+            vault_iam_clear_unoffered_selection(&environments, &mut account_id, &mut env);
+            assert_eq!(account_id, "111");
+            assert_eq!(env, "DEV1");
+        }
+
+        /// The bug the review caught: `open_vault_iam_dialog` seeds the
+        /// selection from `default_script_environment()`, which knows
+        /// nothing about `env_has_vault`. If that default lands on an
+        /// environment the (already-filtered) dropdown does not offer —
+        /// exactly the freshly-discovered-account case — the selection must
+        /// be cleared, or a hand-typed VAULT_ADDR reaches `do_run`'s
+        /// `dlg.env_profile_id.is_empty()` guard with that guard blind to
+        /// the mismatch and Run proceeds against an environment the
+        /// dropdown refused to offer.
+        #[test]
+        fn a_selection_absent_from_the_offered_rows_is_cleared() {
+            let environments = vec![env_row("DEV1", "DEV1")];
+            // Same account, a different (no-Vault) environment.
+            let mut account_id = "111".to_string();
+            let mut env = "DEV9".to_string();
+            vault_iam_clear_unoffered_selection(&environments, &mut account_id, &mut env);
+            assert_eq!(account_id, "");
+            assert_eq!(env, "");
+        }
+
+        /// The discovered-account shape: the default lands on an account
+        /// that has no offered rows at all, not merely the wrong environment
+        /// within one that does.
+        #[test]
+        fn a_selection_for_an_unoffered_account_is_cleared() {
+            let environments = vec![env_row("DEV1", "DEV1")];
+            let mut account_id = "999".to_string();
+            let mut env = "SBX".to_string();
+            vault_iam_clear_unoffered_selection(&environments, &mut account_id, &mut env);
+            assert_eq!(account_id, "");
+            assert_eq!(env, "");
+        }
+
+        /// With nothing offered anywhere, any prior selection is cleared —
+        /// this is the state that also drives the "No environment ... has a
+        /// Vault address" empty-state note, so the two must agree: a
+        /// non-empty `environments` list is exactly what lets a selection
+        /// survive.
+        #[test]
+        fn any_selection_is_cleared_when_nothing_is_offered() {
+            let environments: Vec<ScriptEnv> = Vec::new();
+            let mut account_id = "111".to_string();
+            let mut env = "DEV1".to_string();
+            vault_iam_clear_unoffered_selection(&environments, &mut account_id, &mut env);
+            assert_eq!(account_id, "");
+            assert_eq!(env, "");
         }
 
         #[test]
