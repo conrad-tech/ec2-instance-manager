@@ -14272,7 +14272,7 @@ mod gui {
                             ui.add_space(6.0);
 
                             ui.horizontal(|ui| {
-                                ui.label("Colour:");
+                                ui.label("Color:");
                                 let id = dlg.rows[idx].profile_id.clone();
                                 let shown = dlg
                                     .colors
@@ -14299,7 +14299,7 @@ mod gui {
                                 if ui
                                     .button("Reset")
                                     .on_hover_text(
-                                        "Back to the automatic colour -- the palette \
+                                        "Back to the automatic color -- the palette \
                                          colour for this account's position",
                                     )
                                     .clicked()
@@ -14548,7 +14548,8 @@ mod gui {
                 else {
                     continue;
                 };
-                let name = row.display_name.trim();
+                let name = normalized_account_name(&row.display_name);
+                let name = name.as_str();
                 if name.is_empty() {
                     // The saved name is kept -- an account with no label is
                     // unpickable in every dropdown. Said out loud, because a
@@ -14752,7 +14753,7 @@ mod gui {
 
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
-                                ui.label("Colour:");
+                                ui.label("Color:");
                                 // The palette colour this account will actually
                                 // get, not grey -- see `discovery_swatch_color`.
                                 let shown =
@@ -14773,7 +14774,7 @@ mod gui {
                                 if ui
                                     .button("Reset")
                                     .on_hover_text(
-                                        "Back to the automatic colour -- the palette \
+                                        "Back to the automatic color -- the palette \
                                          colour for this account's position",
                                     )
                                     .clicked()
@@ -37172,7 +37173,8 @@ mod gui {
             match step.decision {
                 StepDecision::Add => {
                     let region = step.region.trim();
-                    let label = step.label.trim();
+                    let label = normalized_account_name(&step.label);
+                let label = label.as_str();
                     // An account with no label is unpickable in every
                     // dropdown -- the same rule `apply_manage_accounts` keeps
                     // for the same field, and the id is always a usable name
@@ -37247,7 +37249,7 @@ mod gui {
             }
             rows.push(ManageAccountRow {
                 profile_id: step.account_id.clone(),
-                display_name: step.label.trim().to_string(),
+                display_name: normalized_account_name(&step.label),
                 region: step.region.trim().to_string(),
                 identity_editable: true,
                 arrangement_editable: true,
@@ -37301,7 +37303,8 @@ mod gui {
     ) {
         for row in rows.iter_mut() {
             if let Some(step) = steps.iter().find(|s| s.account_id == row.profile_id) {
-                let label = step.label.trim();
+                let label = normalized_account_name(&step.label);
+                let label = label.as_str();
                 row.display_name = if label.is_empty() {
                     step.account_id.clone()
                 } else {
@@ -37431,6 +37434,21 @@ mod gui {
             }
         }
         out
+    }
+
+    /// An account name as it should be stored: trimmed and upper-cased.
+    ///
+    /// Deliberately its own function rather than sharing
+    /// [`normalized_env_name`]: an account name and an environment name are
+    /// two different rules that happen to agree today. `accounts.json` ships
+    /// its account labels in title case (`Dev`, `Staging`) and its environments
+    /// upper (`DEV1`), so these could easily diverge again -- and one shared
+    /// function would force a change to one to change the other.
+    ///
+    /// Every site that stores a typed account name routes through here, so the
+    /// wizard and Manage Accounts cannot drift.
+    fn normalized_account_name(raw: &str) -> String {
+        raw.trim().to_ascii_uppercase()
     }
 
     /// An environment name as it should be stored: trimmed and upper-cased.
@@ -50873,6 +50891,22 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         /// `script_env_label`, and `bastion_key`/`vscode_key` upper-case them
         /// to key config. A name typed in lower case was the one place that
         /// convention broke, so `dev` sat next to `DEV1` in the same list.
+        /// A typed account name is stored upper-cased, at every site that
+        /// stores one.
+        ///
+        /// Asked for after a real run: an account added as "dev" stayed "dev"
+        /// in the profile dropdown. The environment fix did not cover it --
+        /// account names and environment names are separate rules.
+        #[test]
+        fn a_typed_account_name_is_stored_upper_case() {
+            assert_eq!(normalized_account_name("  dev  "), "DEV");
+            assert_eq!(normalized_account_name("Sandbox"), "SANDBOX");
+            assert_eq!(normalized_account_name("dev-admin"), "DEV-ADMIN");
+            // Blank stays blank so the account-id fallback still triggers
+            // rather than storing an empty name.
+            assert_eq!(normalized_account_name("   "), "");
+        }
+
         /// The hint must name the keys in the order they are actually tried.
         ///
         /// It read "(Env, Environment, MMODAL_ENV)", which is the order the
@@ -51119,7 +51153,8 @@ fed_expire = 4000000000
 
             assert_eq!(out.added.len(), 1);
             assert_eq!(out.added[0].profile_id, "111");
-            assert_eq!(out.added[0].display_name, "Added");
+            // Upper-cased on the way in, like every stored account name.
+            assert_eq!(out.added[0].display_name, "ADDED");
             assert_eq!(out.dismissed, vec!["333"]);
         }
 
@@ -51336,7 +51371,10 @@ fed_expire = 4000000000
 
             refresh_discovery_row_labels(&mut rows, &steps, &profiles);
 
-            assert_eq!(rows[0].display_name, "Sandbox Renamed", "from the step");
+            // Upper-cased: the step's label is a typed account name.
+            assert_eq!(rows[0].display_name, "SANDBOX RENAMED", "from the step");
+            // NOT upper-cased: this one comes from an already-stored
+            // profile, not from something typed in this dialog.
             assert_eq!(rows[1].display_name, "Three renamed", "from the profile");
             assert_eq!(
                 rows.iter().map(|r| r.profile_id.as_str()).collect::<Vec<_>>(),
