@@ -26636,7 +26636,7 @@ mod gui {
                                 );
                                 let r_name = ui
                                     .interact(
-                                        name_cell.response.rect,
+                                        cell_rect(name_cell.response.rect, cw(0)),
                                         name_cell.response.id.with("lb_name"),
                                         egui::Sense::click(),
                                     )
@@ -26691,7 +26691,8 @@ mod gui {
                                     // it is part of the row, so the highlight
                                     // covers it.
                                     ui.painter().rect_filled(
-                                        row.rect.union(dns_cell.response.rect),
+                                        row.rect
+                                            .union(cell_rect(dns_cell.response.rect, cw(4))),
                                         0.0,
                                         TG_ROW_HOVER,
                                     );
@@ -27283,7 +27284,7 @@ mod gui {
                                 );
                                 let r_name = ui
                                     .interact(
-                                        name_cell.response.rect,
+                                        cell_rect(name_cell.response.rect, cw(0)),
                                         name_cell.response.id.with("zone_name"),
                                         egui::Sense::click(),
                                     )
@@ -27318,7 +27319,7 @@ mod gui {
                                 if hovered {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                     ui.painter().rect_filled(
-                                        row.rect.union(id_cell.response.rect),
+                                        row.rect.union(cell_rect(id_cell.response.rect, cw(3))),
                                         0.0,
                                         TG_ROW_HOVER,
                                     );
@@ -27859,7 +27860,8 @@ mod gui {
                                 if hovered {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                     ui.painter().rect_filled(
-                                        row.rect.union(name_cell.response.rect),
+                                        row.rect
+                                            .union(cell_rect(name_cell.response.rect, cw(0))),
                                         0.0,
                                         TG_ROW_HOVER,
                                     );
@@ -28225,7 +28227,7 @@ mod gui {
                                 );
                                 let r_name = ui
                                     .interact(
-                                        name_cell.response.rect,
+                                        cell_rect(name_cell.response.rect, cw(0)),
                                         name_cell.response.id.with("asg_name"),
                                         egui::Sense::click(),
                                     )
@@ -29144,7 +29146,7 @@ mod gui {
                                 );
                                 let r_name = ui
                                     .interact(
-                                        name_cell.response.rect,
+                                        cell_rect(name_cell.response.rect, cw(0)),
                                         name_cell.response.id.with("tg_name"),
                                         egui::Sense::click(),
                                     )
@@ -39793,7 +39795,7 @@ mod gui {
     /// looked at, and both stay searchable and in the detail view. DNS name
     /// earns its place because it is the thing people actually copy out of
     /// this table.
-    const LB_COLUMN_LABELS: [&str; 5] = ["Name", "Type", "Scheme", "State", "DNS name"];
+    const LB_COLUMN_LABELS: [&str; 5] = ["Name", "Type", "Scheme", "State", "DNS Name"];
 
     const LB_MIN_COL_W: [f32; 5] = [180.0, 60.0, 110.0, 110.0, 260.0];
     const LB_MAX_COL_W: [f32; 5] = [520.0, 90.0, 150.0, 160.0, 620.0];
@@ -39846,6 +39848,26 @@ mod gui {
 
 
 
+
+    /// The whole cell, for something allocated `width` wide.
+    ///
+    /// **`allocate_ui_with_layout` returns the rect its CONTENT used, not the
+    /// space it was given.** A short label in a wide column therefore yields a
+    /// short rect, and interacting over that leaves the rest of the column
+    /// dead: no hover, no click, and — on a header — the resize handle sitting
+    /// at the end of the text instead of at the column edge. The column is
+    /// what the user aims at, so the column is what has to be hittable.
+    ///
+    /// Only the width is corrected. The height is whatever the content laid
+    /// out to, which in an 18px row is the row; forcing that too would mean
+    /// second-guessing the vertical centering for no gain.
+    fn cell_rect(content: egui::Rect, width: f32) -> egui::Rect {
+        let mut rect = content;
+        // `set_width` keeps `min.x` and moves `max.x`, so the cell still
+        // starts where it was drawn.
+        rect.set_width(width);
+        rect
+    }
 
     /// One resource table's sort: which column, and which way.
     ///
@@ -39912,6 +39934,11 @@ mod gui {
                 },
             );
             let resp = cell.response;
+            // The FULL column, not the glyphs in it. A short header like
+            // `Name` or `Path` in a wide column otherwise leaves most of its
+            // own cell unclickable, which is what a header that "only sorts
+            // if you hit the letters" actually is.
+            let full = cell_rect(resp.rect, width);
             if let Some((col, text)) = &hover {
                 if *col == idx {
                     resp.clone().on_hover_text(text.clone());
@@ -39921,26 +39948,25 @@ mod gui {
             // Drag the right edge to resize — the same handle the EC2 table
             // has, and the reason the fixed-width compromise is no longer
             // needed.
+            // Measured against the full column too, so the handle sits at
+            // the column's edge rather than at the end of a short label.
             let drag_id = ui.id().with((salt, idx));
             let near_right = ui.input(|i| {
                 i.pointer
                     .hover_pos()
-                    .is_some_and(|pos| resp.rect.contains(pos) && pos.x > resp.rect.right() - 8.0)
+                    .is_some_and(|pos| full.contains(pos) && pos.x > full.right() - 8.0)
             });
             if near_right || ui.ctx().is_being_dragged(drag_id) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
-                let x = resp.rect.right();
+                let x = full.right();
                 ui.painter().line_segment(
-                    [
-                        egui::pos2(x, resp.rect.top()),
-                        egui::pos2(x, resp.rect.bottom()),
-                    ],
+                    [egui::pos2(x, full.top()), egui::pos2(x, full.bottom())],
                     egui::Stroke::new(2.0, ui.visuals().text_color()),
                 );
                 let drag = ui.interact(
                     egui::Rect::from_min_size(
-                        resp.rect.right_top() - egui::vec2(8.0, 0.0),
-                        egui::vec2(16.0, resp.rect.height()),
+                        full.right_top() - egui::vec2(8.0, 0.0),
+                        egui::vec2(16.0, full.height()),
                     ),
                     drag_id,
                     egui::Sense::drag(),
@@ -39955,7 +39981,7 @@ mod gui {
             // is in the resize zone, or letting go of a drag would also
             // re-sort the table under it — the EC2 header guards the same way.
             let click = ui.interact(
-                resp.rect,
+                full,
                 resp.id.with("resource_header"),
                 egui::Sense::click(),
             );
@@ -41200,9 +41226,11 @@ mod gui {
         // Returning the label's own response — which is what this did — meant a
         // short value in a wide column left most of the row dead: no hover, no
         // click, no menu. The row is what the user aims at, so the row is what
-        // has to be hittable.
+        // has to be hittable. `cell_rect` is the other half of that:
+        // `allocate_ui_with_layout`'s own rect is still only as wide as the
+        // content, so this was half-fixed until the header made it obvious.
         ui.interact(
-            cell.response.rect,
+            cell_rect(cell.response.rect, width),
             cell.response.id.with("tg_cell"),
             egui::Sense::click(),
         )
@@ -48996,6 +49024,75 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let mut out = rows.to_vec();
             sort_resource_rows(&mut out, ResourceSort { column, direction }, compare);
             out
+        }
+
+
+        /// **A short label in a wide column must still fill its cell.**
+        ///
+        /// `allocate_ui_with_layout` returns the rect its CONTENT used, not
+        /// the space it was given, so `Name` in a 400px column came back about
+        /// 40px wide — and interacting over that is what made a header sort
+        /// only when the click landed on the letters, and left the whitespace
+        /// beside a short value dead in a row.
+        #[test]
+        fn a_cell_rect_is_as_wide_as_its_column_not_as_its_text() {
+            // What egui hands back for a short label in a wide column.
+            let content = egui::Rect::from_min_size(
+                egui::pos2(100.0, 50.0),
+                egui::vec2(38.0, TG_ROW_H),
+            );
+            let full = cell_rect(content, 400.0);
+            assert_eq!(full.width(), 400.0);
+            // The left edge does not move: the cell still starts where it was
+            // drawn, or every column would slide right of its header.
+            assert_eq!(full.left(), content.left());
+            assert_eq!(full.top(), content.top());
+            assert_eq!(full.height(), content.height());
+            // And the whitespace a user actually clicks is now inside it.
+            assert!(full.contains(egui::pos2(380.0, 50.0 + TG_ROW_H / 2.0)));
+            assert!(!content.contains(egui::pos2(380.0, 50.0 + TG_ROW_H / 2.0)));
+        }
+
+        /// Content wider than its column is clipped to the column, not left
+        /// overhanging it: the cell truncates its text, so a click past the
+        /// column edge belongs to the next column.
+        #[test]
+        fn a_cell_rect_never_overhangs_its_column() {
+            let content =
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, TG_ROW_H));
+            assert_eq!(cell_rect(content, 200.0).width(), 200.0);
+        }
+
+        /// The header's click target, its resize handle and its label all
+        /// measure the same rect. They drifted apart once — the label was
+        /// drawn across the column while the click and the handle followed the
+        /// text — and the symptom was a header that sorted only on the letters
+        /// AND a resize handle that sat in the middle of the column.
+        #[test]
+        fn the_header_click_and_its_resize_handle_measure_the_same_rect() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let start = src
+                .find("fn render_resource_header(")
+                .expect("render_resource_header");
+            let end = src[start..]
+                .find("\n    /// Case-insensitive, because these names drift")
+                .map(|i| start + i)
+                .expect("the function that follows it");
+            let body = &src[start..end];
+            assert!(
+                body.contains("let full = cell_rect(resp.rect, width);"),
+                "the header must measure the full column"
+            );
+            // Nothing in the body may still be measuring the label's own rect.
+            assert!(
+                !body.contains("resp.rect.right()") && !body.contains("resp.rect.contains("),
+                "the resize handle must follow the column edge, not the text:\n{body}"
+            );
+            assert!(
+                body.contains("egui::Sense::click(),\n            );"),
+                "the click interaction is still there"
+            );
         }
 
         /// Clicking the sorted column flips it; clicking a different one
