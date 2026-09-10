@@ -14138,6 +14138,13 @@ mod gui {
                     p.sort_order = Some(idx as u32);
                 }
             }
+            // Stamping `sort_order` is not enough on its own: the profile
+            // dropdown and every Scripts environment dropdown iterate
+            // `config.profiles` in **vec order** and never look at
+            // `sort_order`, so a reorder was stored and still ignored
+            // everywhere it mattered. Holding the vec in display order is what
+            // actually moves them. See `accounts::sort_profiles`.
+            ec2_manager::accounts::sort_profiles(&mut self.config.profiles);
 
             // Every editable row, not only the selected one -- someone can
             // edit three accounts before pressing Save, and only saving the
@@ -35746,13 +35753,14 @@ mod gui {
     /// the rest from the palette ordered by environment rank.
     /// Sort key for profiles: sort_order first, then alphabetical by display name.
     fn profile_sort_key(profile: Option<&ProfileConfig>, profile_id: &str) -> (u32, String) {
-        if let Some(p) = profile {
-            (
-                p.sort_order.unwrap_or(u32::MAX),
-                p.display_name.to_ascii_lowercase(),
-            )
-        } else {
-            (u32::MAX, profile_id.to_ascii_lowercase())
+        // Delegates rather than restating the rule: `accounts::profile_order_key`
+        // is the one definition of account order, and this file already carries
+        // scars from two places stating one fact and drifting.
+        match profile {
+            Some(p) => ec2_manager::accounts::profile_order_key(p),
+            // A tab open on an account that is no longer configured: sort it
+            // last, by the only name we have.
+            None => (u32::MAX, profile_id.to_ascii_lowercase()),
         }
     }
 

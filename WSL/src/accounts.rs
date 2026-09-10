@@ -236,6 +236,38 @@ pub fn load_accounts() -> Vec<ProfileConfig> {
     parse_accounts(&bundled_accounts())
 }
 
+/// Display-order key for an account: `sort_order` first, then name.
+///
+/// **The one definition of account order.** The GUI's `profile_sort_key`
+/// delegates to this rather than restating it -- this repo has four documented
+/// scars from two places stating one fact and drifting apart.
+///
+/// An account with no `sort_order` sorts last (`u32::MAX`) and then
+/// alphabetically, which is what the GUI has always done for an account
+/// `accounts.json` gave no position.
+pub fn profile_order_key(profile: &ProfileConfig) -> (u32, String) {
+    (
+        profile.sort_order.unwrap_or(u32::MAX),
+        profile.display_name.to_ascii_lowercase(),
+    )
+}
+
+/// Put an account list into display order, in place.
+///
+/// **Callers must hold this invariant: `AppConfig.profiles` is always in
+/// display order.** It exists because `sort_order` was read by only two things
+/// -- the colour map and the colour legend -- while the profile dropdown and
+/// every Scripts environment dropdown iterate the vec directly. A reorder was
+/// therefore stored, stamped onto `sort_order`, and still ignored everywhere it
+/// mattered: Save appeared to do nothing at all.
+///
+/// Sorting the vec is the fix rather than sorting at each reader, because it
+/// makes every Vec-order reader correct at once -- including the ones nobody
+/// has enumerated.
+pub fn sort_profiles(profiles: &mut [ProfileConfig]) {
+    profiles.sort_by_key(profile_order_key);
+}
+
 /// Union the bundled account list with the user's, keyed on account id.
 ///
 /// **Bundled wins on identity** -- label, region, colour. Those are curated by
@@ -267,6 +299,8 @@ pub fn merge_profiles(
             p.sort_order = Some(*order);
         }
     }
+    // The invariant every Vec-order reader depends on -- see `sort_profiles`.
+    sort_profiles(&mut merged);
     merged
 }
 
@@ -538,6 +572,64 @@ mod tests {
 
     /// Bundled accounts keep their declared order; a user-only account has none
     /// and falls to the end, where the reorder step can place it.
+    /// The bug this exists to stop: `sort_order` was read by the colour map and
+    /// the colour legend and by nothing else, so the profile dropdown and every
+    /// Scripts environment dropdown -- all of which iterate `config.profiles` in
+    /// Vec order -- ignored a reorder completely. Save appeared to do nothing.
+    ///
+    /// Sorting the vec itself is the fix, because it makes every Vec-order
+    /// reader correct at once, including ones nobody has enumerated.
+    #[test]
+    fn merge_profiles_returns_them_in_display_order() {
+        let mut third = profile("111", "Dev");
+        third.sort_order = Some(2);
+        let mut first = profile("222", "Prod");
+        first.sort_order = Some(0);
+        let mut second = profile("333", "Stg");
+        second.sort_order = Some(1);
+
+        let merged = merge_profiles(vec![third, first, second], &[], &BTreeMap::new());
+
+        let ids: Vec<&str> = merged.iter().map(|p| p.profile_id.as_str()).collect();
+        assert_eq!(ids, vec!["222", "333", "111"], "display order, not declaration order");
+    }
+
+    /// The reorder path end to end: a user's order map decides the vec order,
+    /// which is what the profile dropdown and the Scripts environment dropdowns
+    /// actually read. This is the assertion that would have caught "I moved an
+    /// account and saved, and nothing moved".
+    #[test]
+    fn a_user_order_decides_the_vec_order_readers_see() {
+        let mut orders = BTreeMap::new();
+        orders.insert("111".to_string(), 2u32);
+        orders.insert("222".to_string(), 0u32);
+        orders.insert("333".to_string(), 1u32);
+
+        let merged = merge_profiles(
+            vec![profile("111", "Dev"), profile("222", "Prod"), profile("333", "Stg")],
+            &[],
+            &orders,
+        );
+
+        let ids: Vec<&str> = merged.iter().map(|p| p.profile_id.as_str()).collect();
+        assert_eq!(ids, vec!["222", "333", "111"]);
+    }
+
+    /// An account with no order sorts last, alphabetically -- the same rule
+    /// `profile_sort_key` has always applied in the GUI.
+    #[test]
+    fn unordered_accounts_sort_last_alphabetically() {
+        let mut ordered = profile("111", "Dev");
+        ordered.sort_order = Some(0);
+        let merged = merge_profiles(
+            vec![ordered, profile("999", "zeta"), profile("888", "alpha")],
+            &[],
+            &BTreeMap::new(),
+        );
+        let ids: Vec<&str> = merged.iter().map(|p| p.profile_id.as_str()).collect();
+        assert_eq!(ids, vec!["111", "888", "999"]);
+    }
+
     #[test]
     fn user_only_accounts_come_after_the_bundled_ones() {
         let merged = merge_profiles(
