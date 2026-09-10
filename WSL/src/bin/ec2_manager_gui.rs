@@ -24896,7 +24896,43 @@ mod gui {
                 .region_searched
                 .iter()
                 .any(|id| id == &account_id);
-            if !region_search::should_search(self.options.mode.clone(), instance_count, already) {
+            // A region set on the profile itself sits **above**
+            // `account_regions` in `resolve_region`'s chain, so a sweep here
+            // would write a region the app then ignores. See
+            // `region_search::should_search` for the rest of why.
+            let explicit_region = self
+                .config
+                .profiles
+                .iter()
+                .find(|p| p.profile_id == profile_id)
+                .and_then(|p| p.region.clone());
+            if !region_search::should_search(
+                self.options.mode.clone(),
+                instance_count,
+                already,
+                explicit_region.is_some(),
+            ) {
+                // Said out loud, because an empty inventory on an account with
+                // a hand-set region is a real situation a user has to be able
+                // to explain — and "nothing happened and nothing was logged"
+                // is the failure mode this codebase documents at length.
+                if let Some(region) = explicit_region {
+                    // Asked again with that one condition lifted, rather than
+                    // re-spelling the other three here: the line must only
+                    // appear when the explicit region is genuinely the sole
+                    // reason, and the two answers cannot drift if there is
+                    // only one place that decides.
+                    if region_search::should_search(
+                        self.options.mode.clone(),
+                        instance_count,
+                        already,
+                        false,
+                    ) {
+                        self.log_info(format!(
+                            "region search: not searching account {account_id} — its region is set to {region} on the account itself, which outranks anything a search could write"
+                        ));
+                    }
+                }
                 return;
             }
             // Claimed before the spawn, not inside it: two inventory loads

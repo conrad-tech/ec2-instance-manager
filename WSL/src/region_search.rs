@@ -18,16 +18,35 @@ use crate::models::Mode;
 
 /// Whether an inventory load that has just landed is the signal to sweep.
 ///
-/// **The gate is the mode, not the credentials.** Sim fakes `auth_status: Ok`,
-/// and sim's whole promise is that it makes no real AWS calls -- the same rule
-/// `power.rs` and the reaper follow.
+/// All four must hold, and each is here for its own reason:
 ///
-/// `already_searched` is the record of a sweep that has already run for this
-/// account. An account with genuinely zero instances is indistinguishable from
-/// a wrong region, so without it an empty account costs a full seventeen-region
-/// sweep every session, forever.
-pub fn should_search(mode: Mode, instance_count: usize, already_searched: bool) -> bool {
-    mode == Mode::Live && instance_count == 0 && !already_searched
+/// - **`mode` is `Live`.** The gate is the mode, *not* the credentials: sim
+///   fakes `auth_status: Ok`, and sim's whole promise is that it makes no real
+///   AWS calls. The same rule `power.rs` and the reaper follow.
+/// - **`instance_count` is zero.** The load itself was the probe; instances
+///   found means the region was right, and there is nothing to ask.
+/// - **`already_searched` is false.** An account with genuinely zero instances
+///   is indistinguishable from a wrong region, so the sweep can never conclude
+///   "nothing here" from its own result. Without the record an empty account
+///   costs a full seventeen-region sweep every session, forever.
+/// - **`has_explicit_region` is false**, and this one is not guessable from
+///   here: [`crate::aws_context`]'s `resolve_region` takes
+///   `ProfileConfig.region` **before** `config.account_regions`, and this
+///   search writes `account_regions`. So for an account carrying a hand-set
+///   region -- every bundled account, and any user account whose Region box
+///   was typed rather than left blank -- a sweep would spend up to seventeen
+///   calls, write a region the app then ignores, **log that it adopted one**,
+///   and record the search, permanently spending the account's one chance.
+///   That is strictly worse than never searching: cost, a false log line, and
+///   an account left broken with no retry. **Do not relax this without moving
+///   `account_regions` above `ProfileConfig.region` in that chain.**
+pub fn should_search(
+    mode: Mode,
+    instance_count: usize,
+    already_searched: bool,
+    has_explicit_region: bool,
+) -> bool {
+    mode == Mode::Live && instance_count == 0 && !already_searched && !has_explicit_region
 }
 
 /// The regions to probe, in the order to probe them.
@@ -106,13 +125,13 @@ mod tests {
     /// An empty inventory in live mode is the signal, and the only one.
     #[test]
     fn an_empty_live_inventory_triggers_a_search() {
-        assert!(should_search(Mode::Live, 0, false));
+        assert!(should_search(Mode::Live, 0, false, false));
     }
 
     /// Instances found means the region was right. Nothing to do, no calls.
     #[test]
     fn a_populated_inventory_triggers_nothing() {
-        assert!(!should_search(Mode::Live, 12, false));
+        assert!(!should_search(Mode::Live, 12, false, false));
     }
 
     /// An account with genuinely zero instances is indistinguishable from a
@@ -120,14 +139,37 @@ mod tests {
     /// an empty account costs a full region sweep every session, forever.
     #[test]
     fn a_search_already_run_never_runs_again() {
-        assert!(!should_search(Mode::Live, 0, true));
+        assert!(!should_search(Mode::Live, 0, true, false));
     }
 
     /// Sim fakes auth_status Ok, so the gate is the mode. Sim's whole promise
     /// is that it makes no real AWS calls.
     #[test]
     fn sim_never_searches() {
-        assert!(!should_search(Mode::Sim, 0, false));
+        assert!(!should_search(Mode::Sim, 0, false, false));
+    }
+
+    /// `resolve_region` takes `ProfileConfig.region` **before**
+    /// `account_regions`, and this search writes `account_regions`. So an
+    /// account carrying a hand-set region would spend up to seventeen calls,
+    /// write a region the app then ignores, log that it adopted one -- which
+    /// is simply false -- and record the search, permanently spending its one
+    /// chance. Not searching at all is strictly better than every part of
+    /// that.
+    #[test]
+    fn an_account_with_an_explicit_region_is_never_searched() {
+        assert!(!should_search(Mode::Live, 0, false, true));
+    }
+
+    /// The *reason* pinned rather than the outcome: every other condition says
+    /// go, so the explicit region is the only thing refusing this search.
+    #[test]
+    fn the_explicit_region_is_the_only_thing_refusing_that_search() {
+        assert!(
+            should_search(Mode::Live, 0, false, false),
+            "every other condition must say go, or this test proves nothing"
+        );
+        assert!(!should_search(Mode::Live, 0, false, true));
     }
 
     /// Regions other accounts already use are tried first: on a single-region
