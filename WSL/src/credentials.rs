@@ -187,6 +187,61 @@ fn parse_all_profiles_by_account_id(content: &str, account_id: &str) -> Vec<Stri
     matches
 }
 
+/// Every distinct AWS account id the credentials file names, in file order.
+///
+/// The inverse of [`parse_all_profiles_by_account_id`]: that answers "which
+/// sections carry this account", this answers "which accounts does this file
+/// carry". `fed up` writes a section per profile the user can reach, so this
+/// is the list of accounts they are authenticated to -- including the ones
+/// `assets/accounts.json` has never heard of, which is the point.
+///
+/// A section with no `fed_role`, or one whose ARN will not parse, names no
+/// account and is skipped: a user on static keys discovers nothing, which is
+/// correct rather than a failure. An **expired** section still counts --
+/// expired access is access, and nothing here needs the credentials to work.
+pub fn discovered_account_ids(content: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if !k.trim().eq_ignore_ascii_case("fed_role") {
+            continue;
+        }
+        if let Some(id) = account_id_from_role_arn(v.trim()) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// A suggested display name for a discovered account: the name of the
+/// credentials section that reaches it.
+///
+/// Several sections can name one account (several roles into the same place --
+/// the case [`parse_all_profiles_by_account_id`]'s tie-break exists for), so this
+/// picks the section whose `fed_expire` is furthest in the future, which is the
+/// profile the user is actually working through. With no usable expiry it falls
+/// back to file order: a name is better than a blank.
+pub fn suggested_label(content: &str, account_id: &str) -> Option<String> {
+    let sections = parse_all_profiles_by_account_id(content, account_id);
+    let mut best: Option<(String, u64)> = None;
+    for section in &sections {
+        let expire = parse_fed_expire(content, section).unwrap_or(0);
+        match &best {
+            Some((_, best_exp)) if *best_exp >= expire => {}
+            _ => best = Some((section.clone(), expire)),
+        }
+    }
+    best.map(|(section, _)| section)
+}
+
 fn parse_profile_by_account_id(content: &str, account_id: &str) -> Option<String> {
     let matches = parse_all_profiles_by_account_id(content, account_id);
     if matches.is_empty() {
@@ -617,5 +672,83 @@ fed_expire=1000000000
     fn parse_profile_by_account_id_no_fed_role() {
         let content = "[aupk168]\nfed_expire=9999999999\n";
         assert_eq!(parse_profile_by_account_id(content, "123456789012"), None);
+    }
+
+    const DISCOVERY_FILE: &str = "\
+[dev]
+fed_role = arn:aws:iam::111111111111:role/DevRole
+fed_expire = 4000000000
+[dev-admin]
+fed_role = arn:aws:iam::111111111111:role/AdminRole
+fed_expire = 4000000001
+[prod]
+fed_role = arn:aws:iam::222222222222:role/ProdRole
+fed_expire = 1000000000
+[static-keys]
+aws_access_key_id = AKIAEXAMPLE
+[broken]
+fed_role = not-an-arn
+";
+
+    /// One entry per account, not per section -- two roles into one account is
+    /// one account.
+    #[test]
+    fn discovered_ids_are_deduped_in_file_order() {
+        let ids = discovered_account_ids(DISCOVERY_FILE);
+        assert_eq!(ids, vec!["111111111111", "222222222222"]);
+    }
+
+    /// A section with no `fed_role` names no account. That is the static-keys
+    /// case, and it is skipped rather than guessed at.
+    #[test]
+    fn a_section_without_a_fed_role_names_no_account() {
+        let ids = discovered_account_ids("[default]\naws_access_key_id = AKIA\n");
+        assert!(ids.is_empty());
+    }
+
+    /// An unparseable ARN is skipped, not surfaced as a blank account.
+    #[test]
+    fn an_unparseable_role_arn_is_skipped() {
+        let ids = discovered_account_ids("[x]\nfed_role = not-an-arn\n");
+        assert!(ids.is_empty());
+    }
+
+    /// Expired credentials still name an account -- expired access is access,
+    /// and nothing in discovery needs the credentials to work.
+    #[test]
+    fn an_expired_section_still_names_its_account() {
+        let ids = discovered_account_ids(
+            "[old]\nfed_role = arn:aws:iam::333333333333:role/R\nfed_expire = 1\n",
+        );
+        assert_eq!(ids, vec!["333333333333"]);
+    }
+
+    /// Several sections can name one account. The label comes from the one
+    /// whose credentials last longest, so the name shown is the profile the
+    /// user is actually working through.
+    #[test]
+    fn the_label_comes_from_the_section_with_the_furthest_expiry() {
+        assert_eq!(
+            suggested_label(DISCOVERY_FILE, "111111111111").as_deref(),
+            Some("dev-admin")
+        );
+    }
+
+    /// With no usable expiry anywhere, fall back to file order rather than
+    /// returning nothing -- a name is better than a blank.
+    #[test]
+    fn the_label_falls_back_to_file_order_without_an_expiry() {
+        let file = "\
+[first]
+fed_role = arn:aws:iam::444444444444:role/A
+[second]
+fed_role = arn:aws:iam::444444444444:role/B
+";
+        assert_eq!(suggested_label(file, "444444444444").as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn an_unknown_account_has_no_label() {
+        assert_eq!(suggested_label(DISCOVERY_FILE, "999999999999"), None);
     }
 }
