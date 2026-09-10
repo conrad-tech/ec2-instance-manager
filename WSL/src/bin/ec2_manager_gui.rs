@@ -8322,6 +8322,10 @@ mod gui {
         manage_accounts_dialog: Option<ManageAccountsDialog>,
         /// Active "New accounts found" wizard, if any.
         discovery_wizard: Option<DiscoveryWizard>,
+        /// When a credentials change was noticed, so discovery can wait out
+        /// `PROFILE_CHANGE_DEBOUNCE` before reading a file `fed up` may still
+        /// be writing.
+        pending_discovery_since: Option<Instant>,
         /// Whether the "File Browser Defaults" modal is open.
         show_file_browser_defaults: bool,
         /// When set, the Edit menu briefly flashes to draw the user's
@@ -9115,6 +9119,7 @@ mod gui {
                 settings_pem_dialog: None,
                 manage_accounts_dialog: None,
                 discovery_wizard: None,
+                pending_discovery_since: None,
                 show_file_browser_defaults: false,
                 edit_menu_flash_start: None,
                 create_user_dialog: None,
@@ -9532,6 +9537,12 @@ mod gui {
                     credentials::check_all_profiles_auth(&self.config.profiles);
                 self.log_debug("credentials file changed; refreshed profile auth status");
 
+                // Discovery rides the same mtime signal, debounced: `fed up`
+                // rewrites this file wholesale, so an mtime hit can land
+                // mid-write and read a partial file. Same debounce the
+                // profileChoice poll already uses.
+                self.pending_discovery_since = Some(Instant::now());
+
                 // Handle profiles that just became expired
                 for pid in &previously_authed {
                     let is_now_expired = self.profile_auth_infos.iter().any(|a| {
@@ -9610,6 +9621,63 @@ mod gui {
                     }
                 }
             }
+        }
+
+        /// Open the discovery wizard once a credentials change has settled.
+        fn poll_account_discovery(&mut self) {
+            let Some(since) = self.pending_discovery_since else {
+                return;
+            };
+            if since.elapsed() < PROFILE_CHANGE_DEBOUNCE {
+                return;
+            }
+            self.pending_discovery_since = None;
+
+            let Some(path) = credentials::credentials_path() else {
+                return;
+            };
+            let Ok(content) = std::fs::read_to_string(path) else {
+                return;
+            };
+            let discovered = credentials::discovered_account_ids(&content);
+            let new_ids = ec2_manager::accounts::new_accounts(
+                &discovered,
+                &self.config.profiles,
+                &self.config.accounts_dismissed,
+            );
+            self.log_debug(format!(
+                "discovery: {} account(s) in the credentials file, {} new",
+                discovered.len(),
+                new_ids.len()
+            ));
+            if !discovery_should_open(
+                self.discovery_wizard.is_some(),
+                self.manage_accounts_dialog.is_some(),
+                new_ids.len(),
+            ) {
+                return;
+            }
+            let default_region = self
+                .config
+                .profiles
+                .iter()
+                .filter_map(|p| p.region.clone())
+                .next()
+                .or_else(|| self.config.default_region.clone())
+                .unwrap_or_default();
+            self.discovery_wizard = Some(DiscoveryWizard {
+                steps: discovery_steps(&new_ids, &content, &default_region),
+                current: 0,
+                ordering: false,
+                rows: Vec::new(),
+                new_env_name: String::new(),
+                new_env_vault: String::new(),
+                error: None,
+            });
+            self.log_info(format!(
+                "discovery: {} new account(s) found",
+                new_ids.len()
+            ));
         }
 
         /// Periodically check whether any authenticated profile has expired
@@ -31857,6 +31925,7 @@ mod gui {
 
                 self.poll_profile_choice_changes();
                 self.poll_credentials_changes();
+                self.poll_account_discovery();
                 self.poll_auth_expiry();
                 // Runs before the credential watcher on the next frame, so a
                 // successful `fed up` is picked up by the existing mtime poll
@@ -36246,6 +36315,16 @@ mod gui {
         dismissed: Vec<String>,
     }
 
+    /// Whether a credentials change should raise the discovery wizard.
+    ///
+    /// Pure, because all three reasons not to are easy to lose in a poll
+    /// function: nothing was found; a wizard is already up and replacing it
+    /// would discard a half-finished answer; or Manage Accounts is open and
+    /// edits the same stores, so both would hold a working copy of one thing.
+    fn discovery_should_open(wizard_open: bool, manage_open: bool, new_count: usize) -> bool {
+        new_count > 0 && !wizard_open && !manage_open
+    }
+
     /// Build a page per newly discovered account.
     ///
     /// **Environments start empty and that is the design.** Filling them would
@@ -36255,12 +36334,6 @@ mod gui {
     /// on their own the first time that account's inventory loads. The editor
     /// here is for what a tag cannot supply: a Vault address, or a name
     /// recorded before any instance carries the tag.
-    ///
-    /// Nothing in this task constructs a `DiscoveryWizard` outside its own
-    /// tests -- the poll hook that calls this to build one is Task 4's job.
-    /// `allow(dead_code)` until that lands, the same stance the file already
-    /// takes for `EscalationStatus` and friends.
-    #[allow(dead_code)]
     fn discovery_steps(
         new_ids: &[String],
         content: &str,
@@ -49686,6 +49759,33 @@ fed_expire = 4000000000
 
             // No rows yet always needs building.
             assert!(discovery_rows_need_rebuild(&[], &steps));
+        }
+
+        /// Nothing new means no window. The ordinary case on a machine whose
+        /// accounts are all bundled, and it must be silent.
+        #[test]
+        fn no_new_accounts_opens_nothing() {
+            assert!(!discovery_should_open(false, false, 0));
+        }
+
+        #[test]
+        fn new_accounts_open_the_wizard() {
+            assert!(discovery_should_open(false, false, 2));
+        }
+
+        /// A wizard already up must not be replaced mid-answer -- a second
+        /// `fed up` landing while someone is on page 3 would discard their
+        /// work with no word.
+        #[test]
+        fn an_open_wizard_is_not_replaced() {
+            assert!(!discovery_should_open(true, false, 2));
+        }
+
+        /// Manage Accounts edits the same stores, so a wizard opening over it
+        /// would have two writers of one working copy.
+        #[test]
+        fn the_wizard_waits_for_manage_accounts_to_close() {
+            assert!(!discovery_should_open(false, true, 2));
         }
 
         /// Reset must genuinely put an account back on its automatic colour.
