@@ -42,7 +42,7 @@ cargo build --features gui
 
 # Run tests
 cargo test                  # lib + CLI tests
-cargo test --features gui   # all tests including GUI (481 GUI tests)
+cargo test --features gui   # all tests including GUI (484 GUI tests)
 
 # Clippy
 cargo clippy --features gui
@@ -62,7 +62,7 @@ stale for months before phase 1 (it read 356 tests / 21 warnings, both months
 out of date; the measured baseline immediately before phase 1 was 1019 tests /
 23 warnings):
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 1232 tests pass, 0 fail (748 lib + 3 CLI + 481 GUI)
+- `cargo test --features gui` — 1235 tests pass, 0 fail (748 lib + 3 CLI + 484 GUI)
 - `cargo clippy --features gui` — no errors; 23 pre-existing style warnings.
   **That is a count of `^warning` lines, which is how the pre-branch baseline
   was measured and why the two are comparable — it is 21 distinct lints (6 lib
@@ -2201,7 +2201,7 @@ The **cache and the multi-account pooling still live in the GUI file**, not in
 
 #### Load Balancers (ALB and NLB)
 
-Columns are `Name · Type · Scheme · State · DNS name` — five, not the spec's
+Columns are `Name · Type · Scheme · State · DNS Name` — five, not the spec's
 seven, for the reason the Target Groups table is four: VPC and Account are
 true but rarely looked at, and both stay searchable and in the detail view.
 
@@ -2614,6 +2614,18 @@ come to behave differently.
   pins the call count.
 - **Sorting is suppressed while the pointer is in the resize zone**, or
   letting go of a column drag would also re-sort the table under it.
+- **A header cell is hittable across its whole column, not just its
+  letters** — `cell_rect`. `allocate_ui_with_layout` returns the rect its
+  CONTENT used, not the space it was given, so `Name` in a 400px column came
+  back about 40px wide. Interacting over that is what made a header sort only
+  when the click landed on the text, and it put the **resize handle in the
+  middle of the column** for the same reason, since that is measured from the
+  same rect. Every row cell goes through it too (`tg_cell`, and the
+  hand-built name / DNS / zone-id cells): a short value in a wide column left
+  the rest of the row dead, which the row `union` had been hiding by spanning
+  the gaps between cells. `a_cell_rect_is_as_wide_as_its_column_not_as_its_text`
+  and `the_header_click_and_its_resize_handle_measure_the_same_rect` pin both
+  halves.
 - **The arrow is ASCII** (` ^` / ` v`), taken from `SortDirection::arrow`,
   which the EC2 header already used. egui's default font carries nothing
   from Unicode's Arrows block, and this file has shipped an empty box three
