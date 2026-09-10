@@ -304,6 +304,29 @@ pub fn merge_profiles(
     merged
 }
 
+/// Which discovered account ids the user has not yet been asked about.
+///
+/// Three states, no fourth store: an account is **added** when it is in
+/// `known` (the merged profile list), **dismissed** when it is in `dismissed`,
+/// and **new** otherwise. Keeping a separate "seen" record would be a fourth
+/// thing to hold in step with the other three, and the two that exist already
+/// answer the question.
+///
+/// Discovered order is preserved, because that is the order the wizard steps
+/// through.
+pub fn new_accounts(
+    discovered: &[String],
+    known: &[ProfileConfig],
+    dismissed: &[String],
+) -> Vec<String> {
+    discovered
+        .iter()
+        .filter(|id| !known.iter().any(|p| &p.profile_id == *id))
+        .filter(|id| !dismissed.iter().any(|d| d == *id))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,5 +742,38 @@ mod tests {
             vault_addr_in_with_user(ENV_JSON, "999", "SBX", &user).as_deref(),
             Some("https://vault.sbx")
         );
+    }
+
+    #[test]
+    fn an_unknown_undismissed_account_is_new() {
+        let discovered = vec!["111".to_string(), "999".to_string()];
+        let known = vec![profile("111", "Dev")];
+        let news = new_accounts(&discovered, &known, &[]);
+        assert_eq!(news, vec!["999"]);
+    }
+
+    /// Dismissed means never ask again -- including after a restart, which is
+    /// why it is persisted rather than held in memory.
+    #[test]
+    fn a_dismissed_account_is_not_new() {
+        let discovered = vec!["999".to_string()];
+        let news = new_accounts(&discovered, &[], &["999".to_string()]);
+        assert!(news.is_empty());
+    }
+
+    /// The order the credentials file lists them in is the order the wizard
+    /// steps through, so it must survive.
+    #[test]
+    fn new_accounts_keep_the_discovered_order() {
+        let discovered = vec!["333".to_string(), "111".to_string(), "222".to_string()];
+        let news = new_accounts(&discovered, &[], &[]);
+        assert_eq!(news, vec!["333", "111", "222"]);
+    }
+
+    /// Nothing discovered is the ordinary case on a machine whose accounts are
+    /// all bundled; it must not be an error or an empty prompt.
+    #[test]
+    fn nothing_discovered_is_nothing_new() {
+        assert!(new_accounts(&[], &[profile("111", "Dev")], &[]).is_empty());
     }
 }

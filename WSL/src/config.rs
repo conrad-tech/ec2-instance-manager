@@ -44,6 +44,13 @@ pub struct AppConfig {
     pub reset_filter_on_profile_switch: bool,
     /// Environment names excluded from the color legend
     pub excluded_envs: Vec<String>,
+    /// Account ids the user chose never to be prompted about again.
+    ///
+    /// Persisted rather than held in memory because "never ask again" that
+    /// forgets on restart is not never. This is the only store discovery needs
+    /// beyond the profile list itself: *added* means the id is in `profiles`,
+    /// *dismissed* means it is here, and anything else is new.
+    pub accounts_dismissed: Vec<String>,
     /// Whether the one-shot "shared excluded by default" migration has run.
     pub shared_env_default_applied: bool,
     /// Saved window position/size from last close
@@ -156,6 +163,7 @@ impl Default for AppConfig {
             profile_orders: BTreeMap::new(),
             reset_filter_on_profile_switch: true,
             excluded_envs: Vec::new(),
+            accounts_dismissed: Vec::new(),
             shared_env_default_applied: false,
             window_x: None,
             window_y: None,
@@ -1041,6 +1049,9 @@ impl AppConfig {
                 "excluded_envs" => {
                     cfg.excluded_envs = split_csv(value);
                 }
+                "accounts_dismissed" => {
+                    cfg.accounts_dismissed = split_csv(value);
+                }
                 "shared_env_default_applied" => {
                     cfg.shared_env_default_applied = matches!(value, "1" | "true" | "TRUE");
                 }
@@ -1241,6 +1252,13 @@ impl AppConfig {
 
         if !self.excluded_envs.is_empty() {
             lines.push(format!("excluded_envs={}", self.excluded_envs.join(",")));
+        }
+
+        if !self.accounts_dismissed.is_empty() {
+            lines.push(format!(
+                "accounts_dismissed={}",
+                self.accounts_dismissed.join(",")
+            ));
         }
 
         if self.shared_env_default_applied {
@@ -2228,5 +2246,21 @@ mod tests {
     fn an_incomplete_account_env_is_skipped() {
         let cfg = AppConfig::parse("account_env=|DEV1|\naccount_env=111||\naccount_env=111\n");
         assert!(cfg.user_environments.is_empty());
+    }
+
+    #[test]
+    fn accounts_dismissed_round_trips_through_config_text() {
+        let cfg = AppConfig::parse("accounts_dismissed=111,222\n");
+        assert_eq!(cfg.accounts_dismissed, vec!["111", "222"]);
+        let again = AppConfig::parse(&cfg.to_text());
+        assert_eq!(again.accounts_dismissed, cfg.accounts_dismissed);
+    }
+
+    /// An empty list writes no line at all, so the file does not accrete a
+    /// blank key on every save.
+    #[test]
+    fn an_empty_dismissed_list_writes_no_line() {
+        let cfg = AppConfig::default();
+        assert!(!cfg.to_text().contains("accounts_dismissed"));
     }
 }
