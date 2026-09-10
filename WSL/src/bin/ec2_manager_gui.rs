@@ -19830,7 +19830,22 @@ mod gui {
             let Some(mut dlg) = self.vault_iam_dialog.take() else {
                 return;
             };
-            let environments = self.script_environments();
+            // Vault IAM has a second gate beyond `vault_iam.allowed_users`:
+            // the environment must actually have a Vault to talk to.
+            // `env_has_vault` is thin over `vault_addr_for`'s own resolver
+            // (`vault_addr_in_with_user`) so "offered here" and "the address
+            // this dialog would fill in" can never disagree.
+            let environments: Vec<ScriptEnv> = self
+                .script_environments()
+                .into_iter()
+                .filter(|e| {
+                    ec2_manager::accounts::env_has_vault(
+                        &e.account_id,
+                        &e.env,
+                        &self.config.user_environments,
+                    )
+                })
+                .collect();
             let instances = self.env_instances(&dlg.env_profile_id, &dlg.env_name);
             let primary_filter = self.primary_bastion_filter.clone();
             let secondary_filter = self.secondary_bastion_filter.clone();
@@ -19981,6 +19996,19 @@ mod gui {
                             }
                             ui.end_row();
                         });
+
+                    // A missing control is not a diagnosis -- see
+                    // `jira_gate_report` / `pingdom_gate_report` -- so an
+                    // empty dropdown says why rather than just sitting empty.
+                    if environments.is_empty() {
+                        ui.add_space(6.0);
+                        note_label(
+                            ui,
+                            egui::Color32::from_rgb(220, 80, 80),
+                            "No environment in this account has a Vault address — add one \
+                             in Edit -> Manage Accounts.",
+                        );
+                    }
 
                     ui.add_space(6.0);
                     Self::bastion_combo_ui(
@@ -47731,6 +47759,26 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 offenders.is_empty(),
                 "arrow glyphs render as empty boxes; write -> instead:\n{}",
                 offenders.join("\n")
+            );
+        }
+
+        /// An empty Vault IAM Environment dropdown is not a diagnosis on its
+        /// own -- the same rule `jira_gate_report` / `pingdom_gate_report`
+        /// follow, and the reason three dark reaper states cost five rounds
+        /// of guessing. Pinned so the pointer at Manage Accounts -- the way
+        /// to actually unblock a discovered account -- cannot be dropped in
+        /// a later edit.
+        #[test]
+        fn the_vault_iam_empty_environment_note_names_manage_accounts() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let needle = "No environment in this account has a Vault address";
+            let start = src
+                .find(needle)
+                .expect("the Vault IAM empty-state message is still there");
+            let body = &src[start..start + 200];
+            assert!(
+                body.contains("Manage Accounts"),
+                "the empty-state message must point at Edit -> Manage Accounts"
             );
         }
 

@@ -216,6 +216,20 @@ pub fn vault_addr_for(
     vault_addr_in_with_user(&bundled_accounts(), account_id, env, user)
 }
 
+/// Whether an environment has a Vault server to talk to.
+///
+/// Thin over [`vault_addr_in_with_user`] on purpose: "has Vault" and "which
+/// address" must never disagree, and they would the moment this grew its own
+/// notion of configured-ness.
+fn env_has_vault_in(json: &str, account_id: &str, env: &str, user: &[UserEnvironment]) -> bool {
+    vault_addr_in_with_user(json, account_id, env, user).is_some()
+}
+
+/// Whether an environment has a Vault server to talk to.
+pub fn env_has_vault(account_id: &str, env: &str, user: &[UserEnvironment]) -> bool {
+    env_has_vault_in(&bundled_accounts(), account_id, env, user)
+}
+
 /// Load the ordered account list.
 ///
 /// Always uses the bundled `assets/accounts.json` compiled into the binary —
@@ -742,6 +756,32 @@ mod tests {
             vault_addr_in_with_user(ENV_JSON, "999", "SBX", &user).as_deref(),
             Some("https://vault.sbx")
         );
+    }
+
+    #[test]
+    fn an_environment_with_a_declared_address_has_vault() {
+        assert!(env_has_vault_in(ENV_JSON, "111", "DEV1", &[]));
+    }
+
+    /// The account-wide address counts: that is what the environment would
+    /// actually connect to.
+    #[test]
+    fn an_environment_inheriting_the_account_address_has_vault() {
+        assert!(env_has_vault_in(ENV_JSON, "111", "DEV2", &[]));
+    }
+
+    /// A user-supplied address counts too, which is what makes Manage Accounts
+    /// the way to unblock a discovered account.
+    #[test]
+    fn a_user_supplied_address_gives_an_environment_vault() {
+        let user = [user_env("999", "SBX", Some("https://vault.sbx"))];
+        assert!(env_has_vault_in(ENV_JSON, "999", "SBX", &user));
+    }
+
+    /// And an account with nothing anywhere does not.
+    #[test]
+    fn an_environment_with_no_address_anywhere_has_no_vault() {
+        assert!(!env_has_vault_in(ENV_JSON, "999", "SBX", &[]));
     }
 
     #[test]
