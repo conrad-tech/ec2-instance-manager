@@ -11097,7 +11097,15 @@ mod gui {
             }
         }
 
-        fn paint_copy_button(ui: &mut egui::Ui, text_to_copy: &str, tooltip: &str) {
+        /// Returns its own response so a caller can tell a click on the
+        /// button from a click on the cell around it. A row whose Name cell
+        /// carries one has to suppress the row's own click when the button
+        /// took it, or copying a name also opens its Details tab.
+        fn paint_copy_button(
+            ui: &mut egui::Ui,
+            text_to_copy: &str,
+            tooltip: &str,
+        ) -> egui::Response {
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(COL_COPY_W, 14.0), egui::Sense::click());
             if ui.is_rect_visible(rect) {
                 let color = ui.visuals().text_color();
@@ -11115,7 +11123,7 @@ mod gui {
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-            resp.on_hover_text(tooltip);
+            resp.on_hover_text(tooltip)
         }
 
         fn maybe_auto_connect_gui_smoke(&mut self) {
@@ -26669,12 +26677,27 @@ mod gui {
                                     egui::vec2(cw(0), TG_ROW_H),
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
+                                        let copied = Self::paint_copy_button(
+                                            ui,
+                                            &lb.name,
+                                            "Copy load balancer name",
+                                        )
+                                        .clicked();
                                         ui.add(
                                             egui::Label::new(lb.name.clone())
                                                 .wrap_mode(egui::TextWrapMode::Truncate),
                                         );
+                                        copied
                                     },
                                 );
+                                // The cell stays part of the row's click
+                                // response — the name is the obvious thing to
+                                // click to open a row — so the BUTTON's click
+                                // is subtracted instead. Excluding the whole
+                                // cell, which is what the DNS and Zone ID
+                                // cells used to do, costs the row its most
+                                // clickable column.
+                                let copy_took_the_click = name_cell.inner;
                                 let r_name = ui
                                     .interact(
                                         cell_rect(name_cell.response.rect, cw(0)),
@@ -26740,7 +26763,7 @@ mod gui {
                                         TG_ROW_HOVER,
                                     );
                                 }
-                                if row.clicked() {
+                                if row.clicked() && !copy_took_the_click {
                                     pending_detail = Some(lb.clone());
                                 }
                                 row.context_menu(|ui| {
@@ -27401,12 +27424,27 @@ mod gui {
                                     egui::vec2(cw(0), TG_ROW_H),
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
+                                        let copied = Self::paint_copy_button(
+                                            ui,
+                                            &z.name,
+                                            "Copy zone name",
+                                        )
+                                        .clicked();
                                         ui.add(
                                             egui::Label::new(z.name.clone())
                                                 .wrap_mode(egui::TextWrapMode::Truncate),
                                         );
+                                        copied
                                     },
                                 );
+                                // The cell stays part of the row's click
+                                // response — the name is the obvious thing to
+                                // click to open a row — so the BUTTON's click
+                                // is subtracted instead. Excluding the whole
+                                // cell, which is what the DNS and Zone ID
+                                // cells used to do, costs the row its most
+                                // clickable column.
+                                let copy_took_the_click = name_cell.inner;
                                 let r_name = ui
                                     .interact(
                                         cell_rect(name_cell.response.rect, cw(0)),
@@ -27452,7 +27490,7 @@ mod gui {
                                         TG_ROW_HOVER,
                                     );
                                 }
-                                if row.clicked() {
+                                if row.clicked() && !copy_took_the_click {
                                     pending_detail = Some(z.clone());
                                 }
                                 row.context_menu(|ui| {
@@ -28004,14 +28042,28 @@ mod gui {
                                     egui::vec2(cw(0), TG_ROW_H),
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
-                                        Self::paint_copy_button(ui, &b.name, "Copy bucket name");
+                                        let copied = Self::paint_copy_button(
+                                            ui,
+                                            &b.name,
+                                            "Copy bucket name",
+                                        )
+                                        .clicked();
                                         ui.add(
                                             egui::Label::new(b.name.clone())
                                                 .wrap_mode(egui::TextWrapMode::Truncate),
                                         )
                                         .on_hover_text(bucket_name_hover(b));
+                                        copied
                                     },
                                 );
+                                let copy_took_the_click = name_cell.inner;
+                                let r_name = ui
+                                    .interact(
+                                        cell_rect(name_cell.response.rect, cw(0)),
+                                        name_cell.response.id.with("bucket_name"),
+                                        egui::Sense::click(),
+                                    )
+                                    .on_hover_text(bucket_name_hover(b));
 
                                 let r_created = tg_cell(
                                     ui,
@@ -28023,23 +28075,20 @@ mod gui {
                                         .unwrap_or_else(|| "—".to_string()),
                                 );
 
-                                // Everything except the name cell, which holds
-                                // the copy button: unioning it would make a
-                                // click on that button also open the details.
-                                let row = r_created;
-                                let hovered =
-                                    row.hovered() || fav.hovered() || name_cell.response.hovered();
-                                if hovered {
+                                // The name cell is IN the row now — the copy
+                                // button's own click is subtracted below
+                                // instead. Leaving the whole cell out, which is
+                                // what this did, cost the row its most
+                                // clickable column: on this table that was the
+                                // name, and the only way left to open a bucket
+                                // was to click its date.
+                                let row = r_name.union(r_created);
+                                if row.hovered() || fav.hovered() {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                    ui.painter().rect_filled(
-                                        row.rect
-                                            .union(fav.rect)
-                                            .union(cell_rect(name_cell.response.rect, cw(0))),
-                                        0.0,
-                                        TG_ROW_HOVER,
-                                    );
+                                    ui.painter()
+                                        .rect_filled(row.rect.union(fav.rect), 0.0, TG_ROW_HOVER);
                                 }
-                                if row.clicked() {
+                                if row.clicked() && !copy_took_the_click {
                                     pending_detail = Some(b.clone());
                                 }
                                 row.context_menu(|ui| {
@@ -28435,12 +28484,27 @@ mod gui {
                                     egui::vec2(cw(0), TG_ROW_H),
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
+                                        let copied = Self::paint_copy_button(
+                                            ui,
+                                            &g.name,
+                                            "Copy group name",
+                                        )
+                                        .clicked();
                                         ui.add(
                                             egui::Label::new(g.name.clone())
                                                 .wrap_mode(egui::TextWrapMode::Truncate),
                                         );
+                                        copied
                                     },
                                 );
+                                // The cell stays part of the row's click
+                                // response — the name is the obvious thing to
+                                // click to open a row — so the BUTTON's click
+                                // is subtracted instead. Excluding the whole
+                                // cell, which is what the DNS and Zone ID
+                                // cells used to do, costs the row its most
+                                // clickable column.
+                                let copy_took_the_click = name_cell.inner;
                                 let r_name = ui
                                     .interact(
                                         cell_rect(name_cell.response.rect, cw(0)),
@@ -28479,7 +28543,7 @@ mod gui {
                                     ui.painter()
                                         .rect_filled(row.rect.union(fav.rect), 0.0, TG_ROW_HOVER);
                                 }
-                                if row.clicked() {
+                                if row.clicked() && !copy_took_the_click {
                                     pending_detail = Some(g.clone());
                                 }
                                 row.context_menu(|ui| {
@@ -29375,12 +29439,27 @@ mod gui {
                                     egui::vec2(cw(0), TG_ROW_H),
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
+                                        let copied = Self::paint_copy_button(
+                                            ui,
+                                            &tg.name,
+                                            "Copy target group name",
+                                        )
+                                        .clicked();
                                         ui.add(
                                             egui::Label::new(tg.name.clone())
                                                 .wrap_mode(egui::TextWrapMode::Truncate),
                                         );
+                                        copied
                                     },
                                 );
+                                // The cell stays part of the row's click
+                                // response — the name is the obvious thing to
+                                // click to open a row — so the BUTTON's click
+                                // is subtracted instead. Excluding the whole
+                                // cell, which is what the DNS and Zone ID
+                                // cells used to do, costs the row its most
+                                // clickable column.
+                                let copy_took_the_click = name_cell.inner;
                                 let r_name = ui
                                     .interact(
                                         cell_rect(name_cell.response.rect, cw(0)),
@@ -29460,7 +29539,7 @@ mod gui {
                                     ui.painter()
                                         .rect_filled(row.rect.union(fav.rect), 0.0, TG_ROW_HOVER);
                                 }
-                                if row.clicked() {
+                                if row.clicked() && !copy_took_the_click {
                                     pending_detail = Some(tg.clone());
                                 }
                                 row.context_menu(|ui| {
@@ -40088,7 +40167,8 @@ mod gui {
         }
         for lb in rows {
             let cells = [
-                text_w(&lb.name),
+                // The copy button sits in this cell too.
+                text_w(&lb.name) + COL_COPY_W,
                 text_w(&elb::load_balancer_kind_label(lb)),
                 text_w(lb.scheme.as_deref().unwrap_or("—")),
                 text_w(&lb.state),
@@ -40559,7 +40639,8 @@ mod gui {
         }
         for z in rows {
             let cells = [
-                text_w(&z.name),
+                // The copy button sits in this cell too.
+                text_w(&z.name) + COL_COPY_W,
                 text_w(&route53::zone_kind_label(z)),
                 text_w(&z.record_count.to_string()),
                 // The copy button sits in this cell too.
@@ -40951,7 +41032,8 @@ mod gui {
         }
         for g in rows {
             let cells = [
-                text_w(&g.name),
+                // The copy button sits in this cell too.
+                text_w(&g.name) + COL_COPY_W,
                 text_w(&g.desired_capacity.to_string()),
                 text_w(&g.min_size.to_string()),
                 text_w(&g.max_size.to_string()),
@@ -41506,7 +41588,8 @@ mod gui {
 
         for tg in rows {
             let cells = [
-                text_w(&tg.name),
+                // The copy button sits in this cell too.
+                text_w(&tg.name) + COL_COPY_W,
                 text_w(&elb::protocol_port_label(tg)),
                 text_w("not permitted"),
                 text_w(tg.health_check.path.as_deref().unwrap_or("—")),
@@ -49561,6 +49644,97 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         }
 
 
+
+
+        /// One method's body, from its `fn` line to the next one.
+        ///
+        /// Fixed-size windows are what these source scans used before, and a
+        /// 14,000-character window silently stopped covering
+        /// `render_target_groups` the moment it grew past that — the test
+        /// failed on a change that was correct. The next `fn` at the same
+        /// indentation is where a method actually ends.
+        fn method_body<'a>(src: &'a str, signature: &str) -> &'a str {
+            let start = src
+                .find(signature)
+                .unwrap_or_else(|| panic!("no {signature}"));
+            let rest = &src[start + signature.len()..];
+            let end = rest.find("\n        fn ").unwrap_or(rest.len());
+            &src[start..start + signature.len() + end]
+        }
+
+        /// **Every resource table's Name cell carries a copy button, and the
+        /// name stays clickable.**
+        ///
+        /// The two used to be exclusive here: a cell holding a copy button
+        /// was kept out of the row's click response entirely, because
+        /// unioning it made a click on the button also open the Details tab.
+        /// On S3 that cost the table its most clickable column — the only way
+        /// left to open a bucket was to click its date. `paint_copy_button`
+        /// returns its response now, so the BUTTON's click is subtracted
+        /// instead of the whole cell.
+        #[test]
+        fn every_name_cell_copies_and_stays_clickable() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            for (func, tooltip) in [
+                ("fn render_target_groups", "Copy target group name"),
+                ("fn render_load_balancers", "Copy load balancer name"),
+                ("fn render_asgs", "Copy group name"),
+                ("fn render_buckets", "Copy bucket name"),
+                ("fn render_hosted_zones", "Copy zone name"),
+            ] {
+                let body = method_body(src, func);
+                assert!(
+                    body.contains(tooltip),
+                    "{func} must have a copy button on its Name cell"
+                );
+                // And the row must subtract the button's click rather than
+                // dropping the cell, or copying a name opens the row.
+                assert!(
+                    body.contains("let copy_took_the_click = name_cell.inner;")
+                        && body.contains("row.clicked() && !copy_took_the_click"),
+                    "{func} must suppress the row click the copy button took"
+                );
+            }
+        }
+
+        /// A copy button hands its response back, which is the whole
+        /// mechanism above. Returning `()` is what forced the old
+        /// all-or-nothing choice between a copyable cell and a clickable one.
+        #[test]
+        fn the_copy_button_reports_its_own_click() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            assert!(
+                src.contains(
+                    "fn paint_copy_button(\n            ui: &mut egui::Ui,\n            \
+                     text_to_copy: &str,\n            tooltip: &str,\n        ) -> egui::Response {"
+                ),
+                "paint_copy_button must return its response"
+            );
+        }
+
+        /// A Name column has to reserve room for its button, or the button
+        /// eats into the space the name was measured for and every name
+        /// truncates two characters early.
+        #[test]
+        fn every_name_column_reserves_room_for_its_copy_button() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            for func in [
+                "fn tg_auto_widths",
+                "fn lb_auto_widths",
+                "fn asg_auto_widths",
+                "fn bucket_auto_widths",
+                "fn zone_auto_widths",
+            ] {
+                let body = method_body(src, func);
+                assert!(
+                    body.contains(".name) + COL_COPY_W"),
+                    "{func}'s name column must reserve the copy button"
+                );
+            }
+        }
 
         /// **An empty table must never blame the account for a filter the
         /// user applied.** With Show Favorites picked and nothing starred, an

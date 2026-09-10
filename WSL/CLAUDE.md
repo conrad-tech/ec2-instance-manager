@@ -42,7 +42,7 @@ cargo build --features gui
 
 # Run tests
 cargo test                  # lib + CLI tests
-cargo test --features gui   # all tests including GUI (546 GUI tests)
+cargo test --features gui   # all tests including GUI (549 GUI tests)
 
 # Clippy
 cargo clippy --features gui
@@ -62,7 +62,7 @@ stale for months before phase 1 (it read 356 tests / 21 warnings, both months
 out of date; the measured baseline immediately before phase 1 was 1019 tests /
 23 warnings):
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 1366 tests pass, 0 fail (817 lib + 3 CLI + 546 GUI)
+- `cargo test --features gui` — 1369 tests pass, 0 fail (817 lib + 3 CLI + 549 GUI)
 - `cargo clippy --features gui` — no errors; 23 pre-existing style warnings.
   **That is a count of `^warning` lines, which is how the pre-branch baseline
   was measured and why the two are comparable — it is 21 distinct lints (6 lib
@@ -2753,6 +2753,33 @@ what lets the header be a word.
   `is_resource_favorite` walks a `Vec`, and a table of several hundred rows
   would walk it several hundred times a frame for an answer that cannot
   change mid-frame.
+
+#### Copy buttons, and the cell that holds one
+
+Every resource table's **Name** cell carries the Inventory table's own copy
+button, and the name stays clickable.
+
+- **Those two used to be exclusive.** `paint_copy_button` returned `()`, so a
+  cell holding one had to be kept out of the row's click response entirely —
+  otherwise clicking the button also opened the Details tab. On S3 that cost
+  the table its most clickable column: the only way left to open a bucket was
+  to click its date.
+- **It returns its `Response` now**, so the BUTTON's click is subtracted
+  (`copy_took_the_click`) instead of the whole cell being dropped. Every Name
+  cell is back in the row, S3's included.
+- **A Name column reserves `COL_COPY_W`** in its `*_auto_widths`, or the
+  button eats into the space the name was measured for and every name
+  truncates early.
+- The Load Balancer **DNS Name** and Route 53 **Zone ID** cells still sit
+  outside their row's click response, on the old all-or-nothing rule. They
+  work, and they were not what was asked for — but they are now the only two
+  cells in the app doing it the old way, and the mechanism above is what
+  would fold them back in.
+
+**Source-scanning tests use `method_body`, not a fixed window.** A
+14,000-character window silently stopped covering `render_target_groups` the
+moment it grew past that, and the test failed on a change that was correct.
+The next `fn` at the same indentation is where a method actually ends.
 
 - **`filter::text_matches` is the shared search engine.** The
   include/exclude matching was lifted out of `apply_filters` so every sub-tab
