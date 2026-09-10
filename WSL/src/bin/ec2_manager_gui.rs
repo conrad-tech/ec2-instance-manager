@@ -1755,6 +1755,95 @@ mod gui {
     /// instinct, kept parallel enough that the sweep is over in seconds.
     const REGION_PROBE_PARALLELISM: usize = 6;
 
+    /// Where a refresh's region override came from, when it has one.
+    ///
+    /// The two are not interchangeable to a reader: one is a setting on the
+    /// account, the other a flag on this session's command line, and the skip
+    /// line has to say which — "explicit region" sends someone to edit the
+    /// wrong thing.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum RegionOverride {
+        /// The `--region` command-line flag. It applies to the **selected**
+        /// profile only, which is exactly why `spawn_refresh` branches.
+        CommandLine(String),
+        /// The account's own `region`, from accounts.json or the Manage
+        /// Accounts / discovery Region box.
+        Account(String),
+    }
+
+    impl RegionOverride {
+        fn region(&self) -> &str {
+            match self {
+                Self::CommandLine(region) | Self::Account(region) => region,
+            }
+        }
+
+        /// Named in the skip line, so the reader knows which setting to change.
+        fn describe(&self) -> String {
+            match self {
+                Self::CommandLine(region) => {
+                    format!("the --region {region} flag this session was started with")
+                }
+                Self::Account(region) => format!("{region}, set on the account itself"),
+            }
+        }
+    }
+
+    /// Which region override a refresh of `profile_id` will actually use.
+    ///
+    /// **`spawn_refresh` calls this, and so does the region search's gate.**
+    /// One definition on purpose: the gate is only correct while it agrees
+    /// with the refresh about which region an account is fetched with, and it
+    /// was wrong once already by reading one of the two sources.
+    ///
+    /// The either/or is `spawn_refresh`'s own and is deliberate — `--region`
+    /// is a flag about the account the user is looking at, so for the selected
+    /// profile it is the whole answer and the account's own region is not
+    /// consulted; every other profile uses its own.
+    ///
+    /// A blank override is no override, matching `resolve_region`, which
+    /// discards one that trims to nothing.
+    fn refresh_region_override(
+        profiles: &[ProfileConfig],
+        selected: Option<&str>,
+        cli_region: Option<&str>,
+        profile_id: &str,
+    ) -> Option<RegionOverride> {
+        let clean = |value: &str| {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        };
+        if selected == Some(profile_id) {
+            return cli_region.and_then(clean).map(RegionOverride::CommandLine);
+        }
+        profiles
+            .iter()
+            .find(|p| p.profile_id == profile_id)
+            .and_then(|p| p.region.as_deref())
+            .and_then(clean)
+            .map(RegionOverride::Account)
+    }
+
+    /// Whether **any** refresh of this account carries a region override.
+    ///
+    /// An account is refreshed both ways over a session — selected while the
+    /// user is looking at it, in the background for Refresh All — so the
+    /// region search has to consider both doors. A region reached through
+    /// either one sits above `config.account_regions` in `resolve_region`'s
+    /// chain, and `account_regions` is all a search can write.
+    fn refresh_names_a_region(
+        profiles: &[ProfileConfig],
+        selected: Option<&str>,
+        cli_region: Option<&str>,
+        profile_id: &str,
+    ) -> Option<RegionOverride> {
+        refresh_region_override(profiles, selected, cli_region, profile_id)
+            // The other door: `--region` covers the selected profile only, so
+            // the account's own region is still what a background refresh of
+            // it uses.
+            .or_else(|| refresh_region_override(profiles, None, None, profile_id))
+    }
+
     /// How long the "everything is forwarding" line stays on the toolbar
     /// before hiding itself. It reappears if forwarding breaks and recovers,
     /// because that transition is worth seeing.
@@ -10737,13 +10826,16 @@ mod gui {
             // Use the profile's own configured region, not the global
             // region override, so Refresh All doesn't force every
             // account to use the currently selected account's region.
-            let region_override = if self.selected_profile.as_deref() == Some(profile_id) {
-                self.options.region.clone()
-            } else {
-                self.config.profiles.iter()
-                    .find(|p| p.profile_id == pid)
-                    .and_then(|p| p.region.clone())
-            };
+            // Through `refresh_region_override` rather than inline, because
+            // the region search's gate has to ask the same question and the
+            // two must not be able to disagree.
+            let region_override = refresh_region_override(
+                &self.config.profiles,
+                self.selected_profile.as_deref(),
+                self.options.region.as_deref(),
+                &pid,
+            )
+            .map(|source| source.region().to_string());
             let tx = self.refresh_tx.clone();
 
             std::thread::spawn(move || {
@@ -24896,27 +24988,30 @@ mod gui {
                 .region_searched
                 .iter()
                 .any(|id| id == &account_id);
-            // A region set on the profile itself sits **above**
+            // A region this account's refresh already names sits **above**
             // `account_regions` in `resolve_region`'s chain, so a sweep here
-            // would write a region the app then ignores. See
-            // `region_search::should_search` for the rest of why.
-            let explicit_region = self
-                .config
-                .profiles
-                .iter()
-                .find(|p| p.profile_id == profile_id)
-                .and_then(|p| p.region.clone());
+            // would write a region the app then ignores. Both doors count —
+            // the account's own region and the `--region` flag — which is why
+            // this tracks `refresh_region_override` rather than reading one
+            // field. See `region_search::should_search` for the rest of why.
+            let named_region = refresh_names_a_region(
+                &self.config.profiles,
+                self.selected_profile.as_deref(),
+                self.options.region.as_deref(),
+                profile_id,
+            );
             if !region_search::should_search(
                 self.options.mode.clone(),
                 instance_count,
                 already,
-                explicit_region.is_some(),
+                named_region.is_some(),
             ) {
-                // Said out loud, because an empty inventory on an account with
-                // a hand-set region is a real situation a user has to be able
-                // to explain — and "nothing happened and nothing was logged"
-                // is the failure mode this codebase documents at length.
-                if let Some(region) = explicit_region {
+                // Said out loud, because an empty inventory on an account
+                // whose region is already named is a real situation a user has
+                // to be able to explain — and "nothing happened and nothing
+                // was logged" is the failure mode this codebase documents at
+                // length.
+                if let Some(named_region) = named_region {
                     // Asked again with that one condition lifted, rather than
                     // re-spelling the other three here: the line must only
                     // appear when the explicit region is genuinely the sole
@@ -24929,7 +25024,8 @@ mod gui {
                         false,
                     ) {
                         self.log_info(format!(
-                            "region search: not searching account {account_id} — its region is set to {region} on the account itself, which outranks anything a search could write"
+                            "region search: not searching account {account_id} — its region is already {}, which outranks anything a search could write",
+                            named_region.describe()
                         ));
                     }
                 }
@@ -50321,6 +50417,103 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 row.contains("if on_ec2 {"),
                 "the count line must be gated on the EC2 tab:\n{row}"
             );
+        }
+
+        fn region_test_profile(id: &str, region: Option<&str>) -> ProfileConfig {
+            ProfileConfig {
+                profile_id: id.to_string(),
+                display_name: id.to_string(),
+                account_id: id.to_string(),
+                region: region.map(str::to_string),
+                sort_order: None,
+                color: None,
+            }
+        }
+
+        /// `spawn_refresh`'s either/or, pinned: `--region` is a flag about the
+        /// account the user is looking at, so for the **selected** profile it
+        /// is the whole answer and the account's own region is not consulted.
+        /// Every other profile uses its own.
+        #[test]
+        fn the_refresh_override_is_the_cli_flag_for_the_selected_profile_only() {
+            let profiles = vec![
+                region_test_profile("111", Some("us-east-1")),
+                region_test_profile("222", None),
+            ];
+            assert_eq!(
+                refresh_region_override(&profiles, Some("111"), Some("eu-west-1"), "111"),
+                Some(RegionOverride::CommandLine("eu-west-1".to_string())),
+                "the flag wins for the selected profile"
+            );
+            assert_eq!(
+                refresh_region_override(&profiles, Some("222"), Some("eu-west-1"), "111"),
+                Some(RegionOverride::Account("us-east-1".to_string())),
+                "another profile being selected leaves 111 on its own region"
+            );
+            assert_eq!(
+                refresh_region_override(&profiles, Some("222"), Some("eu-west-1"), "222"),
+                Some(RegionOverride::CommandLine("eu-west-1".to_string()))
+            );
+            assert_eq!(
+                refresh_region_override(&profiles, Some("111"), None, "111"),
+                None,
+                "selected with no flag takes no override at all -- not the account's region"
+            );
+        }
+
+        /// The region search's gate, and the half that was filed rather than
+        /// fixed once: an account is refreshed **both** ways over a session --
+        /// selected while the user looks at it, in the background for Refresh
+        /// All -- so a region reached by either door outranks
+        /// `config.account_regions`, which is all a search can write.
+        #[test]
+        fn the_cli_flag_names_a_region_for_the_selected_account_only() {
+            let profiles = vec![region_test_profile("111", None)];
+            assert_eq!(
+                refresh_names_a_region(&profiles, Some("111"), Some("eu-west-1"), "111"),
+                Some(RegionOverride::CommandLine("eu-west-1".to_string())),
+                "the selected account's inventory comes back from --region, so a search would write a region resolve_region then ignores"
+            );
+            assert_eq!(
+                refresh_names_a_region(&profiles, Some("222"), Some("eu-west-1"), "111"),
+                None,
+                "the flag does not apply to 111, so nothing outranks a search there"
+            );
+        }
+
+        /// The account's own region still refuses a search whichever profile
+        /// is selected, because a background refresh of it uses that region
+        /// however the user is currently looking at the app.
+        #[test]
+        fn an_account_region_names_a_region_from_either_side() {
+            let profiles = vec![region_test_profile("111", Some("us-east-1"))];
+            assert_eq!(
+                refresh_names_a_region(&profiles, Some("111"), None, "111"),
+                Some(RegionOverride::Account("us-east-1".to_string()))
+            );
+            assert_eq!(
+                refresh_names_a_region(&profiles, Some("999"), None, "111"),
+                Some(RegionOverride::Account("us-east-1".to_string()))
+            );
+            assert_eq!(
+                refresh_names_a_region(&[region_test_profile("111", None)], None, None, "111"),
+                None,
+                "an account naming nothing is exactly the one worth searching"
+            );
+        }
+
+        /// The skip line names the **source**, not just the region: "explicit
+        /// region" reads wrongly when it came from a command-line flag, and
+        /// someone debugging an empty inventory has to know which one to
+        /// change.
+        #[test]
+        fn the_skip_line_says_which_region_setting_to_change() {
+            assert!(RegionOverride::CommandLine("eu-west-1".to_string())
+                .describe()
+                .contains("--region"));
+            assert!(RegionOverride::Account("us-east-1".to_string())
+                .describe()
+                .contains("on the account itself"));
         }
 
         /// The tags message used to send `attributes: Ok(Vec::new())` — safe
