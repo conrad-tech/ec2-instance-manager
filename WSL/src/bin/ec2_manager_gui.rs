@@ -14324,6 +14324,39 @@ mod gui {
 
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
+                                ui.label("Colour:");
+                                let shown = wiz.steps[idx]
+                                    .color
+                                    .as_deref()
+                                    .and_then(parse_hex_color)
+                                    .unwrap_or(egui::Color32::GRAY);
+                                let mut rgb = [
+                                    shown.r() as f32 / 255.0,
+                                    shown.g() as f32 / 255.0,
+                                    shown.b() as f32 / 255.0,
+                                ];
+                                if ui.color_edit_button_rgb(&mut rgb).changed() {
+                                    let picked = egui::Color32::from_rgb(
+                                        (rgb[0] * 255.0).round() as u8,
+                                        (rgb[1] * 255.0).round() as u8,
+                                        (rgb[2] * 255.0).round() as u8,
+                                    );
+                                    wiz.steps[idx].color = Some(color32_to_hex(picked));
+                                }
+                                if ui
+                                    .button("Reset")
+                                    .on_hover_text(
+                                        "Back to the automatic colour -- the palette \
+                                         colour for this account's position",
+                                    )
+                                    .clicked()
+                                {
+                                    wiz.steps[idx].color = None;
+                                }
+                            });
+
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
                                 ui.label("Add:");
                                 for (label, decision) in [
                                     ("Add this account", StepDecision::Add),
@@ -14449,7 +14482,13 @@ mod gui {
                 wiz.error = None;
                 if wiz.current + 1 >= wiz.steps.len() {
                     wiz.ordering = true;
-                    wiz.rows = self.discovery_order_rows(&wiz.steps);
+                    // Only rebuild when the set of accounts being added has
+                    // actually changed -- otherwise a Back into an account
+                    // page and a Next back out would silently throw away a
+                    // manual reorder.
+                    if discovery_rows_need_rebuild(&wiz.rows, &wiz.steps) {
+                        wiz.rows = self.discovery_order_rows(&wiz.steps);
+                    }
                 } else {
                     wiz.current += 1;
                 }
@@ -14502,14 +14541,10 @@ mod gui {
         fn apply_discovery_wizard(&mut self, wiz: &DiscoveryWizard) {
             let outcome = apply_discovery(&wiz.steps);
 
-            let mut next_order = self
-                .config
-                .profile_orders
-                .values()
-                .copied()
-                .max()
-                .map(|m| m + 1)
-                .unwrap_or(0);
+            // Computed before the push loop below, off the order already
+            // stamped on the existing profiles -- see `discovery_next_order`
+            // for why `profile_orders` alone is the wrong source.
+            let mut next_order = discovery_next_order(&self.config.profiles);
 
             for profile in &outcome.added {
                 if !self
@@ -36257,9 +36292,20 @@ mod gui {
             match step.decision {
                 StepDecision::Add => {
                     let region = step.region.trim();
+                    let label = step.label.trim();
+                    // An account with no label is unpickable in every
+                    // dropdown -- the same rule `apply_manage_accounts` keeps
+                    // for the same field, and the id is always a usable name
+                    // (it's what `discovery_steps` itself falls back to when
+                    // the credentials file can't label the account).
+                    let display_name = if label.is_empty() {
+                        step.account_id.clone()
+                    } else {
+                        label.to_string()
+                    };
                     out.added.push(ProfileConfig {
                         profile_id: step.account_id.clone(),
-                        display_name: step.label.trim().to_string(),
+                        display_name,
                         account_id: step.account_id.clone(),
                         region: if region.is_empty() {
                             None
@@ -36276,6 +36322,50 @@ mod gui {
             }
         }
         out
+    }
+
+    /// Where a newly discovered account's `sort_order` should start counting
+    /// from.
+    ///
+    /// Seeded from the `sort_order` already stamped on `config.profiles`, not
+    /// from `profile_orders`. `profile_orders` is the user's *override* map
+    /// and is empty on a fresh install -- bundled accounts carry `sort_order`
+    /// 1/2/3 straight from `accounts.json` and are never mirrored into
+    /// `profile_orders` until a Manage Accounts save runs. Seeding from that
+    /// map alone computed to 0 on exactly the run that matters most (the
+    /// first one, which is when the poll hook first raises this wizard),
+    /// stamping the new account `sort_order = Some(0)` and putting it
+    /// **before** every existing bundled account.
+    fn discovery_next_order(profiles: &[ProfileConfig]) -> u32 {
+        profiles
+            .iter()
+            .filter_map(|p| p.sort_order)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0)
+    }
+
+    /// Whether the wizard's order page needs to rebuild `rows` from `steps`.
+    ///
+    /// Recomputing on every entry into the ordering page silently discards a
+    /// manual reorder: go to the order page, drag rows, press Back into an
+    /// account page, then Next again, and a naive rebuild throws the
+    /// arrangement away with no word. Only the *set* of accounts actually
+    /// being added matters here -- if it hasn't changed since `rows` was
+    /// built, the order the user chose is kept exactly as they left it.
+    fn discovery_rows_need_rebuild(rows: &[ManageAccountRow], steps: &[DiscoveryStep]) -> bool {
+        if rows.is_empty() {
+            return true;
+        }
+        let mut current: Vec<&str> = rows.iter().map(|r| r.profile_id.as_str()).collect();
+        let mut needed: Vec<&str> = steps
+            .iter()
+            .filter(|s| s.decision == StepDecision::Add)
+            .map(|s| s.account_id.as_str())
+            .collect();
+        current.sort_unstable();
+        needed.sort_unstable();
+        current != needed
     }
 
     /// The colour map to store when an order is saved.
@@ -49498,6 +49588,104 @@ fed_expire = 4000000000
             let out = apply_discovery(&steps);
             assert_eq!(out.environments.len(), 1);
             assert_eq!(out.environments[0].name, "SBX");
+        }
+
+        /// A colour chosen on the account's page reaches the profile that
+        /// gets added, exactly as typed by `apply_discovery`.
+        #[test]
+        fn a_chosen_colour_reaches_the_outcome() {
+            let mut steps = discovery_steps(&["111".to_string()], WIZ_FILE, "us-east-1");
+            steps[0].decision = StepDecision::Add;
+            steps[0].color = Some("#2ea043".to_string());
+            let out = apply_discovery(&steps);
+            assert_eq!(out.added[0].color, Some("#2ea043".to_string()));
+        }
+
+        /// An account with no label is unpickable in every dropdown, so a
+        /// cleared name box falls back to the account id -- the same name
+        /// `discovery_steps` itself uses when the credentials file has none.
+        #[test]
+        fn a_blank_label_falls_back_to_the_account_id() {
+            let mut steps = discovery_steps(&["111".to_string()], WIZ_FILE, "us-east-1");
+            steps[0].decision = StepDecision::Add;
+            steps[0].label = "   ".to_string();
+            let out = apply_discovery(&steps);
+            assert_eq!(out.added[0].display_name, "111");
+        }
+
+        /// `profile_orders` is the user's *override* map and is empty on a
+        /// fresh install -- bundled accounts carry `sort_order` straight from
+        /// `accounts.json` and are never mirrored into `profile_orders` until
+        /// a Manage Accounts save runs. Seeding the new account's order from
+        /// that map alone would compute 0 on exactly the run that matters
+        /// (the first one) and put it before every existing account.
+        #[test]
+        fn a_discovered_account_orders_after_existing_ones_with_no_override_entry() {
+            let profiles = vec![
+                ProfileConfig {
+                    profile_id: "111".to_string(),
+                    display_name: "One".to_string(),
+                    account_id: "111".to_string(),
+                    region: None,
+                    sort_order: Some(1),
+                    color: None,
+                },
+                ProfileConfig {
+                    profile_id: "222".to_string(),
+                    display_name: "Two".to_string(),
+                    account_id: "222".to_string(),
+                    region: None,
+                    sort_order: Some(3),
+                    color: None,
+                },
+            ];
+            assert_eq!(discovery_next_order(&profiles), 4);
+        }
+
+        /// No profiles at all (an empty config) still starts counting from 0.
+        #[test]
+        fn a_discovered_account_starts_at_zero_with_no_existing_profiles() {
+            assert_eq!(discovery_next_order(&[]), 0);
+        }
+
+        /// Re-entering the order page must not throw away a manual reorder:
+        /// only the *set* of accounts being added decides whether `rows` gets
+        /// rebuilt, not merely landing on the page again.
+        #[test]
+        fn order_rows_survive_re_entry_when_the_add_set_is_unchanged() {
+            // The user's own arrangement -- reversed from step order, which is
+            // exactly what a rebuild-from-scratch would clobber.
+            let rows = vec![
+                ManageAccountRow {
+                    profile_id: "222".to_string(),
+                    display_name: "Two".to_string(),
+                    region: String::new(),
+                    identity_editable: true,
+                    arrangement_editable: true,
+                },
+                ManageAccountRow {
+                    profile_id: "111".to_string(),
+                    display_name: "One".to_string(),
+                    region: String::new(),
+                    identity_editable: true,
+                    arrangement_editable: true,
+                },
+            ];
+            let mut steps = discovery_steps(
+                &["111".to_string(), "222".to_string()],
+                WIZ_FILE,
+                "us-east-1",
+            );
+            // Both still Add (the default) -- the same set `rows` was built
+            // from, so the arrangement must be kept.
+            assert!(!discovery_rows_need_rebuild(&rows, &steps));
+
+            // Deciding NotNow on one changes the Add set -- rebuild.
+            steps[0].decision = StepDecision::NotNow;
+            assert!(discovery_rows_need_rebuild(&rows, &steps));
+
+            // No rows yet always needs building.
+            assert!(discovery_rows_need_rebuild(&[], &steps));
         }
 
         /// Reset must genuinely put an account back on its automatic colour.
