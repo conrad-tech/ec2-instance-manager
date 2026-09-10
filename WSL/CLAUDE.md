@@ -42,7 +42,7 @@ cargo build --features gui
 
 # Run tests
 cargo test                  # lib + CLI tests
-cargo test --features gui   # all tests including GUI (542 GUI tests)
+cargo test --features gui   # all tests including GUI (546 GUI tests)
 
 # Clippy
 cargo clippy --features gui
@@ -62,7 +62,7 @@ stale for months before phase 1 (it read 356 tests / 21 warnings, both months
 out of date; the measured baseline immediately before phase 1 was 1019 tests /
 23 warnings):
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 1362 tests pass, 0 fail (817 lib + 3 CLI + 542 GUI)
+- `cargo test --features gui` — 1366 tests pass, 0 fail (817 lib + 3 CLI + 546 GUI)
 - `cargo clippy --features gui` — no errors; 23 pre-existing style warnings.
   **That is a count of `^warning` lines, which is how the pre-branch baseline
   was measured and why the two are comparable — it is 21 distinct lints (6 lib
@@ -2730,6 +2730,25 @@ what lets the header be a word.
 - **A toggle saves immediately.** A favorite the user set and lost because
   the app closed without a later save is the kind of thing that quietly
   teaches somebody the feature does not work.
+- **"Show Favorites" filters the resource tables too.** The saved-filter
+  dropdown is drawn in `update`, above the whole Inventory page, so it is on
+  screen on every sub-tab — and picking it there used to filter the EC2
+  instance list and nothing else, leaving the resource table underneath
+  showing everything. That was the bug: favorites you could set and not
+  filter by.
+  - **The dropdown's own selected value IS the state**
+    (`showing_favorites_only`), not a second bool mirrored beside it. Picking
+    another saved filter or pressing Clear turns it off with nothing to keep
+    in step, and the label on screen cannot disagree with what the table is
+    doing.
+  - **The empty note says which emptiness it is.** With the filter on and
+    nothing starred, an account full of target groups reported "No target
+    groups in the selected account(s)" — false, and it sends somebody to
+    check their credentials. `resource_empty_note` takes `favorites_only` and
+    names the filter, plus how to leave it, since the dropdown that turned it
+    on sits a long way from the empty table. Loading and failing still
+    outrank it: both are facts about the fetch and neither becomes less true
+    because a filter is on.
 - `resource_favorite_ids` reads the set once per render, not per row:
   `is_resource_favorite` walks a `Vec`, and a table of several hundred rows
   would walk it several hundred times a frame for an answer that cannot

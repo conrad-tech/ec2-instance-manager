@@ -26502,6 +26502,10 @@ mod gui {
                     )
                 })
                 .collect();
+            if self.showing_favorites_only() {
+                let favs = self.resource_favorite_ids(ResourceKind::LoadBalancer);
+                rows.retain(|lb| favs.contains(&lb.arn));
+            }
             // The default order first, and ALWAYS — the chosen column is
             // then applied with a stable sort, so rows that tie on it keep
             // this order instead of shuffling between frames.
@@ -26590,6 +26594,7 @@ mod gui {
                     ResourceKind::LoadBalancer,
                     !self.lb_list_loading.is_empty(),
                     list_error_detail(&self.lb_list_errors).as_deref(),
+                    self.showing_favorites_only(),
                 ));
                 return;
             }
@@ -27081,6 +27086,16 @@ mod gui {
 
 
 
+        /// Is the saved-filter dropdown asking for favorites only?
+        ///
+        /// Read live from `selected_saved_filter` rather than mirrored into a
+        /// second bool: the dropdown already shows that value as the selected
+        /// entry, and a separate flag is one more thing that can disagree with
+        /// what is on screen.
+        fn showing_favorites_only(&self) -> bool {
+            self.selected_saved_filter == SHOW_FAVORITES_LABEL
+        }
+
         /// The favorited ids for one kind, as a set to test rows against.
         ///
         /// Read once per render rather than per row: `is_resource_favorite`
@@ -27225,6 +27240,10 @@ mod gui {
                     )
                 })
                 .collect();
+            if self.showing_favorites_only() {
+                let favs = self.resource_favorite_ids(ResourceKind::HostedZone);
+                rows.retain(|z| favs.contains(&z.id));
+            }
             rows.sort_by(|a, b| {
                 a.name
                     .to_ascii_lowercase()
@@ -27313,6 +27332,7 @@ mod gui {
                     ResourceKind::HostedZone,
                     !self.zone_list_loading.is_empty(),
                     list_error_detail(&self.zone_list_errors).as_deref(),
+                    self.showing_favorites_only(),
                 ));
                 return;
             }
@@ -27823,6 +27843,10 @@ mod gui {
                     )
                 })
                 .collect();
+            if self.showing_favorites_only() {
+                let favs = self.resource_favorite_ids(ResourceKind::Bucket);
+                rows.retain(|b| favs.contains(&b.name));
+            }
             // The default order first, and ALWAYS — see
             // `filtered_load_balancers`.
             rows.sort_by(|a, b| {
@@ -27907,6 +27931,7 @@ mod gui {
                     ResourceKind::Bucket,
                     !self.bucket_list_loading.is_empty(),
                     list_error_detail(&self.bucket_list_errors).as_deref(),
+                    self.showing_favorites_only(),
                 ));
                 return;
             }
@@ -28249,6 +28274,10 @@ mod gui {
                     )
                 })
                 .collect();
+            if self.showing_favorites_only() {
+                let favs = self.resource_favorite_ids(ResourceKind::Asg);
+                rows.retain(|g| favs.contains(&g.arn));
+            }
             // The default order first, and ALWAYS — see
             // `filtered_load_balancers`.
             rows.sort_by(|a, b| {
@@ -28336,6 +28365,7 @@ mod gui {
                     ResourceKind::Asg,
                     !self.asg_list_loading.is_empty(),
                     list_error_detail(&self.asg_list_errors).as_deref(),
+                    self.showing_favorites_only(),
                 ));
                 return;
             }
@@ -29077,6 +29107,10 @@ mod gui {
                 })
                 .cloned()
                 .collect();
+            if self.showing_favorites_only() {
+                let favs = self.resource_favorite_ids(ResourceKind::TargetGroup);
+                rows.retain(|tg| favs.contains(&tg.arn));
+            }
             // The default order first, and ALWAYS — the chosen column is
             // then applied with a stable sort, so rows that tie on it keep
             // this order instead of shuffling between frames.
@@ -29170,6 +29204,7 @@ mod gui {
                     ResourceKind::TargetGroup,
                     loading,
                     error_detail.as_deref(),
+                    self.showing_favorites_only(),
                 ));
                 return;
             }
@@ -34647,7 +34682,6 @@ mod gui {
                     let mut pending_delete_filter: Option<String> = None;
                     let mut auto_apply = false;
                     let mut show_favorites_only = false;
-                    const SHOW_FAVORITES_LABEL: &str = "Show Favorites";
 
                     let filter_btn_text = if self.selected_saved_filter.is_empty() {
                         "Choose Filter".to_string()
@@ -39832,12 +39866,30 @@ mod gui {
     /// "Nothing here", "still loading" and "the call failed" must never look
     /// alike — reporting either of the last two as the first is the
     /// silent-empty failure this repo has already been bitten by twice.
-    fn resource_empty_note(kind: ResourceKind, loading: bool, error: Option<&str>) -> String {
+    fn resource_empty_note(
+        kind: ResourceKind,
+        loading: bool,
+        error: Option<&str>,
+        favorites_only: bool,
+    ) -> String {
         if loading {
             return format!("Loading {}…", kind.label());
         }
         if let Some(err) = error {
             return format!("Could not list {}: {err}", kind.label());
+        }
+        // **"Nothing here" and "you filtered everything out" are different
+        // facts**, and this is the one that would otherwise lie outright: with
+        // Show Favorites picked and nothing starred, an account full of target
+        // groups reported "No target groups in the selected account(s)". The
+        // note names the filter and says how to leave it, because the dropdown
+        // that turned it on sits a long way from the empty table.
+        if favorites_only {
+            return format!(
+                "No favorites in {} yet. Click a row's star to add one, or pick Clear \
+                 to show everything.",
+                kind.label()
+            );
         }
         match kind {
             ResourceKind::TargetGroup => "No target groups in the selected account(s).".to_string(),
@@ -40074,6 +40126,20 @@ mod gui {
 
 
 
+
+    /// The saved-filter dropdown's built-in "show me only my favorites" entry.
+    ///
+    /// Promoted out of `update`'s local scope because the **resource tables
+    /// read it too**: the dropdown is drawn above the whole Inventory page,
+    /// so it is on screen on every sub-tab, and picking it there used to
+    /// filter the EC2 instance list and nothing else — the resource table
+    /// underneath went on showing everything.
+    ///
+    /// `selected_saved_filter` holding this value is what "favorites only" IS
+    /// for the resource tables. That makes the dropdown's own label the state,
+    /// so picking another filter or pressing Clear turns it off with no second
+    /// flag to keep in step.
+    const SHOW_FAVORITES_LABEL: &str = "Show Favorites";
 
     /// What the Favorite column's header says.
     ///
@@ -48729,15 +48795,20 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         #[test]
         fn the_empty_table_says_which_kind_of_empty_it_is() {
             assert_eq!(
-                resource_empty_note(ResourceKind::TargetGroup, true, None),
+                resource_empty_note(ResourceKind::TargetGroup, true, None, false),
                 "Loading Target Groups…"
             );
             assert_eq!(
-                resource_empty_note(ResourceKind::TargetGroup, false, Some("not permitted")),
+                resource_empty_note(
+                    ResourceKind::TargetGroup,
+                    false,
+                    Some("not permitted"),
+                    false,
+                ),
                 "Could not list Target Groups: not permitted"
             );
             assert_eq!(
-                resource_empty_note(ResourceKind::TargetGroup, false, None),
+                resource_empty_note(ResourceKind::TargetGroup, false, None, false),
                 "No target groups in the selected account(s)."
             );
         }
@@ -48940,7 +49011,8 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 resource_empty_note(
                     ResourceKind::TargetGroup,
                     false,
-                    list_error_detail(&errors).as_deref()
+                    list_error_detail(&errors).as_deref(),
+                    false,
                 ),
                 "Could not list Target Groups: account 1111: not permitted; \
                  account 2222: throttled"
@@ -49488,6 +49560,99 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             }
         }
 
+
+
+        /// **An empty table must never blame the account for a filter the
+        /// user applied.** With Show Favorites picked and nothing starred, an
+        /// account full of target groups reported "No target groups in the
+        /// selected account(s)" — which is simply false, and sends somebody
+        /// to check their credentials.
+        #[test]
+        fn an_empty_favorites_view_says_it_is_the_filter_not_the_account() {
+            let filtered = resource_empty_note(ResourceKind::TargetGroup, false, None, true);
+            assert!(filtered.contains("No favorites"), "{filtered}");
+            assert!(
+                !filtered.contains("in the selected account"),
+                "must not blame the account: {filtered}"
+            );
+            // And it says how to get back out, because the dropdown that
+            // turned this on is a long way from the empty table.
+            assert!(filtered.contains("Clear"), "{filtered}");
+
+            // Genuinely empty still reads as genuinely empty.
+            let empty = resource_empty_note(ResourceKind::TargetGroup, false, None, false);
+            assert!(empty.contains("in the selected account(s)"), "{empty}");
+            assert_ne!(filtered, empty);
+        }
+
+        /// Loading and failing outrank the favorites filter: both are facts
+        /// about the fetch, and neither becomes less true because a filter is
+        /// on.
+        #[test]
+        fn loading_and_failing_still_win_over_the_favorites_note() {
+            assert!(resource_empty_note(ResourceKind::Bucket, true, None, true).contains("Loading"));
+            assert!(
+                resource_empty_note(ResourceKind::Bucket, false, Some("not permitted"), true)
+                    .contains("not permitted")
+            );
+        }
+
+        /// Every kind gets the favorites note, not just the ones with a
+        /// hand-written empty message.
+        #[test]
+        fn every_kind_can_say_it_has_no_favorites() {
+            for kind in [
+                ResourceKind::TargetGroup,
+                ResourceKind::LoadBalancer,
+                ResourceKind::Asg,
+                ResourceKind::Bucket,
+                ResourceKind::HostedZone,
+            ] {
+                let note = resource_empty_note(kind, false, None, true);
+                assert!(note.contains("No favorites"), "{kind:?}: {note}");
+                assert!(note.contains(kind.label()), "{kind:?}: {note}");
+            }
+        }
+
+        /// **"Show Favorites" is the dropdown's own selected value**, not a
+        /// second flag mirrored beside it. The resource tables read it live,
+        /// so picking another saved filter or pressing Clear turns it off with
+        /// nothing to keep in step — and the label on screen cannot disagree
+        /// with what the table is doing.
+        #[test]
+        fn the_favorites_filter_is_the_dropdowns_own_selection() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            assert!(
+                src.contains(
+                    "self.selected_saved_filter == SHOW_FAVORITES_LABEL"
+                ),
+                "showing_favorites_only must read the dropdown's own value"
+            );
+            // Every resource table honours it. This is the bug being fixed:
+            // the dropdown sits above the whole Inventory page, so picking it
+            // on a resource sub-tab used to filter the EC2 list and leave the
+            // table underneath showing everything.
+            assert_eq!(
+                src.matches("if self.showing_favorites_only() {").count(),
+                5,
+                "all five resource tables must apply the favorites filter"
+            );
+            for func in [
+                "fn filtered_target_groups",
+                "fn filtered_load_balancers",
+                "fn filtered_asgs",
+                "fn filtered_buckets",
+                "fn filtered_hosted_zones",
+            ] {
+                let start = src.find(func).unwrap_or_else(|| panic!("{func}"));
+                let body = &src[start..start + 2600];
+                assert!(
+                    body.contains("if self.showing_favorites_only() {"),
+                    "{func} must honour Show Favorites"
+                );
+            }
+        }
 
         /// The Favorite column is the EC2 table's own width, because it is
         /// meant to be the same column on two pages — and because the header
