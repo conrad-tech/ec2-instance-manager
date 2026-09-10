@@ -354,6 +354,49 @@ mod tests {
         assert_eq!(insts["i-1"].env.as_deref(), Some("DEV1"));
     }
 
+    /// The regression that would otherwise have shipped: a real instance
+    /// routinely carries a generic `Env` tag ALONGSIDE `MMODAL_ENV`, and the
+    /// first version of the key chain put the global `env_keys` list first --
+    /// so every such instance silently re-resolved to the wrong value.
+    ///
+    /// Pinned here, against the default chain an unconfigured account actually
+    /// gets, rather than only over the key list: this is the level where the
+    /// resolution happens.
+    #[test]
+    fn mmodal_env_beats_a_generic_env_tag_on_the_same_instance() {
+        let mut insts = tagged("MMODAL_ENV", "DEV1");
+        insts
+            .get_mut("i-1")
+            .expect("the instance exists")
+            .tags
+            .insert("Env".to_string(), "prod".to_string());
+        let keys = AppConfig::default().env_tag_keys_for("111");
+        derive_fields(&mut insts, &TagMapping::default(), &keys);
+        assert_eq!(insts["i-1"].env.as_deref(), Some("DEV1"));
+    }
+
+    /// The lower-case spelling still resolves -- `sim.rs` writes exactly this,
+    /// and the GUI's five hardcoded lookups each carried an `or_else` for it,
+    /// so dropping it would have broken sim on its own.
+    #[test]
+    fn the_lower_case_mmodal_env_tag_still_resolves() {
+        let mut insts = tagged("mmodal_env", "staging");
+        let keys = AppConfig::default().env_tag_keys_for("111");
+        derive_fields(&mut insts, &TagMapping::default(), &keys);
+        assert_eq!(insts["i-1"].env.as_deref(), Some("staging"));
+    }
+
+    /// And an account tagging ONLY `Env` now resolves, which it never did
+    /// before this existed -- that is what `env_keys` still earns its place in
+    /// the chain for, sitting last.
+    #[test]
+    fn an_instance_tagged_only_env_resolves_through_the_global_list() {
+        let mut insts = tagged("Env", "sbx");
+        let keys = AppConfig::default().env_tag_keys_for("111");
+        derive_fields(&mut insts, &TagMapping::default(), &keys);
+        assert_eq!(insts["i-1"].env.as_deref(), Some("sbx"));
+    }
+
     /// An instance carrying none of the keys has no environment -- not a blank
     /// string, which would read as an environment named "".
     #[test]

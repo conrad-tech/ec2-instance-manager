@@ -271,11 +271,30 @@ impl AppConfig {
     /// The tag keys to try, in order, when reading an instance's environment
     /// in this account.
     ///
-    /// The account's own key first (most specific), then the global `env_keys`
-    /// list, then `MMODAL_ENV` last so an account that configures nothing
-    /// behaves exactly as it did before this existed. Deduped, so a configured
-    /// key already in the global list is not probed twice; blanks dropped,
-    /// since a blank key would match a blank tag name.
+    /// The order is **the account's own key, then `MMODAL_ENV` (and its
+    /// lower-case spelling), then the global `env_keys` list** -- and the
+    /// last two are that way round on purpose:
+    ///
+    /// - `MMODAL_ENV` is what this application is actually built around.
+    ///   `accounts.json`, `bastion_key`, `vscode_key` and `script_env` all key
+    ///   on it. Putting anything ahead of it silently re-resolves the
+    ///   environment of every instance that already worked -- and a real EC2
+    ///   instance routinely carries a generic `Env` tag *alongside*
+    ///   `MMODAL_ENV`, so "ahead of it" is not a corner case. `sim.rs` sets
+    ///   both on every simulated instance, which is where this was caught.
+    /// - The lower-case `mmodal_env` is a real spelling in this tree (sim
+    ///   writes it, and the GUI's own lookups carried an `or_else` for it
+    ///   before this function existed). It belongs in the chain, never as a
+    ///   second bypassing lookup at a call site.
+    /// - `env_keys` is therefore **last resort**. It is the vestigial mapping
+    ///   nothing consumed until now; last is the only place it can sit without
+    ///   demoting live behaviour, and it still earns its place there, because
+    ///   an account tagging only `Env` now resolves where it never did before.
+    ///
+    /// Do not "tidy" `env_keys` back up the list.
+    ///
+    /// Deduped, so a configured key already in the chain is not probed twice;
+    /// blanks dropped, since a blank key would match a blank tag name.
     pub fn env_tag_keys_for(&self, account_id: &str) -> Vec<String> {
         let mut keys: Vec<String> = Vec::new();
         let mut push = |k: &str| {
@@ -287,10 +306,11 @@ impl AppConfig {
         if let Some(own) = self.profile_env_tags.get(account_id) {
             push(own);
         }
+        push("MMODAL_ENV");
+        push("mmodal_env");
         for k in &self.tag_mapping.env_keys {
             push(k);
         }
-        push("MMODAL_ENV");
         keys
     }
 
@@ -2178,26 +2198,75 @@ mod tests {
         assert_eq!(again.profile_env_tags, cfg.profile_env_tags);
     }
 
-    /// The account's own key comes first, then the global list, then
-    /// MMODAL_ENV -- so an account that configures nothing behaves exactly as
-    /// it does today.
+    /// The account's own key comes first, then MMODAL_ENV and its lower-case
+    /// spelling, and the global `env_keys` list last.
     #[test]
-    fn env_tag_keys_put_the_account_first_then_the_global_list_then_mmodal_env() {
+    fn env_tag_keys_put_the_account_first_then_mmodal_env_then_the_global_list() {
         let mut cfg = AppConfig::default();
         cfg.profile_env_tags.insert("999".to_string(), "Stage".to_string());
         let keys = cfg.env_tag_keys_for("999");
-        assert_eq!(keys.first().map(String::as_str), Some("Stage"));
-        assert!(keys.iter().any(|k| k == "Env"), "the global list still applies");
-        assert_eq!(keys.last().map(String::as_str), Some("MMODAL_ENV"));
+        assert_eq!(
+            keys,
+            vec![
+                "Stage".to_string(),
+                "MMODAL_ENV".to_string(),
+                "mmodal_env".to_string(),
+                "Env".to_string(),
+                "Environment".to_string(),
+            ]
+        );
     }
 
-    /// An account with no configured key keeps exactly today's behaviour.
+    /// `env_keys` is the LAST RESORT, never ahead of MMODAL_ENV.
+    ///
+    /// Pinned as a position rather than as a membership check because the
+    /// first version of this shipped with `env_keys` ahead of `MMODAL_ENV`,
+    /// which silently re-resolved every instance carrying a generic `Env` tag
+    /// alongside its real one -- a regression for every existing user, and the
+    /// exact failure class this work exists to remove.
     #[test]
-    fn an_unconfigured_account_still_ends_at_mmodal_env() {
+    fn the_global_env_keys_list_never_outranks_mmodal_env() {
         let cfg = AppConfig::default();
         let keys = cfg.env_tag_keys_for("111");
-        assert_eq!(keys.last().map(String::as_str), Some("MMODAL_ENV"));
+        let mmodal = keys
+            .iter()
+            .position(|k| k == "MMODAL_ENV")
+            .expect("MMODAL_ENV is always in the chain");
+        for global in &cfg.tag_mapping.env_keys {
+            let at = keys
+                .iter()
+                .position(|k| k == global)
+                .expect("the global list still applies");
+            assert!(
+                at > mmodal,
+                "{global} must sit after MMODAL_ENV, not before it"
+            );
+        }
+    }
+
+    /// An account with no configured key keeps exactly today's behaviour: the
+    /// first key tried is MMODAL_ENV, which is what everything else in this
+    /// app -- accounts.json, bastion_key, vscode_key, script_env -- is built
+    /// around.
+    #[test]
+    fn an_unconfigured_account_still_starts_at_mmodal_env() {
+        let cfg = AppConfig::default();
+        let keys = cfg.env_tag_keys_for("111");
+        assert_eq!(keys.first().map(String::as_str), Some("MMODAL_ENV"));
         assert!(!keys.is_empty());
+    }
+
+    /// The lower-case spelling is in the chain, because sim writes it and the
+    /// GUI's own lookups carried an `or_else` for it before one resolution
+    /// site existed. It must never come back as a second bypassing lookup.
+    #[test]
+    fn the_lower_case_mmodal_env_spelling_is_in_the_chain() {
+        let cfg = AppConfig::default();
+        let keys = cfg.env_tag_keys_for("111");
+        let upper = keys.iter().position(|k| k == "MMODAL_ENV");
+        let lower = keys.iter().position(|k| k == "mmodal_env");
+        assert_eq!(upper, Some(0));
+        assert_eq!(lower, Some(1), "the canonical spelling is tried first");
     }
 
     /// A blank configured key is dropped rather than matching a blank tag.
