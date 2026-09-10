@@ -21,6 +21,7 @@ struct CacheEntry {
 pub fn load_inventory(
     context: &AwsContext,
     mapping: &TagMapping,
+    env_keys: &[String],
     force_refresh: bool,
 ) -> Result<Inventory> {
     if context.mode == Mode::Live && context.auth_status != AuthStatus::Ok {
@@ -49,9 +50,9 @@ pub fn load_inventory(
     }
 
     let inventory = if context.mode == Mode::Sim {
-        sim::generate_inventory(&context.region, mapping)
+        sim::generate_inventory(&context.region, mapping, env_keys)
     } else {
-        load_live_inventory(context, mapping)?
+        load_live_inventory(context, mapping, env_keys)?
     };
 
     if let Ok(mut guard) = cache.lock() {
@@ -77,10 +78,26 @@ fn disk_cache_path(profile: &str, region: &str) -> Option<PathBuf> {
 }
 
 /// Load inventory from disk cache. Returns None if no cache exists or it can't be read.
-pub fn load_disk_cache(profile: &str, region: &str) -> Option<Inventory> {
+///
+/// The derived fields are recomputed on the way out, because a cache written
+/// under one environment tag key would otherwise keep serving that key's answer
+/// until the next refetch -- so changing an account's key would appear to do
+/// nothing. `tags` is cached alongside and `derive_fields` is a walk over a map
+/// already in memory, which is cheaper and always correct next to trying to
+/// invalidate the file whenever a key changes.
+pub fn load_disk_cache(
+    profile: &str,
+    region: &str,
+    mapping: &TagMapping,
+    env_keys: &[String],
+) -> Option<Inventory> {
     let path = disk_cache_path(profile, region)?;
     let data = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&data).ok()
+    let mut inventory: Inventory = serde_json::from_str(&data).ok()?;
+    for instance in &mut inventory.instances {
+        derive_instance_fields(instance, mapping, env_keys);
+    }
+    Some(inventory)
 }
 
 /// Save inventory to disk cache.
@@ -95,7 +112,11 @@ pub fn save_disk_cache(profile: &str, region: &str, inventory: &Inventory) {
     }
 }
 
-fn load_live_inventory(context: &AwsContext, mapping: &TagMapping) -> Result<Inventory> {
+fn load_live_inventory(
+    context: &AwsContext,
+    mapping: &TagMapping,
+    env_keys: &[String],
+) -> Result<Inventory> {
     let profile = context.profile.to_string();
     let region = context.region.to_string();
 
@@ -157,7 +178,7 @@ fn load_live_inventory(context: &AwsContext, mapping: &TagMapping) -> Result<Inv
     let mut instances = parse_instance_basics(&basics_output)?;
     apply_tags(&mut instances, &tags_output);
     apply_ssm_status(&mut instances, &ssm_output);
-    derive_fields(&mut instances, mapping);
+    derive_fields(&mut instances, mapping, env_keys);
 
     let mut out: Vec<Instance> = instances.into_values().collect();
     out.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
@@ -259,20 +280,34 @@ fn apply_ssm_status(instances: &mut BTreeMap<String, Instance>, raw: &str) {
     }
 }
 
-fn derive_fields(instances: &mut BTreeMap<String, Instance>, mapping: &TagMapping) {
+fn derive_fields(
+    instances: &mut BTreeMap<String, Instance>,
+    mapping: &TagMapping,
+    env_keys: &[String],
+) {
     for instance in instances.values_mut() {
-        instance.name = instance.tags.get("Name").cloned();
-        instance.env = first_tag(&instance.tags, &mapping.env_keys);
-        instance.app_service = first_tag(&instance.tags, &mapping.app_keys);
-        instance.role = first_tag(&instance.tags, &mapping.role_keys);
-        instance.team_owner = first_tag(&instance.tags, &mapping.team_keys);
-
-        instance.asg = instance
-            .tags
-            .get("aws:autoscaling:groupName")
-            .cloned()
-            .or_else(|| instance.tags.get("AutoScalingGroupName").cloned());
+        derive_instance_fields(instance, mapping, env_keys);
     }
+}
+
+/// The per-instance half of `derive_fields`, so the disk cache can re-derive
+/// an `Inventory` (a `Vec`) without first rebuilding the map.
+fn derive_instance_fields(instance: &mut Instance, mapping: &TagMapping, env_keys: &[String]) {
+    instance.name = instance.tags.get("Name").cloned();
+    // Resolved here, at parse time, because this is the one place the
+    // account is unambiguous -- an inventory belongs to exactly one. That
+    // is what lets `instance_env` in the GUI collapse to a field read
+    // instead of every one of its call sites carrying the key.
+    instance.env = first_tag(&instance.tags, env_keys);
+    instance.app_service = first_tag(&instance.tags, &mapping.app_keys);
+    instance.role = first_tag(&instance.tags, &mapping.role_keys);
+    instance.team_owner = first_tag(&instance.tags, &mapping.team_keys);
+
+    instance.asg = instance
+        .tags
+        .get("aws:autoscaling:groupName")
+        .cloned()
+        .or_else(|| instance.tags.get("AutoScalingGroupName").cloned());
 }
 
 fn first_tag(tags: &BTreeMap<String, String>, keys: &[String]) -> Option<String> {
@@ -289,6 +324,45 @@ fn first_tag(tags: &BTreeMap<String, String>, keys: &[String]) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `Instance` does NOT derive Default -- use the `Instance::new(id, state)`
+    // constructor the existing tests in this module already use.
+    fn tagged(key: &str, value: &str) -> BTreeMap<String, Instance> {
+        let mut inst = Instance::new("i-1".to_string(), "running".to_string());
+        inst.tags.insert(key.to_string(), value.to_string());
+        let mut map = BTreeMap::new();
+        map.insert("i-1".to_string(), inst);
+        map
+    }
+
+    /// The account's own key wins, which is the whole point: an account
+    /// tagging under `Stage` gets its environments seen.
+    #[test]
+    fn derive_fields_reads_the_account_s_own_env_tag_key() {
+        let mut insts = tagged("Stage", "sbx");
+        let keys = vec!["Stage".to_string(), "MMODAL_ENV".to_string()];
+        derive_fields(&mut insts, &TagMapping::default(), &keys);
+        assert_eq!(insts["i-1"].env.as_deref(), Some("sbx"));
+    }
+
+    /// And MMODAL_ENV still works, so nothing that works today stops.
+    #[test]
+    fn derive_fields_still_reads_mmodal_env() {
+        let mut insts = tagged("MMODAL_ENV", "DEV1");
+        let keys = vec!["MMODAL_ENV".to_string()];
+        derive_fields(&mut insts, &TagMapping::default(), &keys);
+        assert_eq!(insts["i-1"].env.as_deref(), Some("DEV1"));
+    }
+
+    /// An instance carrying none of the keys has no environment -- not a blank
+    /// string, which would read as an environment named "".
+    #[test]
+    fn an_instance_with_no_matching_tag_has_no_environment() {
+        let mut insts = tagged("Unrelated", "x");
+        let keys = vec!["MMODAL_ENV".to_string()];
+        derive_fields(&mut insts, &TagMapping::default(), &keys);
+        assert_eq!(insts["i-1"].env, None);
+    }
 
     #[test]
     fn parse_basics_lines() {

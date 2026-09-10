@@ -1281,6 +1281,14 @@ mod gui {
         environments: Vec<UserEnvironment>,
         /// Working copy of the colour overrides, keyed by `profile_id`.
         colors: BTreeMap<String, String>,
+        /// Working copy of the per-account environment tag key, keyed by
+        /// `profile_id`. Blank (absent) means the default chain -- the global
+        /// `env_keys` list and then `MMODAL_ENV`.
+        ///
+        /// A separate map rather than a field on `ManageAccountRow`, exactly as
+        /// `colors` is: it is a user store keyed by account, not part of the
+        /// row identity `manage_accounts_rows` builds out of `ProfileConfig`.
+        env_tags: BTreeMap<String, String>,
         /// Accounts whose colour the user pressed **Reset** on.
         ///
         /// Removing the entry from `colors` is not enough: Save freezes a
@@ -9455,7 +9463,12 @@ mod gui {
                 })
                 .collect();
             for (pid, account_id, region) in other_profiles {
-                if let Some(cached) = ec2_manager::inventory::load_disk_cache(&pid, &region) {
+                if let Some(cached) = ec2_manager::inventory::load_disk_cache(
+                    &pid,
+                    &region,
+                    &app.config.tag_mapping,
+                    &app.config.env_tag_keys_for(&pid),
+                ) {
                     let count = cached.instances.len();
                     let resolved = credentials::find_profile_by_account_id(&pid)
                         .unwrap_or_else(|| pid.clone());
@@ -10530,7 +10543,12 @@ mod gui {
                 .filter(|s| !s.is_empty());
 
             self.log_info(format!("disk cache lookup: profile={profile_id} region={region}"));
-            if let Some(cached) = ec2_manager::inventory::load_disk_cache(profile_id, &region) {
+            if let Some(cached) = ec2_manager::inventory::load_disk_cache(
+                profile_id,
+                &region,
+                &self.config.tag_mapping,
+                &self.config.env_tag_keys_for(profile_id),
+            ) {
                 let count = cached.instances.len();
                 let resolved_profile = credentials::find_profile_by_account_id(profile_id)
                     .unwrap_or_else(|| profile_id.to_string());
@@ -10577,9 +10595,12 @@ mod gui {
             let account_id = profile_cfg
                 .map(|p| p.account_id.clone())
                 .filter(|s| !s.is_empty());
-            if let Some(cached) =
-                ec2_manager::inventory::load_disk_cache(profile_id, &region)
-            {
+            if let Some(cached) = ec2_manager::inventory::load_disk_cache(
+                profile_id,
+                &region,
+                &self.config.tag_mapping,
+                &self.config.env_tag_keys_for(profile_id),
+            ) {
                 let resolved_profile =
                     credentials::find_profile_by_account_id(profile_id)
                         .unwrap_or_else(|| profile_id.to_string());
@@ -10725,7 +10746,12 @@ mod gui {
                     if attempt > 0 {
                         std::thread::sleep(std::time::Duration::from_secs(2));
                     }
-                    match load_inventory(&context, &config.tag_mapping, force) {
+                    match load_inventory(
+                        &context,
+                        &config.tag_mapping,
+                        &config.env_tag_keys_for(&pid),
+                        force,
+                    ) {
                         Ok(inventory) => {
                             let _ = tx.send(RefreshEvent::Completed {
                                 generation: gen,
@@ -10926,7 +10952,7 @@ mod gui {
                         SortColumn::PrivateDns => inst.private_dns.clone().unwrap_or_default(),
                         SortColumn::AmiId => inst.image_id.clone().unwrap_or_default(),
                         SortColumn::InstanceType => inst.instance_type.clone().unwrap_or_default(),
-                        SortColumn::Env => inst.tags.get("MMODAL_ENV").or_else(|| inst.tags.get("mmodal_env")).cloned().unwrap_or_default(),
+                        SortColumn::Env => instance_env(inst).unwrap_or_default(),
                         SortColumn::MatchTag => return 0.0_f32,
                     };
                     text.len() as f32 * char_w + copy_extra + copy_gap + pad
@@ -14030,6 +14056,15 @@ mod gui {
                         ui.separator();
                         if let Some(idx) = dlg.selected {
                             let editable = dlg.rows[idx].identity_editable;
+                            let row_id = dlg.rows[idx].profile_id.clone();
+                            // Held in a local across the grid closure, which
+                            // already borrows `dlg.rows` mutably, then written
+                            // back below. Editable on **every** account,
+                            // bundled included: unlike the name and the region
+                            // this is not in `accounts.json` at all, so there
+                            // is nothing in the binary for an edit to fight.
+                            let mut env_tag =
+                                dlg.env_tags.get(&row_id).cloned().unwrap_or_default();
                             egui::Grid::new("manage_accounts_detail")
                                 .num_columns(2)
                                 .spacing([10.0, 8.0])
@@ -14056,7 +14091,26 @@ mod gui {
                                             .desired_width(280.0),
                                     );
                                     ui.end_row();
+
+                                    ui.label("Env Tag Key:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut env_tag)
+                                            .hint_text("MMODAL_ENV")
+                                            .desired_width(280.0),
+                                    );
+                                    ui.end_row();
                                 });
+                            ui.weak(
+                                "Env Tag Key is the instance tag that names an \
+                                 environment in this account. Leave it blank to use \
+                                 the usual keys (Env, Environment, MMODAL_ENV).",
+                            );
+                            let env_tag = env_tag.trim().to_string();
+                            if env_tag.is_empty() {
+                                dlg.env_tags.remove(&row_id);
+                            } else {
+                                dlg.env_tags.insert(row_id, env_tag);
+                            }
 
                             // Clearing the name box keeps the saved name --
                             // the region box clears its override, so the two
@@ -14378,6 +14432,14 @@ mod gui {
 
             self.config.user_environments = dlg.environments.clone();
 
+            // Changing which tag names an environment changes the environment
+            // of every instance in that account, and both the in-memory and the
+            // on-disk inventory were derived under the old key. Without the
+            // refetch below the user changes the key, presses Save, and nothing
+            // whatsoever happens on screen.
+            let env_tags_changed = dlg.env_tags != self.config.profile_env_tags;
+            self.config.profile_env_tags = dlg.env_tags.clone();
+
             // The working copy, so an **Ask again** takes effect and a Cancel
             // discards it -- the same contract as every other field here. An id
             // taken off this list becomes new again, so the next discovery scan
@@ -14408,6 +14470,12 @@ mod gui {
                 return;
             }
             self.log_info("manage accounts: saved");
+            if env_tags_changed {
+                self.log_info(
+                    "manage accounts: environment tag key changed -> refreshing inventory",
+                );
+                self.refresh_all_authenticated(true);
+            }
             if blank_names.is_empty() && !restored.is_empty() {
                 // Said out loud: the effect of **Ask again** is a window that
                 // appears seconds later, and a Save that reports only
@@ -14527,10 +14595,23 @@ mod gui {
                                             .desired_width(280.0),
                                     );
                                     ui.end_row();
+
+                                    ui.label("Env Tag Key:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut wiz.steps[idx].env_tag)
+                                            .hint_text("MMODAL_ENV")
+                                            .desired_width(280.0),
+                                    );
+                                    ui.end_row();
                                 });
                             ui.weak(
                                 "Leave Region blank to let the app work it out from your \
                                  AWS config.",
+                            );
+                            ui.weak(
+                                "Env Tag Key is the instance tag that names an \
+                                 environment in this account. Leave it blank to use \
+                                 the usual keys (Env, Environment, MMODAL_ENV).",
                             );
 
                             ui.add_space(6.0);
@@ -14826,6 +14907,14 @@ mod gui {
             ec2_manager::accounts::sort_profiles(&mut self.config.profiles);
 
             self.config.user_environments.extend(outcome.environments);
+            // Changing which tag names an environment changes the environment of
+            // every instance in that account, and any cached inventory was
+            // derived under the old key -- so the refresh below is what makes a
+            // typed key visible rather than silently correct at the next fetch.
+            let env_tags_changed = !outcome.env_tags.is_empty();
+            for (id, tag) in outcome.env_tags {
+                self.config.profile_env_tags.insert(id, tag);
+            }
             for id in &outcome.dismissed {
                 if !self.config.accounts_dismissed.contains(id) {
                     self.config.accounts_dismissed.push(id.clone());
@@ -14851,6 +14940,12 @@ mod gui {
                 outcome.added.len(),
                 outcome.dismissed.len()
             ));
+            if env_tags_changed {
+                self.log_info(
+                    "discovery: environment tag key set -> refreshing inventory",
+                );
+                self.refresh_all_authenticated(true);
+            }
         }
 
         /// Render the "File Browser Defaults" modal, if open. This is a
@@ -24892,8 +24987,8 @@ mod gui {
                                         da.to_ascii_lowercase().cmp(&db.to_ascii_lowercase())
                                     }
                                     SortColumn::Env => {
-                                        let ea = a.tags.get("MMODAL_ENV").or_else(|| a.tags.get("mmodal_env")).map(|s| s.as_str()).unwrap_or("");
-                                        let eb = b.tags.get("MMODAL_ENV").or_else(|| b.tags.get("mmodal_env")).map(|s| s.as_str()).unwrap_or("");
+                                        let ea = instance_env(a).unwrap_or_default();
+                                        let eb = instance_env(b).unwrap_or_default();
                                         ea.to_ascii_lowercase().cmp(&eb.to_ascii_lowercase())
                                     }
                                     SortColumn::InstanceType => {
@@ -25078,10 +25173,7 @@ mod gui {
                             row_double_clicked |= resp_itype.double_clicked();
                             row_hovered |= resp_itype.hovered();
 
-                            let env_val = instance.tags.get("MMODAL_ENV")
-                                .or_else(|| instance.tags.get("mmodal_env"))
-                                .cloned()
-                                .unwrap_or_default();
+                            let env_val = instance_env(instance).unwrap_or_default();
                             let resp_env = ui.allocate_ui_with_layout(
                                 egui::vec2(cw(SortColumn::Env), 18.0),
                                 egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
@@ -32526,6 +32618,7 @@ mod gui {
                                     selected: None,
                                     environments: self.config.user_environments.clone(),
                                     colors: self.config.account_colors.clone(),
+                                    env_tags: self.config.profile_env_tags.clone(),
                                     reset_colors: HashSet::new(),
                                     error: None,
                                     new_env_name: String::new(),
@@ -36509,6 +36602,10 @@ mod gui {
         /// would outrank the environment and `~/.aws/config` unasked.
         region: String,
         color: Option<String>,
+        /// The instance tag key that names an environment in this account.
+        /// Blank means the default chain -- the global `env_keys` list and then
+        /// `MMODAL_ENV` -- which is what every account did before this existed.
+        env_tag: String,
         environments: Vec<UserEnvironment>,
         decision: StepDecision,
     }
@@ -36519,6 +36616,10 @@ mod gui {
         added: Vec<ProfileConfig>,
         environments: Vec<UserEnvironment>,
         dismissed: Vec<String>,
+        /// Per-account environment tag keys, for the accounts being added.
+        /// Only non-blank ones appear: blank is the default chain, and storing
+        /// it would write a `profile_env_tag.<id>=` line that means nothing.
+        env_tags: BTreeMap<String, String>,
     }
 
     /// Whether a credentials change should raise the discovery wizard.
@@ -36556,6 +36657,7 @@ mod gui {
                     .unwrap_or_else(|| id.clone()),
                 region: String::new(),
                 color: None,
+                env_tag: String::new(),
                 environments: Vec::new(),
                 decision: StepDecision::Add,
             })
@@ -36598,6 +36700,11 @@ mod gui {
                         color: step.color.clone(),
                     });
                     out.environments.extend(step.environments.iter().cloned());
+                    let env_tag = step.env_tag.trim();
+                    if !env_tag.is_empty() {
+                        out.env_tags
+                            .insert(step.account_id.clone(), env_tag.to_string());
+                    }
                 }
                 StepDecision::NotNow => {}
                 StepDecision::NeverAsk => out.dismissed.push(step.account_id.clone()),
@@ -37246,12 +37353,25 @@ mod gui {
         }
     }
 
-    /// Extract the MMODAL_ENV tag value from an instance.
+    /// The instance's environment.
+    ///
+    /// One resolution site. Which tag key names an environment is chosen per
+    /// account by `AppConfig::env_tag_keys_for` and applied at parse time by
+    /// `inventory::derive_fields`, where the account is unambiguous -- so
+    /// every caller here reads a field instead of carrying a key of its own.
+    ///
+    /// This shipped as five separate hardcoded `MMODAL_ENV` lookups: this
+    /// function plus four sites that bypassed it with their own copy, the last
+    /// of which arrived long after the first three. That is why
+    /// `nothing_reads_the_env_tag_key_directly_any_more` pins it rather than
+    /// trusting a convention.
     fn instance_env(instance: &Instance) -> Option<String> {
-        instance.tags.get("MMODAL_ENV")
-            .or_else(|| instance.tags.get("mmodal_env"))
-            .filter(|v| !v.trim().is_empty())
-            .map(|v| v.trim().to_string())
+        instance
+            .env
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
     }
 
     /// Generate dark-to-light shades of the base color for multiple environments.
@@ -47013,6 +47133,29 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert_eq!(Ec2GuiApp::instance_label(&blank), "i-0abc");
         }
 
+        /// The whole point of Task 1: one resolution site, no bypassing copies.
+        /// This shipped as five separate hardcoded lookups and grew by one on
+        /// its own, which is the argument for pinning it rather than trusting
+        /// a convention.
+        #[test]
+        fn nothing_reads_the_env_tag_key_directly_any_more() {
+            let src = include_str!("ec2_manager_gui.rs");
+            // Assembled, not written out: a literal here would match this very
+            // test. Same stance `the_probe_script_changes_nothing_on_the_box`
+            // and `nothing_here_ever_calls_reboot_instances` take. Comments are
+            // skipped -- the prose above names the key deliberately.
+            let needle = format!("tags.get(\"{}\")", "MMODAL_ENV");
+            let offenders: Vec<&str> = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//") && l.contains(&needle))
+                .collect();
+            assert!(
+                offenders.is_empty(),
+                "read the environment through `instance.env`, which resolves the \
+                 account's own tag key: {offenders:?}"
+            );
+        }
+
         /// Restart is a stop and a start. `ec2 reboot-instances` keeps the
         /// same underlying host and never reports `stopped`, so it is not
         /// what was asked for and must not creep in as a "simplification".
@@ -50055,6 +50198,22 @@ fed_expire = 4000000000
             let out = apply_discovery(&steps);
             assert_eq!(out.environments.len(), 1);
             assert_eq!(out.environments[0].name, "SBX");
+        }
+
+        /// An environment tag key typed on the account's page reaches the
+        /// outcome, trimmed -- and a blank one records nothing, because blank
+        /// means the default chain and a stored `profile_env_tag.<id>=` line
+        /// would say nothing at all.
+        #[test]
+        fn a_tag_key_typed_in_the_wizard_reaches_the_outcome() {
+            let mut steps = discovery_steps(&["111".to_string()], WIZ_FILE);
+            steps[0].decision = StepDecision::Add;
+            steps[0].env_tag = "  Stage  ".to_string();
+            let out = apply_discovery(&steps);
+            assert_eq!(out.env_tags.get("111").map(String::as_str), Some("Stage"));
+
+            steps[0].env_tag = "   ".to_string();
+            assert!(apply_discovery(&steps).env_tags.is_empty());
         }
 
         /// A colour chosen on the account's page reaches the profile that

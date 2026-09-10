@@ -153,7 +153,12 @@ fn run() -> Result<()> {
             fetched_at: SystemTime::now(),
         }
     } else {
-        load_inventory(&context, &config.tag_mapping, options.refresh)?
+        load_inventory(
+            &context,
+            &config.tag_mapping,
+            &config.env_tag_keys_for(context.account_id.as_deref().unwrap_or_default()),
+            options.refresh,
+        )?
     };
 
     if let Some(instance_id) = &options.favorite_instance_id {
@@ -862,7 +867,12 @@ fn run_interactive_shell(
 
         let force_refresh = line.eq_ignore_ascii_case("refresh");
         if line.eq_ignore_ascii_case("list") || force_refresh {
-            let inventory = load_inventory(context, &config.tag_mapping, force_refresh)?;
+            let inventory = load_inventory(
+                context,
+                &config.tag_mapping,
+                &config.env_tag_keys_for(context.account_id.as_deref().unwrap_or_default()),
+                force_refresh,
+            )?;
             let filtered = apply_filters(
                 &inventory.instances,
                 &Filters {
@@ -882,7 +892,12 @@ fn run_interactive_shell(
                 continue;
             }
 
-            let inventory = load_inventory(context, &config.tag_mapping, false)?;
+            let inventory = load_inventory(
+                context,
+                &config.tag_mapping,
+                &config.env_tag_keys_for(context.account_id.as_deref().unwrap_or_default()),
+                false,
+            )?;
             let filtered = apply_filters(
                 &inventory.instances,
                 &Filters {
@@ -960,7 +975,12 @@ fn run_interactive_shell(
                 .and_then(|v| v.parse::<u16>().ok())
                 .unwrap_or(22);
 
-            let inventory = load_inventory(context, &config.tag_mapping, false)?;
+            let inventory = load_inventory(
+                context,
+                &config.tag_mapping,
+                &config.env_tag_keys_for(context.account_id.as_deref().unwrap_or_default()),
+                false,
+            )?;
             let Some(instance) = find_instance(&inventory.instances, instance_id) else {
                 println!("instance not found: {instance_id}");
                 continue;

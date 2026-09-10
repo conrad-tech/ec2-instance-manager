@@ -2,7 +2,7 @@ use std::time::SystemTime;
 
 use crate::models::{Instance, Inventory, TagMapping};
 
-pub fn generate_inventory(_region: &str, mapping: &TagMapping) -> Inventory {
+pub fn generate_inventory(_region: &str, mapping: &TagMapping, env_keys: &[String]) -> Inventory {
     let mut instances = vec![
         make_instance(
             "i-sim0001",
@@ -103,7 +103,7 @@ pub fn generate_inventory(_region: &str, mapping: &TagMapping) -> Inventory {
     ];
 
     for instance in &mut instances {
-        derive_fields(instance, mapping);
+        derive_fields(instance, mapping, env_keys);
     }
 
     Inventory {
@@ -167,9 +167,13 @@ fn make_instance(
     instance
 }
 
-fn derive_fields(instance: &mut Instance, mapping: &TagMapping) {
+fn derive_fields(instance: &mut Instance, mapping: &TagMapping, env_keys: &[String]) {
     instance.name = instance.tags.get("Name").cloned();
-    instance.env = first_tag(&instance.tags, &mapping.env_keys);
+    // Resolved from the account's own key chain, exactly as `inventory.rs`
+    // does. Sim exists so behaviour can be trusted without AWS, and simulated
+    // inventory resolving environments by a different rule than live inventory
+    // would break that promise.
+    instance.env = first_tag(&instance.tags, env_keys);
     instance.app_service = first_tag(&instance.tags, &mapping.app_keys);
     instance.role = first_tag(&instance.tags, &mapping.role_keys);
     instance.team_owner = first_tag(&instance.tags, &mapping.team_keys);
@@ -198,7 +202,11 @@ mod tests {
 
     #[test]
     fn sim_inventory_has_instances() {
-        let inv = generate_inventory("us-east-1", &TagMapping::default());
+        let inv = generate_inventory(
+            "us-east-1",
+            &TagMapping::default(),
+            &["MMODAL_ENV".to_string()],
+        );
         assert_eq!(inv.instances.len(), 6);
         assert!(inv.instances.iter().any(|i| i.ssm_managed));
         assert!(inv.instances.iter().any(|i| i.state == "stopped"));

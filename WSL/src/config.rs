@@ -41,6 +41,14 @@ pub struct AppConfig {
     /// the merge, so a bundled account can be moved without editing the
     /// asset. Absent means "wherever the bundled list put it".
     pub profile_orders: BTreeMap<String, u32>,
+    /// The instance tag key that names an environment, per account.
+    ///
+    /// `MMODAL_ENV` is this organisation's convention, but an account outside
+    /// the usual set may tag under `Environment`, `env`, or anything else --
+    /// and until this existed such an account showed **no** environments at
+    /// all, silently. Absent means fall through to the global `env_keys` list
+    /// and then `MMODAL_ENV`, which is exactly today's behaviour.
+    pub profile_env_tags: BTreeMap<String, String>,
     pub reset_filter_on_profile_switch: bool,
     /// Environment names excluded from the color legend
     pub excluded_envs: Vec<String>,
@@ -161,6 +169,7 @@ impl Default for AppConfig {
             account_colors_enabled: true,
             account_colors: BTreeMap::new(),
             profile_orders: BTreeMap::new(),
+            profile_env_tags: BTreeMap::new(),
             reset_filter_on_profile_switch: true,
             excluded_envs: Vec::new(),
             accounts_dismissed: Vec::new(),
@@ -257,6 +266,32 @@ impl AppConfig {
 
         fs::write(path, self.to_text())?;
         Ok(())
+    }
+
+    /// The tag keys to try, in order, when reading an instance's environment
+    /// in this account.
+    ///
+    /// The account's own key first (most specific), then the global `env_keys`
+    /// list, then `MMODAL_ENV` last so an account that configures nothing
+    /// behaves exactly as it did before this existed. Deduped, so a configured
+    /// key already in the global list is not probed twice; blanks dropped,
+    /// since a blank key would match a blank tag name.
+    pub fn env_tag_keys_for(&self, account_id: &str) -> Vec<String> {
+        let mut keys: Vec<String> = Vec::new();
+        let mut push = |k: &str| {
+            let k = k.trim();
+            if !k.is_empty() && !keys.iter().any(|e| e == k) {
+                keys.push(k.to_string());
+            }
+        };
+        if let Some(own) = self.profile_env_tags.get(account_id) {
+            push(own);
+        }
+        for k in &self.tag_mapping.env_keys {
+            push(k);
+        }
+        push("MMODAL_ENV");
+        keys
     }
 
     pub fn upsert_account_region(&mut self, account_id: &str, region: &str) {
@@ -826,6 +861,14 @@ impl AppConfig {
                 continue;
             }
 
+            if let Some(rest) = key.strip_prefix("profile_env_tag.") {
+                if !rest.is_empty() && !value.is_empty() {
+                    cfg.profile_env_tags
+                        .insert(rest.to_string(), value.to_string());
+                }
+                continue;
+            }
+
             if let Some(rest) = key.strip_prefix("account_region.") {
                 if !rest.is_empty() && !value.is_empty() {
                     cfg.account_regions
@@ -1271,6 +1314,10 @@ impl AppConfig {
 
         for (profile, order) in &self.profile_orders {
             lines.push(format!("profile_order.{profile}={order}"));
+        }
+
+        for (profile, tag) in &self.profile_env_tags {
+            lines.push(format!("profile_env_tag.{profile}={tag}"));
         }
 
         for (account, region) in &self.account_regions {
@@ -2121,6 +2168,55 @@ mod tests {
         let text = cfg.to_text();
         let again = AppConfig::parse(&text);
         assert_eq!(again.profile_orders, cfg.profile_orders);
+    }
+
+    #[test]
+    fn profile_env_tag_round_trips_through_config_text() {
+        let cfg = AppConfig::parse("profile_env_tag.999=Environment\n");
+        assert_eq!(cfg.profile_env_tags.get("999").map(String::as_str), Some("Environment"));
+        let again = AppConfig::parse(&cfg.to_text());
+        assert_eq!(again.profile_env_tags, cfg.profile_env_tags);
+    }
+
+    /// The account's own key comes first, then the global list, then
+    /// MMODAL_ENV -- so an account that configures nothing behaves exactly as
+    /// it does today.
+    #[test]
+    fn env_tag_keys_put_the_account_first_then_the_global_list_then_mmodal_env() {
+        let mut cfg = AppConfig::default();
+        cfg.profile_env_tags.insert("999".to_string(), "Stage".to_string());
+        let keys = cfg.env_tag_keys_for("999");
+        assert_eq!(keys.first().map(String::as_str), Some("Stage"));
+        assert!(keys.iter().any(|k| k == "Env"), "the global list still applies");
+        assert_eq!(keys.last().map(String::as_str), Some("MMODAL_ENV"));
+    }
+
+    /// An account with no configured key keeps exactly today's behaviour.
+    #[test]
+    fn an_unconfigured_account_still_ends_at_mmodal_env() {
+        let cfg = AppConfig::default();
+        let keys = cfg.env_tag_keys_for("111");
+        assert_eq!(keys.last().map(String::as_str), Some("MMODAL_ENV"));
+        assert!(!keys.is_empty());
+    }
+
+    /// A blank configured key is dropped rather than matching a blank tag.
+    #[test]
+    fn a_blank_configured_key_is_ignored() {
+        let mut cfg = AppConfig::default();
+        cfg.profile_env_tags.insert("999".to_string(), "   ".to_string());
+        let keys = cfg.env_tag_keys_for("999");
+        assert!(!keys.iter().any(|k| k.trim().is_empty()));
+    }
+
+    /// No duplicates, so a configured key that is already in the global list
+    /// is not probed twice.
+    #[test]
+    fn the_key_list_has_no_duplicates() {
+        let mut cfg = AppConfig::default();
+        cfg.profile_env_tags.insert("999".to_string(), "Env".to_string());
+        let keys = cfg.env_tag_keys_for("999");
+        assert_eq!(keys.iter().filter(|k| *k == "Env").count(), 1);
     }
 
     /// A non-numeric or blank order is dropped rather than defaulting to 0 --
