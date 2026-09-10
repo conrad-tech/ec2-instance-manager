@@ -1301,6 +1301,14 @@ mod gui {
         /// would be added to whichever account was clicked next.
         new_env_name: String,
         new_env_vault: String,
+        /// Working copy of `accounts_dismissed`, so **Ask again** is a real
+        /// edit that Cancel discards like every other field here.
+        ///
+        /// This section is the only way back from "Never ask again": these ids
+        /// are in no `config.profiles` row, so nothing else in this dialog can
+        /// reach them, and until it existed one misclick made an account
+        /// unreachable without hand-editing `config.ini`.
+        dismissed: Vec<String>,
     }
 
     /// Modal state for the "New accounts found" wizard.
@@ -8322,10 +8330,27 @@ mod gui {
         manage_accounts_dialog: Option<ManageAccountsDialog>,
         /// Active "New accounts found" wizard, if any.
         discovery_wizard: Option<DiscoveryWizard>,
-        /// When a credentials change was noticed, so discovery can wait out
+        /// When a discovery scan became due, so it can wait out
         /// `PROFILE_CHANGE_DEBOUNCE` before reading a file `fed up` may still
         /// be writing.
+        ///
+        /// **Armed at startup as well as on a credentials change**, and the
+        /// launch arming is the one that matters most. `App::new` seeds
+        /// `last_credentials_mtime` from the file's live mtime, so the mtime
+        /// path can only ever fire on a *later* write -- and `fed_auth` ships
+        /// disabled, so the app never writes that file itself. Armed only on
+        /// change, the whole feature was invisible on the common path
+        /// (install, launch with an already-populated `~/.aws/credentials`,
+        /// nothing happens), and **`Not now` never meant "offered again next
+        /// launch"** the way `StepDecision::NotNow`, the plan and the spec all
+        /// promise it does. The launch scan gets the same debounce settling as
+        /// the mtime path, and `discovery_should_open` already returns false
+        /// silently when nothing is new, so arming it costs one file read per
+        /// run.
         pending_discovery_since: Option<Instant>,
+        /// The last reason discovery could not read the credentials file, so
+        /// the warning is reported once per reason rather than once per retry.
+        last_discovery_warning: Option<String>,
         /// Whether the "File Browser Defaults" modal is open.
         show_file_browser_defaults: bool,
         /// When set, the Edit menu briefly flashes to draw the user's
@@ -9119,7 +9144,11 @@ mod gui {
                 settings_pem_dialog: None,
                 manage_accounts_dialog: None,
                 discovery_wizard: None,
-                pending_discovery_since: None,
+                // Armed here, not only on an mtime change -- see the field's
+                // own doc comment. Without this the launch scan never runs
+                // and `Not now` is permanent.
+                pending_discovery_since: Some(Instant::now()),
+                last_discovery_warning: None,
                 show_file_browser_defaults: false,
                 edit_menu_flash_start: None,
                 create_user_dialog: None,
@@ -9623,22 +9652,62 @@ mod gui {
             }
         }
 
-        /// Open the discovery wizard once a credentials change has settled.
-        fn poll_account_discovery(&mut self) {
+        /// Open the discovery wizard once a scan has become due and settled.
+        fn poll_account_discovery(&mut self, ctx: &egui::Context) {
             let Some(since) = self.pending_discovery_since else {
                 return;
             };
-            if since.elapsed() < PROFILE_CHANGE_DEBOUNCE {
+            let elapsed = since.elapsed();
+            if elapsed < PROFILE_CHANGE_DEBOUNCE {
+                // egui only redraws when something happens, so a debounce
+                // merely *checked* at render fires whenever the next frame
+                // happens to occur -- and at launch there may not be one for a
+                // long while. Ask for the frame the debounce falls due on.
+                // Same mistake the tunnel status banner already made and fixed.
+                ctx.request_repaint_after(PROFILE_CHANGE_DEBOUNCE - elapsed);
                 return;
             }
             self.pending_discovery_since = None;
 
             let Some(path) = credentials::credentials_path() else {
+                // Not silent: three different reasons for nothing happening,
+                // indistinguishable from outside, is the reaper's dark-states
+                // failure. Nothing re-arms this one -- `credentials_mtime`
+                // needs the same path -- so it is said once, which is right
+                // for a condition that cannot change without a restart.
+                self.log_warn(
+                    "discovery: skipped -- no home directory, so \
+                     ~/.aws/credentials cannot be located",
+                );
                 return;
             };
-            let Ok(content) = std::fs::read_to_string(path) else {
-                return;
+            let content = match std::fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(err) => {
+                    // Re-armed rather than left cleared: an unreadable
+                    // credentials file is usually transient (`fed up` rewrites
+                    // it wholesale), and with the flag cleared nothing ever
+                    // retried. Re-armed *with a fresh instant* rather than
+                    // left set, so the retry is one debounce away instead of
+                    // once per frame -- this runs every frame, and a
+                    // permanently unreadable file would otherwise warn
+                    // thousands of times a minute.
+                    self.pending_discovery_since = Some(Instant::now());
+                    let warning = format!(
+                        "discovery: could not read {}: {err}",
+                        path.display()
+                    );
+                    // Said once per reason, not once per retry -- the same
+                    // rule `report_reaper_reason_change` keeps for the same
+                    // reason. A file that stays unreadable says so once.
+                    if self.last_discovery_warning.as_deref() != Some(warning.as_str()) {
+                        self.log_warn(warning.clone());
+                        self.last_discovery_warning = Some(warning);
+                    }
+                    return;
+                }
             };
+            self.last_discovery_warning = None;
             let discovered = credentials::discovered_account_ids(&content);
             let new_ids = ec2_manager::accounts::new_accounts(
                 &discovered,
@@ -9657,19 +9726,27 @@ mod gui {
             ) {
                 return;
             }
-            let default_region = self
-                .config
-                .profiles
-                .iter()
-                .filter_map(|p| p.region.clone())
-                .next()
-                .or_else(|| self.config.default_region.clone())
-                .unwrap_or_default();
+            // Region is deliberately left **blank**, not prefilled from
+            // whatever another account happens to use. The box is saved as
+            // `ProfileConfig.region`, which is the *top* of `resolve_region`'s
+            // chain -- above `AWS_REGION`, `AWS_DEFAULT_REGION` and
+            // `~/.aws/config`. Prefilling turned that chain's soft fallback
+            // into a hard override the user only had to accept: a machine with
+            // `AWS_REGION=eu-west-1` and a first profile in `us-east-1` showed
+            // `us-east-1`, and the account was pinned to the wrong region by a
+            // default nobody chose. Blank leaves `region: None`, so the chain
+            // applies, and the weak hint under the box says so.
+            let steps = discovery_steps(&new_ids, &content);
+            // Built here rather than on entry to the order page: the order
+            // page lists every account, and the per-account colour swatch
+            // needs the projected position to preview the palette colour the
+            // account will actually get.
+            let rows = self.discovery_order_rows(&steps);
             self.discovery_wizard = Some(DiscoveryWizard {
-                steps: discovery_steps(&new_ids, &content, &default_region),
+                steps,
                 current: 0,
                 ordering: false,
-                rows: Vec::new(),
+                rows,
                 new_env_name: String::new(),
                 new_env_vault: String::new(),
                 error: None,
@@ -14144,6 +14221,37 @@ mod gui {
                             ui.weak("Select an account to edit it.");
                         }
 
+                        // Hidden entirely when nothing is dismissed -- a
+                        // permanently empty heading is noise, and this is the
+                        // ordinary state.
+                        if !dlg.dismissed.is_empty() {
+                            ui.separator();
+                            ui.label("Dismissed accounts:");
+                            ui.weak(
+                                "These are not offered when new accounts are found. \
+                                 Ask again puts one back.",
+                            );
+                            let mut ask_again: Option<String> = None;
+                            for id in &dlg.dismissed {
+                                ui.horizontal(|ui| {
+                                    ui.monospace(id);
+                                    if ui
+                                        .button("Ask again")
+                                        .on_hover_text(
+                                            "Offer this account again the next time \
+                                             discovery runs",
+                                        )
+                                        .clicked()
+                                    {
+                                        ask_again = Some(id.clone());
+                                    }
+                                });
+                            }
+                            if let Some(id) = ask_again {
+                                dlg.dismissed = undismiss_account(&dlg.dismissed, &id);
+                            }
+                        }
+
                         if let Some(err) = &dlg.error {
                             ui.add_space(4.0);
                             note_label(ui, egui::Color32::from_rgb(220, 80, 80), err);
@@ -14270,6 +14378,29 @@ mod gui {
 
             self.config.user_environments = dlg.environments.clone();
 
+            // The working copy, so an **Ask again** takes effect and a Cancel
+            // discards it -- the same contract as every other field here. An id
+            // taken off this list becomes new again, so the next discovery scan
+            // offers it: `accounts::new_accounts` reads nothing else.
+            let restored: Vec<String> = self
+                .config
+                .accounts_dismissed
+                .iter()
+                .filter(|id| !dlg.dismissed.contains(id))
+                .cloned()
+                .collect();
+            self.config.accounts_dismissed = dlg.dismissed.clone();
+            if !restored.is_empty() {
+                self.log_info(format!(
+                    "manage accounts: will ask again about {}",
+                    restored.join(", ")
+                ));
+                // Re-arm discovery so the account comes back now rather than at
+                // the next launch -- a button whose effect is invisible until a
+                // restart reads as a button that did nothing.
+                self.pending_discovery_since = Some(Instant::now());
+            }
+
             self.rebuild_account_colors();
             if let Err(err) = self.config.save() {
                 self.message = format!("error: manage accounts not saved: {err}");
@@ -14277,7 +14408,15 @@ mod gui {
                 return;
             }
             self.log_info("manage accounts: saved");
-            if blank_names.is_empty() {
+            if blank_names.is_empty() && !restored.is_empty() {
+                // Said out loud: the effect of **Ask again** is a window that
+                // appears seconds later, and a Save that reports only
+                // "Accounts saved." reads as the button having done nothing.
+                self.message = format!(
+                    "Accounts saved. {} will be offered again.",
+                    restored.join(", ")
+                );
+            } else if blank_names.is_empty() {
                 self.message = "Accounts saved.".to_string();
             } else {
                 self.message = format!(
@@ -14325,9 +14464,13 @@ mod gui {
                     // the scar CLAUDE.md records for the Jira ticket window.
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         if wiz.ordering {
+                            // No drag handling exists here, and there is none
+                            // in Manage Accounts either -- the two lists use
+                            // the same ^/v buttons, so they say the same thing.
                             ui.label(
-                                "Drag the new accounts into the order you want them \
-                                 listed in.",
+                                "Order decides how accounts appear in the legend and \
+                                 every dropdown. The accounts being added are listed \
+                                 alongside the ones you already have.",
                             );
                             ui.separator();
                             for idx in 0..wiz.rows.len() {
@@ -14393,11 +14536,10 @@ mod gui {
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
                                 ui.label("Colour:");
-                                let shown = wiz.steps[idx]
-                                    .color
-                                    .as_deref()
-                                    .and_then(parse_hex_color)
-                                    .unwrap_or(egui::Color32::GRAY);
+                                // The palette colour this account will actually
+                                // get, not grey -- see `discovery_swatch_color`.
+                                let shown =
+                                    discovery_swatch_color(&wiz.steps[idx], &wiz.rows);
                                 let mut rgb = [
                                     shown.r() as f32 / 255.0,
                                     shown.g() as f32 / 255.0,
@@ -14550,12 +14692,27 @@ mod gui {
                 wiz.error = None;
                 if wiz.current + 1 >= wiz.steps.len() {
                     wiz.ordering = true;
-                    // Only rebuild when the set of accounts being added has
-                    // actually changed -- otherwise a Back into an account
-                    // page and a Next back out would silently throw away a
-                    // manual reorder.
-                    if discovery_rows_need_rebuild(&wiz.rows, &wiz.steps) {
+                    // Only rebuild when the set of accounts the list should
+                    // hold has actually changed -- otherwise a Back into an
+                    // account page and a Next back out would silently throw
+                    // away a manual reorder.
+                    let existing_ids: Vec<String> = self
+                        .config
+                        .profiles
+                        .iter()
+                        .map(|p| p.profile_id.clone())
+                        .collect();
+                    if discovery_rows_need_rebuild(&wiz.rows, &wiz.steps, &existing_ids) {
                         wiz.rows = self.discovery_order_rows(&wiz.steps);
+                    } else {
+                        // The arrangement is kept, but a name edited since the
+                        // rows were built has to catch up or the list is
+                        // labelled with a name the user has just changed.
+                        refresh_discovery_row_labels(
+                            &mut wiz.rows,
+                            &wiz.steps,
+                            &self.config.profiles,
+                        );
                     }
                 } else {
                     wiz.current += 1;
@@ -14584,35 +14741,24 @@ mod gui {
             self.discovery_wizard = Some(wiz);
         }
 
-        /// Order rows for the wizard's last page: the accounts about to be
-        /// added, in the order they will be listed, appended after everything
-        /// already configured.
+        /// Order rows for the wizard's last page: **every** account, bundled
+        /// and discovered together.
         fn discovery_order_rows(&self, steps: &[DiscoveryStep]) -> Vec<ManageAccountRow> {
-            steps
-                .iter()
-                .filter(|s| s.decision == StepDecision::Add)
-                .map(|s| ManageAccountRow {
-                    profile_id: s.account_id.clone(),
-                    display_name: s.label.trim().to_string(),
-                    region: s.region.trim().to_string(),
-                    identity_editable: true,
-                    arrangement_editable: true,
-                })
-                .collect()
+            let bundled_ids: Vec<String> = ec2_manager::accounts::load_accounts()
+                .into_iter()
+                .map(|p| p.profile_id)
+                .collect();
+            discovery_order_rows_from(&self.config.profiles, &bundled_ids, steps)
         }
 
         /// Commit a finished wizard.
         ///
-        /// Ordering starts after every account already configured, so adding
-        /// accounts never reshuffles the ones already on screen -- the same
-        /// reasoning that makes `merge_profiles` append user-only rows.
+        /// The order page lists **every** account, so the order is stamped from
+        /// each row's index in that whole list -- the same shape
+        /// `apply_manage_accounts` uses, and the reason there is no "where do
+        /// the new ones start counting from" question left to get wrong.
         fn apply_discovery_wizard(&mut self, wiz: &DiscoveryWizard) {
             let outcome = apply_discovery(&wiz.steps);
-
-            // Computed before the push loop below, off the order already
-            // stamped on the existing profiles -- see `discovery_next_order`
-            // for why `profile_orders` alone is the wrong source.
-            let mut next_order = discovery_next_order(&self.config.profiles);
 
             for profile in &outcome.added {
                 if !self
@@ -14624,21 +14770,51 @@ mod gui {
                     self.config.profiles.push(profile.clone());
                 }
             }
-            // The wizard's own order page decides the relative order of the
-            // new accounts; everything already configured keeps its place.
-            for row in &wiz.rows {
+
+            self.config.account_colors =
+                discovery_account_colors(&self.config.account_colors, &outcome.added);
+
+            // Freeze every account's current colour before the resort, exactly
+            // as `apply_manage_accounts` does. `build_account_color_map` assigns
+            // palette colours **by index in sorted order**, so saving an order
+            // without freezing repaints every account that never chose one --
+            // and that is not theoretical here: a profile with
+            // `sort_order: None` sorts to `u32::MAX` and therefore *after* a
+            // newly added account, so its palette index shifts. That covers an
+            // `accounts.json` entry that omits `sort_order` (it is `Option`), a
+            // hand-edited `profile_name.*` with no `profile_order.*`, and open
+            // connection tabs on unconfigured accounts. Two sibling save paths
+            // must not disagree about this.
+            //
+            // Rows are built from `config.profiles` rather than from `wiz.rows`
+            // so the freeze covers every account the config knows about, not
+            // only the ones the order page happened to list. Nothing is being
+            // reset here, so the reset set is empty; the colours just chosen are
+            // already in `account_colors` and pass through untouched.
+            let freeze_rows = manage_accounts_rows(&self.config.profiles, &[]);
+            self.config.account_colors = frozen_colors(
+                &freeze_rows,
+                &self.account_color_map,
+                &self.config.account_colors,
+                &HashSet::new(),
+            );
+
+            // The order page's whole arrangement, by index -- every row, not
+            // only the new ones. A partial map would leave the untouched
+            // accounts falling back to their bundled `sort_order` and
+            // interleaving with the explicit positions.
+            for (idx, row) in wiz.rows.iter().enumerate() {
                 self.config
                     .profile_orders
-                    .insert(row.profile_id.clone(), next_order);
+                    .insert(row.profile_id.clone(), idx as u32);
                 if let Some(p) = self
                     .config
                     .profiles
                     .iter_mut()
                     .find(|p| p.profile_id == row.profile_id)
                 {
-                    p.sort_order = Some(next_order);
+                    p.sort_order = Some(idx as u32);
                 }
-                next_order += 1;
             }
 
             // The invariant: `config.profiles` is always in display order,
@@ -14662,9 +14838,13 @@ mod gui {
                 self.log_error(format!("discovery: save failed: {err}"));
                 return;
             }
-            self.message = format!(
-                "Added {} account(s).",
-                outcome.added.len()
+            // Both counts, not just the added one. Dismissing three accounts
+            // and adding none reported "Added 0 account(s)." -- a message that
+            // says nothing happened, about a permanent decision. The log line
+            // below has had both counts all along.
+            self.message = discovery_result_message(
+                outcome.added.len(),
+                outcome.dismissed.len(),
             );
             self.log_info(format!(
                 "discovery: added {}, dismissed {}",
@@ -31925,7 +32105,7 @@ mod gui {
 
                 self.poll_profile_choice_changes();
                 self.poll_credentials_changes();
-                self.poll_account_discovery();
+                self.poll_account_discovery(ctx);
                 self.poll_auth_expiry();
                 // Runs before the credential watcher on the next frame, so a
                 // successful `fed up` is picked up by the existing mtime poll
@@ -32294,7 +32474,30 @@ mod gui {
                                 });
                                 ui.close();
                             }
-                            if ui.button("Manage Accounts...").clicked() {
+                            // The reciprocal of `discovery_should_open`'s
+                            // refusal to raise the wizard over this dialog,
+                            // and for the same stated reason: both edit the
+                            // same stores and each would hold a working copy
+                            // of one thing. Without the guard, a Manage
+                            // Accounts save landing while the wizard was open
+                            // left the wizard's rows naming an account that
+                            // now already exists -- the push was correctly
+                            // skipped, but the stamp loop still overwrote that
+                            // pre-existing account's order, moving a
+                            // configured account to the end and reporting it
+                            // as added.
+                            let wizard_up = self.discovery_wizard.is_some();
+                            if ui
+                                .add_enabled(
+                                    !wizard_up,
+                                    egui::Button::new("Manage Accounts..."),
+                                )
+                                .on_disabled_hover_text(
+                                    "Finish or close the \"New accounts found\" window \
+                                     first -- it edits the same account list.",
+                                )
+                                .clicked()
+                            {
                                 let bundled_ids: Vec<String> =
                                     ec2_manager::accounts::load_accounts()
                                         .into_iter()
@@ -32327,6 +32530,7 @@ mod gui {
                                     error: None,
                                     new_env_name: String::new(),
                                     new_env_vault: String::new(),
+                                    dismissed: self.config.accounts_dismissed.clone(),
                                 });
                                 ui.close();
                             }
@@ -36299,8 +36503,10 @@ mod gui {
         account_id: String,
         /// Prefilled from the credentials section name, editable here.
         label: String,
-        /// Prefilled from whatever the other accounts use. Blank means "let
-        /// `resolve_region` decide", which is a working answer, not a gap.
+        /// Blank by default, meaning "let `resolve_region` decide" -- which is
+        /// a working answer, not a gap. Not prefilled: this becomes
+        /// `ProfileConfig.region`, the top of that chain, so any default here
+        /// would outrank the environment and `~/.aws/config` unasked.
         region: String,
         color: Option<String>,
         environments: Vec<UserEnvironment>,
@@ -36334,18 +36540,21 @@ mod gui {
     /// on their own the first time that account's inventory loads. The editor
     /// here is for what a tag cannot supply: a Vault address, or a name
     /// recorded before any instance carries the tag.
-    fn discovery_steps(
-        new_ids: &[String],
-        content: &str,
-        default_region: &str,
-    ) -> Vec<DiscoveryStep> {
+    ///
+    /// **Region starts blank and there is no default to pass in.** It is saved
+    /// as `ProfileConfig.region`, the *top* of `resolve_region`'s chain, so a
+    /// prefilled value silently outranks `AWS_REGION`,
+    /// `AWS_DEFAULT_REGION` and `~/.aws/config` the moment the user accepts
+    /// the page. Blank keeps the chain in charge, which is a working answer
+    /// rather than a gap.
+    fn discovery_steps(new_ids: &[String], content: &str) -> Vec<DiscoveryStep> {
         new_ids
             .iter()
             .map(|id| DiscoveryStep {
                 account_id: id.clone(),
                 label: credentials::suggested_label(content, id)
                     .unwrap_or_else(|| id.clone()),
-                region: default_region.to_string(),
+                region: String::new(),
                 color: None,
                 environments: Vec::new(),
                 decision: StepDecision::Add,
@@ -36397,48 +36606,193 @@ mod gui {
         out
     }
 
-    /// Where a newly discovered account's `sort_order` should start counting
-    /// from.
+    /// The wizard's order page: **every** account, bundled and discovered
+    /// together, in the order they will be listed.
     ///
-    /// Seeded from the `sort_order` already stamped on `config.profiles`, not
-    /// from `profile_orders`. `profile_orders` is the user's *override* map
-    /// and is empty on a fresh install -- bundled accounts carry `sort_order`
-    /// 1/2/3 straight from `accounts.json` and are never mirrored into
-    /// `profile_orders` until a Manage Accounts save runs. Seeding from that
-    /// map alone computed to 0 on exactly the run that matters most (the
-    /// first one, which is when the poll hook first raises this wizard),
-    /// stamping the new account `sort_order = Some(0)` and putting it
-    /// **before** every existing bundled account.
-    fn discovery_next_order(profiles: &[ProfileConfig]) -> u32 {
-        profiles
-            .iter()
-            .filter_map(|p| p.sort_order)
-            .max()
-            .map(|m| m + 1)
-            .unwrap_or(0)
+    /// The accounts already configured come first, in the order
+    /// `profile_sort_key` currently puts them; the ones being added follow, in
+    /// step order. Filtering this to the discovered accounts alone -- which is
+    /// what shipped -- meant a discovered account could only be ordered
+    /// relative to *other* discovered accounts and always landed at the end,
+    /// while the spec's whole point is that a first run discovering a dozen
+    /// accounts at once must not leave them stuck wherever the merge put them.
+    ///
+    /// It also subsumes the `discovery_next_order` bug it replaces: `sort_order`
+    /// is `Option`, so a site's `accounts.json` may omit it entirely, and
+    /// "highest existing order plus one" then computed 0 against a list of
+    /// `u32::MAX`s and put every discovered account **first**. Order is now
+    /// stamped from each row's index in this whole list, so the existing
+    /// accounts are renumbered from the positions they are actually shown in
+    /// and there is no number to guess.
+    fn discovery_order_rows_from(
+        profiles: &[ProfileConfig],
+        bundled_ids: &[String],
+        steps: &[DiscoveryStep],
+    ) -> Vec<ManageAccountRow> {
+        let mut rows = manage_accounts_rows(profiles, bundled_ids);
+        rows.sort_by(|a, b| {
+            let pa = profiles.iter().find(|p| p.profile_id == a.profile_id);
+            let pb = profiles.iter().find(|p| p.profile_id == b.profile_id);
+            profile_sort_key(pa, &a.profile_id).cmp(&profile_sort_key(pb, &b.profile_id))
+        });
+        for step in steps.iter().filter(|s| s.decision == StepDecision::Add) {
+            // An id already in `profiles` is not pushed twice: Manage Accounts
+            // can have added it while this wizard was open (it no longer can,
+            // but the row set must not depend on that).
+            if rows.iter().any(|r| r.profile_id == step.account_id) {
+                continue;
+            }
+            rows.push(ManageAccountRow {
+                profile_id: step.account_id.clone(),
+                display_name: step.label.trim().to_string(),
+                region: step.region.trim().to_string(),
+                identity_editable: true,
+                arrangement_editable: true,
+            });
+        }
+        rows
     }
 
-    /// Whether the wizard's order page needs to rebuild `rows` from `steps`.
+    /// Whether the wizard's order page needs to rebuild `rows`.
     ///
     /// Recomputing on every entry into the ordering page silently discards a
-    /// manual reorder: go to the order page, drag rows, press Back into an
+    /// manual reorder: go to the order page, move rows, press Back into an
     /// account page, then Next again, and a naive rebuild throws the
-    /// arrangement away with no word. Only the *set* of accounts actually
-    /// being added matters here -- if it hasn't changed since `rows` was
+    /// arrangement away with no word. Only the *set* of accounts the list
+    /// should hold matters here -- the accounts already configured plus the
+    /// ones being added -- so if that set has not changed since `rows` was
     /// built, the order the user chose is kept exactly as they left it.
-    fn discovery_rows_need_rebuild(rows: &[ManageAccountRow], steps: &[DiscoveryStep]) -> bool {
+    fn discovery_rows_need_rebuild(
+        rows: &[ManageAccountRow],
+        steps: &[DiscoveryStep],
+        existing_ids: &[String],
+    ) -> bool {
         if rows.is_empty() {
             return true;
         }
         let mut current: Vec<&str> = rows.iter().map(|r| r.profile_id.as_str()).collect();
-        let mut needed: Vec<&str> = steps
-            .iter()
-            .filter(|s| s.decision == StepDecision::Add)
-            .map(|s| s.account_id.as_str())
-            .collect();
+        let mut needed: Vec<&str> = existing_ids.iter().map(String::as_str).collect();
+        for step in steps.iter().filter(|s| s.decision == StepDecision::Add) {
+            if !needed.contains(&step.account_id.as_str()) {
+                needed.push(step.account_id.as_str());
+            }
+        }
         current.sort_unstable();
         needed.sort_unstable();
         current != needed
+    }
+
+    /// Bring an order row's label and region back in step with where they are
+    /// edited, without touching the arrangement.
+    ///
+    /// An Account Name edited *after* the order page was first built left the
+    /// order page showing the old name -- display only, since the name that
+    /// gets saved comes from the step, but a list labelled with a name the user
+    /// has just changed reads as an edit that did not take. Rebuilding the rows
+    /// would fix the label and discard a manual arrangement, which is the worse
+    /// trade, so the values are refreshed in place and the order is left alone.
+    fn refresh_discovery_row_labels(
+        rows: &mut [ManageAccountRow],
+        steps: &[DiscoveryStep],
+        profiles: &[ProfileConfig],
+    ) {
+        for row in rows.iter_mut() {
+            if let Some(step) = steps.iter().find(|s| s.account_id == row.profile_id) {
+                let label = step.label.trim();
+                row.display_name = if label.is_empty() {
+                    step.account_id.clone()
+                } else {
+                    label.to_string()
+                };
+                row.region = step.region.trim().to_string();
+            } else if let Some(p) = profiles.iter().find(|p| p.profile_id == row.profile_id) {
+                row.display_name = p.display_name.clone();
+                row.region = p.region.clone().unwrap_or_default();
+            }
+        }
+    }
+
+    /// The swatch to show for a discovery step's colour.
+    ///
+    /// An explicit pick wins. Failing that this previews the palette colour the
+    /// account will **actually** get rather than `Color32::GRAY`, which is not
+    /// a colour any account ever ends up with -- and a user who sees grey may
+    /// pick a colour only because grey looks wrong. `build_account_color_map`
+    /// assigns the palette **by index in sorted order**, so the account's
+    /// position in the order list *is* that index; an account not in the list
+    /// yet is previewed as though appended, which is where it would go.
+    fn discovery_swatch_color(
+        step: &DiscoveryStep,
+        rows: &[ManageAccountRow],
+    ) -> egui::Color32 {
+        if let Some(color) = step.color.as_deref().and_then(parse_hex_color) {
+            return color;
+        }
+        let idx = rows
+            .iter()
+            .position(|r| r.profile_id == step.account_id)
+            .unwrap_or(rows.len());
+        let (r, g, b) = ACCOUNT_COLOR_PALETTE[idx % ACCOUNT_COLOR_PALETTE.len()];
+        egui::Color32::from_rgb(r, g, b)
+    }
+
+    /// Take an account id off the "never ask again" list.
+    ///
+    /// **"Never ask again" must not be a one-way door.** Nothing removed an id
+    /// from `accounts_dismissed`, and Manage Accounts renders rows only from
+    /// `config.profiles` and has no Add button -- so one misclick on a button
+    /// sitting beside "Add this account" made that account unreachable without
+    /// hand-editing `config.ini`. This is the same escape hatch
+    /// `clear_vscode_prompt_suppression` and Settings' "Ask which key to use
+    /// again" already exist to provide.
+    fn undismiss_account(dismissed: &[String], id: &str) -> Vec<String> {
+        dismissed.iter().filter(|d| *d != id).cloned().collect()
+    }
+
+    /// The `account_color.<id>` entries a finished wizard must write.
+    ///
+    /// **`ProfileConfig.color` is never persisted**, and setting it was all the
+    /// wizard did: `AppConfig::to_text` writes only `profile_name.*`,
+    /// `profile_account_id.*` and `profile_region.*` for a user profile, and
+    /// `parse` rebuilds every profile with `color: None`. So a colour picked in
+    /// the wizard applied immediately and was gone at the next launch, with no
+    /// word. `config.account_colors` is the store `apply_manage_accounts`
+    /// writes, the one that survives the round trip, and the one
+    /// `build_account_color_map` consults *ahead of* `ProfileConfig.color` --
+    /// `merge_profiles`' own doc comment says exactly this.
+    ///
+    /// An account that chose no colour contributes nothing: it should get the
+    /// palette colour for its position, and `frozen_colors` decides that
+    /// separately.
+    fn discovery_account_colors(
+        existing: &BTreeMap<String, String>,
+        added: &[ProfileConfig],
+    ) -> BTreeMap<String, String> {
+        let mut out = existing.clone();
+        for profile in added {
+            if let Some(hex) = profile.color.clone() {
+                out.insert(profile.profile_id.clone(), hex);
+            }
+        }
+        out
+    }
+
+    /// What a finished wizard reports on screen.
+    ///
+    /// Both counts, because "Never ask again" is the more consequential of the
+    /// two decisions and reporting only additions told a user who dismissed
+    /// three accounts "Added 0 account(s)." -- which reads as nothing having
+    /// happened, about something permanent.
+    fn discovery_result_message(added: usize, dismissed: usize) -> String {
+        match (added, dismissed) {
+            (0, 0) => "No accounts added.".to_string(),
+            (a, 0) => format!("Added {a} account(s)."),
+            (0, d) => format!("Dismissed {d} account(s); you will not be asked again."),
+            (a, d) => format!(
+                "Added {a} account(s). Dismissed {d}; you will not be asked about \
+                 those again."
+            ),
+        }
     }
 
     /// The colour map to store when an order is saved.
@@ -49596,15 +49950,19 @@ fed_role = arn:aws:iam::999999999999:role/Sbx
 fed_expire = 4000000000
 ";
 
-        /// The name is prefilled from the credentials section, and the region
-        /// from whatever the other accounts use -- neither is a blank box.
+        /// The name is prefilled from the credentials section; the **region is
+        /// not**. That box becomes `ProfileConfig.region`, the top of
+        /// `resolve_region`'s chain, so a prefilled guess outranks
+        /// `AWS_REGION`, `AWS_DEFAULT_REGION` and `~/.aws/config` the moment
+        /// the user accepts the page -- a soft fallback turned into a hard
+        /// override by a default nobody chose.
         #[test]
-        fn a_discovery_step_is_prefilled_from_the_credentials_file() {
-            let steps = discovery_steps(&["999999999999".to_string()], WIZ_FILE, "us-east-1");
+        fn a_discovery_step_takes_its_name_from_the_file_and_its_region_from_nothing() {
+            let steps = discovery_steps(&["999999999999".to_string()], WIZ_FILE);
             assert_eq!(steps.len(), 1);
             assert_eq!(steps[0].account_id, "999999999999");
             assert_eq!(steps[0].label, "sandbox");
-            assert_eq!(steps[0].region, "us-east-1");
+            assert_eq!(steps[0].region, "", "blank, so resolve_region stays in charge");
             assert!(steps[0].environments.is_empty(), "environments self-heal from tags");
         }
 
@@ -49612,7 +49970,7 @@ fed_expire = 4000000000
         /// id is the fallback name, since a step is how the user adds it at all.
         #[test]
         fn an_unlabelled_account_falls_back_to_its_id() {
-            let steps = discovery_steps(&["123456789012".to_string()], WIZ_FILE, "us-east-1");
+            let steps = discovery_steps(&["123456789012".to_string()], WIZ_FILE);
             assert_eq!(steps[0].label, "123456789012");
         }
 
@@ -49623,7 +49981,6 @@ fed_expire = 4000000000
             let mut steps = discovery_steps(
                 &["111".to_string(), "222".to_string(), "333".to_string()],
                 WIZ_FILE,
-                "us-east-1",
             );
             steps[0].decision = StepDecision::Add;
             steps[0].label = "Added".to_string();
@@ -49642,7 +49999,7 @@ fed_expire = 4000000000
         /// still applies, rather than pinning the account to an empty string.
         #[test]
         fn a_blank_region_is_stored_as_none() {
-            let mut steps = discovery_steps(&["111".to_string()], WIZ_FILE, "");
+            let mut steps = discovery_steps(&["111".to_string()], WIZ_FILE);
             steps[0].decision = StepDecision::Add;
             let out = apply_discovery(&steps);
             assert_eq!(out.added[0].region, None);
@@ -49651,7 +50008,7 @@ fed_expire = 4000000000
         /// Environments added in the wizard travel with the account.
         #[test]
         fn wizard_environments_reach_the_outcome() {
-            let mut steps = discovery_steps(&["111".to_string()], WIZ_FILE, "us-east-1");
+            let mut steps = discovery_steps(&["111".to_string()], WIZ_FILE);
             steps[0].decision = StepDecision::Add;
             steps[0].environments.push(UserEnvironment {
                 account_id: "111".to_string(),
@@ -49667,7 +50024,7 @@ fed_expire = 4000000000
         /// gets added, exactly as typed by `apply_discovery`.
         #[test]
         fn a_chosen_colour_reaches_the_outcome() {
-            let mut steps = discovery_steps(&["111".to_string()], WIZ_FILE, "us-east-1");
+            let mut steps = discovery_steps(&["111".to_string()], WIZ_FILE);
             steps[0].decision = StepDecision::Add;
             steps[0].color = Some("#2ea043".to_string());
             let out = apply_discovery(&steps);
@@ -49679,86 +50036,299 @@ fed_expire = 4000000000
         /// `discovery_steps` itself uses when the credentials file has none.
         #[test]
         fn a_blank_label_falls_back_to_the_account_id() {
-            let mut steps = discovery_steps(&["111".to_string()], WIZ_FILE, "us-east-1");
+            let mut steps = discovery_steps(&["111".to_string()], WIZ_FILE);
             steps[0].decision = StepDecision::Add;
             steps[0].label = "   ".to_string();
             let out = apply_discovery(&steps);
             assert_eq!(out.added[0].display_name, "111");
         }
 
-        /// `profile_orders` is the user's *override* map and is empty on a
-        /// fresh install -- bundled accounts carry `sort_order` straight from
-        /// `accounts.json` and are never mirrored into `profile_orders` until
-        /// a Manage Accounts save runs. Seeding the new account's order from
-        /// that map alone would compute 0 on exactly the run that matters
-        /// (the first one) and put it before every existing account.
-        #[test]
-        fn a_discovered_account_orders_after_existing_ones_with_no_override_entry() {
-            let profiles = vec![
-                ProfileConfig {
-                    profile_id: "111".to_string(),
-                    display_name: "One".to_string(),
-                    account_id: "111".to_string(),
-                    region: None,
-                    sort_order: Some(1),
-                    color: None,
-                },
-                ProfileConfig {
-                    profile_id: "222".to_string(),
-                    display_name: "Two".to_string(),
-                    account_id: "222".to_string(),
-                    region: None,
-                    sort_order: Some(3),
-                    color: None,
-                },
-            ];
-            assert_eq!(discovery_next_order(&profiles), 4);
+        fn op(id: &str, name: &str, order: Option<u32>) -> ProfileConfig {
+            ProfileConfig {
+                profile_id: id.to_string(),
+                display_name: name.to_string(),
+                account_id: id.to_string(),
+                region: None,
+                sort_order: order,
+                color: None,
+            }
         }
 
-        /// No profiles at all (an empty config) still starts counting from 0.
+        /// The order page lists **every** account, bundled and discovered
+        /// together, and the discovered ones follow the existing list.
+        ///
+        /// Filtering it to the discovered accounts alone -- which is what
+        /// shipped -- meant a discovered account could only be ordered relative
+        /// to *other* discovered accounts and always landed at the end, which
+        /// is exactly what the spec's order step exists to prevent.
         #[test]
-        fn a_discovered_account_starts_at_zero_with_no_existing_profiles() {
-            assert_eq!(discovery_next_order(&[]), 0);
+        fn the_order_page_lists_every_account_not_only_the_discovered_ones() {
+            let profiles = vec![op("111", "One", Some(1)), op("222", "Two", Some(3))];
+            let mut steps = discovery_steps(&["999999999999".to_string()], WIZ_FILE);
+            steps[0].decision = StepDecision::Add;
+
+            let rows = discovery_order_rows_from(
+                &profiles,
+                &["111".to_string(), "222".to_string()],
+                &steps,
+            );
+
+            let ids: Vec<&str> = rows.iter().map(|r| r.profile_id.as_str()).collect();
+            assert_eq!(ids, vec!["111", "222", "999999999999"]);
+            assert!(!rows[0].identity_editable, "a bundled account stays read-only");
+            assert!(rows[2].identity_editable, "the discovered one is editable");
+        }
+
+        /// `sort_order` is `Option`, so a site's `accounts.json` may omit it
+        /// entirely -- and then every existing account sorts to `u32::MAX`.
+        /// "Highest existing order plus one" computed **0** against that and
+        /// put every discovered account *before* every bundled one, which is
+        /// the Phase 1 ordering bug in a different configuration. Stamping from
+        /// each row's index in this whole list removes the number there was to
+        /// guess: the existing accounts are renumbered from the positions they
+        /// are actually shown in.
+        #[test]
+        fn a_discovered_account_still_lands_last_when_nothing_carries_a_sort_order() {
+            let profiles = vec![op("111", "Alpha", None), op("222", "Beta", None)];
+            let mut steps = discovery_steps(&["999999999999".to_string()], WIZ_FILE);
+            steps[0].decision = StepDecision::Add;
+
+            let rows = discovery_order_rows_from(
+                &profiles,
+                &["111".to_string(), "222".to_string()],
+                &steps,
+            );
+
+            let ids: Vec<&str> = rows.iter().map(|r| r.profile_id.as_str()).collect();
+            assert_eq!(
+                ids,
+                vec!["111", "222", "999999999999"],
+                "the discovered account is last, not first"
+            );
+            // And the order saved is each row's index, so the existing
+            // accounts get real numbers instead of staying at u32::MAX.
+            assert_eq!(rows.len(), 3);
+        }
+
+        /// A step that names an account already in `profiles` is listed once,
+        /// not twice -- otherwise its order would be stamped twice and the
+        /// second stamp would win.
+        #[test]
+        fn an_account_that_already_exists_is_not_listed_twice() {
+            let profiles = vec![op("999999999999", "Sandbox", Some(1))];
+            let mut steps = discovery_steps(&["999999999999".to_string()], WIZ_FILE);
+            steps[0].decision = StepDecision::Add;
+            let rows = discovery_order_rows_from(&profiles, &[], &steps);
+            assert_eq!(rows.len(), 1);
         }
 
         /// Re-entering the order page must not throw away a manual reorder:
-        /// only the *set* of accounts being added decides whether `rows` gets
-        /// rebuilt, not merely landing on the page again.
+        /// only the *set* of accounts the list should hold decides whether
+        /// `rows` gets rebuilt, not merely landing on the page again.
         #[test]
-        fn order_rows_survive_re_entry_when_the_add_set_is_unchanged() {
-            // The user's own arrangement -- reversed from step order, which is
-            // exactly what a rebuild-from-scratch would clobber.
-            let rows = vec![
+        fn order_rows_survive_re_entry_when_the_set_is_unchanged() {
+            let existing = vec!["333".to_string()];
+            // The user's own arrangement -- reversed from step order, and with
+            // the existing account moved off the top, which is exactly what a
+            // rebuild-from-scratch would clobber.
+            let row = |id: &str, name: &str| ManageAccountRow {
+                profile_id: id.to_string(),
+                display_name: name.to_string(),
+                region: String::new(),
+                identity_editable: true,
+                arrangement_editable: true,
+            };
+            let rows = vec![row("222", "Two"), row("111", "One"), row("333", "Three")];
+            let mut steps = discovery_steps(
+                &["111".to_string(), "222".to_string()],
+                WIZ_FILE,
+            );
+            // Both still Add (the default) -- the same set `rows` was built
+            // from, so the arrangement must be kept.
+            assert!(!discovery_rows_need_rebuild(&rows, &steps, &existing));
+
+            // Deciding NotNow on one changes the set -- rebuild.
+            steps[0].decision = StepDecision::NotNow;
+            assert!(discovery_rows_need_rebuild(&rows, &steps, &existing));
+
+            // No rows yet always needs building.
+            assert!(discovery_rows_need_rebuild(&[], &steps, &existing));
+
+            // An account that appeared in the config since the rows were built
+            // is a changed set too, even with every decision unchanged.
+            steps[0].decision = StepDecision::Add;
+            assert!(discovery_rows_need_rebuild(
+                &rows,
+                &steps,
+                &["333".to_string(), "444".to_string()]
+            ));
+        }
+
+        /// A name edited after the order page was first built has to catch up
+        /// on re-entry, and the arrangement has to survive it -- the two
+        /// requirements pull against each other, which is why this is not just
+        /// a rebuild.
+        #[test]
+        fn re_entering_the_order_page_refreshes_labels_without_moving_anything() {
+            let profiles = vec![op("333", "Three renamed", None)];
+            let mut rows = vec![
                 ManageAccountRow {
-                    profile_id: "222".to_string(),
-                    display_name: "Two".to_string(),
+                    profile_id: "999999999999".to_string(),
+                    display_name: "sandbox".to_string(),
                     region: String::new(),
                     identity_editable: true,
                     arrangement_editable: true,
                 },
                 ManageAccountRow {
-                    profile_id: "111".to_string(),
-                    display_name: "One".to_string(),
+                    profile_id: "333".to_string(),
+                    display_name: "Three".to_string(),
                     region: String::new(),
                     identity_editable: true,
                     arrangement_editable: true,
                 },
             ];
-            let mut steps = discovery_steps(
-                &["111".to_string(), "222".to_string()],
-                WIZ_FILE,
-                "us-east-1",
+            let mut steps = discovery_steps(&["999999999999".to_string()], WIZ_FILE);
+            steps[0].label = "Sandbox Renamed".to_string();
+
+            refresh_discovery_row_labels(&mut rows, &steps, &profiles);
+
+            assert_eq!(rows[0].display_name, "Sandbox Renamed", "from the step");
+            assert_eq!(rows[1].display_name, "Three renamed", "from the profile");
+            assert_eq!(
+                rows.iter().map(|r| r.profile_id.as_str()).collect::<Vec<_>>(),
+                vec!["999999999999", "333"],
+                "the arrangement is untouched"
             );
-            // Both still Add (the default) -- the same set `rows` was built
-            // from, so the arrangement must be kept.
-            assert!(!discovery_rows_need_rebuild(&rows, &steps));
+        }
 
-            // Deciding NotNow on one changes the Add set -- rebuild.
-            steps[0].decision = StepDecision::NotNow;
-            assert!(discovery_rows_need_rebuild(&rows, &steps));
+        /// Grey is not a colour any account ever ends up with, so showing it
+        /// invites a user to pick a colour only because grey looks wrong. The
+        /// swatch previews the palette colour the account's *position* will
+        /// give it, which is how `build_account_color_map` assigns them.
+        #[test]
+        fn the_wizard_swatch_previews_the_palette_colour_not_grey() {
+            let mut steps = discovery_steps(&["999999999999".to_string()], WIZ_FILE);
+            let rows = vec![
+                ManageAccountRow {
+                    profile_id: "111".to_string(),
+                    display_name: "One".to_string(),
+                    region: String::new(),
+                    identity_editable: false,
+                    arrangement_editable: true,
+                },
+                ManageAccountRow {
+                    profile_id: "999999999999".to_string(),
+                    display_name: "sandbox".to_string(),
+                    region: String::new(),
+                    identity_editable: true,
+                    arrangement_editable: true,
+                },
+            ];
+            let shown = discovery_swatch_color(&steps[0], &rows);
+            let (r, g, b) = ACCOUNT_COLOR_PALETTE[1 % ACCOUNT_COLOR_PALETTE.len()];
+            assert_eq!(shown, egui::Color32::from_rgb(r, g, b));
+            assert_ne!(shown, egui::Color32::GRAY);
 
-            // No rows yet always needs building.
-            assert!(discovery_rows_need_rebuild(&[], &steps));
+            // An explicit pick still wins.
+            steps[0].color = Some("#2ea043".to_string());
+            assert_eq!(
+                discovery_swatch_color(&steps[0], &rows),
+                parse_hex_color("#2ea043").expect("parses")
+            );
+        }
+
+        /// A colour picked in the wizard has to reach `account_color.<id>`.
+        ///
+        /// `ProfileConfig.color` is never persisted -- `AppConfig::to_text`
+        /// writes only `profile_name.*`, `profile_account_id.*` and
+        /// `profile_region.*` for a user profile, and `parse` rebuilds every
+        /// profile with `color: None` -- so setting that field was all the
+        /// wizard did and the colour was gone at the next launch, silently.
+        /// `an_account_colour_survives_only_in_account_colors_never_on_the_profile`
+        /// in `config.rs` pins the round trip this exists to feed.
+        #[test]
+        fn a_colour_chosen_in_the_wizard_reaches_the_store_that_persists() {
+            let mut steps = discovery_steps(
+                &["999999999999".to_string(), "111".to_string()],
+                WIZ_FILE,
+            );
+            steps[0].decision = StepDecision::Add;
+            steps[0].color = Some("#2ea043".to_string());
+            // The second account chooses nothing, and must contribute nothing:
+            // it should get the palette colour for its position instead.
+            steps[1].decision = StepDecision::Add;
+
+            let out = apply_discovery(&steps);
+            let colors = discovery_account_colors(&BTreeMap::new(), &out.added);
+
+            assert_eq!(
+                colors.get("999999999999").map(String::as_str),
+                Some("#2ea043")
+            );
+            assert!(!colors.contains_key("111"), "no pick, no stored hex");
+        }
+
+        /// An existing colour is not disturbed by adding accounts.
+        #[test]
+        fn adding_an_account_leaves_other_accounts_colours_alone() {
+            let mut existing = BTreeMap::new();
+            existing.insert("111".to_string(), "#ff0000".to_string());
+            let mut steps = discovery_steps(&["999999999999".to_string()], WIZ_FILE);
+            steps[0].decision = StepDecision::Add;
+            let out = apply_discovery(&steps);
+            let colors = discovery_account_colors(&existing, &out.added);
+            assert_eq!(colors.get("111").map(String::as_str), Some("#ff0000"));
+        }
+
+        /// Both save paths must freeze colours, or they disagree about a rule
+        /// the spec states unconditionally: `build_account_color_map` assigns
+        /// the palette **by index in sorted order**, so saving an order without
+        /// freezing repaints every account that never chose a colour. A profile
+        /// with `sort_order: None` sorts to `u32::MAX` and therefore *after* a
+        /// newly added account, so its palette index really does shift.
+        ///
+        /// Checked against the source because the two callers are 400 lines
+        /// apart and `frozen_colors` had exactly one non-test caller.
+        #[test]
+        fn both_account_save_paths_freeze_the_colours() {
+            let src = include_str!("ec2_manager_gui.rs");
+            for func in ["fn apply_manage_accounts", "fn apply_discovery_wizard"] {
+                let start = src.find(func).unwrap_or_else(|| panic!("{func} exists"));
+                // The body up to the next function definition at the same
+                // indentation -- enough to cover the whole save.
+                let rest = &src[start..];
+                let end = rest[1..]
+                    .find("\n        fn ")
+                    .map(|i| i + 1)
+                    .unwrap_or(rest.len());
+                assert!(
+                    rest[..end].contains("frozen_colors("),
+                    "{func} must freeze colours before it resorts"
+                );
+            }
+        }
+
+        /// "Never ask again" must not be a one-way door. Nothing else in
+        /// Manage Accounts can reach a dismissed id -- its rows come from
+        /// `config.profiles`, which a dismissed account is not in.
+        #[test]
+        fn a_dismissed_account_can_be_asked_about_again() {
+            let dismissed = vec!["111".to_string(), "222".to_string()];
+            assert_eq!(undismiss_account(&dismissed, "111"), vec!["222".to_string()]);
+            // An id that is not there changes nothing rather than erroring.
+            assert_eq!(undismiss_account(&dismissed, "999"), dismissed);
+        }
+
+        /// Dismissing three accounts and adding none reported "Added 0
+        /// account(s).", which reads as nothing having happened -- about a
+        /// permanent decision.
+        #[test]
+        fn the_result_message_reports_dismissals_too() {
+            assert!(discovery_result_message(0, 3).contains('3'));
+            let both = discovery_result_message(2, 1);
+            assert!(both.contains('2') && both.contains('1'), "{both}");
+            assert_eq!(discovery_result_message(1, 0), "Added 1 account(s).");
+            assert_eq!(discovery_result_message(0, 0), "No accounts added.");
         }
 
         /// Nothing new means no window. The ordinary case on a machine whose

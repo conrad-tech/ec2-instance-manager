@@ -2220,6 +2220,57 @@ mod tests {
         }
     }
 
+    /// **`ProfileConfig.color` is not a persisted field**, and the round trip
+    /// is where that has to be established, because nothing else says so.
+    /// `to_text` writes only `profile_name.*`, `profile_account_id.*` and
+    /// `profile_region.*` for a user account, and `parse` rebuilds every
+    /// profile with `color: None`.
+    ///
+    /// The discovery wizard set that field and nothing else, so a colour picked
+    /// there applied immediately and vanished at the next launch with no word.
+    /// `account_color.<id>` is the store that survives -- the one
+    /// `apply_manage_accounts` writes, and the one `build_account_color_map`
+    /// consults *ahead of* `ProfileConfig.color`.
+    #[test]
+    fn an_account_colour_survives_only_in_account_colors_never_on_the_profile() {
+        let mut cfg = AppConfig::default();
+        cfg.profiles.push(ProfileConfig {
+            profile_id: "999999999999".to_string(),
+            display_name: "Sandbox".to_string(),
+            account_id: "999999999999".to_string(),
+            region: None,
+            sort_order: None,
+            color: Some("#2ea043".to_string()),
+        });
+
+        // The field alone: written nowhere, read back as nothing.
+        let back = AppConfig::parse(&cfg.to_text());
+        assert_eq!(
+            back.profiles
+                .iter()
+                .find(|p| p.profile_id == "999999999999")
+                .and_then(|p| p.color.clone()),
+            None,
+            "ProfileConfig.color does not round trip and never did"
+        );
+        assert!(
+            back.account_colors.is_empty(),
+            "setting the field does not populate the store that persists"
+        );
+
+        // The store that does. This is what the wizard must write.
+        cfg.account_colors
+            .insert("999999999999".to_string(), "#2ea043".to_string());
+        let text = cfg.to_text();
+        assert!(text.contains("account_color.999999999999=#2ea043"), "{text}");
+        let back = AppConfig::parse(&text);
+        assert_eq!(
+            back.account_colors.get("999999999999").map(String::as_str),
+            Some("#2ea043"),
+            "the hex must survive to_text -> parse"
+        );
+    }
+
     #[test]
     fn account_env_round_trips_through_config_text() {
         let cfg = AppConfig::parse(

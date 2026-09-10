@@ -199,6 +199,14 @@ fn parse_all_profiles_by_account_id(content: &str, account_id: &str) -> Vec<Stri
 /// account and is skipped: a user on static keys discovers nothing, which is
 /// correct rather than a failure. An **expired** section still counts --
 /// expired access is access, and nothing here needs the credentials to work.
+///
+/// **It deliberately does not track `[section]` boundaries**, unlike its two
+/// siblings above -- it wants every `fed_role` in the file and does not care
+/// which section carried it, so the bookkeeping would buy nothing. The one
+/// visible effect is that a `fed_role` written *before* any section header
+/// still names its account. That is benign and self-limiting: `suggested_label`
+/// *does* track sections, so such an account has no section to be named after
+/// and falls back to its own id as the label. Left as it is on purpose.
 pub fn discovered_account_ids(content: &str) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for line in content.lines() {
@@ -225,7 +233,7 @@ pub fn discovered_account_ids(content: &str) -> Vec<String> {
 /// credentials section that reaches it.
 ///
 /// Several sections can name one account (several roles into the same place --
-/// the case [`parse_all_profiles_by_account_id`]'s tie-break exists for), so this
+/// the case [`parse_profile_by_account_id`]'s tie-break exists for), so this
 /// picks the section whose `fed_expire` is furthest in the future, which is the
 /// profile the user is actually working through. With no usable expiry it falls
 /// back to file order: a name is better than a blank.
