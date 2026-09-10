@@ -14191,7 +14191,7 @@ mod gui {
                                             let vault = dlg.new_env_vault.trim();
                                             dlg.environments.push(UserEnvironment {
                                                 account_id: account_id.clone(),
-                                                name: dlg.new_env_name.trim().to_string(),
+                                                name: normalized_env_name(&dlg.new_env_name),
                                                 vault_addr: if vault.is_empty() {
                                                     None
                                                 } else {
@@ -14628,7 +14628,7 @@ mod gui {
                                             let vault = wiz.new_env_vault.trim();
                                             wiz.steps[idx].environments.push(UserEnvironment {
                                                 account_id: account_id.clone(),
-                                                name: wiz.new_env_name.trim().to_string(),
+                                                name: normalized_env_name(&wiz.new_env_name),
                                                 vault_addr: if vault.is_empty() {
                                                     None
                                                 } else {
@@ -36830,6 +36830,22 @@ mod gui {
         out
     }
 
+    /// An environment name as it should be stored: trimmed and upper-cased.
+    ///
+    /// `MMODAL_ENV` is free text and every *match* on it here is already
+    /// case-insensitive, so this is about what the user reads, not what the
+    /// code compares. Uppercase is the convention everywhere else: the
+    /// environments `accounts.json` declares are `DEV1`/`STG1`, every Scripts
+    /// dropdown renders them through `script_env_label`, which upper-cases,
+    /// and `bastion_key`/`vscode_key` upper-case to build their config keys.
+    /// A name typed in lower case was the one place that broke, leaving `dev`
+    /// sitting next to `DEV1` in the same list.
+    ///
+    /// Both Add Environment boxes route through here so they cannot drift.
+    fn normalized_env_name(raw: &str) -> String {
+        raw.trim().to_ascii_uppercase()
+    }
+
     /// Why an environment name cannot be added, or `None` if it can.
     ///
     /// Refused locally rather than accepted and lost: `|` is the field
@@ -49844,6 +49860,27 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 name: name.to_string(),
                 vault_addr: None,
             }
+        }
+
+        /// Environments are declared uppercase in `accounts.json` (`DEV1`),
+        /// every Scripts dropdown renders them uppercase via
+        /// `script_env_label`, and `bastion_key`/`vscode_key` upper-case them
+        /// to key config. A name typed in lower case was the one place that
+        /// convention broke, so `dev` sat next to `DEV1` in the same list.
+        #[test]
+        fn a_typed_environment_name_is_stored_upper_case() {
+            assert_eq!(normalized_env_name("  dev  "), "DEV");
+            assert_eq!(normalized_env_name("dev1"), "DEV1");
+            assert_eq!(normalized_env_name("Prod One"), "PROD ONE");
+        }
+
+        /// Already-uppercase input is untouched, and a name that is only
+        /// whitespace stays empty so `environment_name_problem` still refuses
+        /// it rather than storing a blank.
+        #[test]
+        fn normalising_leaves_uppercase_alone_and_blanks_blank() {
+            assert_eq!(normalized_env_name("DEV1"), "DEV1");
+            assert_eq!(normalized_env_name("   "), "");
         }
 
         /// A pipe is the field separator in `account_env=`, so a name carrying one
