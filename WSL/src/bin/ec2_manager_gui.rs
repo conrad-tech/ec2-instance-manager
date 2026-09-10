@@ -14236,8 +14236,9 @@ mod gui {
                                 });
                             ui.weak(
                                 "Env Tag Key is the instance tag that names an \
-                                 environment in this account. Leave it blank to use \
-                                 the usual keys (Env, Environment, MMODAL_ENV).",
+                                 environment in this account. Leave it blank to try \
+                                 MMODAL_ENV first, then Env and Environment -- an \
+                                 instance carrying both is read as MMODAL_ENV.",
                             );
                             let env_tag = env_tag.trim().to_string();
                             if env_tag.is_empty() {
@@ -14744,8 +14745,9 @@ mod gui {
                             );
                             ui.weak(
                                 "Env Tag Key is the instance tag that names an \
-                                 environment in this account. Leave it blank to use \
-                                 the usual keys (Env, Environment, MMODAL_ENV).",
+                                 environment in this account. Leave it blank to try \
+                                 MMODAL_ENV first, then Env and Environment -- an \
+                                 instance carrying both is read as MMODAL_ENV.",
                             );
 
                             ui.add_space(6.0);
@@ -50871,6 +50873,38 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         /// `script_env_label`, and `bastion_key`/`vscode_key` upper-case them
         /// to key config. A name typed in lower case was the one place that
         /// convention broke, so `dev` sat next to `DEV1` in the same list.
+        /// The hint must name the keys in the order they are actually tried.
+        ///
+        /// It read "(Env, Environment, MMODAL_ENV)", which is the order the
+        /// resolver had in an early draft and had to be corrected: MMODAL_ENV
+        /// is tried FIRST. A user with instances carrying both `Environment`
+        /// and `MMODAL_ENV` reads that text to decide whether they need to set
+        /// the key at all, so listing them backwards is worse than saying
+        /// nothing -- and it was spotted by a user, not by a test.
+        #[test]
+        fn the_env_tag_hint_lists_the_keys_in_the_order_they_are_tried() {
+            let src = include_str!("ec2_manager_gui.rs");
+            // Assembled, not written out: a literal here appears in this test's
+            // own source, so the scan matched itself and found four sites
+            // instead of two. Same stance as
+            // `the_detail_event_never_claims_an_answer_it_does_not_have`.
+            let needle = format!("Leave it blank {}", "to try");
+            let sites: Vec<usize> = src.match_indices(&needle).map(|(i, _)| i).collect();
+            // Both dialogs carry it: Manage Accounts and the discovery wizard.
+            assert_eq!(sites.len(), 2, "both dialogs must carry the hint");
+            for at in sites {
+                let window = &src[at..(at + 300).min(src.len())];
+                let mmodal = window.find("MMODAL_ENV").expect("the hint names MMODAL_ENV");
+                let env = window
+                    .find("Env and Environment")
+                    .expect("the hint names the fallback keys");
+                assert!(
+                    mmodal < env,
+                    "MMODAL_ENV is tried first and the hint must say so"
+                );
+            }
+        }
+
         /// A newly added account must be asked about immediately.
         ///
         /// `profile_auth_infos` is recomputed at startup, on a credentials-file
