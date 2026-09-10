@@ -1303,6 +1303,27 @@ mod gui {
         new_env_vault: String,
     }
 
+    /// Modal state for the "New accounts found" wizard.
+    ///
+    /// Holds a working copy like `ManageAccountsDialog` does: nothing reaches
+    /// `AppConfig` until the last page is saved, so closing the window is a
+    /// real cancel and every account is offered again next launch.
+    struct DiscoveryWizard {
+        steps: Vec<DiscoveryStep>,
+        /// Which page is showing.
+        current: usize,
+        /// True once the user has passed the last account and is arranging the
+        /// order. First run after this ships can discover a dozen accounts at
+        /// once, so the newly added ones must not be stuck wherever the merge
+        /// put them.
+        ordering: bool,
+        /// Order rows, built only when `ordering` turns true.
+        rows: Vec<ManageAccountRow>,
+        new_env_name: String,
+        new_env_vault: String,
+        error: Option<String>,
+    }
+
     /// Which of the three bastion user actions a dialog is running.
     ///
     /// Restore is a variant of create, not a third pipeline: it runs the same
@@ -8299,6 +8320,8 @@ mod gui {
         settings_pem_dialog: Option<SettingsPemDialog>,
         /// Active **Manage Accounts…** dialog, if any.
         manage_accounts_dialog: Option<ManageAccountsDialog>,
+        /// Active "New accounts found" wizard, if any.
+        discovery_wizard: Option<DiscoveryWizard>,
         /// Whether the "File Browser Defaults" modal is open.
         show_file_browser_defaults: bool,
         /// When set, the Edit menu briefly flashes to draw the user's
@@ -9091,6 +9114,7 @@ mod gui {
                 pem_dialog: None,
                 settings_pem_dialog: None,
                 manage_accounts_dialog: None,
+                discovery_wizard: None,
                 show_file_browser_defaults: false,
                 edit_menu_flash_start: None,
                 create_user_dialog: None,
@@ -14195,6 +14219,355 @@ mod gui {
                 );
                 self.log_warn(self.message.clone());
             }
+        }
+
+        /// Render the "New accounts found" wizard, if active.
+        fn render_discovery_wizard(&mut self, ctx: &egui::Context) {
+            let Some(mut wiz) = self.discovery_wizard.take() else {
+                return;
+            };
+            let mut window_open = true;
+            let mut do_save = false;
+            let mut do_cancel = false;
+            let mut go_next = false;
+            let mut go_back = false;
+            let mut move_up: Option<usize> = None;
+            let mut move_down: Option<usize> = None;
+
+            let title = if wiz.ordering {
+                "New accounts found - order".to_string()
+            } else {
+                format!(
+                    "New accounts found ({} of {})",
+                    wiz.current + 1,
+                    wiz.steps.len()
+                )
+            };
+
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(true)
+                .default_width(560.0)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    // ONE scroll area around the whole body. The environments
+                    // list is unbounded and this window cannot be dragged, so
+                    // without it Save goes past the bottom edge unreachable --
+                    // the scar CLAUDE.md records for the Jira ticket window.
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        if wiz.ordering {
+                            ui.label(
+                                "Drag the new accounts into the order you want them \
+                                 listed in.",
+                            );
+                            ui.separator();
+                            for idx in 0..wiz.rows.len() {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(idx > 0, egui::Button::new("^"))
+                                        .on_hover_text("Move up")
+                                        .clicked()
+                                    {
+                                        move_up = Some(idx);
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            idx + 1 < wiz.rows.len(),
+                                            egui::Button::new("v"),
+                                        )
+                                        .on_hover_text("Move down")
+                                        .clicked()
+                                    {
+                                        move_down = Some(idx);
+                                    }
+                                    ui.label(format!(
+                                        "{}  ({})",
+                                        wiz.rows[idx].display_name, wiz.rows[idx].profile_id
+                                    ));
+                                });
+                            }
+                        } else {
+                            let idx = wiz.current;
+                            ui.label(
+                                "These accounts are in your AWS credentials but not in \
+                                 this app.",
+                            );
+                            ui.separator();
+                            egui::Grid::new("discovery_grid")
+                                .num_columns(2)
+                                .spacing([10.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.label("Account Number:");
+                                    ui.label(wiz.steps[idx].account_id.as_str());
+                                    ui.end_row();
+
+                                    ui.label("Account Name:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut wiz.steps[idx].label)
+                                            .desired_width(280.0),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Region:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut wiz.steps[idx].region)
+                                            .hint_text("us-east-1")
+                                            .desired_width(280.0),
+                                    );
+                                    ui.end_row();
+                                });
+                            ui.weak(
+                                "Leave Region blank to let the app work it out from your \
+                                 AWS config.",
+                            );
+
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label("Add:");
+                                for (label, decision) in [
+                                    ("Add this account", StepDecision::Add),
+                                    ("Not now", StepDecision::NotNow),
+                                    ("Never ask again", StepDecision::NeverAsk),
+                                ] {
+                                    if ui
+                                        .selectable_label(
+                                            wiz.steps[idx].decision == decision,
+                                            label,
+                                        )
+                                        .clicked()
+                                    {
+                                        wiz.steps[idx].decision = decision;
+                                    }
+                                }
+                            });
+
+                            ui.add_space(6.0);
+                            ui.label("Environments:");
+                            let account_id = wiz.steps[idx].account_id.clone();
+                            let mut remove: Option<usize> = None;
+                            for (i, env) in wiz.steps[idx].environments.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.monospace(&env.name);
+                                    ui.weak(env.vault_addr.as_deref().unwrap_or("(no Vault)"));
+                                    if ui.small_button("x").on_hover_text("Remove").clicked() {
+                                        remove = Some(i);
+                                    }
+                                });
+                            }
+                            if let Some(i) = remove {
+                                wiz.steps[idx].environments.remove(i);
+                            }
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut wiz.new_env_name)
+                                        .hint_text("DEV1")
+                                        .desired_width(110.0),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut wiz.new_env_vault)
+                                        .hint_text("Vault address (optional)")
+                                        .desired_width(240.0),
+                                );
+                                if ui.button("Add Environment").clicked() {
+                                    let bundled = ec2_manager::accounts::environments_for(
+                                        &account_id,
+                                        &[],
+                                    );
+                                    match environment_name_problem(
+                                        &wiz.new_env_name,
+                                        &wiz.steps[idx].environments,
+                                        &bundled,
+                                        &account_id,
+                                    ) {
+                                        Some(problem) => wiz.error = Some(problem),
+                                        None => {
+                                            let vault = wiz.new_env_vault.trim();
+                                            wiz.steps[idx].environments.push(UserEnvironment {
+                                                account_id: account_id.clone(),
+                                                name: wiz.new_env_name.trim().to_string(),
+                                                vault_addr: if vault.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(vault.to_string())
+                                                },
+                                            });
+                                            wiz.new_env_name.clear();
+                                            wiz.new_env_vault.clear();
+                                            wiz.error = None;
+                                        }
+                                    }
+                                }
+                            });
+                            ui.weak(
+                                "Environments found on this account's instances appear on \
+                                 their own. Add one here to give it a Vault address.",
+                            );
+                        }
+
+                        if let Some(err) = &wiz.error {
+                            ui.add_space(4.0);
+                            note_label(ui, egui::Color32::from_rgb(220, 80, 80), err);
+                        }
+
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if wiz.ordering {
+                                if ui.button("Back").clicked() {
+                                    go_back = true;
+                                }
+                                if ui.button("Save").clicked() {
+                                    do_save = true;
+                                }
+                            } else {
+                                if wiz.current > 0 && ui.button("Back").clicked() {
+                                    go_back = true;
+                                }
+                                let last = wiz.current + 1 >= wiz.steps.len();
+                                if ui.button(if last { "Next: order" } else { "Next" }).clicked()
+                                {
+                                    go_next = true;
+                                }
+                            }
+                            if ui.button("Cancel").clicked() {
+                                do_cancel = true;
+                            }
+                        });
+                    });
+                });
+
+            if let Some(idx) = move_up {
+                wiz.rows.swap(idx - 1, idx);
+            }
+            if let Some(idx) = move_down {
+                wiz.rows.swap(idx, idx + 1);
+            }
+
+            if go_next {
+                wiz.new_env_name.clear();
+                wiz.new_env_vault.clear();
+                wiz.error = None;
+                if wiz.current + 1 >= wiz.steps.len() {
+                    wiz.ordering = true;
+                    wiz.rows = self.discovery_order_rows(&wiz.steps);
+                } else {
+                    wiz.current += 1;
+                }
+            }
+            if go_back {
+                wiz.new_env_name.clear();
+                wiz.new_env_vault.clear();
+                wiz.error = None;
+                if wiz.ordering {
+                    wiz.ordering = false;
+                } else if wiz.current > 0 {
+                    wiz.current -= 1;
+                }
+            }
+
+            if do_cancel || !window_open {
+                self.discovery_wizard = None;
+                return;
+            }
+            if do_save {
+                self.apply_discovery_wizard(&wiz);
+                self.discovery_wizard = None;
+                return;
+            }
+            self.discovery_wizard = Some(wiz);
+        }
+
+        /// Order rows for the wizard's last page: the accounts about to be
+        /// added, in the order they will be listed, appended after everything
+        /// already configured.
+        fn discovery_order_rows(&self, steps: &[DiscoveryStep]) -> Vec<ManageAccountRow> {
+            steps
+                .iter()
+                .filter(|s| s.decision == StepDecision::Add)
+                .map(|s| ManageAccountRow {
+                    profile_id: s.account_id.clone(),
+                    display_name: s.label.trim().to_string(),
+                    region: s.region.trim().to_string(),
+                    identity_editable: true,
+                    arrangement_editable: true,
+                })
+                .collect()
+        }
+
+        /// Commit a finished wizard.
+        ///
+        /// Ordering starts after every account already configured, so adding
+        /// accounts never reshuffles the ones already on screen -- the same
+        /// reasoning that makes `merge_profiles` append user-only rows.
+        fn apply_discovery_wizard(&mut self, wiz: &DiscoveryWizard) {
+            let outcome = apply_discovery(&wiz.steps);
+
+            let mut next_order = self
+                .config
+                .profile_orders
+                .values()
+                .copied()
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0);
+
+            for profile in &outcome.added {
+                if !self
+                    .config
+                    .profiles
+                    .iter()
+                    .any(|p| p.profile_id == profile.profile_id)
+                {
+                    self.config.profiles.push(profile.clone());
+                }
+            }
+            // The wizard's own order page decides the relative order of the
+            // new accounts; everything already configured keeps its place.
+            for row in &wiz.rows {
+                self.config
+                    .profile_orders
+                    .insert(row.profile_id.clone(), next_order);
+                if let Some(p) = self
+                    .config
+                    .profiles
+                    .iter_mut()
+                    .find(|p| p.profile_id == row.profile_id)
+                {
+                    p.sort_order = Some(next_order);
+                }
+                next_order += 1;
+            }
+
+            // The invariant: `config.profiles` is always in display order,
+            // because the profile dropdown and every Scripts environment
+            // dropdown iterate it directly and never read `sort_order`.
+            // Pushing new accounts breaks it until this runs. (This is the
+            // bug that shipped in Phase 1 and was fixed in 7da42ea -- do not
+            // reintroduce it here.)
+            ec2_manager::accounts::sort_profiles(&mut self.config.profiles);
+
+            self.config.user_environments.extend(outcome.environments);
+            for id in &outcome.dismissed {
+                if !self.config.accounts_dismissed.contains(id) {
+                    self.config.accounts_dismissed.push(id.clone());
+                }
+            }
+
+            self.rebuild_account_colors();
+            if let Err(err) = self.config.save() {
+                self.message = format!("error: could not save accounts: {err}");
+                self.log_error(format!("discovery: save failed: {err}"));
+                return;
+            }
+            self.message = format!(
+                "Added {} account(s).",
+                outcome.added.len()
+            );
+            self.log_info(format!(
+                "discovery: added {}, dismissed {}",
+                outcome.added.len(),
+                outcome.dismissed.len()
+            ));
         }
 
         /// Render the "File Browser Defaults" modal, if open. This is a
@@ -31592,6 +31965,7 @@ mod gui {
                 self.render_hosts_prompt(ctx);
                 self.render_settings_pem_dialog(ctx);
                 self.render_manage_accounts_dialog(ctx);
+                self.render_discovery_wizard(ctx);
                 self.render_file_browser_defaults_dialog(ctx);
                 self.render_create_user_dialog(ctx);
                 self.render_vault_iam_dialog(ctx);
@@ -35800,6 +36174,108 @@ mod gui {
                 arrangement_editable: true,
             })
             .collect()
+    }
+
+    /// What the user decided about one discovered account.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum StepDecision {
+        /// Add it to the profile list.
+        Add,
+        /// Skip for now -- offered again on the next launch, because nothing
+        /// is recorded.
+        NotNow,
+        /// Write it to `accounts_dismissed` and never prompt again.
+        NeverAsk,
+    }
+
+    /// One discovered account's page in the wizard.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct DiscoveryStep {
+        /// Read-only: it came from the `fed_role` ARN.
+        account_id: String,
+        /// Prefilled from the credentials section name, editable here.
+        label: String,
+        /// Prefilled from whatever the other accounts use. Blank means "let
+        /// `resolve_region` decide", which is a working answer, not a gap.
+        region: String,
+        color: Option<String>,
+        environments: Vec<UserEnvironment>,
+        decision: StepDecision,
+    }
+
+    /// What a finished wizard asks the config to change.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct DiscoveryOutcome {
+        added: Vec<ProfileConfig>,
+        environments: Vec<UserEnvironment>,
+        dismissed: Vec<String>,
+    }
+
+    /// Build a page per newly discovered account.
+    ///
+    /// **Environments start empty and that is the design.** Filling them would
+    /// need a `describe-instances` -- a region the wizard is still collecting,
+    /// and a round trip it would have to block on. `script_env::build` already
+    /// unions tag-discovered environments into every dropdown, so they appear
+    /// on their own the first time that account's inventory loads. The editor
+    /// here is for what a tag cannot supply: a Vault address, or a name
+    /// recorded before any instance carries the tag.
+    ///
+    /// Nothing in this task constructs a `DiscoveryWizard` outside its own
+    /// tests -- the poll hook that calls this to build one is Task 4's job.
+    /// `allow(dead_code)` until that lands, the same stance the file already
+    /// takes for `EscalationStatus` and friends.
+    #[allow(dead_code)]
+    fn discovery_steps(
+        new_ids: &[String],
+        content: &str,
+        default_region: &str,
+    ) -> Vec<DiscoveryStep> {
+        new_ids
+            .iter()
+            .map(|id| DiscoveryStep {
+                account_id: id.clone(),
+                label: credentials::suggested_label(content, id)
+                    .unwrap_or_else(|| id.clone()),
+                region: default_region.to_string(),
+                color: None,
+                environments: Vec::new(),
+                decision: StepDecision::Add,
+            })
+            .collect()
+    }
+
+    /// Reduce the finished pages to the three changes the config needs.
+    ///
+    /// Pure, so which decision produces which effect is settled by a test
+    /// rather than by reading the wizard's closures -- and `NotNow` producing
+    /// *nothing* is the part worth pinning, since that is what makes the
+    /// account come back next launch.
+    fn apply_discovery(steps: &[DiscoveryStep]) -> DiscoveryOutcome {
+        let mut out = DiscoveryOutcome::default();
+        for step in steps {
+            match step.decision {
+                StepDecision::Add => {
+                    let region = step.region.trim();
+                    out.added.push(ProfileConfig {
+                        profile_id: step.account_id.clone(),
+                        display_name: step.label.trim().to_string(),
+                        account_id: step.account_id.clone(),
+                        region: if region.is_empty() {
+                            None
+                        } else {
+                            Some(region.to_string())
+                        },
+                        sort_order: None,
+                        color: step.color.clone(),
+                    });
+                    out.environments.extend(step.environments.iter().cloned());
+                }
+                StepDecision::NotNow => {}
+                StepDecision::NeverAsk => out.dismissed.push(step.account_id.clone()),
+            }
+        }
+        out
     }
 
     /// The colour map to store when an order is saved.
@@ -48949,6 +49425,79 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             );
             // A name it does not declare is still fine.
             assert!(environment_name_problem("DEV9", &[], &bundled, "111").is_none());
+        }
+
+        const WIZ_FILE: &str = "\
+[sandbox]
+fed_role = arn:aws:iam::999999999999:role/Sbx
+fed_expire = 4000000000
+";
+
+        /// The name is prefilled from the credentials section, and the region
+        /// from whatever the other accounts use -- neither is a blank box.
+        #[test]
+        fn a_discovery_step_is_prefilled_from_the_credentials_file() {
+            let steps = discovery_steps(&["999999999999".to_string()], WIZ_FILE, "us-east-1");
+            assert_eq!(steps.len(), 1);
+            assert_eq!(steps[0].account_id, "999999999999");
+            assert_eq!(steps[0].label, "sandbox");
+            assert_eq!(steps[0].region, "us-east-1");
+            assert!(steps[0].environments.is_empty(), "environments self-heal from tags");
+        }
+
+        /// An account the file names but cannot label still gets a step -- the
+        /// id is the fallback name, since a step is how the user adds it at all.
+        #[test]
+        fn an_unlabelled_account_falls_back_to_its_id() {
+            let steps = discovery_steps(&["123456789012".to_string()], WIZ_FILE, "us-east-1");
+            assert_eq!(steps[0].label, "123456789012");
+        }
+
+        /// Only Add produces a profile; NeverAsk produces a dismissal; NotNow
+        /// produces neither, so the account is offered again next launch.
+        #[test]
+        fn each_decision_produces_only_its_own_outcome() {
+            let mut steps = discovery_steps(
+                &["111".to_string(), "222".to_string(), "333".to_string()],
+                WIZ_FILE,
+                "us-east-1",
+            );
+            steps[0].decision = StepDecision::Add;
+            steps[0].label = "Added".to_string();
+            steps[1].decision = StepDecision::NotNow;
+            steps[2].decision = StepDecision::NeverAsk;
+
+            let out = apply_discovery(&steps);
+
+            assert_eq!(out.added.len(), 1);
+            assert_eq!(out.added[0].profile_id, "111");
+            assert_eq!(out.added[0].display_name, "Added");
+            assert_eq!(out.dismissed, vec!["333"]);
+        }
+
+        /// A blank region is stored as None so `resolve_region`'s own chain
+        /// still applies, rather than pinning the account to an empty string.
+        #[test]
+        fn a_blank_region_is_stored_as_none() {
+            let mut steps = discovery_steps(&["111".to_string()], WIZ_FILE, "");
+            steps[0].decision = StepDecision::Add;
+            let out = apply_discovery(&steps);
+            assert_eq!(out.added[0].region, None);
+        }
+
+        /// Environments added in the wizard travel with the account.
+        #[test]
+        fn wizard_environments_reach_the_outcome() {
+            let mut steps = discovery_steps(&["111".to_string()], WIZ_FILE, "us-east-1");
+            steps[0].decision = StepDecision::Add;
+            steps[0].environments.push(UserEnvironment {
+                account_id: "111".to_string(),
+                name: "SBX".to_string(),
+                vault_addr: None,
+            });
+            let out = apply_discovery(&steps);
+            assert_eq!(out.environments.len(), 1);
+            assert_eq!(out.environments[0].name, "SBX");
         }
 
         /// Reset must genuinely put an account back on its automatic colour.
