@@ -55,6 +55,7 @@ mod gui {
     };
     use ec2_manager::power::{self, PowerAction, PowerPhase};
     use ec2_manager::profile_choice::profile_choice_path;
+    use ec2_manager::region_search;
     use ec2_manager::resources::{self, ResourceKind};
     use ec2_manager::route53::{self, HostedZone, RecordPage, ZoneDetail};
     use ec2_manager::s3::{self, Bucket, BucketFacts, BucketSection, SectionResult};
@@ -824,6 +825,29 @@ mod gui {
             instance_id: String,
             action: PowerAction,
             result: std::result::Result<String, String>,
+        },
+        /// One line from a region search, on its way to the log.
+        ///
+        /// The sweep runs on a worker thread and `log_*` needs `&mut self`, so
+        /// its narration travels as events like every other worker's does. A
+        /// silent sweep of seventeen regions is exactly the kind of thing this
+        /// codebase has a history of shipping dark.
+        RegionSearchNote {
+            level: LogLevel,
+            message: String,
+        },
+        /// A region search finished. `found` is the region to adopt, or `None`
+        /// when the account really has nothing anywhere.
+        ///
+        /// `searched` is how many regions were actually probed. **Zero means
+        /// the search never ran** — `describe-regions` was denied and the user
+        /// has no other account to borrow a region from — and that is not an
+        /// answer, so the handler does not record it as one.
+        RegionSearchDone {
+            account_id: String,
+            profile_id: String,
+            found: Option<String>,
+            searched: usize,
         },
     }
 
@@ -1721,6 +1745,15 @@ mod gui {
     /// reasoning as the tunnel banner: a green line saying a thing worked is
     /// noise once it has been read, and a red one is not.
     const POWER_OK_BANNER: Duration = Duration::from_secs(30);
+
+    /// How many regions a region search probes at once.
+    ///
+    /// Every probe is its own `aws` process, and all seventeen at once is a
+    /// great deal of memory on an ordinary laptop to answer a question nobody
+    /// is waiting on. This app already runs its inventory refreshes strictly
+    /// one at a time to keep a throttled EC2 API happy; this is the same
+    /// instinct, kept parallel enough that the sweep is over in seconds.
+    const REGION_PROBE_PARALLELISM: usize = 6;
 
     /// How long the "everything is forwarding" line stays on the toolbar
     /// before hiding itself. It reappears if forwarding breaks and recovers,
@@ -3172,13 +3205,14 @@ mod gui {
         ))))
     }
 
-    /// One `aws` call returning JSON, for the reaper's target-group lookups.
+    /// One read-only `aws` call returning JSON, for the reaper's target-group
+    /// lookups and for the region search.
     ///
     /// Spelled out here rather than through `run_aws_cli` for the same reason
     /// `fetch_instance_extras` is: `aws_command()` carries `CREATE_NO_WINDOW`,
     /// and these run on a background thread where a console flashing up would
     /// be the only visible sign the app is doing anything.
-    fn reaper_aws_json(
+    fn aws_json(
         profile: &str,
         region: &str,
         args: &[&str],
@@ -3223,13 +3257,13 @@ mod gui {
         };
         let name = reaper::target_group_name(resource)
             .ok_or_else(|| format!("{resource} is not a target group resource id"))?;
-        let arn = reaper::parse_target_group_arn(&reaper_aws_json(
+        let arn = reaper::parse_target_group_arn(&aws_json(
             profile,
             region,
             &["elbv2", "describe-target-groups", "--names", name],
         )?)
         .ok_or_else(|| format!("no target group named {name} in {region}"))?;
-        let members = reaper::parse_target_health(&reaper_aws_json(
+        let members = reaper::parse_target_health(&aws_json(
             profile,
             region,
             &["elbv2", "describe-target-health", "--target-group-arn", &arn],
@@ -8503,6 +8537,13 @@ mod gui {
         power_in_flight: Arc<Mutex<HashSet<String>>>,
         /// The status line above the inventory table.
         power_status: Option<PowerStatus>,
+        /// Account ids with a region search already going. Shared with the
+        /// workers, each of which removes its own id on the way out.
+        ///
+        /// Claimed **before** the thread is spawned, for the reason
+        /// `power_in_flight` is: two inventory loads landing in one frame
+        /// would otherwise put two seventeen-region sweeps on one account.
+        region_search_in_flight: Arc<Mutex<HashSet<String>>>,
         /// Active git-PAT prompt, if any.
         pat_dialog: Option<PatDialog>,
         /// Set for one frame when a personal-script hotkey fired, so the key
@@ -9209,6 +9250,7 @@ mod gui {
                 power_confirm: None,
                 power_in_flight: Arc::new(Mutex::new(HashSet::new())),
                 power_status: None,
+                region_search_in_flight: Arc::new(Mutex::new(HashSet::new())),
                 pat_dialog,
                 hotkey_consumed_frame: false,
                 last_git_failure_prompt: None,
@@ -22486,6 +22528,69 @@ mod gui {
                             self.enqueue_refresh(&profile_id, true, true);
                         }
                     }
+                    ProcEvent::RegionSearchNote { level, message } => {
+                        self.log(level, message);
+                    }
+                    ProcEvent::RegionSearchDone {
+                        account_id,
+                        profile_id,
+                        found,
+                        searched,
+                    } => {
+                        if let Ok(mut guard) = self.region_search_in_flight.lock() {
+                            guard.remove(&account_id);
+                        }
+                        if searched == 0 {
+                            // Not an answer, so not recorded as one: with no
+                            // region to probe the search never ran, and
+                            // recording it would mean this account is never
+                            // searched again — not when the permission is
+                            // granted, not when a second account arrives with
+                            // a region to borrow.
+                            self.log_warn(format!(
+                                "region search: account {account_id} had no regions to search — describe-regions was denied and no other account has a region to borrow"
+                            ));
+                        } else {
+                            match &found {
+                                Some(region) => {
+                                    self.log_info(format!(
+                                        "region search: account {account_id} has instances in {region} (searched {searched} region(s)) — adopting it"
+                                    ));
+                                    // Already wired: this is the second step
+                                    // of `resolve_region`, so it takes effect
+                                    // with nothing else to change.
+                                    self.config.upsert_account_region(&account_id, region);
+                                }
+                                None => {
+                                    self.log_info(format!(
+                                        "region search: account {account_id} has no instances in any of the {searched} region(s) searched — its region is left as it was"
+                                    ));
+                                }
+                            }
+                            // Recorded whichever way it went. An account with
+                            // genuinely zero instances is indistinguishable
+                            // from a wrong region, so without this the empty
+                            // one pays for a full sweep every session forever.
+                            if !self
+                                .config
+                                .region_searched
+                                .iter()
+                                .any(|id| id == &account_id)
+                            {
+                                self.config.region_searched.push(account_id.clone());
+                            }
+                            if let Err(err) = self.config.save() {
+                                self.log_warn(format!(
+                                    "failed to save the region search result: {err}"
+                                ));
+                            }
+                            if found.is_some() {
+                                // Through the queue, not `spawn_refresh`, so
+                                // the one-at-a-time limit still holds.
+                                self.enqueue_refresh(&profile_id, true, true);
+                            }
+                        }
+                    }
                 }
                 events_processed += 1;
                 if events_processed >= MAX_EVENTS_PER_FRAME {
@@ -22936,6 +23041,16 @@ mod gui {
                             "refreshed profile={profile_id}: {} instances",
                             inventory.instances.len()
                         ));
+                        // The load that just landed **is** the region
+                        // search's probe: an empty result is the signal that
+                        // this account's region may simply be wrong. Called
+                        // here, before `context` and `inventory` are moved
+                        // into the display below.
+                        self.maybe_start_region_search(
+                            &profile_id,
+                            &context,
+                            inventory.instances.len(),
+                        );
                         // Update the active display if this is the selected profile
                         if is_selected {
                             self.context = Some(context);
@@ -24755,6 +24870,194 @@ mod gui {
                     c.request_repaint();
                 }
             });
+        }
+
+        /// An inventory load has just landed. If it came back empty, go and
+        /// find out where this account's instances actually are.
+        ///
+        /// **The load itself was the probe** — the `describe-instances` the
+        /// app makes anyway — so an account whose region is already right
+        /// costs nothing at all here.
+        fn maybe_start_region_search(
+            &mut self,
+            profile_id: &str,
+            context: &AwsContext,
+            instance_count: usize,
+        ) {
+            // The search records itself against the account id, and adopting
+            // a region writes `account_region.<id>`. With no account id there
+            // is nothing to write and nothing to remember, so there is no
+            // search worth starting.
+            let Some(account_id) = context.account_id.clone() else {
+                return;
+            };
+            let already = self
+                .config
+                .region_searched
+                .iter()
+                .any(|id| id == &account_id);
+            if !region_search::should_search(self.options.mode.clone(), instance_count, already) {
+                return;
+            }
+            // Claimed before the spawn, not inside it: two inventory loads
+            // landing in the same frame would otherwise both pass the check
+            // and put two sweeps on one account.
+            // The guard is scoped so it is dropped before the `&mut self`
+            // logging calls below.
+            let claimed = match self.region_search_in_flight.lock() {
+                Ok(mut guard) => guard.insert(account_id.clone()),
+                Err(_) => false,
+            };
+            if !claimed {
+                self.log_debug(format!(
+                    "region search: one is already running for account {account_id}"
+                ));
+                return;
+            }
+
+            let preferred = self.preferred_regions(&account_id);
+            self.log_info(format!(
+                "region search: account {account_id} came back empty in {} — looking for its instances elsewhere",
+                context.region
+            ));
+
+            let profile = context.profile.clone();
+            let region = context.region.clone();
+            let profile_id = profile_id.to_string();
+            let tx = self.proc_tx.clone();
+            let egui_ctx = self.egui_ctx.clone();
+            let in_flight = Arc::clone(&self.region_search_in_flight);
+            std::thread::spawn(move || {
+                let note = |level: LogLevel, message: String| {
+                    let _ = tx.send(ProcEvent::RegionSearchNote { level, message });
+                    if let Some(c) = &egui_ctx {
+                        c.request_repaint();
+                    }
+                };
+
+                // A denied `describe-regions` is not a failure: the regions
+                // the user's other accounts already use are a short list and
+                // almost certainly right, so the sweep degrades to those and
+                // says so.
+                let enabled = match describe_enabled_regions(&profile, &region) {
+                    Ok(list) => {
+                        note(
+                            LogLevel::Debug,
+                            format!(
+                                "region search: {} region(s) enabled for account {account_id}",
+                                list.len()
+                            ),
+                        );
+                        list
+                    }
+                    Err(err) => {
+                        note(
+                            LogLevel::Debug,
+                            format!(
+                                "region search: describe-regions failed ({err}) — falling back to the {} region(s) your other accounts use",
+                                preferred.len()
+                            ),
+                        );
+                        Vec::new()
+                    }
+                };
+
+                let order = region_search::search_order(&enabled, &preferred);
+                note(
+                    LogLevel::Info,
+                    format!(
+                        "region search: probing {} region(s) for account {account_id}, starting with {}",
+                        order.len(),
+                        order.first().map(String::as_str).unwrap_or("nothing")
+                    ),
+                );
+
+                // In parallel, but bounded: one `describe-instances
+                // --max-items 1` per region, `REGION_PROBE_PARALLELISM` at a
+                // time. Serially this is seventeen round trips a user sits
+                // through; all at once it is seventeen `aws` processes.
+                // Collected in search order, batch by batch, because
+                // `best_region` breaks a tie on position -- and with
+                // `--max-items 1` every count is 0 or 1, so a tie is the
+                // ordinary case.
+                let mut counts: Vec<(String, usize)> = Vec::new();
+                for batch in order.chunks(REGION_PROBE_PARALLELISM) {
+                    let mut handles = Vec::new();
+                    for candidate in batch {
+                        let profile = profile.clone();
+                        let candidate = candidate.clone();
+                        handles.push(std::thread::spawn(move || {
+                            let count = count_instances_in_region(&profile, &candidate);
+                            (candidate, count)
+                        }));
+                    }
+                    for handle in handles {
+                        // A probe thread that panicked says nothing about the
+                        // region either way, so it simply contributes nothing.
+                        let Ok((candidate, result)) = handle.join() else {
+                            continue;
+                        };
+                        match result {
+                            Ok(count) => counts.push((candidate, count)),
+                            Err(err) => note(
+                                LogLevel::Debug,
+                                format!("region search: {candidate} could not be read ({err})"),
+                            ),
+                        }
+                    }
+                }
+
+                let found = region_search::best_region(&counts);
+                let _ = tx.send(ProcEvent::RegionSearchDone {
+                    account_id: account_id.clone(),
+                    profile_id,
+                    found,
+                    searched: counts.len(),
+                });
+                // The event handler clears this too. Doing it here as well
+                // means a send that fails — the app closing mid-sweep — cannot
+                // leave the account permanently claimed. Released *after* the
+                // send, so the record it carries is already queued by the time
+                // another load could claim the account again.
+                if let Ok(mut guard) = in_flight.lock() {
+                    guard.remove(&account_id);
+                }
+                if let Some(c) = &egui_ctx {
+                    c.request_repaint();
+                }
+            });
+        }
+
+        /// The distinct regions the user's **other** accounts resolve to.
+        ///
+        /// These only *order* a region search, never shorten it — but on a
+        /// single-region site that is what turns the sweep into one call
+        /// instead of seventeen. Both the saved `account_region.` entries and
+        /// the contexts of whatever is already loaded count, since a freshly
+        /// discovered account may have neither yet.
+        fn preferred_regions(&self, account_id: &str) -> Vec<String> {
+            let mut candidates: Vec<String> = Vec::new();
+            for (acct, region) in &self.config.account_regions {
+                if acct != account_id {
+                    candidates.push(region.clone());
+                }
+            }
+            for (_, ctx) in self.profile_inventory_cache.values() {
+                if ctx.account_id.as_deref() != Some(account_id) {
+                    candidates.push(ctx.region.clone());
+                }
+            }
+            let mut out: Vec<String> = Vec::new();
+            for candidate in candidates {
+                let candidate = candidate.trim();
+                if candidate.is_empty() {
+                    continue;
+                }
+                if !out.iter().any(|seen| seen.eq_ignore_ascii_case(candidate)) {
+                    out.push(candidate.to_string());
+                }
+            }
+            out
         }
 
         /// The Start / Stop / Restart line above the inventory table.
@@ -38758,6 +39061,73 @@ mod gui {
                 ))
             }
         }
+    }
+
+    /// The regions this account has enabled, for the region search.
+    ///
+    /// Read-only, and it only ever *orders* the sweep: it reports which
+    /// regions are enabled, not where the instances are. See
+    /// `ec2_manager::region_search` for why that distinction is the whole
+    /// design.
+    fn describe_enabled_regions(
+        profile: &str,
+        region: &str,
+    ) -> std::result::Result<Vec<String>, String> {
+        let raw = aws_json(
+            profile,
+            region,
+            &["ec2", "describe-regions", "--query", "Regions[].RegionName"],
+        )?;
+        let parsed: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("describe-regions returned unreadable JSON: {e}"))?;
+        Ok(parsed
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Whether one region has any instances at all, for the region search.
+    ///
+    /// **`--max-items 1`, because the question is only whether anything is
+    /// there.** This runs once per enabled region, so a full page from each
+    /// would be seventeen inventories fetched to answer a yes/no. Read-only.
+    ///
+    /// A truncating `--max-items` can leave the CLI printing a pagination
+    /// token *after* the result, so the **first** JSON value is read out of
+    /// the stream rather than the whole of stdout being parsed as one
+    /// document. Anything that is neither a list nor `null` is counted as one:
+    /// something came back, which is the whole question.
+    fn count_instances_in_region(
+        profile: &str,
+        region: &str,
+    ) -> std::result::Result<usize, String> {
+        let raw = aws_json(
+            profile,
+            region,
+            &[
+                "ec2",
+                "describe-instances",
+                "--max-items",
+                "1",
+                "--query",
+                "Reservations[].Instances[].InstanceId",
+            ],
+        )?;
+        let first = serde_json::Deserializer::from_str(&raw)
+            .into_iter::<serde_json::Value>()
+            .next()
+            .transpose()
+            .map_err(|e| format!("describe-instances returned unreadable JSON: {e}"))?;
+        Ok(match first {
+            Some(serde_json::Value::Array(items)) => items.len(),
+            None | Some(serde_json::Value::Null) => 0,
+            Some(_) => 1,
+        })
     }
 
     fn aws_command() -> std::process::Command {

@@ -28,6 +28,7 @@ pub mod probe;
 pub mod profile_choice;
 pub mod pingdom;
 pub mod reaper;
+pub mod region_search;
 pub mod resources;
 pub mod route53;
 pub mod s3;

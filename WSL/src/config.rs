@@ -59,6 +59,16 @@ pub struct AppConfig {
     /// beyond the profile list itself: *added* means the id is in `profiles`,
     /// *dismissed* means it is here, and anything else is new.
     pub accounts_dismissed: Vec<String>,
+    /// Account ids whose region search has already run.
+    ///
+    /// An account with genuinely zero instances looks exactly like an account
+    /// pointed at the wrong region -- an empty `describe-instances` either
+    /// way -- so the sweep can never conclude "nothing here, stop asking" from
+    /// its own result. Without this record it would re-run a full
+    /// seventeen-region sweep on every launch, forever, for an account that is
+    /// simply empty. Recorded whether or not a region was found: `None` is an
+    /// answer.
+    pub region_searched: Vec<String>,
     /// Whether the one-shot "shared excluded by default" migration has run.
     pub shared_env_default_applied: bool,
     /// Saved window position/size from last close
@@ -173,6 +183,7 @@ impl Default for AppConfig {
             reset_filter_on_profile_switch: true,
             excluded_envs: Vec::new(),
             accounts_dismissed: Vec::new(),
+            region_searched: Vec::new(),
             shared_env_default_applied: false,
             window_x: None,
             window_y: None,
@@ -1115,6 +1126,9 @@ impl AppConfig {
                 "accounts_dismissed" => {
                     cfg.accounts_dismissed = split_csv(value);
                 }
+                "region_searched" => {
+                    cfg.region_searched = split_csv(value);
+                }
                 "shared_env_default_applied" => {
                     cfg.shared_env_default_applied = matches!(value, "1" | "true" | "TRUE");
                 }
@@ -1321,6 +1335,13 @@ impl AppConfig {
             lines.push(format!(
                 "accounts_dismissed={}",
                 self.accounts_dismissed.join(",")
+            ));
+        }
+
+        if !self.region_searched.is_empty() {
+            lines.push(format!(
+                "region_searched={}",
+                self.region_searched.join(",")
             ));
         }
 
@@ -2478,5 +2499,23 @@ mod tests {
     fn an_empty_dismissed_list_writes_no_line() {
         let cfg = AppConfig::default();
         assert!(!cfg.to_text().contains("accounts_dismissed"));
+    }
+
+    /// The record that stops an empty account paying for a full region sweep
+    /// on every launch is only worth having if it survives the restart.
+    #[test]
+    fn region_searched_round_trips_through_config_text() {
+        let cfg = AppConfig::parse("region_searched=111,222\n");
+        assert_eq!(cfg.region_searched, vec!["111", "222"]);
+        let again = AppConfig::parse(&cfg.to_text());
+        assert_eq!(again.region_searched, cfg.region_searched);
+    }
+
+    /// Same rule as every other list here: nothing searched yet writes no
+    /// line, so the file does not accrete a blank key on every save.
+    #[test]
+    fn an_empty_region_searched_list_writes_no_line() {
+        let cfg = AppConfig::default();
+        assert!(!cfg.to_text().contains("region_searched"));
     }
 }
