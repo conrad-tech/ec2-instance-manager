@@ -26512,7 +26512,13 @@ mod gui {
                     .then_with(|| a.account_id.cmp(&b.account_id))
             });
             if let Some(sort) = self.resource_sort(ResourceKind::LoadBalancer) {
-                sort_resource_rows(&mut rows, sort, cmp_load_balancers);
+                let favs = self.resource_favorite_ids(ResourceKind::LoadBalancer);
+                sort_resource_rows(
+                    &mut rows,
+                    sort,
+                    |lb| favs.contains(&lb.arn),
+                    cmp_load_balancers,
+                );
             }
             rows
         }
@@ -26591,7 +26597,9 @@ mod gui {
             let auto = lb_auto_widths(&rows);
             let overrides = self.lb_col_widths.clone();
             let sort = self.resource_sort(ResourceKind::LoadBalancer);
+            let fav_ids = self.resource_favorite_ids(ResourceKind::LoadBalancer);
             let mut pending_sort: Option<usize> = None;
+            let mut pending_fav: Option<String> = None;
             let mut pending_detail: Option<LoadBalancer> = None;
             let mut pending_width: Option<(usize, f32)> = None;
 
@@ -26610,23 +26618,48 @@ mod gui {
                 .show(ui, |ui| {
                     let cw =
                         |idx: usize| -> f32 { overrides.get(&idx).copied().unwrap_or(auto[idx]) };
+                    // The header's own space, with the star at 0.
+                    let header_w = |idx: usize| -> f32 {
+                        if idx == RESOURCE_FAV_COL {
+                            RESOURCE_FAV_W
+                        } else {
+                            cw(idx - 1)
+                        }
+                    };
                     egui::Grid::new("load_balancer_grid")
                         .striped(true)
                         .min_col_width(0.0)
                         .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
                         .show(ui, |ui| {
-                            let labels: Vec<String> =
-                                LB_COLUMN_LABELS.iter().map(|l| (*l).to_string()).collect();
+                            let labels = resource_header_labels(
+                                LB_COLUMN_LABELS.iter().map(|l| (*l).to_string()),
+                            );
                             let (clicked, resized) = render_resource_header(
-                                ui, "lb_col_resize", &labels, None, sort, &cw,
+                                ui, "lb_col_resize", &labels, None, sort, &header_w,
                             );
                             pending_sort = clicked;
-                            if resized.is_some() {
-                                pending_width = resized;
+                            // Back into DATA-column space for the width
+                            // override: the star is column 0 here and is not
+                            // resizable, so anything that comes back is a real
+                            // column and `- 1` is safe.
+                            if let Some((idx, w)) = resized {
+                                pending_width = Some((idx - 1, w));
                             }
                             ui.end_row();
 
                             for lb in &rows {
+                                // The star first, in its own fixed slot, and
+                                // deliberately NOT part of the row's click
+                                // response below: starring a row must not also
+                                // open its Details tab, the same reasoning that
+                                // keeps the copy buttons out.
+                                let fav = resource_star(
+                                    ui,
+                                    fav_ids.contains(&lb.arn),
+                                );
+                                if fav.clicked() {
+                                    pending_fav = Some(lb.arn.clone());
+                                }
                                 let name_cell = ui.allocate_ui_with_layout(
                                     egui::vec2(cw(0), TG_ROW_H),
                                     egui::Layout::left_to_right(egui::Align::Center),
@@ -26686,7 +26719,8 @@ mod gui {
                                 // the copy button: unioning it would make a
                                 // click on that button also open the details.
                                 let row = r_name.union(r_kind).union(r_scheme).union(r_state);
-                                let hovered = row.hovered() || dns_cell.response.hovered();
+                                let hovered =
+                                    row.hovered() || fav.hovered() || dns_cell.response.hovered();
                                 if hovered {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                     // The DNS cell is not part of the click
@@ -26695,6 +26729,7 @@ mod gui {
                                     // covers it.
                                     ui.painter().rect_filled(
                                         row.rect
+                                            .union(fav.rect)
                                             .union(cell_rect(dns_cell.response.rect, cw(4))),
                                         0.0,
                                         TG_ROW_HOVER,
@@ -26722,6 +26757,11 @@ mod gui {
 
             if let Some(column) = pending_sort {
                 self.toggle_resource_sort(ResourceKind::LoadBalancer, column);
+            }
+            // Applied after the table is drawn, never during: the row loop
+            // borrows `rows`, and this writes to the config and saves it.
+            if let Some(id) = pending_fav {
+                self.toggle_resource_favorite(ResourceKind::LoadBalancer, &id);
             }
             if let Some((idx, w)) = pending_width {
                 self.lb_col_widths.insert(idx, w);
@@ -27041,9 +27081,38 @@ mod gui {
 
 
 
+        /// The favourited ids for one kind, as a set to test rows against.
+        ///
+        /// Read once per render rather than per row: `is_resource_favorite`
+        /// walks a `Vec`, and a table of several hundred rows would walk it
+        /// several hundred times a frame for an answer that cannot change
+        /// mid-frame.
+        fn resource_favorite_ids(&self, kind: ResourceKind) -> HashSet<String> {
+            self.config
+                .resource_favorites_for(kind.as_str())
+                .into_iter()
+                .collect()
+        }
+
         /// How one resource table is sorted, if the user has picked.
         fn resource_sort(&self, kind: ResourceKind) -> Option<ResourceSort> {
             self.resource_sorts.get(&kind).copied()
+        }
+
+        /// A row's star was clicked.
+        ///
+        /// Saved immediately, like the EC2 table's own favourite toggle: a
+        /// favourite the user set and lost because the app closed without a
+        /// later save is the kind of thing that quietly teaches somebody the
+        /// feature does not work.
+        fn toggle_resource_favorite(&mut self, kind: ResourceKind, id: &str) {
+            let now = self.config.toggle_resource_favorite(kind.as_str(), id);
+            self.log_info(format!(
+                "{} favourite {id}: {}",
+                kind.label(),
+                if now { "on" } else { "off" }
+            ));
+            self.save_config_quietly("favourites");
         }
 
         /// A header was clicked.
@@ -27166,7 +27235,13 @@ mod gui {
                     .then_with(|| a.id.cmp(&b.id))
             });
             if let Some(sort) = self.resource_sort(ResourceKind::HostedZone) {
-                sort_resource_rows(&mut rows, sort, cmp_hosted_zones);
+                let favs = self.resource_favorite_ids(ResourceKind::HostedZone);
+                sort_resource_rows(
+                    &mut rows,
+                    sort,
+                    |z| favs.contains(&z.id),
+                    cmp_hosted_zones,
+                );
             }
             rows
         }
@@ -27245,7 +27320,9 @@ mod gui {
             let auto = zone_auto_widths(&rows);
             let overrides = self.zone_col_widths.clone();
             let sort = self.resource_sort(ResourceKind::HostedZone);
+            let fav_ids = self.resource_favorite_ids(ResourceKind::HostedZone);
             let mut pending_sort: Option<usize> = None;
+            let mut pending_fav: Option<String> = None;
             let mut pending_detail: Option<HostedZone> = None;
             let mut pending_width: Option<(usize, f32)> = None;
 
@@ -27258,23 +27335,48 @@ mod gui {
                 .show(ui, |ui| {
                     let cw =
                         |idx: usize| -> f32 { overrides.get(&idx).copied().unwrap_or(auto[idx]) };
+                    // The header's own space, with the star at 0.
+                    let header_w = |idx: usize| -> f32 {
+                        if idx == RESOURCE_FAV_COL {
+                            RESOURCE_FAV_W
+                        } else {
+                            cw(idx - 1)
+                        }
+                    };
                     egui::Grid::new("hosted_zone_grid")
                         .striped(true)
                         .min_col_width(0.0)
                         .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
                         .show(ui, |ui| {
-                            let labels: Vec<String> =
-                                ZONE_COLUMN_LABELS.iter().map(|l| (*l).to_string()).collect();
+                            let labels = resource_header_labels(
+                                ZONE_COLUMN_LABELS.iter().map(|l| (*l).to_string()),
+                            );
                             let (clicked, resized) = render_resource_header(
-                                ui, "zone_col_resize", &labels, None, sort, &cw,
+                                ui, "zone_col_resize", &labels, None, sort, &header_w,
                             );
                             pending_sort = clicked;
-                            if resized.is_some() {
-                                pending_width = resized;
+                            // Back into DATA-column space for the width
+                            // override: the star is column 0 here and is not
+                            // resizable, so anything that comes back is a real
+                            // column and `- 1` is safe.
+                            if let Some((idx, w)) = resized {
+                                pending_width = Some((idx - 1, w));
                             }
                             ui.end_row();
 
                             for z in &rows {
+                                // The star first, in its own fixed slot, and
+                                // deliberately NOT part of the row's click
+                                // response below: starring a row must not also
+                                // open its Details tab, the same reasoning that
+                                // keeps the copy buttons out.
+                                let fav = resource_star(
+                                    ui,
+                                    fav_ids.contains(&z.id),
+                                );
+                                if fav.clicked() {
+                                    pending_fav = Some(z.id.clone());
+                                }
                                 let name_cell = ui.allocate_ui_with_layout(
                                     egui::vec2(cw(0), TG_ROW_H),
                                     egui::Layout::left_to_right(egui::Align::Center),
@@ -27318,11 +27420,14 @@ mod gui {
                                 // the copy button: unioning it would make a
                                 // click on that button also open the details.
                                 let row = r_name.union(r_kind).union(r_count);
-                                let hovered = row.hovered() || id_cell.response.hovered();
+                                let hovered =
+                                    row.hovered() || fav.hovered() || id_cell.response.hovered();
                                 if hovered {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                     ui.painter().rect_filled(
-                                        row.rect.union(cell_rect(id_cell.response.rect, cw(3))),
+                                        row.rect
+                                            .union(fav.rect)
+                                            .union(cell_rect(id_cell.response.rect, cw(3))),
                                         0.0,
                                         TG_ROW_HOVER,
                                     );
@@ -27346,6 +27451,11 @@ mod gui {
 
             if let Some(column) = pending_sort {
                 self.toggle_resource_sort(ResourceKind::HostedZone, column);
+            }
+            // Applied after the table is drawn, never during: the row loop
+            // borrows `rows`, and this writes to the config and saves it.
+            if let Some(id) = pending_fav {
+                self.toggle_resource_favorite(ResourceKind::HostedZone, &id);
             }
             if let Some((idx, w)) = pending_width {
                 self.zone_col_widths.insert(idx, w);
@@ -27722,7 +27832,13 @@ mod gui {
                     .then_with(|| a.account_id.cmp(&b.account_id))
             });
             if let Some(sort) = self.resource_sort(ResourceKind::Bucket) {
-                sort_resource_rows(&mut rows, sort, cmp_buckets);
+                let favs = self.resource_favorite_ids(ResourceKind::Bucket);
+                sort_resource_rows(
+                    &mut rows,
+                    sort,
+                    |b| favs.contains(&b.name),
+                    cmp_buckets,
+                );
             }
             rows
         }
@@ -27798,7 +27914,9 @@ mod gui {
             let auto = bucket_auto_widths(&rows);
             let overrides = self.bucket_col_widths.clone();
             let sort = self.resource_sort(ResourceKind::Bucket);
+            let fav_ids = self.resource_favorite_ids(ResourceKind::Bucket);
             let mut pending_sort: Option<usize> = None;
+            let mut pending_fav: Option<String> = None;
             let mut pending_detail: Option<Bucket> = None;
             let mut pending_width: Option<(usize, f32)> = None;
 
@@ -27811,23 +27929,48 @@ mod gui {
                 .show(ui, |ui| {
                     let cw =
                         |idx: usize| -> f32 { overrides.get(&idx).copied().unwrap_or(auto[idx]) };
+                    // The header's own space, with the star at 0.
+                    let header_w = |idx: usize| -> f32 {
+                        if idx == RESOURCE_FAV_COL {
+                            RESOURCE_FAV_W
+                        } else {
+                            cw(idx - 1)
+                        }
+                    };
                     egui::Grid::new("bucket_grid")
                         .striped(true)
                         .min_col_width(0.0)
                         .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
                         .show(ui, |ui| {
-                            let labels: Vec<String> =
-                                BUCKET_COLUMN_LABELS.iter().map(|l| (*l).to_string()).collect();
+                            let labels = resource_header_labels(
+                                BUCKET_COLUMN_LABELS.iter().map(|l| (*l).to_string()),
+                            );
                             let (clicked, resized) = render_resource_header(
-                                ui, "bucket_col_resize", &labels, None, sort, &cw,
+                                ui, "bucket_col_resize", &labels, None, sort, &header_w,
                             );
                             pending_sort = clicked;
-                            if resized.is_some() {
-                                pending_width = resized;
+                            // Back into DATA-column space for the width
+                            // override: the star is column 0 here and is not
+                            // resizable, so anything that comes back is a real
+                            // column and `- 1` is safe.
+                            if let Some((idx, w)) = resized {
+                                pending_width = Some((idx - 1, w));
                             }
                             ui.end_row();
 
                             for b in &rows {
+                                // The star first, in its own fixed slot, and
+                                // deliberately NOT part of the row's click
+                                // response below: starring a row must not also
+                                // open its Details tab, the same reasoning that
+                                // keeps the copy buttons out.
+                                let fav = resource_star(
+                                    ui,
+                                    fav_ids.contains(&b.name),
+                                );
+                                if fav.clicked() {
+                                    pending_fav = Some(b.name.clone());
+                                }
                                 // The one field people copy out of this table,
                                 // so it carries the Inventory table's own copy
                                 // button rather than making somebody select
@@ -27859,11 +28002,13 @@ mod gui {
                                 // the copy button: unioning it would make a
                                 // click on that button also open the details.
                                 let row = r_created;
-                                let hovered = row.hovered() || name_cell.response.hovered();
+                                let hovered =
+                                    row.hovered() || fav.hovered() || name_cell.response.hovered();
                                 if hovered {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                     ui.painter().rect_filled(
                                         row.rect
+                                            .union(fav.rect)
                                             .union(cell_rect(name_cell.response.rect, cw(0))),
                                         0.0,
                                         TG_ROW_HOVER,
@@ -27888,6 +28033,11 @@ mod gui {
 
             if let Some(column) = pending_sort {
                 self.toggle_resource_sort(ResourceKind::Bucket, column);
+            }
+            // Applied after the table is drawn, never during: the row loop
+            // borrows `rows`, and this writes to the config and saves it.
+            if let Some(id) = pending_fav {
+                self.toggle_resource_favorite(ResourceKind::Bucket, &id);
             }
             if let Some((idx, w)) = pending_width {
                 self.bucket_col_widths.insert(idx, w);
@@ -28108,7 +28258,13 @@ mod gui {
                     .then_with(|| a.account_id.cmp(&b.account_id))
             });
             if let Some(sort) = self.resource_sort(ResourceKind::Asg) {
-                sort_resource_rows(&mut rows, sort, cmp_asgs);
+                let favs = self.resource_favorite_ids(ResourceKind::Asg);
+                sort_resource_rows(
+                    &mut rows,
+                    sort,
+                    |g| favs.contains(&g.arn),
+                    cmp_asgs,
+                );
             }
             rows
         }
@@ -28187,7 +28343,9 @@ mod gui {
             let auto = asg_auto_widths(&rows);
             let overrides = self.asg_col_widths.clone();
             let sort = self.resource_sort(ResourceKind::Asg);
+            let fav_ids = self.resource_favorite_ids(ResourceKind::Asg);
             let mut pending_sort: Option<usize> = None;
+            let mut pending_fav: Option<String> = None;
             let mut pending_detail: Option<AutoScalingGroup> = None;
             let mut pending_capacity: Option<AutoScalingGroup> = None;
             let mut pending_width: Option<(usize, f32)> = None;
@@ -28201,23 +28359,48 @@ mod gui {
                 .show(ui, |ui| {
                     let cw =
                         |idx: usize| -> f32 { overrides.get(&idx).copied().unwrap_or(auto[idx]) };
+                    // The header's own space, with the star at 0.
+                    let header_w = |idx: usize| -> f32 {
+                        if idx == RESOURCE_FAV_COL {
+                            RESOURCE_FAV_W
+                        } else {
+                            cw(idx - 1)
+                        }
+                    };
                     egui::Grid::new("asg_grid")
                         .striped(true)
                         .min_col_width(0.0)
                         .spacing(egui::vec2(TG_COL_GAP, TG_ROW_SPACING))
                         .show(ui, |ui| {
-                            let labels: Vec<String> =
-                                ASG_COLUMN_LABELS.iter().map(|l| (*l).to_string()).collect();
+                            let labels = resource_header_labels(
+                                ASG_COLUMN_LABELS.iter().map(|l| (*l).to_string()),
+                            );
                             let (clicked, resized) = render_resource_header(
-                                ui, "asg_col_resize", &labels, None, sort, &cw,
+                                ui, "asg_col_resize", &labels, None, sort, &header_w,
                             );
                             pending_sort = clicked;
-                            if resized.is_some() {
-                                pending_width = resized;
+                            // Back into DATA-column space for the width
+                            // override: the star is column 0 here and is not
+                            // resizable, so anything that comes back is a real
+                            // column and `- 1` is safe.
+                            if let Some((idx, w)) = resized {
+                                pending_width = Some((idx - 1, w));
                             }
                             ui.end_row();
 
                             for g in &rows {
+                                // The star first, in its own fixed slot, and
+                                // deliberately NOT part of the row's click
+                                // response below: starring a row must not also
+                                // open its Details tab, the same reasoning that
+                                // keeps the copy buttons out.
+                                let fav = resource_star(
+                                    ui,
+                                    fav_ids.contains(&g.arn),
+                                );
+                                if fav.clicked() {
+                                    pending_fav = Some(g.arn.clone());
+                                }
                                 let name_cell = ui.allocate_ui_with_layout(
                                     egui::vec2(cw(0), TG_ROW_H),
                                     egui::Layout::left_to_right(egui::Align::Center),
@@ -28261,9 +28444,10 @@ mod gui {
                                     .union(r_max)
                                     .union(r_instances)
                                     .union(r_health);
-                                if row.hovered() {
+                                if row.hovered() || fav.hovered() {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                    ui.painter().rect_filled(row.rect, 0.0, TG_ROW_HOVER);
+                                    ui.painter()
+                                        .rect_filled(row.rect.union(fav.rect), 0.0, TG_ROW_HOVER);
                                 }
                                 if row.clicked() {
                                     pending_detail = Some(g.clone());
@@ -28296,6 +28480,11 @@ mod gui {
 
             if let Some(column) = pending_sort {
                 self.toggle_resource_sort(ResourceKind::Asg, column);
+            }
+            // Applied after the table is drawn, never during: the row loop
+            // borrows `rows`, and this writes to the config and saves it.
+            if let Some(id) = pending_fav {
+                self.toggle_resource_favorite(ResourceKind::Asg, &id);
             }
             if let Some((idx, w)) = pending_width {
                 self.asg_col_widths.insert(idx, w);
@@ -28902,9 +29091,13 @@ mod gui {
                 // group's Healthy/Total lives in `tg_health`, filled lazily by
                 // its own calls, not on the `TargetGroup`.
                 let health = &self.tg_health;
-                sort_resource_rows(&mut rows, sort, |a, b, column| {
-                    cmp_target_groups(a, b, column, health)
-                });
+                let favs = self.resource_favorite_ids(ResourceKind::TargetGroup);
+                sort_resource_rows(
+                    &mut rows,
+                    sort,
+                    |tg| favs.contains(&tg.arn),
+                    |a, b, column| cmp_target_groups(a, b, column, health),
+                );
             }
             rows
         }
@@ -29023,7 +29216,6 @@ mod gui {
             }
             let mut priority_arns: Vec<String> =
                 priority_idx.iter().map(|i| rows[*i].arn.clone()).collect();
-            let is_priority: HashSet<usize> = priority_idx.iter().copied().collect();
 
             // A search is itself a statement of what matters. Somebody who has
             // just narrowed 200 target groups to three is looking at all three,
@@ -29032,8 +29224,7 @@ mod gui {
             // cap as the configured list: a search matching half the account
             // must not turn the bounded fill into one call per row. Rows
             // already claimed by the configured list are not added twice --
-            // `health_requests` dedupes -- and the star is left alone, since it
-            // marks the configured list, not the search.
+            // `health_requests` dedupes.
             if search_promotes_every_row(
                 self.search_rules.iter().any(|r| !r.term.trim().is_empty()),
                 rows.len(),
@@ -29068,7 +29259,9 @@ mod gui {
             let overrides = self.tg_col_widths.clone();
             let mut pending_detail: Option<TargetGroup> = None;
             let sort = self.resource_sort(ResourceKind::TargetGroup);
+            let fav_ids = self.resource_favorite_ids(ResourceKind::TargetGroup);
             let mut pending_sort: Option<usize> = None;
+            let mut pending_fav: Option<String> = None;
             let mut pending_width: Option<(usize, f32)> = None;
 
             // See the load balancer table: solid so it is visible when it
@@ -29082,6 +29275,14 @@ mod gui {
                     let cw = |idx: usize| -> f32 {
                         overrides.get(&idx).copied().unwrap_or(auto[idx])
                     };
+                    // The header's own space, with the star at 0.
+                    let header_w = |idx: usize| -> f32 {
+                        if idx == RESOURCE_FAV_COL {
+                            RESOURCE_FAV_W
+                        } else {
+                            cw(idx - 1)
+                        }
+                    };
                     egui::Grid::new("target_group_grid")
                         .striped(true)
                         .min_col_width(0.0)
@@ -29091,56 +29292,54 @@ mod gui {
                             // the column is switched off for an account, so
                             // the labels are built rather than taken from the
                             // constant — and its hover explains why.
-                            let labels: Vec<String> = TG_COLUMN_LABELS
-                                .iter()
-                                .enumerate()
-                                .map(|(idx, label)| {
+                            let labels = resource_header_labels(
+                                TG_COLUMN_LABELS.iter().enumerate().map(|(idx, label)| {
                                     if idx == TG_HEALTH_COL {
                                         health_header.clone()
                                     } else {
                                         (*label).to_string()
                                     }
-                                })
-                                .collect();
+                                }),
+                            );
+                            // `+ 1` because the labels now carry the star at 0
+                            // and `TG_HEALTH_COL` indexes the data columns.
                             let hover = health_hover
                                 .clone()
-                                .map(|text| (TG_HEALTH_COL, text));
+                                .map(|text| (TG_HEALTH_COL + 1, text));
                             let (clicked, resized) = render_resource_header(
                                 ui,
                                 "tg_col_resize",
                                 &labels,
                                 hover,
                                 sort,
-                                &cw,
+                                &header_w,
                             );
                             pending_sort = clicked;
-                            if resized.is_some() {
-                                pending_width = resized;
+                            // Back into DATA-column space — see the other
+                            // tables' headers.
+                            if let Some((idx, w)) = resized {
+                                pending_width = Some((idx - 1, w));
                             }
                             ui.end_row();
 
-                            for (idx, tg) in rows.iter().enumerate() {
-                                // The star gets a fixed slot of its own rather
-                                // than being glued onto the name. Prefixed, a
-                                // starred row's name started two characters
-                                // right of every other row's, so configuring a
-                                // priority list put a jag down the one column
-                                // people actually read.
-                                let starred = is_priority.contains(&idx);
+                            for tg in &rows {
+                                // The star first, in its own fixed slot, and
+                                // deliberately NOT part of the row's click
+                                // response below: starring a row must not also
+                                // open its Details tab, the same reasoning that
+                                // keeps the copy buttons out.
+                                let fav = resource_star(
+                                    ui,
+                                    fav_ids.contains(&tg.arn),
+                                );
+                                if fav.clicked() {
+                                    pending_fav = Some(tg.arn.clone());
+                                }
+
                                 let name_cell = ui.allocate_ui_with_layout(
                                     egui::vec2(cw(0), TG_ROW_H),
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
-                                        ui.spacing_mut().item_spacing.x = 2.0;
-                                        ui.allocate_ui_with_layout(
-                                            egui::vec2(TG_STAR_W, TG_ROW_H),
-                                            egui::Layout::left_to_right(egui::Align::Center),
-                                            |ui| {
-                                                if starred {
-                                                    ui.label("★");
-                                                }
-                                            },
-                                        );
                                         ui.add(
                                             egui::Label::new(tg.name.clone())
                                                 .wrap_mode(egui::TextWrapMode::Truncate),
@@ -29221,9 +29420,10 @@ mod gui {
                                     .union(r_proto)
                                     .union(r_health)
                                     .union(r_path);
-                                if row.hovered() {
+                                if row.hovered() || fav.hovered() {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                    ui.painter().rect_filled(row.rect, 0.0, TG_ROW_HOVER);
+                                    ui.painter()
+                                        .rect_filled(row.rect.union(fav.rect), 0.0, TG_ROW_HOVER);
                                 }
                                 if row.clicked() {
                                     pending_detail = Some(tg.clone());
@@ -29247,6 +29447,11 @@ mod gui {
 
             if let Some(column) = pending_sort {
                 self.toggle_resource_sort(ResourceKind::TargetGroup, column);
+            }
+            // Applied after the table is drawn, never during: the row loop
+            // borrows `rows`, and this writes to the config and saves it.
+            if let Some(id) = pending_fav {
+                self.toggle_resource_favorite(ResourceKind::TargetGroup, &id);
             }
             if let Some((idx, w)) = pending_width {
                 self.tg_col_widths.insert(idx, w);
@@ -39869,6 +40074,63 @@ mod gui {
 
 
 
+
+    /// Column 0 of every resource table is the favourite star.
+    ///
+    /// The tables' own `*_COLUMN_LABELS` do **not** include it —
+    /// `resource_header_labels` puts it in front at render time. That keeps
+    /// one index space per concern: the labels arrays, the `*_MIN_COL_W`
+    /// arrays, the `cmp_*` comparators and the `*_col_widths` overrides all
+    /// stay 0-based over the DATA columns, and only the header and the sort
+    /// deal in the space with the star at 0. Shifting all five tables'
+    /// arrays and every `cw(n)` in their row loops was the alternative, and
+    /// it is a much larger edit for the same pixels.
+    const RESOURCE_FAV_COL: usize = 0;
+
+    /// How wide the star column is. Fixed — a star does not vary in width, so
+    /// unlike every data column it is not resizable either.
+    const RESOURCE_FAV_W: f32 = 24.0;
+
+    /// A resource table's header labels: its own columns with the favourite
+    /// star in front.
+    fn resource_header_labels(columns: impl IntoIterator<Item = String>) -> Vec<String> {
+        // A glyph rather than the word "Favorite": the column is 24px wide and
+        // the EC2 table's own header spells it out only because that column is
+        // 55px. The hollow star is what an unstarred row shows, so the header
+        // reads as "this column is the star".
+        let mut out = vec!["\u{2606}".to_string()];
+        out.extend(columns);
+        out
+    }
+
+    /// The favourite star for one row, in its own fixed slot.
+    ///
+    /// An unframed button, exactly as the EC2 table's is: filled and yellow
+    /// when favourited, hollow when not. Returned rather than acted on,
+    /// because every caller has to keep it OUT of the row's click response —
+    /// starring a row must not also open its Details tab, the same reasoning
+    /// that keeps the copy buttons out.
+    fn resource_star(ui: &mut egui::Ui, is_favorite: bool) -> egui::Response {
+        let label = if is_favorite {
+            egui::RichText::new("\u{2605}").color(egui::Color32::YELLOW)
+        } else {
+            egui::RichText::new("\u{2606}")
+        };
+        ui.allocate_ui_with_layout(
+            egui::vec2(RESOURCE_FAV_W, TG_ROW_H),
+            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+            |ui| {
+                ui.add(egui::Button::new(label).frame(false))
+                    .on_hover_text(if is_favorite {
+                        "Remove from favourites"
+                    } else {
+                        "Add to favourites"
+                    })
+            },
+        )
+        .inner
+    }
+
     /// The whole cell, for something allocated `width` wide.
     ///
     /// **`allocate_ui_with_layout` returns the rect its CONTENT used, not the
@@ -39969,13 +40231,16 @@ mod gui {
             // has, and the reason the fixed-width compromise is no longer
             // needed.
             // Measured against the full column too, so the handle sits at
-            // the column's edge rather than at the end of a short label.
+            // the column's edge rather than at the end of a short label. The
+            // star column is fixed width and has no handle at all — dragging
+            // an edge that cannot move is worse than having no edge to drag.
             let drag_id = ui.id().with((salt, idx));
-            let near_right = ui.input(|i| {
-                i.pointer
-                    .hover_pos()
-                    .is_some_and(|pos| full.contains(pos) && pos.x > full.right() - 8.0)
-            });
+            let near_right = idx != RESOURCE_FAV_COL
+                && ui.input(|i| {
+                    i.pointer
+                        .hover_pos()
+                        .is_some_and(|pos| full.contains(pos) && pos.x > full.right() - 8.0)
+                });
             if near_right || ui.ctx().is_being_dragged(drag_id) {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
                 let x = full.right();
@@ -40049,10 +40314,22 @@ mod gui {
     fn sort_resource_rows<T>(
         rows: &mut [T],
         sort: ResourceSort,
+        favorite: impl Fn(&T) -> bool,
         compare: impl Fn(&T, &T, usize) -> std::cmp::Ordering,
     ) {
         rows.sort_by(|a, b| {
-            let ord = compare(a, b, sort.column);
+            let ord = if sort.column == RESOURCE_FAV_COL {
+                // **Favourites first when ascending.** `false < true`, so the
+                // flags are compared the other way round: clicking the star
+                // header once has to bring the starred rows to the top, which
+                // is the only reason anybody clicks it.
+                favorite(b).cmp(&favorite(a))
+            } else {
+                // The comparators are 0-based over the DATA columns, and the
+                // star occupies 0 here — see `RESOURCE_FAV_COL`. The `- 1` is
+                // safe because column 0 took the branch above.
+                compare(a, b, sort.column - 1)
+            };
             match sort.direction {
                 SortDirection::Ascending => ord,
                 SortDirection::Descending => ord.reverse(),
@@ -41108,13 +41385,6 @@ mod gui {
     /// purpose; neither needs to be exact, only stable.
     const TG_CHAR_W: f32 = 6.5;
 
-    /// The slot the priority star sits in, at the head of every Name cell.
-    ///
-    /// Fixed, and present whether or not the row is starred, so names all
-    /// start at the same x. Glued onto the name as a prefix instead, a
-    /// configured priority list put a two-character jag down the column.
-    const TG_STAR_W: f32 = 14.0;
-
     /// Horizontal gap between columns — the grid's own `spacing.x`.
     const TG_COL_GAP: f32 = 12.0;
 
@@ -41156,9 +41426,7 @@ mod gui {
 
         for tg in rows {
             let cells = [
-                // The star is only on some rows, but every row must leave room
-                // for it or the column jumps when one appears.
-                text_w(&tg.name) + TG_STAR_W,
+                text_w(&tg.name),
                 text_w(&elb::protocol_port_label(tg)),
                 text_w("not permitted"),
                 text_w(tg.health_check.path.as_deref().unwrap_or("—")),
@@ -49035,6 +49303,11 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         }
 
 
+        /// Sort by a DATA column, named 0-based as `*_COLUMN_LABELS` are.
+        ///
+        /// The `+ 1` is the star: `ResourceSort.column` counts the favourite
+        /// column at 0, and shifting here rather than in every test keeps them
+        /// reading in the same terms as the comparators they exercise.
         fn sorted<T: Clone>(
             rows: &[T],
             column: usize,
@@ -49042,7 +49315,35 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             compare: impl Fn(&T, &T, usize) -> std::cmp::Ordering,
         ) -> Vec<T> {
             let mut out = rows.to_vec();
-            sort_resource_rows(&mut out, ResourceSort { column, direction }, compare);
+            sort_resource_rows(
+                &mut out,
+                ResourceSort {
+                    column: column + 1,
+                    direction,
+                },
+                |_| false,
+                compare,
+            );
+            out
+        }
+
+        /// Sort by the favourite column itself.
+        fn sorted_by_favorite<T: Clone>(
+            rows: &[T],
+            direction: SortDirection,
+            favorite: impl Fn(&T) -> bool,
+        ) -> Vec<T> {
+            let mut out = rows.to_vec();
+            sort_resource_rows(
+                &mut out,
+                ResourceSort {
+                    column: RESOURCE_FAV_COL,
+                    direction,
+                },
+                favorite,
+                // Never reached: column 0 takes the favourite branch.
+                |_, _, _| std::cmp::Ordering::Equal,
+            );
             out
         }
 
@@ -49112,6 +49413,107 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert!(
                 body.contains("egui::Sense::click(),\n            );"),
                 "the click interaction is still there"
+            );
+        }
+
+
+        /// **Clicking the star header brings favourites to the TOP.** That is
+        /// the only reason anybody clicks it, and `false < true` means the
+        /// naive comparison does the opposite.
+        #[test]
+        fn sorting_by_the_star_puts_favourites_first() {
+            let rows = vec![
+                bucket_row("alpha"),
+                bucket_row("beta"),
+                bucket_row("gamma"),
+            ];
+            let starred = |b: &Bucket| b.name == "gamma";
+            let asc = sorted_by_favorite(&rows, SortDirection::Ascending, starred);
+            assert_eq!(
+                asc.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+                vec!["gamma", "alpha", "beta"]
+            );
+            // And the other way round on the second click.
+            let desc = sorted_by_favorite(&rows, SortDirection::Descending, starred);
+            assert_eq!(desc.last().unwrap().name, "gamma");
+        }
+
+        /// The unstarred rows keep their default order behind the starred
+        /// ones — the sort is stable, so starring one row must not reshuffle
+        /// everything else.
+        #[test]
+        fn starring_one_row_does_not_reorder_the_rest() {
+            let rows = vec![
+                bucket_row("alpha"),
+                bucket_row("beta"),
+                bucket_row("gamma"),
+            ];
+            let asc = sorted_by_favorite(&rows, SortDirection::Ascending, |b| b.name == "beta");
+            assert_eq!(
+                asc.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+                vec!["beta", "alpha", "gamma"]
+            );
+        }
+
+        /// The star sits at column 0 and every data column is one to its
+        /// right. Getting that mapping wrong sorts the wrong column, silently.
+        #[test]
+        fn the_star_is_column_zero_and_the_data_columns_follow_it() {
+            assert_eq!(RESOURCE_FAV_COL, 0);
+            let labels = resource_header_labels(
+                BUCKET_COLUMN_LABELS.iter().map(|l| (*l).to_string()),
+            );
+            assert_eq!(labels.len(), BUCKET_COLUMN_LABELS.len() + 1);
+            assert_eq!(labels[0], "\u{2606}");
+            for (idx, label) in BUCKET_COLUMN_LABELS.iter().enumerate() {
+                assert_eq!(&labels[idx + 1], label);
+            }
+        }
+
+        /// The star column is not resizable — it is a fixed 24px and dragging
+        /// an edge that cannot move is worse than having no edge to drag.
+        #[test]
+        fn the_star_column_has_no_resize_handle() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let start = src
+                .find("fn render_resource_header(")
+                .expect("render_resource_header");
+            let end = src[start..]
+                .find("\n    /// Case-insensitive, because these names drift")
+                .map(|i| start + i)
+                .expect("the function that follows it");
+            assert!(
+                src[start..end].contains("let near_right = idx != RESOURCE_FAV_COL"),
+                "the star column must be excluded from the resize handle"
+            );
+        }
+
+        /// **The priority star is gone from the Target Groups name cell.** It
+        /// marked `resources.priority_target_groups` and was removed at the
+        /// maintainer's request; the favourite star now occupies that visual
+        /// slot and means something the user set, not something a config file
+        /// did. The priority list still decides which health calls go first —
+        /// only its marker went — and the too-broad-pattern warning is now the
+        /// whole of how a bad pattern announces itself.
+        #[test]
+        fn the_priority_star_no_longer_marks_a_target_group_row() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            assert!(
+                !src.contains("TG_STAR_W"),
+                "the priority star's fixed slot should be gone"
+            );
+            let start = src.find("fn render_target_groups").expect("render_target_groups");
+            let body = &src[start..start + 14000];
+            assert!(
+                !body.contains("is_priority"),
+                "the row loop must not still mark the configured list"
+            );
+            // The warning that made a too-broad pattern visible stays.
+            assert!(
+                src.contains("tg_priority_warned"),
+                "the priority warning is the remaining signal and must stay"
             );
         }
 

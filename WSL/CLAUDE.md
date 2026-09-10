@@ -42,7 +42,7 @@ cargo build --features gui
 
 # Run tests
 cargo test                  # lib + CLI tests
-cargo test --features gui   # all tests including GUI (534 GUI tests)
+cargo test --features gui   # all tests including GUI (541 GUI tests)
 
 # Clippy
 cargo clippy --features gui
@@ -62,7 +62,7 @@ stale for months before phase 1 (it read 356 tests / 21 warnings, both months
 out of date; the measured baseline immediately before phase 1 was 1019 tests /
 23 warnings):
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 1350 tests pass, 0 fail (813 lib + 3 CLI + 534 GUI)
+- `cargo test --features gui` — 1361 tests pass, 0 fail (817 lib + 3 CLI + 541 GUI)
 - `cargo clippy --features gui` — no errors; 23 pre-existing style warnings.
   **That is a count of `^warning` lines, which is how the pre-branch baseline
   was measured and why the two are comparable — it is 21 distinct lints (6 lib
@@ -2674,6 +2674,61 @@ come to behave differently.
   group at all. It is also the one comparator needing more than the row
   itself — a group's health lives in `tg_health`, filled lazily by its own
   calls.
+
+#### The favourite star
+
+Every resource table carries the same favourite star the EC2 table has, as
+its **first column**, clickable to toggle and sortable to bring favourites to
+the top.
+
+- **`resources.priority_target_groups` no longer draws a star.** It marked
+  the configured priority list and was removed at the maintainer's request;
+  the favourite star now holds that visual slot and means something the user
+  set rather than something a config file did. The priority list still
+  decides which health calls go first — only its marker went — so the
+  too-broad-pattern warning is now the whole of how a bad pattern announces
+  itself. `the_priority_star_no_longer_marks_a_target_group_row` pins both
+  halves.
+- **`AppConfig::resource_favorites` is separate from `favorites`.** That one
+  is instances, keyed `account:region` because an instance id is only unique
+  inside one, and the EC2 "Show Favorites" filter reads it by scope. Every
+  resource id is already globally unique — an ARN carries its own account, a
+  bucket name is unique across all of AWS, a hosted zone id is unique — so a
+  scope would be a key with nothing to disambiguate, and mixing the two would
+  put resource ids in front of the instance filter.
+  - Keyed by `ResourceKind::as_str`, the **cache-key fragment**, not the
+    sub-tab label — renaming a tab must not orphan somebody's favourites.
+  - Compared **case-sensitively**, unlike the instance one: S3 allows
+    `Alpha-Assets` and `alpha-assets` to be two different buckets, and
+    folding case would let starring one un-star the other.
+  - `resource_favorite.` is checked **before** `favorite.` when loading,
+    since one key is a prefix of the other.
+- **The star is column 0 in the SORT space only.** The tables'
+  `*_COLUMN_LABELS`, `*_MIN_COL_W`, the `cmp_*` comparators and the
+  `*_col_widths` overrides all stay 0-based over the DATA columns;
+  `resource_header_labels` puts the star in front at render time and
+  `sort_resource_rows` maps `column - 1` back. Shifting all five tables'
+  arrays and every `cw(n)` in their row loops was the alternative — a much
+  larger edit for the same pixels, and five more places to get an index
+  wrong.
+- **Ascending puts favourites at the TOP**, which is the only reason anybody
+  clicks that header — and `false < true`, so the flags are compared the
+  other way round. The sort stays stable, so starring one row does not
+  reshuffle the rest.
+- **The star is not part of the row's click response.** Starring a row must
+  not also open its Details tab — the same reasoning that keeps the copy
+  buttons out. It IS part of the hover highlight, since the row is one thing
+  to look at even where it is two things to click.
+- **The star column is fixed width and has no resize handle.** A star does
+  not vary in width, and dragging an edge that cannot move is worse than
+  having no edge to drag.
+- **A toggle saves immediately.** A favourite the user set and lost because
+  the app closed without a later save is the kind of thing that quietly
+  teaches somebody the feature does not work.
+- `resource_favorite_ids` reads the set once per render, not per row:
+  `is_resource_favorite` walks a `Vec`, and a table of several hundred rows
+  would walk it several hundred times a frame for an answer that cannot
+  change mid-frame.
 
 - **`filter::text_matches` is the shared search engine.** The
   include/exclude matching was lifted out of `apply_filters` so every sub-tab

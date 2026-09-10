@@ -22,6 +22,18 @@ pub struct AppConfig {
     pub account_regions: BTreeMap<String, String>,
     pub tag_mapping: TagMapping,
     pub favorites: BTreeMap<String, Vec<String>>,
+    /// Favourited resources, keyed by resource kind (`targetgroup`,
+    /// `loadbalancer`, `asg`, `bucket`, `hostedzone`).
+    ///
+    /// **Separate from `favorites`, which is instances.** That one is keyed by
+    /// `account:region` because an instance id is only unique inside one, and
+    /// the EC2 "Show Favorites" filter reads it by scope. Every id in here is
+    /// already globally unique — an ARN carries its own account, a bucket name
+    /// is unique across all of AWS, a hosted zone id is unique — so a scope
+    /// would be a key with nothing to disambiguate. Mixing the two would also
+    /// put resource ids in front of the instance filter, which matches nothing
+    /// and is a question nobody should have to ask.
+    pub resource_favorites: BTreeMap<String, Vec<String>>,
     pub recents: Vec<RecentConnection>,
     pub saved_filters: BTreeMap<String, Vec<SavedFilter>>,
     pub port_forward_presets: Vec<PortForwardPreset>,
@@ -156,6 +168,7 @@ impl Default for AppConfig {
             account_regions: BTreeMap::new(),
             tag_mapping: TagMapping::default(),
             favorites: BTreeMap::new(),
+            resource_favorites: BTreeMap::new(),
             recents: Vec::new(),
             saved_filters: BTreeMap::new(),
             port_forward_presets: vec![
@@ -748,6 +761,42 @@ impl AppConfig {
         }
     }
 
+    /// Is this resource favourited?
+    ///
+    /// `kind` is `ResourceKind::as_str` — the same stable fragment the cache
+    /// keys use, not the sub-tab's label, so renaming a tab cannot silently
+    /// orphan somebody's favourites.
+    pub fn is_resource_favorite(&self, kind: &str, id: &str) -> bool {
+        self.resource_favorites
+            .get(kind)
+            .map(|v| v.iter().any(|held| held == id))
+            .unwrap_or(false)
+    }
+
+    /// Toggle it, returning whether it is now favourited.
+    ///
+    /// Compared **case-sensitively**, unlike the instance one. An instance id
+    /// is hex and case-insensitive in practice; these are ARNs and bucket
+    /// names, where case is significant — S3 allows `Alpha-Assets` and
+    /// `alpha-assets` to be two different buckets, and folding them would let
+    /// starring one un-star the other.
+    pub fn toggle_resource_favorite(&mut self, kind: &str, id: &str) -> bool {
+        let entry = self.resource_favorites.entry(kind.to_string()).or_default();
+        if let Some(idx) = entry.iter().position(|held| held == id) {
+            entry.remove(idx);
+            false
+        } else {
+            entry.push(id.to_string());
+            entry.sort();
+            true
+        }
+    }
+
+    /// Every favourited id for one kind.
+    pub fn resource_favorites_for(&self, kind: &str) -> Vec<String> {
+        self.resource_favorites.get(kind).cloned().unwrap_or_default()
+    }
+
     pub fn add_recent_connection(&mut self, recent: RecentConnection) {
         self.recents.retain(|item| {
             !(item.account_id == recent.account_id
@@ -1006,6 +1055,18 @@ impl AppConfig {
                         rest.to_string(),
                         matches!(value, "1" | "true" | "TRUE"),
                     );
+                }
+                continue;
+            }
+
+            // Checked BEFORE `favorite.`, which is a prefix of it — the
+            // other way round, every `resource_favorite.asg=` line would be
+            // read as an instance favourite in an account called
+            // `resource_favorite.asg`.
+            if let Some(rest) = key.strip_prefix("resource_favorite.") {
+                if !rest.is_empty() {
+                    cfg.resource_favorites
+                        .insert(rest.to_string(), split_csv(value));
                 }
                 continue;
             }
@@ -1367,6 +1428,10 @@ impl AppConfig {
 
         for (scope, ids) in &self.favorites {
             lines.push(format!("favorite.{scope}={}", ids.join(",")));
+        }
+
+        for (kind, ids) in &self.resource_favorites {
+            lines.push(format!("resource_favorite.{kind}={}", ids.join(",")));
         }
 
         for recent in &self.recents {
@@ -2080,6 +2145,57 @@ mod tests {
         assert_eq!(cfg.recents.len(), 1);
         assert_eq!(cfg.saved_filters_for_scope("123", "us-east-1").len(), 1);
         assert!(cfg.port_forward_presets.iter().any(|p| p.name == "ssh"));
+    }
+
+    #[test]
+    fn resource_favorites_round_trip_through_the_file() {
+        let mut cfg = AppConfig::default();
+        let arn = "arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/app/73e2d6bc";
+        assert!(cfg.toggle_resource_favorite("targetgroup", arn));
+        assert!(cfg.toggle_resource_favorite("bucket", "app-assets"));
+        assert!(cfg.is_resource_favorite("targetgroup", arn));
+
+        let text = cfg.to_text();
+        assert!(text.contains("resource_favorite.targetgroup="), "{text}");
+        let back = AppConfig::parse(&text);
+        assert!(back.is_resource_favorite("targetgroup", arn));
+        assert!(back.is_resource_favorite("bucket", "app-assets"));
+        // An ARN carries colons and slashes; neither may break the line format.
+        assert_eq!(back.resource_favorites_for("targetgroup"), vec![arn]);
+    }
+
+    #[test]
+    fn toggling_a_resource_favorite_twice_clears_it() {
+        let mut cfg = AppConfig::default();
+        assert!(cfg.toggle_resource_favorite("asg", "app-asg"));
+        assert!(!cfg.toggle_resource_favorite("asg", "app-asg"));
+        assert!(!cfg.is_resource_favorite("asg", "app-asg"));
+    }
+
+    /// **Case matters here, unlike for instance ids.** S3 allows
+    /// `Alpha-Assets` and `alpha-assets` to be two different buckets, so
+    /// folding case would let starring one un-star the other.
+    #[test]
+    fn resource_favorites_are_case_sensitive() {
+        let mut cfg = AppConfig::default();
+        cfg.toggle_resource_favorite("bucket", "Alpha-Assets");
+        assert!(cfg.is_resource_favorite("bucket", "Alpha-Assets"));
+        assert!(!cfg.is_resource_favorite("bucket", "alpha-assets"));
+    }
+
+    /// The two favourite stores must not read each other's lines: one key is
+    /// a prefix of the other, so the load order is load-bearing.
+    #[test]
+    fn resource_favorites_do_not_collide_with_instance_favorites() {
+        let mut cfg = AppConfig::default();
+        cfg.toggle_favorite("123", "us-east-1", "i-abc");
+        cfg.toggle_resource_favorite("asg", "app-asg");
+        let back = AppConfig::parse(&cfg.to_text());
+        assert!(back.is_favorite("123", "us-east-1", "i-abc"));
+        assert!(back.is_resource_favorite("asg", "app-asg"));
+        // Neither store swallowed the other's entry.
+        assert_eq!(back.favorites_for_scope("123", "us-east-1"), vec!["i-abc"]);
+        assert_eq!(back.resource_favorites_for("asg"), vec!["app-asg"]);
     }
 
     #[test]
