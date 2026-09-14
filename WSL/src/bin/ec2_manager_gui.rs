@@ -36483,6 +36483,23 @@ mod gui {
         format!("{} x{count}", title.trim())
     }
 
+    /// Which wait a finished check earns. **A terminate that did not happen —
+    /// because `plan` named nothing, or because the call failed — always takes
+    /// the escalation window, never the plan's own wait.** `Wait::VaultRetry`
+    /// schedules another health check, and a check that spent no budget would
+    /// schedule one forever; only a terminate that actually landed may ask for
+    /// one.
+    fn wait_after_check(
+        terminated: bool,
+        planned: ec2_manager::unhealthy_host::Wait,
+    ) -> ec2_manager::unhealthy_host::Wait {
+        if terminated {
+            planned
+        } else {
+            ec2_manager::unhealthy_host::Wait::AfterTerminate
+        }
+    }
+
     fn start_unhealthy_host_poll(
         auth: ec2_manager::alerts::AlertsAuth,
         cfg: ec2_manager::features::UnhealthyHostFeature,
@@ -36666,7 +36683,6 @@ mod gui {
                 for due in state.due(monotonic_ms(started)) {
                     match due.phase {
                         uh::Phase::Check => {
-                            let now = monotonic_ms(started);
                             let read = reaper_account_context(&mode, &app_config, &due.account_id)
                                 .and_then(|ctx| {
                                     target_group_members(&ctx.profile, &ctx.region, &due.resource)
@@ -36685,7 +36701,18 @@ mod gui {
                                             cfg.after_terminate().as_secs() / 60,
                                         ),
                                     );
-                                    state.advance(&due.resource, uh::Wait::AfterTerminate, false, now);
+                                    // The clock is read here, not before the two
+                                    // blocking AWS calls above: reading it early
+                                    // would measure the escalation deadline from
+                                    // before whatever made this read fail (a
+                                    // hung call included), shortening the window
+                                    // exactly when it is longest.
+                                    state.advance(
+                                        &due.resource,
+                                        uh::Wait::AfterTerminate,
+                                        false,
+                                        monotonic_ms(started),
+                                    );
                                     continue;
                                 }
                             };
@@ -36729,7 +36756,7 @@ mod gui {
                                 }
                                 None => note(LogLevel::Warn, format!("unhealthy host: {}", plan.reason)),
                             }
-                            let wait = if terminated { plan.wait } else { uh::Wait::AfterTerminate };
+                            let wait = wait_after_check(terminated, plan.wait);
                             note(
                                 LogLevel::Info,
                                 match wait {
@@ -48731,6 +48758,19 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         }
 
         #[test]
+        fn wait_after_check_only_grants_vault_retry_to_a_landed_terminate() {
+            use ec2_manager::unhealthy_host::Wait;
+            // A terminate that landed keeps whatever `plan` asked for.
+            assert_eq!(wait_after_check(true, Wait::AfterTerminate), Wait::AfterTerminate);
+            assert_eq!(wait_after_check(true, Wait::VaultRetry), Wait::VaultRetry);
+            // No terminate -- because none was planned, or because the call
+            // failed -- always takes the escalation window. A `VaultRetry`
+            // here would spend no budget and schedule another check forever.
+            assert_eq!(wait_after_check(false, Wait::AfterTerminate), Wait::AfterTerminate);
+            assert_eq!(wait_after_check(false, Wait::VaultRetry), Wait::AfterTerminate);
+        }
+
+        #[test]
         fn the_pingdom_code_is_taken_from_the_shared_vocabulary() {
             // Never a literal. A drifted code sends mail the Pi daemon does
             // not recognise, which it escalates as unknown -- a failure that
@@ -50322,6 +50362,151 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let rest = &src[start + signature.len()..];
             let end = rest.find("\n        fn ").unwrap_or(rest.len());
             &src[start..start + signature.len() + end]
+        }
+
+        /// The byte offset, within `s`, of the `}` that closes the `{` at
+        /// `open_idx` (which must itself be the index of that `{` character).
+        /// Tracks brace depth and skips the contents of `"..."` string
+        /// literals -- `format!` bodies in this file are full of `{}` and
+        /// `{name}` placeholders that are not Rust braces at all, and a naive
+        /// character count would stop early on the first one.
+        fn find_matching_close(s: &str, open_idx: usize) -> usize {
+            let bytes = s.as_bytes();
+            assert_eq!(bytes[open_idx], b'{', "open_idx must point at a '{{'");
+            let mut depth: i32 = 1;
+            let mut i = open_idx + 1;
+            let mut in_string = false;
+            let mut escape = false;
+            while i < bytes.len() {
+                let b = bytes[i];
+                if in_string {
+                    if escape {
+                        escape = false;
+                    } else if b == b'\\' {
+                        escape = true;
+                    } else if b == b'"' {
+                        in_string = false;
+                    }
+                } else {
+                    match b {
+                        b'"' => in_string = true,
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return i;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                i += 1;
+            }
+            panic!("no matching close brace for the '{{' at {open_idx}");
+        }
+
+        /// **The on-call gate in the unhealthy-host poll thread must close
+        /// before the running-incident re-read and before `state.due(...)`
+        /// handling** -- those two run on every poll, on call or not, per
+        /// `unhealthy_host_on_call_decision`'s own doc comment ("Incidents
+        /// already running are not affected"). Moving the gate's closing
+        /// brace down past either would make an off-call machine stop
+        /// re-reading and advancing an incident it has already acknowledged
+        /// -- silent, because nothing else here notices a `for`/`due()` loop
+        /// that simply stopped running.
+        ///
+        /// Brace-depth based, not a bare byte-offset comparison of the
+        /// opening `if on_call {` against the two markers: both markers are
+        /// textually after the opening brace in *either* the correct code or
+        /// the regression (moving the closing brace down doesn't change
+        /// linear order), so only the position of the actual matching close
+        /// distinguishes "inside the gate" from "after it".
+        #[test]
+        fn the_on_call_gate_excludes_the_running_incident_and_due_handling() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+
+            let start = src
+                .find("fn start_unhealthy_host_poll(")
+                .expect("start_unhealthy_host_poll");
+            let end = src[start..]
+                .find("\n    fn monotonic_ms(")
+                .map(|i| start + i)
+                .expect("the function that follows it");
+            let body = &src[start..end];
+
+            // Not a bare `body.find("if on_call {")`: the earlier
+            // `note(if on_call { LogLevel::Info } else { ... }, reason)` line
+            // contains that exact substring too, and matches it first -- its
+            // trivial `{ LogLevel::Info }` closes almost at once, which would
+            // make this test pass no matter where the real gate's brace is.
+            // The comment right above the real gate is unique.
+            let marker = "// ---- new alerts: on call only ----";
+            let after_marker = body.find(marker).expect("the on-call gate's marker comment")
+                + marker.len();
+            let gate = after_marker
+                + body[after_marker..]
+                    .find("if on_call {")
+                    .expect("the on-call gate");
+            let open_brace = gate + "if on_call {".len() - 1;
+            let close_brace = find_matching_close(body, open_brace);
+
+            let running = body
+                .find("for id in state.watched_alert_ids()")
+                .expect("the running-incident re-read");
+            let due = body.find("state.due(").expect("the due() handling");
+
+            assert!(
+                close_brace < running,
+                "the on-call gate must close before the running-incident re-read, \
+                 or an off-call machine stops advancing an already-acknowledged \
+                 incident"
+            );
+            assert!(
+                close_brace < due,
+                "the on-call gate must close before state.due(...) handling, or \
+                 off call nothing escalates and no wait ever advances"
+            );
+        }
+
+        /// **Every exit from the `Phase::Check` arm calls `state.advance(...)`
+        /// first.** Two exit paths exist today: the early `continue` when the
+        /// target group could not be read, and the normal fall-through after a
+        /// successful check. Dropping the `state.advance(...)` ahead of the
+        /// `continue` strands that incident in its current stage forever --
+        /// nothing else ever re-reads its deadline, since `due()` only yields
+        /// an incident whose deadline has passed.
+        ///
+        /// Expressed as a count rather than "advance precedes every continue"
+        /// because the arm has exactly one `continue` and one unconditional
+        /// tail call today; asserting the count is 2 fails immediately if
+        /// either the early or the final `state.advance(...)` is removed,
+        /// which is the same property a "precedes" check would pin, with less
+        /// text-position bookkeeping.
+        #[test]
+        fn phase_check_calls_advance_on_every_exit_path() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+
+            let start = src.find("uh::Phase::Check => {").expect("the Check arm");
+            let end = src[start..]
+                .find("uh::Phase::Escalate => {")
+                .map(|i| start + i)
+                .expect("the Escalate arm that follows it");
+            let body = &src[start..end];
+
+            let continues = body.matches("continue;").count();
+            assert_eq!(
+                continues, 1,
+                "expected exactly one early continue in the Check arm; this test's \
+                 exit-path count needs updating to match"
+            );
+            let advances = body.matches("state.advance(").count();
+            assert_eq!(
+                advances, 2,
+                "the Check arm must call state.advance() on both exit paths (the \
+                 early continue and the normal completion); found {advances}"
+            );
         }
 
         /// **Every resource table's Name cell carries a copy button, and the
