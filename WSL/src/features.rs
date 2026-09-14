@@ -100,6 +100,9 @@ pub struct Features {
     /// Unattended pingdom acknowledge-and-escalate: who may run it, and
     /// every tunable.
     pub pingdom: PingdomFeature,
+    /// Unattended unhealthy-host remediation: acknowledge, terminate the
+    /// unhealthy instance, escalate. Who may run it, and every tunable.
+    pub unhealthy_host: UnhealthyHostFeature,
     /// Start / Stop / Restart from the Inventory right-click menu: who may
     /// see the entries.
     pub instance_power: InstancePowerFeature,
@@ -799,6 +802,131 @@ impl PingdomFeature {
     }
 }
 
+/// The `unhealthy_host` section of `assets/features.json`.
+///
+/// Gates the unhealthy-host watcher: acknowledge an application
+/// `UnHealthyHostCount` alert, terminate the unhealthy instance if the alert
+/// has not cleared after `ack_wait_mins`, and escalate if it is still open
+/// `after_terminate_mins` later. A Vault target group — one whose name
+/// contains `vault_tg_contains` — gets a second terminate when neither of
+/// its two instances is healthy, `vault_retry_mins` after the first.
+///
+/// **This terminates instances.** Ships closed on both gates, like `reaper`
+/// and `pingdom`, and `"*"` is not honoured on the allow-list.
+///
+/// Its own block rather than fields under `reaper` for the reason pingdom
+/// has one: the watchers share a feed and nothing else.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct UnhealthyHostFeature {
+    /// Master switch. Off in the shipped file.
+    pub enabled: bool,
+    /// OS usernames permitted to run it. `"*"` is deliberately **not**
+    /// honoured: this acknowledges a live page, terminates an instance and
+    /// rings a phone with nobody watching.
+    pub allowed_users: Vec<String>,
+    /// Substring identifying one of these alerts in `extraProperties.alertname`.
+    pub alertname_contains: String,
+    /// Substring identifying one in the `App:` tag. Secondary.
+    pub app_contains: String,
+    /// Substring identifying one in `message` (the alert title). The primary
+    /// rule for this feed; shipped `UnHealthyHostCount`.
+    pub message_contains: String,
+    /// Substring of the target group NAME that marks a Vault group, matched
+    /// case-insensitively. Blank disables the Vault rule.
+    pub vault_tg_contains: String,
+    /// Minutes between the acknowledge and the first health check.
+    pub ack_wait_mins: u64,
+    /// Minutes to wait for the alert to clear after a terminate (or after a
+    /// check that terminated nothing) before escalating.
+    pub after_terminate_mins: u64,
+    /// Minutes to wait after terminating one of two unhealthy Vault instances
+    /// before re-reading health.
+    pub vault_retry_mins: u64,
+    /// A second alert for the same target group within this many minutes is
+    /// the insurance case: not acknowledged, nothing done, a notification.
+    pub insurance_window_mins: u64,
+    /// Feed poll interval.
+    pub poll_secs: u64,
+    /// Alerts pulled per poll.
+    pub fetch_count: u32,
+}
+
+impl UnhealthyHostFeature {
+    /// True when `user` may run the watcher. Like [`PingdomFeature`], `"*"`
+    /// does not match.
+    pub fn is_allowed_user(&self, user: &str) -> bool {
+        let u = user.trim();
+        if u.is_empty() || !self.enabled {
+            return false;
+        }
+        self.allowed_users
+            .iter()
+            .any(|a| a.trim() != "*" && a.trim().eq_ignore_ascii_case(u))
+    }
+
+    /// True when the list names more than one user. Two machines watching
+    /// one feed would both acknowledge and both terminate.
+    pub fn has_multiple_users(&self) -> bool {
+        self.allowed_users
+            .iter()
+            .filter(|a| !a.trim().is_empty())
+            .count()
+            > 1
+    }
+
+    pub fn resolved_schedule_id(&self) -> String {
+        crate::jsm_auth::resolve_id(
+            crate::jsm_auth::SCHEDULE_ID_ENV,
+            crate::jsm_auth::SCHEDULE_ID_TARGET,
+            "",
+        )
+    }
+
+    pub fn resolved_atlassian_account_id(&self) -> String {
+        crate::jsm_auth::resolve_id(
+            crate::jsm_auth::ATLASSIAN_ACCOUNT_ID_ENV,
+            crate::jsm_auth::ATLASSIAN_ACCOUNT_ID_TARGET,
+            "",
+        )
+    }
+
+    /// Zero means the default, never "at once": a missing section
+    /// deserializes every tunable to zero, and that must not become a
+    /// terminate the instant an alert lands.
+    fn mins_or(value: u64, default: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(60 * if value == 0 { default } else { value })
+    }
+
+    pub fn ack_wait(&self) -> std::time::Duration {
+        Self::mins_or(self.ack_wait_mins, 7)
+    }
+
+    pub fn after_terminate(&self) -> std::time::Duration {
+        Self::mins_or(self.after_terminate_mins, 10)
+    }
+
+    pub fn vault_retry(&self) -> std::time::Duration {
+        Self::mins_or(self.vault_retry_mins, 7)
+    }
+
+    pub fn insurance_window(&self) -> std::time::Duration {
+        Self::mins_or(self.insurance_window_mins, 60)
+    }
+
+    pub fn poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(if self.poll_secs == 0 { 30 } else { self.poll_secs })
+    }
+
+    pub fn alerts_per_poll(&self) -> u32 {
+        if self.fetch_count == 0 {
+            10
+        } else {
+            self.fetch_count
+        }
+    }
+}
+
 impl ReaperFeature {
     /// True when `user` may remediate. Unlike every other gate in this file,
     /// `"*"` does not match: a site-wide wildcard must not silently authorise
@@ -1062,6 +1190,9 @@ impl Default for Features {
             reaper: ReaperFeature::default(),
             // Derived Default, and the same three reasons.
             pingdom: PingdomFeature::default(),
+            // Derived Default, and the same three reasons: off, nobody
+            // allowed, every rule blank.
+            unhealthy_host: UnhealthyHostFeature::default(),
             // Derived Default: `enabled` false and an empty allow-list. Both
             // are required by the gate, so a features.json nobody can parse
             // hands out no power to stop a production instance.
@@ -1201,6 +1332,13 @@ impl Features {
     /// never disarm the other.
     pub fn pingdom_enabled_for(&self, user: &str) -> bool {
         self.pingdom.is_allowed_user(user)
+    }
+
+    /// True when the unhealthy-host watcher may run for `user`. Independent
+    /// of the other two watchers' gates for the same reason they are of each
+    /// other.
+    pub fn unhealthy_host_enabled_for(&self, user: &str) -> bool {
+        self.unhealthy_host.is_allowed_user(user)
     }
 
     /// True when the Inventory tab's **Start / Stop / Restart** entries
@@ -2410,5 +2548,94 @@ mod pingdom_feature_tests {
         }"#;
         let features: Features = serde_json::from_str(raw).expect("parses");
         assert!(features.resources.priority_target_groups.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod unhealthy_host_feature_tests {
+    use super::*;
+
+    fn armed() -> UnhealthyHostFeature {
+        UnhealthyHostFeature {
+            enabled: true,
+            allowed_users: vec!["bconrad".to_string()],
+            ..UnhealthyHostFeature::default()
+        }
+    }
+
+    #[test]
+    fn the_shipped_unhealthy_host_block_is_closed() {
+        let shipped: Features = serde_json::from_str(&bundled_features()).expect("parses");
+        assert!(!shipped.unhealthy_host.enabled, "unhealthy_host must ship disabled");
+        assert!(
+            shipped.unhealthy_host.allowed_users.is_empty(),
+            "unhealthy_host must ship with an empty allow-list"
+        );
+        // The rules the feature needs to be useful ship filled in; only the
+        // gates ship closed.
+        assert_eq!(shipped.unhealthy_host.message_contains, "UnHealthyHostCount");
+        assert_eq!(shipped.unhealthy_host.vault_tg_contains, "vault");
+        assert_eq!(shipped.unhealthy_host.ack_wait_mins, 7);
+        assert_eq!(shipped.unhealthy_host.after_terminate_mins, 10);
+        assert_eq!(shipped.unhealthy_host.vault_retry_mins, 7);
+        assert_eq!(shipped.unhealthy_host.insurance_window_mins, 60);
+    }
+
+    #[test]
+    fn a_wildcard_never_arms_unhealthy_host() {
+        let star = UnhealthyHostFeature {
+            allowed_users: vec!["*".to_string()],
+            ..armed()
+        };
+        assert!(!star.is_allowed_user("bconrad"));
+        assert!(armed().is_allowed_user("BCONRAD"), "case-insensitive like every gate");
+        assert!(!armed().is_allowed_user("someone-else"));
+        let off = UnhealthyHostFeature { enabled: false, ..armed() };
+        assert!(!off.is_allowed_user("bconrad"), "enabled is required as well");
+    }
+
+    #[test]
+    fn zero_tunables_mean_the_defaults_never_zero() {
+        let d = UnhealthyHostFeature::default();
+        assert_eq!(d.ack_wait(), std::time::Duration::from_secs(7 * 60));
+        assert_eq!(d.after_terminate(), std::time::Duration::from_secs(10 * 60));
+        assert_eq!(d.vault_retry(), std::time::Duration::from_secs(7 * 60));
+        assert_eq!(d.insurance_window(), std::time::Duration::from_secs(60 * 60));
+        assert_eq!(d.poll_interval(), std::time::Duration::from_secs(30));
+        assert_eq!(d.alerts_per_poll(), 10);
+
+        let set = UnhealthyHostFeature {
+            ack_wait_mins: 3,
+            after_terminate_mins: 4,
+            vault_retry_mins: 5,
+            insurance_window_mins: 90,
+            poll_secs: 15,
+            fetch_count: 25,
+            ..armed()
+        };
+        assert_eq!(set.ack_wait(), std::time::Duration::from_secs(3 * 60));
+        assert_eq!(set.after_terminate(), std::time::Duration::from_secs(4 * 60));
+        assert_eq!(set.vault_retry(), std::time::Duration::from_secs(5 * 60));
+        assert_eq!(set.insurance_window(), std::time::Duration::from_secs(90 * 60));
+        assert_eq!(set.poll_interval(), std::time::Duration::from_secs(15));
+        assert_eq!(set.alerts_per_poll(), 25);
+    }
+
+    #[test]
+    fn a_malformed_features_file_leaves_unhealthy_host_dark() {
+        let missing: Features = serde_json::from_str("{}").expect("parses");
+        assert!(!missing.unhealthy_host.enabled);
+        assert!(!missing.unhealthy_host_enabled_for("bconrad"));
+        assert!(!Features::default().unhealthy_host_enabled_for("bconrad"));
+    }
+
+    #[test]
+    fn more_than_one_user_is_reported() {
+        assert!(!armed().has_multiple_users());
+        let two = UnhealthyHostFeature {
+            allowed_users: vec!["a".to_string(), "b".to_string()],
+            ..armed()
+        };
+        assert!(two.has_multiple_users());
     }
 }
