@@ -506,10 +506,6 @@ mod gui {
         /// The unhealthy-host watcher: the poll thread, every acknowledge,
         /// every terminate, every escalation, every insured alert, and the
         /// startup lines about whether the feature came up at all.
-        ///
-        /// Constructed by the poll thread added in a later task; allowed
-        /// dead here so this task's own build stays warning-free meanwhile.
-        #[allow(dead_code)]
         UnhealthyHost,
         /// One **Test Alert Match** run, whichever watcher claimed the alert.
         ///
@@ -8609,6 +8605,10 @@ mod gui {
         /// working, red on failure). Kept separate from `script_status` so a
         /// tunnel cannot stomp an in-flight Scripts run.
         tunnel_status: Option<(String, ScriptState)>,
+        /// The insurance notification: `<alert title> xN`, drawn red on the
+        /// Connections toolbar until dismissed. A later insured alert
+        /// replaces it.
+        unhealthy_host_notice: Option<String>,
         /// When every enabled environment last became healthy, or `None`
         /// while any is not. Drives the self-expiring success banner, and
         /// resetting it on failure is what makes a recovery show again.
@@ -8685,9 +8685,8 @@ mod gui {
         /// The compiled-in unhealthy-host rules, for the dry run's matcher.
         /// The watcher's own copy is moved into its thread.
         ///
-        /// Read by the dry run and the poll thread added in a later task;
-        /// allowed dead here so this task's own build stays warning-free
-        /// meanwhile.
+        /// Read by the dry run added in a later task; allowed dead here so
+        /// this task's own build stays warning-free meanwhile.
         #[allow(dead_code)]
         unhealthy_host_cfg: ec2_manager::features::UnhealthyHostFeature,
         /// Where a dry run reports back to the *window* — an alert that
@@ -8815,6 +8814,10 @@ mod gui {
         /// this user, JSM credentials are not configured, or no escalation
         /// mailbox is set — see `pingdom_gate_report`, which names which.
         pingdom: Option<PingdomRuntime>,
+        /// Background unhealthy-host watcher. `None` when the feature is off
+        /// for this user, JSM credentials are not configured, or no
+        /// escalation mailbox is set — `unhealthy_host_gate_report` names which.
+        unhealthy_host: Option<UnhealthyHostRuntime>,
         /// Finished remediations waiting on a notifier: the outcome code
         /// (`RE-F`/`RE-N`/`RE-K`/`RE-C`) and the alert's `createdAt`.
         /// Nothing reads this yet — wiring it to a send path is a separate,
@@ -9162,6 +9165,30 @@ mod gui {
                 (rt, lines)
             };
 
+            let (unhealthy_host, unhealthy_host_startup_log) = {
+                let user = ec2_manager::features::current_os_user();
+                let mailbox = ec2_manager::jsm_auth::escalation_mailbox();
+                let (armed, lines) = unhealthy_host_gate_report(
+                    &features.unhealthy_host,
+                    &user,
+                    resolved_alerts_auth.is_complete(),
+                    mailbox.as_deref(),
+                );
+                let rt = if armed {
+                    Some(start_unhealthy_host_poll(
+                        resolved_alerts_auth.clone(),
+                        features.unhealthy_host.clone(),
+                        features.reaper.clone(),
+                        config.clone(),
+                        options.mode.clone(),
+                        mailbox.unwrap_or_default(),
+                    ))
+                } else {
+                    None
+                };
+                (rt, lines)
+            };
+
             let mut app = Self {
                 wsl_setup_state,
                 wsl_setup_status: None,
@@ -9424,6 +9451,8 @@ mod gui {
                 alerts_generation: 0,
                 reaper,
                 pingdom,
+                unhealthy_host,
+                unhealthy_host_notice: None,
                 pending_notify: Vec::new(),
                 fed_auth_enabled: features
                     .fed_auth_enabled_for(&ec2_manager::features::current_os_user()),
@@ -9528,6 +9557,10 @@ mod gui {
                 // nothing else is there.
                 let level = if is_warn { LogLevel::Warn } else { LogLevel::Info };
                 app.log_pingdom(level, msg);
+            }
+            for (is_warn, msg) in unhealthy_host_startup_log {
+                let level = if is_warn { LogLevel::Warn } else { LogLevel::Info };
+                app.log_unhealthy_host(level, msg);
             }
             // The name every `allowed_users` gate is matched against, and what
             // each one decided. Without this a gate that does not match is
@@ -10554,9 +10587,6 @@ mod gui {
             self.log_from(LogSource::Pingdom, level, message);
         }
 
-        /// Called by the poll thread added in a later task; allowed dead
-        /// here so this task's own build stays warning-free meanwhile.
-        #[allow(dead_code)]
         fn log_unhealthy_host(&mut self, level: LogLevel, message: impl Into<String>) {
             self.log_from(LogSource::UnhealthyHost, level, message);
         }
@@ -12039,6 +12069,7 @@ mod gui {
             };
             failed(&self.script_status)
                 || failed(&self.tunnel_status)
+                || self.unhealthy_host_notice.is_some()
                 || !self.message.is_empty()
         }
 
@@ -12055,6 +12086,7 @@ mod gui {
             }
             self.message.clear();
             self.script_status_highlight = None;
+            self.unhealthy_host_notice = None;
 
             if let Some((_, ScriptState::Failed)) = self.tunnel_status {
                 let rows = self.port_forward_rows();
@@ -16635,6 +16667,42 @@ mod gui {
                                     "pingdom: escalation for {incident} FAILED TO SEND — {detail}. \
                                      The alert is acknowledged and nothing will ring; handle it \
                                      by hand"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Drain whatever the unhealthy-host watcher has said since the last
+        /// frame. Same shape as `poll_pingdom_events`: the terminate and the
+        /// escalation both already happened on the watcher's own thread, so
+        /// this only records them.
+        fn poll_unhealthy_host_events(&mut self) {
+            let Some(rt) = &self.unhealthy_host else { return };
+            let events: Vec<UnhealthyHostEvent> = rt.rx.try_iter().collect();
+            for ev in events {
+                match ev {
+                    UnhealthyHostEvent::Note { level, message } => {
+                        self.log_unhealthy_host(level, message)
+                    }
+                    UnhealthyHostEvent::Insured { title, count } => {
+                        self.unhealthy_host_notice = Some(insured_banner(&title, count));
+                    }
+                    UnhealthyHostEvent::Escalated { resource, detail, ok } => {
+                        if ok {
+                            self.log_unhealthy_host(
+                                LogLevel::Warn,
+                                format!("unhealthy host: escalation for {resource} {detail}"),
+                            );
+                        } else {
+                            self.log_unhealthy_host(
+                                LogLevel::Error,
+                                format!(
+                                    "unhealthy host: escalation for {resource} FAILED TO SEND — \
+                                     {detail}. The alert is acknowledged and nothing will ring; \
+                                     handle it by hand"
                                 ),
                             );
                         }
@@ -33138,7 +33206,8 @@ mod gui {
                 self.poll_ack_all_events();
                 self.poll_reaper_events();
                 self.poll_pingdom_events();
-                if self.pingdom.is_some() {
+                self.poll_unhealthy_host_events();
+                if self.pingdom.is_some() || self.unhealthy_host.is_some() {
                     // The watcher runs on its own thread and does not need a
                     // frame to acknowledge, time or escalate — but its log is
                     // the only account it gives of itself, and without a tick
@@ -34019,6 +34088,7 @@ mod gui {
                 let has_status = self.script_status.is_some()
                     || self.tunnel_status.is_some()
                     || self.script_status_highlight.is_some()
+                    || self.unhealthy_host_notice.is_some()
                     || !self.message.is_empty();
                 if has_status {
                     let status_color = |state: &ScriptState, ui: &egui::Ui| match state {
@@ -34058,6 +34128,10 @@ mod gui {
                                     let c = status_color(&state, ui);
                                     ui.label(notification_text(ui, c, text));
                                 }
+                            }
+                            if let Some(text) = self.unhealthy_host_notice.clone() {
+                                let c = status_color(&ScriptState::Failed, ui);
+                                ui.label(notification_text(ui, c, text));
                             }
                             if let Some(hl) = self.script_status_highlight.clone() {
                                 let c = flashing_yellow(ui);
@@ -35882,11 +35956,6 @@ mod gui {
     /// Whether the unhealthy-host watcher may run, and the startup lines
     /// saying why. Pure, for the reason `pingdom_gate_report` is: each dark
     /// state names itself. The mailbox is never included in a line.
-    ///
-    /// Called from `App::new`'s startup block, added in a later task;
-    /// allowed dead here so this task's own build stays warning-free
-    /// meanwhile.
-    #[allow(dead_code)]
     fn unhealthy_host_gate_report(
         cfg: &ec2_manager::features::UnhealthyHostFeature,
         user: &str,
@@ -36356,6 +36425,358 @@ mod gui {
         });
 
         PingdomRuntime { rx, _handle: handle }
+    }
+
+    // ---- unhealthy-host watcher -------------------------------------------
+
+    /// What the unhealthy-host poll thread reports back.
+    enum UnhealthyHostEvent {
+        Note { level: LogLevel, message: String },
+        /// An escalation was sent, or could not be.
+        Escalated { resource: String, detail: String, ok: bool },
+        /// The insurance case: for the toolbar banner.
+        Insured { title: String, count: usize },
+    }
+
+    struct UnhealthyHostRuntime {
+        rx: std::sync::mpsc::Receiver<UnhealthyHostEvent>,
+        _handle: std::thread::JoinHandle<()>,
+    }
+
+    /// The entire payload of an unhealthy-host escalation: reaper's `RE-F`
+    /// code and the alert's own timestamp. The target group, the account,
+    /// the alert id and the kind are for the local log and never leave.
+    fn unhealthy_host_escalation_subject(d: &ec2_manager::unhealthy_host::Due) -> String {
+        ec2_manager::reaper::escalation_subject(
+            ec2_manager::reaper::OutcomeCode::Failure,
+            &d.created_at,
+        )
+    }
+
+    /// Whether a NEW incident may start this poll. Off call — or unable to
+    /// tell — starts nothing: no acknowledge, no terminate, no notification.
+    /// Incidents already running are not affected; they were acknowledged by
+    /// this machine and must be finished by it.
+    fn unhealthy_host_on_call_decision(
+        lookup: std::result::Result<bool, String>,
+    ) -> (bool, String) {
+        match lookup {
+            Ok(true) => (true, "unhealthy host: on call — watching the feed".to_string()),
+            Ok(false) => (
+                false,
+                "unhealthy host: off call — no new incident starts (no acknowledge, no \
+                 terminate, no notification); anything already running finishes"
+                    .to_string(),
+            ),
+            Err(e) => (
+                false,
+                format!(
+                    "unhealthy host: on-call lookup failed ({e}) — treating as off call, so no \
+                     new incident starts"
+                ),
+            ),
+        }
+    }
+
+    /// `<alert title> xN`, for the toolbar and the log.
+    fn insured_banner(title: &str, count: usize) -> String {
+        format!("{} x{count}", title.trim())
+    }
+
+    fn start_unhealthy_host_poll(
+        auth: ec2_manager::alerts::AlertsAuth,
+        cfg: ec2_manager::features::UnhealthyHostFeature,
+        reaper_cfg: ec2_manager::features::ReaperFeature,
+        app_config: ec2_manager::config::AppConfig,
+        mode: Mode,
+        mailbox: String,
+    ) -> UnhealthyHostRuntime {
+        use ec2_manager::{alerts, oncall, reaper, unhealthy_host as uh};
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut state = uh::UnhealthyHostState::new(uh::Timing::from_feature(&cfg));
+            let schedule_id = cfg.resolved_schedule_id();
+            let account_id = cfg.resolved_atlassian_account_id();
+            let mut last_on_call: Option<bool> = None;
+            let mut last_tally: Option<String> = None;
+
+            let note = |level: LogLevel, message: String| {
+                let _ = tx.send(UnhealthyHostEvent::Note { level, message });
+            };
+
+            loop {
+                let now_ms = monotonic_ms(started);
+
+                let (on_call, reason) = unhealthy_host_on_call_decision(
+                    oncall::is_on_call(&auth, &schedule_id, &account_id).map_err(|e| e.to_string()),
+                );
+                if last_on_call != Some(on_call) {
+                    note(if on_call { LogLevel::Info } else { LogLevel::Warn }, reason);
+                    last_on_call = Some(on_call);
+                }
+
+                // ---- new alerts: on call only ----
+                if on_call {
+                    match alerts::fetch_latest(&auth, cfg.alerts_per_poll()) {
+                        Ok(list) => {
+                            let mut claimed = 0usize;
+                            let mut closed = 0usize;
+                            let mut already = 0usize;
+                            let mut insured = 0usize;
+                            for listed in &list {
+                                if !uh::claims(listed, &cfg, &reaper_cfg) {
+                                    continue;
+                                }
+                                claimed += 1;
+                                if reaper::alert_is_closed(&listed.status) {
+                                    closed += 1;
+                                    continue;
+                                }
+                                if state.is_seen(&listed.id) {
+                                    already += 1;
+                                    continue;
+                                }
+                                // The list omits `description`, which is the
+                                // only place these alarms name their target
+                                // group. Read in full, as reaper does.
+                                let alert = match alerts::fetch_alert(&auth, &listed.id) {
+                                    Ok(a) => a,
+                                    Err(e) => {
+                                        note(
+                                            LogLevel::Warn,
+                                            format!(
+                                                "unhealthy host: could not read {} in full: {e} — \
+                                                 will retry next poll",
+                                                listed.id
+                                            ),
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let Some(resource) = reaper::alert_target_group(&alert) else {
+                                    note(
+                                        LogLevel::Warn,
+                                        format!(
+                                            "unhealthy host: {} matches the rules but names no \
+                                             target group — nothing to act on",
+                                            alert.id
+                                        ),
+                                    );
+                                    state.mark_seen(&alert.id);
+                                    continue;
+                                };
+                                let tg_name = reaper::target_group_name(&resource).unwrap_or("");
+                                let kind = uh::kind_of(tg_name, &cfg);
+                                match state.consider(&alert, &resource, kind, now_ms) {
+                                    uh::Action::Ignore => already += 1,
+                                    uh::Action::Insured { title, count } => {
+                                        insured += 1;
+                                        note(
+                                            LogLevel::Error,
+                                            format!(
+                                                "unhealthy host: {} — alert {} is the {count}th \
+                                                 for {resource} inside {} minute(s); NOT \
+                                                 acknowledged and nothing done, the page reaches \
+                                                 a human",
+                                                insured_banner(&title, count),
+                                                alert.id,
+                                                cfg.insurance_window().as_secs() / 60,
+                                            ),
+                                        );
+                                        let _ = tx.send(UnhealthyHostEvent::Insured { title, count });
+                                    }
+                                    uh::Action::SlotHeld { owner } => note(
+                                        LogLevel::Warn,
+                                        format!(
+                                            "unhealthy host: {} not acknowledged — {resource} \
+                                             still has an unresolved incident owned by {owner}",
+                                            alert.id
+                                        ),
+                                    ),
+                                    uh::Action::AckAndWatch => {
+                                        note(
+                                            LogLevel::Info,
+                                            format!(
+                                                "unhealthy host: {} names {resource} ({} group, \
+                                                 account {:?})",
+                                                alert.id,
+                                                kind.label(),
+                                                alert.account,
+                                            ),
+                                        );
+                                        match alerts::acknowledge_alert(&auth, &alert.id) {
+                                            Ok(()) => note(
+                                                LogLevel::Info,
+                                                format!(
+                                                    "unhealthy host: acknowledged {} — reading the \
+                                                     target group in {} minute(s) if it has not \
+                                                     cleared",
+                                                    alert.id,
+                                                    cfg.ack_wait().as_secs() / 60,
+                                                ),
+                                            ),
+                                            Err(e) => note(
+                                                LogLevel::Warn,
+                                                format!(
+                                                    "unhealthy host: could not acknowledge {}: {e} \
+                                                     — still timing it",
+                                                    alert.id
+                                                ),
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                            let tally = format!(
+                                "unhealthy host: polled {} alert(s), {claimed} claimed ({closed} \
+                                 closed, {already} already handled, {insured} insured, {} \
+                                 incident(s) running)",
+                                list.len(),
+                                state.incident_count(),
+                            );
+                            if last_tally.as_deref() != Some(tally.as_str()) {
+                                note(LogLevel::Info, tally.clone());
+                                last_tally = Some(tally);
+                            }
+                        }
+                        Err(e) => note(LogLevel::Warn, format!("unhealthy host: feed read failed: {e}")),
+                    }
+                }
+
+                // ---- running incidents: always ----
+                for id in state.watched_alert_ids() {
+                    match alerts::fetch_alert(&auth, &id) {
+                        Ok(a) if reaper::alert_is_closed(&a.status) => {
+                            note(
+                                LogLevel::Info,
+                                format!("unhealthy host: {id} closed — incident over, nothing escalated"),
+                            );
+                            state.closed(&id);
+                        }
+                        Ok(_) => {}
+                        Err(e) => note(
+                            LogLevel::Warn,
+                            format!("unhealthy host: could not re-read {id}, still timing it: {e}"),
+                        ),
+                    }
+                }
+
+                for due in state.due(monotonic_ms(started)) {
+                    match due.phase {
+                        uh::Phase::Check => {
+                            let now = monotonic_ms(started);
+                            let read = reaper_account_context(&mode, &app_config, &due.account_id)
+                                .and_then(|ctx| {
+                                    target_group_members(&ctx.profile, &ctx.region, &due.resource)
+                                        .map(|m| (ctx, m))
+                                });
+                            let (ctx, members) = match read {
+                                Ok(v) => v,
+                                Err(why) => {
+                                    note(
+                                        LogLevel::Error,
+                                        format!(
+                                            "unhealthy host: {} could not be read ({why}) — \
+                                             terminating nothing, escalating in {} minute(s) if \
+                                             the alert is still open",
+                                            due.resource,
+                                            cfg.after_terminate().as_secs() / 60,
+                                        ),
+                                    );
+                                    state.advance(&due.resource, uh::Wait::AfterTerminate, false, now);
+                                    continue;
+                                }
+                            };
+                            note(
+                                LogLevel::Info,
+                                format!(
+                                    "unhealthy host: {} health: {}",
+                                    due.resource,
+                                    members
+                                        .iter()
+                                        .map(|m| format!("{} ({})", m.id, m.health))
+                                        .collect::<Vec<_>>()
+                                        .join(", "),
+                                ),
+                            );
+                            let plan = uh::plan(&members, due.kind, due.spent);
+                            let mut terminated = false;
+                            match &plan.terminate {
+                                Some(id) => {
+                                    note(LogLevel::Warn, format!("unhealthy host: {}", plan.reason));
+                                    match terminate_instance(&ctx.profile, &ctx.region, id) {
+                                        Ok(()) => {
+                                            terminated = true;
+                                            note(
+                                                LogLevel::Warn,
+                                                format!(
+                                                    "unhealthy host: TERMINATED {id} in {} \
+                                                     (account {})",
+                                                    due.resource, due.account_id
+                                                ),
+                                            );
+                                        }
+                                        Err(e) => note(
+                                            LogLevel::Error,
+                                            format!(
+                                                "unhealthy host: terminate of {id} FAILED — {e}. \
+                                                 Not retried; still timing the alert"
+                                            ),
+                                        ),
+                                    }
+                                }
+                                None => note(LogLevel::Warn, format!("unhealthy host: {}", plan.reason)),
+                            }
+                            let wait = if terminated { plan.wait } else { uh::Wait::AfterTerminate };
+                            note(
+                                LogLevel::Info,
+                                match wait {
+                                    uh::Wait::AfterTerminate => format!(
+                                        "unhealthy host: escalating for {} in {} minute(s) if \
+                                         the alert is still open",
+                                        due.resource,
+                                        cfg.after_terminate().as_secs() / 60
+                                    ),
+                                    uh::Wait::VaultRetry => format!(
+                                        "unhealthy host: re-reading {} in {} minute(s)",
+                                        due.resource,
+                                        cfg.vault_retry().as_secs() / 60
+                                    ),
+                                },
+                            );
+                            state.advance(&due.resource, wait, terminated, monotonic_ms(started));
+                        }
+                        uh::Phase::Escalate => {
+                            let subject = unhealthy_host_escalation_subject(&due);
+                            note(
+                                LogLevel::Error,
+                                format!(
+                                    "unhealthy host: {} ({}) is still open at the deadline after \
+                                     {} terminate(s) — escalating",
+                                    due.owner, due.resource, due.spent
+                                ),
+                            );
+                            let tx2 = tx.clone();
+                            let mailbox2 = mailbox.clone();
+                            let resource = due.resource.clone();
+                            std::thread::spawn(move || {
+                                let (ok, detail) = match send_escalation_email(&mailbox2, &subject) {
+                                    Ok(address) => (true, format!("sent to {address}")),
+                                    Err(reason) => (false, reason),
+                                };
+                                let _ = tx2.send(UnhealthyHostEvent::Escalated { resource, detail, ok });
+                            });
+                        }
+                    }
+                }
+
+                std::thread::sleep(cfg.poll_interval());
+            }
+        });
+
+        UnhealthyHostRuntime { rx, _handle: handle }
     }
 
     /// Monotonic milliseconds for the cooldown bookkeeping. A wall clock
@@ -39549,9 +39970,6 @@ mod gui {
     /// The id is whitelisted rather than escaped: it came out of an ELB
     /// response, and `find_instance_id` accepting the whole string is what
     /// makes it safe on argv.
-    ///
-    /// The caller lands in Task 7; unused until then.
-    #[allow(dead_code)]
     fn terminate_instance(
         profile: &str,
         region: &str,
@@ -48272,6 +48690,44 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert_eq!(subject, "RE-F 2026-08-26T14:03:11Z");
             assert!(!subject.contains("PROD"), "the environment must not leave the org");
             assert!(!subject.contains("0b3f"), "the alert id must not leave the org");
+        }
+
+        #[test]
+        fn an_unhealthy_host_escalation_carries_nothing_but_a_code_and_a_time() {
+            let d = ec2_manager::unhealthy_host::Due {
+                resource: "targetgroup/prod-secret-app-tg/17bb79ec89f6d7d9".to_string(),
+                owner: "0b3f-alert-id".to_string(),
+                created_at: "2026-09-11T14:03:11Z".to_string(),
+                account_id: "830301468378".to_string(),
+                kind: ec2_manager::unhealthy_host::Kind::Vault,
+                spent: 1,
+                phase: ec2_manager::unhealthy_host::Phase::Escalate,
+            };
+            let subject = unhealthy_host_escalation_subject(&d);
+            assert_eq!(subject, "RE-F 2026-09-11T14:03:11Z");
+            assert!(!subject.contains("secret-app"));
+            assert!(!subject.contains("0b3f"));
+            assert!(!subject.contains("830301468378"));
+            assert!(!subject.contains("vault"));
+        }
+
+        #[test]
+        fn off_call_or_an_unanswerable_lookup_starts_nothing() {
+            assert!(unhealthy_host_on_call_decision(Ok(true)).0);
+            assert!(!unhealthy_host_on_call_decision(Ok(false)).0);
+            let (acting, why) = unhealthy_host_on_call_decision(Err("403".to_string()));
+            assert!(!acting);
+            assert!(why.contains("403"));
+            assert!(why.contains("no new incident"), "{why}");
+        }
+
+        #[test]
+        fn the_insured_banner_is_the_title_and_the_count() {
+            assert_eq!(
+                insured_banner("[Target Group]: prod-App-UnHealthyHostCount-Critical", 2),
+                "[Target Group]: prod-App-UnHealthyHostCount-Critical x2"
+            );
+            assert_eq!(insured_banner("  padded  ", 3), "padded x3");
         }
 
         #[test]
