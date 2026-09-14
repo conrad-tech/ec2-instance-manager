@@ -958,6 +958,57 @@ thread and a thread that never started are distinguishable.
 `dry_run` is **not** a config field for either watcher — see "Test Alert
 Match is the dry run, and it really does page" below.
 
+### Unhealthy host: acknowledge, terminate, escalate
+
+`src/unhealthy_host.rs` is the third watcher on the same JSM feed, for the
+application `UnHealthyHostCount` alarms. **On call only**, like pingdom:
+acknowledge, wait `ack_wait_mins` (7), read the target group and terminate
+one unhealthy instance so the ASG replaces it, wait `after_terminate_mins`
+(10), escalate with the same `RE-F` email if the alert is still open. The
+state machine is pure; the GUI thread (`start_unhealthy_host_poll`) makes
+every call.
+
+- **Reaper wins.** The reaper alarm *is* an `UnHealthyHostCount` alarm, so
+  `claims` refuses any alert `reaper::identifies` — whether or not reaper is
+  armed. Reaper's fix must never be replaced by a terminate.
+- **Off call no incident starts; one already running finishes.** It was
+  acknowledged by this machine, so the real page is silent, and dropping it
+  at a rotation boundary leaves an acknowledged alert nobody is timing.
+- **Insurance: the second alert for a target group inside
+  `insurance_window_mins` (60) is not acknowledged and nothing is done.** The
+  log gets an error line and the Connections toolbar a red banner reading
+  `<alert title> x2` (`unhealthy_host_notice`, cleared with the ✖). The
+  window slides. After the hour with the first incident still unresolved the
+  slot is held (`Action::SlotHeld`): still no acknowledge, no notification.
+- **Only an instance reported `unhealthy` is ever terminated**, the lowest id
+  where several are, and the budget is one for an ordinary group and two for
+  Vault — both pinned by tests over `plan`. A draining, initial or IP target
+  is never named.
+- **Vault is one rule applied at every check**: a healthy instance exists,
+  so terminate the unhealthy one and wait the long window; none does, so
+  terminate one, wait `vault_retry_mins` (7), and check again. A Vault group
+  not holding exactly two instances is left alone.
+- **The unexpected shape terminates nothing and keeps the deadline.** No
+  unhealthy member, an unreadable group, a terminate that fails: logged, and
+  the alert is timed to the same deadline. A failed terminate spends none of
+  the budget and is never retried.
+- **`terminate-instances` has exactly one call site** (`terminate_instance`),
+  pinned by `terminate_instances_has_exactly_one_call_site` in the shape of
+  the `reboot-instances` scan. The id is whitelisted with `find_instance_id`.
+- **The target group is read the way reaper reads it** —
+  `reaper::alert_target_group`, extracted from `match_alert` — and every
+  candidate alert is read in full by id, because the list omits
+  `description` and that is the only place these alarms name the group.
+- **Nothing new crosses the org boundary.** The subject is
+  `escalation_subject(Failure, created_at)`; the title, count, target group
+  and instance ids stay local.
+- Gates: `unhealthy_host.enabled` plus `allowed_users` (`"*"` not honoured),
+  JSM credentials, and the escalation mailbox. `unhealthy_host_gate_report`
+  names each dark state at startup and `unhealthy_host=` is on the `gates:`
+  line. Its log source has an **Unhealthy Host** entry in the Logs tab's
+  On-Call dropdown, and Test Alert Match routes to it (after reaper, before
+  pingdom), reading the group and reporting what would be terminated.
+
 #### Right-click an alert row
 
 Every cell in the Alerts window's grid carries the same context menu
