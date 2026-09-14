@@ -3802,6 +3802,8 @@ mod gui {
                  compose ps, the watchdog), but never compose down / compose up -d\n\
                  - pingdom - reads the environment out of the alert summary; there is \
                  no box in its path to read\n\n\
+                 For an unhealthy-host alert: reads the target group and says what would \
+                 be terminated; terminates nothing.\n\n\
                  Then it escalates as though the fix had failed. Nothing is \
                  acknowledged and nothing is changed. Every step is in the log under \
                  On-Call -> Alert Test.",
@@ -3870,6 +3872,7 @@ mod gui {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum DryRunRoute {
         Reaper,
+        UnhealthyHost,
         Pingdom,
         /// No watcher claims it. Nothing is run and nothing is escalated —
         /// paging about an alert neither watcher would ever act on proves
@@ -3887,9 +3890,12 @@ mod gui {
         alert: &ec2_manager::alerts::Alert,
         reaper_cfg: &ec2_manager::features::ReaperFeature,
         pingdom_cfg: &ec2_manager::features::PingdomFeature,
+        unhealthy_cfg: &ec2_manager::features::UnhealthyHostFeature,
     ) -> DryRunRoute {
         if ec2_manager::reaper::identifies(alert, reaper_cfg) {
             DryRunRoute::Reaper
+        } else if ec2_manager::unhealthy_host::claims(alert, unhealthy_cfg, reaper_cfg) {
+            DryRunRoute::UnhealthyHost
         } else if ec2_manager::pingdom::identifies(alert, pingdom_cfg) {
             DryRunRoute::Pingdom
         } else {
@@ -3912,6 +3918,9 @@ mod gui {
     ///   `compose ps`, the watchdog's state, container uptimes). Everything
     ///   `run_reaper_remediation` does apart from stopping the watchdog and
     ///   the `compose down` / `compose up -d`.
+    /// * **unhealthy host** — fetch, identify, resolve the target group, read
+    ///   its health, and report what `plan` would terminate at the first
+    ///   check. No acknowledge, no terminate.
     /// * **pingdom** — fetch and identify, which is all a pingdom decision
     ///   has ever needed; there is no box in its path to read.
     ///
@@ -3929,6 +3938,7 @@ mod gui {
         auth: ec2_manager::alerts::AlertsAuth,
         reaper_cfg: ec2_manager::features::ReaperFeature,
         pingdom_cfg: ec2_manager::features::PingdomFeature,
+        unhealthy_cfg: ec2_manager::features::UnhealthyHostFeature,
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
         mailbox: Option<String>,
@@ -4001,7 +4011,7 @@ mod gui {
                 ),
             );
 
-            match dry_run_route(&alert, &reaper_cfg, &pingdom_cfg) {
+            match dry_run_route(&alert, &reaper_cfg, &pingdom_cfg, &unhealthy_cfg) {
                 DryRunRoute::Reaper => {
                     note(
                         LogLevel::Info,
@@ -4053,15 +4063,88 @@ mod gui {
                         ),
                     );
                 }
+                DryRunRoute::UnhealthyHost => {
+                    use ec2_manager::unhealthy_host as uh;
+                    note(
+                        LogLevel::Info,
+                        format!("dry run: alert {} matches the unhealthy-host rules", alert.id),
+                    );
+                    match reaper::alert_target_group(&alert) {
+                        None => note(
+                            LogLevel::Warn,
+                            format!(
+                                "dry run: alert {} names no target group — a real run would \
+                                 have nothing to act on",
+                                alert.id
+                            ),
+                        ),
+                        Some(resource) => {
+                            let kind = uh::kind_of(
+                                reaper::target_group_name(&resource).unwrap_or(""),
+                                &unhealthy_cfg,
+                            );
+                            note(
+                                LogLevel::Info,
+                                format!(
+                                    "dry run: the alert names {resource} ({} group) — a real run \
+                                     would acknowledge it and read the group after {} minute(s)",
+                                    kind.label(),
+                                    unhealthy_cfg.ack_wait().as_secs() / 60,
+                                ),
+                            );
+                            let read = reaper_account_context(&mode, &app_config, &alert.account)
+                                .and_then(|ctx| target_group_members(&ctx.profile, &ctx.region, &resource));
+                            match read {
+                                Err(why) => note(
+                                    LogLevel::Error,
+                                    format!("dry run: could not read the target group — {why}"),
+                                ),
+                                Ok(members) => {
+                                    note(
+                                        LogLevel::Info,
+                                        format!(
+                                            "dry run: health now: {}",
+                                            members
+                                                .iter()
+                                                .map(|m| format!("{} ({})", m.id, m.health))
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        ),
+                                    );
+                                    let p = uh::plan(&members, kind, 0);
+                                    note(
+                                        LogLevel::Warn,
+                                        match &p.terminate {
+                                            Some(id) => format!(
+                                                "dry run: a real check right now would TERMINATE \
+                                                 {id} — {}. The dry run terminates nothing",
+                                                p.reason
+                                            ),
+                                            None => format!(
+                                                "dry run: a real check right now would terminate \
+                                                 nothing — {}",
+                                                p.reason
+                                            ),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 DryRunRoute::Neither => {
                     fail(format!(
                         "alert {} matches no watcher — not a reaper alert \
+                         (alertname~{:?} app~{:?} message~{:?}), not an unhealthy-host alert \
                          (alertname~{:?} app~{:?} message~{:?}) and not a pingdom alert \
                          (alertname~{:?} app~{:?} message~{:?}). Nothing was escalated.",
                         alert.id,
                         reaper_cfg.alertname_contains,
                         reaper_cfg.app_contains,
                         reaper_cfg.message_contains,
+                        unhealthy_cfg.alertname_contains,
+                        unhealthy_cfg.app_contains,
+                        unhealthy_cfg.message_contains,
                         pingdom_cfg.alertname_contains,
                         pingdom_cfg.app_contains,
                         pingdom_cfg.message_contains,
@@ -8684,10 +8767,6 @@ mod gui {
         pingdom_cfg: ec2_manager::features::PingdomFeature,
         /// The compiled-in unhealthy-host rules, for the dry run's matcher.
         /// The watcher's own copy is moved into its thread.
-        ///
-        /// Read by the dry run added in a later task; allowed dead here so
-        /// this task's own build stays warning-free meanwhile.
-        #[allow(dead_code)]
         unhealthy_host_cfg: ec2_manager::features::UnhealthyHostFeature,
         /// Where a dry run reports back to the *window* — an alert that
         /// could not be fetched, one no watcher claims, a send that did not
@@ -18425,6 +18504,8 @@ mod gui {
                  compose ps, the watchdog), but never compose down / compose up -d\n\
                  - pingdom - reads the environment out of the alert summary; there is \
                  no box in its path to read\n\n\
+                 For an unhealthy-host alert: reads the target group and says what would \
+                 be terminated; terminates nothing.\n\n\
                  Then it escalates as though the fix had failed. Nothing is \
                  acknowledged and nothing is changed. Every step is in the log under \
                  On-Call -> Alert Test.",
@@ -18648,6 +18729,7 @@ mod gui {
                     self.alerts_auth.clone(),
                     self.reaper_cfg.clone(),
                     self.pingdom_cfg.clone(),
+                    self.unhealthy_host_cfg.clone(),
                     self.config.clone(),
                     self.options.mode.clone(),
                     ec2_manager::jsm_auth::escalation_mailbox(),
@@ -48644,6 +48726,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &dry_run_alert("[Pingdom] domain xxx yy PROD"),
                     &dry_run_reaper_cfg(),
                     &pingdom_cfg(),
+                    &unhealthy_host_cfg(),
                 ),
                 DryRunRoute::Pingdom
             );
@@ -48654,7 +48737,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let mut a = dry_run_alert("something is wrong");
             a.extra.insert("alertname".to_string(), "reaper-stalled".to_string());
             assert_eq!(
-                dry_run_route(&a, &dry_run_reaper_cfg(), &pingdom_cfg()),
+                dry_run_route(&a, &dry_run_reaper_cfg(), &pingdom_cfg(), &unhealthy_host_cfg()),
                 DryRunRoute::Reaper
             );
         }
@@ -48667,7 +48750,30 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let mut a = dry_run_alert("[Pingdom] domain xxx yy PROD");
             a.extra.insert("alertname".to_string(), "reaper-stalled".to_string());
             assert_eq!(
-                dry_run_route(&a, &dry_run_reaper_cfg(), &pingdom_cfg()),
+                dry_run_route(&a, &dry_run_reaper_cfg(), &pingdom_cfg(), &unhealthy_host_cfg()),
+                DryRunRoute::Reaper
+            );
+        }
+
+        #[test]
+        fn a_dry_run_routes_an_unhealthy_host_alert_to_its_own_path() {
+            assert_eq!(
+                dry_run_route(
+                    &dry_run_alert("[Target Group]: prod-App-UnHealthyHostCount-Critical"),
+                    &dry_run_reaper_cfg(),
+                    &pingdom_cfg(),
+                    &unhealthy_host_cfg(),
+                ),
+                DryRunRoute::UnhealthyHost
+            );
+        }
+
+        #[test]
+        fn the_reaper_unhealthy_host_alarm_still_takes_the_reaper_path() {
+            let mut a = dry_run_alert("[Target Group]: prod-Reaper-UnHealthyHostCount-Critical");
+            a.extra.insert("alertname".to_string(), "Reaper-UnHealthyHostCount".to_string());
+            assert_eq!(
+                dry_run_route(&a, &dry_run_reaper_cfg(), &pingdom_cfg(), &unhealthy_host_cfg()),
                 DryRunRoute::Reaper
             );
         }
@@ -48682,6 +48788,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &dry_run_alert("disk usage on some unrelated box"),
                     &dry_run_reaper_cfg(),
                     &pingdom_cfg(),
+                    &unhealthy_host_cfg(),
                 ),
                 DryRunRoute::Neither
             );
@@ -48697,6 +48804,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &dry_run_alert("[Pingdom] domain xxx yy PROD"),
                     &ec2_manager::features::ReaperFeature::default(),
                     &ec2_manager::features::PingdomFeature::default(),
+                    &unhealthy_host_cfg(),
                 ),
                 DryRunRoute::Neither
             );
