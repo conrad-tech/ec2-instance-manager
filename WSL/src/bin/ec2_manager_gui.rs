@@ -503,6 +503,14 @@ mod gui {
         /// timer, every escalation, and the startup lines about whether the
         /// feature came up at all.
         Pingdom,
+        /// The unhealthy-host watcher: the poll thread, every acknowledge,
+        /// every terminate, every escalation, every insured alert, and the
+        /// startup lines about whether the feature came up at all.
+        ///
+        /// Constructed by the poll thread added in a later task; allowed
+        /// dead here so this task's own build stays warning-free meanwhile.
+        #[allow(dead_code)]
+        UnhealthyHost,
         /// One **Test Alert Match** run, whichever watcher claimed the alert.
         ///
         /// Its own source rather than the claiming watcher's: a dry run is
@@ -536,6 +544,7 @@ mod gui {
     struct OnCallFilters {
         reaper_down: bool,
         pingdom: bool,
+        unhealthy_host: bool,
         alert_test: bool,
     }
 
@@ -543,7 +552,7 @@ mod gui {
         /// True when at least one script is selected. With none selected the
         /// filter is off entirely rather than matching nothing.
         fn any(self) -> bool {
-            self.reaper_down || self.pingdom || self.alert_test
+            self.reaper_down || self.pingdom || self.alert_test || self.unhealthy_host
         }
 
         fn includes(self, source: LogSource) -> bool {
@@ -553,6 +562,7 @@ mod gui {
             match source {
                 LogSource::ReaperDown => self.reaper_down,
                 LogSource::Pingdom => self.pingdom,
+                LogSource::UnhealthyHost => self.unhealthy_host,
                 LogSource::AlertTest => self.alert_test,
                 LogSource::App => false,
             }
@@ -572,6 +582,9 @@ mod gui {
             }
             if self.pingdom {
                 picked.push("Pingdom");
+            }
+            if self.unhealthy_host {
+                picked.push("Unhealthy Host");
             }
             if self.alert_test {
                 picked.push("Alert Test");
@@ -8654,6 +8667,14 @@ mod gui {
         /// The compiled-in pingdom rules, for the dry run's matcher. The
         /// watcher's own copy is moved into its thread.
         pingdom_cfg: ec2_manager::features::PingdomFeature,
+        /// The compiled-in unhealthy-host rules, for the dry run's matcher.
+        /// The watcher's own copy is moved into its thread.
+        ///
+        /// Read by the dry run and the poll thread added in a later task;
+        /// allowed dead here so this task's own build stays warning-free
+        /// meanwhile.
+        #[allow(dead_code)]
+        unhealthy_host_cfg: ec2_manager::features::UnhealthyHostFeature,
         /// Where a dry run reports back to the *window* — an alert that
         /// could not be fetched, one no watcher claims, a send that did not
         /// go, and the address a send that did go reached. A channel, not a
@@ -9349,6 +9370,7 @@ mod gui {
                 ),
                 reaper_cfg: features.reaper.clone(),
                 pingdom_cfg: features.pingdom.clone(),
+                unhealthy_host_cfg: features.unhealthy_host.clone(),
                 dry_run_status_tx,
                 dry_run_status_rx,
                 reaper_probe_enabled: features
@@ -9503,7 +9525,7 @@ mod gui {
             // process started later and never consulted here.
             app.log_info(format!(
                 "gates: os_user='{}' (from {}) — git_scripts={} alerts={} reaper={} \
-                 pingdom={} jira={} vault_iam={} vault_iam_delete={} fed_auth={} \
+                 pingdom={} unhealthy_host={} jira={} vault_iam={} vault_iam_delete={} fed_auth={} \
                  fed_auto_sign_in={} instance_power={}",
                 if os_user.is_empty() { "(unset!)" } else { &os_user },
                 if cfg!(target_os = "windows") { "%USERNAME%" } else { "$USER" },
@@ -9511,6 +9533,7 @@ mod gui {
                 app.alerts_enabled,
                 features.reaper_enabled_for(&os_user),
                 features.pingdom_enabled_for(&os_user),
+                features.unhealthy_host_enabled_for(&os_user),
                 app.jira_enabled,
                 features.vault_iam_enabled_for(&os_user),
                 features.vault_iam_delete_enabled_for(&os_user),
@@ -10514,6 +10537,13 @@ mod gui {
 
         fn log_pingdom(&mut self, level: LogLevel, message: impl Into<String>) {
             self.log_from(LogSource::Pingdom, level, message);
+        }
+
+        /// Called by the poll thread added in a later task; allowed dead
+        /// here so this task's own build stays warning-free meanwhile.
+        #[allow(dead_code)]
+        fn log_unhealthy_host(&mut self, level: LogLevel, message: impl Into<String>) {
+            self.log_from(LogSource::UnhealthyHost, level, message);
         }
 
         fn log_error(&mut self, message: impl Into<String>) {
@@ -32652,6 +32682,15 @@ mod gui {
                         );
                     });
                     ui.horizontal(|ui| {
+                        ui.label("Unhealthy Host");
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.checkbox(&mut self.oncall_filters.unhealthy_host, "");
+                            },
+                        );
+                    });
+                    ui.horizontal(|ui| {
                         ui.label("Alert Test");
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
@@ -35820,6 +35859,86 @@ mod gui {
                 cfg.alertname_contains,
                 cfg.app_contains,
                 cfg.message_contains,
+            ),
+        ));
+        (true, lines)
+    }
+
+    /// Whether the unhealthy-host watcher may run, and the startup lines
+    /// saying why. Pure, for the reason `pingdom_gate_report` is: each dark
+    /// state names itself. The mailbox is never included in a line.
+    ///
+    /// Called from `App::new`'s startup block, added in a later task;
+    /// allowed dead here so this task's own build stays warning-free
+    /// meanwhile.
+    #[allow(dead_code)]
+    fn unhealthy_host_gate_report(
+        cfg: &ec2_manager::features::UnhealthyHostFeature,
+        user: &str,
+        auth_complete: bool,
+        mailbox: Option<&str>,
+    ) -> (bool, Vec<(bool, String)>) {
+        let mut lines: Vec<(bool, String)> = Vec::new();
+
+        if !cfg.enabled {
+            lines.push((
+                false,
+                "unhealthy host: off — unhealthy_host.enabled is false in this build".to_string(),
+            ));
+            return (false, lines);
+        }
+        if !cfg.is_allowed_user(user) {
+            lines.push((
+                false,
+                format!(
+                    "unhealthy host: off — os_user '{user}' is not on unhealthy_host.allowed_users \
+                     (note '*' is deliberately not honoured here)"
+                ),
+            ));
+            return (false, lines);
+        }
+        if cfg.has_multiple_users() {
+            lines.push((
+                true,
+                "unhealthy_host.allowed_users names more than one user; both machines will \
+                 acknowledge, both will terminate, and nothing arbitrates between them"
+                    .to_string(),
+            ));
+        }
+        if !auth_complete {
+            lines.push((false, "unhealthy host: no JSM credentials, staying dark".to_string()));
+            return (false, lines);
+        }
+        if mailbox.map(str::trim).unwrap_or("").is_empty() {
+            lines.push((
+                false,
+                "unhealthy host: no escalation mailbox configured, staying dark — set \
+                 ESCALATION_MAILBOX or store the ec2_manager/escalation_mailbox \
+                 credential. Acknowledging without being able to escalate would \
+                 silence a live page and never ring"
+                    .to_string(),
+            ));
+            return (false, lines);
+        }
+
+        lines.push((
+            false,
+            format!(
+                "unhealthy host: armed, ON CALL ONLY — polling every {}s over the {} newest \
+                 alert(s); acknowledge, check the target group after {} minute(s) and \
+                 terminate one unhealthy instance, escalate if still open {} minute(s) \
+                 later (vault re-check {} minute(s), insurance window {} minute(s)); \
+                 matching alertname~{:?} app~{:?} message~{:?}, vault groups ~{:?}",
+                cfg.poll_interval().as_secs(),
+                cfg.alerts_per_poll(),
+                cfg.ack_wait().as_secs() / 60,
+                cfg.after_terminate().as_secs() / 60,
+                cfg.vault_retry().as_secs() / 60,
+                cfg.insurance_window().as_secs() / 60,
+                cfg.alertname_contains,
+                cfg.app_contains,
+                cfg.message_contains,
+                cfg.vault_tg_contains,
             ),
         ));
         (true, lines)
@@ -46581,7 +46700,7 @@ mod gui {
 
         #[test]
         fn ticking_reaper_down_narrows_the_log_to_that_script() {
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false };
             assert!(only_reaper.any());
             assert!(only_reaper.includes(LogSource::ReaperDown));
             assert!(!only_reaper.includes(LogSource::App));
@@ -46592,7 +46711,7 @@ mod gui {
             // The popup shuts as soon as it is used, so without this the only
             // evidence that most of the log is being hidden is the log being
             // short — which reads as the app having stopped logging.
-            assert_eq!(OnCallFilters { reaper_down: true, pingdom: false, alert_test: false }.label(), "On-Call: Reaper Down");
+            assert_eq!(OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false }.label(), "On-Call: Reaper Down");
         }
 
         #[test]
@@ -46613,7 +46732,7 @@ mod gui {
 
             // And that tag is what the dropdown filters on — asserted through
             // the same predicate the panel uses, not a reimplementation of it.
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false };
             let kept: Vec<&str> = app
                 .logs
                 .iter()
@@ -46628,7 +46747,7 @@ mod gui {
             // The two filters are independent and both on screen. A DEBUG
             // reaper line with DEBUG unticked stays hidden, the same as any
             // other DEBUG line.
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false };
             let mut levels = LogFilters::default();
             levels.set_verbosity_low();
             assert!(!levels.includes(LogLevel::Debug));
@@ -48644,7 +48763,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn the_on_call_filter_can_narrow_the_log_to_pingdom() {
-            let only_pingdom = OnCallFilters { reaper_down: false, pingdom: true, alert_test: false };
+            let only_pingdom = OnCallFilters { reaper_down: false, pingdom: true, alert_test: false, unhealthy_host: false };
             assert!(only_pingdom.includes(LogSource::Pingdom));
             assert!(!only_pingdom.includes(LogSource::ReaperDown));
             assert!(!only_pingdom.includes(LogSource::App));
@@ -48654,7 +48773,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         #[test]
         fn nothing_ticked_still_shows_the_pingdom_lines() {
             // A dropdown nobody opens must not remove anything from view.
-            let none = OnCallFilters { reaper_down: false, pingdom: false, alert_test: false };
+            let none = OnCallFilters { reaper_down: false, pingdom: false, alert_test: false, unhealthy_host: false };
             assert!(none.includes(LogSource::Pingdom));
             assert!(none.includes(LogSource::ReaperDown));
             assert!(none.includes(LogSource::App));
@@ -48663,11 +48782,75 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn both_ticked_shows_both_and_says_so() {
-            let both = OnCallFilters { reaper_down: true, pingdom: true, alert_test: false };
+            let both = OnCallFilters { reaper_down: true, pingdom: true, alert_test: false, unhealthy_host: false };
             assert!(both.includes(LogSource::Pingdom));
             assert!(both.includes(LogSource::ReaperDown));
             assert!(!both.includes(LogSource::App));
             assert_eq!(both.label(), "On-Call: Reaper Down, Pingdom");
+        }
+
+        fn unhealthy_host_cfg() -> ec2_manager::features::UnhealthyHostFeature {
+            ec2_manager::features::UnhealthyHostFeature {
+                enabled: true,
+                allowed_users: vec!["bconrad".to_string()],
+                message_contains: "UnHealthyHostCount".to_string(),
+                vault_tg_contains: "vault".to_string(),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn unhealthy_host_gate_report_names_each_dark_state() {
+            let off = ec2_manager::features::UnhealthyHostFeature { enabled: false, ..unhealthy_host_cfg() };
+            let (armed, lines) = unhealthy_host_gate_report(&off, "bconrad", true, Some("x@y.com"));
+            assert!(!armed);
+            assert!(lines[0].1.contains("unhealthy_host.enabled is false"), "{}", lines[0].1);
+
+            let (armed, lines) =
+                unhealthy_host_gate_report(&unhealthy_host_cfg(), "someone-else", true, Some("x@y.com"));
+            assert!(!armed);
+            assert!(lines[0].1.contains("not on unhealthy_host.allowed_users"), "{}", lines[0].1);
+
+            let (armed, lines) =
+                unhealthy_host_gate_report(&unhealthy_host_cfg(), "bconrad", false, Some("x@y.com"));
+            assert!(!armed);
+            assert!(lines[0].1.contains("no JSM credentials"), "{}", lines[0].1);
+
+            for mailbox in [None, Some(""), Some("   ")] {
+                let (armed, lines) =
+                    unhealthy_host_gate_report(&unhealthy_host_cfg(), "bconrad", true, mailbox);
+                assert!(!armed);
+                assert!(lines[0].1.contains("no escalation mailbox"), "{}", lines[0].1);
+            }
+
+            let (armed, lines) = unhealthy_host_gate_report(
+                &unhealthy_host_cfg(),
+                "bconrad",
+                true,
+                Some("secret@example.com"),
+            );
+            assert!(armed);
+            assert!(
+                lines.iter().all(|(_, l)| !l.contains("secret@example.com")),
+                "the address never appears in the log"
+            );
+            assert!(lines.last().unwrap().1.contains("armed"), "{}", lines.last().unwrap().1);
+            assert!(
+                lines.last().unwrap().1.contains("ON CALL ONLY"),
+                "{}",
+                lines.last().unwrap().1
+            );
+        }
+
+        #[test]
+        fn the_on_call_filter_has_an_unhealthy_host_row() {
+            let only = OnCallFilters { unhealthy_host: true, ..Default::default() };
+            assert!(only.includes(LogSource::UnhealthyHost));
+            assert!(!only.includes(LogSource::Pingdom));
+            assert!(!only.includes(LogSource::App));
+            assert_eq!(only.label(), "On-Call: Unhealthy Host");
+            let none = OnCallFilters::default();
+            assert!(none.includes(LogSource::UnhealthyHost));
         }
 
         fn health_input<'a>(
