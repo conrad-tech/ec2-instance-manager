@@ -149,7 +149,16 @@ pub fn plan(members: &[TargetMember], kind: Kind, spent: u32) -> Plan {
         .filter(|m| reaper::find_instance_id(&m.id).as_deref() == Some(m.id.as_str()))
         .count();
     let unhealthy = lowest_with(members, "unhealthy");
-    let any_healthy = members.iter().any(|m| m.health == "healthy");
+    // Filtered the same way `instances` is: an IP target counted here would
+    // flip the Vault "neither instance healthy" case into the "one is
+    // healthy" one on a group that also happens to register an IP target,
+    // which under-terminates (safe) but logs a false sentence — "one Vault
+    // instance is healthy" — about a destructive decision when no Vault
+    // INSTANCE is healthy at all.
+    let any_healthy = members
+        .iter()
+        .filter(|m| reaper::find_instance_id(&m.id).as_deref() == Some(m.id.as_str()))
+        .any(|m| m.health == "healthy");
 
     match kind {
         Kind::Ordinary => match unhealthy {
@@ -191,6 +200,42 @@ pub fn plan(members: &[TargetMember], kind: Kind, spent: u32) -> Plan {
             }
         }
     }
+}
+
+/// The `aws:autoscaling:groupName` tag value out of a `describe-instances`
+/// response, in its full shape (`Reservations[].Instances[].Tags[]`) — not
+/// pre-filtered by a `--query`, so this is exactly what the AWS CLI returns
+/// and can be tested against a captured payload with no AWS involved. `None`
+/// when the instance carries no such tag, or when `json` does not parse.
+///
+/// **The whole justification for terminating an unhealthy instance is that
+/// an auto scaling group replaces it.** A target group can just as well hold
+/// standalone instances — hand-built, Terraform-managed, a migration
+/// leftover — and terminating one of those loses capacity permanently with
+/// nothing to replace it. Every other failure mode in this feature is
+/// recoverable; this one is not, which is why the GUI's caller
+/// (`instance_asg_group`) refuses the terminate outright on `None`, whether
+/// that means "no tag" or "could not read the instance at all". Follows the
+/// shape of `reaper::parse_target_health`: pure, parses the raw JSON,
+/// tested here without AWS.
+pub fn parse_asg_group(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let tags = v
+        .get("Reservations")?
+        .as_array()?
+        .first()?
+        .get("Instances")?
+        .as_array()?
+        .first()?
+        .get("Tags")?
+        .as_array()?;
+    tags.iter().find_map(|t| {
+        let key = t.get("Key")?.as_str()?;
+        if key != "aws:autoscaling:groupName" {
+            return None;
+        }
+        t.get("Value")?.as_str().map(str::to_string)
+    })
 }
 
 /// The four windows, in milliseconds, so the state machine never reads the
@@ -639,6 +684,73 @@ mod tests {
             assert_eq!(p.wait, Wait::AfterTerminate);
             assert!(p.reason.contains("two"), "{}", p.reason);
         }
+    }
+
+    #[test]
+    fn vault_any_healthy_ignores_a_healthy_ip_target() {
+        // Two Vault instances, both unhealthy, plus a registered IP target
+        // that happens to be healthy. Before the filter, `any_healthy`
+        // counted the IP target and picked the "one instance is healthy"
+        // branch — under-terminating safely, but logging a false sentence
+        // ("one Vault instance is healthy") about a destructive decision
+        // when no Vault INSTANCE is healthy at all.
+        let p = plan(
+            &[
+                member("i-00000001", "unhealthy"),
+                member("i-00000002", "unhealthy"),
+                member("10.0.1.5", "healthy"),
+            ],
+            Kind::Vault,
+            0,
+        );
+        assert_eq!(p.terminate.as_deref(), Some("i-00000001"));
+        assert_eq!(
+            p.wait,
+            Wait::VaultRetry,
+            "a healthy IP target must not count as the healthy instance: {}",
+            p.reason
+        );
+        assert!(p.reason.contains("neither"), "{}", p.reason);
+    }
+
+    // ---- the ASG tag ----
+
+    fn describe_instances_json(tags: &[(&str, &str)]) -> String {
+        let pairs: Vec<String> = tags
+            .iter()
+            .map(|(k, v)| format!(r#"{{"Key":"{k}","Value":"{v}"}}"#))
+            .collect();
+        format!(
+            r#"{{"Reservations":[{{"Instances":[{{"InstanceId":"i-0abc123","Tags":[{}]}}]}}]}}"#,
+            pairs.join(",")
+        )
+    }
+
+    #[test]
+    fn parse_asg_group_finds_the_tag_among_others() {
+        let json = describe_instances_json(&[
+            ("Name", "app-web-1"),
+            ("aws:autoscaling:groupName", "app-web-asg"),
+            ("Environment", "prod"),
+        ]);
+        assert_eq!(parse_asg_group(&json).as_deref(), Some("app-web-asg"));
+    }
+
+    #[test]
+    fn parse_asg_group_is_none_without_the_asg_tag() {
+        let json = describe_instances_json(&[("Name", "standalone-box"), ("Environment", "prod")]);
+        assert_eq!(parse_asg_group(&json), None);
+    }
+
+    #[test]
+    fn parse_asg_group_is_none_on_malformed_json() {
+        assert_eq!(parse_asg_group("not json"), None);
+        assert_eq!(parse_asg_group(r#"{"Reservations":[]}"#), None);
+        assert_eq!(parse_asg_group(r#"{"Reservations":[{"Instances":[]}]}"#), None);
+        assert_eq!(
+            parse_asg_group(r#"{"Reservations":[{"Instances":[{"Tags":"oops"}]}]}"#),
+            None
+        );
     }
 
     // ---- insurance ----

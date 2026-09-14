@@ -984,6 +984,19 @@ every call.
   where several are, and the budget is one for an ordinary group and two for
   Vault — both pinned by tests over `plan`. A draining, initial or IP target
   is never named.
+- **Only an ASG-managed instance is ever terminated.** Before the terminate
+  call, the poll thread reads the chosen instance's
+  `aws:autoscaling:groupName` tag (`instance_asg_group`, one
+  `describe-instances` through `aws_json`; the pure parse is
+  `unhealthy_host::parse_asg_group`, tested without AWS). No tag, or a
+  failed read, refuses the terminate outright — logged at Error, naming the
+  instance — and the alert keeps timing toward its ordinary escalation
+  deadline unchanged. The entire justification for terminating is that an
+  ASG replaces the instance; a target group can just as well hold
+  standalone instances — hand-built, Terraform-managed, a migration
+  leftover — and terminating one of those loses capacity permanently with
+  nothing to replace it. Every other failure mode in this feature is
+  recoverable; this one is not.
 - **Vault is one rule applied at every check**: a healthy instance exists,
   so terminate the unhealthy one and wait the long window; none does, so
   terminate one, wait `vault_retry_mins` (7), and check again. A Vault group
@@ -992,9 +1005,24 @@ every call.
   unhealthy member, an unreadable group, a terminate that fails: logged, and
   the alert is timed to the same deadline. A failed terminate spends none of
   the budget and is never retried.
+- **The re-read right before `due()` is also, in the ordinary case, the last
+  look before a terminate.** Every watched alert is re-read by id each poll
+  (closing the incident if it has cleared) immediately ahead of
+  `state.due(...)`, which is what can hand back a `Phase::Check`. If the
+  alert closes in the gap between that successful re-read and this same
+  poll's check — **and** this poll's re-read for that owner then fails — an
+  instance is terminated for an incident that is already over. The failed
+  read is logged (`could not re-read {id}, still timing it: …`); the window
+  this can happen in is roughly one poll wide. Reaper documents the same
+  trade for its own last look, immediately before its first mutating
+  command.
 - **`terminate-instances` has exactly one call site** (`terminate_instance`),
   pinned by `terminate_instances_has_exactly_one_call_site` in the shape of
   the `reboot-instances` scan. The id is whitelisted with `find_instance_id`.
+  The function also refuses outside Live mode itself, rather than trusting
+  its one caller (`reaper_account_context`) to have kept it there — the
+  same stance `request_asg_capacity` takes for the other destructive write
+  in this app, so the function is safe standing alone.
 - **The target group is read the way reaper reads it** —
   `reaper::alert_target_group`, extracted from `match_alert` — and every
   candidate alert is read in full by id, because the list omits

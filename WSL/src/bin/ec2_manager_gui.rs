@@ -3384,6 +3384,31 @@ mod gui {
         )?))
     }
 
+    /// Is `instance_id` managed by an auto scaling group? One read-only
+    /// `describe-instances` call through `aws_json` — the same call path
+    /// `target_group_members` uses, per its own doc comment — read for its
+    /// `aws:autoscaling:groupName` tag. `None` means the instance carries no
+    /// such tag; the parsing is `unhealthy_host::parse_asg_group`, pure and
+    /// tested without AWS.
+    ///
+    /// The unhealthy-host poll thread's one caller, checked immediately
+    /// before a terminate: the entire justification for terminating an
+    /// unhealthy target is that an ASG replaces it, so an instance with no
+    /// such tag must never be terminated by this feature — nothing would
+    /// bring it back.
+    fn instance_asg_group(
+        profile: &str,
+        region: &str,
+        instance_id: &str,
+    ) -> std::result::Result<Option<String>, String> {
+        let raw = aws_json(
+            profile,
+            region,
+            &["ec2", "describe-instances", "--instance-ids", instance_id],
+        )?;
+        Ok(ec2_manager::unhealthy_host::parse_asg_group(&raw))
+    }
+
     /// `s`, trimmed, cut to `max` characters with the full length named.
     ///
     /// Alert bodies run to kilobytes and each of these becomes one log line.
@@ -36742,6 +36767,23 @@ mod gui {
                         }
                         Err(e) => note(LogLevel::Warn, format!("unhealthy host: feed read failed: {e}")),
                     }
+                } else {
+                    // Off call, the feed is never polled — new alerts are
+                    // not this machine's to act on. But an incident already
+                    // running keeps advancing below ("running incidents:
+                    // always"), so without this an armed machine that is off
+                    // call writes nothing per poll and a running thread is
+                    // indistinguishable from one that never started, the
+                    // same lesson reaper and pingdom's heartbeats already
+                    // record.
+                    let tally = format!(
+                        "unhealthy host: off call — {} incident(s) still running",
+                        state.incident_count(),
+                    );
+                    if last_tally.as_deref() != Some(tally.as_str()) {
+                        note(LogLevel::Debug, tally.clone());
+                        last_tally = Some(tally);
+                    }
                 }
 
                 // ---- running incidents: always ----
@@ -36815,23 +36857,58 @@ mod gui {
                             match &plan.terminate {
                                 Some(id) => {
                                     note(LogLevel::Warn, format!("unhealthy host: {}", plan.reason));
-                                    match terminate_instance(&ctx.profile, &ctx.region, id) {
-                                        Ok(()) => {
-                                            terminated = true;
+                                    // The whole justification for terminating
+                                    // is that an ASG replaces the instance.
+                                    // Refuse outright on anything short of a
+                                    // confirmed tag — an instance this
+                                    // watcher terminates by mistake is never
+                                    // coming back.
+                                    match instance_asg_group(&ctx.profile, &ctx.region, id) {
+                                        Ok(Some(group)) => {
                                             note(
-                                                LogLevel::Warn,
+                                                LogLevel::Info,
                                                 format!(
-                                                    "unhealthy host: TERMINATED {id} in {} \
-                                                     (account {})",
-                                                    due.resource, due.account_id
+                                                    "unhealthy host: {id} is managed by ASG \
+                                                     {group}",
                                                 ),
                                             );
+                                            match terminate_instance(&ctx.profile, &ctx.region, id, &mode) {
+                                                Ok(()) => {
+                                                    terminated = true;
+                                                    note(
+                                                        LogLevel::Warn,
+                                                        format!(
+                                                            "unhealthy host: TERMINATED {id} in \
+                                                             {} (account {})",
+                                                            due.resource, due.account_id
+                                                        ),
+                                                    );
+                                                }
+                                                Err(e) => note(
+                                                    LogLevel::Error,
+                                                    format!(
+                                                        "unhealthy host: terminate of {id} \
+                                                         FAILED — {e}. Not retried; still \
+                                                         timing the alert"
+                                                    ),
+                                                ),
+                                            }
                                         }
+                                        Ok(None) => note(
+                                            LogLevel::Error,
+                                            format!(
+                                                "unhealthy host: refusing to terminate {id} — \
+                                                 it carries no aws:autoscaling:groupName tag, \
+                                                 so nothing would replace it. Not terminated; \
+                                                 still timing the alert"
+                                            ),
+                                        ),
                                         Err(e) => note(
                                             LogLevel::Error,
                                             format!(
-                                                "unhealthy host: terminate of {id} FAILED — {e}. \
-                                                 Not retried; still timing the alert"
+                                                "unhealthy host: could not confirm {id} is \
+                                                 ASG-managed ({e}) — refusing to terminate. \
+                                                 Still timing the alert"
                                             ),
                                         ),
                                     }
@@ -40079,11 +40156,22 @@ mod gui {
     /// The id is whitelisted rather than escaped: it came out of an ELB
     /// response, and `find_instance_id` accepting the whole string is what
     /// makes it safe on argv.
+    ///
+    /// **Live mode only, checked here rather than trusted from the caller.**
+    /// `request_asg_capacity` — the other destructive write in this app —
+    /// refuses on the mode at its own chokepoint instead of relying solely on
+    /// its caller; this does the same, so the function is safe in isolation
+    /// even though today's one caller already resolves a Live-only
+    /// `AwsContext` via `reaper_account_context`.
     fn terminate_instance(
         profile: &str,
         region: &str,
         instance_id: &str,
+        mode: &Mode,
     ) -> std::result::Result<(), String> {
+        if *mode != Mode::Live {
+            return Err("refusing to terminate: not in Live mode".to_string());
+        }
         if ec2_manager::reaper::find_instance_id(instance_id).as_deref() != Some(instance_id) {
             return Err(format!("refusing to terminate {instance_id:?}: not an instance id"));
         }
