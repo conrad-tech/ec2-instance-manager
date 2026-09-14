@@ -220,6 +220,20 @@ pub fn identifies(alert: &Alert, cfg: &ReaperFeature) -> bool {
         || contains_ci(&alert.message, &cfg.message_contains)
 }
 
+/// The `targetgroup/<name>/<id>` an alert names, wherever it names one.
+///
+/// Read by key from `extraProperties` first, then out of the free text in
+/// the order a human reads it. Shared with `crate::unhealthy_host`, which
+/// keys its incidents on this value: two watchers reading the target group
+/// two different ways would disagree about which alerts are one incident.
+pub fn alert_target_group(alert: &Alert) -> Option<String> {
+    TARGET_GROUP_KEYS
+        .iter()
+        .filter_map(|k| alert.extra.get(*k))
+        .find_map(|v| find_target_group(v))
+        .or_else(|| find_target_group(&alert.description).or_else(|| find_target_group(&alert.message)))
+}
+
 /// Is this alert one of ours, and if so what does it point at?
 ///
 /// Identification prefers `extraProperties.alertname`, then the `App:` tag,
@@ -252,16 +266,7 @@ pub fn match_alert(alert: &Alert, cfg: &ReaperFeature) -> Option<AlertMatch> {
     // fallback, never the preference.
     let subject = match instance {
         Some(id) => Subject::Instance(id),
-        None => Subject::TargetGroup(
-            TARGET_GROUP_KEYS
-                .iter()
-                .filter_map(|k| alert.extra.get(*k))
-                .find_map(|v| find_target_group(v))
-                .or_else(|| {
-                    find_target_group(&alert.description)
-                        .or_else(|| find_target_group(&alert.message))
-                })?,
-        ),
+        None => Subject::TargetGroup(alert_target_group(alert)?),
     };
 
     Some(AlertMatch {
@@ -1226,6 +1231,30 @@ mod tests {
         listed.description = String::new();
         assert!(identifies(&listed, &cfg()));
         assert!(match_alert(&listed, &cfg()).is_none());
+    }
+
+    #[test]
+    fn alert_target_group_reads_the_same_fields_match_alert_does() {
+        let mut a = alert();
+        a.description = "Resource ID: targetgroup/prod-app-tg/17bb79ec89f6d7d9\n".to_string();
+        assert_eq!(
+            alert_target_group(&a).as_deref(),
+            Some("targetgroup/prod-app-tg/17bb79ec89f6d7d9")
+        );
+
+        // An extra-properties key wins over the free text.
+        a.extra.insert(
+            "ResourceId".to_string(),
+            "targetgroup/from-extra/0123456789abcdef".to_string(),
+        );
+        assert_eq!(
+            alert_target_group(&a).as_deref(),
+            Some("targetgroup/from-extra/0123456789abcdef")
+        );
+
+        // Nothing anywhere is None, not a panic.
+        let bare = alert();
+        assert_eq!(alert_target_group(&bare), None);
     }
 
     #[test]
