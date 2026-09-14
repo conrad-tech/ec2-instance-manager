@@ -3357,6 +3357,22 @@ mod gui {
             Subject::Instance(id) => return Ok(id.clone()),
             Subject::TargetGroup(r) => r,
         };
+        let members = target_group_members(profile, region, resource)?;
+        reaper::sole_target_instance(&members)
+    }
+
+    /// Every registered target of `targetgroup/<name>/<id>` with its health.
+    /// Two read-only ELB calls: the name to its ARN, then the ARN to its
+    /// targets. The ARN is looked up, never constructed — a hand-built ARN
+    /// does not fail loudly, it finds nothing, which reads like an empty
+    /// group. Shared by reaper's resolution and the unhealthy-host watcher.
+    fn target_group_members(
+        profile: &str,
+        region: &str,
+        resource: &str,
+    ) -> std::result::Result<Vec<ec2_manager::reaper::TargetMember>, String> {
+        use ec2_manager::reaper;
+
         let name = reaper::target_group_name(resource)
             .ok_or_else(|| format!("{resource} is not a target group resource id"))?;
         let arn = reaper::parse_target_group_arn(&aws_json(
@@ -3365,12 +3381,11 @@ mod gui {
             &["elbv2", "describe-target-groups", "--names", name],
         )?)
         .ok_or_else(|| format!("no target group named {name} in {region}"))?;
-        let members = reaper::parse_target_health(&aws_json(
+        Ok(reaper::parse_target_health(&aws_json(
             profile,
             region,
             &["elbv2", "describe-target-health", "--target-group-arn", &arn],
-        )?);
-        reaper::sole_target_instance(&members)
+        )?))
     }
 
     /// `s`, trimmed, cut to `max` characters with the full length named.
@@ -39526,6 +39541,45 @@ mod gui {
         Ok(())
     }
 
+    /// Terminate one instance. **The only call site of `terminate-instances`
+    /// in this file**, reached from the unhealthy-host poll thread after
+    /// `unhealthy_host::plan` has named an instance reported unhealthy.
+    /// `terminate_instances_has_exactly_one_call_site` pins that.
+    ///
+    /// The id is whitelisted rather than escaped: it came out of an ELB
+    /// response, and `find_instance_id` accepting the whole string is what
+    /// makes it safe on argv.
+    ///
+    /// The caller lands in Task 7; unused until then.
+    #[allow(dead_code)]
+    fn terminate_instance(
+        profile: &str,
+        region: &str,
+        instance_id: &str,
+    ) -> std::result::Result<(), String> {
+        if ec2_manager::reaper::find_instance_id(instance_id).as_deref() != Some(instance_id) {
+            return Err(format!("refusing to terminate {instance_id:?}: not an instance id"));
+        }
+        let output = aws_command()
+            .args([
+                "ec2", "terminate-instances",
+                "--profile", profile,
+                "--region", region,
+                "--instance-ids", instance_id,
+                "--output", "json",
+            ])
+            .output()
+            .map_err(|e| format!("terminate failed to run: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr: String = stderr.trim().chars().take(300).collect();
+            // "terminate error", not the verb: the scan test counts
+            // non-comment lines carrying the verb and wants exactly one.
+            return Err(format!("terminate error: {stderr}"));
+        }
+        Ok(())
+    }
+
     /// The whole of a Start / Stop / Restart, on its own thread.
     ///
     /// The restart is a stop, a poll until the instance actually reports
@@ -48368,6 +48422,28 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     line.trim(),
                 );
             }
+        }
+
+        /// `terminate-instances` is the one destructive call the on-call
+        /// watchers make, and it must reach `aws` from exactly one function
+        /// — the one the unhealthy-host poll thread calls after `plan` has
+        /// named an unhealthy instance. A second call site would bypass the
+        /// plan and the budget with no compile error.
+        #[test]
+        fn terminate_instances_has_exactly_one_call_site() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let needle = format!("terminate-{}", "instances");
+            let hits: Vec<usize> = src
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| !l.trim_start().starts_with("//") && l.contains(&needle))
+                .map(|(n, _)| n + 1)
+                .collect();
+            // The message is built from `needle` rather than retyping it, or
+            // this very assertion line would contain the literal text and
+            // count as a hit of its own — self-matching regardless of what
+            // the rest of the file does.
+            assert_eq!(hits.len(), 1, "{needle} must appear once, found at lines {hits:?}");
         }
 
         /// The row menu's Start / Stop / Restart entries must stay behind
