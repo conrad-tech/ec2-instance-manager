@@ -1062,15 +1062,79 @@ impl ReaperFeature {
     }
 }
 
-/// The OS username of the person running the app: `USERNAME` on Windows,
-/// `USER` elsewhere. Empty when neither is set.
+/// The OS username of the person running the app, **asked of the operating
+/// system, never of the environment**.
+///
+/// Every `allowed_users` gate in this app compares against this one string,
+/// so whatever can set it can turn on every feature those lists guard. It
+/// used to read `%USERNAME%` / `$USER`, which any user can set for a single
+/// launch — `set USERNAME=someone-on-the-list` armed the alert watchers, the
+/// Jira button and the remediation controls, and the `gates:` line then
+/// dutifully reported the spoofed name as though it were a fact.
+///
+/// So Windows asks `GetUserNameW` and Unix reads the effective uid out of
+/// `/proc/self/status` and resolves it through `/etc/passwd`. Neither answer
+/// comes from anything the user launching the process can set.
+///
+/// **A name that cannot be determined is empty, and empty matches no list**
+/// (`user_in_list` and `names_user` both refuse it), so failure closes every
+/// gate rather than opening one. The startup `gates:` line prints
+/// `(unknown!)` in that case, which is the signal to look here.
 pub fn current_os_user() -> String {
-    let key = if cfg!(target_os = "windows") {
-        "USERNAME"
+    os_account_name().unwrap_or_default().trim().to_string()
+}
+
+/// The account name from the OS itself. `None` when it cannot be determined.
+#[cfg(target_os = "windows")]
+fn os_account_name() -> Option<String> {
+    use windows_sys::Win32::System::WindowsProgramming::GetUserNameW;
+
+    // UNLEN + 1. The call writes the length back, including the NUL.
+    let mut buf = [0u16; 257];
+    let mut len: u32 = buf.len() as u32;
+    // SAFETY: `buf` is `len` u16s long and the call writes at most that many,
+    // reporting back how many it used.
+    let ok = unsafe { GetUserNameW(buf.as_mut_ptr(), &mut len) };
+    if ok == 0 || len == 0 {
+        return None;
+    }
+    // `len` counts the trailing NUL.
+    let name = String::from_utf16_lossy(&buf[..(len as usize).saturating_sub(1)]);
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        None
     } else {
-        "USER"
-    };
-    std::env::var(key).unwrap_or_default().trim().to_string()
+        Some(name)
+    }
+}
+
+/// The account name from the OS itself. `None` when it cannot be determined.
+///
+/// Two plain files rather than a `libc` dependency for one lookup: the
+/// effective uid is the third field of `/proc/self/status`'s `Uid:` line, and
+/// `/etc/passwd` maps it to a name. Linux here is the development build —
+/// this app ships on Windows — but it must not be spoofable either, or a
+/// rule proved on one platform is untrue on the other.
+#[cfg(not(target_os = "windows"))]
+fn os_account_name() -> Option<String> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let uid = status.lines().find_map(|l| {
+        // `Uid:\t<real>\t<effective>\t<saved>\t<fs>` — the EFFECTIVE uid
+        // is what the kernel checks, so it is what this must report.
+        let rest = l.strip_prefix("Uid:")?;
+        rest.split_whitespace().nth(1).map(str::to_string)
+    })?;
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let mut f = line.split(':');
+        let name = f.next()?;
+        let _password = f.next()?;
+        if f.next()? != uid {
+            return None;
+        }
+        let name = name.trim();
+        (!name.is_empty()).then(|| name.to_string())
+    })
 }
 
 /// Config for the post-create Outlook access email (see
@@ -2729,5 +2793,54 @@ mod log_visibility_gate_tests {
         assert!(reaper.is_listed_user("alice") && !pingdom.is_listed_user("alice") && !uh.is_listed_user("alice"));
         assert!(!reaper.is_listed_user("bob") && pingdom.is_listed_user("bob") && !uh.is_listed_user("bob"));
         assert!(!reaper.is_listed_user("carol") && !pingdom.is_listed_user("carol") && uh.is_listed_user("carol"));
+    }
+}
+
+#[cfg(test)]
+mod os_identity_tests {
+    use super::*;
+
+    /// **The whole point of `current_os_user`.** Every `allowed_users` gate
+    /// compares against this string, so anything that can set it can arm
+    /// every feature those lists guard. It used to read `%USERNAME%` /
+    /// `$USER`, and `set USERNAME=someone-on-the-list` was enough to turn on
+    /// the alert watchers, the Jira button and the remediation controls.
+    ///
+    /// Setting the environment here must therefore change nothing. This is a
+    /// process-wide mutation, so it is deliberately **one** test rather than
+    /// several that would race under the parallel runner.
+    #[test]
+    fn the_username_does_not_come_from_the_environment() {
+        let real = current_os_user();
+
+        // SAFETY: single-threaded within this test, and the value is
+        // restored below. The assertion is precisely that nothing reads it.
+        unsafe {
+            std::env::set_var("USER", "spoofed-user");
+            std::env::set_var("USERNAME", "spoofed-user");
+        }
+        let after = current_os_user();
+        unsafe {
+            std::env::remove_var("USER");
+            std::env::remove_var("USERNAME");
+        }
+        let with_none = current_os_user();
+
+        assert_eq!(after, real, "the environment must not change who we are");
+        assert_ne!(after, "spoofed-user", "the spoofed name must never be adopted");
+        assert_eq!(with_none, real, "and removing it must not change it either");
+    }
+
+    /// A name that could not be determined matches no list, so a failed
+    /// lookup closes every gate rather than opening one.
+    #[test]
+    fn an_unknown_user_is_on_no_list() {
+        assert!(!user_in_list(&["bconrad".to_string()], ""));
+        assert!(!user_in_list(&["bconrad".to_string()], "   "));
+        assert!(!names_user(&["bconrad".to_string()], ""));
+        assert!(!names_user(&["bconrad".to_string()], "   "));
+        // Even a wildcard, which `user_in_list` otherwise honours: an
+        // unidentified caller is not "everyone".
+        assert!(!user_in_list(&["*".to_string()], ""));
     }
 }

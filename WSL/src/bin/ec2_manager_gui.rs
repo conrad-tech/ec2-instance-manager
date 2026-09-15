@@ -507,6 +507,14 @@ mod gui {
         /// every terminate, every escalation, every insured alert, and the
         /// startup lines about whether the feature came up at all.
         UnhealthyHost,
+        /// The Jira Tickets feature: the list, every ticket opened, every
+        /// transition, comment and edit. Its own source so a user off
+        /// `jira.allowed_users` never reads ticket keys or comment text out
+        /// of a log they can otherwise open.
+        Jira,
+        /// The Alerts feature: the feed window, every alert opened, every
+        /// acknowledgement. Its own source for the same reason as [`Self::Jira`].
+        Alerts,
         /// One **Test Alert Match** run, whichever watcher claimed the alert.
         ///
         /// Its own source rather than the claiming watcher's: a dry run is
@@ -542,13 +550,20 @@ mod gui {
         pingdom: bool,
         unhealthy_host: bool,
         alert_test: bool,
+        jira: bool,
+        alerts: bool,
     }
 
     impl OnCallFilters {
         /// True when at least one script is selected. With none selected the
         /// filter is off entirely rather than matching nothing.
         fn any(self) -> bool {
-            self.reaper_down || self.pingdom || self.alert_test || self.unhealthy_host
+            self.reaper_down
+                || self.pingdom
+                || self.alert_test
+                || self.unhealthy_host
+                || self.jira
+                || self.alerts
         }
 
         fn includes(self, source: LogSource) -> bool {
@@ -560,6 +575,8 @@ mod gui {
                 LogSource::Pingdom => self.pingdom,
                 LogSource::UnhealthyHost => self.unhealthy_host,
                 LogSource::AlertTest => self.alert_test,
+                LogSource::Jira => self.jira,
+                LogSource::Alerts => self.alerts,
                 LogSource::App => false,
             }
         }
@@ -585,10 +602,20 @@ mod gui {
             if self.alert_test {
                 picked.push("Alert Test");
             }
+            if self.jira {
+                picked.push("Jira");
+            }
+            if self.alerts {
+                picked.push("Alerts");
+            }
             if picked.is_empty() {
-                "On-Call".to_string()
+                // Renamed from "On-Call" when Jira and Alerts joined it: a
+                // dropdown that narrows to a Jira ticket is not an on-call
+                // filter, and a label that lies about its contents is how
+                // somebody concludes the rows they want are not in it.
+                "Sources".to_string()
             } else {
-                format!("On-Call: {}", picked.join(", "))
+                format!("Sources: {}", picked.join(", "))
             }
         }
     }
@@ -619,10 +646,18 @@ mod gui {
         pingdom: bool,
         unhealthy_host: bool,
         alert_test: bool,
+        jira: bool,
+        alerts: bool,
     }
 
     impl LogVisibility {
-        /// What `user` may read, from the three watchers' own allow-lists.
+        /// What `user` may read, from each feature's own allow-list.
+        ///
+        /// Jira and Alerts key on **`allowed_users` alone**, deliberately
+        /// without the credential and site terms `jira_visible_for` and
+        /// `alerts_visible_for` also require. Those decide whether the
+        /// feature can *work*; this decides whose output it is. A listed user
+        /// whose token has expired still needs to read the line saying so.
         fn for_user(features: &ec2_manager::features::Features, user: &str) -> Self {
             Self {
                 reaper_down: features.reaper.is_listed_user(user),
@@ -631,6 +666,8 @@ mod gui {
                 // The button's gate, not a watcher's: a dry run is something
                 // this person ran, whichever watcher claimed the alert.
                 alert_test: features.reaper.is_listed_user(user),
+                jira: features.jira.is_allowed_user(user),
+                alerts: features.alerts.is_allowed_user(user),
             }
         }
 
@@ -643,13 +680,21 @@ mod gui {
                 LogSource::Pingdom => self.pingdom,
                 LogSource::UnhealthyHost => self.unhealthy_host,
                 LogSource::AlertTest => self.alert_test,
+                LogSource::Jira => self.jira,
+                LogSource::Alerts => self.alerts,
             }
         }
 
-        /// True when there is at least one on-call source to offer. With
-        /// none, the whole dropdown is hidden rather than drawn empty.
-        fn any_oncall(self) -> bool {
-            self.reaper_down || self.pingdom || self.unhealthy_host || self.alert_test
+        /// True when there is at least one gated source to offer. With none,
+        /// the whole dropdown is hidden rather than drawn empty — an empty
+        /// filter would only advertise output the user cannot read.
+        fn any_source(self) -> bool {
+            self.reaper_down
+                || self.pingdom
+                || self.unhealthy_host
+                || self.alert_test
+                || self.jira
+                || self.alerts
         }
     }
 
@@ -9719,13 +9764,17 @@ mod gui {
                 app.alerts_auth.is_complete(),
                 app.jira_site.is_complete(),
             ) {
-                app.log_info(reason);
+                // Its own source: a user off `jira.allowed_users` must not
+                // read that the feature exists, let alone why it is closed to
+                // them. A user who IS on the list still gets the whole
+                // sentence, which is the half that matters.
+                app.log_jira(LogLevel::Info, reason);
             } else {
                 // Which site the tickets are actually read from. Worth a line
                 // of its own: pointing at the alert feed's tenant instead of
                 // the Jira site returns a perfectly valid, entirely empty
                 // ticket list, and nothing else in the log would say so.
-                app.log_info(format!("jira: reading tickets from {}", app.jira_site.api_base()));
+                app.log_jira(LogLevel::Info, format!("jira: reading tickets from {}", app.jira_site.api_base()));
                 // The badge is only worth having if it is live before the
                 // window is ever opened.
                 app.start_jira_background_poll();
@@ -9755,28 +9804,55 @@ mod gui {
             // invisible: the button simply never appears, with nothing to say
             // the name was wrong.
             //
-            // This is the **host** account (%USERNAME% on Windows, $USER on
-            // Linux) read from the process the GUI itself runs in — not the
-            // login inside an embedded WSL/SSM terminal, which is a child
+            // This is the **host** account, asked of the OS itself
+            // (`GetUserNameW` on Windows, the effective uid via
+            // `/proc/self/status` on Linux) — never `%USERNAME%`/`$USER`,
+            // which the person launching the app can set. It is not the login
+            // inside an embedded WSL/SSM terminal either: that is a child
             // process started later and never consulted here.
+            //
+            // **The five gated features are deliberately absent from this
+            // line.** It goes to `LogSource::App`, which everyone reads, and
+            // naming them here would tell a user who is on none of the lists
+            // that the features exist and what state they are in — the one
+            // thing `LogVisibility` is for. Each now reports itself to its own
+            // source, below, so the person a feature belongs to still gets the
+            // whole diagnosis and nobody else learns it is there.
             app.log_info(format!(
-                "gates: os_user='{}' (from {}) — git_scripts={} alerts={} reaper={} \
-                 pingdom={} unhealthy_host={} jira={} vault_iam={} vault_iam_delete={} fed_auth={} \
-                 fed_auto_sign_in={} instance_power={}",
-                if os_user.is_empty() { "(unset!)" } else { &os_user },
-                if cfg!(target_os = "windows") { "%USERNAME%" } else { "$USER" },
+                "gates: os_user='{}' (from the OS) — git_scripts={} vault_iam={} \
+                 vault_iam_delete={} fed_auth={} fed_auto_sign_in={} instance_power={}",
+                if os_user.is_empty() { "(unknown!)" } else { &os_user },
                 app.git_scripts_enabled,
-                app.alerts_enabled,
-                features.reaper_enabled_for(&os_user),
-                features.pingdom_enabled_for(&os_user),
-                features.unhealthy_host_enabled_for(&os_user),
-                app.jira_enabled,
                 features.vault_iam_enabled_for(&os_user),
                 features.vault_iam_delete_enabled_for(&os_user),
                 app.fed_auth_enabled,
                 app.fed_auto_sign_in,
                 app.instance_power_enabled,
             ));
+            // Each gated feature's own verdict, on its own source, so it
+            // reaches exactly the people entitled to the feature. `reaper=`
+            // names what the WATCHER decided; the Test Alert Match and Run
+            // Remediation controls are gated by `reaper.allowed_users` alone
+            // (`reaper.enabled` is not required for them), so both are said
+            // rather than one standing for the other.
+            let reaper_gate = format!(
+                "gates: reaper={} (watcher), alert controls={}",
+                features.reaper_enabled_for(&os_user),
+                app.reaper_probe_enabled,
+            );
+            app.log_reaper(LogLevel::Info, reaper_gate);
+            let pingdom_gate =
+                format!("gates: pingdom={}", features.pingdom_enabled_for(&os_user));
+            app.log_pingdom(LogLevel::Info, pingdom_gate);
+            let uh_gate = format!(
+                "gates: unhealthy_host={}",
+                features.unhealthy_host_enabled_for(&os_user)
+            );
+            app.log_unhealthy_host(LogLevel::Info, uh_gate);
+            let alerts_gate = format!("gates: alerts={}", app.alerts_enabled);
+            app.log_alerts(LogLevel::Info, alerts_gate);
+            let jira_gate = format!("gates: jira={}", app.jira_enabled);
+            app.log_jira(LogLevel::Info, jira_gate);
             // Report the compiled-in access-email config immediately, so a
             // config that did not survive a rebuild or a pull is visible
             // without having to create a user first.
@@ -10777,6 +10853,20 @@ mod gui {
 
         fn log_unhealthy_host(&mut self, level: LogLevel, message: impl Into<String>) {
             self.log_from(LogSource::UnhealthyHost, level, message);
+        }
+
+        /// Everything the Jira Tickets feature says about itself. Its own
+        /// source so a user off `jira.allowed_users` never reads ticket keys
+        /// or comment text out of the Logs tab.
+        fn log_jira(&mut self, level: LogLevel, message: impl Into<String>) {
+            self.log_from(LogSource::Jira, level, message);
+        }
+
+        /// Everything the Alerts feature says about itself — alert ids,
+        /// acknowledgements, fetch failures. Its own source for the same
+        /// reason as [`Self::log_jira`].
+        fn log_alerts(&mut self, level: LogLevel, message: impl Into<String>) {
+            self.log_from(LogSource::Alerts, level, message);
         }
 
         fn log_error(&mut self, message: impl Into<String>) {
@@ -15837,7 +15927,7 @@ mod gui {
                 ));
                 return;
             }
-            self.log_info(format!("jira: opening {key}"));
+            self.log_jira(LogLevel::Info, format!("jira: opening {key}"));
             let seen_before = self.config.jira_seen.get(&key).cloned();
             let mut win = TicketWindow::new(key.clone(), seen_before);
             if let Some((draft, mentions)) = self.jira_drafts.remove(&key) {
@@ -15907,7 +15997,7 @@ mod gui {
             // pasted into tickets.
             let filled: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
             if filled.is_empty() {
-                self.log_info(format!("jira: {key} — applying transition '{name}' (id {id})"));
+                self.log_jira(LogLevel::Info, format!("jira: {key} — applying transition '{name}' (id {id})"));
             } else {
                 self.log_info(format!(
                     "jira: {key} — applying transition '{name}' (id {id}) with {}",
@@ -15978,7 +16068,7 @@ mod gui {
             let (text, mentions) = (edit.text.clone(), edit.mentions.clone());
             win.edit_note = None;
             let key = key.to_string();
-            self.log_info(format!("jira: {key} — saving an edited description"));
+            self.log_jira(LogLevel::Info, format!("jira: {key} — saving an edited description"));
             let site = self.jira_site.clone();
             let tx = self.jira_tx.clone();
             std::thread::spawn(move || {
@@ -16006,7 +16096,7 @@ mod gui {
                 (comment_id.clone(), edit.text.clone(), edit.mentions.clone());
             win.edit_note = None;
             let key = key.to_string();
-            self.log_info(format!("jira: {key} — saving an edit to comment {id}"));
+            self.log_jira(LogLevel::Info, format!("jira: {key} — saving an edit to comment {id}"));
             let site = self.jira_site.clone();
             let tx = self.jira_tx.clone();
             std::thread::spawn(move || {
@@ -16034,7 +16124,7 @@ mod gui {
             let text = win.comment_draft.clone();
             let mentions = win.picked_mentions.clone();
             let key = key.to_string();
-            self.log_info(format!("jira: {key} — posting a comment"));
+            self.log_jira(LogLevel::Info, format!("jira: {key} — posting a comment"));
             let site = self.jira_site.clone();
             let tx = self.jira_tx.clone();
             std::thread::spawn(move || {
@@ -16069,7 +16159,7 @@ mod gui {
                                 }
                             }
                             Err(err) => {
-                                self.log_error(format!("jira: {err}"));
+                                self.log_jira(LogLevel::Error, format!("jira: {err}"));
                                 if let Some(win) = self.jira_window.as_mut() {
                                     win.error = Some(err);
                                 }
@@ -16089,7 +16179,7 @@ mod gui {
                                 self.mark_jira_ticket_seen(&issue);
                             }
                             Err(err) => {
-                                self.log_error(format!("jira: {key}: {err}"));
+                                self.log_jira(LogLevel::Error, format!("jira: {key}: {err}"));
                                 if let Some(win) =
                                     self.jira_tickets.iter_mut().find(|w| w.key == key)
                                 {
@@ -16111,7 +16201,7 @@ mod gui {
                             Err(err) => {
                                 // A warning, not an error: the ticket itself
                                 // is still perfectly readable without this.
-                                self.log_warn(format!("jira: {key}: transitions: {err}"));
+                                self.log_jira(LogLevel::Warn, format!("jira: {key}: transitions: {err}"));
                                 if let Some(win) =
                                     self.jira_tickets.iter_mut().find(|w| w.key == key)
                                 {
@@ -16134,7 +16224,7 @@ mod gui {
                             Err(err) => {
                                 // A warning: the ticket reads fine without
                                 // its thread.
-                                self.log_warn(format!("jira: {key}: comments: {err}"));
+                                self.log_jira(LogLevel::Warn, format!("jira: {key}: comments: {err}"));
                                 if let Some(win) =
                                     self.jira_tickets.iter_mut().find(|w| w.key == key)
                                 {
@@ -16160,7 +16250,7 @@ mod gui {
                                 ));
                             }
                         }
-                        Err(err) => self.log_warn(format!("jira: background poll: {err}")),
+                        Err(err) => self.log_jira(LogLevel::Warn, format!("jira: background poll: {err}")),
                     },
                     JiraEvent::Myself(result) => match result {
                         Ok(me) => {
@@ -16190,11 +16280,11 @@ mod gui {
                                 win.desc_edit = None;
                                 win.comment_edit = None;
                                 win.edit_note = Some(Ok(msg.clone()));
-                                self.log_info(format!("jira: {key} — {msg}"));
+                                self.log_jira(LogLevel::Info, format!("jira: {key} — {msg}"));
                                 reload.push(key);
                             }
                             Err(err) => {
-                                self.log_error(format!("jira: {key} — edit failed: {err}"));
+                                self.log_jira(LogLevel::Error, format!("jira: {key} — edit failed: {err}"));
                                 if let Some(win) =
                                     self.jira_tickets.iter_mut().find(|w| w.key == key)
                                 {
@@ -16228,7 +16318,7 @@ mod gui {
                                 // dropdown, so this is a warning, not a
                                 // failure that closes it.
                                 popup.directory.clear();
-                                self.log_warn(format!("jira: {key}: user search: {err}"));
+                                self.log_jira(LogLevel::Warn, format!("jira: {key}: user search: {err}"));
                             }
                         }
                     }
@@ -16247,11 +16337,11 @@ mod gui {
                                 win.comment_note = Some(Ok("Comment posted".to_string()));
                                 // Nothing left to keep for this ticket.
                                 self.jira_drafts.remove(&key);
-                                self.log_info(format!("jira: {key} — comment posted"));
+                                self.log_jira(LogLevel::Info, format!("jira: {key} — comment posted"));
                                 reload.push(key);
                             }
                             Err(err) => {
-                                self.log_error(format!("jira: {key} — comment failed: {err}"));
+                                self.log_jira(LogLevel::Error, format!("jira: {key} — comment failed: {err}"));
                                 if let Some(win) =
                                     self.jira_tickets.iter_mut().find(|w| w.key == key)
                                 {
@@ -16271,7 +16361,7 @@ mod gui {
                             Ok(()) => {
                                 win.pending_transition = None;
                                 win.note = Some(Ok(format!("Applied '{name}'")));
-                                self.log_info(format!("jira: {key} — '{name}' applied"));
+                                self.log_jira(LogLevel::Info, format!("jira: {key} — '{name}' applied"));
                                 // The status just changed, and so did the set
                                 // of legal next moves, so both are re-read
                                 // rather than guessed at locally.
@@ -16301,6 +16391,13 @@ mod gui {
         }
 
         fn start_alerts_fetch(&mut self) {
+            // The gate, re-read, not the state. Each of these is reachable
+            // only from a gated button today, so this changes nothing now —
+            // which is the point: it is the half of the design that would
+            // fail quietly if a later edit opened one of them another way.
+            if !self.alerts_enabled {
+                return;
+            }
             if self.ack_all_running {
                 return;
             }
@@ -16336,7 +16433,7 @@ mod gui {
                 ));
                 return;
             }
-            self.log_info(format!("alerts: opening alert {id}"));
+            self.log_alerts(LogLevel::Info, format!("alerts: opening alert {id}"));
             self.alert_windows
                 .push(AlertWindow::new(id.clone(), tiny_id.to_string()));
             self.start_alert_detail_fetch(&id);
@@ -16379,7 +16476,7 @@ mod gui {
             win.ack_in_flight = true;
             win.note = None;
             let id = id.to_string();
-            self.log_info(format!("alerts: acknowledging {id} from its window"));
+            self.log_alerts(LogLevel::Info, format!("alerts: acknowledging {id} from its window"));
             let auth = self.alerts_auth.clone();
             let tx = self.alert_detail_tx.clone();
             std::thread::spawn(move || {
@@ -16406,7 +16503,7 @@ mod gui {
                                 win.error = None;
                             }
                             Err(err) => {
-                                self.log_error(format!("alerts: {id}: {err}"));
+                                self.log_alerts(LogLevel::Error, format!("alerts: {id}: {err}"));
                                 if let Some(win) =
                                     self.alert_windows.iter_mut().find(|w| w.id == id)
                                 {
@@ -16424,13 +16521,13 @@ mod gui {
                         match result {
                             Ok(()) => {
                                 win.note = Some(Ok("Acknowledged".to_string()));
-                                self.log_info(format!("alerts: {id} acknowledged"));
+                                self.log_alerts(LogLevel::Info, format!("alerts: {id} acknowledged"));
                                 // The alert's own `acknowledged` flag and the
                                 // list's row are both stale now.
                                 reload.push(id);
                             }
                             Err(err) => {
-                                self.log_error(format!("alerts: {id}: acknowledge: {err}"));
+                                self.log_alerts(LogLevel::Error, format!("alerts: {id}: acknowledge: {err}"));
                                 if let Some(win) =
                                     self.alert_windows.iter_mut().find(|w| w.id == id)
                                 {
@@ -16479,7 +16576,7 @@ mod gui {
                         win.fetched_at = Some(chrono::Local::now());
                     }
                     Err(err) => {
-                        self.log_error(format!("alerts: {err}"));
+                        self.log_alerts(LogLevel::Error, format!("alerts: {err}"));
                         if let Some(win) = self.alerts_window.as_mut() {
                             win.error = Some(err);
                         }
@@ -16557,7 +16654,7 @@ mod gui {
                             }
                         }
                         Err(err) => {
-                            self.log_error(format!("alerts: failed to acknowledge {id}: {err}"));
+                            self.log_alerts(LogLevel::Error, format!("alerts: failed to acknowledge {id}: {err}"));
                         }
                     },
                     AckAllEvent::Done { total, ok, failed } => {
@@ -16633,6 +16730,14 @@ mod gui {
         /// open — `start_ack_all` no longer needs the window either, so a
         /// confirm here always runs the action it names.
         fn render_ack_all_confirm(&mut self, ctx: &egui::Context) {
+            // The gate, re-read, not the state. Each of these is reachable
+            // only from a gated button today, so this changes nothing now —
+            // which is the point: it is the half of the design that would
+            // fail quietly if a later edit opened one of them another way.
+            if !self.alerts_enabled {
+                self.pending_ack_all = None;
+                return;
+            }
             let Some(ids) = self.pending_ack_all.clone() else {
                 return;
             };
@@ -16681,6 +16786,14 @@ mod gui {
         ///
         /// Mirrors `render_ack_all_confirm`'s Confirm/Cancel shape.
         fn render_run_remediation_confirm(&mut self, ctx: &egui::Context) {
+            // The gate, re-read, not the state. Each of these is reachable
+            // only from a gated button today, so this changes nothing now —
+            // which is the point: it is the half of the design that would
+            // fail quietly if a later edit opened one of them another way.
+            if !self.reaper_probe_enabled {
+                self.pending_run_remediation = None;
+                return;
+            }
             let Some((alert_id, override_health)) = self.pending_run_remediation.clone()
             else {
                 return;
@@ -16903,6 +17016,14 @@ mod gui {
         /// local timezone; the API reports UTC.
         /// The ticket list.
         fn render_jira_window(&mut self, ctx: &egui::Context) {
+            // The gate, re-read, not the state. Each of these is reachable
+            // only from a gated button today, so this changes nothing now —
+            // which is the point: it is the half of the design that would
+            // fail quietly if a later edit opened one of them another way.
+            if !self.jira_enabled {
+                self.jira_window = None;
+                return;
+            }
             if self.jira_window.is_none() {
                 return;
             }
@@ -17271,6 +17392,14 @@ mod gui {
 
         /// Every open ticket window.
         fn render_jira_ticket_windows(&mut self, ctx: &egui::Context) {
+            // The gate, re-read, not the state. Each of these is reachable
+            // only from a gated button today, so this changes nothing now —
+            // which is the point: it is the half of the design that would
+            // fail quietly if a later edit opened one of them another way.
+            if !self.jira_enabled {
+                self.jira_tickets.clear();
+                return;
+            }
             // Actions are collected and applied after the loop: the render
             // borrows `self.jira_tickets`, and both of these need `&mut self`.
             let mut closed: Vec<String> = Vec::new();
@@ -18224,6 +18353,14 @@ mod gui {
 
         /// Every open alert-detail window.
         fn render_alert_windows(&mut self, ctx: &egui::Context) {
+            // The gate, re-read, not the state. Each of these is reachable
+            // only from a gated button today, so this changes nothing now —
+            // which is the point: it is the half of the design that would
+            // fail quietly if a later edit opened one of them another way.
+            if !self.alerts_enabled {
+                self.alert_windows.clear();
+                return;
+            }
             let mut closed: Vec<String> = Vec::new();
             let mut ack: Option<String> = None;
             let mut reload: Option<String> = None;
@@ -18468,6 +18605,14 @@ mod gui {
         }
 
         fn render_alerts_window(&mut self, ctx: &egui::Context) {
+            // The gate, re-read, not the state. Each of these is reachable
+            // only from a gated button today, so this changes nothing now —
+            // which is the point: it is the half of the design that would
+            // fail quietly if a later edit opened one of them another way.
+            if !self.alerts_enabled {
+                self.alerts_window = None;
+                return;
+            }
             if self.alerts_window.is_none() {
                 return;
             }
@@ -18807,7 +18952,7 @@ mod gui {
             }
             if let Some(text) = copy_text {
                 ctx.copy_text(text);
-                self.log_info("alerts: copied table to clipboard");
+                self.log_alerts(LogLevel::Info, "alerts: copied table to clipboard");
             }
             if let Some(ids) = ack_all_ids {
                 self.pending_ack_all = Some(ids);
@@ -32939,7 +33084,7 @@ mod gui {
             // sees none of their lines, so an empty dropdown would only
             // advertise output they cannot read.
             let vis = self.log_visibility;
-            if !vis.any_oncall() {
+            if !vis.any_source() {
                 return;
             }
             ui.separator();
@@ -32998,6 +33143,28 @@ mod gui {
                             );
                         });
                     }
+                    if vis.jira {
+                        ui.horizontal(|ui| {
+                            ui.label("Jira");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.checkbox(&mut self.oncall_filters.jira, "");
+                                },
+                            );
+                        });
+                    }
+                    if vis.alerts {
+                        ui.horizontal(|ui| {
+                            ui.label("Alerts");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.checkbox(&mut self.oncall_filters.alerts, "");
+                                },
+                            );
+                        });
+                    }
                 })
                 .response
                 .on_hover_text(
@@ -33037,8 +33204,13 @@ mod gui {
                              The newest one keeps its full response; older rows are \
                              metadata only.",
                         );
-                    self.render_oncall_log_filter(ui);
                 }
+                // Outside the Atlassian gate on purpose. The sources dropdown
+                // covers the watchers too, and nesting it here left a user on
+                // `reaper.allowed_users` but on neither Atlassian list with no
+                // way to narrow to their own output. It hides itself when the
+                // user is entitled to no source at all.
+                self.render_oncall_log_filter(ui);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.checkbox(&mut self.log_filters.trace, "TRACE");
                     ui.checkbox(&mut self.log_filters.debug, "DEBUG");
@@ -34203,7 +34375,7 @@ mod gui {
                                     self.alerts_window = None;
                                 } else if self.alerts_auth.is_complete() {
                                     self.alerts_window = Some(AlertsWindow::new());
-                                    self.log_info("alerts: opening on-call alerts");
+                                    self.log_alerts(LogLevel::Info, "alerts: opening on-call alerts");
                                     self.start_alerts_fetch();
                                 } else {
                                     // Site is configured but no token — the
@@ -34262,7 +34434,7 @@ mod gui {
                                     self.jira_window = Some(JiraWindow::new());
                                     self.jira_window_open
                                         .store(true, std::sync::atomic::Ordering::Relaxed);
-                                    self.log_info("jira: opening ticket list");
+                                    self.log_jira(LogLevel::Info, "jira: opening ticket list");
                                     self.start_jira_search();
                                 }
                             }
@@ -47485,12 +47657,12 @@ mod gui {
             assert!(!none.any());
             assert!(none.includes(LogSource::App));
             assert!(none.includes(LogSource::ReaperDown));
-            assert_eq!(none.label(), "On-Call");
+            assert_eq!(none.label(), "Sources");
         }
 
         #[test]
         fn ticking_reaper_down_narrows_the_log_to_that_script() {
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, jira: false, alerts: false };
             assert!(only_reaper.any());
             assert!(only_reaper.includes(LogSource::ReaperDown));
             assert!(!only_reaper.includes(LogSource::App));
@@ -47501,7 +47673,7 @@ mod gui {
             // The popup shuts as soon as it is used, so without this the only
             // evidence that most of the log is being hidden is the log being
             // short — which reads as the app having stopped logging.
-            assert_eq!(OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false }.label(), "On-Call: Reaper Down");
+            assert_eq!(OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, jira: false, alerts: false }.label(), "Sources: Reaper Down");
         }
 
         #[test]
@@ -47522,7 +47694,7 @@ mod gui {
 
             // And that tag is what the dropdown filters on — asserted through
             // the same predicate the panel uses, not a reimplementation of it.
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, jira: false, alerts: false };
             let kept: Vec<&str> = app
                 .logs
                 .iter()
@@ -47537,7 +47709,7 @@ mod gui {
             // The two filters are independent and both on screen. A DEBUG
             // reaper line with DEBUG unticked stays hidden, the same as any
             // other DEBUG line.
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, jira: false, alerts: false };
             let mut levels = LogFilters::default();
             levels.set_verbosity_low();
             assert!(!levels.includes(LogLevel::Debug));
@@ -49652,30 +49824,30 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn the_on_call_filter_can_narrow_the_log_to_pingdom() {
-            let only_pingdom = OnCallFilters { reaper_down: false, pingdom: true, alert_test: false, unhealthy_host: false };
+            let only_pingdom = OnCallFilters { reaper_down: false, pingdom: true, alert_test: false, unhealthy_host: false, jira: false, alerts: false };
             assert!(only_pingdom.includes(LogSource::Pingdom));
             assert!(!only_pingdom.includes(LogSource::ReaperDown));
             assert!(!only_pingdom.includes(LogSource::App));
-            assert_eq!(only_pingdom.label(), "On-Call: Pingdom");
+            assert_eq!(only_pingdom.label(), "Sources: Pingdom");
         }
 
         #[test]
         fn nothing_ticked_still_shows_the_pingdom_lines() {
             // A dropdown nobody opens must not remove anything from view.
-            let none = OnCallFilters { reaper_down: false, pingdom: false, alert_test: false, unhealthy_host: false };
+            let none = OnCallFilters { reaper_down: false, pingdom: false, alert_test: false, unhealthy_host: false, jira: false, alerts: false };
             assert!(none.includes(LogSource::Pingdom));
             assert!(none.includes(LogSource::ReaperDown));
             assert!(none.includes(LogSource::App));
-            assert_eq!(none.label(), "On-Call");
+            assert_eq!(none.label(), "Sources");
         }
 
         #[test]
         fn both_ticked_shows_both_and_says_so() {
-            let both = OnCallFilters { reaper_down: true, pingdom: true, alert_test: false, unhealthy_host: false };
+            let both = OnCallFilters { reaper_down: true, pingdom: true, alert_test: false, unhealthy_host: false, jira: false, alerts: false };
             assert!(both.includes(LogSource::Pingdom));
             assert!(both.includes(LogSource::ReaperDown));
             assert!(!both.includes(LogSource::App));
-            assert_eq!(both.label(), "On-Call: Reaper Down, Pingdom");
+            assert_eq!(both.label(), "Sources: Reaper Down, Pingdom");
         }
 
         fn unhealthy_host_cfg() -> ec2_manager::features::UnhealthyHostFeature {
@@ -49737,9 +49909,138 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert!(only.includes(LogSource::UnhealthyHost));
             assert!(!only.includes(LogSource::Pingdom));
             assert!(!only.includes(LogSource::App));
-            assert_eq!(only.label(), "On-Call: Unhealthy Host");
+            assert_eq!(only.label(), "Sources: Unhealthy Host");
             let none = OnCallFilters::default();
             assert!(none.includes(LogSource::UnhealthyHost));
+        }
+
+        /// Jira and Alerts each own a log source, so their lines are
+        /// withheld from a user off their list exactly as a watcher's are.
+        /// Before this they had no source at all and went to `App`, which
+        /// everyone reads — 27 lines carrying ticket keys, comment activity,
+        /// alert ids and acknowledgements.
+        #[test]
+        fn jira_and_alerts_lines_are_withheld_from_users_off_their_lists() {
+            let features = ec2_manager::features::Features {
+                jira: ec2_manager::features::JiraFeature {
+                    allowed_users: listed(&["jira-user"]),
+                    ..Default::default()
+                },
+                alerts: ec2_manager::features::AlertsFeature {
+                    allowed_users: listed(&["alerts-user"]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let jira_user = LogVisibility::for_user(&features, "jira-user");
+            assert!(jira_user.shows(LogSource::Jira));
+            assert!(!jira_user.shows(LogSource::Alerts), "a neighbour's output is not theirs");
+
+            let alerts_user = LogVisibility::for_user(&features, "alerts-user");
+            assert!(alerts_user.shows(LogSource::Alerts));
+            assert!(!alerts_user.shows(LogSource::Jira));
+
+            let outsider = LogVisibility::for_user(&features, "nobody");
+            assert!(!outsider.shows(LogSource::Jira));
+            assert!(!outsider.shows(LogSource::Alerts));
+            assert!(!outsider.any_source(), "and no dropdown to tell them the sources exist");
+        }
+
+        /// Visibility keys on `allowed_users` ALONE, without the credential
+        /// and site terms the feature itself also needs. Those decide whether
+        /// it can work; this decides whose output it is, and a listed user
+        /// whose token expired still needs to read the line saying so.
+        #[test]
+        fn a_listed_user_reads_the_feature_even_with_no_credentials() {
+            let features = ec2_manager::features::Features {
+                jira: ec2_manager::features::JiraFeature {
+                    allowed_users: listed(&["bconrad"]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            // No credentials and no site, so the button is not shown at all.
+            let no_auth = ec2_manager::alerts::AlertsAuth::default();
+            assert!(
+                !features.jira_visible_for("bconrad", &no_auth),
+                "the feature cannot work"
+            );
+            assert!(
+                LogVisibility::for_user(&features, "bconrad").shows(LogSource::Jira),
+                "but its own user still reads why"
+            );
+        }
+
+        /// The sources dropdown covers the watchers as well as the two
+        /// Atlassian features, so it must not be nested inside the Atlassian
+        /// gate — that left a reaper-only user with no way to narrow to their
+        /// own output. It is drawn from `render_log_panel` directly.
+        #[test]
+        fn the_sources_dropdown_is_not_nested_inside_the_atlassian_gate() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let body = &src[..src.find("    mod tests {").expect("the test module")];
+            let call = body
+                .find("self.render_oncall_log_filter(ui);")
+                .expect("the dropdown is drawn");
+            let gate = body
+                .find("if self.alerts_enabled || self.jira_enabled {")
+                .expect("the Jira API checkbox gate");
+            // The gate block closes before the call: everything between them
+            // is the checkbox and its hover text.
+            let between = &body[gate..call];
+            assert!(
+                between.contains("\n                }\n"),
+                "the dropdown must be drawn after the Atlassian gate closes, not inside it"
+            );
+        }
+
+        /// The label names what it filters. It stopped being an on-call
+        /// filter when Jira and Alerts joined it, and a label that lies about
+        /// its contents is how somebody concludes their rows are not in it.
+        #[test]
+        fn the_sources_label_lists_every_picked_source() {
+            assert_eq!(OnCallFilters::default().label(), "Sources");
+            let picked = OnCallFilters {
+                reaper_down: true,
+                jira: true,
+                ..Default::default()
+            };
+            assert_eq!(picked.label(), "Sources: Reaper Down, Jira");
+            let just_alerts = OnCallFilters { alerts: true, ..Default::default() };
+            assert_eq!(just_alerts.label(), "Sources: Alerts");
+            assert!(just_alerts.includes(LogSource::Alerts));
+            assert!(!just_alerts.includes(LogSource::Jira));
+        }
+
+        /// The startup `gates:` line goes to `LogSource::App`, which everyone
+        /// reads, so it must not name a gated feature. It used to print all
+        /// five — telling a user on none of the lists that the features exist
+        /// and what state each was in, which is the one thing the visibility
+        /// rule is for.
+        #[test]
+        fn the_shared_gates_line_names_no_gated_feature() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let body = &src[..src.find("    mod tests {").expect("the test module")];
+            let start = body.find("\"gates: os_user=").expect("the shared gates line");
+            let line = &body[start..start + 400];
+            for banned in ["alerts=", "reaper=", "pingdom=", "unhealthy_host=", "jira="] {
+                assert!(
+                    !line.contains(banned),
+                    "the shared gates line must not carry {banned:?} — it reaches every user"
+                );
+            }
+            // And each one still reports itself, to its own source.
+            for (helper, text) in [
+                ("log_reaper", "gates: reaper="),
+                ("log_pingdom", "gates: pingdom="),
+                ("log_unhealthy_host", "gates: unhealthy_host="),
+                ("log_alerts", "gates: alerts="),
+                ("log_jira", "gates: jira="),
+            ] {
+                assert!(body.contains(text), "{text:?} must still be reported");
+                assert!(body.contains(helper), "{helper} must exist to carry it");
+            }
         }
 
         fn listed(users: &[&str]) -> Vec<String> {
@@ -49754,7 +50055,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 &ec2_manager::features::Features::default(),
                 "nobody",
             );
-            assert!(!vis.any_oncall(), "nothing to narrow to, so no dropdown");
+            assert!(!vis.any_source(), "nothing to narrow to, so no dropdown");
             for source in [
                 LogSource::ReaperDown,
                 LogSource::Pingdom,
@@ -49792,7 +50093,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert!(bob.shows(LogSource::Pingdom));
             assert!(!bob.shows(LogSource::ReaperDown));
             assert!(!bob.shows(LogSource::UnhealthyHost));
-            assert!(bob.any_oncall());
+            assert!(bob.any_source());
 
             let carol = LogVisibility::for_user(&features, "carol");
             assert!(carol.shows(LogSource::UnhealthyHost));
@@ -49844,7 +50145,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             };
             let vis = LogVisibility::for_user(&features, "bconrad");
             assert!(!vis.shows(LogSource::ReaperDown));
-            assert!(!vis.any_oncall());
+            assert!(!vis.any_source());
         }
 
         /// The trace is one list holding both APIs, reached with the same

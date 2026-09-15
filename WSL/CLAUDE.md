@@ -1165,6 +1165,28 @@ log to that script's lines; nothing ticked is the whole log, exactly as before.
   the other is the opposite of what the dropdown is for.
 - Gated by `alerts_enabled`, the same gate as the checkbox beside it.
 
+#### Who the app thinks you are
+
+`features::current_os_user` is the single string every `allowed_users` gate
+compares against, so whatever can set it can arm every feature those lists
+guard. It **asks the operating system** — `GetUserNameW` on Windows, the
+effective uid from `/proc/self/status` resolved through `/etc/passwd` on Linux
+— and never reads `%USERNAME%` / `$USER`.
+
+- **It used to read the environment**, which any user can set for one launch:
+  `set USERNAME=someone-on-the-list` armed the watchers, the Jira button and
+  the remediation controls, and the `gates:` line then reported the spoofed
+  name as though it were a fact. `the_username_does_not_come_from_the_environment`
+  sets both variables and asserts the answer does not move. It is deliberately
+  **one** test — `set_var` is process-wide, and split up the cases would race
+  under the parallel runner.
+- **A name that cannot be determined is empty, and empty is on no list** —
+  `user_in_list` and `names_user` both refuse it, wildcard included. Failure
+  closes every gate rather than opening one, and the `gates:` line prints
+  `(unknown!)`, which is the signal to look here.
+- Linux is the development build (this ships on Windows), but it resolves the
+  same way: a rule proved on one platform and not the other is not a rule.
+
 #### You only see the on-call output you are on the list for
 
 `LogVisibility` is what a user is *entitled* to read; `OnCallFilters` is what
@@ -1189,8 +1211,45 @@ no watcher naming them the whole dropdown is gone rather than drawn empty.
   whichever watcher happened to claim the alert.
 - **`"*"` is not honoured**, here as it is not by the watchers' own gates, so
   a stray wildcard cannot open one site's on-call output to everyone.
-- **`LogSource::App` is always visible.** This narrows who reads a *watcher*,
+- **`LogSource::App` is always visible.** This narrows who reads a *feature*,
   not who reads the app's own log.
+- **Jira and Alerts each own a source too** (`log_jira`, `log_alerts`). They
+  had none, so 27 lines carrying ticket keys, comment activity, alert ids and
+  acknowledgements went to `App` and were readable by anyone who opened the
+  Logs tab. Their visibility keys on `allowed_users` **alone**, without the
+  credential and site terms `jira_visible_for` / `alerts_visible_for` also
+  require: those decide whether the feature can *work*, and a listed user
+  whose token expired still needs to read the line saying so.
+- **The dropdown is `Sources`, not `On-Call`.** It stopped being an on-call
+  filter when those two joined it, and a label that lies about its contents is
+  how somebody concludes their rows are not in it. It is also drawn **outside**
+  the `alerts_enabled || jira_enabled` block: nested inside, a user on
+  `reaper.allowed_users` and on neither Atlassian list had no way to narrow to
+  their own output.
+- **The shared `gates:` line names none of the five gated features.** It goes
+  to `App`, which everyone reads, and it used to print `alerts=`, `reaper=`,
+  `pingdom=`, `unhealthy_host=` and `jira=` — telling a user on none of the
+  lists that the features exist and what state each was in, which is the one
+  thing this rule is for. Each now reports itself to its own source, so the
+  person a feature belongs to still gets the whole verdict and nobody else
+  learns it is there. `the_shared_gates_line_names_no_gated_feature` scans for
+  all five. The reaper line says **both** numbers, because the watcher's gate
+  (`reaper_enabled_for`, which needs `enabled`) and the Test Alert Match / Run
+  Remediation gate (`reaper.allowed_users` alone) disagree by design, and one
+  standing for the other is how a build with `enabled: false` printed
+  `reaper=false` with both buttons on screen.
+- **The cost, accepted deliberately:** a user off a list now gets *no* line
+  explaining why they cannot see a feature. That is the opposite of the rule
+  the rest of this file follows, and it is what "make it invisible" means —
+  diagnosis moves to whoever can read the allow-list.
+- **Every window and panel re-checks its gate** rather than trusting the
+  session state that opened it (`render_alerts_window`, `render_jira_window`,
+  `render_alert_windows`, `render_jira_ticket_windows`,
+  `render_run_remediation_confirm`, `render_ack_all_confirm`,
+  `start_alerts_fetch`), dropping the state when the gate is shut. Each is
+  reachable only from a gated button today, so this changes nothing now —
+  which is the point: it is the half that would fail quietly if a later edit
+  opened one of them another way.
 - **It is a UI visibility rule, not a security boundary.** The lines are still
   written and still in the process; what this decides is what the app shows.
 - **The Jira API trace is one list holding two APIs**, reached with the same

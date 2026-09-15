@@ -48,4 +48,7 @@ chrono = "0.4"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security_Credentials",
+    # GetUserNameW: the OS's own answer for who is running this, which is
+    # what every allowed_users gate compares against. Never %USERNAME%.
+    "Win32_System_WindowsProgramming",
 ] }
