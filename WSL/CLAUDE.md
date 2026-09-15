@@ -1165,6 +1165,46 @@ log to that script's lines; nothing ticked is the whole log, exactly as before.
   the other is the opposite of what the dropdown is for.
 - Gated by `alerts_enabled`, the same gate as the checkbox beside it.
 
+#### You only see the on-call output you are on the list for
+
+`LogVisibility` is what a user is *entitled* to read; `OnCallFilters` is what
+they have *chosen* to narrow to. A user off a watcher's `allowed_users` never
+sees that watcher's lines — filtered or not — its row is not drawn, and with
+no watcher naming them the whole dropdown is gone rather than drawn empty.
+
+- **It ANDs into the one predicate**, ahead of the selection and the level
+  checkboxes, so the view, the count line and Copy All cannot disagree about
+  what is readable. The count's denominator is the *permitted* total, not
+  every line held: counting the hidden ones would report how much is hidden.
+- **Keyed on list membership, never on `enabled`.** A listed user with the
+  feature switched off still sees the startup line saying it is switched off.
+  That line is the whole diagnosis when a watcher looks dead — reaper had
+  three dark states that each wrote nothing and telling them apart took five
+  rounds of guessing — so hiding it from the person the feature belongs to is
+  exactly backwards. `is_listed_user` answers "is this one of the people this
+  is for"; each watcher's `is_allowed_user` answers "may this run", and the
+  two are deliberately different questions.
+- **`AlertTest` follows `reaper.allowed_users`**, because that is the list
+  gating the **Test Alert Match** button which writes those lines — not
+  whichever watcher happened to claim the alert.
+- **`"*"` is not honoured**, here as it is not by the watchers' own gates, so
+  a stray wildcard cannot open one site's on-call output to everyone.
+- **`LogSource::App` is always visible.** This narrows who reads a *watcher*,
+  not who reads the app's own log.
+- **It is a UI visibility rule, not a security boundary.** The lines are still
+  written and still in the process; what this decides is what the app shows.
+- **The Jira API trace is one list holding two APIs**, reached with the same
+  credentials, so the panel opening is not the same question as a row being
+  readable. `ApiCall.kind` is set by the **caller** (`ApiKind::Alerts` in
+  `alerts::curl_request`, `ApiKind::Jira` at each `jira.rs` call site) and
+  never guessed from the URL — `jira::resolve_base_url` lets the Jira site be
+  any company domain, so a URL-shaped guess would be wrong on exactly the
+  tenants that configure one. `api_call_is_visible` is pure and tested: an
+  alerts-only user sees no ticket calls, a Jira-only user no alert calls, and
+  a user with neither gets no checkbox. Jira-only is the shipped state of both
+  lists, and is the case that had the panel opening on the alert feed's
+  traffic.
+
 ### Jira Tickets (the ticket list and the ticket view)
 
 `src/jira.rs` reads the Jira **issue** API — a different API from the JSM Ops

@@ -593,6 +593,66 @@ mod gui {
         }
     }
 
+    /// Which on-call log sources this user is entitled to see at all.
+    ///
+    /// Separate from [`OnCallFilters`], which is what the user has *chosen*
+    /// to narrow to. This is what they are allowed to choose from: a user off
+    /// a watcher's `allowed_users` never sees that watcher's lines, filtered
+    /// or not, and its row is not drawn.
+    ///
+    /// **Keyed on list membership, never on `enabled`.** A listed user with
+    /// the feature switched off still sees the startup line saying so — that
+    /// line is the whole diagnosis when a watcher looks dead, and reaper
+    /// already cost five rounds of guessing by having three dark states that
+    /// each wrote nothing.
+    ///
+    /// `AlertTest` follows `reaper.allowed_users`, because that is the list
+    /// gating the **Test Alert Match** button which produces those lines —
+    /// not the watcher that happens to claim the alert.
+    ///
+    /// This is a UI visibility rule, not a security boundary: the lines are
+    /// still written and still in the process. It decides what the app shows,
+    /// which is what the count line and Copy All must agree with.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct LogVisibility {
+        reaper_down: bool,
+        pingdom: bool,
+        unhealthy_host: bool,
+        alert_test: bool,
+    }
+
+    impl LogVisibility {
+        /// What `user` may read, from the three watchers' own allow-lists.
+        fn for_user(features: &ec2_manager::features::Features, user: &str) -> Self {
+            Self {
+                reaper_down: features.reaper.is_listed_user(user),
+                pingdom: features.pingdom.is_listed_user(user),
+                unhealthy_host: features.unhealthy_host.is_listed_user(user),
+                // The button's gate, not a watcher's: a dry run is something
+                // this person ran, whichever watcher claimed the alert.
+                alert_test: features.reaper.is_listed_user(user),
+            }
+        }
+
+        /// May this user see lines from `source`? `App` is everything that is
+        /// not an on-call script and is always visible.
+        fn shows(self, source: LogSource) -> bool {
+            match source {
+                LogSource::App => true,
+                LogSource::ReaperDown => self.reaper_down,
+                LogSource::Pingdom => self.pingdom,
+                LogSource::UnhealthyHost => self.unhealthy_host,
+                LogSource::AlertTest => self.alert_test,
+            }
+        }
+
+        /// True when there is at least one on-call source to offer. With
+        /// none, the whole dropdown is hidden rather than drawn empty.
+        fn any_oncall(self) -> bool {
+            self.reaper_down || self.pingdom || self.unhealthy_host || self.alert_test
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct LogFilters {
         error: bool,
@@ -5282,6 +5342,22 @@ mod gui {
     /// The URL is included verbatim: credentials reach curl on stdin via
     /// `-K -`, so neither the endpoint nor the query can carry the token.
     /// That property is what makes this safe to render and to copy.
+    /// May a user with these two gates see a call to `kind`?
+    ///
+    /// The trace is one list holding both APIs, so the panel opening is not
+    /// the same question as a row being readable. Pure, so the rule is
+    /// pinned by a test rather than by reading a `filter`.
+    fn api_call_is_visible(
+        kind: ec2_manager::alerts::ApiKind,
+        alerts_enabled: bool,
+        jira_enabled: bool,
+    ) -> bool {
+        match kind {
+            ec2_manager::alerts::ApiKind::Alerts => alerts_enabled,
+            ec2_manager::alerts::ApiKind::Jira => jira_enabled,
+        }
+    }
+
     fn api_call_summary(call: &ec2_manager::alerts::ApiCall) -> String {
         let when = call
             .at
@@ -8485,6 +8561,10 @@ mod gui {
         /// Which on-call scripts the Logs tab is narrowed to. All false — the
         /// default — means no narrowing at all.
         oncall_filters: OnCallFilters,
+        /// Which on-call log sources this user may see at all — their
+        /// allow-lists, not their current selection. Resolved once at
+        /// startup, like every other gate here.
+        log_visibility: LogVisibility,
         /// Set for one frame by Ctrl+F so the search box takes focus.
         log_search_focus: bool,
         terminals: Vec<TerminalOption>,
@@ -9386,6 +9466,10 @@ mod gui {
                 log_search: String::new(),
                 log_show_alerts_api: false,
                 oncall_filters: OnCallFilters::default(),
+                log_visibility: LogVisibility::for_user(
+                    &features,
+                    &ec2_manager::features::current_os_user(),
+                ),
                 log_search_focus: false,
                 terminals,
                 selected_terminal_id,
@@ -32747,7 +32831,17 @@ mod gui {
             if !(self.alerts_enabled || self.jira_enabled) || !self.log_show_alerts_api {
                 return;
             }
-            let calls = ec2_manager::alerts::recent_api_calls();
+            // Either feature opens the panel, but each row is shown only to a
+            // user whose own gate covers the API it went to: the two are
+            // reached with the same credentials and recorded in one trace, so
+            // without this a user opted into `jira` alone would read the
+            // alert feed's traffic. `ApiKind` is set by the caller, never
+            // guessed from the URL — the Jira site may be any company domain.
+            let calls: Vec<ec2_manager::alerts::ApiCall> =
+                ec2_manager::alerts::recent_api_calls()
+                    .into_iter()
+                    .filter(|c| api_call_is_visible(c.kind, self.alerts_enabled, self.jira_enabled))
+                    .collect();
             ui.horizontal(|ui| {
                 ui.strong(format!(
                     "Jira Alerts API - last {} call(s), newest first",
@@ -32841,6 +32935,13 @@ mod gui {
         /// same story, and hiding one while reading the other is the opposite
         /// of what this dropdown is for.
         fn render_oncall_log_filter(&mut self, ui: &mut egui::Ui) {
+            // Nothing to narrow to: a user on none of the watchers' lists
+            // sees none of their lines, so an empty dropdown would only
+            // advertise output they cannot read.
+            let vis = self.log_visibility;
+            if !vis.any_oncall() {
+                return;
+            }
             ui.separator();
             egui::ComboBox::from_id_salt("oncall_log_filter")
                 .selected_text(self.oncall_filters.label())
@@ -32853,42 +32954,50 @@ mod gui {
                     // Label left, checkbox right — the popup is sized to its
                     // widest row, so the checkbox lands in a column rather
                     // than against the text.
-                    ui.horizontal(|ui| {
-                        ui.label("Reaper Down");
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.checkbox(&mut self.oncall_filters.reaper_down, "");
-                            },
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Pingdom");
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.checkbox(&mut self.oncall_filters.pingdom, "");
-                            },
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Unhealthy Host");
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.checkbox(&mut self.oncall_filters.unhealthy_host, "");
-                            },
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Alert Test");
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.checkbox(&mut self.oncall_filters.alert_test, "");
-                            },
-                        );
-                    });
+                    if vis.reaper_down {
+                        ui.horizontal(|ui| {
+                            ui.label("Reaper Down");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.checkbox(&mut self.oncall_filters.reaper_down, "");
+                                },
+                            );
+                        });
+                    }
+                    if vis.pingdom {
+                        ui.horizontal(|ui| {
+                            ui.label("Pingdom");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.checkbox(&mut self.oncall_filters.pingdom, "");
+                                },
+                            );
+                        });
+                    }
+                    if vis.unhealthy_host {
+                        ui.horizontal(|ui| {
+                            ui.label("Unhealthy Host");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.checkbox(&mut self.oncall_filters.unhealthy_host, "");
+                                },
+                            );
+                        });
+                    }
+                    if vis.alert_test {
+                        ui.horizontal(|ui| {
+                            ui.label("Alert Test");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.checkbox(&mut self.oncall_filters.alert_test, "");
+                                },
+                            );
+                        });
+                    }
                 })
                 .response
                 .on_hover_text(
@@ -32972,13 +33081,24 @@ mod gui {
             let rendered = |e: &LogEntry| format!("[{}] [{}] {}", e.time, e.level.as_str(), e.message);
             let search = self.log_search.clone();
             let oncall = self.oncall_filters;
+            let vis = self.log_visibility;
+            // What this user is entitled to see at all, before any filter.
+            // The denominator counts these rather than every line held, or
+            // the numbers themselves would report how much is hidden.
+            let permitted = self.logs.iter().filter(|e| vis.shows(e.source)).count();
             let visible: Vec<String> = self
                 .logs
                 .iter()
-                // The On-Call selection and the level checkboxes are
-                // independent and both on screen, so both apply. The count
-                // line, the view and Copy All all read this one predicate.
-                .filter(|e| oncall.includes(e.source) && self.log_filters.includes(e.level))
+                // Entitlement first, then the two filters. The On-Call
+                // selection and the level checkboxes are independent and both
+                // on screen, so both apply. The count line, the view and Copy
+                // All all read this one predicate, so a line this user may not
+                // see cannot reach any of the three.
+                .filter(|e| {
+                    vis.shows(e.source)
+                        && oncall.includes(e.source)
+                        && self.log_filters.includes(e.level)
+                })
                 .map(&rendered)
                 .filter(|line| log_line_matches(line, &search))
                 .collect();
@@ -32987,13 +33107,13 @@ mod gui {
                 ui.label(format!(
                     "Showing {} / {} log lines",
                     visible.len(),
-                    self.logs.len()
+                    permitted
                 ));
             } else {
                 ui.label(format!(
                     "Showing {} / {} log lines matching \"{}\"",
                     visible.len(),
-                    self.logs.len(),
+                    permitted,
                     search.trim()
                 ));
             }
@@ -42778,6 +42898,7 @@ mod gui {
         fn trace_call(err: Option<&str>) -> ec2_manager::alerts::ApiCall {
             ec2_manager::alerts::ApiCall {
                 at: chrono::Utc::now(),
+                kind: ec2_manager::alerts::ApiKind::Alerts,
                 method: "GET",
                 url: "https://api.atlassian.com/jsm/ops/api/cid/v1/alerts?\
                       sort=createdAt&order=desc&size=50&offset=0"
@@ -49619,6 +49740,134 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert_eq!(only.label(), "On-Call: Unhealthy Host");
             let none = OnCallFilters::default();
             assert!(none.includes(LogSource::UnhealthyHost));
+        }
+
+        fn listed(users: &[&str]) -> Vec<String> {
+            users.iter().map(|u| u.to_string()).collect()
+        }
+
+        /// A user on none of the watchers' allow-lists sees none of their log
+        /// lines and is offered no dropdown — the whole point of the gate.
+        #[test]
+        fn a_user_off_every_list_sees_no_on_call_lines() {
+            let vis = LogVisibility::for_user(
+                &ec2_manager::features::Features::default(),
+                "nobody",
+            );
+            assert!(!vis.any_oncall(), "nothing to narrow to, so no dropdown");
+            for source in [
+                LogSource::ReaperDown,
+                LogSource::Pingdom,
+                LogSource::UnhealthyHost,
+                LogSource::AlertTest,
+            ] {
+                assert!(!vis.shows(source), "{source:?} must be hidden");
+            }
+            // Everything that is not an on-call script stays visible: this
+            // narrows who reads a watcher, not who reads the app's own log.
+            assert!(vis.shows(LogSource::App));
+        }
+
+        /// Three independent lists. Being on one reveals exactly one
+        /// watcher's output, never a neighbour's.
+        #[test]
+        fn each_watcher_is_visible_only_to_its_own_list() {
+            let features = ec2_manager::features::Features {
+                reaper: ec2_manager::features::ReaperFeature {
+                    allowed_users: listed(&["alice"]),
+                    ..Default::default()
+                },
+                pingdom: ec2_manager::features::PingdomFeature {
+                    allowed_users: listed(&["bob"]),
+                    ..Default::default()
+                },
+                unhealthy_host: ec2_manager::features::UnhealthyHostFeature {
+                    allowed_users: listed(&["carol"]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let bob = LogVisibility::for_user(&features, "bob");
+            assert!(bob.shows(LogSource::Pingdom));
+            assert!(!bob.shows(LogSource::ReaperDown));
+            assert!(!bob.shows(LogSource::UnhealthyHost));
+            assert!(bob.any_oncall());
+
+            let carol = LogVisibility::for_user(&features, "carol");
+            assert!(carol.shows(LogSource::UnhealthyHost));
+            assert!(!carol.shows(LogSource::Pingdom));
+
+            // Alert Test follows the REAPER list, because that is the list
+            // gating the button which produces those lines — not whichever
+            // watcher happens to claim the alert.
+            let alice = LogVisibility::for_user(&features, "alice");
+            assert!(alice.shows(LogSource::AlertTest));
+            assert!(!bob.shows(LogSource::AlertTest));
+            assert!(!carol.shows(LogSource::AlertTest));
+        }
+
+        /// The feature being switched off must not hide its output from the
+        /// person it belongs to: the startup line saying it is off is the
+        /// whole diagnosis when a watcher looks dead.
+        #[test]
+        fn a_listed_user_with_the_feature_disabled_still_sees_its_startup_line() {
+            let features = ec2_manager::features::Features {
+                unhealthy_host: ec2_manager::features::UnhealthyHostFeature {
+                    enabled: false,
+                    allowed_users: listed(&["bconrad"]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(
+                !features.unhealthy_host_enabled_for("bconrad"),
+                "disabled, so the watcher must not run"
+            );
+            assert!(
+                LogVisibility::for_user(&features, "bconrad").shows(LogSource::UnhealthyHost),
+                "but its own user still reads why it is dark"
+            );
+        }
+
+        /// `"*"` is not honoured by these watchers' gates, so it must not
+        /// become a way to read their output either.
+        #[test]
+        fn a_wildcard_reveals_nothing() {
+            let features = ec2_manager::features::Features {
+                reaper: ec2_manager::features::ReaperFeature {
+                    enabled: true,
+                    allowed_users: listed(&["*"]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let vis = LogVisibility::for_user(&features, "bconrad");
+            assert!(!vis.shows(LogSource::ReaperDown));
+            assert!(!vis.any_oncall());
+        }
+
+        /// The trace is one list holding both APIs, reached with the same
+        /// credentials, so each row is shown only to a user whose own gate
+        /// covers the API it went to.
+        #[test]
+        fn the_trace_shows_only_the_apis_a_user_can_reach() {
+            use ec2_manager::alerts::ApiKind;
+
+            // Alerts only: the ticket calls are not theirs to read.
+            assert!(api_call_is_visible(ApiKind::Alerts, true, false));
+            assert!(!api_call_is_visible(ApiKind::Jira, true, false));
+
+            // Jira only — the shipped state of both lists, and the exact
+            // case that made the panel open on the alert feed's traffic.
+            assert!(api_call_is_visible(ApiKind::Jira, false, true));
+            assert!(!api_call_is_visible(ApiKind::Alerts, false, true));
+
+            // Both, and neither.
+            assert!(api_call_is_visible(ApiKind::Alerts, true, true));
+            assert!(api_call_is_visible(ApiKind::Jira, true, true));
+            assert!(!api_call_is_visible(ApiKind::Alerts, false, false));
+            assert!(!api_call_is_visible(ApiKind::Jira, false, false));
         }
 
         fn health_input<'a>(

@@ -739,16 +739,17 @@ pub struct PingdomFeature {
 }
 
 impl PingdomFeature {
+    /// True when `user` is on `allowed_users`, whether or not the feature is
+    /// enabled. Decides whether they see this watcher's log lines; see
+    /// [`names_user`].
+    pub fn is_listed_user(&self, user: &str) -> bool {
+        names_user(&self.allowed_users, user)
+    }
+
     /// True when `user` may run the watcher. Like [`ReaperFeature`] and
     /// unlike every other gate in this file, `"*"` does not match.
     pub fn is_allowed_user(&self, user: &str) -> bool {
-        let u = user.trim();
-        if u.is_empty() || !self.enabled {
-            return false;
-        }
-        self.allowed_users
-            .iter()
-            .any(|a| a.trim() != "*" && a.trim().eq_ignore_ascii_case(u))
+        self.enabled && names_user(&self.allowed_users, user)
     }
 
     /// True when the list names more than one user. The caller warns: two
@@ -802,6 +803,29 @@ impl PingdomFeature {
     }
 }
 
+/// True when `user` is named on `allowed_users`, **regardless of whether the
+/// feature is enabled**.
+///
+/// Distinct from each watcher's `is_allowed_user`, which also requires
+/// `enabled` because it answers "may this run". This answers "is this
+/// person one of the people this feature is for", which is what decides
+/// whether they see its log lines. A user on the list with the feature
+/// switched off still sees the startup line saying it is switched off —
+/// that line is the whole diagnosis when a watcher looks dead, and hiding
+/// it from the person the feature belongs to is how three dark states that
+/// all wrote nothing cost five rounds of guessing.
+///
+/// `"*"` is not honoured, exactly as it is not by the watchers' own gates.
+fn names_user(allowed: &[String], user: &str) -> bool {
+    let u = user.trim();
+    if u.is_empty() {
+        return false;
+    }
+    allowed
+        .iter()
+        .any(|a| a.trim() != "*" && a.trim().eq_ignore_ascii_case(u))
+}
+
 /// The `unhealthy_host` section of `assets/features.json`.
 ///
 /// Gates the unhealthy-host watcher: acknowledge an application
@@ -853,16 +877,17 @@ pub struct UnhealthyHostFeature {
 }
 
 impl UnhealthyHostFeature {
+    /// True when `user` is on `allowed_users`, whether or not the feature is
+    /// enabled. Decides whether they see this watcher's log lines; see
+    /// [`names_user`].
+    pub fn is_listed_user(&self, user: &str) -> bool {
+        names_user(&self.allowed_users, user)
+    }
+
     /// True when `user` may run the watcher. Like [`PingdomFeature`], `"*"`
     /// does not match.
     pub fn is_allowed_user(&self, user: &str) -> bool {
-        let u = user.trim();
-        if u.is_empty() || !self.enabled {
-            return false;
-        }
-        self.allowed_users
-            .iter()
-            .any(|a| a.trim() != "*" && a.trim().eq_ignore_ascii_case(u))
+        self.enabled && names_user(&self.allowed_users, user)
     }
 
     /// True when the list names more than one user. Two machines watching
@@ -928,17 +953,20 @@ impl UnhealthyHostFeature {
 }
 
 impl ReaperFeature {
+    /// True when `user` is on `allowed_users`, whether or not the feature is
+    /// enabled. Decides whether they see this watcher's log lines; see
+    /// [`names_user`].
+    pub fn is_listed_user(&self, user: &str) -> bool {
+        names_user(&self.allowed_users, user)
+    }
+
     /// True when `user` may remediate. Unlike every other gate in this file,
     /// `"*"` does not match: a site-wide wildcard must not silently authorise
     /// unattended `compose down` on production.
     pub fn is_allowed_user(&self, user: &str) -> bool {
-        let u = user.trim();
-        if u.is_empty() {
-            return false;
-        }
-        self.allowed_users
-            .iter()
-            .any(|a| a.trim() != "*" && a.trim().eq_ignore_ascii_case(u))
+        // Reaper's `enabled` check lives in `Features::reaper_enabled_for`,
+        // not here, so this already means exactly "on the list".
+        names_user(&self.allowed_users, user)
     }
 
     /// True when the list names more than one user — the caller logs a
@@ -2637,5 +2665,69 @@ mod unhealthy_host_feature_tests {
             ..armed()
         };
         assert!(two.has_multiple_users());
+    }
+}
+
+#[cfg(test)]
+mod log_visibility_gate_tests {
+    use super::*;
+
+    /// Being on the list is what decides whether a user sees a watcher's log
+    /// lines — **not** whether the watcher is armed. A listed user with the
+    /// feature switched off still needs the startup line that says so.
+    #[test]
+    fn a_listed_user_sees_the_lines_even_with_the_feature_disabled() {
+        let off = ReaperFeature {
+            enabled: false,
+            allowed_users: vec!["bconrad".to_string()],
+            ..ReaperFeature::default()
+        };
+        // Reaper's `enabled` check lives on `Features`, not on the feature
+        // struct, so the run gate is asked there.
+        let features = Features { reaper: off.clone(), ..Features::default() };
+        assert!(!features.reaper_enabled_for("bconrad"), "disabled, so it must not run");
+        assert!(off.is_listed_user("bconrad"), "but the person it is for still reads its log");
+        assert!(off.is_listed_user("BCONRAD"), "case-insensitive, like every gate here");
+        assert!(!off.is_listed_user("someone-else"));
+        assert!(!off.is_listed_user("   "));
+    }
+
+    #[test]
+    fn a_wildcard_names_nobody() {
+        // `"*"` is not honoured by these watchers' own gates, so it must not
+        // become a way to read their output either.
+        let star = PingdomFeature {
+            enabled: true,
+            allowed_users: vec!["*".to_string()],
+            ..PingdomFeature::default()
+        };
+        assert!(!star.is_listed_user("bconrad"));
+
+        let empty = UnhealthyHostFeature {
+            enabled: true,
+            ..UnhealthyHostFeature::default()
+        };
+        assert!(!empty.is_listed_user("bconrad"), "an empty list names nobody");
+    }
+
+    #[test]
+    fn each_watcher_answers_for_its_own_list() {
+        // Three independent lists: being on one must not reveal another's
+        // output.
+        let reaper = ReaperFeature {
+            allowed_users: vec!["alice".to_string()],
+            ..ReaperFeature::default()
+        };
+        let pingdom = PingdomFeature {
+            allowed_users: vec!["bob".to_string()],
+            ..PingdomFeature::default()
+        };
+        let uh = UnhealthyHostFeature {
+            allowed_users: vec!["carol".to_string()],
+            ..UnhealthyHostFeature::default()
+        };
+        assert!(reaper.is_listed_user("alice") && !pingdom.is_listed_user("alice") && !uh.is_listed_user("alice"));
+        assert!(!reaper.is_listed_user("bob") && pingdom.is_listed_user("bob") && !uh.is_listed_user("bob"));
+        assert!(!reaper.is_listed_user("carol") && !pingdom.is_listed_user("carol") && uh.is_listed_user("carol"));
     }
 }

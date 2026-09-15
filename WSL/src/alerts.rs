@@ -25,7 +25,7 @@ use crate::error::{AppError, Result};
 // tab has always reached it as `alerts::…` and the trace is still labelled
 // **Jira Alerts** on screen — moving the path would be churn in the GUI for
 // no gain.
-pub use crate::atlassian_http::{clear_api_calls, recent_api_calls, ApiCall};
+pub use crate::atlassian_http::{clear_api_calls, recent_api_calls, ApiCall, ApiKind};
 
 /// Alerts per request. The API caps `size` at 100.
 const PAGE_SIZE: u32 = 50;
@@ -451,7 +451,14 @@ fn curl_request(
     query: &[(&str, String)],
     post_body: Option<&str>,
 ) -> Result<String> {
-    atlassian_http::request(&auth.email, &auth.token, url, query, post_body)
+    atlassian_http::request(
+        &auth.email,
+        &auth.token,
+        atlassian_http::ApiKind::Alerts,
+        url,
+        query,
+        post_body,
+    )
 }
 
 /// Base `…/v1` for this site.

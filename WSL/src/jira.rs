@@ -1283,6 +1283,7 @@ pub fn search_my_issues(
     let body = atlassian_http::request(
         &site.auth.email,
         &site.auth.token,
+        atlassian_http::ApiKind::Jira,
         &url,
         &[],
         Some(&payload),
@@ -1298,6 +1299,7 @@ pub fn fetch_issue(site: &JiraSite, key: &str) -> Result<Issue> {
     let body = atlassian_http::request(
         &site.auth.email,
         &site.auth.token,
+        atlassian_http::ApiKind::Jira,
         &url,
         &[("fields", ISSUE_FIELDS.to_string())],
         None,
@@ -1320,6 +1322,7 @@ pub fn fetch_transitions(site: &JiraSite, key: &str) -> Result<Vec<Transition>> 
     let body = atlassian_http::request(
         &site.auth.email,
         &site.auth.token,
+        atlassian_http::ApiKind::Jira,
         &url,
         &[("expand", "transitions.fields".to_string())],
         None,
@@ -1338,6 +1341,7 @@ pub fn search_users(site: &JiraSite, query: &str) -> Result<Vec<User>> {
     let body = atlassian_http::request(
         &site.auth.email,
         &site.auth.token,
+        atlassian_http::ApiKind::Jira,
         &url,
         &[
             ("query", query.trim().to_string()),
@@ -1356,6 +1360,7 @@ pub fn fetch_comments(site: &JiraSite, key: &str) -> Result<Vec<Comment>> {
     let body = atlassian_http::request(
         &site.auth.email,
         &site.auth.token,
+        atlassian_http::ApiKind::Jira,
         &url,
         &[("maxResults", MAX_COMMENTS.to_string())],
         None,
@@ -1376,7 +1381,8 @@ pub fn add_comment(
     let url = format!("{}/issue/{}/comment", site.api_base, key.trim());
     let payload =
         serde_json::json!({ "body": comment_adf_with_mentions(text, mentions) }).to_string();
-    atlassian_http::request(&site.auth.email, &site.auth.token, &url, &[], Some(&payload))?;
+    atlassian_http::request(&site.auth.email, &site.auth.token,
+        atlassian_http::ApiKind::Jira, &url, &[], Some(&payload))?;
     Ok(())
 }
 
@@ -1509,6 +1515,7 @@ pub fn do_transition(
     atlassian_http::request(
         &site.auth.email,
         &site.auth.token,
+        atlassian_http::ApiKind::Jira,
         &url,
         &[],
         Some(&payload.to_string()),
@@ -1524,7 +1531,8 @@ pub fn do_transition(
 pub fn fetch_myself(site: &JiraSite) -> Result<User> {
     require_complete(site)?;
     let url = format!("{}/myself", site.api_base);
-    let body = atlassian_http::request(&site.auth.email, &site.auth.token, &url, &[], None)?;
+    let body = atlassian_http::request(&site.auth.email, &site.auth.token,
+        atlassian_http::ApiKind::Jira, &url, &[], None)?;
     let v: Value = serde_json::from_str(&body)
         .map_err(|e| AppError::InvalidArgument(format!("jira: could not parse myself: {e}")))?;
     let account_id = field_str(&v, &["accountId"]);
@@ -1565,6 +1573,7 @@ pub fn update_description(
     atlassian_http::request_with_method(
         &site.auth.email,
         &site.auth.token,
+        atlassian_http::ApiKind::Jira,
         "PUT",
         &url,
         &[],
@@ -1601,6 +1610,7 @@ pub fn update_comment(
     atlassian_http::request_with_method(
         &site.auth.email,
         &site.auth.token,
+        atlassian_http::ApiKind::Jira,
         "PUT",
         &url,
         &[],

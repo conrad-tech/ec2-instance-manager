@@ -38,6 +38,36 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 /// How many calls the trace keeps. The Logs tab renders exactly this many.
 pub const API_TRACE_LEN: usize = 5;
 
+/// Which Atlassian API a recorded call went to.
+///
+/// Named by the caller rather than guessed from the URL: the alert feed and
+/// the Jira issue API are reached with the *same* credentials, and the Jira
+/// site may be an arbitrary company domain (`jira::resolve_base_url`), so a
+/// URL-shaped guess would be wrong on exactly the tenants that configure one.
+///
+/// The Logs tab shows a user only the kinds their own gates cover — alert
+/// rows need `alerts.allowed_users`, ticket rows need `jira.allowed_users` —
+/// so a value set wrongly here shows somebody a call they are not entitled
+/// to see.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApiKind {
+    /// The JSM Operations alert feed: the watchers and the Alerts window.
+    Alerts,
+    /// The Jira issue API: the ticket list, a ticket, its comments and
+    /// transitions.
+    Jira,
+}
+
+impl ApiKind {
+    /// What the trace row calls it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Alerts => "alerts",
+            Self::Jira => "jira",
+        }
+    }
+}
+
 /// A recorded Atlassian API call, for the **Jira Alerts** trace in the Logs
 /// tab.
 ///
@@ -49,6 +79,9 @@ pub const API_TRACE_LEN: usize = 5;
 pub struct ApiCall {
     /// When the request went out, UTC. Rendered in local time.
     pub at: DateTime<Utc>,
+    /// Which API this went to, so the Logs tab can show a user only the
+    /// calls their own gates cover.
+    pub kind: ApiKind,
     pub method: &'static str,
     /// Endpoint with the query folded in, exactly as sent.
     pub url: String,
@@ -121,12 +154,13 @@ pub fn clear_api_calls() {
 pub fn request(
     email: &str,
     token: &str,
+    kind: ApiKind,
     url: &str,
     query: &[(&str, String)],
     post_body: Option<&str>,
 ) -> Result<String> {
     let method = if post_body.is_some() { "POST" } else { "GET" };
-    request_with_method(email, token, method, url, query, post_body)
+    request_with_method(email, token, kind, method, url, query, post_body)
 }
 
 /// As [`request`], but naming the method — `PUT` for the edit endpoints,
@@ -135,6 +169,7 @@ pub fn request(
 pub fn request_with_method(
     email: &str,
     token: &str,
+    kind: ApiKind,
     method: &'static str,
     url: &str,
     query: &[(&str, String)],
@@ -220,6 +255,7 @@ pub fn request_with_method(
         // the API's own explanation and is the whole point of looking.
         record_api_call(ApiCall {
             at: started_at,
+            kind,
             method,
             url: display_url.clone(),
             error: Some(detail.clone()),
@@ -235,6 +271,7 @@ pub fn request_with_method(
     }
     record_api_call(ApiCall {
         at: started_at,
+        kind,
         method,
         url: display_url,
         error: None,
@@ -252,6 +289,7 @@ mod tests {
     fn sample_call(url: &str, body: &str) -> ApiCall {
         ApiCall {
             at: Utc::now(),
+            kind: ApiKind::Alerts,
             method: "GET",
             url: url.to_string(),
             error: None,
@@ -348,6 +386,7 @@ mod tests {
     fn a_failed_call_is_recorded_with_its_reason() {
         let call = ApiCall {
             at: Utc::now(),
+            kind: ApiKind::Alerts,
             method: "GET",
             url: "https://x/alerts?offset=50".to_string(),
             error: Some("HTTP 401 Unauthorized".to_string()),
