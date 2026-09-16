@@ -37,15 +37,45 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
     hay.to_ascii_lowercase().contains(&n.to_ascii_lowercase())
 }
 
-/// Is this alert one this watcher's rules match? Reads the same three
-/// fields reaper and pingdom read, in the same order, and only
-/// `alertname` by name — never the whole `extraProperties` map, which
-/// carries a flattened `{{extraProperties}}` copy of itself.
-pub fn identifies(alert: &Alert, cfg: &UnhealthyHostFeature) -> bool {
+/// Is this the right *kind* of alert? Reads the same three fields reaper and
+/// pingdom read, in the same order, and only `alertname` by name — never the
+/// whole `extraProperties` map, which carries a flattened
+/// `{{extraProperties}}` copy of itself.
+///
+/// Answers "is this an `UnHealthyHostCount` alert", not "is it ours" — see
+/// [`names_an_app`] for the second half.
+fn matches_metric_rule(alert: &Alert, cfg: &UnhealthyHostFeature) -> bool {
     let alertname = alert.extra.get("alertname").map(String::as_str).unwrap_or("");
     contains_ci(alertname, &cfg.alertname_contains)
         || contains_ci(&alert.app, &cfg.app_contains)
         || contains_ci(&alert.message, &cfg.message_contains)
+}
+
+/// Does the alert **title** name one of the apps this watcher may act on?
+///
+/// The title is where these alarms carry the app
+/// (`[Target Group]: prod-cassandra-UnHealthyHostCount-Critical`), and it is
+/// the one field the list reads — deliberately not `app`, the `App:` tag,
+/// which this feed has been observed serving as an unrendered `{{…}}`
+/// template.
+///
+/// **An empty list matches nothing, and so does a blank entry.** An empty
+/// string is a substring of everything, so one stray `""` would quietly turn
+/// the list back into "every app on the feed"; `contains_ci` refuses a blank
+/// needle for exactly that reason, here as everywhere else in this module.
+fn names_an_app(alert: &Alert, cfg: &UnhealthyHostFeature) -> bool {
+    cfg.title_app_names.iter().any(|app| contains_ci(&alert.message, app))
+}
+
+/// Is this alert one this watcher's rules match?
+///
+/// **Both halves, ANDed**: the right kind of alarm *and* one of the apps
+/// named in `title_app_names`. The rules within
+/// [`matches_metric_rule`] are ORed with each other, so each one filled in
+/// widens the net; the app list is the only thing that narrows it, which is
+/// why it is a separate test rather than a fourth `*_contains`.
+pub fn identifies(alert: &Alert, cfg: &UnhealthyHostFeature) -> bool {
+    matches_metric_rule(alert, cfg) && names_an_app(alert, cfg)
 }
 
 /// Is this alert ours to act on? **Reaper wins.** The reaper alarm is itself
@@ -494,6 +524,7 @@ mod tests {
             enabled: true,
             allowed_users: vec!["bconrad".to_string()],
             message_contains: "UnHealthyHostCount".to_string(),
+            title_app_names: vec!["prod".to_string()],
             vault_tg_contains: "vault".to_string(),
             ..Default::default()
         }
@@ -525,9 +556,13 @@ mod tests {
     // ---- identification ----
 
     #[test]
-    fn identifies_on_each_field_and_a_blank_rule_matches_nothing() {
-        assert!(identifies(&alert("[Target Group]: prod-App-UnHealthyHostCount-Critical"), &cfg()));
-        assert!(!identifies(&alert("[Target Group]: prod-App-Latency-Critical"), &cfg()));
+    fn the_metric_rule_matches_on_each_field_and_a_blank_rule_matches_nothing() {
+        assert!(matches_metric_rule(
+            &alert("[Target Group]: prod-App-UnHealthyHostCount-Critical"),
+            &cfg()
+        ));
+        assert!(matches_metric_rule(&alert("[Target Group]: prod-App-Latency-Critical"), &cfg())
+            == false);
 
         let mut by_name = alert("something");
         by_name.extra.insert("alertname".to_string(), "App-UnHealthyHostCount".to_string());
@@ -536,7 +571,7 @@ mod tests {
             message_contains: String::new(),
             ..cfg()
         };
-        assert!(identifies(&by_name, &name_rule), "case-insensitive on alertname");
+        assert!(matches_metric_rule(&by_name, &name_rule), "case-insensitive on alertname");
 
         let blank = UnhealthyHostFeature {
             alertname_contains: String::new(),
@@ -544,7 +579,7 @@ mod tests {
             message_contains: String::new(),
             ..cfg()
         };
-        assert!(!identifies(&alert("UnHealthyHostCount"), &blank));
+        assert!(!matches_metric_rule(&alert("UnHealthyHostCount"), &blank));
     }
 
     #[test]
@@ -558,6 +593,80 @@ mod tests {
 
         let ours = alert("[Target Group]: prod-App-UnHealthyHostCount-Critical");
         assert!(claims(&ours, &cfg(), &reaper_cfg()));
+    }
+
+    // ---- the app list ----
+
+    #[test]
+    fn a_listed_app_is_identified_case_insensitively() {
+        let c = UnhealthyHostFeature { title_app_names: vec!["cassandra".to_string()], ..cfg() };
+        assert!(identifies(
+            &alert("[Target Group]: prod-CASSANDRA-UnHealthyHostCount-Critical"),
+            &c
+        ));
+    }
+
+    #[test]
+    fn an_alert_for_an_unlisted_app_is_not_identified() {
+        // The whole point of the list: an UnHealthyHostCount alert for an app
+        // nobody named is left alone entirely, so the page reaches a human
+        // rather than being acknowledged and timed toward a terminate.
+        let c = UnhealthyHostFeature { title_app_names: vec!["cassandra".to_string()], ..cfg() };
+        assert!(!identifies(
+            &alert("[Target Group]: prod-someoneelse-UnHealthyHostCount-Critical"),
+            &c
+        ));
+    }
+
+    #[test]
+    fn an_empty_app_list_identifies_nothing() {
+        // Fails closed. The gate report turns this into a named dark state at
+        // startup, but the matcher must not depend on that having run.
+        let c = UnhealthyHostFeature { title_app_names: Vec::new(), ..cfg() };
+        assert!(!identifies(
+            &alert("[Target Group]: prod-App-UnHealthyHostCount-Critical"),
+            &c
+        ));
+    }
+
+    #[test]
+    fn a_blank_entry_in_the_app_list_matches_nothing() {
+        // An empty string is a substring of everything, so one stray "" would
+        // silently restore "act on every app on the feed" -- the same trap a
+        // blank forwards section marker and a blank *_contains record.
+        let c = UnhealthyHostFeature {
+            title_app_names: vec![String::new(), "   ".to_string()],
+            ..cfg()
+        };
+        assert!(!identifies(
+            &alert("[Target Group]: prod-App-UnHealthyHostCount-Critical"),
+            &c
+        ));
+    }
+
+    #[test]
+    fn the_app_list_is_anded_with_the_metric_rule() {
+        // A listed app raising a different alarm is not ours. The list narrows
+        // what this watcher acts on; OR-ing it in would claim every alert an
+        // app ever raises, which is the opposite of what it is for.
+        let c = UnhealthyHostFeature { title_app_names: vec!["cassandra".to_string()], ..cfg() };
+        assert!(matches_metric_rule(&alert("[Target Group]: prod-App-UnHealthyHostCount-Critical"), &c));
+        assert!(!identifies(&alert("[Target Group]: prod-cassandra-Latency-Critical"), &c));
+    }
+
+    #[test]
+    fn reaper_still_wins_over_a_listed_app() {
+        // "cassandra" is a substring of "cassandra-reaper", so the list is a
+        // second route by which reaper's own alarm reaches this watcher.
+        let c = UnhealthyHostFeature { title_app_names: vec!["cassandra".to_string()], ..cfg() };
+        let r = ReaperFeature {
+            alertname_contains: "cassandra-reaper".to_string(),
+            ..reaper_cfg()
+        };
+        let mut a = alert("[Target Group]: prod-cassandra-reaper-UnHealthyHostCount-Critical");
+        a.extra.insert("alertname".to_string(), "cassandra-reaper-stalled".to_string());
+        assert!(identifies(&a, &c), "this watcher's rules do match it");
+        assert!(!claims(&a, &c, &r), "but reaper wins");
     }
 
     // ---- kind ----

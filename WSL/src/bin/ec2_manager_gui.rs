@@ -36388,6 +36388,15 @@ mod gui {
                     .to_string(),
             ));
         }
+        if !cfg.names_any_app() {
+            lines.push((
+                false,
+                "unhealthy host: off — unhealthy_host.title_app_names is empty, staying dark \
+                 (it would otherwise act on every app on the feed)"
+                    .to_string(),
+            ));
+            return (false, lines);
+        }
         if !auth_complete {
             lines.push((false, "unhealthy host: no JSM credentials, staying dark".to_string()));
             return (false, lines);
@@ -49855,6 +49864,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 enabled: true,
                 allowed_users: vec!["bconrad".to_string()],
                 message_contains: "UnHealthyHostCount".to_string(),
+                title_app_names: vec!["prod".to_string()],
                 vault_tg_contains: "vault".to_string(),
                 ..Default::default()
             }
@@ -49871,6 +49881,26 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 unhealthy_host_gate_report(&unhealthy_host_cfg(), "someone-else", true, Some("x@y.com"));
             assert!(!armed);
             assert!(lines[0].1.contains("not on unhealthy_host.allowed_users"), "{}", lines[0].1);
+
+            // Empty app list: without it the shipped message_contains claims
+            // every UnHealthyHostCount alert on the feed, so this stays dark
+            // rather than acting on apps nobody named.
+            let no_apps = ec2_manager::features::UnhealthyHostFeature {
+                title_app_names: Vec::new(),
+                ..unhealthy_host_cfg()
+            };
+            let (armed, lines) = unhealthy_host_gate_report(&no_apps, "bconrad", true, Some("x@y.com"));
+            assert!(!armed);
+            assert!(lines[0].1.contains("title_app_names"), "{}", lines[0].1);
+
+            let blank_apps = ec2_manager::features::UnhealthyHostFeature {
+                title_app_names: vec![String::new(), "  ".to_string()],
+                ..unhealthy_host_cfg()
+            };
+            let (armed, lines) =
+                unhealthy_host_gate_report(&blank_apps, "bconrad", true, Some("x@y.com"));
+            assert!(!armed, "a list of blanks names no app");
+            assert!(lines[0].1.contains("title_app_names"), "{}", lines[0].1);
 
             let (armed, lines) =
                 unhealthy_host_gate_report(&unhealthy_host_cfg(), "bconrad", false, Some("x@y.com"));

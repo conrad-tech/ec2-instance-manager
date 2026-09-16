@@ -968,6 +968,35 @@ one unhealthy instance so the ASG replaces it, wait `after_terminate_mins`
 state machine is pure; the GUI thread (`start_unhealthy_host_poll`) makes
 every call.
 
+- **`title_app_names` is required, and it is the only rule that narrows.**
+  The three `*_contains` rules are ORed with each other, so each one filled
+  in *widens* what is claimed — which meant the shipped
+  `message_contains: "UnHealthyHostCount"` claimed every such alert on the
+  feed, for every app, with no way to say "only mine". `identifies` is now
+  `matches_metric_rule(...) && names_an_app(...)`: the first half says *is
+  this an UnHealthyHostCount alert*, the second says *is it one of ours*.
+  - **It reads the alert TITLE (`message`), not the `App:` tag.** These
+    alarms carry the app in the title
+    (`[Target Group]: prod-cassandra-UnHealthyHostCount-Critical`), and the
+    tag is the field this feed has been observed serving as an unrendered
+    `{{…}}` template. `app_contains` still reads the tag, which is why the
+    new field is *not* called `app_names` — two adjacent `app_*` fields
+    reading different sources is how somebody fills in the wrong one.
+  - **Empty keeps the watcher dark**, as a fifth state in
+    `unhealthy_host_gate_report`, checked after `allowed_users` and before
+    the JSM credentials. The matcher already fails closed on an empty list;
+    the gate is what makes it *say so* rather than look dead — the lesson
+    the reaper section records three times over.
+  - **A blank entry names nobody**, in the matcher (`contains_ci` refuses a
+    blank needle) and in the gate (`names_any_app` skips blanks). An empty
+    string is a substring of everything, so one stray `""` would silently
+    restore "act on every app on the feed" — the same trap as a blank
+    forwards section marker.
+  - **A name is a substring, so `"cassandra"` also matches a
+    `cassandra-reaper` title.** The list is therefore a second route by
+    which reaper's own alarm reaches this watcher, and the reaper block's
+    own rules — which ship blank, matching nothing — are what stop it.
+    `reaper_still_wins_over_a_listed_app` pins that.
 - **Reaper wins.** The reaper alarm *is* an `UnHealthyHostCount` alarm, so
   `claims` refuses any alert `reaper::identifies` — whether or not reaper is
   armed. Reaper's fix must never be replaced by a terminate.
@@ -1031,7 +1060,7 @@ every call.
   `escalation_subject(Failure, created_at)`; the title, count, target group
   and instance ids stay local.
 - Gates: `unhealthy_host.enabled` plus `allowed_users` (`"*"` not honoured),
-  JSM credentials, and the escalation mailbox. `unhealthy_host_gate_report`
+  a non-empty `title_app_names`, JSM credentials, and the escalation mailbox. `unhealthy_host_gate_report`
   names each dark state at startup and `unhealthy_host=` is on the `gates:`
   line. Its log source has an **Unhealthy Host** entry in the Logs tab's
   On-Call dropdown, and Test Alert Match routes to it (after reaper, before

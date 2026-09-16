@@ -856,6 +856,22 @@ pub struct UnhealthyHostFeature {
     /// Substring identifying one in `message` (the alert title). The primary
     /// rule for this feed; shipped `UnHealthyHostCount`.
     pub message_contains: String,
+    /// The apps this watcher may act on, as substrings of the **alert title**
+    /// (`message`). **ANDed** with the three `*_contains` rules above, which
+    /// together answer "is this an UnHealthyHostCount alert" — this answers
+    /// "is it one of ours". OR-ing it in would widen the net, which is the
+    /// opposite of what it is for.
+    ///
+    /// Distinct from [`Self::app_contains`], which reads the `App:` **tag**
+    /// rather than the title, and is measurably unreliable on this feed.
+    ///
+    /// **Empty matches nothing, and the watcher stays dark**: without this
+    /// rule the shipped `message_contains` claims every `UnHealthyHostCount`
+    /// alert on the feed, and acting on an app nobody named means
+    /// acknowledging somebody else's page and terminating their instance. A
+    /// blank entry matches nothing too — an empty string is a substring of
+    /// everything, which would silently restore exactly that.
+    pub title_app_names: Vec<String>,
     /// Substring of the target group NAME that marks a Vault group, matched
     /// case-insensitively. Blank disables the Vault rule.
     pub vault_tg_contains: String,
@@ -888,6 +904,15 @@ impl UnhealthyHostFeature {
     /// does not match.
     pub fn is_allowed_user(&self, user: &str) -> bool {
         self.enabled && names_user(&self.allowed_users, user)
+    }
+
+    /// True when `title_app_names` names at least one app.
+    ///
+    /// Blank entries do not count, matching [`crate::unhealthy_host::identifies`],
+    /// which refuses a blank needle: a list holding only `""` names nobody and
+    /// would otherwise arm the watcher while matching nothing.
+    pub fn names_any_app(&self) -> bool {
+        self.title_app_names.iter().any(|a| !a.trim().is_empty())
     }
 
     /// True when the list names more than one user. Two machines watching
