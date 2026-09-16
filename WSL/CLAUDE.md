@@ -1466,9 +1466,20 @@ window, and a search box opens any ticket by key.
     built from the salt alone addresses nothing and `load_state`/`store_state`
     silently do nothing. Without the move the caret stays where the `@` was
     and the next keystroke lands inside the name just inserted.
-  - **No glyphs from Unicode's Arrows block (U+2190–U+21FF) in any UI
-    string** — write `->`. egui's default font carries none of them, so every
-    one renders as an empty box. `·`, `—` and `…` are fine and used widely.
+  - **A UI string may only use a glyph egui's bundled fonts actually carry**
+    — write `->` for an arrow. The four bundled fonts (Ubuntu-Light,
+    Hack-Regular, NotoEmoji-Regular, emoji-icon-font) carry nothing from
+    Unicode's Arrows block, so every one renders as an empty box. **It is not
+    only arrows**: `✓` U+2713 is in none of the four while `✔` U+2714 is in
+    two, and the light one drew a box beside every successful Test Alert
+    Match until 2026-09-16. Two glyphs one codepoint apart, one of which
+    works.
+    `no_ui_string_uses_a_glyph_the_default_font_cannot_draw` therefore checks
+    every non-ASCII character against a `DRAWABLE` allow-list measured from
+    those fonts' cmap, rather than one blocked range — and it **decodes
+    `\u{...}` escapes**, because an escape is plain ASCII in the source and
+    the old character-only scan could never see one. That is how U+2713 hid:
+    neither an arrow nor a character. `·`, `—` and `…` are fine and used widely.
     `no_ui_string_uses_a_glyph_the_default_font_cannot_draw` scans this file
     and fails naming the line, because this shipped three separate times
     before it was pinned: `↻` on the ticket reload button, `↑↓` in the

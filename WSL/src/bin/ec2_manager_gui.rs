@@ -3992,7 +3992,10 @@ mod gui {
         fn text(&self) -> String {
             match self {
                 Self::Running(m) => format!("\u{23f3} {m}"),
-                Self::Ok(m) => format!("\u{2713} {m}"),
+                // U+2714, not U+2713: the light check mark is in none of the
+                // fonts egui bundles and drew an empty box beside every
+                // successful dry run.
+                Self::Ok(m) => format!("\u{2714} {m}"),
                 Self::Failed(m) => format!("\u{26a0} {m}"),
             }
         }
@@ -49477,19 +49480,58 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn no_ui_string_uses_a_glyph_the_default_font_cannot_draw() {
-            let src = include_str!("ec2_manager_gui.rs");
+            // Every non-ASCII glyph below was checked against the cmap of the
+            // four fonts egui actually bundles (Ubuntu-Light, Hack-Regular,
+            // NotoEmoji-Regular, emoji-icon-font). Adding one here without
+            // checking is how a box ships: U+2713 and U+2714 are both check
+            // marks and only the heavy one is in any of them.
+            const DRAWABLE: &str = "\u{a0}·×éπ—•…−⏳▶◀★☆☕⚠✉✏✔✖👁📂📋🔍🔒";
+
+            let whole = include_str!("ec2_manager_gui.rs");
+            // Above the test module only: the allow-list itself lives down
+            // here, and every glyph in it would otherwise match this scan.
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+
             let mut offenders: Vec<String> = Vec::new();
             for (n, line) in src.lines().enumerate() {
                 if line.trim_start().starts_with("//") {
                     continue;
                 }
-                if let Some(bad) = line.chars().find(|c| ('\u{2190}'..='\u{21FF}').contains(c)) {
-                    offenders.push(format!("line {}: {bad:?} in {}", n + 1, line.trim()));
+                // Literal glyphs, and the ones written as \u{...} escapes --
+                // an escape is plain ASCII in the source, so a scan reading
+                // only characters cannot see it. That is how the one box in
+                // this file hid: the old scan checked the Arrows block by
+                // character, and U+2713 was neither an arrow nor a character.
+                let mut found: Vec<char> = line.chars().filter(|c| !c.is_ascii()).collect();
+                let mut rest = line;
+                while let Some(at) = rest.find("\\u{") {
+                    rest = &rest[at + 3..];
+                    let Some(end) = rest.find('}') else { break };
+                    if let Ok(cp) = u32::from_str_radix(&rest[..end], 16) {
+                        if let Some(c) = char::from_u32(cp) {
+                            if !c.is_ascii() {
+                                found.push(c);
+                            }
+                        }
+                    }
+                    rest = &rest[end..];
+                }
+                for c in found {
+                    if !DRAWABLE.contains(c) {
+                        offenders.push(format!(
+                            "line {}: U+{:04X} {c:?} in {}",
+                            n + 1,
+                            c as u32,
+                            line.trim()
+                        ));
+                    }
                 }
             }
             assert!(
                 offenders.is_empty(),
-                "arrow glyphs render as empty boxes; write -> instead:\n{}",
+                "these render as empty boxes -- use an ASCII spelling (-> for an arrow) \
+                 or a glyph from DRAWABLE, and only extend DRAWABLE against the bundled \
+                 fonts' cmap:\n{}",
                 offenders.join("\n")
             );
         }
