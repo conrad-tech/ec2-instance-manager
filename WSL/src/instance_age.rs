@@ -683,6 +683,49 @@ impl InstanceAgeState {
     }
 }
 
+/// Turn the alert's `Account:` value into a 12-digit account id.
+///
+/// The alert names the account by a name; every AWS call here resolves
+/// credentials by id. A value that is already 12 digits is taken as an id
+/// directly — some feeds send one, and accepting it avoids an error about a
+/// name nobody wrote.
+///
+/// **Zero matches or two-plus is an error, never a guess.** Acting with the
+/// wrong account's credentials finds nothing, which reads exactly like a
+/// permissions failure — an hour of debugging pointed at the wrong thing.
+pub fn resolve_account_id(
+    name: &str,
+    profiles: &[crate::models::ProfileConfig],
+) -> std::result::Result<String, String> {
+    let n = name.trim();
+    if n.is_empty() {
+        return Err("the alert names no account, so there is no profile to work with".to_string());
+    }
+    if n.len() == 12 && n.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(n.to_string());
+    }
+    let hits: Vec<&crate::models::ProfileConfig> = profiles
+        .iter()
+        .filter(|p| p.display_name.trim().eq_ignore_ascii_case(n))
+        .collect();
+    match hits.len() {
+        1 => Ok(hits[0].account_id.clone()),
+        0 => Err(format!(
+            "no account in accounts.json is labelled {n:?} — the alert's account cannot be \
+             resolved to credentials"
+        )),
+        _ => Err(format!(
+            "{} accounts in accounts.json are labelled {n:?} ({}) — refusing to guess which one \
+             the alert means",
+            hits.len(),
+            hits.iter()
+                .map(|p| p.account_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -690,6 +733,7 @@ mod tests {
     use crate::asg::AsgInstance;
     use crate::asg::ScalingActivity;
     use crate::features::{InstanceAgeFeature, ReaperFeature, UnhealthyHostFeature};
+    use crate::models::ProfileConfig;
     use crate::reaper::TargetMember;
 
     const REAL: &str = "\
@@ -1493,5 +1537,55 @@ Runbook: https://example.invalid/runbook
             ..Default::default()
         });
         assert_eq!(t.retry_window_ms, 3 * 60 * 1000);
+    }
+
+    fn profile(label: &str, id: &str) -> ProfileConfig {
+        ProfileConfig {
+            profile_id: id.to_string(),
+            display_name: label.to_string(),
+            account_id: id.to_string(),
+            region: Some("us-east-1".to_string()),
+            sort_order: None,
+            color: None,
+        }
+    }
+
+    #[test]
+    fn an_account_name_resolves_to_exactly_one_account_id_or_it_is_an_error() {
+        let profiles = vec![profile("acme-prod", "123456789012"), profile("acme-dev", "210987654321")];
+
+        assert_eq!(resolve_account_id("acme-prod", &profiles).unwrap(), "123456789012");
+        assert_eq!(
+            resolve_account_id("  ACME-DEV  ", &profiles).unwrap(),
+            "210987654321",
+            "trimmed and case-insensitive"
+        );
+
+        let none = resolve_account_id("acme-staging", &profiles).unwrap_err();
+        assert!(none.contains("acme-staging"), "{none}");
+
+        let ambiguous = vec![profile("acme-prod", "111111111111"), profile("ACME-PROD", "222222222222")];
+        let two = resolve_account_id("acme-prod", &ambiguous).unwrap_err();
+        assert!(two.contains("111111111111") && two.contains("222222222222"), "{two}");
+
+        assert!(resolve_account_id("", &profiles).is_err(), "a blank name resolves to nothing");
+    }
+
+    #[test]
+    fn a_twelve_digit_name_is_taken_as_an_account_id_directly() {
+        // Some feeds send the id in the Account field. Accepting it costs
+        // nothing and avoids an error about a name nobody wrote.
+        let profiles = vec![profile("acme-prod", "123456789012")];
+        assert_eq!(resolve_account_id("123456789012", &profiles).unwrap(), "123456789012");
+        assert_eq!(
+            resolve_account_id("999999999999", &profiles).unwrap(),
+            "999999999999",
+            "an id we do not know is still an id; the credentials lookup reports the rest"
+        );
+        assert!(
+            resolve_account_id("12345678901", &profiles).is_err(),
+            "eleven digits is not an account id"
+        );
+        assert!(resolve_account_id("12345678901a", &profiles).is_err());
     }
 }
