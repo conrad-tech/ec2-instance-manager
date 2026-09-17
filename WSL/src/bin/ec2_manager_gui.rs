@@ -9573,6 +9573,7 @@ mod gui {
                 let user = ec2_manager::features::current_os_user();
                 let mailbox = ec2_manager::jsm_auth::escalation_mailbox();
                 let (armed, lines) = instance_age_gate_report(
+                    &options.mode,
                     &features.instance_age,
                     &user,
                     resolved_alerts_auth.is_complete(),
@@ -36985,14 +36986,24 @@ mod gui {
     /// Why the instance-age watcher is or is not armed, as lines for its own
     /// log source.
     ///
-    /// Five dark states, each naming itself. Reaper had three that all wrote
+    /// Six dark states, each naming itself. Reaper had three that all wrote
     /// nothing and telling them apart cost five rounds of guessing; this is
     /// that lesson, not a nicety.
     ///
     /// Order is cheapest and most specific first, so a build with nothing
     /// configured reports the switch rather than the mailbox. It never carries
     /// the mailbox address or the token: the app log gets pasted into tickets.
+    ///
+    /// **The mode is checked first, and this watcher gates on it where its
+    /// siblings do not.** Every AWS call here goes through
+    /// `reaper_account_context`, which refuses outside Live — but the JSM
+    /// calls are not AWS calls, so in Sim a matching alert would be *really*
+    /// acknowledged and would then escalate on its very first poll, since the
+    /// context fails immediately. The siblings share the acknowledge-in-Sim
+    /// wart but only page at a deadline; paging at once is materially worse,
+    /// and Sim's whole promise is that it touches nothing.
     fn instance_age_gate_report(
+        mode: &Mode,
         cfg: &ec2_manager::features::InstanceAgeFeature,
         user: &str,
         auth_complete: bool,
@@ -37000,6 +37011,18 @@ mod gui {
     ) -> (bool, Vec<(bool, String)>) {
         let mut lines: Vec<(bool, String)> = Vec::new();
 
+        if *mode != Mode::Live {
+            lines.push((
+                false,
+                format!(
+                    "instance age: off — the app is in {} mode, not live. Every AWS read here \
+                     needs Live, so an alert would be acknowledged for real and then escalate \
+                     on the first poll",
+                    mode.as_str()
+                ),
+            ));
+            return (false, lines);
+        }
         if !cfg.enabled {
             lines.push((
                 false,
@@ -38060,6 +38083,41 @@ mod gui {
                             return true;
                         }
                     };
+                // Claim the group the moment it is known, and before the
+                // other three reads — there is no point spending them on an
+                // alert about to stand down.
+                //
+                // **This is the only thing stopping two instances leaving one
+                // ASG in a single poll**, and the precondition is the
+                // expected case rather than a corner: instances in a group
+                // age together, so these alerts arrive in batches. Neither
+                // health guard covers it — `terminate_instance` calls the EC2
+                // API directly rather than asking the ASG to scale, so
+                // `read_termination_history` does not see it until the ASG
+                // notices, and `describe-auto-scaling-groups` reports
+                // the box `InService`/`Healthy` for seconds afterwards. The
+                // claim `consider` takes is keyed on the instance id, which
+                // is a different key space and says nothing about the group.
+                let holder = state.group_holder(&asg_name).map(str::to_string);
+                if !state.claim_group(&asg_name, alert_id) {
+                    note(
+                        LogLevel::Info,
+                        format!(
+                            "instance age: {alert_id} deferred to next poll — {} holds \
+                             {asg_name} this poll",
+                            holder.unwrap_or_else(|| "another alert".to_string())
+                        ),
+                    );
+                    // **Waiting, not returning.** The alert has been
+                    // acknowledged by now and is already in `seen`, so
+                    // standing down without this drops the incident forever:
+                    // nobody terminates, nobody escalates, and the page stays
+                    // silent. Waiting keeps it acknowledged, keeps it timed,
+                    // retries it next poll once the group is free, and still
+                    // escalates at the retry window if it never becomes safe.
+                    state.begin_wait(alert_id, created_at, facts, &asg_name, now_ms);
+                    return false;
+                }
                 let group = match read_group(&ctx, &asg_name) {
                     Ok(g) => g,
                     Err(e) => {
@@ -51613,11 +51671,23 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         fn every_dark_state_of_the_instance_age_watcher_names_itself() {
             let mailbox = Some("someone@example.invalid");
 
+            // Sim is the sixth, and this watcher gates on it where its
+            // siblings do not: the JSM calls are not AWS calls, so a matching
+            // alert would be really acknowledged and would then escalate on
+            // the first poll, `reaper_account_context` having refused.
+            let (armed, lines) =
+                instance_age_gate_report(&Mode::Sim, &instance_age_cfg(), "bconrad", true, mailbox);
+            assert!(!armed);
+            assert!(
+                lines.iter().any(|(_, l)| l.contains("not live")),
+                "{lines:?}"
+            );
+
             let off = ec2_manager::features::InstanceAgeFeature {
                 enabled: false,
                 ..instance_age_cfg()
             };
-            let (armed, lines) = instance_age_gate_report(&off, "bconrad", true, mailbox);
+            let (armed, lines) = instance_age_gate_report(&Mode::Live, &off, "bconrad", true, mailbox);
             assert!(!armed);
             assert!(
                 lines
@@ -51627,7 +51697,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             );
 
             let (armed, lines) =
-                instance_age_gate_report(&instance_age_cfg(), "someone", true, mailbox);
+                instance_age_gate_report(&Mode::Live, &instance_age_cfg(), "someone", true, mailbox);
             assert!(!armed);
             assert!(
                 lines.iter().any(|(_, l)| l.contains("instance_age.allowed_users")),
@@ -51638,7 +51708,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 applications: vec![],
                 ..instance_age_cfg()
             };
-            let (armed, lines) = instance_age_gate_report(&no_apps, "bconrad", true, mailbox);
+            let (armed, lines) = instance_age_gate_report(&Mode::Live, &no_apps, "bconrad", true, mailbox);
             assert!(!armed);
             assert!(
                 lines
@@ -51648,24 +51718,64 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             );
 
             let (armed, lines) =
-                instance_age_gate_report(&instance_age_cfg(), "bconrad", false, mailbox);
+                instance_age_gate_report(&Mode::Live, &instance_age_cfg(), "bconrad", false, mailbox);
             assert!(!armed);
             assert!(lines.iter().any(|(_, l)| l.contains("credentials")), "{lines:?}");
 
             let (armed, lines) =
-                instance_age_gate_report(&instance_age_cfg(), "bconrad", true, None);
+                instance_age_gate_report(&Mode::Live, &instance_age_cfg(), "bconrad", true, None);
             assert!(!armed);
             assert!(lines.iter().any(|(_, l)| l.contains("mailbox")), "{lines:?}");
 
             let (armed, lines) =
-                instance_age_gate_report(&instance_age_cfg(), "bconrad", true, mailbox);
+                instance_age_gate_report(&Mode::Live, &instance_age_cfg(), "bconrad", true, mailbox);
             assert!(armed, "{lines:?}");
+        }
+
+        /// Every other case shuts exactly ONE gate, so a report that checked
+        /// them in any order at all would pass the lot. The order is the
+        /// design — cheapest and most categorical first, so a build with
+        /// nothing configured names the switch rather than the mailbox — and
+        /// only a case with two shut at once can pin it.
+        #[test]
+        fn the_instance_age_gate_report_names_the_first_shut_gate_not_the_last() {
+            let off_and_no_mailbox = ec2_manager::features::InstanceAgeFeature {
+                enabled: false,
+                ..instance_age_cfg()
+            };
+            let (armed, lines) =
+                instance_age_gate_report(&Mode::Live, &off_and_no_mailbox, "bconrad", false, None);
+            assert!(!armed);
+            assert!(
+                lines
+                    .iter()
+                    .any(|(_, l)| l.contains("instance_age.enabled is false")),
+                "the switch is what a build with nothing configured must be told about: {lines:?}"
+            );
+            assert!(
+                !lines.iter().any(|(_, l)| l.contains("mailbox")),
+                "and only the first shut gate is reported: {lines:?}"
+            );
+            // Mode outranks even that.
+            let (_, lines) =
+                instance_age_gate_report(&Mode::Sim, &off_and_no_mailbox, "bconrad", false, None);
+            assert!(
+                lines.iter().any(|(_, l)| l.contains("not live")),
+                "{lines:?}"
+            );
+            assert!(
+                !lines
+                    .iter()
+                    .any(|(_, l)| l.contains("instance_age.enabled is false")),
+                "{lines:?}"
+            );
         }
 
         #[test]
         fn the_instance_age_gate_report_never_prints_the_mailbox() {
             // The app log gets pasted into tickets.
             let (_, lines) = instance_age_gate_report(
+                &Mode::Live,
                 &instance_age_cfg(),
                 "bconrad",
                 true,
@@ -51685,7 +51795,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 ..instance_age_cfg()
             };
             let (armed, lines) =
-                instance_age_gate_report(&two, "bconrad", true, Some("x@example.invalid"));
+                instance_age_gate_report(&Mode::Live, &two, "bconrad", true, Some("x@example.invalid"));
             assert!(armed, "it is a warning, not a gate");
             assert!(
                 lines
@@ -51790,6 +51900,143 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert!(f.contains("terminate_instance("), "it must still terminate");
         }
 
+        /// **The group is claimed before the reads, and an alert that loses
+        /// the claim goes into `waiting` rather than standing down.**
+        ///
+        /// Both halves are load-bearing and neither is visible from the pure
+        /// module, which cannot see where the GUI chooses to call it:
+        ///
+        /// - Claiming *after* the reads would let two alerts on one group both
+        ///   read it healthy and both terminate. Nothing downstream catches
+        ///   that — `terminate_instance` calls the EC2 API directly rather
+        ///   than asking the ASG to scale, so the scaling history has no
+        ///   record of it for seconds, and the group reports the box
+        ///   `InService`/`Healthy` for just as long.
+        /// - Returning instead of waiting would drop the incident **forever**:
+        ///   by this point the alert has been acknowledged and is in `seen`,
+        ///   so nobody terminates, nobody escalates, and the page stays
+        ///   silent. Returning `true` would be the same bug spelled
+        ///   differently — that means "finished".
+        #[test]
+        fn an_instance_age_alert_that_loses_its_group_keeps_waiting_for_it() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let start = src
+                .find("fn start_instance_age_poll(")
+                .expect("start_instance_age_poll");
+            let end = start
+                + src[start..]
+                    .find("\n    fn monotonic_ms(")
+                    .expect("the function that follows it");
+            let f = &src[start..end];
+
+            // `run_one`'s own body: from its binding to the poll loop that
+            // follows it. Not the whole function — `pending` and `consider`
+            // touch claims too, and a slice holding them would pass however
+            // `run_one` were written.
+            let body_start = f.find("let run_one =").expect("the run_one closure");
+            let body_end = f.find("\n            loop {").expect("the poll loop");
+            assert!(body_start < body_end, "run_one is defined before the loop");
+            let run_one = &f[body_start..body_end];
+
+            let claim = run_one.find("claim_group(").expect("the group must be claimed");
+            let read = run_one
+                .find("read_group(&ctx")
+                .expect("the group must still be read");
+            assert!(
+                claim < read,
+                "the group must be claimed BEFORE it is read, or two alerts on one group \
+                 both read it healthy and both terminate — neither the scaling history nor \
+                 the group's own health reflects a terminate issued seconds earlier"
+            );
+
+            // The refusal branch, by brace depth.
+            let gate = run_one
+                .find("if !state.claim_group(")
+                .expect("losing the claim must be handled");
+            let open = gate
+                + run_one[gate..].find('{').expect("the branch's opening brace");
+            let refused = &run_one[open..=find_matching_close(run_one, open)];
+            assert!(
+                refused.contains("begin_wait("),
+                "an alert that loses the claim must go into `waiting`: it is already \
+                 acknowledged and already in `seen`, so standing down drops the incident \
+                 forever — nobody terminates, nobody escalates, the page stays silent. \
+                 Found: {refused}"
+            );
+            assert!(
+                !refused.contains("return true"),
+                "`true` means the incident is FINISHED, which is the same silent drop \
+                 spelled differently. Found: {refused}"
+            );
+        }
+
+        /// **`expired` and `pending` must stay OUTSIDE the on-call gate**, and
+        /// the byte-order test above cannot say so: wrapping both inside
+        /// `if on_call {` leaves `begin < expired < pending < consider`
+        /// exactly as it was, so that test passes while an off-call machine
+        /// silently stops finishing incidents it has already acknowledged.
+        ///
+        /// Brace-depth based, like
+        /// `the_on_call_gate_excludes_the_running_incident_and_due_handling`
+        /// next door, and for the same reason: linear order does not move
+        /// when a closing brace does, so only the position of the actual
+        /// matching close distinguishes "inside the gate" from "after it".
+        /// Every `if on_call {` in the function is checked rather than just
+        /// the last, or the regression could be reintroduced as a new gate
+        /// higher up.
+        #[test]
+        fn the_instance_age_poll_finishes_what_it_started_even_off_call() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let start = src
+                .find("fn start_instance_age_poll(")
+                .expect("start_instance_age_poll");
+            let end = start
+                + src[start..]
+                    .find("\n    fn monotonic_ms(")
+                    .expect("the function that follows it");
+            let body = &src[start..end];
+
+            let expired = body.find("state.expired(").expect("the expired sweep");
+            let pending = body.find("state.pending(").expect("the pending re-reads");
+
+            // Note this also sweeps up the `note(if on_call { … } else { … })`
+            // line, whose braces close almost at once — it simply contains
+            // neither marker, so it costs nothing to include and removes the
+            // need to guess which occurrence is the real gate.
+            let mut gates = 0;
+            let mut at = 0;
+            while let Some(i) = body[at..].find("if on_call {") {
+                let gate = at + i;
+                let open = gate + "if on_call {".len() - 1;
+                let close = find_matching_close(body, open);
+                for (what, idx, cost) in [
+                    (
+                        "the expired sweep",
+                        expired,
+                        "an incident past its retry window would never escalate",
+                    ),
+                    (
+                        "the pending re-reads",
+                        pending,
+                        "an incident this machine acknowledged would be abandoned at a \
+                         rotation boundary — an acknowledged alert nobody is timing",
+                    ),
+                ] {
+                    assert!(
+                        idx < open || idx > close,
+                        "{what} must not sit inside an `if on_call {{` block: off call, \
+                         {cost}. Incidents already waiting were acknowledged by THIS machine, \
+                         so the real page is already silent and only this poll can finish them."
+                    );
+                }
+                gates += 1;
+                at = gate + 1;
+            }
+            assert!(gates > 0, "the on-call gate must still exist");
+        }
+
         /// The escalation send must never run on the poll thread. This got
         /// written inline once and only reading the callee's doc comment
         /// caught it, so it is pinned rather than left to be noticed again.
@@ -51814,15 +52061,29 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let end = start + f[start..].find("let run_one =").expect("the binding after it");
             let escalate = &f[start..end];
 
+            let spawn = escalate.find("thread::spawn(").unwrap_or_else(|| {
+                panic!(
+                    "the escalation send must be spawned, not run here. \
+                     `send_escalation_email` drives Outlook COM through PowerShell and takes \
+                     seconds; run inline it stalls the whole poll — the `expired` sweep, the \
+                     `pending` re-reads and the new-alert pass all sit behind it — so a hung \
+                     mail client makes the watcher stop terminating AND stop escalating. \
+                     `start_unhealthy_host_poll` spawns its own send for the same reason. \
+                     Found in: {escalate}"
+                )
+            });
+            // Presence alone is not the property: a closure holding a spawn
+            // AND an inline send would satisfy it while stalling the poll
+            // exactly as before. The send has to be *inside* the spawn, which
+            // for a slice of one closure means after it.
+            let send = escalate
+                .find("send_escalation_email(")
+                .expect("it must still send");
             assert!(
-                escalate.contains("thread::spawn"),
-                "the escalation send must be spawned, not run here. \
-                 `send_escalation_email` drives Outlook COM through PowerShell and takes \
-                 seconds; run inline it stalls the whole poll — the `expired` sweep, the \
-                 `pending` re-reads and the new-alert pass all sit behind it — so a hung mail \
-                 client makes the watcher stop terminating AND stop escalating. \
-                 `start_unhealthy_host_poll` spawns its own send for the same reason. \
-                 Found in: {escalate}"
+                send > spawn,
+                "the send must sit INSIDE the spawn, not merely beside one — a closure with \
+                 both a spawned and an inline `send_escalation_email` blocks the poll just as \
+                 badly. Found in: {escalate}"
             );
         }
 

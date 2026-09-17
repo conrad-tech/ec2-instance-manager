@@ -580,6 +580,40 @@ impl InstanceAgeState {
         self.seen.insert(alert_id.to_string());
     }
 
+    /// Claim `asg` for this poll, so two alerts naming instances in the same
+    /// group cannot both act.
+    ///
+    /// **This is the guard, and nothing downstream stands in for it.** The
+    /// terminate is an `ec2 terminate-instances` call, not an ASG scaling
+    /// action, so [`termination_history`] does not see it until the ASG
+    /// itself notices — and `describe-auto-scaling-groups` goes on reporting
+    /// the box `InService`/`Healthy` for seconds after. Both of the health
+    /// guards therefore miss a terminate issued moments earlier, and two
+    /// production instances would go from one group in one poll. The
+    /// precondition is the *expected* case rather than a corner: instances in
+    /// a group age together, so these alerts arrive on one group in batches.
+    ///
+    /// True when the group was unclaimed (and `alert_id` now holds it), true
+    /// when `alert_id` **already** holds it — [`Self::pending`] claims the
+    /// group for each incident it hands back, so a re-checked alert must not
+    /// collide with its own claim — and false when a different alert holds
+    /// it.
+    pub fn claim_group(&mut self, asg: &str, alert_id: &str) -> bool {
+        match self.claimed.get(asg) {
+            Some(holder) => holder == alert_id,
+            None => {
+                self.claimed.insert(asg.to_string(), alert_id.to_string());
+                true
+            }
+        }
+    }
+
+    /// Which alert holds `asg` this poll, if any. For the log line naming the
+    /// holder when [`Self::claim_group`] refuses.
+    pub fn group_holder(&self, asg: &str) -> Option<&str> {
+        self.claimed.get(asg).map(String::as_str)
+    }
+
     /// Decide what to do about an alert off the feed, and claim its group.
     pub fn consider(&mut self, alert_id: &str, asg: &str, _now_ms: u64) -> Action {
         if self.seen.contains(alert_id) {
@@ -1470,6 +1504,64 @@ Runbook: https://example.invalid/runbook
             1,
             "the deadline is still 20 minutes after the FIRST wait"
         );
+    }
+
+    #[test]
+    fn one_alert_holds_a_group_for_the_whole_poll() {
+        // The guard that stops two instances leaving one ASG together.
+        // Nothing downstream stands in for it: the terminate is an
+        // `ec2 terminate-instances` call, so the scaling history does not
+        // carry it until the ASG notices, and the group goes on reporting the
+        // box healthy for seconds.
+        let mut s = state();
+        s.begin_poll();
+        assert!(s.claim_group(ASG, "a1"), "an unclaimed group is taken");
+        assert!(
+            !s.claim_group(ASG, "a2"),
+            "a second alert must not act on a group already claimed this poll"
+        );
+        assert_eq!(s.group_holder(ASG), Some("a1"), "and the holder is nameable");
+        assert!(
+            s.claim_group(OTHER_ASG, "a2"),
+            "a different group is unaffected"
+        );
+    }
+
+    #[test]
+    fn an_alert_does_not_collide_with_its_own_group_claim() {
+        // `pending` claims the group for every incident it hands back, so a
+        // re-checked alert reaches `claim_group` already holding it. Reading
+        // that as a collision would make a waiting incident defer to itself
+        // forever and never terminate.
+        let mut s = state();
+        s.begin_poll();
+        assert!(s.claim_group(ASG, "a1"));
+        assert!(s.claim_group(ASG, "a1"), "the same alert may re-claim it");
+
+        let mut s = state();
+        let f = aged_facts();
+        s.begin_wait("a1", "t", &f, ASG, 0);
+        s.begin_poll();
+        let p = s.pending(1000);
+        assert_eq!(p.len(), 1);
+        assert!(
+            s.claim_group(&p[0].asg, &p[0].alert_id),
+            "an incident handed back by `pending` already holds its own group"
+        );
+    }
+
+    #[test]
+    fn beginning_a_poll_releases_every_group_claim() {
+        let mut s = state();
+        s.begin_poll();
+        assert!(s.claim_group(ASG, "a1"));
+        assert!(!s.claim_group(ASG, "a2"));
+        s.begin_poll();
+        assert!(
+            s.claim_group(ASG, "a2"),
+            "a claim lasts one poll, or the group is never acted on again"
+        );
+        assert_eq!(s.group_holder(OTHER_ASG), None);
     }
 
     #[test]
