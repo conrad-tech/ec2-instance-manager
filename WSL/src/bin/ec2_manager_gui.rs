@@ -4051,6 +4051,9 @@ mod gui {
                  no box in its path to read\n\n\
                  For an unhealthy-host alert: reads the target group and says what would \
                  be terminated; terminates nothing.\n\n\
+                 For an instance-age alert: reads the instance, its auto scaling group, \
+                 its recent scaling activity and its target health, and reports what would \
+                 be terminated; terminates nothing.\n\n\
                  Then it escalates as though the fix had failed. Nothing is \
                  acknowledged and nothing is changed. Every step is in the log under \
                  On-Call -> Alert Test.",
@@ -4139,6 +4142,7 @@ mod gui {
     enum DryRunRoute {
         Reaper,
         UnhealthyHost,
+        InstanceAge,
         Pingdom,
         /// No watcher claims it. Nothing is run and nothing is escalated —
         /// paging about an alert neither watcher would ever act on proves
@@ -4149,19 +4153,26 @@ mod gui {
     /// Pick the route. **Reaper wins when both claim the alert**: it is the
     /// watcher with a box to read, so an alert both match gets the more
     /// thorough run — which answers the pingdom question along the way.
+    /// **Unhealthy-host outranks instance-age**, the older claim on the same
+    /// `UnHealthyHostCount` alarms — `instance_age::claims` already excludes
+    /// both reaper and unhealthy-host, so this is four deep: reaper, then
+    /// unhealthy-host, then instance-age, then pingdom.
     ///
     /// Pure, so the precedence is pinned by a test rather than by the order
-    /// of two `if`s inside a thread.
+    /// of `if`s inside a thread.
     fn dry_run_route(
         alert: &ec2_manager::alerts::Alert,
         reaper_cfg: &ec2_manager::features::ReaperFeature,
         pingdom_cfg: &ec2_manager::features::PingdomFeature,
         unhealthy_cfg: &ec2_manager::features::UnhealthyHostFeature,
+        instance_age_cfg: &ec2_manager::features::InstanceAgeFeature,
     ) -> DryRunRoute {
         if ec2_manager::reaper::identifies(alert, reaper_cfg) {
             DryRunRoute::Reaper
         } else if ec2_manager::unhealthy_host::claims(alert, unhealthy_cfg, reaper_cfg) {
             DryRunRoute::UnhealthyHost
+        } else if ec2_manager::instance_age::claims(alert, instance_age_cfg, reaper_cfg, unhealthy_cfg) {
+            DryRunRoute::InstanceAge
         } else if ec2_manager::pingdom::identifies(alert, pingdom_cfg) {
             DryRunRoute::Pingdom
         } else {
@@ -4187,6 +4198,10 @@ mod gui {
     /// * **unhealthy host** — fetch, identify, resolve the target group, read
     ///   its health, and report what `plan` would terminate at the first
     ///   check. No acknowledge, no terminate.
+    /// * **instance age** — parse the facts off the description, resolve the
+    ///   account, read the instance, its auto scaling group, its recent
+    ///   scaling activity and its target health, and report the `Decision` a
+    ///   real run would have made. No acknowledge, no terminate.
     /// * **pingdom** — fetch and identify, which is all a pingdom decision
     ///   has ever needed; there is no box in its path to read.
     ///
@@ -4205,6 +4220,7 @@ mod gui {
         reaper_cfg: ec2_manager::features::ReaperFeature,
         pingdom_cfg: ec2_manager::features::PingdomFeature,
         unhealthy_cfg: ec2_manager::features::UnhealthyHostFeature,
+        instance_age_cfg: ec2_manager::features::InstanceAgeFeature,
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
         mailbox: Option<String>,
@@ -4277,7 +4293,7 @@ mod gui {
                 ),
             );
 
-            match dry_run_route(&alert, &reaper_cfg, &pingdom_cfg, &unhealthy_cfg) {
+            match dry_run_route(&alert, &reaper_cfg, &pingdom_cfg, &unhealthy_cfg, &instance_age_cfg) {
                 DryRunRoute::Reaper => {
                     note(
                         LogLevel::Info,
@@ -4397,6 +4413,98 @@ mod gui {
                             }
                         }
                     }
+                }
+                DryRunRoute::InstanceAge => {
+                    use ec2_manager::instance_age as ia;
+                    note(
+                        LogLevel::Info,
+                        format!("dry run: alert {} matches the instance-age rules", alert.id),
+                    );
+                    let facts = ia::parse_facts(&alert.description);
+                    note(
+                        LogLevel::Info,
+                        format!(
+                            "dry run: the description names application={:?} instance={:?} \
+                             environment={:?} account={:?} region={:?}",
+                            facts.application,
+                            facts.instance_id,
+                            facts.environment,
+                            facts.account,
+                            facts.region
+                        ),
+                    );
+                    if !ia::names_an_app(&facts, &instance_age_cfg) {
+                        note(
+                            LogLevel::Warn,
+                            format!(
+                                "dry run: {:?} is not on instance_age.applications — a real run \
+                                 would do nothing",
+                                facts.application
+                            ),
+                        );
+                    } else if facts.instance_id.is_empty() {
+                        note(
+                            LogLevel::Warn,
+                            "dry run: the alert names no readable instance id — a real run would \
+                             have nothing to act on"
+                                .to_string(),
+                        );
+                    } else {
+                        let walked = instance_age_context(&mode, &app_config, &facts).and_then(|ctx| {
+                            let asg = instance_asg_group(&ctx.profile, &ctx.region, &facts.instance_id)?
+                                .ok_or_else(|| {
+                                    format!(
+                                        "{} carries no aws:autoscaling:groupName tag",
+                                        facts.instance_id
+                                    )
+                                })?;
+                            let group = read_group(&ctx, &asg)?;
+                            let history = read_termination_history(
+                                &ctx,
+                                &asg,
+                                instance_age_cfg.recent_terminate_window(),
+                            )?;
+                            let view = read_group_view(&ctx, &group)?;
+                            Ok((asg, group, history, view))
+                        });
+                        match walked {
+                            Err(why) => note(
+                                LogLevel::Error,
+                                format!("dry run: could not read the group — {why}"),
+                            ),
+                            Ok((asg, group, history, view)) => {
+                                let tg_names: Vec<String> = group
+                                    .target_group_arns
+                                    .iter()
+                                    .map(|a| ec2_manager::asg::target_group_name_from_arn(a))
+                                    .collect();
+                                let kind = ia::kind_of(&asg, &tg_names, &instance_age_cfg);
+                                note(
+                                    LogLevel::Info,
+                                    format!(
+                                        "dry run: {} is in {asg} ({} group, {} member(s)); recent \
+                                         activity: {history:?}",
+                                        facts.instance_id,
+                                        kind.label(),
+                                        view.members.len()
+                                    ),
+                                );
+                                note(
+                                    LogLevel::Info,
+                                    format!(
+                                        "dry run: a real run would: {:?}",
+                                        ia::decide(&facts, &view, kind, &history)
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    note(
+                        LogLevel::Info,
+                        "dry run: nothing was acknowledged and nothing was terminated — this \
+                         will escalate next, as though the run had failed"
+                            .to_string(),
+                    );
                 }
                 DryRunRoute::Neither => {
                     fail(format!(
@@ -9060,6 +9168,9 @@ mod gui {
         /// The compiled-in unhealthy-host rules, for the dry run's matcher.
         /// The watcher's own copy is moved into its thread.
         unhealthy_host_cfg: ec2_manager::features::UnhealthyHostFeature,
+        /// The compiled-in instance-age rules, for the dry run's matcher.
+        /// The watcher's own copy is moved into its thread.
+        instance_age_cfg: ec2_manager::features::InstanceAgeFeature,
         /// Where a dry run reports back to the *window* — an alert that
         /// could not be fetched, one no watcher claims, a send that did not
         /// go, and the address a send that did go reached. A channel, not a
@@ -9824,6 +9935,7 @@ mod gui {
                 reaper_cfg: features.reaper.clone(),
                 pingdom_cfg: features.pingdom.clone(),
                 unhealthy_host_cfg: features.unhealthy_host.clone(),
+                instance_age_cfg: features.instance_age.clone(),
                 dry_run_status_tx,
                 dry_run_status_rx,
                 reaper_probe_enabled: features
@@ -19000,6 +19112,9 @@ mod gui {
                  no box in its path to read\n\n\
                  For an unhealthy-host alert: reads the target group and says what would \
                  be terminated; terminates nothing.\n\n\
+                 For an instance-age alert: reads the instance, its auto scaling group, \
+                 its recent scaling activity and its target health, and reports what would \
+                 be terminated; terminates nothing.\n\n\
                  Then it escalates as though the fix had failed. Nothing is \
                  acknowledged and nothing is changed. Every step is in the log under \
                  On-Call -> Alert Test.",
@@ -19255,6 +19370,7 @@ mod gui {
                     self.reaper_cfg.clone(),
                     self.pingdom_cfg.clone(),
                     self.unhealthy_host_cfg.clone(),
+                    self.instance_age_cfg.clone(),
                     self.config.clone(),
                     self.options.mode.clone(),
                     ec2_manager::jsm_auth::escalation_mailbox(),
@@ -50592,6 +50708,17 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             }
         }
 
+        fn dry_run_instance_age_cfg() -> ec2_manager::features::InstanceAgeFeature {
+            ec2_manager::features::InstanceAgeFeature {
+                enabled: true,
+                allowed_users: listed(&["bconrad"]),
+                message_contains: "InstanceAge".to_string(),
+                applications: listed(&["cassandra"]),
+                vault_name_contains: "vault".to_string(),
+                ..Default::default()
+            }
+        }
+
         #[test]
         fn a_dry_run_routes_a_pingdom_alert_to_the_pingdom_path() {
             assert_eq!(
@@ -50600,6 +50727,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &dry_run_reaper_cfg(),
                     &pingdom_cfg(),
                     &unhealthy_host_cfg(),
+                    &dry_run_instance_age_cfg(),
                 ),
                 DryRunRoute::Pingdom
             );
@@ -50610,7 +50738,13 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let mut a = dry_run_alert("something is wrong");
             a.extra.insert("alertname".to_string(), "reaper-stalled".to_string());
             assert_eq!(
-                dry_run_route(&a, &dry_run_reaper_cfg(), &pingdom_cfg(), &unhealthy_host_cfg()),
+                dry_run_route(
+                    &a,
+                    &dry_run_reaper_cfg(),
+                    &pingdom_cfg(),
+                    &unhealthy_host_cfg(),
+                    &dry_run_instance_age_cfg(),
+                ),
                 DryRunRoute::Reaper
             );
         }
@@ -50623,7 +50757,13 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let mut a = dry_run_alert("[Pingdom] domain xxx yy PROD");
             a.extra.insert("alertname".to_string(), "reaper-stalled".to_string());
             assert_eq!(
-                dry_run_route(&a, &dry_run_reaper_cfg(), &pingdom_cfg(), &unhealthy_host_cfg()),
+                dry_run_route(
+                    &a,
+                    &dry_run_reaper_cfg(),
+                    &pingdom_cfg(),
+                    &unhealthy_host_cfg(),
+                    &dry_run_instance_age_cfg(),
+                ),
                 DryRunRoute::Reaper
             );
         }
@@ -50636,6 +50776,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &dry_run_reaper_cfg(),
                     &pingdom_cfg(),
                     &unhealthy_host_cfg(),
+                    &dry_run_instance_age_cfg(),
                 ),
                 DryRunRoute::UnhealthyHost
             );
@@ -50646,7 +50787,13 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let mut a = dry_run_alert("[Target Group]: prod-Reaper-UnHealthyHostCount-Critical");
             a.extra.insert("alertname".to_string(), "Reaper-UnHealthyHostCount".to_string());
             assert_eq!(
-                dry_run_route(&a, &dry_run_reaper_cfg(), &pingdom_cfg(), &unhealthy_host_cfg()),
+                dry_run_route(
+                    &a,
+                    &dry_run_reaper_cfg(),
+                    &pingdom_cfg(),
+                    &unhealthy_host_cfg(),
+                    &dry_run_instance_age_cfg(),
+                ),
                 DryRunRoute::Reaper
             );
         }
@@ -50662,6 +50809,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &dry_run_reaper_cfg(),
                     &pingdom_cfg(),
                     &unhealthy_host_cfg(),
+                    &dry_run_instance_age_cfg(),
                 ),
                 DryRunRoute::Neither
             );
@@ -50678,8 +50826,98 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &ec2_manager::features::ReaperFeature::default(),
                     &ec2_manager::features::PingdomFeature::default(),
                     &unhealthy_host_cfg(),
+                    &dry_run_instance_age_cfg(),
                 ),
                 DryRunRoute::Neither
+            );
+        }
+
+        #[test]
+        fn a_dry_run_routes_an_instance_age_alert_to_its_own_path() {
+            let mut a = ec2_manager::alerts::Alert::default();
+            a.message = "prod-cassandra-InstanceAge-Warning".to_string();
+            assert_eq!(
+                dry_run_route(
+                    &a,
+                    &dry_run_reaper_cfg(),
+                    &pingdom_cfg(),
+                    &unhealthy_host_cfg(),
+                    &dry_run_instance_age_cfg(),
+                ),
+                DryRunRoute::InstanceAge
+            );
+        }
+
+        #[test]
+        fn reaper_and_the_unhealthy_host_watcher_both_outrank_instance_age_in_a_dry_run() {
+            let mut reaper_alert = ec2_manager::alerts::Alert::default();
+            reaper_alert.message = "prod-reaper-InstanceAge-Warning".to_string();
+            reaper_alert
+                .extra
+                .insert("alertname".to_string(), "reaper-down".to_string());
+            assert_eq!(
+                dry_run_route(
+                    &reaper_alert,
+                    &dry_run_reaper_cfg(),
+                    &pingdom_cfg(),
+                    &unhealthy_host_cfg(),
+                    &dry_run_instance_age_cfg(),
+                ),
+                DryRunRoute::Reaper
+            );
+
+            let mut uh_alert = ec2_manager::alerts::Alert::default();
+            uh_alert.message = "prod-cassandra-UnHealthyHostCount-InstanceAge".to_string();
+            assert_eq!(
+                dry_run_route(
+                    &uh_alert,
+                    &dry_run_reaper_cfg(),
+                    &pingdom_cfg(),
+                    &unhealthy_host_cfg(),
+                    &dry_run_instance_age_cfg(),
+                ),
+                DryRunRoute::UnhealthyHost
+            );
+        }
+
+        #[test]
+        fn an_unconfigured_build_routes_nothing_to_instance_age() {
+            // Every *_contains ships blank and applications ships empty, so
+            // the shipped state claims nothing.
+            let mut a = ec2_manager::alerts::Alert::default();
+            a.message = "prod-cassandra-InstanceAge-Warning".to_string();
+            assert_eq!(
+                dry_run_route(
+                    &a,
+                    &dry_run_reaper_cfg(),
+                    &pingdom_cfg(),
+                    &unhealthy_host_cfg(),
+                    &ec2_manager::features::InstanceAgeFeature::default(),
+                ),
+                DryRunRoute::Neither
+            );
+        }
+
+        #[test]
+        fn the_instance_age_dry_run_never_acknowledges_and_never_terminates() {
+            // A control called "Test" that silences a live page, or takes a
+            // box down, is not a test.
+            let src = include_str!("ec2_manager_gui.rs");
+            let body = &src[..src.find("    mod tests {").expect("the test module")];
+            let start = body
+                .find("DryRunRoute::InstanceAge => {")
+                .expect("the dry-run arm");
+            let end = start
+                + body[start..]
+                    .find("\n                DryRunRoute::")
+                    .or_else(|| body[start..].find("\n            }"))
+                    .expect("the end of the arm");
+            let arm = &body[start..end];
+            assert!(!arm.contains("acknowledge_alert"), "{arm}");
+            assert!(!arm.contains("terminate_instance"), "{arm}");
+            assert!(
+                arm.contains("send_escalation_email") || arm.contains("escalate"),
+                "the dry run must really escalate — a simulated send tests nothing: {arm}"
             );
         }
 
