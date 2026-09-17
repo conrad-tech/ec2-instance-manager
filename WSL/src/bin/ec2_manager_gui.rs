@@ -3528,6 +3528,109 @@ mod gui {
         Ok(ec2_manager::unhealthy_host::parse_asg_group(&raw))
     }
 
+    /// The AWS context for an instance-age alert: the account resolved from
+    /// its name, in the region the alert names.
+    ///
+    /// `reaper_account_context` carries the Live-mode check, the blank-account
+    /// check, the credentials lookup and the auth check, in one order, in one
+    /// place — do not reimplement any of them here.
+    fn instance_age_context(
+        mode: &Mode,
+        app_config: &ec2_manager::config::AppConfig,
+        facts: &ec2_manager::instance_age::AlertFacts,
+    ) -> std::result::Result<AwsContext, String> {
+        let profiles = ec2_manager::accounts::load_accounts();
+        let account_id = ec2_manager::instance_age::resolve_account_id(&facts.account, &profiles)?;
+        let mut ctx = reaper_account_context(mode, app_config, &account_id)?;
+        // The alert names its region, and an account spanning two would
+        // otherwise be read in whichever one it is configured with.
+        let region = facts.region.trim();
+        if !region.is_empty() {
+            ctx.region = region.to_string();
+        }
+        Ok(ctx)
+    }
+
+    /// One auto scaling group by name.
+    fn read_group(
+        ctx: &AwsContext,
+        asg_name: &str,
+    ) -> std::result::Result<ec2_manager::asg::AutoScalingGroup, String> {
+        let raw = aws_json(
+            &ctx.profile,
+            &ctx.region,
+            &[
+                "autoscaling",
+                "describe-auto-scaling-groups",
+                "--auto-scaling-group-names",
+                asg_name,
+            ],
+        )?;
+        ec2_manager::asg::parse_auto_scaling_groups(&raw)
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("no auto scaling group named {asg_name} in {}", ctx.region))
+    }
+
+    /// The group plus its target health, ready for `decide`.
+    ///
+    /// **`target_health` is `None` only when the group has no target group
+    /// attached.** A read that fails is an `Err` and becomes a `Refuse` — being
+    /// denied is not the same as being told there is nothing, and the two must
+    /// not render alike.
+    fn read_group_view(
+        ctx: &AwsContext,
+        group: &ec2_manager::asg::AutoScalingGroup,
+    ) -> std::result::Result<ec2_manager::instance_age::GroupView, String> {
+        let mut health: Option<Vec<ec2_manager::reaper::TargetMember>> = None;
+        for arn in &group.target_group_arns {
+            let raw = aws_json(
+                &ctx.profile,
+                &ctx.region,
+                &["elbv2", "describe-target-health", "--target-group-arn", arn],
+            )?;
+            health
+                .get_or_insert_with(Vec::new)
+                .extend(ec2_manager::reaper::parse_target_health(&raw));
+        }
+        Ok(ec2_manager::instance_age::GroupView {
+            asg_name: group.name.clone(),
+            members: group.instances.clone(),
+            target_health: health,
+        })
+    }
+
+    /// Has this group lost an instance inside `window`?
+    fn read_termination_history(
+        ctx: &AwsContext,
+        asg_name: &str,
+        window: std::time::Duration,
+    ) -> std::result::Result<ec2_manager::instance_age::HistoryVerdict, String> {
+        let limit = ec2_manager::instance_age::INSTANCE_AGE_ACTIVITY_LIMIT;
+        let limit_arg = limit.to_string();
+        let raw = aws_json(
+            &ctx.profile,
+            &ctx.region,
+            &[
+                "autoscaling",
+                "describe-scaling-activities",
+                "--auto-scaling-group-name",
+                asg_name,
+                // The CLI's own paginator, so it stops the walk rather than
+                // trimming a full result after the fact.
+                "--max-items",
+                &limit_arg,
+            ],
+        )?;
+        let activities = ec2_manager::asg::parse_scaling_activities(&raw);
+        Ok(ec2_manager::instance_age::termination_history(
+            &activities,
+            chrono::Utc::now(),
+            window,
+            limit,
+        ))
+    }
+
     /// `s`, trimmed, cut to `max` characters with the full length named.
     ///
     /// Alert bodies run to kilobytes and each of these becomes one log line.
@@ -8877,6 +8980,10 @@ mod gui {
         /// Connections toolbar until dismissed. A later insured alert
         /// replaces it.
         unhealthy_host_notice: Option<String>,
+        /// The instance-age watcher's own toolbar line: the one refusal or
+        /// escalation a human needs to see without opening the Logs tab.
+        /// Drawn red beside the insurance one, and dismissed the same way.
+        instance_age_notice: Option<String>,
         /// When every enabled environment last became healthy, or `None`
         /// while any is not. Drives the self-expiring success banner, and
         /// resetting it on failure is what makes a recovery show again.
@@ -9085,6 +9192,9 @@ mod gui {
         /// for this user, JSM credentials are not configured, or no
         /// escalation mailbox is set — `unhealthy_host_gate_report` names which.
         unhealthy_host: Option<UnhealthyHostRuntime>,
+        /// The instance-age watcher, when it is armed. `None` when any of its
+        /// five gates is shut — `instance_age_gate_report` names which.
+        instance_age: Option<InstanceAgeRuntime>,
         /// Finished remediations waiting on a notifier: the outcome code
         /// (`RE-F`/`RE-N`/`RE-K`/`RE-C`) and the alert's `createdAt`.
         /// Nothing reads this yet — wiring it to a send path is a separate,
@@ -9456,6 +9566,34 @@ mod gui {
                 (rt, lines)
             };
 
+            // Its own gate and its own thread, for the reason pingdom's is
+            // separate from reaper's: the four watchers share a feed and
+            // nothing else, and one being disarmed must never disarm another.
+            let (instance_age, instance_age_startup_log) = {
+                let user = ec2_manager::features::current_os_user();
+                let mailbox = ec2_manager::jsm_auth::escalation_mailbox();
+                let (armed, lines) = instance_age_gate_report(
+                    &features.instance_age,
+                    &user,
+                    resolved_alerts_auth.is_complete(),
+                    mailbox.as_deref(),
+                );
+                let rt = if armed {
+                    Some(start_instance_age_poll(
+                        resolved_alerts_auth.clone(),
+                        features.instance_age.clone(),
+                        features.reaper.clone(),
+                        features.unhealthy_host.clone(),
+                        config.clone(),
+                        options.mode.clone(),
+                        mailbox.unwrap_or_default(),
+                    ))
+                } else {
+                    None
+                };
+                (rt, lines)
+            };
+
             let mut app = Self {
                 wsl_setup_state,
                 wsl_setup_status: None,
@@ -9726,6 +9864,8 @@ mod gui {
                 pingdom,
                 unhealthy_host,
                 unhealthy_host_notice: None,
+                instance_age,
+                instance_age_notice: None,
                 pending_notify: Vec::new(),
                 fed_auth_enabled: features
                     .fed_auth_enabled_for(&ec2_manager::features::current_os_user()),
@@ -9839,6 +9979,13 @@ mod gui {
                 let level = if is_warn { LogLevel::Warn } else { LogLevel::Info };
                 app.log_unhealthy_host(level, msg);
             }
+            for (is_warn, msg) in instance_age_startup_log {
+                // Same reasoning, its own tag: "the watcher never came up" is
+                // the first thing to look for under Sources -> Instance Age
+                // when nothing else is there.
+                let level = if is_warn { LogLevel::Warn } else { LogLevel::Info };
+                app.log_instance_age(level, msg);
+            }
             // The name every `allowed_users` gate is matched against, and what
             // each one decided. Without this a gate that does not match is
             // invisible: the button simply never appears, with nothing to say
@@ -9889,6 +10036,11 @@ mod gui {
                 features.unhealthy_host_enabled_for(&os_user)
             );
             app.log_unhealthy_host(LogLevel::Info, uh_gate);
+            let ia_gate = format!(
+                "gates: instance_age={}",
+                features.instance_age_enabled_for(&os_user)
+            );
+            app.log_instance_age(LogLevel::Info, ia_gate);
             let alerts_gate = format!("gates: alerts={}", app.alerts_enabled);
             app.log_alerts(LogLevel::Info, alerts_gate);
             let jira_gate = format!("gates: jira={}", app.jira_enabled);
@@ -10895,10 +11047,6 @@ mod gui {
             self.log_from(LogSource::UnhealthyHost, level, message);
         }
 
-        // The instance-age watcher's poll thread (a later task) is the real
-        // caller; this task wires only the source and the Sources row, so
-        // nothing calls this yet.
-        #[allow(dead_code)]
         fn log_instance_age(&mut self, level: LogLevel, message: impl Into<String>) {
             self.log_from(LogSource::InstanceAge, level, message);
         }
@@ -12396,6 +12544,7 @@ mod gui {
             failed(&self.script_status)
                 || failed(&self.tunnel_status)
                 || self.unhealthy_host_notice.is_some()
+                || self.instance_age_notice.is_some()
                 || !self.message.is_empty()
         }
 
@@ -12413,6 +12562,7 @@ mod gui {
             self.message.clear();
             self.script_status_highlight = None;
             self.unhealthy_host_notice = None;
+            self.instance_age_notice = None;
 
             if let Some((_, ScriptState::Failed)) = self.tunnel_status {
                 let rows = self.port_forward_rows();
@@ -17051,6 +17201,42 @@ mod gui {
                                 LogLevel::Error,
                                 format!(
                                     "unhealthy host: escalation for {resource} FAILED TO SEND — \
+                                     {detail}. The alert is acknowledged and nothing will ring; \
+                                     handle it by hand"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Drain whatever the instance-age watcher has said since the last
+        /// frame. Same shape as `poll_unhealthy_host_events`: the terminate
+        /// and the escalation both already happened on the watcher's own
+        /// thread, so this only records them.
+        fn poll_instance_age_events(&mut self) {
+            let Some(rt) = &self.instance_age else { return };
+            let events: Vec<InstanceAgeEvent> = rt.rx.try_iter().collect();
+            for ev in events {
+                match ev {
+                    InstanceAgeEvent::Note { level, message } => {
+                        self.log_instance_age(level, message)
+                    }
+                    InstanceAgeEvent::Notice { text } => {
+                        self.instance_age_notice = Some(text);
+                    }
+                    InstanceAgeEvent::Escalated { alert_id, detail, ok } => {
+                        if ok {
+                            self.log_instance_age(
+                                LogLevel::Warn,
+                                format!("instance age: escalation for {alert_id} {detail}"),
+                            );
+                        } else {
+                            self.log_instance_age(
+                                LogLevel::Error,
+                                format!(
+                                    "instance age: escalation for {alert_id} FAILED TO SEND — \
                                      {detail}. The alert is acknowledged and nothing will ring; \
                                      handle it by hand"
                                 ),
@@ -33957,7 +34143,11 @@ mod gui {
                 self.poll_reaper_events();
                 self.poll_pingdom_events();
                 self.poll_unhealthy_host_events();
-                if self.pingdom.is_some() || self.unhealthy_host.is_some() {
+                self.poll_instance_age_events();
+                if self.pingdom.is_some()
+                    || self.unhealthy_host.is_some()
+                    || self.instance_age.is_some()
+                {
                     // The watcher runs on its own thread and does not need a
                     // frame to acknowledge, time or escalate — but its log is
                     // the only account it gives of itself, and without a tick
@@ -34839,6 +35029,7 @@ mod gui {
                     || self.tunnel_status.is_some()
                     || self.script_status_highlight.is_some()
                     || self.unhealthy_host_notice.is_some()
+                    || self.instance_age_notice.is_some()
                     || !self.message.is_empty();
                 if has_status {
                     let status_color = |state: &ScriptState, ui: &egui::Ui| match state {
@@ -34880,6 +35071,10 @@ mod gui {
                                 }
                             }
                             if let Some(text) = self.unhealthy_host_notice.clone() {
+                                let c = status_color(&ScriptState::Failed, ui);
+                                ui.label(notification_text(ui, c, text));
+                            }
+                            if let Some(text) = self.instance_age_notice.clone() {
                                 let c = status_color(&ScriptState::Failed, ui);
                                 ui.label(notification_text(ui, c, text));
                             }
@@ -36787,6 +36982,96 @@ mod gui {
         (true, lines)
     }
 
+    /// Why the instance-age watcher is or is not armed, as lines for its own
+    /// log source.
+    ///
+    /// Five dark states, each naming itself. Reaper had three that all wrote
+    /// nothing and telling them apart cost five rounds of guessing; this is
+    /// that lesson, not a nicety.
+    ///
+    /// Order is cheapest and most specific first, so a build with nothing
+    /// configured reports the switch rather than the mailbox. It never carries
+    /// the mailbox address or the token: the app log gets pasted into tickets.
+    fn instance_age_gate_report(
+        cfg: &ec2_manager::features::InstanceAgeFeature,
+        user: &str,
+        auth_complete: bool,
+        mailbox: Option<&str>,
+    ) -> (bool, Vec<(bool, String)>) {
+        let mut lines: Vec<(bool, String)> = Vec::new();
+
+        if !cfg.enabled {
+            lines.push((
+                false,
+                "instance age: off — instance_age.enabled is false in this build".to_string(),
+            ));
+            return (false, lines);
+        }
+        if !cfg.is_allowed_user(user) {
+            lines.push((
+                false,
+                format!(
+                    "instance age: off — os_user '{user}' is not on instance_age.allowed_users \
+                     (note '*' is deliberately not honoured here)"
+                ),
+            ));
+            return (false, lines);
+        }
+        if !cfg.names_any_app() {
+            lines.push((
+                false,
+                "instance age: off — instance_age.applications is empty, so the matcher claims \
+                 nothing; name the applications this watcher may act on"
+                    .to_string(),
+            ));
+            return (false, lines);
+        }
+        if !auth_complete {
+            lines.push((
+                false,
+                "instance age: off — no JSM credentials resolved, so the alert feed cannot be \
+                 read"
+                    .to_string(),
+            ));
+            return (false, lines);
+        }
+        if mailbox.map(str::trim).unwrap_or("").is_empty() {
+            lines.push((
+                false,
+                "instance age: off — no escalation mailbox is configured. It stays dark rather \
+                 than running acknowledge-only: silencing a live page and then never being able \
+                 to ring is worse than doing nothing"
+                    .to_string(),
+            ));
+            return (false, lines);
+        }
+        if cfg.has_multiple_users() {
+            lines.push((
+                true,
+                "instance_age.allowed_users names more than one user; both machines will \
+                 acknowledge and both will terminate"
+                    .to_string(),
+            ));
+        }
+        lines.push((
+            false,
+            format!(
+                "instance age: armed, ON CALL ONLY — polling every {}s over the {} newest \
+                 alert(s); acknowledge, resolve the instance to its auto scaling group and \
+                 terminate it once every other member is healthy, retrying for up to {} \
+                 minute(s) before escalating once. A termination in the group inside the last \
+                 {} hour(s) refuses the alert; applications ~{:?}, vault groups ~{:?}",
+                cfg.poll_interval().as_secs(),
+                cfg.alerts_per_poll(),
+                cfg.retry_window().as_secs() / 60,
+                cfg.recent_terminate_window().as_secs() / 3600,
+                cfg.applications,
+                cfg.vault_name_contains,
+            ),
+        ));
+        (true, lines)
+    }
+
     /// Where `send_escalation.ps1` lives: next to the executable.
     ///
     /// **Never written to `%TEMP%` and run from there**, and never spawned
@@ -37615,6 +37900,403 @@ mod gui {
         });
 
         UnhealthyHostRuntime { rx, _handle: handle }
+    }
+
+    // ---- instance-age watcher ---------------------------------------------
+
+    /// What the instance-age poll thread reports back.
+    enum InstanceAgeEvent {
+        Note { level: LogLevel, message: String },
+        /// An escalation was sent, or could not be.
+        Escalated { alert_id: String, detail: String, ok: bool },
+        /// Something a human needs to see without opening the Logs tab.
+        Notice { text: String },
+    }
+
+    struct InstanceAgeRuntime {
+        rx: std::sync::mpsc::Receiver<InstanceAgeEvent>,
+        _handle: std::thread::JoinHandle<()>,
+    }
+
+    /// The entire payload of an instance-age escalation: reaper's `RE-F` code
+    /// and the alert's own timestamp. The application, environment, account,
+    /// instance id and group name are for the local log and never leave.
+    fn instance_age_escalation_subject(created_at: &str) -> String {
+        ec2_manager::reaper::escalation_subject(
+            ec2_manager::reaper::OutcomeCode::Failure,
+            created_at,
+        )
+    }
+
+    /// Whether a NEW incident may start this poll. Off call — or unable to
+    /// tell — starts nothing: no acknowledge, no terminate, no escalation.
+    /// Incidents already waiting are not affected; they were acknowledged by
+    /// this machine and must be finished by it.
+    fn instance_age_on_call_decision(
+        lookup: std::result::Result<bool, String>,
+    ) -> (bool, String) {
+        match lookup {
+            Ok(true) => (true, "instance age: on call — watching the feed".to_string()),
+            Ok(false) => (
+                false,
+                "instance age: off call — no new incident starts (no acknowledge, no terminate, \
+                 no escalation); anything already waiting finishes"
+                    .to_string(),
+            ),
+            Err(e) => (
+                false,
+                format!(
+                    "instance age: on-call lookup failed ({e}) — treating as off call, so no new \
+                     incident starts"
+                ),
+            ),
+        }
+    }
+
+    /// The instance-age watcher's poll thread.
+    ///
+    /// **The order inside one poll is the design**: `begin_poll`, then the
+    /// expired incidents (escalate once and free their group), then the
+    /// pending ones (re-read by id and re-decide), and only then the new
+    /// alerts off the feed. New alerts get whatever groups are left, so an
+    /// incident already being timed is never displaced by a fresh one on the
+    /// same group.
+    fn start_instance_age_poll(
+        auth: ec2_manager::alerts::AlertsAuth,
+        cfg: ec2_manager::features::InstanceAgeFeature,
+        reaper_cfg: ec2_manager::features::ReaperFeature,
+        unhealthy_cfg: ec2_manager::features::UnhealthyHostFeature,
+        app_config: ec2_manager::config::AppConfig,
+        mode: Mode,
+        mailbox: String,
+    ) -> InstanceAgeRuntime {
+        use ec2_manager::{alerts, instance_age as ia, oncall, reaper};
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut state = ia::InstanceAgeState::new(ia::Timing::from_feature(&cfg));
+            let schedule_id = cfg.resolved_schedule_id();
+            let atlassian_id = cfg.resolved_atlassian_account_id();
+            let mut last_on_call: Option<bool> = None;
+
+            let note = |level: LogLevel, message: String| {
+                let _ = tx.send(InstanceAgeEvent::Note { level, message });
+            };
+
+            // Escalate once, report whether it went, and put a line on the
+            // toolbar. Every refusal ends here, so this is the one place the
+            // outcome is said.
+            let escalate = |alert_id: &str, created_at: &str, why: &str| {
+                let subject = instance_age_escalation_subject(created_at);
+                let (ok, detail) = match send_escalation_email(&mailbox, &subject) {
+                    Ok(address) => (true, format!("sent to {address}")),
+                    Err(e) => (false, e),
+                };
+                let _ = tx.send(InstanceAgeEvent::Escalated {
+                    alert_id: alert_id.to_string(),
+                    detail,
+                    ok,
+                });
+                let _ = tx.send(InstanceAgeEvent::Notice {
+                    text: format!("Instance age: {alert_id} — {why}"),
+                });
+            };
+
+            // One alert, resolved and decided. Returns true when the incident
+            // is finished (terminated, refused or escalated) and false when it
+            // is waiting.
+            let run_one = |state: &mut ia::InstanceAgeState,
+                           alert_id: &str,
+                           created_at: &str,
+                           facts: &ia::AlertFacts,
+                           now_ms: u64|
+             -> bool {
+                let ctx = match instance_age_context(&mode, &app_config, facts) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        note(LogLevel::Error, format!("instance age: {alert_id} — {e}"));
+                        escalate(alert_id, created_at, &e);
+                        return true;
+                    }
+                };
+                let asg_name =
+                    match instance_asg_group(&ctx.profile, &ctx.region, &facts.instance_id) {
+                        Ok(Some(n)) => n,
+                        Ok(None) => {
+                            let why = format!(
+                                "{} carries no aws:autoscaling:groupName tag — nothing would \
+                                 replace it, so it is never terminated by this feature",
+                                facts.instance_id
+                            );
+                            note(LogLevel::Error, format!("instance age: {alert_id} — {why}"));
+                            escalate(alert_id, created_at, &why);
+                            return true;
+                        }
+                        Err(e) => {
+                            let why = format!("could not read {}: {e}", facts.instance_id);
+                            note(LogLevel::Error, format!("instance age: {alert_id} — {why}"));
+                            escalate(alert_id, created_at, &why);
+                            return true;
+                        }
+                    };
+                let group = match read_group(&ctx, &asg_name) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        note(LogLevel::Error, format!("instance age: {alert_id} — {e}"));
+                        escalate(alert_id, created_at, &e);
+                        return true;
+                    }
+                };
+                let history =
+                    match read_termination_history(&ctx, &asg_name, cfg.recent_terminate_window()) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            note(LogLevel::Error, format!("instance age: {alert_id} — {e}"));
+                            escalate(alert_id, created_at, &e);
+                            return true;
+                        }
+                    };
+                let view = match read_group_view(&ctx, &group) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        note(LogLevel::Error, format!("instance age: {alert_id} — {e}"));
+                        escalate(alert_id, created_at, &e);
+                        return true;
+                    }
+                };
+                let tg_names: Vec<String> = group
+                    .target_group_arns
+                    .iter()
+                    .map(|a| ec2_manager::asg::target_group_name_from_arn(a))
+                    .collect();
+                let kind = ia::kind_of(&asg_name, &tg_names, &cfg);
+
+                match ia::decide(facts, &view, kind, &history) {
+                    ia::Decision::Refuse { reason } => {
+                        note(LogLevel::Error, format!("instance age: {alert_id} — {reason}"));
+                        escalate(alert_id, created_at, &reason);
+                        true
+                    }
+                    ia::Decision::Wait { reason } => {
+                        note(LogLevel::Info, format!("instance age: {alert_id} — {reason}"));
+                        state.begin_wait(alert_id, created_at, facts, &asg_name, now_ms);
+                        false
+                    }
+                    ia::Decision::Terminate { instance_id, reason } => {
+                        note(
+                            LogLevel::Warn,
+                            format!("instance age: {alert_id} ({}) — {reason}", kind.label()),
+                        );
+                        match terminate_instance(&ctx.profile, &ctx.region, &instance_id, &mode) {
+                            Ok(()) => {
+                                note(
+                                    LogLevel::Warn,
+                                    format!(
+                                        "instance age: {alert_id} — terminated {instance_id}; \
+                                         {asg_name} will replace it"
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                let why = format!("terminate of {instance_id} failed: {e}");
+                                note(
+                                    LogLevel::Error,
+                                    format!("instance age: {alert_id} — {why}"),
+                                );
+                                escalate(alert_id, created_at, &why);
+                            }
+                        }
+                        true
+                    }
+                }
+            };
+
+            loop {
+                let now_ms = monotonic_ms(started);
+                state.begin_poll();
+
+                let (on_call, reason) = instance_age_on_call_decision(
+                    oncall::is_on_call(&auth, &schedule_id, &atlassian_id)
+                        .map_err(|e| e.to_string()),
+                );
+                if last_on_call != Some(on_call) {
+                    note(if on_call { LogLevel::Info } else { LogLevel::Warn }, reason);
+                    last_on_call = Some(on_call);
+                }
+
+                // 1. Incidents whose retry window ran out: escalate once, and
+                //    free their group for whatever comes next.
+                for due in state.expired(now_ms) {
+                    let why = format!(
+                        "{} is still not healthy enough to lose {} after {} minute(s)",
+                        due.asg,
+                        due.facts.instance_id,
+                        cfg.retry_window().as_secs() / 60
+                    );
+                    note(
+                        LogLevel::Error,
+                        format!("instance age: {} — {why}", due.alert_id),
+                    );
+                    escalate(&due.alert_id, &due.created_at, &why);
+                }
+
+                // 2. Incidents still inside their window: re-read the alert by
+                //    id — an alert older than fetch_count has fallen off the
+                //    list, and its absence there is not evidence it closed.
+                for due in state.pending(now_ms) {
+                    match alerts::fetch_alert(&auth, &due.alert_id) {
+                        Ok(a) if reaper::alert_is_closed(&a.status) => {
+                            note(
+                                LogLevel::Info,
+                                format!(
+                                    "instance age: {} closed on its own — nothing terminated",
+                                    due.alert_id
+                                ),
+                            );
+                            state.finish(&due.alert_id);
+                        }
+                        Ok(_) => {
+                            if run_one(
+                                &mut state,
+                                &due.alert_id,
+                                &due.created_at,
+                                &due.facts,
+                                now_ms,
+                            ) {
+                                state.finish(&due.alert_id);
+                            }
+                        }
+                        // Must not both free the slot and cancel the escalation.
+                        Err(e) => note(
+                            LogLevel::Warn,
+                            format!(
+                                "instance age: could not re-read {}, still timing it: {e}",
+                                due.alert_id
+                            ),
+                        ),
+                    }
+                }
+
+                // 3. New alerts, on call only, with whatever groups are left.
+                if on_call {
+                    match alerts::fetch_latest(&auth, cfg.alerts_per_poll()) {
+                        Ok(list) => {
+                            let mut claimed = 0usize;
+                            for listed in &list {
+                                if !ia::claims(listed, &cfg, &reaper_cfg, &unhealthy_cfg) {
+                                    continue;
+                                }
+                                if reaper::alert_is_closed(&listed.status)
+                                    || state.is_seen(&listed.id)
+                                {
+                                    continue;
+                                }
+                                // The list omits `description`, which is the
+                                // only place these alerts carry their facts.
+                                let alert = match alerts::fetch_alert(&auth, &listed.id) {
+                                    Ok(a) => a,
+                                    Err(e) => {
+                                        note(
+                                            LogLevel::Warn,
+                                            format!(
+                                                "instance age: could not read {} in full: {e} — \
+                                                 will retry next poll",
+                                                listed.id
+                                            ),
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let facts = ia::parse_facts(&alert.description);
+                                if !ia::names_an_app(&facts, &cfg) {
+                                    note(
+                                        LogLevel::Debug,
+                                        format!(
+                                            "instance age: {} names application {:?}, which is \
+                                             not on instance_age.applications",
+                                            alert.id, facts.application
+                                        ),
+                                    );
+                                    state.mark_seen(&alert.id);
+                                    continue;
+                                }
+                                if facts.instance_id.is_empty() {
+                                    note(
+                                        LogLevel::Warn,
+                                        format!(
+                                            "instance age: {} matches the rules but names no \
+                                             readable instance id — nothing to act on",
+                                            alert.id
+                                        ),
+                                    );
+                                    state.mark_seen(&alert.id);
+                                    continue;
+                                }
+                                claimed += 1;
+                                // Claimed on the instance id: the group is not
+                                // known until the instance has been read, and
+                                // the claim has to be taken before the work.
+                                match state.consider(&alert.id, &facts.instance_id, now_ms) {
+                                    ia::Action::Ignore => {}
+                                    ia::Action::Deferred { holder } => note(
+                                        LogLevel::Info,
+                                        format!(
+                                            "instance age: {} deferred to next poll — {holder} \
+                                             holds this group",
+                                            alert.id
+                                        ),
+                                    ),
+                                    ia::Action::AckAndAct => {
+                                        // Acknowledge FIRST: every branch below
+                                        // terminates or escalates, so there is
+                                        // no outcome that leaves it ringing.
+                                        if let Err(e) =
+                                            alerts::acknowledge_alert(&auth, &alert.id)
+                                        {
+                                            // Costs a duplicate page; dropping
+                                            // the incident costs the terminate
+                                            // and the escalation both.
+                                            note(
+                                                LogLevel::Warn,
+                                                format!(
+                                                    "instance age: could not acknowledge {}: {e} \
+                                                     — carrying on",
+                                                    alert.id
+                                                ),
+                                            );
+                                        }
+                                        run_one(
+                                            &mut state,
+                                            &alert.id,
+                                            &alert.created_at,
+                                            &facts,
+                                            now_ms,
+                                        );
+                                    }
+                                }
+                            }
+                            note(
+                                LogLevel::Debug,
+                                format!(
+                                    "instance age: polled {} alert(s), {claimed} claimed, {} \
+                                     waiting",
+                                    list.len(),
+                                    state.waiting_count()
+                                ),
+                            );
+                        }
+                        Err(e) => note(
+                            LogLevel::Warn,
+                            format!("instance age: could not read the alert feed: {e}"),
+                        ),
+                    }
+                }
+
+                std::thread::sleep(cfg.poll_interval());
+            }
+        });
+        InstanceAgeRuntime { rx, _handle: handle }
     }
 
     /// Monotonic milliseconds for the cooldown bookkeeping. A wall clock
@@ -50867,7 +51549,14 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let body = &src[..src.find("    mod tests {").expect("the test module")];
             let start = body.find("\"gates: os_user=").expect("the shared gates line");
             let line = &body[start..start + 400];
-            for banned in ["alerts=", "reaper=", "pingdom=", "unhealthy_host=", "jira="] {
+            for banned in [
+                "alerts=",
+                "reaper=",
+                "pingdom=",
+                "unhealthy_host=",
+                "instance_age=",
+                "jira=",
+            ] {
                 assert!(
                     !line.contains(banned),
                     "the shared gates line must not carry {banned:?} — it reaches every user"
@@ -50878,6 +51567,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 ("log_reaper", "gates: reaper="),
                 ("log_pingdom", "gates: pingdom="),
                 ("log_unhealthy_host", "gates: unhealthy_host="),
+                ("log_instance_age", "gates: instance_age="),
                 ("log_alerts", "gates: alerts="),
                 ("log_jira", "gates: jira="),
             ] {
@@ -50888,6 +51578,196 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         fn listed(users: &[&str]) -> Vec<String> {
             users.iter().map(|u| u.to_string()).collect()
+        }
+
+        fn instance_age_cfg() -> ec2_manager::features::InstanceAgeFeature {
+            ec2_manager::features::InstanceAgeFeature {
+                enabled: true,
+                allowed_users: listed(&["bconrad"]),
+                applications: listed(&["cassandra"]),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn every_dark_state_of_the_instance_age_watcher_names_itself() {
+            let mailbox = Some("someone@example.invalid");
+
+            let off = ec2_manager::features::InstanceAgeFeature {
+                enabled: false,
+                ..instance_age_cfg()
+            };
+            let (armed, lines) = instance_age_gate_report(&off, "bconrad", true, mailbox);
+            assert!(!armed);
+            assert!(
+                lines
+                    .iter()
+                    .any(|(_, l)| l.contains("instance_age.enabled is false")),
+                "{lines:?}"
+            );
+
+            let (armed, lines) =
+                instance_age_gate_report(&instance_age_cfg(), "someone", true, mailbox);
+            assert!(!armed);
+            assert!(
+                lines.iter().any(|(_, l)| l.contains("instance_age.allowed_users")),
+                "{lines:?}"
+            );
+
+            let no_apps = ec2_manager::features::InstanceAgeFeature {
+                applications: vec![],
+                ..instance_age_cfg()
+            };
+            let (armed, lines) = instance_age_gate_report(&no_apps, "bconrad", true, mailbox);
+            assert!(!armed);
+            assert!(
+                lines
+                    .iter()
+                    .any(|(_, l)| l.contains("instance_age.applications is empty")),
+                "{lines:?}"
+            );
+
+            let (armed, lines) =
+                instance_age_gate_report(&instance_age_cfg(), "bconrad", false, mailbox);
+            assert!(!armed);
+            assert!(lines.iter().any(|(_, l)| l.contains("credentials")), "{lines:?}");
+
+            let (armed, lines) =
+                instance_age_gate_report(&instance_age_cfg(), "bconrad", true, None);
+            assert!(!armed);
+            assert!(lines.iter().any(|(_, l)| l.contains("mailbox")), "{lines:?}");
+
+            let (armed, lines) =
+                instance_age_gate_report(&instance_age_cfg(), "bconrad", true, mailbox);
+            assert!(armed, "{lines:?}");
+        }
+
+        #[test]
+        fn the_instance_age_gate_report_never_prints_the_mailbox() {
+            // The app log gets pasted into tickets.
+            let (_, lines) = instance_age_gate_report(
+                &instance_age_cfg(),
+                "bconrad",
+                true,
+                Some("ops@example.invalid"),
+            );
+            for (_, l) in &lines {
+                assert!(!l.contains("ops@example.invalid"), "{l}");
+            }
+        }
+
+        #[test]
+        fn two_names_on_the_instance_age_list_are_warned_about() {
+            // Two machines watching one feed would both acknowledge and both
+            // terminate.
+            let two = ec2_manager::features::InstanceAgeFeature {
+                allowed_users: listed(&["bconrad", "someone"]),
+                ..instance_age_cfg()
+            };
+            let (armed, lines) =
+                instance_age_gate_report(&two, "bconrad", true, Some("x@example.invalid"));
+            assert!(armed, "it is a warning, not a gate");
+            assert!(
+                lines
+                    .iter()
+                    .any(|(warn, l)| *warn && l.contains("more than one user")),
+                "{lines:?}"
+            );
+        }
+
+        #[test]
+        fn an_instance_age_escalation_carries_nothing_but_a_code_and_a_time() {
+            let subject = instance_age_escalation_subject("2026-09-17T14:03:11Z");
+            assert_eq!(subject, "RE-F 2026-09-17T14:03:11Z");
+            for local in [
+                "cassandra",
+                "prod",
+                "acme-prod",
+                "i-0aaa1111bbbb2222c",
+                "prod-cassandra-asg",
+                "us-east-1",
+            ] {
+                assert!(
+                    !subject.contains(local),
+                    "{local:?} must not cross the org boundary"
+                );
+            }
+        }
+
+        #[test]
+        fn the_instance_age_escalation_code_is_never_written_as_a_literal() {
+            // The Pi-side daemon tiers on that vocabulary; a code it does not
+            // recognise is escalated as unknown, which looks exactly like
+            // success from this side.
+            let src = include_str!("ec2_manager_gui.rs");
+            let body = &src[..src.find("    mod tests {").expect("the test module")];
+            let start = body
+                .find("fn instance_age_escalation_subject")
+                .expect("the subject builder");
+            let end = start + body[start..].find("\n    }").expect("its end");
+            let f = &body[start..end];
+            assert!(
+                f.contains("OutcomeCode::Failure"),
+                "the code must come from the enum: {f}"
+            );
+            assert!(
+                !f.contains(&format!("RE{}F", "-")),
+                "the code must not be a literal: {f}"
+            );
+        }
+
+        #[test]
+        fn instance_age_starts_nothing_off_call_or_when_the_lookup_fails() {
+            assert!(instance_age_on_call_decision(Ok(true)).0);
+
+            let (act, why) = instance_age_on_call_decision(Ok(false));
+            assert!(!act);
+            assert!(why.contains("off call"), "{why}");
+
+            let (act, why) = instance_age_on_call_decision(Err("boom".to_string()));
+            assert!(
+                !act,
+                "a failed lookup is the only direction that can do neither by mistake"
+            );
+            assert!(why.contains("boom"), "{why}");
+        }
+
+        #[test]
+        fn the_instance_age_poll_acts_on_new_alerts_only_after_the_ones_it_is_already_timing() {
+            // A fresh alert must never displace an incident already being
+            // timed on the same group: expired frees a group, pending claims
+            // what is still waiting, and consider gets what is left.
+            let src = include_str!("ec2_manager_gui.rs");
+            let body = &src[..src.find("    mod tests {").expect("the test module")];
+            let start = body.find("fn start_instance_age_poll").expect("the poll thread");
+            let end = start + body[start..].find("\n    fn ").expect("the next function");
+            let f = &body[start..end];
+
+            let begin = f.find(".begin_poll(").expect("the poll must reset its claims");
+            let expired = f.find(".expired(").expect("expired incidents escalate");
+            let pending = f.find(".pending(").expect("waiting incidents are re-checked");
+            let consider = f.find(".consider(").expect("new alerts are considered");
+            assert!(
+                begin < expired && expired < pending && pending < consider,
+                "begin_poll -> expired -> pending -> consider, in that order"
+            );
+        }
+
+        #[test]
+        fn the_instance_age_poll_never_calls_the_terminate_cli_itself() {
+            // One call site for terminate-instances, and this is not it: the
+            // poll goes through terminate_instance, which re-checks Live mode
+            // and whitelists the id.
+            let src = include_str!("ec2_manager_gui.rs");
+            let body = &src[..src.find("    mod tests {").expect("the test module")];
+            let start = body.find("fn start_instance_age_poll").expect("the poll thread");
+            let end = start + body[start..].find("\n    fn ").expect("the next function");
+            let f = &body[start..end];
+            assert!(
+                !f.contains(&format!("terminate-{}", "instances")),
+                "call terminate_instance, never the CLI directly"
+            );
+            assert!(f.contains("terminate_instance("), "it must still terminate");
         }
 
         /// A user on none of the watchers' allow-lists sees none of their log
