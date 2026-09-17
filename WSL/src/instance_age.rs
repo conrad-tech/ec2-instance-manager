@@ -171,6 +171,49 @@ pub fn claims(
         && !crate::unhealthy_host::identifies(alert, unhealthy_cfg)
 }
 
+/// What shape of group the alert is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// Any ordinary application group: the health gate applies.
+    Ordinary,
+    /// A Vault group: active and standby, always two. The health gate is
+    /// waived, because the peer being unwell is not a reason to leave an aged
+    /// box running.
+    Vault,
+}
+
+impl Kind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::Vault => "vault",
+        }
+    }
+}
+
+/// Which kind a group is, from the ASG's own name and every target group
+/// attached to it — **either** hitting is enough.
+///
+/// Both are AWS facts already in hand from calls the watcher makes anyway, and
+/// reading both is what lets a Vault ASG with no target group still be
+/// recognised. Deliberately not read from the alert's `Application` field:
+/// that is free text off a feed this repo has been burned by, and it decides
+/// whether a destructive safety check is skipped.
+///
+/// A blank rule marks nothing as Vault, so the waiver fails closed.
+pub fn kind_of(
+    asg_name: &str,
+    tg_names: &[String],
+    cfg: &crate::features::InstanceAgeFeature,
+) -> Kind {
+    let needle = &cfg.vault_name_contains;
+    if contains_ci(asg_name, needle) || tg_names.iter().any(|n| contains_ci(n, needle)) {
+        Kind::Vault
+    } else {
+        Kind::Ordinary
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,5 +448,42 @@ Runbook: https://example.invalid/runbook
 
         let ours = alert("prod-cassandra-InstanceAge-Warning");
         assert!(claims(&ours, &cfg(), &reaper_cfg(), &uh_cfg()));
+    }
+
+    #[test]
+    fn a_vault_group_is_recognised_by_its_asg_name_or_any_attached_target_group() {
+        let c = cfg();
+        assert_eq!(kind_of("prod-vault-asg", &[], &c), Kind::Vault);
+        assert_eq!(kind_of("PROD-VAULT-ASG", &[], &c), Kind::Vault, "case-insensitive");
+        assert_eq!(
+            kind_of("prod-cassandra-asg", &["prod-vault-tg".to_string()], &c),
+            Kind::Vault,
+            "an attached target group names it even when the ASG does not"
+        );
+        assert_eq!(
+            kind_of(
+                "prod-cassandra-asg",
+                &["prod-cassandra-tg".to_string(), "prod-vault-tg".to_string()],
+                &c
+            ),
+            Kind::Vault,
+            "any one of them is enough"
+        );
+        assert_eq!(kind_of("prod-cassandra-asg", &[], &c), Kind::Ordinary);
+        assert_eq!(
+            kind_of("prod-cassandra-asg", &["prod-kafka-tg".to_string()], &c),
+            Kind::Ordinary
+        );
+    }
+
+    #[test]
+    fn a_blank_vault_rule_marks_nothing_as_vault() {
+        // Blank disables the waiver. An empty needle is a substring of
+        // everything, and this decides whether a destructive safety check is
+        // skipped -- so it must fail closed, not open.
+        let c = InstanceAgeFeature { vault_name_contains: String::new(), ..cfg() };
+        assert_eq!(kind_of("prod-vault-asg", &["prod-vault-tg".to_string()], &c), Kind::Ordinary);
+        let c = InstanceAgeFeature { vault_name_contains: "   ".to_string(), ..cfg() };
+        assert_eq!(kind_of("prod-vault-asg", &[], &c), Kind::Ordinary);
     }
 }
