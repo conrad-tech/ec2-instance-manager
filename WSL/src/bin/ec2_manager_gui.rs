@@ -37987,19 +37987,39 @@ mod gui {
             // Escalate once, report whether it went, and put a line on the
             // toolbar. Every refusal ends here, so this is the one place the
             // outcome is said.
+            //
+            // **The send is spawned, never run here.**
+            // `send_escalation_email` drives Outlook COM through PowerShell
+            // and takes seconds — its own doc comment says callers run it off
+            // the poll thread, and `start_unhealthy_host_poll` does exactly
+            // this. Inline, a hung mail client stalls the whole poll: the
+            // expired sweep, the pending re-reads and the new-alert pass all
+            // sit behind it, so the watcher stops terminating *and* stops
+            // escalating because Outlook hung. That is the one failure mode
+            // this feature must not have.
+            //
+            // The toolbar notice is sent from here, before the spawn: it says
+            // *why* we escalated, which is true whether or not the mail
+            // lands, and the caller has already logged that reason — so the
+            // reason precedes its outcome in the log rather than racing it.
             let escalate = |alert_id: &str, created_at: &str, why: &str| {
                 let subject = instance_age_escalation_subject(created_at);
-                let (ok, detail) = match send_escalation_email(&mailbox, &subject) {
-                    Ok(address) => (true, format!("sent to {address}")),
-                    Err(e) => (false, e),
-                };
-                let _ = tx.send(InstanceAgeEvent::Escalated {
-                    alert_id: alert_id.to_string(),
-                    detail,
-                    ok,
-                });
                 let _ = tx.send(InstanceAgeEvent::Notice {
                     text: format!("Instance age: {alert_id} — {why}"),
+                });
+                let tx2 = tx.clone();
+                let mailbox2 = mailbox.clone();
+                let id = alert_id.to_string();
+                std::thread::spawn(move || {
+                    let (ok, detail) = match send_escalation_email(&mailbox2, &subject) {
+                        Ok(address) => (true, format!("sent to {address}")),
+                        Err(reason) => (false, reason),
+                    };
+                    let _ = tx2.send(InstanceAgeEvent::Escalated {
+                        alert_id: id,
+                        detail,
+                        ok,
+                    });
                 });
             };
 
