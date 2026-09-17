@@ -214,10 +214,118 @@ pub fn kind_of(
     }
 }
 
+/// How far back the recent-terminate guard reads.
+///
+/// **Its own limit, not `asg::ACTIVITY_LIMIT` (20).** That one sizes a detail
+/// panel a human reads; this one has to span a day on a group that flaps.
+/// Raising the shared constant would make every ASG detail view five times
+/// heavier for a reason that has nothing to do with it.
+pub const INSTANCE_AGE_ACTIVITY_LIMIT: usize = 100;
+
+/// What the group's recent scaling activity says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HistoryVerdict {
+    /// The whole window was read and holds no termination.
+    Clean,
+    /// The group lost an instance inside the window.
+    RecentTermination { detail: String },
+    /// The page was full and its oldest entry is still newer than the cutoff,
+    /// so the window was not fully read. **Not the same as clean** — this is
+    /// "could not see", and the guard exists precisely to refuse on that.
+    NotFullySeen { detail: String },
+}
+
+/// Does this activity describe an instance going away?
+///
+/// Reads `description`, which the API words consistently
+/// (`Terminating EC2 instance: i-…`), rather than `cause`, which is prose
+/// about *why* and mentions termination in plenty of activities that are not
+/// one.
+fn is_termination(a: &crate::asg::ScalingActivity) -> bool {
+    contains_ci(&a.description, "terminating ec2 instance")
+}
+
+/// Parse an activity's `StartTime`. `DateTime::parse_from_rfc3339` is the same
+/// parser `reaper::escalation_subject` and `Alert::created_utc` use, so "valid
+/// here" and "renderable in the Alerts window" cannot come apart.
+fn activity_time(a: &crate::asg::ScalingActivity) -> Option<chrono::DateTime<chrono::Utc>> {
+    let raw = a.start_time.as_deref()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// Read the group's recent scaling activity for the terminate guard.
+///
+/// `limit` is what the read was bounded at, and it is load-bearing:
+/// **truncation is only possible when the API filled the page**, so
+/// `activities.len() < limit` means we were handed everything the group has
+/// and a young group whose whole history is an hour old is `Clean` rather than
+/// permanently refused.
+///
+/// Every ambiguity resolves toward refusing — a `Failed` termination counts,
+/// and so does one whose `StartTime` cannot be read. Over-counting costs one
+/// escalation a human waves through; under-counting costs a second live
+/// terminate on a group that just lost an instance.
+pub fn termination_history(
+    activities: &[crate::asg::ScalingActivity],
+    now: chrono::DateTime<chrono::Utc>,
+    window: std::time::Duration,
+    limit: usize,
+) -> HistoryVerdict {
+    let cutoff = now - chrono::Duration::from_std(window).unwrap_or_else(|_| chrono::Duration::days(1));
+
+    for a in activities.iter().filter(|a| is_termination(a)) {
+        match activity_time(a) {
+            Some(t) if t < cutoff => continue,
+            Some(t) => {
+                return HistoryVerdict::RecentTermination {
+                    detail: format!("the group terminated an instance at {t} ({})", a.status_code),
+                }
+            }
+            // Cannot be read, so it cannot be ruled out.
+            None => {
+                return HistoryVerdict::RecentTermination {
+                    detail: format!(
+                        "the group has a termination whose start time could not be read \
+                         ({:?}), which cannot be ruled out of the window",
+                        a.start_time
+                    ),
+                }
+            }
+        }
+    }
+
+    // Nothing recent in what we read. Did what we read cover the window?
+    if activities.len() < limit {
+        return HistoryVerdict::Clean;
+    }
+    let oldest = activities.iter().filter_map(activity_time).min();
+    match oldest {
+        Some(t) if t < cutoff => HistoryVerdict::Clean,
+        Some(t) => HistoryVerdict::NotFullySeen {
+            detail: format!(
+                "read {limit} activities and the oldest is {t}, which is inside the window — \
+                 a termination before it would not have been seen"
+            ),
+        },
+        None => HistoryVerdict::NotFullySeen {
+            detail: format!(
+                "read {limit} activities and none carried a readable start time, so the \
+                 window cannot be shown to be clear"
+            ),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::alerts::Alert;
+    use crate::asg::ScalingActivity;
     use crate::features::{InstanceAgeFeature, ReaperFeature, UnhealthyHostFeature};
 
     const REAL: &str = "\
@@ -485,5 +593,131 @@ Runbook: https://example.invalid/runbook
         assert_eq!(kind_of("prod-vault-asg", &["prod-vault-tg".to_string()], &c), Kind::Ordinary);
         let c = InstanceAgeFeature { vault_name_contains: "   ".to_string(), ..cfg() };
         assert_eq!(kind_of("prod-vault-asg", &[], &c), Kind::Ordinary);
+    }
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-09-17T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn day() -> std::time::Duration {
+        std::time::Duration::from_secs(24 * 60 * 60)
+    }
+
+    fn activity(desc: &str, start: &str, status: &str) -> ScalingActivity {
+        ScalingActivity {
+            start_time: if start.is_empty() { None } else { Some(start.to_string()) },
+            status_code: status.to_string(),
+            description: desc.to_string(),
+            cause: String::new(),
+            status_message: None,
+        }
+    }
+
+    fn terminating(start: &str) -> ScalingActivity {
+        activity("Terminating EC2 instance: i-0abc123def4567890", start, "Successful")
+    }
+
+    fn launching(start: &str) -> ScalingActivity {
+        activity("Launching a new EC2 instance: i-0abc123def4567890", start, "Successful")
+    }
+
+    #[test]
+    fn a_termination_inside_the_window_refuses_and_one_outside_it_does_not() {
+        let recent = vec![terminating("2026-09-17T09:00:00Z"), launching("2026-09-16T01:00:00Z")];
+        assert!(matches!(
+            termination_history(&recent, now(), day(), 100),
+            HistoryVerdict::RecentTermination { .. }
+        ));
+
+        // 25 hours ago, and an older launch behind it so the window is fully
+        // seen.
+        let old = vec![terminating("2026-09-16T11:00:00Z"), launching("2026-09-15T01:00:00Z")];
+        assert_eq!(termination_history(&old, now(), day(), 100), HistoryVerdict::Clean);
+    }
+
+    #[test]
+    fn a_launch_is_not_a_termination() {
+        let only_launches = vec![launching("2026-09-17T09:00:00Z"), launching("2026-09-10T09:00:00Z")];
+        assert_eq!(
+            termination_history(&only_launches, now(), day(), 100),
+            HistoryVerdict::Clean
+        );
+    }
+
+    #[test]
+    fn an_empty_history_is_clean_not_unseen() {
+        // A group with no recorded activity has nothing hiding past the end.
+        assert_eq!(termination_history(&[], now(), day(), 100), HistoryVerdict::Clean);
+    }
+
+    #[test]
+    fn a_failed_termination_still_counts() {
+        // This is a safety guard: over-counting costs one escalation a human
+        // waves through, under-counting costs a second live terminate.
+        let failed = vec![
+            activity("Terminating EC2 instance: i-0abc123def4567890", "2026-09-17T09:00:00Z", "Failed"),
+            launching("2026-09-15T01:00:00Z"),
+        ];
+        assert!(matches!(
+            termination_history(&failed, now(), day(), 100),
+            HistoryVerdict::RecentTermination { .. }
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_start_time_on_a_termination_counts_as_recent() {
+        for stamp in ["", "yesterday-ish"] {
+            let odd = vec![terminating(stamp), launching("2026-09-15T01:00:00Z")];
+            assert!(
+                matches!(
+                    termination_history(&odd, now(), day(), 100),
+                    HistoryVerdict::RecentTermination { .. }
+                ),
+                "a termination whose time cannot be read must not be assumed old ({stamp:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_page_that_does_not_reach_the_cutoff_is_not_fully_seen() {
+        // Activities come back newest-first and the read is bounded, so a
+        // group that flaps fills the page with the last twenty minutes while a
+        // termination five hours ago sits just past the end. "Could not see"
+        // is not "nothing happened".
+        let page: Vec<ScalingActivity> = (0..3).map(|_| launching("2026-09-17T11:50:00Z")).collect();
+        assert!(matches!(
+            termination_history(&page, now(), day(), 3),
+            HistoryVerdict::NotFullySeen { .. }
+        ));
+    }
+
+    #[test]
+    fn a_short_page_is_everything_the_group_has_even_when_it_is_all_recent() {
+        // len < limit means the API handed us the lot. Without this a young
+        // group would refuse every alert forever.
+        let page: Vec<ScalingActivity> = (0..3).map(|_| launching("2026-09-17T11:50:00Z")).collect();
+        assert_eq!(termination_history(&page, now(), day(), 100), HistoryVerdict::Clean);
+    }
+
+    #[test]
+    fn a_recent_termination_outranks_an_unseen_window() {
+        // Both true: the answer that refuses for the more specific reason wins,
+        // so the log names the termination rather than the truncation.
+        let page = vec![terminating("2026-09-17T11:50:00Z"), launching("2026-09-17T11:55:00Z")];
+        assert!(matches!(
+            termination_history(&page, now(), day(), 2),
+            HistoryVerdict::RecentTermination { .. }
+        ));
+    }
+
+    #[test]
+    fn a_full_page_of_unreadable_timestamps_is_not_fully_seen() {
+        let page: Vec<ScalingActivity> = (0..2).map(|_| launching("nonsense")).collect();
+        assert!(matches!(
+            termination_history(&page, now(), day(), 2),
+            HistoryVerdict::NotFullySeen { .. }
+        ));
     }
 }
