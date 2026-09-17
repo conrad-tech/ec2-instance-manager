@@ -18,6 +18,7 @@
 //! unhealthy-host watcher's alarms are excluded by [`claims`].
 
 use crate::reaper;
+use std::collections::{HashMap, HashSet};
 
 /// The five fields these alerts carry, as `Key: value` lines in the alert's
 /// **description**.
@@ -491,6 +492,194 @@ pub fn decide(
                 unwell.join(", ")
             ),
         }
+    }
+}
+
+/// The one window, in milliseconds, so the state machine never reads the
+/// feature struct and every test can name its own numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timing {
+    pub retry_window_ms: u64,
+}
+
+impl Timing {
+    pub fn from_feature(cfg: &crate::features::InstanceAgeFeature) -> Self {
+        Self { retry_window_ms: cfg.retry_window().as_millis() as u64 }
+    }
+}
+
+/// What the caller should do about one alert off the feed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Action {
+    /// Already decided on an earlier poll.
+    Ignore,
+    /// Another alert holds this group for this poll. **Deliberately not
+    /// marked seen** — it is reconsidered next poll rather than swallowed.
+    Deferred { holder: String },
+    /// A first sighting: acknowledge it and act now.
+    AckAndAct,
+}
+
+/// One incident handed back to the caller to re-check or to escalate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Due {
+    pub alert_id: String,
+    /// `createdAt` verbatim, for the escalation subject.
+    pub created_at: String,
+    /// Parsed once, when the alert was first read in full, and carried here so
+    /// the description is not re-parsed on every poll.
+    pub facts: AlertFacts,
+    pub asg: String,
+}
+
+#[derive(Clone, Debug)]
+struct Waiting {
+    created_at: String,
+    facts: AlertFacts,
+    asg: String,
+    deadline_ms: u64,
+}
+
+/// What this process has decided, and what it is still waiting on.
+///
+/// Owned by the poll thread and never shared, so there is no lock — the
+/// property [`crate::pingdom::PingdomState`] and
+/// [`crate::unhealthy_host::UnhealthyHostState`] both keep.
+#[derive(Debug)]
+pub struct InstanceAgeState {
+    timing: Timing,
+    seen: HashSet<String>,
+    /// Keyed by alert id: one waiting incident per alert.
+    waiting: HashMap<String, Waiting>,
+    /// Groups already acted on this poll. Cleared by [`Self::begin_poll`].
+    claimed: HashMap<String, String>,
+}
+
+impl InstanceAgeState {
+    pub fn new(timing: Timing) -> Self {
+        Self {
+            timing,
+            seen: HashSet::new(),
+            waiting: HashMap::new(),
+            claimed: HashMap::new(),
+        }
+    }
+
+    /// Start of a poll: every group is unclaimed again.
+    pub fn begin_poll(&mut self) {
+        self.claimed.clear();
+    }
+
+    pub fn is_seen(&self, alert_id: &str) -> bool {
+        self.seen.contains(alert_id)
+    }
+
+    /// Record an alert as decided without deciding anything — for one that
+    /// names nothing actionable, so it is reported once rather than per poll.
+    pub fn mark_seen(&mut self, alert_id: &str) {
+        self.seen.insert(alert_id.to_string());
+    }
+
+    /// Decide what to do about an alert off the feed, and claim its group.
+    pub fn consider(&mut self, alert_id: &str, asg: &str, _now_ms: u64) -> Action {
+        if self.seen.contains(alert_id) {
+            return Action::Ignore;
+        }
+        if let Some(holder) = self.claimed.get(asg) {
+            return Action::Deferred { holder: holder.clone() };
+        }
+        self.claimed.insert(asg.to_string(), alert_id.to_string());
+        self.seen.insert(alert_id.to_string());
+        Action::AckAndAct
+    }
+
+    /// The group was read fine and is not healthy enough yet: keep re-checking
+    /// until the window runs out.
+    ///
+    /// **Never refreshes an existing deadline.** Pushing it out on every poll
+    /// is how an incident waits forever and never escalates.
+    pub fn begin_wait(
+        &mut self,
+        alert_id: &str,
+        created_at: &str,
+        facts: &AlertFacts,
+        asg: &str,
+        now_ms: u64,
+    ) {
+        if self.waiting.contains_key(alert_id) {
+            return;
+        }
+        self.waiting.insert(
+            alert_id.to_string(),
+            Waiting {
+                created_at: created_at.to_string(),
+                facts: facts.clone(),
+                asg: asg.to_string(),
+                deadline_ms: now_ms.saturating_add(self.timing.retry_window_ms),
+            },
+        );
+    }
+
+    /// The incident is over — terminated, refused, or the alert closed.
+    pub fn finish(&mut self, alert_id: &str) {
+        self.waiting.remove(alert_id);
+    }
+
+    /// Every waiting incident past its deadline, removed as it is handed back
+    /// so one incident escalates exactly once.
+    pub fn expired(&mut self, now_ms: u64) -> Vec<Due> {
+        let mut ids: Vec<String> = self
+            .waiting
+            .iter()
+            .filter(|(_, w)| now_ms >= w.deadline_ms)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids.into_iter()
+            .filter_map(|id| self.waiting.remove(&id).map(|w| Due {
+                alert_id: id,
+                created_at: w.created_at,
+                facts: w.facts,
+                asg: w.asg,
+            }))
+            .collect()
+    }
+
+    /// Waiting incidents to re-check this poll — **at most one per group**,
+    /// and claiming that group so a new alert on it defers.
+    ///
+    /// Sorted by alert id: the feed's order is not stable, and a poll that
+    /// acts in a different order every time is untestable and unreadable in a
+    /// log.
+    pub fn pending(&mut self, now_ms: u64) -> Vec<Due> {
+        let mut ids: Vec<String> = self
+            .waiting
+            .iter()
+            .filter(|(_, w)| now_ms < w.deadline_ms)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+
+        let mut out = Vec::new();
+        for id in ids {
+            let Some(w) = self.waiting.get(&id) else { continue };
+            if self.claimed.contains_key(&w.asg) {
+                continue;
+            }
+            self.claimed.insert(w.asg.clone(), id.clone());
+            out.push(Due {
+                alert_id: id,
+                created_at: w.created_at.clone(),
+                facts: w.facts.clone(),
+                asg: w.asg.clone(),
+            });
+        }
+        out
+    }
+
+    /// For the heartbeat.
+    pub fn waiting_count(&self) -> usize {
+        self.waiting.len()
     }
 }
 
@@ -1146,5 +1335,163 @@ Runbook: https://example.invalid/runbook
             decide(&aged_facts(), &v, Kind::Ordinary, &HistoryVerdict::Clean),
             Decision::Terminate { .. }
         ));
+    }
+
+    const ASG: &str = "prod-cassandra-asg";
+    const OTHER_ASG: &str = "prod-kafka-asg";
+
+    fn timing() -> Timing {
+        Timing { retry_window_ms: 20 * 60 * 1000 }
+    }
+
+    fn state() -> InstanceAgeState {
+        InstanceAgeState::new(timing())
+    }
+
+    #[test]
+    fn a_first_sighting_acts_and_a_second_look_at_the_same_alert_does_not() {
+        let mut s = state();
+        s.begin_poll();
+        assert_eq!(s.consider("a1", ASG, 0), Action::AckAndAct);
+        assert!(s.is_seen("a1"));
+        s.begin_poll();
+        assert_eq!(s.consider("a1", ASG, 0), Action::Ignore);
+    }
+
+    #[test]
+    fn only_one_alert_per_group_acts_in_a_poll_and_the_loser_is_not_marked_seen() {
+        // Two alerts on one group landing together would otherwise both read a
+        // healthy group and both terminate, before either read reflected the
+        // other.
+        let mut s = state();
+        s.begin_poll();
+        assert_eq!(s.consider("a1", ASG, 0), Action::AckAndAct);
+        match s.consider("a2", ASG, 0) {
+            Action::Deferred { holder } => assert_eq!(holder, "a1"),
+            other => panic!("expected the second alert to defer, got {other:?}"),
+        }
+        assert!(
+            !s.is_seen("a2"),
+            "a deferred alert must be reconsidered next poll, not swallowed"
+        );
+        // A different group is unaffected.
+        assert_eq!(s.consider("a3", OTHER_ASG, 0), Action::AckAndAct);
+
+        // Next poll the claim is gone and a2 gets its turn.
+        s.begin_poll();
+        assert_eq!(s.consider("a2", ASG, 0), Action::AckAndAct);
+    }
+
+    #[test]
+    fn a_waiting_incident_is_handed_back_every_poll_until_its_window_runs_out() {
+        let mut s = state();
+        let f = aged_facts();
+        s.begin_poll();
+        assert_eq!(s.consider("a1", ASG, 0), Action::AckAndAct);
+        s.begin_wait("a1", "2026-09-17T14:03:11Z", &f, ASG, 0);
+        assert_eq!(s.waiting_count(), 1);
+
+        // Five minutes later: still pending, not expired.
+        s.begin_poll();
+        assert!(s.expired(5 * 60 * 1000).is_empty());
+        let p = s.pending(5 * 60 * 1000);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].alert_id, "a1");
+        assert_eq!(p[0].asg, ASG);
+        assert_eq!(p[0].created_at, "2026-09-17T14:03:11Z");
+        assert_eq!(p[0].facts, f, "the facts travel with the incident, parsed once");
+
+        // Past the window: expired exactly once, and gone.
+        s.begin_poll();
+        let e = s.expired(21 * 60 * 1000);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].alert_id, "a1");
+        assert_eq!(s.waiting_count(), 0);
+        s.begin_poll();
+        assert!(s.expired(60 * 60 * 1000).is_empty(), "it escalates once, not every poll");
+    }
+
+    #[test]
+    fn waiting_again_never_pushes_the_deadline_out() {
+        // Refreshing on every poll is how an incident waits forever and never
+        // escalates.
+        let mut s = state();
+        let f = aged_facts();
+        s.begin_wait("a1", "t", &f, ASG, 0);
+        s.begin_wait("a1", "t", &f, ASG, 10 * 60 * 1000);
+        s.begin_wait("a1", "t", &f, ASG, 19 * 60 * 1000);
+        s.begin_poll();
+        assert_eq!(
+            s.expired(21 * 60 * 1000).len(),
+            1,
+            "the deadline is still 20 minutes after the FIRST wait"
+        );
+    }
+
+    #[test]
+    fn a_pending_re_check_claims_its_group_so_a_new_alert_on_it_defers() {
+        let mut s = state();
+        let f = aged_facts();
+        s.begin_wait("a1", "t", &f, ASG, 0);
+        s.begin_poll();
+        assert_eq!(s.pending(1000).len(), 1);
+        assert!(
+            matches!(s.consider("a2", ASG, 1000), Action::Deferred { .. }),
+            "the waiting incident holds the group for this poll"
+        );
+    }
+
+    #[test]
+    fn only_one_waiting_incident_per_group_is_handed_back_per_poll() {
+        let mut s = state();
+        let f = aged_facts();
+        s.begin_wait("a1", "t", &f, ASG, 0);
+        s.begin_wait("a2", "t", &f, ASG, 0);
+        s.begin_wait("a3", "t", &f, OTHER_ASG, 0);
+        s.begin_poll();
+        let p = s.pending(1000);
+        assert_eq!(p.len(), 2, "one per group, not one per incident");
+        let groups: Vec<&str> = p.iter().map(|d| d.asg.as_str()).collect();
+        assert!(groups.contains(&ASG) && groups.contains(&OTHER_ASG));
+    }
+
+    #[test]
+    fn finishing_an_incident_drops_it_and_frees_nothing_else() {
+        let mut s = state();
+        let f = aged_facts();
+        s.begin_wait("a1", "t", &f, ASG, 0);
+        s.begin_wait("a2", "t", &f, OTHER_ASG, 0);
+        s.finish("a1");
+        assert_eq!(s.waiting_count(), 1);
+        s.begin_poll();
+        let left: Vec<String> = s.pending(1000).into_iter().map(|d| d.alert_id).collect();
+        assert_eq!(left, vec!["a2".to_string()], "the finished one is gone, the other is not");
+        s.finish("nobody");
+        assert_eq!(s.waiting_count(), 1, "finishing an unknown id is a no-op");
+    }
+
+    #[test]
+    fn the_handed_back_order_is_stable() {
+        // The API's order is not, and a poll that acts in a different order
+        // every time is untestable and unreadable in a log.
+        let mut s = state();
+        let f = aged_facts();
+        for id in ["a3", "a1", "a2"] {
+            s.begin_wait(id, "t", &f, &format!("asg-{id}"), 0);
+        }
+        s.begin_poll();
+        let ids: Vec<String> = s.pending(1000).into_iter().map(|d| d.alert_id).collect();
+        assert_eq!(ids, vec!["a1".to_string(), "a2".to_string(), "a3".to_string()]);
+    }
+
+    #[test]
+    fn the_timing_comes_from_the_feature_and_zero_means_the_default() {
+        let t = Timing::from_feature(&InstanceAgeFeature::default());
+        assert_eq!(t.retry_window_ms, 20 * 60 * 1000);
+        let t = Timing::from_feature(&InstanceAgeFeature {
+            retry_window_mins: 3,
+            ..Default::default()
+        });
+        assert_eq!(t.retry_window_ms, 3 * 60 * 1000);
     }
 }
