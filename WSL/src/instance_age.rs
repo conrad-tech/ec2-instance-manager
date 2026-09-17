@@ -104,9 +104,78 @@ pub fn parse_facts(description: &str) -> AlertFacts {
     }
 }
 
+/// `true` when `hay` contains `needle`, case-insensitively. **A blank needle
+/// matches nothing** — an unconfigured rule must not match every alert on the
+/// feed and start terminating instances. The same helper, with the same rule,
+/// as `reaper::contains_ci` and `unhealthy_host::contains_ci`.
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    let n = needle.trim();
+    if n.is_empty() {
+        return false;
+    }
+    hay.to_ascii_lowercase().contains(&n.to_ascii_lowercase())
+}
+
+/// Is this the right *kind* of alert?
+///
+/// Reads the three fields the other watchers read, in the same order, and only
+/// `alertname` by name — never the whole `extraProperties` map, which carries
+/// a flattened `{{extraProperties}}` copy of itself.
+///
+/// **Answers "is this an instance-age alert", not "is it ours"** — see
+/// [`names_an_app`] for the second half. Cheap: every field it reads comes
+/// with the alert *list*, so an alert on somebody else's feed is declined
+/// without a per-alert read.
+pub fn identifies(alert: &crate::alerts::Alert, cfg: &crate::features::InstanceAgeFeature) -> bool {
+    let alertname = alert.extra.get("alertname").map(String::as_str).unwrap_or("");
+    contains_ci(alertname, &cfg.alertname_contains)
+        || contains_ci(&alert.app, &cfg.app_contains)
+        || contains_ci(&alert.message, &cfg.message_contains)
+}
+
+/// Does the alert name an application this watcher may act on?
+///
+/// Reads the `Application:` line parsed out of the **description**, not the
+/// `App:` tag — that is the field this feed has been observed serving as an
+/// unrendered `{{…}}` template, which is also why the config field is called
+/// `applications` and not `app_names`: two adjacent `app_*` rules reading
+/// different sources is how somebody fills in the wrong one.
+///
+/// **An empty list matches nothing, and so does a blank entry.** An empty
+/// string is a substring of everything, so one stray `""` would quietly turn
+/// the list back into "every app on the feed".
+pub fn names_an_app(facts: &AlertFacts, cfg: &crate::features::InstanceAgeFeature) -> bool {
+    cfg.applications
+        .iter()
+        .any(|app| contains_ci(&facts.application, app))
+}
+
+/// Is this alert ours to act on? **Reaper wins, and so does the unhealthy-host
+/// watcher.**
+///
+/// Those two already have a fix and a terminate of their own for the alarms
+/// they claim, and one alarm being handled twice is the failure this exists to
+/// prevent — whether or not either happens to be armed on this machine, for
+/// the reason `unhealthy_host::claims` ignores reaper's `enabled` flag.
+///
+/// Note this is only the list-level half; the caller must also check
+/// [`names_an_app`] once the description has been read.
+pub fn claims(
+    alert: &crate::alerts::Alert,
+    cfg: &crate::features::InstanceAgeFeature,
+    reaper_cfg: &crate::features::ReaperFeature,
+    unhealthy_cfg: &crate::features::UnhealthyHostFeature,
+) -> bool {
+    identifies(alert, cfg)
+        && !reaper::identifies(alert, reaper_cfg)
+        && !crate::unhealthy_host::identifies(alert, unhealthy_cfg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alerts::Alert;
+    use crate::features::{InstanceAgeFeature, ReaperFeature, UnhealthyHostFeature};
 
     const REAL: &str = "\
 Instance has exceeded its maximum age and should be recycled.
@@ -217,5 +286,124 @@ Runbook: https://example.invalid/runbook
         let f = parse_facts("just some prose\nSeverity: critical\nRegion: eu-west-1\n");
         assert_eq!(f.region, "eu-west-1");
         assert!(f.application.is_empty());
+    }
+
+    fn cfg() -> InstanceAgeFeature {
+        InstanceAgeFeature {
+            enabled: true,
+            allowed_users: vec!["bconrad".to_string()],
+            message_contains: "InstanceAge".to_string(),
+            applications: vec!["cassandra".to_string()],
+            vault_name_contains: "vault".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn reaper_cfg() -> ReaperFeature {
+        ReaperFeature {
+            enabled: true,
+            allowed_users: vec!["bconrad".to_string()],
+            alertname_contains: "reaper".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn uh_cfg() -> UnhealthyHostFeature {
+        UnhealthyHostFeature {
+            enabled: true,
+            allowed_users: vec!["bconrad".to_string()],
+            message_contains: "UnHealthyHostCount".to_string(),
+            title_app_names: vec!["prod".to_string()],
+            ..Default::default()
+        }
+    }
+
+    fn alert(title: &str) -> Alert {
+        Alert {
+            id: "a1".to_string(),
+            status: "open".to_string(),
+            message: title.to_string(),
+            created_at: "2026-09-17T14:03:11Z".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn facts(app: &str) -> AlertFacts {
+        AlertFacts { application: app.to_string(), ..Default::default() }
+    }
+
+    #[test]
+    fn each_contains_rule_identifies_on_its_own_field() {
+        let mut c = InstanceAgeFeature::default();
+
+        c.message_contains = "InstanceAge".to_string();
+        assert!(identifies(&alert("prod-cassandra-InstanceAge-Warning"), &c));
+        assert!(identifies(&alert("PROD-INSTANCEAGE"), &c), "case-insensitive");
+        assert!(!identifies(&alert("prod-cassandra-UnHealthyHostCount"), &c));
+
+        let mut c = InstanceAgeFeature::default();
+        c.alertname_contains = "instance_age".to_string();
+        let mut a = alert("anything");
+        a.extra.insert("alertname".to_string(), "aws_instance_age".to_string());
+        assert!(identifies(&a, &c));
+
+        let mut c = InstanceAgeFeature::default();
+        c.app_contains = "cass".to_string();
+        let mut a = alert("anything");
+        a.app = "cassandra".to_string();
+        assert!(identifies(&a, &c));
+    }
+
+    #[test]
+    fn a_build_with_every_rule_blank_identifies_nothing() {
+        // The shipped state. An unconfigured watcher must not claim every
+        // alert on somebody else's feed.
+        let c = InstanceAgeFeature::default();
+        assert!(!identifies(&alert("prod-cassandra-InstanceAge-Warning"), &c));
+        let mut a = alert("x");
+        a.app = "cassandra".to_string();
+        a.extra.insert("alertname".to_string(), "instance_age".to_string());
+        assert!(!identifies(&a, &c));
+    }
+
+    #[test]
+    fn the_application_list_narrows_and_an_empty_or_blank_list_names_nobody() {
+        let c = cfg();
+        assert!(names_an_app(&facts("cassandra"), &c));
+        assert!(names_an_app(&facts("CASSANDRA-01"), &c), "substring, any case");
+        assert!(!names_an_app(&facts("kafka"), &c));
+
+        let empty = InstanceAgeFeature { applications: vec![], ..cfg() };
+        assert!(!names_an_app(&facts("cassandra"), &empty));
+
+        let blank = InstanceAgeFeature { applications: vec!["".to_string()], ..cfg() };
+        assert!(
+            !names_an_app(&facts("cassandra"), &blank),
+            "an empty needle is a substring of everything and must claim nothing"
+        );
+
+        assert!(
+            !names_an_app(&facts(""), &c),
+            "an application that could not be read names nobody"
+        );
+    }
+
+    #[test]
+    fn reaper_and_the_unhealthy_host_watcher_both_win_over_this_one() {
+        // One alarm must never be both fixed and terminated, whether or not
+        // those watchers happen to be armed on this machine.
+        let mut reaper_alert = alert("prod-reaper-InstanceAge-Warning");
+        reaper_alert
+            .extra
+            .insert("alertname".to_string(), "reaper-down".to_string());
+        assert!(identifies(&reaper_alert, &cfg()));
+        assert!(!claims(&reaper_alert, &cfg(), &reaper_cfg(), &uh_cfg()));
+
+        let uh_alert = alert("prod-cassandra-UnHealthyHostCount-InstanceAge");
+        assert!(identifies(&uh_alert, &cfg()));
+        assert!(!claims(&uh_alert, &cfg(), &reaper_cfg(), &uh_cfg()));
+
+        let ours = alert("prod-cassandra-InstanceAge-Warning");
+        assert!(claims(&ours, &cfg(), &reaper_cfg(), &uh_cfg()));
     }
 }
