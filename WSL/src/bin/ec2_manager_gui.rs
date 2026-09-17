@@ -51790,6 +51790,42 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert!(f.contains("terminate_instance("), "it must still terminate");
         }
 
+        /// The escalation send must never run on the poll thread. This got
+        /// written inline once and only reading the callee's doc comment
+        /// caught it, so it is pinned rather than left to be noticed again.
+        #[test]
+        fn the_instance_age_escalation_is_sent_off_the_poll_thread() {
+            let src = include_str!("ec2_manager_gui.rs");
+            // Above `mod tests {` only, so the scan cannot match its own
+            // text — this assertion names `thread::spawn` itself, and
+            // without the cut it would pass no matter what the poll does.
+            // Every source scan in this file is sliced this way for that
+            // reason.
+            let body = &src[..src.find("    mod tests {").expect("the test module")];
+            let poll = body.find("fn start_instance_age_poll").expect("the poll thread");
+            let poll_end = poll + body[poll..].find("\n    fn ").expect("the next function");
+            let f = &body[poll..poll_end];
+
+            // The closure's own body, ending where the next binding in the
+            // same scope begins. Slicing to the end of the function instead
+            // would match the `thread::spawn` of anything else in it, so the
+            // test would pass however `escalate` were written.
+            let start = f.find("let escalate =").expect("the escalate closure");
+            let end = start + f[start..].find("let run_one =").expect("the binding after it");
+            let escalate = &f[start..end];
+
+            assert!(
+                escalate.contains("thread::spawn"),
+                "the escalation send must be spawned, not run here. \
+                 `send_escalation_email` drives Outlook COM through PowerShell and takes \
+                 seconds; run inline it stalls the whole poll — the `expired` sweep, the \
+                 `pending` re-reads and the new-alert pass all sit behind it — so a hung mail \
+                 client makes the watcher stop terminating AND stop escalating. \
+                 `start_unhealthy_host_poll` spawns its own send for the same reason. \
+                 Found in: {escalate}"
+            );
+        }
+
         /// A user on none of the watchers' allow-lists sees none of their log
         /// lines and is offered no dropdown — the whole point of the gate.
         #[test]
