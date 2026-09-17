@@ -3980,6 +3980,22 @@ mod gui {
         Failed(String),
     }
 
+    /// How long a successful dry-run / escalation line stays under the Alert
+    /// ID box before clearing itself. Same interval as [`POWER_OK_BANNER`]:
+    /// long enough to read, short enough not to look like a permanent banner.
+    /// Failures stay until the next action — those need a dismiss or a
+    /// follow-up run.
+    const ALERT_ACTION_OK_BANNER: Duration = Duration::from_secs(30);
+
+    /// Whether a success line under the Alert ID box has outlived its welcome.
+    ///
+    /// Pure over an age so the 30s hide is pinned by a test rather than by
+    /// reading the render path. Only `Ok` ages out; `Running` and `Failed`
+    /// are never expired by this.
+    fn alert_action_ok_expired(status: &AlertActionStatus, age: Duration) -> bool {
+        matches!(status, AlertActionStatus::Ok(_)) && age >= ALERT_ACTION_OK_BANNER
+    }
+
     impl AlertActionStatus {
         fn color(&self) -> egui::Color32 {
             match self {
@@ -8625,6 +8641,8 @@ mod gui {
         connections: ConnectionTabs,
         pty_sessions: HashMap<u64, PtySession>,
         terminal_selections: HashMap<u64, TerminalSelection>,
+        /// Per-connection-tab Ctrl+F find bar for the embedded terminal.
+        terminal_finds: HashMap<u64, TerminalFindState>,
         proc_tx: Sender<ProcEvent>,
         proc_rx: Receiver<ProcEvent>,
         refresh_tx: Sender<RefreshEvent>,
@@ -8956,6 +8974,9 @@ mod gui {
         /// a different tab and "nothing happened" is what a button that fired
         /// a background thread otherwise looks like.
         alert_action_status: Option<AlertActionStatus>,
+        /// When the current [`AlertActionStatus::Ok`] line was raised, for
+        /// the auto-hide. `None` while Running / Failed / cleared.
+        alert_action_ok_since: Option<Instant>,
         /// Alerts window state; `None` while the window is closed.
         alerts_window: Option<AlertsWindow>,
         /// Open alert-detail windows, one per alert id.
@@ -9529,6 +9550,7 @@ mod gui {
                 connections: ConnectionTabs::new(),
                 pty_sessions: HashMap::new(),
                 terminal_selections: HashMap::new(),
+                terminal_finds: HashMap::new(),
                 proc_tx,
                 proc_rx,
                 refresh_tx,
@@ -9662,6 +9684,7 @@ mod gui {
                 pending_run_remediation: None,
                 reaper_override: false,
                 alert_action_status: None,
+                alert_action_ok_since: None,
                 alerts_auth: resolved_alerts_auth,
                 alerts_window: None,
                 alert_windows: Vec::new(),
@@ -16869,6 +16892,7 @@ mod gui {
                 // The window says a run started; the log carries the rest.
                 // A remediation can take the whole stage-2 window, so without
                 // this the button looks like it did nothing for 15 minutes.
+                self.alert_action_ok_since = None;
                 self.alert_action_status = Some(AlertActionStatus::Running(format!(
                     "remediating alert {alert_id} — progress in the log under On-Call -> \
                      Reaper Down"
@@ -18651,6 +18675,10 @@ mod gui {
             // then exactly one outcome, so the last message is the current
             // state and there is never a queue to reconcile.
             if let Some(latest) = self.dry_run_status_rx.try_iter().last() {
+                self.alert_action_ok_since = match &latest {
+                    AlertActionStatus::Ok(_) => Some(Instant::now()),
+                    _ => None,
+                };
                 self.alert_action_status = Some(latest);
             }
 
@@ -18810,11 +18838,41 @@ mod gui {
                             // a pass run immediately.
                             ui.weak("results appear in the Logs tab");
                         });
+                        // A finished success hides itself after
+                        // `ALERT_ACTION_OK_BANNER`; a failure stays until the
+                        // next action. Expiry is judged here, at render, and
+                        // a repaint is requested for the instant it falls due
+                        // — egui only redraws when something happens, so a
+                        // timer merely *checked* on a frame fires whenever
+                        // the next frame happens to occur. Same mistake the
+                        // tunnel / power banners already made and fixed.
+                        //
+                        // Decide first, then mutate — clearing while `st` is
+                        // borrowed does not compile, and a timer that is only
+                        // *checked* on a frame needs `request_repaint_after`
+                        // for the remaining time or it overstays.
+                        let mut clear_ok = false;
+                        let mut repaint_in = None;
+                        if let (Some(st), Some(at)) =
+                            (self.alert_action_status.as_ref(), self.alert_action_ok_since)
+                        {
+                            let age = at.elapsed();
+                            if alert_action_ok_expired(st, age) {
+                                clear_ok = true;
+                            } else if matches!(st, AlertActionStatus::Ok(_)) {
+                                repaint_in = Some(ALERT_ACTION_OK_BANNER.saturating_sub(age));
+                            }
+                        }
+                        if clear_ok {
+                            self.alert_action_status = None;
+                            self.alert_action_ok_since = None;
+                        } else if let Some(delay) = repaint_in {
+                            ui.ctx().request_repaint_after(delay);
+                        }
                         if let Some(st) = &self.alert_action_status {
-                            // Under the box, and it stays until the next
-                            // action: yellow while running, green on success,
-                            // red on failure. Through `note_label`, like every
-                            // other status-coloured line here -- a direct
+                            // Yellow while running, green on success, red on
+                            // failure. Through `note_label`, like every other
+                            // status-coloured line here -- a direct
                             // `colored_label` stays thin on a light panel, and
                             // there is a test that says so.
                             ui.horizontal_wrapped(|ui| {
@@ -18973,6 +19031,7 @@ mod gui {
             if let Some(id) = dry_run_alert_id {
                 // Replaced on every submit: a stale outcome under the box
                 // after a fresh run is worse than none at all.
+                self.alert_action_ok_since = None;
                 self.alert_action_status =
                     Some(AlertActionStatus::Running(format!("testing alert {id}…")));
                 self.log_reaper(
@@ -23567,6 +23626,7 @@ mod gui {
                 }
                 self.pty_sessions.remove(&tab_id);
                 self.terminal_selections.remove(&tab_id);
+                self.terminal_finds.remove(&tab_id);
                 let _ = self.proc_tx.send(ProcEvent::Exited { tab_id, code });
             }
 
@@ -23782,6 +23842,7 @@ mod gui {
             // Dropping the Arc kills the hidden control-channel shell.
             self.control_channels.remove(&tab_id);
             self.terminal_selections.remove(&tab_id);
+                self.terminal_finds.remove(&tab_id);
             self.connections.close(tab_id);
             self.log_info(format!("closed connection tab id={tab_id}"));
         }
@@ -24992,7 +25053,38 @@ mod gui {
             let screen_rows = self.pty_sessions.get(&tab_id)
                 .map(|s| s.parser.screen().size().0 as usize)
                 .unwrap_or(45);
+            let has_editors = self
+                .file_browsers
+                .get(&tab_id)
+                .is_some_and(|fb| !fb.editor_tabs.is_empty());
+            let find_owns = terminal_find_owns_ctrl_f(has_editors);
+            let find_open = self
+                .terminal_finds
+                .get(&tab_id)
+                .is_some_and(|f| f.open);
             for event in events {
+                // Terminal Ctrl+F find bar: do not forward the keys it owns.
+                // Ctrl+F opens the bar (and must not send 0x06); Esc / F3 are
+                // handled while the bar is open in the Connections render path.
+                if let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = &event
+                {
+                    if find_owns
+                        && *key == egui::Key::F
+                        && (modifiers.ctrl || modifiers.command)
+                    {
+                        continue;
+                    }
+                    if find_open
+                        && matches!(*key, egui::Key::Escape | egui::Key::F3)
+                    {
+                        continue;
+                    }
+                }
                 // Intercept Shift+PageUp/Down/Home/End for scrollback navigation.
                 // Only when not on alternate screen (vim, less, htop handle their own scrolling).
                 if !on_alt_screen {
@@ -30809,6 +30901,225 @@ mod gui {
                                 }
                             }
 
+                            // --- Terminal Ctrl+F (only when no editor tabs) ---
+                            // Editor find owns Ctrl+F whenever editor tabs exist;
+                            // otherwise this bar searches the active PTY scrollback.
+                            let mut find_for_layout: Option<(Vec<TermFindMatch>, usize, usize)> =
+                                None;
+                            if terminal_find_owns_ctrl_f(has_editors) {
+                                let (mut find_open, mut find_query, mut find_current, mut want_focus, mut want_scroll) =
+                                    self.terminal_finds
+                                        .get(&tab_id)
+                                        .map(|f| {
+                                            (
+                                                f.open,
+                                                f.query.clone(),
+                                                f.current,
+                                                f.focus,
+                                                f.scroll,
+                                            )
+                                        })
+                                        .unwrap_or((false, String::new(), 0, false, false));
+
+                                let (ctrl_f, esc_pressed, mut do_next, mut do_prev) = ui.input(|i| {
+                                    let mut cf = false;
+                                    let mut esc = false;
+                                    let mut nx = false;
+                                    let mut pv = false;
+                                    for e in &i.events {
+                                        if let egui::Event::Key {
+                                            key,
+                                            pressed: true,
+                                            modifiers,
+                                            ..
+                                        } = e
+                                        {
+                                            match key {
+                                                egui::Key::F
+                                                    if modifiers.ctrl || modifiers.command =>
+                                                {
+                                                    cf = true
+                                                }
+                                                egui::Key::Escape => esc = true,
+                                                egui::Key::F3 => {
+                                                    if modifiers.shift {
+                                                        pv = true;
+                                                    } else {
+                                                        nx = true;
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    (cf, esc, nx, pv)
+                                });
+                                if ctrl_f {
+                                    find_open = true;
+                                    want_focus = true;
+                                }
+                                if esc_pressed && find_open {
+                                    find_open = false;
+                                }
+
+                                let mut matches: Vec<TermFindMatch> = Vec::new();
+                                let mut query_changed = false;
+                                if find_open {
+                                    let prev_query = find_query.clone();
+                                    ui.horizontal(|ui| {
+                                        ui.label("Find:");
+                                        let resp = ui.add(
+                                            egui::TextEdit::singleline(&mut find_query)
+                                                .desired_width(220.0)
+                                                .hint_text("search terminal"),
+                                        );
+                                        if want_focus {
+                                            resp.request_focus();
+                                            want_focus = false;
+                                        }
+                                        if resp.lost_focus()
+                                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                        {
+                                            if ui.input(|i| i.modifiers.shift) {
+                                                do_prev = true;
+                                            } else {
+                                                do_next = true;
+                                            }
+                                            want_focus = true;
+                                        }
+
+                                        if let Some(session) =
+                                            self.pty_sessions.get_mut(&tab_id)
+                                        {
+                                            let rows = collect_terminal_find_rows(
+                                                &mut session.parser,
+                                            );
+                                            let borrowed: Vec<(usize, &str)> = rows
+                                                .iter()
+                                                .map(|(a, t)| (*a, t.as_str()))
+                                                .collect();
+                                            matches = find_matches_in_terminal_rows(
+                                                &borrowed,
+                                                &find_query,
+                                            );
+                                        }
+
+                                        if ui
+                                            .small_button("◀")
+                                            .on_hover_text(
+                                                "Previous (Shift+Enter / Shift+F3)",
+                                            )
+                                            .clicked()
+                                        {
+                                            do_prev = true;
+                                        }
+                                        if ui
+                                            .small_button("▶")
+                                            .on_hover_text("Next (Enter / F3)")
+                                            .clicked()
+                                        {
+                                            do_next = true;
+                                        }
+
+                                        let counter = if find_query.is_empty() {
+                                            String::new()
+                                        } else if matches.is_empty() {
+                                            "No matches".to_string()
+                                        } else {
+                                            let shown =
+                                                find_current.min(matches.len() - 1) + 1;
+                                            format!("{shown}/{}", matches.len())
+                                        };
+                                        ui.label(counter);
+
+                                        // Plain ASCII "X" — egui's fonts lack ✕.
+                                        if ui
+                                            .small_button("X")
+                                            .on_hover_text("Close (Esc)")
+                                            .clicked()
+                                        {
+                                            find_open = false;
+                                        }
+                                    });
+                                    query_changed = find_query != prev_query;
+                                }
+
+                                if query_changed {
+                                    find_current = 0;
+                                    if !matches.is_empty() {
+                                        want_scroll = true;
+                                    }
+                                }
+                                if matches.is_empty() {
+                                    find_current = 0;
+                                } else {
+                                    if find_current >= matches.len() {
+                                        find_current = 0;
+                                    }
+                                    if do_next {
+                                        find_current =
+                                            cycle_find_index(find_current, matches.len(), true);
+                                        want_scroll = true;
+                                    }
+                                    if do_prev {
+                                        find_current =
+                                            cycle_find_index(find_current, matches.len(), false);
+                                        want_scroll = true;
+                                    }
+                                }
+
+                                if want_scroll {
+                                    if let Some(m) = matches.get(find_current) {
+                                        if let Some(session) =
+                                            self.pty_sessions.get_mut(&tab_id)
+                                        {
+                                            let vr = session.parser.screen().size().0;
+                                            session.parser.screen_mut().set_scrollback(
+                                                usize::MAX,
+                                            );
+                                            let max_sb =
+                                                session.parser.screen().scrollback();
+                                            session.parser.screen_mut().set_scrollback(0);
+                                            session.scroll_offset =
+                                                scroll_offset_to_reveal_abs_row(
+                                                    m.abs_row,
+                                                    vr,
+                                                    max_sb,
+                                                    session.scroll_offset,
+                                                );
+                                        }
+                                    }
+                                    want_scroll = false;
+                                }
+
+                                if find_open && !matches.is_empty() {
+                                    let off = self
+                                        .pty_sessions
+                                        .get(&tab_id)
+                                        .map(|s| s.scroll_offset)
+                                        .unwrap_or(0);
+                                    find_for_layout =
+                                        Some((matches, find_current, off));
+                                }
+
+                                let entry = self.terminal_finds.entry(tab_id).or_default();
+                                entry.open = find_open;
+                                entry.query = find_query;
+                                entry.current = find_current;
+                                entry.focus = want_focus;
+                                entry.scroll = want_scroll;
+                                if !find_open {
+                                    // Keep query/current so reopening Ctrl+F
+                                    // resumes where the user left off (same as
+                                    // the file-editor find bar).
+                                    entry.focus = false;
+                                    entry.scroll = false;
+                                }
+                            } else if let Some(f) = self.terminal_finds.get_mut(&tab_id) {
+                                // Editor owns Ctrl+F — drop any leftover terminal find.
+                                *f = TerminalFindState::default();
+                            }
+
                             // --- Terminal panel (bottom / full when no editor) ---
                             let terminal_response = egui::Frame::NONE
                                 .fill(banner_fill)
@@ -30857,11 +31168,15 @@ mod gui {
                                                             };
                                                             let cursor_visible = show_cursor && effective_offset == 0;
                                                             let layout_sel = norm_sel.map(|(s, e)| (s, e, effective_offset));
+                                                            let layout_find = find_for_layout.as_ref().map(|(m, cur, off)| {
+                                                                (m.as_slice(), *cur, *off)
+                                                            });
                                                             let job = terminal_layout_job(
                                                                 session.parser.screen(),
                                                                 cursor_visible,
                                                                 font_id.clone(),
                                                                 layout_sel,
+                                                                layout_find,
                                                             );
                                                             if effective_offset > 0 {
                                                                 session.parser.screen_mut().set_scrollback(0);
@@ -39306,16 +39621,23 @@ mod gui {
     /// Build a LayoutJob for terminal content.  When `selection` is provided
     /// (start, end, scroll_offset), selected cells get a highlight background
     /// baked directly into the galley so it is pixel-perfect on every display.
+    /// `find` is `(matches, current_index, scroll_offset)` for Ctrl+F; find
+    /// colours override the selection on matched cells (current is strongest).
     fn terminal_layout_job(
         screen: &vt100::Screen,
         show_cursor: bool,
         font_id: egui::FontId,
         selection: Option<(AbsPos, AbsPos, usize)>,
+        find: Option<(&[TermFindMatch], usize, usize)>,
     ) -> egui::text::LayoutJob {
         let (rows, cols) = screen.size();
         let default_fg = terminal_panel_text();
         let default_bg = terminal_panel_fill();
         let highlight_bg = egui::Color32::from_rgba_unmultiplied(60, 120, 220, 180);
+        // Terminal panel is always dark — same amber pair the editor uses
+        // in dark mode, so a match stays readable on black cells.
+        let find_match_bg = egui::Color32::from_rgba_unmultiplied(94, 94, 40, 200);
+        let find_current_bg = egui::Color32::from_rgba_unmultiplied(170, 120, 30, 220);
         let cursor = if show_cursor && !screen.hide_cursor() {
             Some(screen.cursor_position())
         } else {
@@ -39368,6 +39690,16 @@ mod gui {
                         && !(abs_r == end.abs_row && col > end.col);
                     if in_sel {
                         format.background = highlight_bg;
+                    }
+                }
+
+                // Ctrl+F highlights override selection on matched cells.
+                if let Some((matches, current, scroll_off)) = find {
+                    let abs_r = screen_row_to_abs(row, scroll_off, rows);
+                    match cell_in_term_find(abs_r, col, matches, current) {
+                        TermFindCell::Current => format.background = find_current_bg,
+                        TermFindCell::Match => format.background = find_match_bg,
+                        TermFindCell::None => {}
                     }
                 }
 
@@ -39442,6 +39774,159 @@ mod gui {
         let col = (x / cell_w).floor().max(0.0) as u16;
         let row = (y / cell_h).floor().max(0.0) as u16;
         (row.min(rows.saturating_sub(1)), col.min(cols.saturating_sub(1)))
+    }
+
+    /// One hit from Ctrl+F in a connection terminal. Columns are inclusive,
+    /// matching the selection highlight's own cell range.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct TermFindMatch {
+        abs_row: usize,
+        col_start: u16,
+        col_end: u16,
+    }
+
+    /// How a cell sits relative to the open terminal find query.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TermFindCell {
+        None,
+        Match,
+        Current,
+    }
+
+    /// Per-tab Ctrl+F state for the Connections terminal (mirrors the
+    /// file-editor find bar; kept separate so the two cannot collide).
+    #[derive(Clone, Debug, Default)]
+    struct TerminalFindState {
+        open: bool,
+        query: String,
+        current: usize,
+        /// Request focus on the find box next frame.
+        focus: bool,
+        /// Scroll the terminal so `current` is on screen next frame.
+        scroll: bool,
+    }
+
+    /// True when Connections Ctrl+F should search the terminal rather than
+    /// deferring to the file-editor find bar. Editor tabs take priority.
+    fn terminal_find_owns_ctrl_f(has_editor_tabs: bool) -> bool {
+        !has_editor_tabs
+    }
+
+    /// Case-insensitive find over terminal rows. `rows` is oldest→newest
+    /// (high `abs_row` first); matches keep that order, left-to-right in a
+    /// row. Caps at `FIND_MAX_MATCHES` like the editor find.
+    fn find_matches_in_terminal_rows(rows: &[(usize, &str)], query: &str) -> Vec<TermFindMatch> {
+        let mut out = Vec::new();
+        if query.is_empty() {
+            return out;
+        }
+        let q: Vec<char> = query.chars().collect();
+        let m = q.len();
+        if m == 0 {
+            return out;
+        }
+        for &(abs_row, text) in rows {
+            let chars: Vec<char> = text.chars().collect();
+            let n = chars.len();
+            if m > n {
+                continue;
+            }
+            let mut i = 0usize;
+            while i + m <= n {
+                let mut k = 0usize;
+                while k < m
+                    && chars[i + k].to_ascii_lowercase() == q[k].to_ascii_lowercase()
+                {
+                    k += 1;
+                }
+                if k == m {
+                    out.push(TermFindMatch {
+                        abs_row,
+                        col_start: i as u16,
+                        col_end: (i + m - 1) as u16,
+                    });
+                    if out.len() >= FIND_MAX_MATCHES {
+                        return out;
+                    }
+                    i += m;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Scroll offset that puts `abs_row` on screen. Leaves `current_offset`
+    /// alone when the row is already visible so cycling nearby matches does
+    /// not jump the viewport.
+    fn scroll_offset_to_reveal_abs_row(
+        abs_row: usize,
+        visible_rows: u16,
+        max_scroll: usize,
+        current_offset: usize,
+    ) -> usize {
+        let vr = visible_rows.max(1) as usize;
+        let top = current_offset + vr - 1;
+        if abs_row >= current_offset && abs_row <= top {
+            return current_offset.min(max_scroll);
+        }
+        // Place the match about a third of the way down the viewport.
+        let desired_top = abs_row + (vr / 3);
+        desired_top.saturating_sub(vr - 1).min(max_scroll)
+    }
+
+    fn cycle_find_index(current: usize, len: usize, next: bool) -> usize {
+        if len == 0 {
+            return 0;
+        }
+        if next {
+            (current + 1) % len
+        } else {
+            (current + len - 1) % len
+        }
+    }
+
+    fn cell_in_term_find(
+        abs_row: usize,
+        col: u16,
+        matches: &[TermFindMatch],
+        current: usize,
+    ) -> TermFindCell {
+        for (i, m) in matches.iter().enumerate() {
+            if m.abs_row == abs_row && col >= m.col_start && col <= m.col_end {
+                return if i == current {
+                    TermFindCell::Current
+                } else {
+                    TermFindCell::Match
+                };
+            }
+        }
+        TermFindCell::None
+    }
+
+    /// Dump every scrollback + viewport row as `(abs_row, text)`, oldest
+    /// first. Used by Ctrl+F; the parser's scrollback view is restored to 0
+    /// before returning so painting is undisturbed.
+    fn collect_terminal_find_rows(parser: &mut vt100::Parser) -> Vec<(usize, String)> {
+        let (vr_u, cols) = parser.screen().size();
+        let vr = vr_u as usize;
+        if vr == 0 {
+            return Vec::new();
+        }
+        parser.screen_mut().set_scrollback(usize::MAX);
+        let max_sb = parser.screen().scrollback();
+        let top_abs = max_sb + vr - 1;
+        let mut rows = Vec::with_capacity(top_abs + 1);
+        for abs in (0..=top_abs).rev() {
+            let Some((sr, _)) = set_scrollback_for_top_abs_row_checked(parser, abs) else {
+                continue;
+            };
+            let text = parser.screen().contents_between(sr, 0, sr, cols);
+            rows.push((abs, text));
+        }
+        parser.screen_mut().set_scrollback(0);
+        rows
     }
 
     /// Convert a screen row to an absolute row (scroll-invariant).
@@ -46386,6 +46871,27 @@ mod gui {
             assert!(text.ends_with('…'), "{text}");
         }
 
+        /// A successful dry-run / escalation line under the Alert ID box
+        /// clears itself after 30s; a failure does not. Without this the green
+        /// "escalation email sent to …" sat there until the next action, and
+        /// looked permanent.
+        #[test]
+        fn a_successful_alert_action_line_hides_after_thirty_seconds() {
+            let ok = AlertActionStatus::Ok("escalation email sent to ops@example.com".into());
+            let failed = AlertActionStatus::Failed("could not send".into());
+            let running = AlertActionStatus::Running("sending…".into());
+
+            assert!(!alert_action_ok_expired(&ok, Duration::from_secs(0)));
+            assert!(!alert_action_ok_expired(&ok, Duration::from_secs(29)));
+            assert!(alert_action_ok_expired(&ok, ALERT_ACTION_OK_BANNER));
+            assert!(alert_action_ok_expired(&ok, Duration::from_secs(31)));
+
+            // Failures and in-flight lines stay until the next action, however
+            // long they have been on screen.
+            assert!(!alert_action_ok_expired(&failed, Duration::from_secs(600)));
+            assert!(!alert_action_ok_expired(&running, Duration::from_secs(600)));
+        }
+
         /// Every status-coloured label goes through `note_label`, so a stray
         /// direct call would be a notification that stays thin on a light
         /// panel — the exact thing this fixes, and invisible in review. The
@@ -48434,6 +48940,7 @@ mod gui {
                 false,
                 egui::FontId::monospace(12.0),
                 None,
+                None,
             );
             let mut found_red = false;
             for section in &job.sections {
@@ -48466,8 +48973,39 @@ mod gui {
                 false,
                 egui::FontId::monospace(12.0),
                 None,
+                None,
             );
             assert!(job.text.contains("hello"));
+        }
+
+        #[test]
+        fn terminal_layout_job_paints_find_match_background() {
+            let mut parser = vt100::Parser::new(1, 10, 10);
+            parser.process(b"xxFINDyy");
+            let matches = vec![TermFindMatch {
+                abs_row: 0,
+                col_start: 2,
+                col_end: 5,
+            }];
+            // abs_row 0 at scroll_offset 0, vr=1 → screen row 0.
+            let job = terminal_layout_job(
+                parser.screen(),
+                false,
+                egui::FontId::monospace(12.0),
+                None,
+                Some((matches.as_slice(), 0, 0)),
+            );
+            let current_bg = egui::Color32::from_rgba_unmultiplied(170, 120, 30, 220);
+            let mut found = false;
+            for section in &job.sections {
+                let text = &job.text[section.byte_range.clone()];
+                if text.contains('F') {
+                    assert_eq!(section.format.background, current_bg);
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "expected find highlight on F");
         }
 
         #[test]
@@ -48711,6 +49249,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 false,
                 egui::FontId::monospace(12.0),
                 None,
+                None,
             );
             // Scroll up to see earlier content
             parser.screen_mut().set_scrollback(5);
@@ -48718,6 +49257,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 parser.screen(),
                 false,
                 egui::FontId::monospace(12.0),
+                None,
                 None,
             );
             parser.screen_mut().set_scrollback(0);
@@ -48855,6 +49395,153 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let end = AbsPos { abs_row: 4, col: 5 };
             let text = extract_selection_text(&mut parser, start, end);
             assert!(text.starts_with("line"), "got {text:?}");
+        }
+
+        #[test]
+        fn terminal_find_matches_case_insensitively_top_to_bottom() {
+            // Rows are listed oldest→newest (high abs_row first). Matches
+            // follow that reading order, left-to-right within a row.
+            let rows: Vec<(usize, &str)> = vec![
+                (5, "Alpha ERROR here"),
+                (3, "nothing"),
+                (1, "error again ERROR"),
+            ];
+            let hits = find_matches_in_terminal_rows(&rows, "error");
+            assert_eq!(
+                hits,
+                vec![
+                    TermFindMatch {
+                        abs_row: 5,
+                        col_start: 6,
+                        col_end: 10,
+                    },
+                    TermFindMatch {
+                        abs_row: 1,
+                        col_start: 0,
+                        col_end: 4,
+                    },
+                    TermFindMatch {
+                        abs_row: 1,
+                        col_start: 12,
+                        col_end: 16,
+                    },
+                ]
+            );
+        }
+
+        #[test]
+        fn terminal_find_empty_query_matches_nothing() {
+            let rows: Vec<(usize, &str)> = vec![(0, "hello")];
+            assert!(find_matches_in_terminal_rows(&rows, "").is_empty());
+        }
+
+        #[test]
+        fn scroll_offset_to_reveal_keeps_an_already_visible_row() {
+            // visible abs_rows at offset 10, vr=25 → 10..=34
+            assert_eq!(scroll_offset_to_reveal_abs_row(20, 25, 100, 10), 10);
+        }
+
+        #[test]
+        fn scroll_offset_to_reveal_moves_to_bring_a_hidden_row_on_screen() {
+            let off = scroll_offset_to_reveal_abs_row(80, 25, 100, 0);
+            let top = off + 24;
+            assert!(
+                (off..=top).contains(&80),
+                "abs_row 80 should be visible at offset {off} (range {off}..={top})"
+            );
+            assert!(off <= 100);
+        }
+
+        #[test]
+        fn cycle_find_index_wraps_both_directions() {
+            assert_eq!(cycle_find_index(0, 3, true), 1);
+            assert_eq!(cycle_find_index(2, 3, true), 0);
+            assert_eq!(cycle_find_index(0, 3, false), 2);
+            assert_eq!(cycle_find_index(0, 0, true), 0);
+        }
+
+        #[test]
+        fn cell_in_term_find_marks_current_stronger_than_other_matches() {
+            let matches = vec![
+                TermFindMatch {
+                    abs_row: 4,
+                    col_start: 2,
+                    col_end: 4,
+                },
+                TermFindMatch {
+                    abs_row: 1,
+                    col_start: 0,
+                    col_end: 2,
+                },
+            ];
+            assert_eq!(
+                cell_in_term_find(4, 3, &matches, 0),
+                TermFindCell::Current
+            );
+            assert_eq!(
+                cell_in_term_find(1, 1, &matches, 0),
+                TermFindCell::Match
+            );
+            assert_eq!(
+                cell_in_term_find(4, 0, &matches, 0),
+                TermFindCell::None
+            );
+        }
+
+        #[test]
+        fn collect_terminal_find_rows_covers_scrollback() {
+            let mut parser = vt100::Parser::new(5, 20, 100);
+            for i in 0..10 {
+                let line = format!("needle{i:02}\r\n");
+                parser.process(line.as_bytes());
+            }
+            let rows = collect_terminal_find_rows(&mut parser);
+            let joined: String = rows
+                .iter()
+                .map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                joined.contains("needle00") && joined.contains("needle09"),
+                "scrollback dump missed early/late lines: {joined:?}"
+            );
+            let hits = find_matches_in_terminal_rows(
+                &rows
+                    .iter()
+                    .map(|(a, t)| (*a, t.as_str()))
+                    .collect::<Vec<_>>(),
+                "needle05",
+            );
+            assert_eq!(hits.len(), 1, "expected one hit for needle05, got {hits:?}");
+        }
+
+        #[test]
+        fn terminal_find_owns_ctrl_f_only_without_editor_tabs() {
+            assert!(terminal_find_owns_ctrl_f(false));
+            assert!(!terminal_find_owns_ctrl_f(true));
+        }
+
+        /// Ctrl+F used to reach the PTY as 0x06 whenever the terminal had
+        /// focus. The find bar owns that chord when there are no editor tabs;
+        /// this pins the skip so a later edit cannot quietly restore the send.
+        #[test]
+        fn forward_terminal_key_input_skips_ctrl_f_when_terminal_find_owns_it() {
+            let src = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/bin/ec2_manager_gui.rs"
+            ));
+            let start = src
+                .find("fn forward_terminal_key_input(")
+                .expect("forward_terminal_key_input");
+            let body = &src[start..];
+            let end = body.find("\n        fn ").unwrap_or(body.len().min(8000));
+            let body = &body[..end];
+            assert!(
+                body.contains("terminal_find_owns_ctrl_f")
+                    && body.contains("egui::Key::F")
+                    && body.contains("continue"),
+                "Ctrl+F must be skipped when terminal find owns it"
+            );
         }
 
         #[test]
