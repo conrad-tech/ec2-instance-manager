@@ -321,12 +321,187 @@ pub fn termination_history(
     }
 }
 
+/// Everything about the group that a decision needs.
+#[derive(Clone, Debug, Default)]
+pub struct GroupView {
+    pub asg_name: String,
+    /// The group's members, from `describe-auto-scaling-groups`.
+    pub members: Vec<crate::asg::AsgInstance>,
+    /// Target health, where the group has a target group attached.
+    ///
+    /// **`None` means there is no target group — never that the read failed.**
+    /// A failed read is a `Refuse` decided by the caller, because being denied
+    /// is not the same as being told there is nothing, and the two must not
+    /// render alike.
+    pub target_health: Option<Vec<crate::reaper::TargetMember>>,
+}
+
+/// What to do about one alert.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Terminate { instance_id: String, reason: String },
+    /// The group was read fine and is not healthy enough yet. Re-checked on
+    /// the next poll until the retry window runs out.
+    Wait { reason: String },
+    /// Escalate now, and never retry. Everything except `Wait` is an answer we
+    /// do not have, and retrying an answer we cannot get is how an alert sits
+    /// acknowledged and silent.
+    Refuse { reason: String },
+}
+
+/// Is this member on its way out?
+fn is_leaving(m: &crate::asg::AsgInstance) -> bool {
+    let s = m.lifecycle_state.trim();
+    s.eq_ignore_ascii_case("Terminated")
+        || s.len() >= 11 && s[..11].eq_ignore_ascii_case("Terminating")
+}
+
+/// Is this member in good shape?
+///
+/// The target group is the authority for any member registered in it; a member
+/// it does not know about — a `Pending` instance is not registered yet — falls
+/// back to its own `InService` + `Healthy`. Skipping such a member instead
+/// would let the gate pass on a group that is one box down and one box not up.
+fn member_is_good(
+    m: &crate::asg::AsgInstance,
+    health: Option<&Vec<crate::reaper::TargetMember>>,
+) -> bool {
+    if let Some(list) = health {
+        if let Some(t) = list.iter().find(|t| t.id == m.instance_id) {
+            return t.health.eq_ignore_ascii_case("healthy");
+        }
+    }
+    m.is_serving()
+}
+
+/// Decide what to do about one instance-age alert.
+///
+/// Six rules, first to fire wins. **The order is the design** — it decides
+/// which sentence a human reads — and the recent-terminate guard sits above
+/// the Vault waiver deliberately.
+pub fn decide(
+    facts: &AlertFacts,
+    view: &GroupView,
+    kind: Kind,
+    history: &HistoryVerdict,
+) -> Decision {
+    // 1. Is it even in this group?
+    let Some(aged) = view
+        .members
+        .iter()
+        .find(|m| m.instance_id == facts.instance_id)
+    else {
+        return Decision::Refuse {
+            reason: format!(
+                "{} is not a member of {} ({} member(s): {}) — it moved, or the tag is stale",
+                facts.instance_id,
+                view.asg_name,
+                view.members.len(),
+                view.members
+                    .iter()
+                    .map(|m| m.instance_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+    };
+
+    // 2. Already going. Worded as a state, not a fault.
+    if is_leaving(aged) {
+        return Decision::Refuse {
+            reason: format!(
+                "{} is already terminating (lifecycle {}) — nothing to do",
+                facts.instance_id, aged.lifecycle_state
+            ),
+        };
+    }
+
+    // 3. Somebody said this box is not to be recycled.
+    if aged.protected_from_scale_in {
+        return Decision::Refuse {
+            reason: format!(
+                "{} has scale-in protection on — this feature does not overrule that",
+                facts.instance_id
+            ),
+        };
+    }
+
+    // 4. Has the group already lost one today? Above the Vault waiver.
+    match history {
+        HistoryVerdict::RecentTermination { detail } => {
+            return Decision::Refuse {
+                reason: format!("{} already lost an instance recently: {detail}", view.asg_name),
+            }
+        }
+        HistoryVerdict::NotFullySeen { detail } => {
+            return Decision::Refuse {
+                reason: format!(
+                    "{}'s recent activity could not be read far enough back: {detail}",
+                    view.asg_name
+                ),
+            }
+        }
+        HistoryVerdict::Clean => {}
+    }
+
+    // 5. A Vault pair is active/standby and always two: the peer being unwell
+    //    is not a reason to leave an aged box running.
+    if kind == Kind::Vault && view.members.len() == 2 {
+        return Decision::Terminate {
+            instance_id: facts.instance_id.clone(),
+            reason: format!(
+                "vault pair — the health gate does not apply, terminating {}",
+                facts.instance_id
+            ),
+        };
+    }
+
+    // 6. Every OTHER member must be in good shape. The alerted instance itself
+    //    may read anything: an aged box is often already unhealthy, and
+    //    requiring it to be healthy would block every terminate.
+    let others: Vec<&crate::asg::AsgInstance> = view
+        .members
+        .iter()
+        .filter(|m| m.instance_id != facts.instance_id)
+        .collect();
+    let health = view.target_health.as_ref();
+    let unwell: Vec<&str> = others
+        .iter()
+        .filter(|m| !member_is_good(m, health))
+        .map(|m| m.instance_id.as_str())
+        .collect();
+
+    if unwell.is_empty() {
+        Decision::Terminate {
+            instance_id: facts.instance_id.clone(),
+            reason: format!(
+                "every other member of {} is healthy ({} of them) — terminating {}",
+                view.asg_name,
+                others.len(),
+                facts.instance_id
+            ),
+        }
+    } else {
+        Decision::Wait {
+            reason: format!(
+                "not terminating {} yet: {} of {}'s other member(s) are not healthy ({})",
+                facts.instance_id,
+                unwell.len(),
+                view.asg_name,
+                unwell.join(", ")
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::alerts::Alert;
+    use crate::asg::AsgInstance;
     use crate::asg::ScalingActivity;
     use crate::features::{InstanceAgeFeature, ReaperFeature, UnhealthyHostFeature};
+    use crate::reaper::TargetMember;
 
     const REAL: &str = "\
 Instance has exceeded its maximum age and should be recycled.
@@ -718,6 +893,258 @@ Runbook: https://example.invalid/runbook
         assert!(matches!(
             termination_history(&page, now(), day(), 2),
             HistoryVerdict::NotFullySeen { .. }
+        ));
+    }
+
+    const AGED: &str = "i-0aaa1111bbbb2222c";
+    const PEER: &str = "i-0ddd3333eeee4444f";
+
+    fn member(id: &str, lifecycle: &str, health: &str) -> AsgInstance {
+        AsgInstance {
+            instance_id: id.to_string(),
+            lifecycle_state: lifecycle.to_string(),
+            health_status: health.to_string(),
+            protected_from_scale_in: false,
+            ..Default::default()
+        }
+    }
+
+    fn healthy(id: &str) -> AsgInstance {
+        member(id, "InService", "Healthy")
+    }
+
+    fn target(id: &str, health: &str) -> TargetMember {
+        TargetMember { id: id.to_string(), health: health.to_string() }
+    }
+
+    fn aged_facts() -> AlertFacts {
+        AlertFacts {
+            application: "cassandra".to_string(),
+            instance_id: AGED.to_string(),
+            environment: "prod".to_string(),
+            account: "acme-prod".to_string(),
+            region: "us-east-1".to_string(),
+        }
+    }
+
+    fn view(members: Vec<AsgInstance>, health: Option<Vec<TargetMember>>) -> GroupView {
+        GroupView {
+            asg_name: "prod-cassandra-asg".to_string(),
+            members,
+            target_health: health,
+        }
+    }
+
+    #[test]
+    fn an_instance_that_is_not_a_member_of_the_group_is_refused() {
+        let v = view(vec![healthy(PEER)], None);
+        assert!(matches!(
+            decide(&aged_facts(), &v, Kind::Ordinary, &HistoryVerdict::Clean),
+            Decision::Refuse { .. }
+        ));
+    }
+
+    #[test]
+    fn an_instance_already_leaving_is_refused_and_says_so() {
+        for state in ["Terminating", "Terminating:Wait", "Terminating:Proceed", "Terminated"] {
+            let v = view(vec![member(AGED, state, "Healthy"), healthy(PEER)], None);
+            let d = decide(&aged_facts(), &v, Kind::Ordinary, &HistoryVerdict::Clean);
+            match d {
+                Decision::Refuse { reason } => assert!(
+                    reason.contains("already terminating"),
+                    "{state}: the reason must read as already terminating, not as a fault: {reason}"
+                ),
+                other => panic!("{state}: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn scale_in_protection_refuses_and_outranks_the_health_gate() {
+        let mut aged = healthy(AGED);
+        aged.protected_from_scale_in = true;
+        let v = view(vec![aged, healthy(PEER)], None);
+        let d = decide(&aged_facts(), &v, Kind::Ordinary, &HistoryVerdict::Clean);
+        match d {
+            Decision::Refuse { reason } => {
+                assert!(reason.contains("scale-in protection"), "{reason}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_recent_termination_refuses_an_ordinary_group() {
+        let v = view(vec![healthy(AGED), healthy(PEER)], None);
+        let history = HistoryVerdict::RecentTermination { detail: "lost one at 09:00".to_string() };
+        match decide(&aged_facts(), &v, Kind::Ordinary, &history) {
+            Decision::Refuse { reason } => assert!(reason.contains("lost one at 09:00"), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_recent_termination_blocks_a_vault_pair_too() {
+        // The guard sits ABOVE the Vault waiver on purpose: a Vault pair is
+        // exactly where a second terminate inside a day is most dangerous,
+        // because the peer that answered for the first one may be the only
+        // thing serving.
+        let v = view(vec![healthy(AGED), healthy(PEER)], None);
+        let history = HistoryVerdict::RecentTermination { detail: "lost one at 09:00".to_string() };
+        assert!(matches!(
+            decide(&aged_facts(), &v, Kind::Vault, &history),
+            Decision::Refuse { .. }
+        ));
+    }
+
+    #[test]
+    fn a_window_that_was_not_fully_seen_refuses() {
+        let v = view(vec![healthy(AGED), healthy(PEER)], None);
+        let history = HistoryVerdict::NotFullySeen { detail: "oldest is 11:50".to_string() };
+        assert!(matches!(
+            decide(&aged_facts(), &v, Kind::Ordinary, &history),
+            Decision::Refuse { .. }
+        ));
+    }
+
+    #[test]
+    fn a_vault_pair_terminates_whatever_the_peer_reads() {
+        for peer_health in ["Unhealthy", "Healthy"] {
+            for peer_state in ["InService", "Pending"] {
+                let v = view(
+                    vec![healthy(AGED), member(PEER, peer_state, peer_health)],
+                    Some(vec![target(AGED, "healthy"), target(PEER, "unhealthy")]),
+                );
+                assert_eq!(
+                    decide(&aged_facts(), &v, Kind::Vault, &HistoryVerdict::Clean),
+                    Decision::Terminate {
+                        instance_id: AGED.to_string(),
+                        reason: "vault pair — the health gate does not apply, terminating \
+                                 i-0aaa1111bbbb2222c"
+                            .to_string()
+                    },
+                    "peer {peer_state}/{peer_health}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_vault_group_that_is_not_a_pair_falls_through_to_the_ordinary_gate() {
+        // Safe, and no surprise: the waiver is justified by the two-box
+        // active/standby shape, so a group that is not that shape gets the
+        // ordinary rule rather than an outright refusal.
+        let three = view(
+            vec![healthy(AGED), member(PEER, "InService", "Unhealthy"), healthy("i-0fff5555aaaa6666b")],
+            None,
+        );
+        assert!(matches!(
+            decide(&aged_facts(), &three, Kind::Vault, &HistoryVerdict::Clean),
+            Decision::Wait { .. }
+        ));
+
+        let alone = view(vec![healthy(AGED)], None);
+        assert!(matches!(
+            decide(&aged_facts(), &alone, Kind::Vault, &HistoryVerdict::Clean),
+            Decision::Terminate { .. }
+        ));
+    }
+
+    #[test]
+    fn every_other_member_healthy_terminates_and_one_that_is_not_waits() {
+        let good = view(
+            vec![healthy(AGED), healthy(PEER)],
+            Some(vec![target(AGED, "unhealthy"), target(PEER, "healthy")]),
+        );
+        assert!(
+            matches!(
+                decide(&aged_facts(), &good, Kind::Ordinary, &HistoryVerdict::Clean),
+                Decision::Terminate { .. }
+            ),
+            "the alerted instance itself may read anything — an aged box is often unhealthy"
+        );
+
+        for bad in ["unhealthy", "draining", "initial", "unused"] {
+            let v = view(
+                vec![healthy(AGED), healthy(PEER)],
+                Some(vec![target(AGED, "healthy"), target(PEER, bad)]),
+            );
+            assert!(
+                matches!(
+                    decide(&aged_facts(), &v, Kind::Ordinary, &HistoryVerdict::Clean),
+                    Decision::Wait { .. }
+                ),
+                "a peer reading {bad} is not a healthy group"
+            );
+        }
+    }
+
+    #[test]
+    fn a_one_instance_group_terminates_with_no_carve_out() {
+        // There are no other members, so "every other member healthy" is
+        // vacuously true. This is the rule falling out, not an exception.
+        let v = view(vec![healthy(AGED)], Some(vec![target(AGED, "unhealthy")]));
+        assert!(matches!(
+            decide(&aged_facts(), &v, Kind::Ordinary, &HistoryVerdict::Clean),
+            Decision::Terminate { .. }
+        ));
+    }
+
+    #[test]
+    fn with_no_target_group_the_groups_own_view_answers() {
+        let serving = view(vec![healthy(AGED), healthy(PEER)], None);
+        assert!(matches!(
+            decide(&aged_facts(), &serving, Kind::Ordinary, &HistoryVerdict::Clean),
+            Decision::Terminate { .. }
+        ));
+
+        // is_serving needs BOTH halves: InService and Healthy.
+        for (state, health) in [("InService", "Unhealthy"), ("Pending", "Healthy"), ("Standby", "Healthy")] {
+            let v = view(vec![healthy(AGED), member(PEER, state, health)], None);
+            assert!(
+                matches!(
+                    decide(&aged_facts(), &v, Kind::Ordinary, &HistoryVerdict::Clean),
+                    Decision::Wait { .. }
+                ),
+                "a peer that is {state}/{health} is not serving"
+            );
+        }
+    }
+
+    #[test]
+    fn a_member_missing_from_the_target_group_falls_back_to_its_own_state() {
+        // A Pending instance is not registered yet. Skipping it would let the
+        // gate pass on a group that is one box down and one box not up.
+        let v = view(
+            vec![healthy(AGED), member(PEER, "Pending", "Healthy")],
+            Some(vec![target(AGED, "healthy")]),
+        );
+        assert!(matches!(
+            decide(&aged_facts(), &v, Kind::Ordinary, &HistoryVerdict::Clean),
+            Decision::Wait { .. }
+        ));
+    }
+
+    #[test]
+    fn a_terminating_peer_is_not_a_healthy_group() {
+        let v = view(vec![healthy(AGED), member(PEER, "Terminating", "Healthy")], None);
+        assert!(matches!(
+            decide(&aged_facts(), &v, Kind::Ordinary, &HistoryVerdict::Clean),
+            Decision::Wait { .. }
+        ));
+    }
+
+    #[test]
+    fn an_ip_target_in_the_health_list_is_ignored_rather_than_read_as_a_member() {
+        // The gate is over MEMBERS; an IP target is not one of them and has no
+        // instance to match. It must not silently fail the gate.
+        let v = view(
+            vec![healthy(AGED), healthy(PEER)],
+            Some(vec![target(PEER, "healthy"), target("10.1.2.3", "unhealthy")]),
+        );
+        assert!(matches!(
+            decide(&aged_facts(), &v, Kind::Ordinary, &HistoryVerdict::Clean),
+            Decision::Terminate { .. }
         ));
     }
 }
