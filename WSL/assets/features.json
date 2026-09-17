@@ -176,6 +176,36 @@
     "poll_secs": 30,
     "fetch_count": 10
   },
+  "_instance_age_comment": [
+    "Instance age watcher. Acknowledges an instance-age alert, resolves the",
+    "instance named in the alert description to its auto scaling group, and",
+    "terminates it so the ASG replaces it. Ships closed: set enabled, add your",
+    "OS username to allowed_users, and name your applications.",
+    "",
+    "alertname_contains / app_contains / message_contains are ORed and answer",
+    "'is this an instance-age alert'. applications is ANDed with them and is",
+    "the only rule that narrows: it matches the 'Application:' line in the",
+    "alert description. Example: [\"cassandra\", \"kafka\"].",
+    "",
+    "vault_name_contains marks a Vault group (matched against the ASG name and",
+    "every target group attached to it); a Vault pair skips the health gate.",
+    "recent_terminate_hours refuses an alert when the group already lost an",
+    "instance that recently. retry_window_mins is how long an alert waiting on",
+    "the health gate is retried before it escalates once."
+  ],
+  "instance_age": {
+    "enabled": false,
+    "allowed_users": [],
+    "alertname_contains": "",
+    "app_contains": "",
+    "message_contains": "",
+    "applications": [],
+    "vault_name_contains": "vault",
+    "recent_terminate_hours": 24,
+    "retry_window_mins": 20,
+    "poll_secs": 30,
+    "fetch_count": 10
+  },
   "_instance_power_comment": "Start instance / Stop instance / Restart (stop -> start) on the Inventory tab's right-click menu. Restart is a STOP, a poll until the instance actually reports 'stopped', a 20s hold so the shutdown is visible, and then a START — it is NOT ec2 reboot-instances, which keeps the same host and never reports stopped. These write live AWS state, so BOTH keys are required: set enabled to true AND name the OS username in allowed_users ([\"*\"] = everyone, [] = nobody). Shipped closed on both counts, so the menu entries are hidden until an admin opts users in and rebuilds; instance_power= on the startup gates: log line says which way it resolved. Live mode only — a Sim profile refuses. One list covers all three actions.",
   "instance_power": {
     "enabled": false,

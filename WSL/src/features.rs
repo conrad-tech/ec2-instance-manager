@@ -103,6 +103,10 @@ pub struct Features {
     /// Unattended unhealthy-host remediation: acknowledge, terminate the
     /// unhealthy instance, escalate. Who may run it, and every tunable.
     pub unhealthy_host: UnhealthyHostFeature,
+    /// Unattended instance-age remediation: acknowledge, terminate the aged
+    /// instance so the ASG replaces it, escalate. Who may run it, and every
+    /// tunable.
+    pub instance_age: InstanceAgeFeature,
     /// Start / Stop / Restart from the Inventory right-click menu: who may
     /// see the entries.
     pub instance_power: InstancePowerFeature,
@@ -977,6 +981,137 @@ impl UnhealthyHostFeature {
     }
 }
 
+/// The `instance_age` section of `assets/features.json`.
+///
+/// Gates the instance-age watcher: acknowledge an instance-age alert, resolve
+/// the named instance to its auto scaling group, confirm the group has not
+/// already lost an instance inside `recent_terminate_hours` and that every
+/// *other* member is healthy, then terminate it so the ASG replaces it.
+/// Anything that cannot be confirmed escalates instead.
+///
+/// Ships disabled with an empty allow-list and an empty `applications`, and
+/// needs all three, so a stray `["*"]` cannot arm live terminates for a site.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct InstanceAgeFeature {
+    /// Master switch. Off in the shipped file.
+    pub enabled: bool,
+    /// OS usernames permitted to run it. `"*"` is deliberately **not**
+    /// honoured: this acknowledges a live page, terminates an instance and
+    /// rings a phone with nobody watching.
+    pub allowed_users: Vec<String>,
+    /// Substring identifying one of these alerts in `extraProperties.alertname`.
+    pub alertname_contains: String,
+    /// Substring identifying one in the `App:` tag. Secondary, and measurably
+    /// unreliable on this feed.
+    pub app_contains: String,
+    /// Substring identifying one in `message` (the alert title).
+    pub message_contains: String,
+    /// The applications this watcher may act on, as substrings of the
+    /// `Application:` line parsed out of the alert **description**.
+    ///
+    /// **ANDed** with the three `*_contains` rules above, which together
+    /// answer "is this an instance-age alert" — this answers "is it one of
+    /// ours". Empty matches nothing and the watcher stays dark; a blank entry
+    /// matches nothing too, since an empty string is a substring of
+    /// everything and one stray `""` would silently restore "act on every app
+    /// on the feed".
+    pub applications: Vec<String>,
+    /// Substring marking a Vault group, matched case-insensitively against
+    /// the ASG's own name and every target group attached to it. Blank
+    /// disables the Vault waiver.
+    pub vault_name_contains: String,
+    /// A termination in the group inside this many hours refuses the alert.
+    pub recent_terminate_hours: u64,
+    /// How long an alert waiting on the health gate is retried before it
+    /// escalates once and stops.
+    pub retry_window_mins: u64,
+    /// Feed poll interval.
+    pub poll_secs: u64,
+    /// Alerts pulled per poll.
+    pub fetch_count: u32,
+}
+
+impl InstanceAgeFeature {
+    /// True when `user` is on `allowed_users`, whether or not the feature is
+    /// enabled. Decides whether they see this watcher's log lines.
+    pub fn is_listed_user(&self, user: &str) -> bool {
+        names_user(&self.allowed_users, user)
+    }
+
+    /// True when `user` may run the watcher. Like every other watcher here,
+    /// `"*"` does not match.
+    pub fn is_allowed_user(&self, user: &str) -> bool {
+        self.enabled && names_user(&self.allowed_users, user)
+    }
+
+    /// True when `applications` names at least one app. Blank entries do not
+    /// count, matching `instance_age::names_an_app`, which refuses a blank
+    /// needle.
+    pub fn names_any_app(&self) -> bool {
+        self.applications.iter().any(|a| !a.trim().is_empty())
+    }
+
+    /// True when the list names more than one user. Two machines watching one
+    /// feed would both acknowledge and both terminate.
+    pub fn has_multiple_users(&self) -> bool {
+        self.allowed_users
+            .iter()
+            .filter(|a| !a.trim().is_empty())
+            .count()
+            > 1
+    }
+
+    pub fn resolved_schedule_id(&self) -> String {
+        crate::jsm_auth::resolve_id(
+            crate::jsm_auth::SCHEDULE_ID_ENV,
+            crate::jsm_auth::SCHEDULE_ID_TARGET,
+            "",
+        )
+    }
+
+    pub fn resolved_atlassian_account_id(&self) -> String {
+        crate::jsm_auth::resolve_id(
+            crate::jsm_auth::ATLASSIAN_ACCOUNT_ID_ENV,
+            crate::jsm_auth::ATLASSIAN_ACCOUNT_ID_TARGET,
+            "",
+        )
+    }
+
+    /// Zero means the default, never "at once": a missing section
+    /// deserializes every tunable to zero, and that must not become a
+    /// terminate the instant an alert lands.
+    fn mins_or(value: u64, default: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(60 * if value == 0 { default } else { value })
+    }
+
+    pub fn retry_window(&self) -> std::time::Duration {
+        Self::mins_or(self.retry_window_mins, 20)
+    }
+
+    /// Same "zero means the default" rule, in hours.
+    pub fn recent_terminate_window(&self) -> std::time::Duration {
+        let hours = if self.recent_terminate_hours == 0 {
+            24
+        } else {
+            self.recent_terminate_hours
+        };
+        std::time::Duration::from_secs(60 * 60 * hours)
+    }
+
+    pub fn poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(if self.poll_secs == 0 { 30 } else { self.poll_secs })
+    }
+
+    pub fn alerts_per_poll(&self) -> u32 {
+        if self.fetch_count == 0 {
+            10
+        } else {
+            self.fetch_count
+        }
+    }
+}
+
 impl ReaperFeature {
     /// True when `user` is on `allowed_users`, whether or not the feature is
     /// enabled. Decides whether they see this watcher's log lines; see
@@ -1310,6 +1445,9 @@ impl Default for Features {
             // Derived Default, and the same three reasons: off, nobody
             // allowed, every rule blank.
             unhealthy_host: UnhealthyHostFeature::default(),
+            // Derived Default, and the same three reasons: off, nobody
+            // allowed, no application named.
+            instance_age: InstanceAgeFeature::default(),
             // Derived Default: `enabled` false and an empty allow-list. Both
             // are required by the gate, so a features.json nobody can parse
             // hands out no power to stop a production instance.
@@ -1456,6 +1594,13 @@ impl Features {
     /// other.
     pub fn unhealthy_host_enabled_for(&self, user: &str) -> bool {
         self.unhealthy_host.is_allowed_user(user)
+    }
+
+    /// True when the instance-age watcher may run for `user`. Independent of
+    /// the other three watchers' gates for the same reason they are of each
+    /// other.
+    pub fn instance_age_enabled_for(&self, user: &str) -> bool {
+        self.instance_age.is_allowed_user(user)
     }
 
     /// True when the Inventory tab's **Start / Stop / Restart** entries
@@ -2754,6 +2899,122 @@ mod unhealthy_host_feature_tests {
             ..armed()
         };
         assert!(two.has_multiple_users());
+    }
+}
+
+#[cfg(test)]
+mod instance_age_feature_tests {
+    use super::*;
+
+    #[test]
+    fn the_instance_age_gate_needs_enabled_and_the_list_and_never_honours_a_wildcard() {
+        let mut cfg = InstanceAgeFeature {
+            allowed_users: vec!["bconrad".to_string()],
+            ..Default::default()
+        };
+        // Listed but not enabled: may read the log, may not run.
+        assert!(cfg.is_listed_user("bconrad"));
+        assert!(!cfg.is_allowed_user("bconrad"));
+
+        cfg.enabled = true;
+        assert!(cfg.is_allowed_user("bconrad"));
+        assert!(cfg.is_allowed_user("BCONRAD"), "the list is case-insensitive");
+        assert!(!cfg.is_allowed_user("someone-else"));
+        assert!(!cfg.is_allowed_user(""), "an unknown user is on no list");
+
+        let wild = InstanceAgeFeature {
+            enabled: true,
+            allowed_users: vec!["*".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            !wild.is_allowed_user("bconrad"),
+            "'*' must not arm a watcher that terminates instances"
+        );
+        assert!(!wild.is_listed_user("bconrad"));
+    }
+
+    #[test]
+    fn an_empty_or_blank_application_list_names_nobody() {
+        assert!(!InstanceAgeFeature::default().names_any_app());
+        let blank = InstanceAgeFeature {
+            applications: vec!["   ".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            !blank.names_any_app(),
+            "a blank entry is a substring of everything and must not arm the watcher"
+        );
+        let named = InstanceAgeFeature {
+            applications: vec!["cassandra".to_string()],
+            ..Default::default()
+        };
+        assert!(named.names_any_app());
+    }
+
+    #[test]
+    fn every_instance_age_window_falls_back_to_its_default_rather_than_zero() {
+        // A missing section deserializes every tunable to zero. Zero must never
+        // mean "at once" for a feature whose next step is a terminate.
+        let cfg = InstanceAgeFeature::default();
+        assert_eq!(cfg.retry_window(), std::time::Duration::from_secs(20 * 60));
+        assert_eq!(
+            cfg.recent_terminate_window(),
+            std::time::Duration::from_secs(24 * 60 * 60)
+        );
+        assert_eq!(cfg.poll_interval(), std::time::Duration::from_secs(30));
+        assert_eq!(cfg.alerts_per_poll(), 10);
+
+        let set = InstanceAgeFeature {
+            retry_window_mins: 5,
+            recent_terminate_hours: 6,
+            poll_secs: 15,
+            fetch_count: 25,
+            ..Default::default()
+        };
+        assert_eq!(set.retry_window(), std::time::Duration::from_secs(5 * 60));
+        assert_eq!(
+            set.recent_terminate_window(),
+            std::time::Duration::from_secs(6 * 60 * 60)
+        );
+        assert_eq!(set.poll_interval(), std::time::Duration::from_secs(15));
+        assert_eq!(set.alerts_per_poll(), 25);
+    }
+
+    #[test]
+    fn two_names_on_the_instance_age_list_are_reported_as_such() {
+        // Two machines watching one feed would both acknowledge and both
+        // terminate — the same hazard unhealthy_host warns about at startup.
+        let one = InstanceAgeFeature {
+            allowed_users: vec!["bconrad".to_string(), "  ".to_string()],
+            ..Default::default()
+        };
+        assert!(!one.has_multiple_users());
+        let two = InstanceAgeFeature {
+            allowed_users: vec!["bconrad".to_string(), "someone".to_string()],
+            ..Default::default()
+        };
+        assert!(two.has_multiple_users());
+    }
+
+    #[test]
+    fn the_shipped_instance_age_section_is_closed() {
+        // `bundled_features()` is private, and this test lives in the same module
+        // — which is how every other shipped-config test in this file reads the
+        // compiled-in JSON. There is no `Features::bundled()`.
+        let features: Features =
+            serde_json::from_str(&bundled_features()).expect("the bundled features.json parses");
+        assert!(!features.instance_age.enabled, "ships disabled");
+        assert!(
+            features.instance_age.allowed_users.is_empty(),
+            "ships with nobody on the list"
+        );
+        assert!(
+            !features.instance_age.names_any_app(),
+            "ships naming no application, so the matcher claims nothing"
+        );
+        assert_eq!(features.instance_age.vault_name_contains, "vault");
+        assert!(!features.instance_age_enabled_for("bconrad"));
     }
 }
 
