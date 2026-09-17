@@ -18,6 +18,7 @@ pub mod forwards;
 pub mod forwards_check;
 pub mod gui_cli;
 pub mod inventory;
+pub mod instance_age;
 pub mod jira;
 pub mod jsm_auth;
 pub mod models;
