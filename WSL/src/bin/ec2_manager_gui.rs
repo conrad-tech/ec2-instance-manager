@@ -507,6 +507,10 @@ mod gui {
         /// every terminate, every escalation, every insured alert, and the
         /// startup lines about whether the feature came up at all.
         UnhealthyHost,
+        /// The instance-age watcher: the poll thread, every acknowledge,
+        /// every terminate, every escalation, and the startup lines about
+        /// whether the feature came up at all.
+        InstanceAge,
         /// The Jira Tickets feature: the list, every ticket opened, every
         /// transition, comment and edit. Its own source so a user off
         /// `jira.allowed_users` never reads ticket keys or comment text out
@@ -549,6 +553,7 @@ mod gui {
         reaper_down: bool,
         pingdom: bool,
         unhealthy_host: bool,
+        instance_age: bool,
         alert_test: bool,
         jira: bool,
         alerts: bool,
@@ -562,6 +567,7 @@ mod gui {
                 || self.pingdom
                 || self.alert_test
                 || self.unhealthy_host
+                || self.instance_age
                 || self.jira
                 || self.alerts
         }
@@ -574,6 +580,7 @@ mod gui {
                 LogSource::ReaperDown => self.reaper_down,
                 LogSource::Pingdom => self.pingdom,
                 LogSource::UnhealthyHost => self.unhealthy_host,
+                LogSource::InstanceAge => self.instance_age,
                 LogSource::AlertTest => self.alert_test,
                 LogSource::Jira => self.jira,
                 LogSource::Alerts => self.alerts,
@@ -598,6 +605,9 @@ mod gui {
             }
             if self.unhealthy_host {
                 picked.push("Unhealthy Host");
+            }
+            if self.instance_age {
+                picked.push("Instance Age");
             }
             if self.alert_test {
                 picked.push("Alert Test");
@@ -645,6 +655,7 @@ mod gui {
         reaper_down: bool,
         pingdom: bool,
         unhealthy_host: bool,
+        instance_age: bool,
         alert_test: bool,
         jira: bool,
         alerts: bool,
@@ -663,6 +674,7 @@ mod gui {
                 reaper_down: features.reaper.is_listed_user(user),
                 pingdom: features.pingdom.is_listed_user(user),
                 unhealthy_host: features.unhealthy_host.is_listed_user(user),
+                instance_age: features.instance_age.is_listed_user(user),
                 // The button's gate, not a watcher's: a dry run is something
                 // this person ran, whichever watcher claimed the alert.
                 alert_test: features.reaper.is_listed_user(user),
@@ -679,6 +691,7 @@ mod gui {
                 LogSource::ReaperDown => self.reaper_down,
                 LogSource::Pingdom => self.pingdom,
                 LogSource::UnhealthyHost => self.unhealthy_host,
+                LogSource::InstanceAge => self.instance_age,
                 LogSource::AlertTest => self.alert_test,
                 LogSource::Jira => self.jira,
                 LogSource::Alerts => self.alerts,
@@ -692,6 +705,7 @@ mod gui {
             self.reaper_down
                 || self.pingdom
                 || self.unhealthy_host
+                || self.instance_age
                 || self.alert_test
                 || self.jira
                 || self.alerts
@@ -10879,6 +10893,14 @@ mod gui {
 
         fn log_unhealthy_host(&mut self, level: LogLevel, message: impl Into<String>) {
             self.log_from(LogSource::UnhealthyHost, level, message);
+        }
+
+        // The instance-age watcher's poll thread (a later task) is the real
+        // caller; this task wires only the source and the Sources row, so
+        // nothing calls this yet.
+        #[allow(dead_code)]
+        fn log_instance_age(&mut self, level: LogLevel, message: impl Into<String>) {
+            self.log_from(LogSource::InstanceAge, level, message);
         }
 
         /// Everything the Jira Tickets feature says about itself. Its own
@@ -33450,6 +33472,17 @@ mod gui {
                             );
                         });
                     }
+                    if vis.instance_age {
+                        ui.horizontal(|ui| {
+                            ui.label("Instance Age");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.checkbox(&mut self.oncall_filters.instance_age, "");
+                                },
+                            );
+                        });
+                    }
                     if vis.alert_test {
                         ui.horizontal(|ui| {
                             ui.label("Alert Test");
@@ -48180,7 +48213,7 @@ mod gui {
 
         #[test]
         fn ticking_reaper_down_narrows_the_log_to_that_script() {
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, jira: false, alerts: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false };
             assert!(only_reaper.any());
             assert!(only_reaper.includes(LogSource::ReaperDown));
             assert!(!only_reaper.includes(LogSource::App));
@@ -48191,7 +48224,7 @@ mod gui {
             // The popup shuts as soon as it is used, so without this the only
             // evidence that most of the log is being hidden is the log being
             // short — which reads as the app having stopped logging.
-            assert_eq!(OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, jira: false, alerts: false }.label(), "Sources: Reaper Down");
+            assert_eq!(OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false }.label(), "Sources: Reaper Down");
         }
 
         #[test]
@@ -48212,7 +48245,7 @@ mod gui {
 
             // And that tag is what the dropdown filters on — asserted through
             // the same predicate the panel uses, not a reimplementation of it.
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, jira: false, alerts: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false };
             let kept: Vec<&str> = app
                 .logs
                 .iter()
@@ -48227,7 +48260,7 @@ mod gui {
             // The two filters are independent and both on screen. A DEBUG
             // reaper line with DEBUG unticked stays hidden, the same as any
             // other DEBUG line.
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, jira: false, alerts: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false };
             let mut levels = LogFilters::default();
             levels.set_verbosity_low();
             assert!(!levels.includes(LogLevel::Debug));
@@ -50562,7 +50595,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn the_on_call_filter_can_narrow_the_log_to_pingdom() {
-            let only_pingdom = OnCallFilters { reaper_down: false, pingdom: true, alert_test: false, unhealthy_host: false, jira: false, alerts: false };
+            let only_pingdom = OnCallFilters { reaper_down: false, pingdom: true, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false };
             assert!(only_pingdom.includes(LogSource::Pingdom));
             assert!(!only_pingdom.includes(LogSource::ReaperDown));
             assert!(!only_pingdom.includes(LogSource::App));
@@ -50572,7 +50605,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         #[test]
         fn nothing_ticked_still_shows_the_pingdom_lines() {
             // A dropdown nobody opens must not remove anything from view.
-            let none = OnCallFilters { reaper_down: false, pingdom: false, alert_test: false, unhealthy_host: false, jira: false, alerts: false };
+            let none = OnCallFilters { reaper_down: false, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false };
             assert!(none.includes(LogSource::Pingdom));
             assert!(none.includes(LogSource::ReaperDown));
             assert!(none.includes(LogSource::App));
@@ -50581,7 +50614,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn both_ticked_shows_both_and_says_so() {
-            let both = OnCallFilters { reaper_down: true, pingdom: true, alert_test: false, unhealthy_host: false, jira: false, alerts: false };
+            let both = OnCallFilters { reaper_down: true, pingdom: true, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false };
             assert!(both.includes(LogSource::Pingdom));
             assert!(both.includes(LogSource::ReaperDown));
             assert!(!both.includes(LogSource::App));
@@ -50671,6 +50704,57 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert_eq!(only.label(), "Sources: Unhealthy Host");
             let none = OnCallFilters::default();
             assert!(none.includes(LogSource::UnhealthyHost));
+        }
+
+        #[test]
+        fn the_instance_age_source_is_filtered_and_labelled_like_the_others() {
+            let none = OnCallFilters::default();
+            assert!(
+                none.includes(LogSource::InstanceAge),
+                "nothing ticked must stay 'everything'"
+            );
+
+            let only = OnCallFilters { instance_age: true, ..Default::default() };
+            assert!(only.any());
+            assert!(only.includes(LogSource::InstanceAge));
+            assert!(!only.includes(LogSource::UnhealthyHost));
+            assert!(!only.includes(LogSource::ReaperDown));
+            assert!(!only.includes(LogSource::App));
+            assert_eq!(only.label(), "Sources: Instance Age");
+
+            let two = OnCallFilters { instance_age: true, pingdom: true, ..Default::default() };
+            assert_eq!(two.label(), "Sources: Pingdom, Instance Age");
+        }
+
+        #[test]
+        fn instance_age_output_is_visible_only_to_its_own_listed_users() {
+            let mut features = ec2_manager::features::Features::default();
+            features.instance_age.allowed_users = listed(&["bconrad"]);
+
+            let mine = LogVisibility::for_user(&features, "bconrad");
+            assert!(mine.shows(LogSource::InstanceAge));
+            assert!(mine.any_source());
+            assert!(
+                !mine.shows(LogSource::UnhealthyHost),
+                "being on one watcher's list is not being on another's"
+            );
+
+            let theirs = LogVisibility::for_user(&features, "someone-else");
+            assert!(!theirs.shows(LogSource::InstanceAge));
+            assert!(!theirs.any_source(), "with no source to offer, no dropdown is drawn");
+            assert!(theirs.shows(LogSource::App), "the app's own log is always readable");
+        }
+
+        #[test]
+        fn a_listed_user_reads_instance_age_lines_even_with_the_feature_switched_off() {
+            // Keyed on list membership, never on `enabled`: the startup line
+            // saying it is switched off is the whole diagnosis when a watcher
+            // looks dead, and hiding it from the person the feature belongs to
+            // is exactly backwards.
+            let mut features = ec2_manager::features::Features::default();
+            features.instance_age.enabled = false;
+            features.instance_age.allowed_users = listed(&["bconrad"]);
+            assert!(LogVisibility::for_user(&features, "bconrad").shows(LogSource::InstanceAge));
         }
 
         /// Jira and Alerts each own a log source, so their lines are
