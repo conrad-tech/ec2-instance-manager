@@ -262,6 +262,51 @@ fn page_is_past_cutoff(
 /// so a server that does not honour the filter costs coverage, never
 /// correctness. `OPEN_MAX_PAGES` is small for the same reason — with the
 /// filter working there is nothing to page through.
+/// Whether an alert is still live.
+///
+/// **`closed` is the only status that ends one.** `acked` is a real third
+/// value on this tenant, and an acknowledged alert is precisely one somebody
+/// is *working* — so anything phrased as "not open" would drop it from the
+/// toolbar count exactly while it matters most. The same distinction
+/// [`crate::reaper::alert_is_closed`] turns on, and the same one that makes
+/// `fetch_recent`'s window govern closed alerts only.
+pub fn is_open(a: &Alert) -> bool {
+    !a.status.trim().eq_ignore_ascii_case("closed")
+}
+
+/// How many of these alerts are still open — the number on the **Alerts**
+/// button.
+///
+/// Taken over whatever rows the caller holds rather than over a fetch of its
+/// own, so the open Alerts window and the background poll count the same way.
+/// The window's rows deliberately carry closed history (that is what its
+/// lookback is for), and counting those would make a settled night read as a
+/// busy one.
+pub fn open_count(alerts: &[Alert]) -> usize {
+    alerts.iter().filter(|a| is_open(a)).count()
+}
+
+/// Every open alert, whatever its age — the toolbar badge's own fetch.
+///
+/// [`fetch_recent`]'s bounded `status:open` pass on its own, rather than
+/// `fetch_recent` itself: the badge wants one number, and that walks up to
+/// `MAX_PAGES` of closed history the count has no use for. Polled on a timer
+/// while the Alerts window is **shut**, so a page that arrived before anyone
+/// looked is still on the button.
+pub fn fetch_open_alerts(auth: &AlertsAuth) -> Result<Vec<Alert>> {
+    if !auth.is_complete() {
+        return Err(AppError::InvalidArgument(
+            "alerts: email, token and cloud id must all be set (see assets/features.json)"
+                .to_string(),
+        ));
+    }
+    let base = format!(
+        "https://api.atlassian.com/jsm/ops/api/{}/v1/alerts",
+        auth.cloud_id.trim()
+    );
+    fetch_open(auth, &base)
+}
+
 fn fetch_open(auth: &AlertsAuth, base: &str) -> Result<Vec<Alert>> {
     let mut out: Vec<Alert> = Vec::new();
     let mut offset: u32 = 0;
@@ -282,11 +327,7 @@ fn fetch_open(auth: &AlertsAuth, base: &str) -> Result<Vec<Alert>> {
         if alerts.is_empty() {
             break;
         }
-        out.extend(
-            alerts
-                .into_iter()
-                .filter(|a| !a.status.trim().eq_ignore_ascii_case("closed")),
-        );
+        out.extend(alerts.into_iter().filter(is_open));
         let Some(next) = next else { break };
         let Some(next_offset) = offset_from_next(&next) else {
             break;
@@ -567,6 +608,43 @@ pub fn cutoff_string(window_min: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(status: &str) -> Alert {
+        Alert { status: status.to_string(), ..Default::default() }
+    }
+
+    /// The badge counts alerts that are still live, and an **acknowledged**
+    /// alert is one somebody is working — it stays counted. Only `closed`
+    /// takes a row off the button.
+    #[test]
+    fn the_open_count_keeps_acknowledged_alerts_and_drops_closed_ones() {
+        let rows = vec![
+            row("open"),
+            row("acked"),
+            // Case and padding both drift on this feed.
+            row("CLOSED"),
+            row(" closed "),
+            // A status the API has never sent is not evidence the alert is
+            // over, so it counts.
+            row("snoozed"),
+        ];
+        assert_eq!(open_count(&rows), 3);
+        assert!(is_open(&row("acked")));
+        assert!(!is_open(&row("Closed")));
+        assert_eq!(open_count(&[]), 0);
+    }
+
+    /// The badge's fetch refuses to build a request against nowhere, rather
+    /// than shelling out to be told no.
+    #[test]
+    fn the_open_alert_fetch_refuses_incomplete_credentials() {
+        let auth = AlertsAuth {
+            email: "me@example.com".to_string(),
+            token: String::new(),
+            cloud_id: "cloud".to_string(),
+        };
+        assert!(fetch_open_alerts(&auth).is_err());
+    }
 
     #[test]
     fn links_are_found_wherever_the_feed_buried_them() {

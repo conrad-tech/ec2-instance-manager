@@ -1989,6 +1989,15 @@ mod gui {
     /// How often the Alerts window refreshes when auto-refresh is on.
     const ALERTS_REFRESH_EVERY: Duration = Duration::from_secs(10);
 
+    /// How often the toolbar's open-alert count is refreshed while the
+    /// Alerts window is **shut**.
+    ///
+    /// A minute, not the window's ten seconds: this runs for the whole life
+    /// of the app, and the badge answers "is anything ringing" rather than
+    /// "what exactly is it". Not the ticket poll's five minutes either — an
+    /// unacknowledged page is time-critical in a way a ticket list is not.
+    const ALERTS_BADGE_POLL: Duration = Duration::from_secs(60);
+
     /// State of the on-call Alerts window.
     struct AlertsWindow {
         /// Lookback in minutes (one of `ALERT_WINDOWS`).
@@ -2173,6 +2182,8 @@ mod gui {
         desc_edit: Option<TextEditState>,
         /// The comment being edited, while one is.
         comment_edit: Option<(String, TextEditState)>,
+        /// The due-date editor, while one is open.
+        due_edit: Option<DueEdit>,
         /// Outcome of the last edit save.
         edit_note: Option<std::result::Result<String, String>>,
         /// The transition screen being filled in, if any.
@@ -2220,6 +2231,20 @@ mod gui {
             id: String,
             result: std::result::Result<(), String>,
         },
+    }
+
+    /// The due-date editor, while one is open.
+    ///
+    /// Deliberately not a [`TextEditState`]: there are no mentions in a date
+    /// and nothing about it can be lost in a round trip, so the two fields
+    /// that exist for those would be permanently dead here. What it does
+    /// share is `saving`, which disables the row so one edit cannot be sent
+    /// twice.
+    struct DueEdit {
+        /// What is typed. **Empty means clear the date**, which is a real
+        /// edit rather than a no-op — see `jira::parse_due_entry`.
+        text: String,
+        saving: bool,
     }
 
     /// One open editor: the text, the mentions to re-emit with it, and
@@ -2376,6 +2401,7 @@ mod gui {
                 comment_note: None,
                 desc_edit: None,
                 comment_edit: None,
+                due_edit: None,
                 edit_note: None,
                 mention: None,
                 picked_mentions: Vec::new(),
@@ -5839,6 +5865,40 @@ mod gui {
         }
     }
 
+    /// The text on the **Alerts** button.
+    ///
+    /// The parameter is the count of **open** alerts, which is the whole
+    /// design: the button used to read `rows.len()` off the Alerts window,
+    /// so it was blank whenever that window was shut — which is almost
+    /// always — and counted the window's closed history whenever it was not.
+    ///
+    /// A count of nothing is left off rather than rendered as `(0)`: a zero
+    /// in brackets reads as a thing to look at, and the point of this number
+    /// is that it is only there when something is.
+    fn alerts_button_label(open_count: usize) -> String {
+        if open_count > 0 {
+            format!("Alerts ({open_count})")
+        } else {
+            "Alerts".to_string()
+        }
+    }
+
+    /// The text on the **Jira Tickets** button.
+    ///
+    /// The parameter is the count of **open tickets**, deliberately not the
+    /// unread count that used to be here: those answer two different
+    /// questions — "how much is on me" and "has any of it moved" — and the
+    /// button had been showing the second while claiming to be about the
+    /// first. The unread signal did not go anywhere; it is the amber fill,
+    /// which cannot be skimmed past the way a changed digit can.
+    ///
+    /// Unlike the Alerts one this always shows its number, including zero.
+    /// "No open tickets" is a fact somebody wants at a glance; "no alerts
+    /// are ringing" is the ordinary state of the world and needs no badge.
+    fn jira_button_label(open_count: usize) -> String {
+        format!("Jira Tickets ({open_count})")
+    }
+
     /// One required field on a transition screen.
     ///
     /// A dropdown's options are whatever Jira listed for *this* transition on
@@ -9219,6 +9279,35 @@ mod gui {
         /// Alerts fetch worker → UI.
         alerts_tx: Sender<AlertsFetch>,
         alerts_rx: Receiver<AlertsFetch>,
+        /// Open alerts as of the last count — the number on the **Alerts**
+        /// button. Fed by the background poll while the window is shut and
+        /// by the window's own fetches while it is open, so there is one
+        /// number whichever is running.
+        alerts_open_count: usize,
+        /// The badge poll's own channel, deliberately **not** `alerts_tx`.
+        /// That one is generation-stamped so an "Acknowledge all" run can
+        /// drop replies it has overtaken; a count has no part in that, and
+        /// sharing the channel would mean teaching the generation rules
+        /// about a second kind of message that does not obey them.
+        alerts_count_tx: Sender<std::result::Result<usize, String>>,
+        alerts_count_rx: Receiver<std::result::Result<usize, String>>,
+        /// The last badge-poll failure that was logged. Reported **once per
+        /// change**, like `report_reaper_reason_change` — a site whose token
+        /// has expired would otherwise write a line every minute for as long
+        /// as the app is open.
+        alerts_count_error: Option<String>,
+        /// True while the Alerts window is open, read by the background poll
+        /// so the two do not both fetch — the same arrangement as
+        /// `jira_window_open`. Stored once per frame from the window state
+        /// itself rather than at each toggle: there are four places that
+        /// close that window and a flag set at each of them is a flag one of
+        /// them forgets.
+        alerts_window_open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// Whether the badge poll has been started. It is started from the
+        /// first `update`, not from `App::new`, because that is where a real
+        /// `egui::Context` first exists — without one the thread can deliver
+        /// a count and never wake the UI to draw it.
+        alerts_badge_poll_started: bool,
         /// Build-time gate: whether the Jira Tickets button is shown to the
         /// current OS user (features.json `jira.allowed_users`, ANDed with
         /// credentials that actually resolve).
@@ -9449,6 +9538,9 @@ mod gui {
             let (verify_tx, verify_rx) = mpsc::channel();
             let (preflight_tx, preflight_rx) = mpsc::channel();
             let (alerts_tx, alerts_rx) = mpsc::channel();
+            let (alerts_count_tx, alerts_count_rx) = mpsc::channel();
+            let alerts_window_open_flag =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (jira_tx, jira_rx) = mpsc::channel();
             let (alert_detail_tx, alert_detail_rx) = mpsc::channel();
             let jira_window_open_flag =
@@ -9957,6 +10049,12 @@ mod gui {
                 alert_detail_rx,
                 alerts_tx,
                 alerts_rx,
+                alerts_open_count: 0,
+                alerts_count_tx,
+                alerts_count_rx,
+                alerts_count_error: None,
+                alerts_window_open: alerts_window_open_flag,
+                alerts_badge_poll_started: false,
                 jira_enabled,
                 jira_site,
                 jira_me: None,
@@ -16391,6 +16489,55 @@ mod gui {
             });
         }
 
+        /// Save an edited due date.
+        ///
+        /// The entry is parsed **again** here rather than trusted from the
+        /// render: the box disables Save on a bad date, but that is a
+        /// courtesy — this is the one place the value reaches a live ticket,
+        /// and it refuses on its own rather than relying on its one caller,
+        /// the same stance `terminate_instance` and `request_asg_capacity`
+        /// take for the destructive writes in this app.
+        ///
+        /// An empty box is a **clear**, sent as an explicit JSON `null`.
+        fn start_jira_save_due(&mut self, key: &str) {
+            let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key) else {
+                return;
+            };
+            let Some(edit) = win.due_edit.as_mut() else {
+                return;
+            };
+            if edit.saving {
+                return;
+            }
+            let due = match ec2_manager::jira::parse_due_entry(&edit.text) {
+                Ok(d) => d,
+                Err(err) => {
+                    win.edit_note = Some(Err(err));
+                    return;
+                }
+            };
+            edit.saving = true;
+            win.edit_note = None;
+            let key = key.to_string();
+            let what = match due {
+                Some(d) => format!("setting the due date to {}", d.format("%Y-%m-%d")),
+                None => "clearing the due date".to_string(),
+            };
+            self.log_jira(LogLevel::Info, format!("jira: {key} — {what}"));
+            let site = self.jira_site.clone();
+            let tx = self.jira_tx.clone();
+            std::thread::spawn(move || {
+                let msg = match due {
+                    Some(d) => format!("Due date set to {}", d.format("%Y-%m-%d")),
+                    None => "Due date cleared".to_string(),
+                };
+                let result = ec2_manager::jira::update_due(&site, &key, due)
+                    .map(|()| msg)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(JiraEvent::Edited { key, result });
+            });
+        }
+
         /// Save an edited comment.
         fn start_jira_save_comment_edit(&mut self, key: &str) {
             let Some(win) = self.jira_tickets.iter_mut().find(|w| w.key == key) else {
@@ -16590,6 +16737,7 @@ mod gui {
                                 // if the save failed.
                                 win.desc_edit = None;
                                 win.comment_edit = None;
+                                win.due_edit = None;
                                 win.edit_note = Some(Ok(msg.clone()));
                                 self.log_jira(LogLevel::Info, format!("jira: {key} — {msg}"));
                                 reload.push(key);
@@ -16603,6 +16751,9 @@ mod gui {
                                         e.saving = false;
                                     }
                                     if let Some((_, e)) = win.comment_edit.as_mut() {
+                                        e.saving = false;
+                                    }
+                                    if let Some(e) = win.due_edit.as_mut() {
                                         e.saving = false;
                                     }
                                     win.edit_note = Some(Err(err));
@@ -16729,6 +16880,82 @@ mod gui {
                     .map_err(|e| e.to_string());
                 let _ = tx.send(AlertsFetch { window_min, generation, result });
             });
+        }
+
+        /// The badge watcher: how many alerts are open, whether or not the
+        /// window has ever been opened.
+        ///
+        /// **Skipped while the Alerts window is open** — its own 10-second
+        /// refresh already answers the question, and running both would
+        /// double the traffic for one number. The same arrangement as
+        /// `start_jira_background_poll`, and for the same reason.
+        ///
+        /// It polls **before** its first sleep, unlike the Jira one: a page
+        /// that came in overnight should be on the button when the app comes
+        /// up, not a minute later.
+        ///
+        /// A `Context` is cloned in so the thread can wake the UI. Without
+        /// it the count lands in the channel and sits there — egui only
+        /// draws when something happens, and nobody touching an idle window
+        /// is exactly the case this feature exists for. The same mistake the
+        /// tunnel banner, the power status line and the resource TTL each
+        /// made in their turn.
+        fn start_alerts_badge_poll(&mut self, ctx: &egui::Context) {
+            if self.alerts_badge_poll_started {
+                return;
+            }
+            if !self.alerts_enabled || !self.alerts_auth.is_complete() {
+                return;
+            }
+            self.alerts_badge_poll_started = true;
+            let auth = self.alerts_auth.clone();
+            let tx = self.alerts_count_tx.clone();
+            let window_open = self.alerts_window_open.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || loop {
+                if !window_open.load(std::sync::atomic::Ordering::Relaxed) {
+                    let result = alerts::fetch_open_alerts(&auth)
+                        .map(|rows| alerts::open_count(&rows))
+                        .map_err(|e| e.to_string());
+                    if tx.send(result).is_err() {
+                        return; // the app is gone
+                    }
+                    ctx.request_repaint();
+                }
+                std::thread::sleep(ALERTS_BADGE_POLL);
+            });
+        }
+
+        /// Drain the badge poll into the count on the button.
+        ///
+        /// A failure is reported **once per change**: a site whose token has
+        /// expired would otherwise write one line a minute for as long as
+        /// the app is open. A poll that fails leaves the previous count
+        /// alone rather than zeroing it — "no alerts" and "could not ask"
+        /// are different answers, and only one of them is good news.
+        fn poll_alerts_badge(&mut self) {
+            while let Ok(result) = self.alerts_count_rx.try_recv() {
+                match result {
+                    Ok(n) => {
+                        self.alerts_open_count = n;
+                        if self.alerts_count_error.take().is_some() {
+                            self.log_alerts(
+                                LogLevel::Info,
+                                "alerts: the open-alert count is being read again",
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        if self.alerts_count_error.as_deref() != Some(err.as_str()) {
+                            self.log_alerts(
+                                LogLevel::Warn,
+                                format!("alerts: could not count open alerts: {err}"),
+                            );
+                            self.alerts_count_error = Some(err);
+                        }
+                    }
+                }
+            }
         }
 
         /// Open an alert's detail window, or raise the one it has.
@@ -16882,9 +17109,17 @@ mod gui {
                 }
                 match fetch.result {
                     Ok(rows) => {
+                        // The badge's own number, taken from the rows that
+                        // just landed. While this window is open the
+                        // background poll stands down, so this is the only
+                        // thing keeping the count current — and the window's
+                        // rows carry closed history, which is why it is
+                        // counted rather than measured with `len`.
+                        let open = alerts::open_count(&rows);
                         win.rows = rows;
                         win.error = None;
                         win.fetched_at = Some(chrono::Local::now());
+                        self.alerts_open_count = open;
                     }
                     Err(err) => {
                         self.log_alerts(LogLevel::Error, format!("alerts: {err}"));
@@ -17379,6 +17614,12 @@ mod gui {
             let mut refresh_now = false;
             let mut submit_search = false;
             let mut open_key: Option<String> = None;
+            // Right-click -> Open in Jira, applied after the window renders:
+            // the row loop is inside a closure that has `self` borrowed.
+            let mut browse_key: Option<String> = None;
+            // The resolved API base, taken once so the row loop can build a
+            // browse URL per row without reaching back into `self`.
+            let api_base = self.jira_site.api_base().to_string();
             let (mut auto_refresh, mut search, loading, last_fetch) = {
                 let w = self.jira_window.as_ref().expect("checked above");
                 (w.auto_refresh, w.search.clone(), w.loading, w.last_fetch)
@@ -17576,14 +17817,31 @@ mod gui {
                                         // there is one obvious place to click
                                         // and no accidental opens while
                                         // reading.
-                                        if ui
+                                        let key_link = ui
                                             .add(egui::Link::new(
                                                 egui::RichText::new(&row.key).strong(),
                                             ))
-                                            .on_hover_text("Open this ticket")
-                                            .clicked()
-                                        {
+                                            .on_hover_text("Open this ticket");
+                                        if key_link.clicked() {
                                             open_key = Some(row.key.clone());
+                                        }
+                                        // Only where a browser has somewhere
+                                        // to go; a build with no
+                                        // `jira.base_url` gets no entry
+                                        // rather than a dead one.
+                                        if let Some(url) = ec2_manager::jira::browse_url(
+                                            &api_base, &row.key,
+                                        ) {
+                                            key_link.context_menu(|ui| {
+                                                if ui
+                                                    .button("Open in Jira")
+                                                    .on_hover_text(url.as_str())
+                                                    .clicked()
+                                                {
+                                                    browse_key = Some(row.key.clone());
+                                                    ui.close();
+                                                }
+                                            });
                                         }
                                         if unread.contains(&row.key) {
                                             note_label(
@@ -17677,6 +17935,14 @@ mod gui {
             if let Some(key) = open_key {
                 self.open_jira_ticket(ctx, &key);
             }
+            if let Some(key) = browse_key {
+                if let Some(url) = self.jira_site.browse_url(&key) {
+                    self.log_jira(LogLevel::Info, format!("jira: {key} — opening {url}"));
+                    if let Err(err) = open_in_browser(&url) {
+                        self.log_jira(LogLevel::Error, format!("jira: {key} — {err}"));
+                    }
+                }
+            }
             if !open {
                 self.jira_window = None;
                 // The background poll steps aside while the window is open;
@@ -17763,6 +18029,11 @@ mod gui {
             let mut comment_for: Option<String> = None;
             let mut save_desc_for: Option<String> = None;
             let mut save_comment_for: Option<String> = None;
+            let mut save_due_for: Option<String> = None;
+            // `open_in_browser` is a free function, so it could be called
+            // from inside the render — but reporting a failure needs
+            // `log_jira`, and the closure already borrows `self`.
+            let mut open_browser: Option<(String, String)> = None;
 
             for idx in 0..self.jira_tickets.len() {
                 let (key, issue, transitions, error, transitions_error, loading, in_flight, note) = {
@@ -17825,6 +18096,15 @@ mod gui {
                 // Editor state, edited in place and written back after.
                 let mut desc_edit = self.jira_tickets[idx].desc_edit.take();
                 let mut comment_edit = self.jira_tickets[idx].comment_edit.take();
+                let mut due_edit = self.jira_tickets[idx].due_edit.take();
+                let mut begin_due_edit = false;
+                let mut cancel_due_edit = false;
+                let mut save_due = false;
+                // Resolved out here: the site lives on `self`, which the
+                // render closure already has borrowed. `None` on a build
+                // with no `jira.base_url`, where there is no page a browser
+                // could open — see `jira::browse_url`.
+                let browse = self.jira_site.browse_url(&key);
                 let edit_note = self.jira_tickets[idx].edit_note.clone();
                 let mut begin_desc_edit = false;
                 let mut cancel_desc_edit = false;
@@ -17900,6 +18180,22 @@ mod gui {
                                         jira_status_color(&issue.status_category),
                                         egui::RichText::new(dash_if_blank(&issue.status)).strong(),
                                     );
+                                    // Hidden rather than greyed out where
+                                    // there is no site: a disabled button
+                                    // invites a question whose answer is a
+                                    // config field nobody looking at this
+                                    // window can see. The startup log line
+                                    // already names the resolved site.
+                                    if let Some(url) = &browse {
+                                        if ui
+                                            .small_button("Open in Jira")
+                                            .on_hover_text(url.as_str())
+                                            .clicked()
+                                        {
+                                            open_browser =
+                                                Some((key.clone(), url.clone()));
+                                        }
+                                    }
                                 });
                                 ui.label(egui::RichText::new(&issue.summary).size(16.0));
 
@@ -17976,12 +18272,109 @@ mod gui {
                                             chrono::Local::now().date_naive(),
                                         );
                                         let due = ec2_manager::jira::due_label(&issue.due);
-                                        match due_color(due_state) {
-                                            Some(c) => {
-                                                note_label(ui, c, dash_if_blank(&due));
+                                        match due_edit.as_mut() {
+                                            Some(edit) => {
+                                                // Refused locally, as it is
+                                                // typed: a `ValidationError`
+                                                // arrives seconds later out
+                                                // of a subprocess and names
+                                                // Jira's field rather than
+                                                // this box.
+                                                let parsed =
+                                                    ec2_manager::jira::parse_due_entry(
+                                                        &edit.text,
+                                                    );
+                                                let saving = edit.saving;
+                                                let had_due = !issue.due.trim().is_empty();
+                                                ui.vertical(|ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.add_enabled(
+                                                            !saving,
+                                                            egui::TextEdit::singleline(
+                                                                &mut edit.text,
+                                                            )
+                                                            .hint_text("YYYY-MM-DD")
+                                                            .desired_width(110.0),
+                                                        );
+                                                        if ui
+                                                            .add_enabled(
+                                                                !saving && parsed.is_ok(),
+                                                                egui::Button::new("Save"),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            save_due = true;
+                                                        }
+                                                        // An empty box is a
+                                                        // clear, and this is
+                                                        // what says so —
+                                                        // nobody discovers
+                                                        // that by emptying
+                                                        // a field to see
+                                                        // what happens.
+                                                        if ui
+                                                            .add_enabled(
+                                                                !saving && had_due,
+                                                                egui::Button::new("Clear"),
+                                                            )
+                                                            .on_hover_text(
+                                                                "Remove this ticket's \
+                                                                 due date",
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            edit.text.clear();
+                                                            save_due = true;
+                                                        }
+                                                        if ui
+                                                            .add_enabled(
+                                                                !saving,
+                                                                egui::Button::new("Cancel"),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            cancel_due_edit = true;
+                                                        }
+                                                        if saving {
+                                                            ui.spinner();
+                                                        }
+                                                    });
+                                                    if let Err(msg) = &parsed {
+                                                        note_label(
+                                                            ui,
+                                                            egui::Color32::from_rgb(
+                                                                220, 90, 90,
+                                                            ),
+                                                            msg,
+                                                        );
+                                                    }
+                                                });
                                             }
                                             None => {
-                                                ui.label(dash_if_blank(&due));
+                                                ui.horizontal(|ui| {
+                                                    match due_color(due_state) {
+                                                        Some(c) => {
+                                                            note_label(
+                                                                ui,
+                                                                c,
+                                                                dash_if_blank(&due),
+                                                            );
+                                                        }
+                                                        None => {
+                                                            ui.label(dash_if_blank(&due));
+                                                        }
+                                                    }
+                                                    if ui
+                                                        .small_button("Edit")
+                                                        .on_hover_text(
+                                                            "Set or clear this ticket's \
+                                                             due date",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        begin_due_edit = true;
+                                                    }
+                                                });
                                             }
                                         }
                                         ui.end_row();
@@ -18546,6 +18939,7 @@ mod gui {
                     w.comment_draft = draft;
                     w.desc_edit = desc_edit;
                     w.comment_edit = comment_edit;
+                    w.due_edit = due_edit;
                     w.pending_transition = pending;
                 }
                 // Move the caret past the name just inserted, or the next
@@ -18606,12 +19000,31 @@ mod gui {
                     if cancel_comment_edit {
                         w.comment_edit = None;
                     }
+                    if begin_due_edit {
+                        if let Some(issue) = w.issue.as_ref() {
+                            w.edit_note = None;
+                            // Seeded with the date the ticket already has,
+                            // in Jira's own spelling, so the common edit —
+                            // moving it a few days — is a keystroke rather
+                            // than typing a date out.
+                            w.due_edit = Some(DueEdit {
+                                text: ec2_manager::jira::due_label(&issue.due),
+                                saving: false,
+                            });
+                        }
+                    }
+                    if cancel_due_edit {
+                        w.due_edit = None;
+                    }
                 }
                 if save_desc {
                     save_desc_for = Some(key.clone());
                 }
                 if save_comment_edit {
                     save_comment_for = Some(key.clone());
+                }
+                if save_due {
+                    save_due_for = Some(key.clone());
                 }
                 if !open {
                     closed.push(key);
@@ -18637,6 +19050,15 @@ mod gui {
             }
             if let Some(key) = save_comment_for {
                 self.start_jira_save_comment_edit(&key);
+            }
+            if let Some(key) = save_due_for {
+                self.start_jira_save_due(&key);
+            }
+            if let Some((key, url)) = open_browser {
+                self.log_jira(LogLevel::Info, format!("jira: {key} — opening {url}"));
+                if let Err(err) = open_in_browser(&url) {
+                    self.log_jira(LogLevel::Error, format!("jira: {key} — {err}"));
+                }
             }
             if let Some((key, id, name, fields, inputs)) = transition {
                 self.start_jira_transition(&key, &id, &name, fields, inputs);
@@ -33984,6 +34406,17 @@ mod gui {
             if self.egui_ctx.is_none() {
                 self.egui_ctx = Some(ctx.clone());
             }
+            // Started here rather than in `App::new` so the thread has a
+            // real `Context` to wake the UI with; a no-op after the first
+            // frame.
+            self.start_alerts_badge_poll(ctx);
+            // Read from the window state itself, every frame, rather than
+            // written at each of the four places that close that window —
+            // one of them would eventually forget.
+            self.alerts_window_open.store(
+                self.alerts_window.is_some(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let update_result = panic::catch_unwind(AssertUnwindSafe(|| {
                 // Re-apply scaling when native DPI changes (monitor switch)
                 let native_ppp = ctx.native_pixels_per_point().unwrap_or(1.0);
@@ -34254,6 +34687,7 @@ mod gui {
                 self.pump_script_runs();
                 self.poll_script_events();
                 self.poll_alerts_events();
+                self.poll_alerts_badge();
                 self.poll_alert_detail_events();
                 self.poll_jira_events();
                 self.poll_ack_all_events();
@@ -35018,17 +35452,43 @@ mod gui {
                         // On-call alerts — only for users on the features.json
                         // allow-list, on a build with a Jira site configured.
                         if self.alerts_enabled {
-                            let open_count = self
-                                .alerts_window
-                                .as_ref()
-                                .map(|w| w.rows.len())
-                                .unwrap_or(0);
-                            let label = if open_count > 0 {
-                                format!("Alerts ({open_count})")
+                            // The count is `alerts_open_count`, not the rows
+                            // the window happens to hold: the window is
+                            // usually shut, and its rows carry closed
+                            // history besides. It is live from launch —
+                            // `start_alerts_badge_poll` keeps it so.
+                            //
+                            // Amber and filled once anything is open, for
+                            // the reason the Jira badge is: in a row of
+                            // identically-shaped grey buttons a number alone
+                            // is easy to skim past, and a page nobody has
+                            // taken must not have that failure mode. Amber
+                            // rather than red — red means "a thing failed"
+                            // everywhere else in this app, and an open alert
+                            // is not a failure of the app.
+                            let open_count = self.alerts_open_count;
+                            let button = if open_count > 0 {
+                                egui::Button::new(
+                                    egui::RichText::new(alerts_button_label(open_count))
+                                        .strong()
+                                        .color(egui::Color32::BLACK),
+                                )
+                                .fill(egui::Color32::from_rgb(220, 160, 60))
                             } else {
-                                "Alerts".to_string()
+                                egui::Button::new(alerts_button_label(open_count))
                             };
-                            if ui.button(label).clicked() {
+                            let hover = if open_count > 0 {
+                                format!(
+                                    "{open_count} open alert(s) — acknowledged ones \
+                                     included, since an acknowledged alert is one \
+                                     somebody is working.\n\nOnly a closed alert \
+                                     leaves the count."
+                                )
+                            } else {
+                                "The on-call alert feed. Nothing is open right now."
+                                    .to_string()
+                            };
+                            if ui.add(button).on_hover_text(hover).clicked() {
                                 if self.alerts_window.is_some() {
                                     self.alerts_window = None;
                                 } else if self.alerts_auth.is_complete() {
@@ -35055,29 +35515,41 @@ mod gui {
                             // notification cannot have that failure mode.
                             // Amber rather than red — red means "a thing
                             // failed" everywhere else in this app.
+                            // **The number is the open-ticket count; the
+                            // amber is the unread flag.** They answer two
+                            // different questions — "how much is on me" and
+                            // "has any of it moved" — and the count used to
+                            // be the unread one, which meant a button
+                            // reading `Jira Tickets` while three tickets
+                            // were open. The colour keeps carrying the
+                            // notification, because a fill cannot be skimmed
+                            // past the way a changed digit can.
+                            let open = self.jira_open_count;
+                            let label = jira_button_label(open);
                             let button = if unread > 0 {
                                 egui::Button::new(
-                                    egui::RichText::new(format!("Jira Tickets ({unread})"))
+                                    egui::RichText::new(label)
                                         .strong()
                                         .color(egui::Color32::BLACK),
                                 )
                                 .fill(egui::Color32::from_rgb(220, 160, 60))
                             } else {
-                                egui::Button::new("Jira Tickets")
+                                egui::Button::new(label)
                             };
                             let hover = if unread > 0 {
                                 format!(
-                                    "{unread} changed since you looked · {} open ticket(s)\n\n\
+                                    "{open} open ticket(s) · {unread} changed since you \
+                                     looked\n\n\
                                      A ticket is flagged when its status moves or it is \
                                      updated — a new comment always counts. Opening it \
-                                     clears the flag.",
-                                    self.jira_open_count
+                                     clears the flag."
                                 )
                             } else {
-                                "Your open tickets. Click one to open its ticket view, \
-                                 where the moves that ticket's own workflow allows \
-                                 (Start Progress, Close, ...) are buttons."
-                                    .to_string()
+                                format!(
+                                    "{open} open ticket(s). Click one to open its ticket \
+                                     view, where the moves that ticket's own workflow \
+                                     allows (Start Progress, Close, ...) are buttons."
+                                )
                             };
                             if ui
                                 .add(button)
@@ -44447,6 +44919,49 @@ mod gui {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The number on the **Alerts** button is a count of open alerts,
+        /// and a count of nothing is left off — a `(0)` in brackets reads as
+        /// a thing to look at.
+        #[test]
+        fn the_alerts_button_shows_a_count_only_when_something_is_open() {
+            assert_eq!(alerts_button_label(0), "Alerts");
+            assert_eq!(alerts_button_label(2), "Alerts (2)");
+            assert_eq!(alerts_button_label(17), "Alerts (17)");
+        }
+
+        /// The Jira button counts **open tickets**, and shows the number
+        /// even when it is zero: "nothing is on me" is a fact somebody wants
+        /// at a glance, where "no alerts are ringing" is the ordinary state
+        /// of the world.
+        ///
+        /// The unread count is deliberately absent from the label — it is
+        /// the amber fill, which cannot be skimmed past the way a changed
+        /// digit can.
+        #[test]
+        fn the_jira_button_counts_open_tickets_not_unread_ones() {
+            assert_eq!(jira_button_label(0), "Jira Tickets (0)");
+            assert_eq!(jira_button_label(3), "Jira Tickets (3)");
+        }
+
+        /// The Jira button's label is built from `jira_open_count`, not from
+        /// `jira_unread`. They are one line apart at the call site and the
+        /// unread one is what used to be there, so a later edit restoring it
+        /// would look like a tidy-up and silently undo the feature.
+        #[test]
+        fn the_jira_button_label_is_fed_the_open_count() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let at = src
+                .find("let label = jira_button_label(open);")
+                .expect("the Jira button builds its label through the helper");
+            // The binding it is handed, a few lines above.
+            let before = &src[at.saturating_sub(400)..at];
+            assert!(
+                before.contains("let open = self.jira_open_count;"),
+                "the Jira button label must be fed the open-ticket count"
+            );
+        }
 
         /// The row reads left to right as EC2 first — the tab the app opens on and
         /// the one everybody already knows — then the rest in the order the spec's

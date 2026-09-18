@@ -286,6 +286,41 @@ impl JiraSite {
     pub fn api_base(&self) -> &str {
         &self.api_base
     }
+
+    /// The URL a **browser** opens for this ticket, or `None` when there is
+    /// no site a browser could open. See [`browse_url`].
+    pub fn browse_url(&self, key: &str) -> Option<String> {
+        browse_url(&self.api_base, key)
+    }
+}
+
+/// `https://<site>/browse/<KEY>` — what **Open in Jira** launches.
+///
+/// **`None` for the cloud-id gateway form.** With no `jira.base_url`
+/// configured the API base resolves to
+/// `https://api.atlassian.com/ex/jira/<cloud_id>/rest/api/3`, which is an
+/// OAuth-authenticated API endpoint and not a page: a `/browse/` link built
+/// on it looks perfectly well-formed and lands nowhere. The button is hidden
+/// in that case and says which setting would bring it back — the same stance
+/// `jira_gate_report` takes about the button itself, and the same trap the
+/// empty-ticket-list bug came out of.
+///
+/// The key is whitelisted rather than escaped, like every other place it
+/// reaches a URL path.
+pub fn browse_url(api_base: &str, key: &str) -> Option<String> {
+    // Upper-cased first: a key is upper-case everywhere Jira writes one, and
+    // `validate_issue_key` says so, but the search box takes what is typed.
+    let key = key.trim().to_uppercase();
+    if validate_issue_key(&key).is_err() {
+        return None;
+    }
+    let base = api_base.trim().trim_end_matches('/');
+    let root = base.strip_suffix("/rest/api/3").or_else(|| base.strip_suffix("/rest/api/2"))?;
+    let root = root.trim_end_matches('/');
+    if root.is_empty() || root.starts_with("https://api.atlassian.com/ex/jira/") {
+        return None;
+    }
+    Some(format!("{root}/browse/{key}"))
 }
 
 /// Work out the `…/rest/api/3` base for the issue API.
@@ -1682,6 +1717,72 @@ pub fn due_label(due: &str) -> String {
     }
 }
 
+/// Read a due date typed into the ticket window, before anything is sent.
+///
+/// `Ok(None)` is a deliberate **clear** — an empty box means "this ticket has
+/// no due date", which is a real edit and is sent as a JSON `null`. It is the
+/// one place blank does not mean "leave it alone", so the button beside the
+/// box says `Clear` rather than leaving someone to discover that by emptying
+/// it.
+///
+/// Refused locally rather than by a 400: a `ValidationError` arrives seconds
+/// later out of a subprocess and names Jira's field rather than the box the
+/// date was typed into — the same reasoning `check_capacity` follows for ASG
+/// capacity.
+///
+/// Input is lenient and output is canonical: `2026-9-1` is what somebody
+/// types and `2026-09-01` is what Jira is sent. The **year is bounded**
+/// because `%Y` will happily take `20266`, and a date eighteen thousand years
+/// out is a wrong write to a live ticket that nothing else would question.
+pub fn parse_due_entry(input: &str) -> std::result::Result<Option<chrono::NaiveDate>, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(None);
+    }
+    let date = chrono::NaiveDate::parse_from_str(input, "%Y-%m-%d")
+        .map_err(|_| format!("'{input}' is not a date — use YYYY-MM-DD, or empty to clear"))?;
+    let year = date.format("%Y").to_string().parse::<i32>().unwrap_or(0);
+    if !(1970..=2999).contains(&year) {
+        return Err(format!("{year} is not a plausible year — use YYYY-MM-DD"));
+    }
+    Ok(Some(date))
+}
+
+/// Set or clear a ticket's due date.
+///
+/// `None` clears it, which Jira does by being sent an explicit `null` —
+/// omitting the field would leave the date alone, so the two cases cannot
+/// share one code path by accident.
+///
+/// The body is built with `serde_json` rather than `format!`, like every
+/// other write here, and the date has already been through
+/// [`parse_due_entry`] — so what goes out is a real calendar date in Jira's
+/// own spelling and nothing else.
+pub fn update_due(
+    site: &JiraSite,
+    key: &str,
+    due: Option<chrono::NaiveDate>,
+) -> Result<()> {
+    require_complete(site)?;
+    validate_issue_key(key)?;
+    let url = format!("{}/issue/{}", site.api_base, key.trim());
+    let value = match due {
+        Some(d) => Value::String(d.format("%Y-%m-%d").to_string()),
+        None => Value::Null,
+    };
+    let payload = serde_json::json!({ "fields": { "duedate": value } }).to_string();
+    atlassian_http::request_with_method(
+        &site.auth.email,
+        &site.auth.token,
+        atlassian_http::ApiKind::Jira,
+        "PUT",
+        &url,
+        &[],
+        Some(&payload),
+    )?;
+    Ok(())
+}
+
 fn parse_due(due: &str) -> Option<chrono::NaiveDate> {
     let due = due.trim();
     if due.is_empty() {
@@ -2341,6 +2442,51 @@ mod tests {
         // one row needing no attention red is noise.
         assert_eq!(due_state("2026-01-01", "done", today), DueState::Future);
         assert_eq!(due_state("2026-01-01", "DONE", today), DueState::Future);
+    }
+
+    /// Blank is a **clear**, not a no-op: it is the one place an empty box
+    /// means an edit, which is why the button says so.
+    #[test]
+    fn a_blank_due_date_entry_means_clear_it() {
+        assert_eq!(parse_due_entry(""), Ok(None));
+        assert_eq!(parse_due_entry("   "), Ok(None));
+    }
+
+    /// Typed leniently, sent canonically.
+    #[test]
+    fn a_due_date_entry_is_canonicalised() {
+        let d = parse_due_entry("2026-9-1").expect("parses").expect("a date");
+        assert_eq!(d.format("%Y-%m-%d").to_string(), "2026-09-01");
+        let d = parse_due_entry(" 2026-09-01 ").expect("parses").expect("a date");
+        assert_eq!(d.format("%Y-%m-%d").to_string(), "2026-09-01");
+    }
+
+    /// Refused here rather than by a 400 that names Jira's field instead of
+    /// the box it was typed into.
+    #[test]
+    fn a_bad_due_date_entry_is_refused_locally() {
+        for bad in ["tomorrow", "01/09/2026", "2026-13-01", "2026-02-30", "20266-01-01"] {
+            assert!(parse_due_entry(bad).is_err(), "{bad} should be refused");
+        }
+    }
+
+    /// A `/browse/` link is only offered where a browser has somewhere to go.
+    #[test]
+    fn the_browse_url_needs_a_real_site() {
+        assert_eq!(
+            browse_url("https://jira.example.com/rest/api/3", "abc-12"),
+            Some("https://jira.example.com/browse/ABC-12".to_string())
+        );
+        // The cloud-id gateway is an API endpoint, not a page: a link built
+        // on it is well-formed and lands nowhere.
+        assert_eq!(
+            browse_url("https://api.atlassian.com/ex/jira/cloud-id/rest/api/3", "ABC-12"),
+            None
+        );
+        // Nothing resolved at all.
+        assert_eq!(browse_url("", "ABC-12"), None);
+        // The key reaches a URL path, so it is whitelisted here too.
+        assert_eq!(browse_url("https://jira.example.com/rest/api/3", "ABC-12/../.."), None);
     }
 
     #[test]

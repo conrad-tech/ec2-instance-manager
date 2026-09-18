@@ -56,25 +56,25 @@ cargo clippy --features gui
 
 ## Build status
 
-As of 2026-09-09 (rustc 1.94.0), measured on `aws-resource-browser-phase1`
-after the Inventory resource sub-tabs were finished (phase 5, Route 53) — this line was
-stale for months before phase 1 (it read 356 tests / 21 warnings, both months
-out of date; the measured baseline immediately before phase 1 was 1019 tests /
-23 warnings):
+As of 2026-09-18 (rustc 1.94.0), measured on `brandons_changes` after the
+toolbar badge counts, the editable due date and Open in Jira — the measured
+baseline immediately before that work was 1522 tests / 24 warnings, on the
+same tree. (Before phase 1 of the resource browser this line had been stale
+for months, reading 356 tests / 21 warnings.)
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 1370 tests pass, 0 fail (817 lib + 3 CLI + 550 GUI)
-- `cargo clippy --features gui` — no errors; 23 pre-existing style warnings.
+- `cargo test --features gui` — 1531 tests pass, 0 fail (924 lib + 3 CLI + 604 GUI)
+- `cargo clippy --features gui` — no errors; 24 pre-existing style warnings.
   **That is a count of `^warning` lines, which is how the pre-branch baseline
-  was measured and why the two are comparable — it is 21 distinct lints (6 lib
-  + 15 GUI) plus the two per-crate "generated N warnings" summary lines.** The
-  21 are: lib — derivable_impls on Mode, too_many_arguments on
+  was measured and why the two are comparable — it is 22 distinct lints (6 lib
+  + 16 GUI) plus the two per-crate "generated N warnings" summary lines.** The
+  22 are: lib — derivable_impls on Mode, too_many_arguments on
   sim::make_instance, three manual_is_multiple_of, one manual div_ceil; GUI —
-  two more too_many_arguments, manual case-insensitive ASCII comparison, manual
-  `Range::contains`, a clamp-like pattern, a simplifiable `map_or`, four
-  let_and_return, four collapsible_if, one unneeded `return`
+  two more too_many_arguments, **two** manual case-insensitive ASCII
+  comparisons, manual `Range::contains`, a clamp-like pattern, a simplifiable
+  `map_or`, four let_and_return, four collapsible_if, one unneeded `return`
 - The Windows release cross-compile
   (`ALLOW_NO_FORWARDS=1 CARGO_TARGET_DIR=/tmp/ec2m cargo build --release
-  --target x86_64-pc-windows-gnu --features gui`) — reverified 2026-09-09,
+  --target x86_64-pc-windows-gnu --features gui`) — reverified 2026-09-18,
   exit 0, zero warnings
 - Release targets — zero warnings on both Linux (x86_64-unknown-linux-gnu, via
   `build_binaries.sh`) and Windows (x86_64-pc-windows-gnu, built directly since
@@ -397,6 +397,54 @@ Credential Manager.
 
 `assets/scripts/alerts_10min.sh` is the standalone bash equivalent (curl + jq,
 same tag parsing, same local-time conversion) for terminal use.
+
+#### The count on the Alerts button
+
+The button reads **`Alerts (2)`**, amber-filled, whenever anything is open,
+and plain `Alerts` when nothing is. `alerts_button_label` owns that, so what
+the button says is settled by a test rather than by reading a render.
+
+- **It counts open alerts, not rows.** It used to read `rows.len()` off the
+  Alerts *window*, which is wrong twice over: that window is shut almost all
+  the time, so the number was simply absent — and when it was open its rows
+  carry closed history on purpose (that is what the lookback is for), so a
+  settled night counted as a busy one. `alerts::open_count` is the definition
+  now, and `alerts::is_open` is the one place "open" is decided.
+- **An acknowledged alert still counts.** `acked` is a real third status on
+  this tenant and an acknowledged alert is precisely one somebody is
+  *working*; only `closed` takes a row off the button. The same distinction
+  `reaper::alert_is_closed` turns on, and the same one that makes
+  `fetch_recent`'s window govern closed alerts only.
+- **`start_alerts_badge_poll` is what makes it true before you look.** One
+  thread, `ALERTS_BADGE_POLL` (60s), calling `alerts::fetch_open_alerts` —
+  `fetch_open`'s bounded `status:open` pass on its own, not `fetch_recent`,
+  which would walk up to `MAX_PAGES` of closed history for a number that has
+  no use for it. A minute rather than the ticket poll's five: an
+  unacknowledged page is time-critical in a way a ticket list is not.
+- **It polls before its first sleep**, unlike `start_jira_background_poll`. A
+  page that came in overnight belongs on the button when the app comes up,
+  not a minute later.
+- **It stands down while the window is open** (`alerts_window_open`), whose
+  10-second refresh already answers the question — and that fetch feeds
+  `alerts_open_count` itself, so there is one number whichever is running.
+  The flag is stored **once per frame from the window state**, not at each
+  toggle: four places close that window and a flag set at each of them is a
+  flag one of them forgets.
+- **It is started from the first `update`, not from `App::new`**, because
+  that is where a real `egui::Context` exists. Without one the thread
+  delivers a count and never wakes the UI to draw it — the same mistake the
+  tunnel banner, the power status line and the resource TTL each made in
+  turn. `alerts_badge_poll_started` makes it a no-op thereafter.
+- **A failed poll leaves the previous count alone** and is logged **once per
+  change**, like `report_reaper_reason_change`: "no alerts" and "could not
+  ask" are different answers and only one is good news, and a site whose
+  token expired would otherwise write a line a minute for as long as the app
+  is open. Its own channel, deliberately not `alerts_tx` — that one is
+  generation-stamped so an "Acknowledge all" run can drop replies it has
+  overtaken, and a count has no part in those rules.
+- **Zero shows no number at all.** `(0)` in brackets reads as a thing to look
+  at, and the whole point of this badge is that it is only there when
+  something is. The Jira one is the opposite, and deliberately so — see below.
 
 #### The alert window (click an alert's id)
 
@@ -1555,6 +1603,53 @@ window, and a search box opens any ticket by key.
   never overdue** — it is finished, not late, and colouring the one row
   needing no attention red is noise. Only overdue and due-today are coloured;
   colouring future dates too would leave nothing standing out.
+- **The due date is editable, and blank means CLEAR.** An **Edit** button
+  beside the Due row opens a `YYYY-MM-DD` box with Save / Clear / Cancel;
+  `jira::update_due` sends `fields.duedate`, and `None` goes out as an
+  explicit JSON `null`, because omitting the field leaves the date alone —
+  the two cases must not be able to share a code path by accident.
+  - **`parse_due_entry` refuses locally, as it is typed**, and Save stays
+    disabled until it parses. A `ValidationError` arrives seconds later out
+    of a subprocess and names Jira's field rather than the box the date was
+    typed into — the same reasoning `check_capacity` follows for ASG
+    capacity.
+  - **Lenient in, canonical out.** `2026-9-1` is what somebody types and
+    `2026-09-01` is what Jira is sent.
+  - **The year is bounded (1970–2999).** `%Y` will happily take `20266`, and
+    a due date eighteen thousand years out is a wrong write to a live ticket
+    that nothing else here would question.
+  - **`start_jira_save_due` parses again** rather than trusting the render.
+    The disabled button is a courtesy; this is the one place the value
+    reaches a live ticket, and it refuses standing alone — the stance
+    `terminate_instance` and `request_asg_capacity` take for the destructive
+    writes in this app.
+  - **An empty box is a real edit, so a button says so.** Nobody discovers
+    that by emptying a field to see what happens, which is why **Clear**
+    exists beside Save and is enabled only on a ticket that has a date.
+  - **The editor seeds with the date the ticket already has**, so the common
+    edit — moving it a few days — is a keystroke rather than typing a date
+    out.
+  - It reuses `JiraEvent::Edited`, so a save closes the editor only on
+    success and the reload that follows is the description editor's, already
+    written. `DueEdit` is deliberately **not** a `TextEditState`: there are no
+    mentions in a date and nothing about one can be lost in a round trip, so
+    two of that struct's four fields would be permanently dead here.
+- **Open in Jira opens the browser, and only where there is one to open.**
+  `jira::browse_url` turns the resolved API base back into `https://<site>/
+  browse/<KEY>` — a button in the ticket window's header and a right-click
+  entry on the key in the list. It goes through `open_in_browser`, the
+  default browser, like every other link this app opens.
+  - **`None` for the cloud-id gateway form.** With no `jira.base_url`
+    configured the API base resolves to
+    `https://api.atlassian.com/ex/jira/<cloud_id>/rest/api/3`, which is an
+    OAuth-authenticated API endpoint and not a page: a `/browse/` link built
+    on it is perfectly well-formed and lands nowhere. The entry is **hidden**
+    rather than greyed out — a disabled button invites a question whose
+    answer is a config field nobody looking at that window can see, and the
+    startup line already names the resolved site.
+  - The key is upper-cased and then **whitelisted**, not escaped: it goes
+    into a URL path, the same stance `validate_issue_key` takes everywhere
+    else.
 - **A failed call now carries the API's own explanation.** `atlassian_http`
   preferred stderr whenever it was non-empty, and curl writes
   `(22) The requested URL returned error: 400` there every time — so the
@@ -1596,10 +1691,25 @@ window, and a search box opens any ticket by key.
 - **The empty closed list names the window it searched** — otherwise "no
   tickets" reads as "you have closed nothing, ever" rather than "nothing in
   the last 30 days".
-#### The unread badge
+#### The badge: the number is open tickets, the amber is unread
 
-The **Jira Tickets** button carries an amber fill and a count while anything
-has changed since you last looked at it.
+The **Jira Tickets** button reads `Jira Tickets (3)` — the count of open
+tickets, from `jira_open_count`, via `jira_button_label` — and fills amber
+while anything has changed since you last looked at it.
+
+**The number used to be the unread count.** The two answer different
+questions — "how much is on me" and "has any of it moved" — and the button
+was showing the second while its label claimed the first, so three open
+tickets with nothing new on them read as a bare `Jira Tickets`. The unread
+signal did not go anywhere: it is the fill, which cannot be skimmed past the
+way a changed digit can, and the hover carries both numbers.
+`the_jira_button_label_is_fed_the_open_count` scans the call site, because the
+two bindings are a line apart and restoring the old one would look like a
+tidy-up.
+
+**It shows its number even at zero**, unlike the Alerts badge beside it. "No
+open tickets" is a fact somebody wants at a glance; "no alerts are ringing" is
+the ordinary state of the world and needs no badge.
 
 - **What "unread" detects.** `unread_keys` is pure over the rows and the seen
   store: a ticket is unread when its **status moved**, its **`updated` stamp
