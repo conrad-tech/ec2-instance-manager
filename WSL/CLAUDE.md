@@ -1738,13 +1738,30 @@ the ordinary state of the world and needs no badge.
   and pruning would make it announce itself the moment it surfaced.
   `prune_seen` is the age backstop (180 days) for tickets that left the list
   another way, such as being reassigned.
-- **The background poll runs every five minutes and steps aside while the
-  window is open** (a shared `AtomicBool`), because the window's own
-  auto-refresh already polls on the same cadence and running both doubles the
-  traffic for one answer. It polls the **Open** scope only — unread on a
-  closed ticket is meaningless. DEBUG heartbeat per tick, so "the thread never
-  started" and "nothing changed" stay distinguishable, which is the lesson
-  both the reaper and pingdom watchers carry.
+- **The background poll runs every minute (`JIRA_BADGE_POLL`) and polls
+  BEFORE its first sleep.** It used to sleep five minutes first, so the
+  button read `Jira Tickets (0)` for the first five minutes of every run —
+  and `0` is not "we have not asked yet", it is an assertion that nothing is
+  on you. Clicking the button was the only thing that corrected it, which
+  made the badge useless exactly where it was meant to save the click.
+  `start_alerts_badge_poll` had the same shape for the same reason.
+  - **`JIRA_BADGE_POLL` is deliberately not `JIRA_REFRESH_SECS`.** That one
+    paces the *open* window's auto-refresh, where the list is on screen and a
+    Refresh button is right there, and five minutes is still right for it.
+    This one is the only thing keeping a number on a button somebody is
+    glancing at, and a five-minute-old count reads as a wrong count rather
+    than an old one.
+  - **It is started from the first `update`, not from `App::new`.** That is
+    where a real `egui::Context` exists, and without one the thread delivers
+    a count and never wakes the UI to draw it — egui only draws when
+    something happens. `App::new` decides whether it is *due* (the gate
+    passes) and `jira_badge_poll_started` makes the start idempotent.
+- **It steps aside while the window is open** (a shared `AtomicBool`),
+  because the window's own auto-refresh already polls and running both
+  doubles the traffic for one answer. It polls the **Open** scope only —
+  unread on a closed ticket is meaningless. DEBUG heartbeat per tick, so "the
+  thread never started" and "nothing changed" stay distinguishable, which is
+  the lesson both the reaper and pingdom watchers carry.
 - **A filled button, not coloured text.** In a row of identically-shaped grey
   buttons a few coloured characters are easy to skim past, and a notification
   cannot have that failure mode. **Amber, not red** — red means "a thing

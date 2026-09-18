@@ -2068,6 +2068,18 @@ mod gui {
     /// browser and want to see it now.
     const JIRA_REFRESH_SECS: u64 = 300;
 
+    /// How often the **badge** poll asks how many tickets are open, while
+    /// the ticket window is shut.
+    ///
+    /// A minute, matching `ALERTS_BADGE_POLL`. Deliberately **not**
+    /// `JIRA_REFRESH_SECS`: that one paces the open window's own
+    /// auto-refresh, where the list is on screen and a Refresh button is
+    /// right there, and five minutes remains the right answer for it. This
+    /// one is the only thing keeping a number on a button somebody is
+    /// glancing at, and a five-minute-old count on a button reads as a wrong
+    /// count rather than an old one.
+    const JIRA_BADGE_POLL: u64 = 60;
+
     /// Jira Tickets list window state; `None` while the window is closed.
     struct JiraWindow {
         /// Rows from the last successful search, as the JQL ordered them
@@ -9308,6 +9320,12 @@ mod gui {
         /// `egui::Context` first exists — without one the thread can deliver
         /// a count and never wake the UI to draw it.
         alerts_badge_poll_started: bool,
+        /// Same arrangement for the ticket badge: `App::new` decides whether
+        /// it is *due* (the Jira gate passes), and the first `update` is
+        /// what starts it, because that is where a `Context` exists to wake
+        /// the UI with.
+        jira_badge_poll_due: bool,
+        jira_badge_poll_started: bool,
         /// Build-time gate: whether the Jira Tickets button is shown to the
         /// current OS user (features.json `jira.allowed_users`, ANDed with
         /// credentials that actually resolve).
@@ -10055,6 +10073,8 @@ mod gui {
                 alerts_count_error: None,
                 alerts_window_open: alerts_window_open_flag,
                 alerts_badge_poll_started: false,
+                jira_badge_poll_due: false,
+                jira_badge_poll_started: false,
                 jira_enabled,
                 jira_site,
                 jira_me: None,
@@ -10167,8 +10187,10 @@ mod gui {
                 // ticket list, and nothing else in the log would say so.
                 app.log_jira(LogLevel::Info, format!("jira: reading tickets from {}", app.jira_site.api_base()));
                 // The badge is only worth having if it is live before the
-                // window is ever opened.
-                app.start_jira_background_poll();
+                // window is ever opened. Started from the first `update`,
+                // where there is a `Context` to wake the UI with — see
+                // `start_jira_background_poll`.
+                app.jira_badge_poll_due = true;
                 // Who this token is — decides which comments you may edit.
                 app.start_jira_myself();
             }
@@ -16225,36 +16247,52 @@ mod gui {
             });
         }
 
-        /// The background watcher: one open-tickets poll every five minutes,
-        /// whether or not the window is open, so the toolbar badge means
-        /// something before you look.
+        /// The background watcher: one open-tickets poll a minute
+        /// (`JIRA_BADGE_POLL`), whether or not the window is open, so the
+        /// toolbar badge means something before you look.
+        ///
+        /// **It polls before its first sleep.** It used to sleep first, so
+        /// the button read `Jira Tickets (0)` for the first five minutes of
+        /// every run — and 0 is not "we have not asked yet", it is an
+        /// assertion that nothing is on you. Clicking the button was the
+        /// only thing that corrected it, which made the badge useless
+        /// exactly when it was meant to save the click.
+        /// `start_alerts_badge_poll` had the same shape for the same reason.
         ///
         /// **Skipped while the window is open** — its own auto-refresh
-        /// already polls on the same cadence, and running both would double
-        /// the traffic for one answer. A DEBUG heartbeat per tick keeps "the
-        /// thread never started" and "nothing has changed" distinguishable,
-        /// which is the lesson the reaper and pingdom watchers both carry.
-        fn start_jira_background_poll(&mut self) {
+        /// already polls, and running both would double the traffic for one
+        /// answer. A DEBUG heartbeat per tick keeps "the thread never
+        /// started" and "nothing has changed" distinguishable, which is the
+        /// lesson the reaper and pingdom watchers both carry.
+        fn start_jira_background_poll(&mut self, ctx: &egui::Context) {
+            if self.jira_badge_poll_started || !self.jira_badge_poll_due {
+                return;
+            }
             if !self.jira_enabled {
                 return;
             }
+            self.jira_badge_poll_started = true;
             let site = self.jira_site.clone();
             let tx = self.jira_tx.clone();
             let window_open = self.jira_window_open.clone();
+            // Without this the count lands in the channel and sits there:
+            // egui only draws when something happens, and nobody touching an
+            // idle window is exactly the case a badge is for.
+            let ctx = ctx.clone();
             std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(JIRA_REFRESH_SECS));
-                if window_open.load(std::sync::atomic::Ordering::Relaxed) {
-                    continue;
+                if !window_open.load(std::sync::atomic::Ordering::Relaxed) {
+                    let result = ec2_manager::jira::search_my_issues(
+                        &site,
+                        ec2_manager::jira::TicketScope::Open,
+                        ec2_manager::jira::DEFAULT_CLOSED_DAYS,
+                    )
+                    .map_err(|e| e.to_string());
+                    if tx.send(JiraEvent::Background(result)).is_err() {
+                        return; // the app is gone
+                    }
+                    ctx.request_repaint();
                 }
-                let result = ec2_manager::jira::search_my_issues(
-                    &site,
-                    ec2_manager::jira::TicketScope::Open,
-                    ec2_manager::jira::DEFAULT_CLOSED_DAYS,
-                )
-                .map_err(|e| e.to_string());
-                if tx.send(JiraEvent::Background(result)).is_err() {
-                    return; // the app is gone
-                }
+                std::thread::sleep(Duration::from_secs(JIRA_BADGE_POLL));
             });
         }
 
@@ -34410,6 +34448,7 @@ mod gui {
             // real `Context` to wake the UI with; a no-op after the first
             // frame.
             self.start_alerts_badge_poll(ctx);
+            self.start_jira_background_poll(ctx);
             // Read from the window state itself, every frame, rather than
             // written at each of the four places that close that window —
             // one of them would eventually forget.
