@@ -145,6 +145,69 @@ test_package_windows_zip_ships_both_powershell_scripts() {
   WINDOWS_DIST_DIR="$original_windows_dist_dir"
 }
 
+# A run that cannot package must FAIL, and must not leave the previous
+# release's zip sitting there looking current.
+#
+# This is the exact shape of the bug: Git for Windows ships no zip, so
+# `require_cmd zip` exited 1 with `set -e` — after the fresh exes had been
+# copied into dist/ and verified. What a person then saw was today's
+# binaries beside a weeks-old zip and SHA256SUMS, which is worse than a
+# failed build because it looks finished.
+#
+# PATH is reduced to a directory holding only the externals make_flat_zip
+# actually uses, so zip, cygpath and powershell are absent whatever the host
+# has installed — otherwise this test would pass for the wrong reason on a
+# machine with zip and never run at all on the machines that matter.
+test_make_flat_zip_fails_loudly_when_it_cannot_package() {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  mkdir -p "$tmpdir/stage" "$tmpdir/bin"
+  echo "payload" > "$tmpdir/stage/a.txt"
+  echo "last month" > "$tmpdir/out.zip"
+  ln -s "$(command -v rm)" "$tmpdir/bin/rm"
+
+  local rc=0
+  (
+    PATH="$tmpdir/bin"
+    make_flat_zip "$tmpdir/stage" "$tmpdir/out.zip"
+  ) >/dev/null 2>&1 || rc=$?
+
+  if [[ "$rc" -eq 0 ]]; then
+    echo "assertion failed: make_flat_zip reported success with no way to zip" >&2
+    rm -rf "$tmpdir"
+    exit 1
+  fi
+  if [[ -f "$tmpdir/out.zip" ]]; then
+    echo "assertion failed: a failed packaging run left the previous zip in place" >&2
+    rm -rf "$tmpdir"
+    exit 1
+  fi
+  rm -rf "$tmpdir"
+}
+
+# The PowerShell fallback is only reached where a Windows path can be built,
+# which is what `cygpath` stands for. Reaching it from WSL hands PowerShell a
+# path Windows cannot open (`'\tmp\...' either does not exist`), so a WSL
+# host must fall through to the error telling it to install zip.
+test_make_flat_zip_needs_cygpath_for_the_powershell_fallback() {
+  local src="${ROOT_DIR}/scripts/build_binaries.sh"
+  local body
+  body="$(sed -n '/^make_flat_zip()/,/^}/p' "$src")"
+  if ! grep -q 'command -v cygpath' <<<"$body"; then
+    echo "assertion failed: make_flat_zip must gate PowerShell on cygpath" >&2
+    exit 1
+  fi
+  # The gate has to sit OUTSIDE the interpreter search, or a WSL host finds
+  # powershell.exe and takes a path it cannot complete.
+  local gate_line ps_line
+  gate_line="$(grep -n 'command -v cygpath' <<<"$body" | head -1 | cut -d: -f1)"
+  ps_line="$(grep -n 'for candidate in powershell' <<<"$body" | head -1 | cut -d: -f1)"
+  if [[ -z "$gate_line" || -z "$ps_line" || "$gate_line" -gt "$ps_line" ]]; then
+    echo "assertion failed: the cygpath gate must precede the PowerShell search" >&2
+    exit 1
+  fi
+}
+
 test_package_linux_zip_skips_when_no_artifacts() {
   local tmpdir
   tmpdir="$(mktemp -d)"
@@ -300,6 +363,8 @@ main() {
   test_only_test_mode_sets_the_forwards_bypass
   test_package_linux_zip_creates_archive_with_artifacts
   test_package_windows_zip_ships_both_powershell_scripts
+  test_make_flat_zip_fails_loudly_when_it_cannot_package
+  test_make_flat_zip_needs_cygpath_for_the_powershell_fallback
   test_package_linux_zip_skips_when_no_artifacts
   test_copy_windows_runtime_dlls_with_custom_gcc
   test_versioned_name_matches_the_exe_copy_artifact_writes

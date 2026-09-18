@@ -85,13 +85,47 @@ for months, reading 356 tests / 21 warnings.)
   alone is ~10 GB. Either `cargo clean`, or build to the Linux filesystem with
   `CARGO_TARGET_DIR=/tmp/ec2m-test cargo test --features gui` (same trick the
   Windows cross-compile already uses for the spaces-in-path problem).
-- Packaging the release zips needs `zip`/`unzip` on PATH (`sudo apt install zip`).
-  **Without them `build_binaries.sh` aborts, it does not skip the step:**
-  `package_linux_zip` calls `require_cmd zip`, which `exit 1`s — so the Linux
-  binaries land in `dist/linux/` and the run dies there, *before* the Windows
-  target is ever built. If you only need to check that both targets compile,
-  build them directly (see the cross-compile note below) rather than running the
-  packaging script.
+- Packaging the release zips needs `zip` on PATH **on Linux or WSL**
+  (`sudo apt install zip`). **Without it `build_binaries.sh` aborts, it does
+  not skip the step:** `package_linux_zip` calls `require_cmd zip`, which
+  `exit 1`s — so the Linux binaries land in `dist/linux/` and the run dies
+  there, *before* the Windows target is ever built. If you only need to check
+  that both targets compile, build them directly (see the cross-compile note
+  below) rather than running the packaging script.
+- **On a Windows host there is no `zip`, and that used to end the run
+  silently-in-effect.** Git for Windows ships neither `zip` nor `unzip`, so
+  `package_windows_zip` hit the same `require_cmd zip` — *after* the fresh
+  exes were copied into `dist/windows/` and their icon verified. What that
+  leaves is today's binaries beside a weeks-old zip and `SHA256SUMS`, which
+  is worse than a failed build because it looks finished; it is how a release
+  went out with a zip three weeks older than the exes next to it.
+  `make_flat_zip` now falls back to PowerShell's **`Compress-Archive`**,
+  which is on every Windows box since Windows 10 and needs installing
+  nowhere.
+  - **`cygpath` is the gate, and it is also the test for "am I on Git
+    Bash".** PowerShell is reachable from WSL too, but a WSL path is not one
+    Windows can open — it answers `'\tmp\…' either does not exist or is not
+    a valid file system path`. A WSL host therefore falls through to the
+    error telling it to install `zip`.
+    `test_make_flat_zip_needs_cygpath_for_the_powershell_fallback` pins that
+    the gate sits *outside* the interpreter search, or WSL finds
+    `powershell.exe` and takes a path it cannot finish.
+  - **The payload is staged into `dist/windows/.stage` first**, and both the
+    zip and the extracted folder are copies of that one list. That removes
+    `unzip` from the release path entirely (Git for Windows has none either)
+    and means the archive and the folder cannot disagree. It is staged in
+    `dist/` rather than under `$TMPDIR` because the PowerShell fallback can
+    only reach paths Windows can open — Git Bash's `mktemp` does land in the
+    Windows temp directory, but that is a property of one shell rather than
+    something to rely on.
+  - **A run that cannot package fails and removes the stale zip.** No zip at
+    all is a visibly incomplete release; last month's zip with a current
+    timestamp beside it is not.
+    `test_make_flat_zip_fails_loudly_when_it_cannot_package` reduces `PATH`
+    to just the externals the function uses, so it exercises that path on
+    every host rather than skipping on the ones that have `zip` — the old
+    zip tests skip when `zip`/`unzip` are missing, which is exactly the
+    machine where this broke.
 
 ### Known-good rollback point: `pre-email-readd-58a9b9a`
 

@@ -371,6 +371,75 @@ copy_windows_runtime_dlls() {
   done
 }
 
+# Zip everything in $1 into $2, flat (no directory entries).
+#
+# `zip` where there is one, and otherwise PowerShell's Compress-Archive,
+# which is on every Windows box since Windows 10 and needs installing
+# nowhere.
+#
+# That fallback is not a nicety. **Git for Windows ships no zip and no
+# unzip**, so on a Windows host this step hit `require_cmd zip`, and with
+# `set -e` the whole run stopped dead — after the exes had been copied into
+# dist/ and verified, and before the zip was rebuilt. The visible result is a
+# dist directory holding today's binaries beside a weeks-old zip and
+# SHA256SUMS, which is worse than a failed build: it looks finished.
+#
+# Paths are handed to PowerShell through `cygpath -w`, because a `/c/...`
+# path means nothing to it and MSYS rewrites bare `/`-leading arguments on
+# the way out.
+make_flat_zip() {
+  local src_dir="$1"
+  local zip_path="$2"
+
+  rm -f "$zip_path"
+
+  if command -v zip >/dev/null 2>&1; then
+    # Unchanged from how every previous release was cut.
+    ( shopt -s nullglob; zip -q -j "$zip_path" "$src_dir"/* )
+    return 0
+  fi
+
+  # `cygpath` is required, not optional, and it is also the test for "am I
+  # on Git Bash / MSYS" -- the environment where this fallback is wanted.
+  # PowerShell is reachable from WSL too, but a WSL path is not a path
+  # Windows can open, so handing it one produces
+  # "'\tmp\...' either does not exist or is not a valid file system path".
+  # A WSL host wants `apt install zip`, which the error below says.
+  local ps=""
+  if command -v cygpath >/dev/null 2>&1; then
+    local candidate
+    for candidate in powershell.exe pwsh.exe powershell pwsh; do
+      if command -v "$candidate" >/dev/null 2>&1; then
+        ps="$candidate"
+        break
+      fi
+    done
+  fi
+
+  if [[ -n "$ps" ]]; then
+    local win_src win_zip
+    win_src="$(cygpath -w "$src_dir")"
+    win_zip="$(cygpath -w "$zip_path")"
+    echo "info: no zip(1); packaging with PowerShell Compress-Archive"
+    "$ps" -NoProfile -NonInteractive -Command \
+      "\$ErrorActionPreference='Stop'; Compress-Archive -Path '${win_src}\\*' -DestinationPath '${win_zip}' -Force"
+    # PowerShell reports failure through its exit code, but a zip that was
+    # never written is the thing actually worth checking.
+    if [[ ! -f "$zip_path" ]]; then
+      echo "error: Compress-Archive reported success but produced no $zip_path" >&2
+      exit 1
+    fi
+    return 0
+  fi
+
+  echo "error: cannot package the release: no zip(1), and no usable" >&2
+  echo "       PowerShell fallback (that needs cygpath, i.e. Git Bash/MSYS)." >&2
+  echo "       On Linux or WSL:  sudo apt install zip" >&2
+  echo "       On Windows:       run from Git Bash, where powershell.exe is" >&2
+  echo "                         used instead -- Git for Windows ships no zip." >&2
+  exit 1
+}
+
 package_windows_zip() {
   local zip_path="${WINDOWS_DIST_DIR}/ec2_manager_windows_${APP_VERSION}.zip"
   # Copy walkthrough into dist dir for packaging, only when opted in. Otherwise
@@ -424,19 +493,35 @@ package_windows_zip() {
     return 0
   fi
 
-  require_cmd zip
+  # Staged into a directory first, so the zip and the extracted folder are
+  # two copies of ONE list rather than a zip and an unzip that have to agree
+  # -- and so neither `unzip` nor any second tool is needed to produce the
+  # folder. Git for Windows ships neither zip nor unzip.
   local extract_dir="${WINDOWS_DIST_DIR}/ec2_manager_windows"
+  # Staged inside the dist directory, NOT under $TMPDIR. The PowerShell
+  # fallback in make_flat_zip can only reach paths Windows can open, and
+  # while Git Bash's own mktemp does land in the Windows temp directory,
+  # that is a property of one shell rather than something to rely on --
+  # dist/ is by definition somewhere this machine can write and Windows can
+  # see. Cleared first, so a run that died part way through cannot
+  # contribute a file to the next one's archive.
+  local stage="${WINDOWS_DIST_DIR}/.stage"
+  rm -rf "$stage"
+  mkdir -p "$stage"
+  cp "${files[@]}" "$stage"/
+
+  make_flat_zip "$stage" "$zip_path"
+
   rm -rf "$extract_dir"
-  rm -f "$zip_path"
-  zip -q -j "$zip_path" "${files[@]}"
   mkdir -p "$extract_dir"
-  unzip -qo "$zip_path" -d "$extract_dir"
+  cp "$stage"/* "$extract_dir"/
   # User-facing README goes ONLY in the extracted folder (not the zip), so
   # someone opening the folder has a quick "what is this / how to run" guide.
   # The WALKTHROUGH is in both, but only under --with-walkthrough.
   if [[ -f "${ROOT_DIR}/USER_README.md" ]]; then
     cp "${ROOT_DIR}/USER_README.md" "${extract_dir}/README.md"
   fi
+  rm -rf "$stage"
   echo "info: packaged Windows zip: $zip_path"
   echo "info: extracted to: $extract_dir"
 
