@@ -262,10 +262,39 @@ verify_windows_icon() {
       break
     fi
   done
+  # ...and then where they live when PATH has none, which is the ordinary
+  # state of a Windows host: Git Bash ships no binutils, and LLVM's objdump
+  # sits in its own install directory. rustup's llvm-tools component carries
+  # one too, which is the cheapest thing to add on a machine that already has
+  # rustup (`rustup component add llvm-tools`).
+  if [[ -z "$dumper" ]]; then
+    local sysroot probe
+    sysroot="$(rustc --print sysroot 2>/dev/null || true)"
+    # `ProgramFiles(x86)` is not a name bash can expand, so that one is
+    # spelled out in Git Bash's own /c/... form rather than read from the
+    # environment.
+    for probe in \
+      "${sysroot}/lib/rustlib/${HOST_TRIPLE}/bin/llvm-objdump" \
+      "${sysroot}/lib/rustlib/${HOST_TRIPLE}/bin/llvm-objdump.exe" \
+      "${ProgramFiles:-/nonexistent}/LLVM/bin/llvm-objdump.exe" \
+      "${ProgramW6432:-/nonexistent}/LLVM/bin/llvm-objdump.exe" \
+      "/c/Program Files/LLVM/bin/llvm-objdump.exe" \
+      "/c/Program Files (x86)/LLVM/bin/llvm-objdump.exe"
+    do
+      if [[ -n "$probe" && -x "$probe" ]]; then
+        dumper="$probe"
+        break
+      fi
+    done
+  fi
   if [[ -z "$dumper" ]]; then
     echo "error: cannot verify the app icon in $(basename "$exe"): no objdump found" >&2
-    echo "       (tried x86_64-w64-mingw32-objdump, objdump, llvm-objdump)" >&2
-    echo "       Install binutils, or re-run with SKIP_ICON_VERIFY=1 to bypass." >&2
+    echo "       (tried x86_64-w64-mingw32-objdump, objdump, llvm-objdump, the LLVM" >&2
+    echo "        install directory, and rustup's llvm-tools component)" >&2
+    echo "       Install binutils, run 'rustup component add llvm-tools', or" >&2
+    echo "       install LLVM (winget install LLVM.LLVM)." >&2
+    echo "       SKIP_ICON_VERIFY=1 bypasses THIS CHECK ONLY — the build itself" >&2
+    echo "       still refuses to produce an icon-less exe (REQUIRE_APP_ICON)." >&2
     exit 1
   fi
 
@@ -451,6 +480,19 @@ build_for_target() {
   local target="$1"
 
   echo "info: building release target: $target"
+
+  # A released Windows exe must carry its icon resource, so build.rs turns
+  # its soft `cargo:warning` into a hard failure that names the reason.
+  #
+  # This is the half that matters, and verify_windows_icon below is only the
+  # backstop: that one needs `objdump`, which a Git Bash host does not have,
+  # so on the machine this actually went wrong the check could not run at all
+  # and the only signal was one warning line in the middle of a build log.
+  if [[ "$target" == *"windows"* ]]; then
+    export REQUIRE_APP_ICON=1
+  else
+    unset REQUIRE_APP_ICON
+  fi
 
   if [[ "$target" == "$HOST_TRIPLE" ]]; then
     (cd "$ROOT_DIR" && cargo build --release --bin "$CLI_APP_NAME")

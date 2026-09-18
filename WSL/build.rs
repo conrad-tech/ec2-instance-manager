@@ -111,6 +111,136 @@ fn main() {
     embed_windows_icon();
 }
 
+/// Report that the icon did not get embedded — as a warning, or as a hard
+/// failure when `REQUIRE_APP_ICON=1`.
+///
+/// **Soft is right for a developer and wrong for a release.** An icon must
+/// never break somebody's `cargo build`; but a `cargo:warning` scrolls past
+/// in a build log, and that is precisely how an icon-less exe was published
+/// — the machine linked MSVC binaries perfectly well, printed one warning
+/// nobody read, and produced a file Explorer draws with the generic glyph.
+///
+/// `build_binaries.sh` sets `REQUIRE_APP_ICON=1`, so a release says so at
+/// the point of failure and names the reason. That matters more than the
+/// `verify_windows_icon` check it backs up, because that check needs
+/// `objdump` — which a Git Bash host does not have, so on the very machine
+/// this happened to, the belt could not be fastened either.
+fn icon_not_embedded(reason: &str) {
+    if std::env::var("REQUIRE_APP_ICON").as_deref() == Ok("1") {
+        panic!(
+            "Build failed: app icon not embedded: {reason}\n\n\
+             REQUIRE_APP_ICON=1 is set (build_binaries.sh sets it for release\n\
+             builds), so this is an error rather than a warning: a released exe\n\
+             with no icon resource is drawn with the generic Windows glyph in\n\
+             Explorer, the Start menu and any pinned taskbar shortcut.\n\n\
+             Unset REQUIRE_APP_ICON to build anyway."
+        );
+    }
+    println!("cargo:warning=app icon not embedded: {reason}");
+}
+
+/// Where `rc.exe` and `llvm-rc` are installed, for when they are not on PATH.
+///
+/// **This is the ordinary case, not a broken machine.** The Windows SDK's
+/// `bin` directory is added to PATH by the Visual Studio developer prompt and
+/// by nothing else, so a build run from Git Bash, PowerShell or an IDE links
+/// MSVC binaries happily and cannot find the resource compiler sitting beside
+/// the linker it just used.
+///
+/// Newest SDK first: the `10.0.x.y` directories are compared componentwise,
+/// because sorted as text `10.0.9.0` beats `10.0.22621.0`.
+///
+/// Returns paths, which are handed to `Command::new` exactly as a name on
+/// PATH would be — so the caller's candidate loop does not have to know that
+/// some of its entries came from here.
+fn installed_resource_compilers() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
+    // The developer prompt exports these; honour them before guessing.
+    if let Ok(dir) = std::env::var("WindowsSdkVerBinPath") {
+        push_sdk_arch_dirs(Path::new(&dir), &mut out);
+    }
+    if let Ok(dir) = std::env::var("WindowsSdkDir") {
+        collect_sdk_versions(&Path::new(&dir).join("bin"), &mut out);
+    }
+
+    let program_files: Vec<String> = ["ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .collect();
+
+    for pf in &program_files {
+        for kit in ["10", "8.1"] {
+            collect_sdk_versions(&Path::new(pf).join("Windows Kits").join(kit).join("bin"), &mut out);
+        }
+        // LLVM's drop-in, which needs no SDK at all.
+        let llvm = Path::new(pf).join("LLVM").join("bin").join("llvm-rc.exe");
+        if llvm.is_file() {
+            out.push(llvm.display().to_string());
+        }
+    }
+    out
+}
+
+/// Add every `rc.exe` under an SDK `bin` directory, newest version first.
+///
+/// Two layouts are in the wild: `bin/<version>/<arch>/rc.exe` (Windows 10
+/// SDKs) and `bin/<arch>/rc.exe` (8.1 and very early 10 kits). Both are
+/// checked, because a machine can carry either.
+fn collect_sdk_versions(bin: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(bin) else {
+        return;
+    };
+    let mut versions: Vec<(Vec<u64>, std::path::PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Componentwise, or `10.0.9.0` sorts above `10.0.22621.0`.
+        let parts: Vec<u64> = name.split('.').filter_map(|p| p.parse().ok()).collect();
+        if parts.is_empty() {
+            continue; // an arch directory, handled by the flat layout below
+        }
+        versions.push((parts, path));
+    }
+    versions.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, dir) in versions {
+        push_sdk_arch_dirs(&dir, out);
+    }
+    // The flat 8.1-era layout.
+    push_sdk_arch_dirs(bin, out);
+}
+
+/// `rc.exe` for this host's architecture, under one SDK version directory.
+///
+/// The host's own arch leads — this tool runs here, whatever it is being
+/// asked to build — with the others after it, since an x64 machine can run
+/// the x86 build of `rc.exe` perfectly well and an SDK is not guaranteed to
+/// carry every arch.
+fn push_sdk_arch_dirs(dir: &Path, out: &mut Vec<String>) {
+    let host_first: &[&str] = if cfg!(target_arch = "aarch64") {
+        &["arm64", "x64", "x86"]
+    } else if cfg!(target_pointer_width = "64") {
+        &["x64", "x86", "arm64"]
+    } else {
+        &["x86", "x64", "arm64"]
+    };
+    for arch in host_first {
+        let candidate = dir.join(arch).join("rc.exe");
+        if candidate.is_file() {
+            out.push(candidate.display().to_string());
+        }
+    }
+    let flat = dir.join("rc.exe");
+    if flat.is_file() {
+        out.push(flat.display().to_string());
+    }
+}
+
 /// Compile `assets/app_icon.ico` into the GUI executable as its Win32 icon
 /// resource (Windows targets only).
 ///
@@ -143,16 +273,16 @@ fn embed_windows_icon() {
     println!("cargo:rerun-if-changed={}", icon_src.display());
     println!("cargo:rerun-if-env-changed=WINDRES");
     println!("cargo:rerun-if-env-changed=RC");
+    println!("cargo:rerun-if-env-changed=REQUIRE_APP_ICON");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     if target_env != "gnu" && target_env != "msvc" {
-        println!(
-            "cargo:warning=app icon not embedded: unsupported target env {target_env:?} \
-             (expected gnu or msvc)"
-        );
+        icon_not_embedded(&format!(
+            "unsupported target env {target_env:?} (expected gnu or msvc)"
+        ));
         return;
     }
 
@@ -160,16 +290,13 @@ fn embed_windows_icon() {
     let out_dir = Path::new(&out_dir);
 
     if let Err(err) = std::fs::copy(icon_src, out_dir.join("app_icon.ico")) {
-        println!(
-            "cargo:warning=app icon not embedded: could not copy {}: {err}",
-            icon_src.display()
-        );
+        icon_not_embedded(&format!("could not copy {}: {err}", icon_src.display()));
         return;
     }
     // Resource id 1: the lowest-numbered ICON resource is the one Windows
     // shows for the file, so this must stay 1.
     if let Err(err) = std::fs::write(out_dir.join("app_icon.rc"), "1 ICON \"app_icon.ico\"\n") {
-        println!("cargo:warning=app icon not embedded: could not write app_icon.rc: {err}");
+        icon_not_embedded(&format!("could not write app_icon.rc: {err}"));
         return;
     }
 
@@ -206,11 +333,21 @@ fn embed_windows_icon() {
         // varied, and the banner is harmless.
         candidates.push("rc.exe".to_string());
         candidates.push("llvm-rc".to_string());
+        // ...and then where they actually live, because PATH is the one
+        // place they are usually NOT. A plain `cargo build` from Git Bash or
+        // PowerShell links MSVC binaries perfectly well while finding
+        // neither name — the SDK's bin directory is put on PATH by the
+        // developer prompt and by nothing else. That is not an exotic
+        // setup, it is the ordinary one, and it is what shipped an
+        // icon-less release: the step failed soft, the warning scrolled
+        // past, and the exe came out with the generic glyph.
+        candidates.extend(installed_resource_compilers());
         (
             candidates,
             vec!["/fo", "app_icon.res", "app_icon.rc"],
             "app_icon.res",
-            "Build from a Visual Studio developer prompt, install llvm-rc, or set RC.",
+            "Build from a Visual Studio developer prompt, install LLVM \
+             (winget install LLVM.LLVM), or set RC to the full path of rc.exe.",
         )
     };
 
@@ -223,11 +360,11 @@ fn embed_windows_icon() {
             // Not installed under this name — try the next spelling.
             Err(_) => continue,
             Ok(output) if !output.status.success() => {
-                println!(
-                    "cargo:warning=app icon not embedded: {tool} failed ({}): {}",
+                icon_not_embedded(&format!(
+                    "{tool} failed ({}): {}",
                     output.status,
                     String::from_utf8_lossy(&output.stderr).trim()
-                );
+                ));
                 return;
             }
             Ok(_) => {
@@ -242,10 +379,10 @@ fn embed_windows_icon() {
         }
     }
 
-    println!(
-        "cargo:warning=app icon not embedded: no resource compiler found (tried {}). {hint}",
+    icon_not_embedded(&format!(
+        "no resource compiler found (tried {}). {hint}",
         candidates.join(", ")
-    );
+    ));
 }
 
 /// Encrypt each compiled-in asset with the shared keystream and write the

@@ -311,6 +311,30 @@ visually. Depending on a fallback meant the icon was a crate default one bump
 away from changing, and the exe had no `.rsrc` section at all, so anything
 reading the file got the generic executable glyph.
 
+- **`rc.exe` is almost never on PATH, and that is the ordinary state of a
+  Windows box.** The Windows SDK's `bin` directory is added to PATH by the
+  Visual Studio **developer prompt** and by nothing else, so a build run from
+  Git Bash, PowerShell or an IDE links MSVC binaries perfectly happily and
+  then cannot find the resource compiler sitting next to the linker it just
+  used. That is what shipped the second icon-less release:
+  `app icon not embedded: no resource compiler found (tried rc.exe, llvm-rc)`,
+  one warning line in the middle of a build log. `installed_resource_compilers`
+  now probes for it — `WindowsSdkVerBinPath` / `WindowsSdkDir`, then
+  `%ProgramFiles%\Windows Kits\{10,8.1}\bin`, newest version first and the
+  host's own architecture first, then LLVM's `llvm-rc.exe`. SDK version
+  directories are compared **componentwise**, because as text `10.0.9.0`
+  sorts above `10.0.22621.0`.
+- **`REQUIRE_APP_ICON=1` turns the soft warning into a build failure**, and
+  `build_binaries.sh` sets it for every Windows target. Soft is right for a
+  developer and wrong for a release; a `cargo:warning` scrolls past, which is
+  the whole mechanism by which this has now happened twice.
+  **It matters more than `verify_windows_icon`**, which is only the backstop:
+  that check needs `objdump`, and a Git Bash host has no binutils — so on the
+  exact machine this went wrong, the check aborted the release with
+  `no objdump found` and could not answer the question at all. The verifier
+  now also looks in rustup's `llvm-tools` component and in LLVM's install
+  directory, and its error says plainly that `SKIP_ICON_VERIFY=1` bypasses
+  **that check only** — the build itself still refuses.
 - **The resource compiler differs per target env, and both are supported.**
   `windres` emits a COFF `.o` for `*-pc-windows-gnu`; `rc.exe` (or `llvm-rc`)
   emits a `.res` for `*-pc-windows-msvc`. Only the tool and its arguments
