@@ -11040,6 +11040,28 @@ mod gui {
             }
         }
 
+        /// Clear every stand-down prompt field.
+        ///
+        /// Prompt state describes a *live* stand-down, so anything that
+        /// leaves one -- a user action, or a run starting for any reason --
+        /// must leave none of it behind. Called from `restart_fed_after_stall`
+        /// (a user-driven exit, which needs the fields cleared at once,
+        /// before the run it schedules is actually started) and from
+        /// `start_fed_run` -- the one function every run passes through,
+        /// however it was triggered, which is what makes the coverage
+        /// total: a stand-down broken by a fresh expiry
+        /// (`fed_expiry_trigger` / `stall_break_reason`) reaches
+        /// `start_fed_run` directly and never goes through
+        /// `restart_fed_after_stall` at all.
+        fn clear_stall_prompt_state(&mut self) {
+            self.fed_stall_profiles.clear();
+            self.fed_stall_error = None;
+            self.fed_stall_prompt_open = false;
+            self.fed_stall_acknowledged = false;
+            self.fed_stall_armed.clear();
+            self.pending_fed_retry = false;
+        }
+
         /// Put the refresh back to work after a stand-down.
         ///
         /// Any run started from a stand-down gets the FULL retry window --
@@ -11049,21 +11071,16 @@ mod gui {
         /// access-pending interval exists to catch exactly that.
         ///
         /// Clears every stand-down prompt field, whichever of the three
-        /// exits from `Stalled` got here -- the Retry button, the prompt's
-        /// own Yes, or a manual sign-in. The stand-down is over the moment
-        /// this runs, and a prompt (or an armed dropdown entry) left behind
-        /// would be asking about, or acting on, a run already back in
-        /// flight.
+        /// user-driven exits from `Stalled` got here -- the Retry button,
+        /// the prompt's own Yes, or a manual sign-in. The stand-down is over
+        /// the moment this runs, and a prompt (or an armed dropdown entry)
+        /// left behind would be asking about, or acting on, a run already
+        /// back in flight.
         fn restart_fed_after_stall(&mut self, why: &str) {
             self.log_info(format!("fed_auth: retrying after stand-down ({why})"));
             self.fed_retrying_since = None;
             self.fed_stalled_at_mtime = None;
-            self.fed_stall_profiles.clear();
-            self.fed_stall_error = None;
-            self.fed_stall_prompt_open = false;
-            self.fed_stall_acknowledged = false;
-            self.fed_stall_armed.clear();
-            self.pending_fed_retry = false;
+            self.clear_stall_prompt_state();
             self.fed_next_run_at = Some(Instant::now());
             self.fed_state = FedState::Idle;
         }
@@ -11212,6 +11229,13 @@ mod gui {
             self.log_info(format!("fed_auth: running fed up ({reason})"));
             self.fed_running = true;
             self.fed_next_run_at = None;
+            // The one chokepoint every run passes through, whatever
+            // triggered it -- including a stand-down broken by a fresh
+            // expiry, which reaches here without ever going through
+            // `restart_fed_after_stall`. A no-op for an ordinary expiry run
+            // (nothing was set) and for a run already routed through
+            // `restart_fed_after_stall` (already cleared a moment earlier).
+            self.clear_stall_prompt_state();
             self.fed_last_attempt_at = Some(Instant::now());
             self.fed_last_attempt_expired =
                 self.fed_expired_profiles.iter().cloned().collect();
