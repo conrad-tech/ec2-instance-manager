@@ -10796,12 +10796,12 @@ mod gui {
             if self.fed_running {
                 return None;
             }
-            // Stood down, or waiting out a retry / a sign-in the user is
-            // partway through: not ours to restart.
+            // Waiting out a retry, or a sign-in the user is partway
+            // through: not ours to restart. A stand-down is handled below
+            // -- it CAN be broken, but only by new information.
             if matches!(
                 self.fed_state,
-                FedState::Stalled(_)
-                    | FedState::Retrying { .. }
+                FedState::Retrying { .. }
                     | FedState::AwaitingSignIn { .. }
                     | FedState::SigningIn(_)
             ) {
@@ -10816,6 +10816,17 @@ mod gui {
                 self.fed_expired_profiles.iter().map(String::as_str).collect();
             if expired.is_empty() {
                 return None;
+            }
+
+            // Stood down over an account that cannot be fixed. Only an
+            // expiry we have NOT already tried for is worth breaking that
+            // for -- see `fed_auth::stall_break_reason` for why the gate is
+            // the whole safety property.
+            if matches!(self.fed_state, FedState::Stalled(_)) {
+                return ec2_manager::fed_auth::stall_break_reason(
+                    &expired,
+                    &self.fed_last_attempt_expired,
+                );
             }
 
             // Floor between attempts, so a `fed up` that exits without

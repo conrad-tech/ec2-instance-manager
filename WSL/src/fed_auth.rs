@@ -20,6 +20,7 @@
 //! run's raw output is logged by the caller precisely so these patterns can
 //! be tightened against the real thing.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 /// The verdict for a **completed** `fed up`.
@@ -315,6 +316,41 @@ pub fn next_delay(
     }
 }
 
+/// Why a stood-down refresh should run again, or `None` to stay put.
+///
+/// `fed up` is one command for every account the user holds, so a single
+/// inaccessible account fails the whole run and eventually stands the
+/// refresh down. The accounts that are *fine* still expire 24 hours
+/// later, and nothing would run for them: the caller refuses to act while
+/// stood down, and the only other way back reads the credentials file's
+/// mtime, which nothing moves on its own.
+///
+/// So a stand-down is broken by an expiry we have **not already tried
+/// for**. `attempted` is the set captured at the last run, which always
+/// holds the account that stood us down -- a stand-down only follows a
+/// failure, and that set is cleared only on success. It therefore can
+/// never re-trigger itself, which is the whole safety property: without
+/// it a stood-down refresh would start a run every `retry_interval_secs`
+/// for as long as the bad account stayed expired.
+///
+/// The reason names only the *unseen* accounts. The one that stood us
+/// down is not what changed, and a log line leading with it reads as the
+/// app retrying something it has already given up on.
+pub fn stall_break_reason(expired: &[&str], attempted: &HashSet<String>) -> Option<String> {
+    let unseen: Vec<&str> = expired
+        .iter()
+        .copied()
+        .filter(|p| !attempted.contains(*p))
+        .collect();
+    if unseen.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "credentials expired for {} while stood down",
+        unseen.join(", ")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,5 +613,36 @@ mod tests {
         let pw = FedError::NotAuthenticated.to_string();
         assert!(pw.contains("password"), "{pw}");
         assert!(pw.contains("Okta"), "{pw}");
+    }
+
+    /// The 24-hour case: the app is stood down over an account nobody can
+    /// fix, and a *different* account lapses. That is new information and
+    /// must start a run, or every account expires with nothing trying.
+    #[test]
+    fn an_expiry_we_have_not_tried_for_breaks_a_stand_down() {
+        let attempted: HashSet<String> = ["bad".to_string()].into_iter().collect();
+        let reason = stall_break_reason(&["bad", "good"], &attempted).expect("a reason");
+        assert!(reason.contains("good"), "{reason}");
+        assert!(
+            !reason.contains("bad"),
+            "the account that stood us down is not the news: {reason}"
+        );
+    }
+
+    /// The safety property. A stand-down only follows a failed run, and
+    /// `attempted` is cleared only on success -- so the inaccessible
+    /// account is ALWAYS in it and must never be able to restart the loop
+    /// on its own. Without this the stand-down starts a run every
+    /// retry_interval_secs for as long as that account stays expired.
+    #[test]
+    fn the_account_that_stood_us_down_cannot_restart_the_loop() {
+        let attempted: HashSet<String> = ["bad".to_string()].into_iter().collect();
+        assert_eq!(stall_break_reason(&["bad"], &attempted), None);
+    }
+
+    #[test]
+    fn nothing_expired_is_nothing_to_do() {
+        let attempted: HashSet<String> = ["bad".to_string()].into_iter().collect();
+        assert_eq!(stall_break_reason(&[], &attempted), None);
     }
 }
