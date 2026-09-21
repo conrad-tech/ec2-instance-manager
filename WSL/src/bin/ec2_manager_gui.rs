@@ -11080,9 +11080,10 @@ mod gui {
         /// auto-approved within a minute or two, and the 30-second
         /// access-pending interval exists to catch exactly that.
         ///
-        /// Clears every stand-down prompt field, whichever of the three
+        /// Clears every stand-down prompt field, whichever of the four
         /// user-driven exits from `Stalled` got here -- the Retry button,
-        /// the prompt's own Yes, or a manual sign-in. The stand-down is over
+        /// the prompt's own Yes, a manual sign-in, or picking the armed
+        /// account in the profile dropdown. The stand-down is over
         /// the moment this runs, and a prompt (or an armed dropdown entry)
         /// left behind would be asking about, or acting on, a run already
         /// back in flight.
@@ -11181,10 +11182,13 @@ mod gui {
                 self.fed_stall_prompt_open = false;
                 self.fed_stall_acknowledged = true;
                 self.fed_stall_armed = self.fed_stall_profiles.clone();
+                // The labels, not the raw profile ids: this line tells the
+                // user to find the account in a dropdown that shows labels,
+                // and it is the same phrase the grey status line uses.
                 self.log_info(format!(
                     "fed_auth: stand-down acknowledged for {} — select it in the \
                      profile dropdown to retry",
-                    self.fed_stall_profiles.join(", ")
+                    names.join(", ")
                 ));
             }
         }
@@ -11257,11 +11261,14 @@ mod gui {
         }
 
         fn fed_status_line(&self) -> Option<(egui::Color32, String)> {
-            let ack = if self.fed_stall_acknowledged {
-                Some(self.fed_stall_account_summary())
-            } else {
-                None
-            };
+            // Both halves, not the flag alone. The line names the account,
+            // so an acknowledgement with nothing to name would render
+            // "fed up: no access to  — select it to retry". Nothing sets
+            // the flag without profiles today, but that invariant is held
+            // by convention across three call sites; deriving it from the
+            // data holds it by construction.
+            let ack = (self.fed_stall_acknowledged && !self.fed_stall_profiles.is_empty())
+                .then(|| self.fed_stall_account_summary());
             fed_status_for(&self.fed_state, ack.as_deref())
         }
 
@@ -36161,6 +36168,13 @@ mod gui {
                             base_text
                         };
 
+                        // Which row was CLICKED, as distinct from which
+                        // profile ended up selected. Recorded in the closure
+                        // and acted on below, because the closure already
+                        // holds `&mut self.selected_profile` and a second
+                        // `&mut self` borrow beside it does not compile.
+                        let mut clicked_profile: Option<String> = None;
+
                         egui::ComboBox::from_id_salt("profile_selector_combo")
                             .selected_text(selected_text)
                             .show_ui(ui, |ui| {
@@ -36178,11 +36192,16 @@ mod gui {
                                         egui::RichText::new("Authenticated").weak().small(),
                                     );
                                     for (profile_id, label, _) in &auth {
-                                        ui.selectable_value(
-                                            &mut self.selected_profile,
-                                            Some(profile_id.clone()),
-                                            label,
-                                        );
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.selected_profile,
+                                                Some(profile_id.clone()),
+                                                label,
+                                            )
+                                            .clicked()
+                                        {
+                                            clicked_profile = Some(profile_id.to_string());
+                                        }
                                     }
                                 }
 
@@ -36195,32 +36214,46 @@ mod gui {
                                         egui::RichText::new("Not Authenticated").weak().small(),
                                     );
                                     for (profile_id, label, _) in &unauth {
-                                        ui.selectable_value(
-                                            &mut self.selected_profile,
-                                            Some(profile_id.clone()),
-                                            label,
-                                        );
+                                        if ui
+                                            .selectable_value(
+                                                &mut self.selected_profile,
+                                                Some(profile_id.clone()),
+                                                label,
+                                            )
+                                            .clicked()
+                                        {
+                                            clicked_profile = Some(profile_id.to_string());
+                                        }
                                     }
                                 }
                             });
 
+                        // A stand-down the user acknowledged: picking that
+                        // account is them saying access is back.
+                        //
+                        // Keyed on the CLICK, not on the selection changing.
+                        // The stood-down account is very often the one
+                        // already selected -- noticing it is how the
+                        // stand-down gets noticed at all -- and re-picking it
+                        // changes nothing, so a changed-selection hook would
+                        // leave the grey line's own instruction ("select it
+                        // to retry") doing nothing at all.
+                        //
+                        // Deferred rather than run here -- this is the
+                        // dropdown's own block and `start_fed_run` wants the
+                        // poll's ordering.
+                        if let Some(pid) = &clicked_profile {
+                            if ec2_manager::fed_auth::take_armed_retry(
+                                &mut self.fed_stall_armed,
+                                pid,
+                            ) {
+                                self.pending_fed_retry = true;
+                            }
+                        }
+
                         if self.selected_profile != before_profile {
                             // Clear multi-account selections when switching profiles
                             self.multi_account_ids.clear();
-                            // A stand-down the user acknowledged: selecting
-                            // that account is them saying access is back.
-                            // Deferred rather than run here -- this is the
-                            // dropdown's own block and `start_fed_run` wants
-                            // the poll's ordering.
-                            let selected_now = self.selected_profile.clone();
-                            if let Some(pid) = selected_now {
-                                if ec2_manager::fed_auth::take_armed_retry(
-                                    &mut self.fed_stall_armed,
-                                    &pid,
-                                ) {
-                                    self.pending_fed_retry = true;
-                                }
-                            }
                             // Reset filters and saved-filter dropdown on profile switch
                             if self.config.reset_filter_on_profile_switch {
                                 self.search_rules = vec![SearchRuleInput::default()];
@@ -48609,10 +48642,15 @@ mod gui {
             use ec2_manager::fed_auth::FedError;
             let red = egui::Color32::from_rgb(220, 80, 80);
             let amber = egui::Color32::from_rgb(220, 150, 60);
+            let grey = egui::Color32::from_rgb(150, 150, 150);
             let state = FedState::Stalled(FedError::Command("nope".into()));
             let (color, text) = fed_status_for(&state, Some("PA (1234)")).expect("line");
             assert_ne!(color, red, "the alarm was dismissed");
             assert_ne!(color, amber, "amber means retrying, and this is not");
+            // The two above carry the reasoning; this one carries the
+            // decision. Without it a drift to green or yellow passes, and
+            // "grey, not amber" is the thing that was actually decided.
+            assert_eq!(color, grey, "a dismissed stand-down is grey");
             assert!(text.contains("PA (1234)"), "{text}");
         }
 
@@ -48620,9 +48658,23 @@ mod gui {
         /// in progress: it is only ever about a stand-down.
         #[test]
         fn an_acknowledgement_only_applies_to_a_stand_down() {
+            use ec2_manager::fed_auth::FedError;
             let (plain, _) = fed_status_for(&FedState::Running, None).expect("line");
             let (acked, _) = fed_status_for(&FedState::Running, Some("PA")).expect("line");
             assert_eq!(plain, acked);
+
+            // A live retry is the case this is really about: a stand-down
+            // broken by a fresh expiry goes Stalled -> Running -> Retrying,
+            // and an acknowledgement left over from the stand-down must not
+            // grey out a retry that is actively working.
+            let retrying = FedState::Retrying {
+                error: FedError::Command("nope".into()),
+                attempt: 2,
+            };
+            let (plain, plain_text) = fed_status_for(&retrying, None).expect("line");
+            let (acked, acked_text) = fed_status_for(&retrying, Some("PA")).expect("line");
+            assert_eq!(plain, acked, "a retry keeps its own colour");
+            assert_eq!(plain_text, acked_text, "and its own words");
         }
 
         /// A successful dry-run / escalation line under the Alert ID box
@@ -55525,16 +55577,26 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 "restart_fed_after_stall must clear the stall prompt state"
             );
 
-            // And no third path: clear_stall_prompt_state is called from
-            // exactly these two functions (plus its own definition). A
-            // fourth occurrence means a new exit from `Stalled` was added
-            // that does not route through either chokepoint.
-            assert_eq!(
-                src.matches("clear_stall_prompt_state(").count(),
-                3,
-                "clear_stall_prompt_state: one definition plus exactly two \
-                 call sites (start_fed_run, restart_fed_after_stall) -- a \
-                 third call site means a new exit from Stalled that skips it"
+            // The helper must exist and be reached from both chokepoints --
+            // which the two `body.contains` assertions above are what
+            // actually check. The count here is only a floor: one
+            // definition plus those two calls.
+            //
+            // Deliberately NOT pinned to an exact number. Folding more
+            // hand-written six-field resets into this helper (the success
+            // branch of `on_fed_run_finished` still has one) is the correct
+            // DRY fix, and an exact count would fail that change with a
+            // message telling the maintainer they had added a new exit from
+            // `Stalled`, which they would not have. What guards the real
+            // property is the pair of chokepoint assertions plus the
+            // sole-writer count on `FedState::Running` above -- a new exit
+            // has to set `Running` through `start_fed_run`, and
+            // `start_fed_run` clears.
+            assert!(
+                src.matches("clear_stall_prompt_state(").count() >= 3,
+                "clear_stall_prompt_state: one definition plus at least the \
+                 two chokepoint call sites (start_fed_run, \
+                 restart_fed_after_stall)"
             );
         }
 

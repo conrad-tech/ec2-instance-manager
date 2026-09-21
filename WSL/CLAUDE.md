@@ -3813,7 +3813,7 @@ so pointing it at a policy shared by another role takes that role's policy with
 it. Deleting something already absent is fine — the verdict checks end state,
 not the delete's exit code.
 
-#### One inaccessible account used to stand the refresh down for good
+### fed_auth: one inaccessible account used to stand the refresh down for good
 
 `fed up` is ONE command for every account a user holds, so an account they
 have lost access to fails the whole run. After `retry_window_secs` the
@@ -3824,12 +3824,27 @@ once, and a day later everything was expired with nothing trying. Restarting
 "fixed" it only because `fed_state` is in memory.
 
 - **A stand-down is broken by an expiry we have NOT already tried for**
-  (`fed_auth::stall_break_reason`). `fed_last_attempt_expired` is cleared
-  only on success and a stand-down only follows a failure, so the
-  inaccessible account is always in it and can never re-trigger itself.
-  That gate is the whole safety property: without it a stood-down refresh
-  starts a run every `retry_interval_secs` for as long as that account
-  stays expired.
+  (`fed_auth::stall_break_reason`). That gate is the whole safety property:
+  without it a stood-down refresh starts a run every `retry_interval_secs`
+  for as long as that account stays expired.
+  - **What guarantees no spin is a same-frame property, not "the account is
+    always in the set".** `fed_expiry_trigger` and `start_fed_run` read the
+    same `self.fed_expired_profiles` inside one `poll_fed_auth` call, with
+    no mutation between them — the set is recomputed once at the top of
+    that function, on a 2-second throttle, and `fed_expiry_trigger` takes
+    `&self`. So **any expiry set that breaks a stand-down is in
+    `fed_last_attempt_expired` before the next poll**, and cannot break the
+    next one.
+  - The weaker reading — "`fed_last_attempt_expired` is cleared only on
+    success and a stand-down only follows a failure, so the inaccessible
+    account is always in it" — does **not** hold. `start_fed_run` captures
+    whatever the set holds at that moment, so a stand-down whose run was
+    not expiry-triggered (the Retry button pressed while nothing is
+    expired) lands in `Stalled` with `fed_last_attempt_expired` **empty**,
+    and the bad account expiring then fires a run. That is bounded rather
+    than a spin — that run captures the set, so the next stand-down
+    converges, costing at most one extra retry window — but it is not the
+    property to lean on.
 - **Any run started from a stand-down gets the FULL retry window** — the
   new-expiry one, the prompt's Yes, and the dropdown's. An earlier draft
   sent it straight back to `Stalled` on the grounds that `fed up` refreshes
