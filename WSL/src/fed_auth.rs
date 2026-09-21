@@ -351,6 +351,25 @@ pub fn stall_break_reason(expired: &[&str], attempted: &HashSet<String>) -> Opti
     ))
 }
 
+/// Whether selecting `selected` in the profile dropdown should start a
+/// run, consuming the arming if so.
+///
+/// A dismissed stand-down arms the accounts it named; picking one is the
+/// user saying access is back. The arming is spent on the first pick,
+/// because a dropdown is clicked through casually and each run can open an
+/// Okta device-authorization browser window. If that run stands down
+/// again, the prompt returns and arms it afresh.
+///
+/// The whole list is cleared rather than the one entry removed: the
+/// arming is one acknowledgement, not one per account.
+pub fn take_armed_retry(armed: &mut Vec<String>, selected: &str) -> bool {
+    if !armed.iter().any(|p| p == selected) {
+        return false;
+    }
+    armed.clear();
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,5 +663,27 @@ mod tests {
     fn nothing_expired_is_nothing_to_do() {
         let attempted: HashSet<String> = ["bad".to_string()].into_iter().collect();
         assert_eq!(stall_break_reason(&[], &attempted), None);
+    }
+
+    /// One acknowledgement buys exactly one run. Selecting the account
+    /// five times must not run `fed up` five times, each of which can open
+    /// an Okta device-authorization browser window.
+    #[test]
+    fn an_armed_account_retries_once_and_only_once() {
+        let mut armed = vec!["bad".to_string()];
+        assert!(take_armed_retry(&mut armed, "bad"));
+        assert!(
+            !take_armed_retry(&mut armed, "bad"),
+            "one acknowledgement buys one run"
+        );
+    }
+
+    /// Switching to some other account is ordinary use of the dropdown and
+    /// must neither run anything nor spend the arming.
+    #[test]
+    fn selecting_another_account_leaves_the_arming_alone() {
+        let mut armed = vec!["bad".to_string()];
+        assert!(!take_armed_retry(&mut armed, "good"));
+        assert_eq!(armed, vec!["bad".to_string()]);
     }
 }

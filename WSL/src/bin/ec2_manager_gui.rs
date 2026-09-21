@@ -10746,6 +10746,16 @@ mod gui {
 
             self.resume_fed_after_manual_signin();
 
+            // The dropdown asked for a retry. Consumed here rather than
+            // acted on in the dropdown's own block, so there is one place
+            // that decides whether a run may start.
+            if std::mem::take(&mut self.pending_fed_retry)
+                && matches!(self.fed_state, FedState::Stalled(_))
+                && !self.fed_running
+            {
+                self.restart_fed_after_stall("account selected in the profile dropdown");
+            }
+
             // A scheduled retry that has come due.
             let due = self.fed_next_run_at.is_some_and(|at| Instant::now() >= at);
             if due && !self.fed_running {
@@ -36197,6 +36207,20 @@ mod gui {
                         if self.selected_profile != before_profile {
                             // Clear multi-account selections when switching profiles
                             self.multi_account_ids.clear();
+                            // A stand-down the user acknowledged: selecting
+                            // that account is them saying access is back.
+                            // Deferred rather than run here -- this is the
+                            // dropdown's own block and `start_fed_run` wants
+                            // the poll's ordering.
+                            let selected_now = self.selected_profile.clone();
+                            if let Some(pid) = selected_now {
+                                if ec2_manager::fed_auth::take_armed_retry(
+                                    &mut self.fed_stall_armed,
+                                    &pid,
+                                ) {
+                                    self.pending_fed_retry = true;
+                                }
+                            }
                             // Reset filters and saved-filter dropdown on profile switch
                             if self.config.reset_filter_on_profile_switch {
                                 self.search_rules = vec![SearchRuleInput::default()];
@@ -55412,6 +55436,27 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let check = body.find("asg::check_capacity(").expect("the re-check");
             let send = body.find("asg::set_capacity(").expect("the send");
             assert!(check < send, "the re-check must come before the send");
+        }
+
+        /// One acknowledgement buys one run, and that rule lives in
+        /// `take_armed_retry`. A later edit calling `start_fed_run` or
+        /// `restart_fed_after_stall` from the dropdown would bypass it and
+        /// nothing else in the suite would notice.
+        #[test]
+        fn the_dropdown_retry_goes_through_the_arming() {
+            // The SHIPPING half of the file only: this test names the very
+            // function it is counting.
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            assert_eq!(
+                src.matches("take_armed_retry(").count(),
+                1,
+                "exactly one call site, in the profile dropdown"
+            );
+            assert!(
+                src.contains("self.pending_fed_retry = true"),
+                "the dropdown defers rather than starting a run inline"
+            );
         }
 
         /// Apply is gated on BOTH a clean set of numbers and a separate tick.
