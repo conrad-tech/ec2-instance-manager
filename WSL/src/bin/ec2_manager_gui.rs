@@ -11246,8 +11246,23 @@ mod gui {
             std::thread::spawn(move || run_fed_worker(cfg, auto, tx));
         }
 
-            fn fed_status_line(&self) -> Option<(egui::Color32, String)> {
-            fed_status_for(&self.fed_state)
+        fn fed_status_line(&self) -> Option<(egui::Color32, String)> {
+            let ack = if self.fed_stall_acknowledged {
+                Some(self.fed_stall_account_summary())
+            } else {
+                None
+            };
+            fed_status_for(&self.fed_state, ack.as_deref())
+        }
+
+        /// The accounts a stand-down is about, as one phrase for a status
+        /// line.
+        fn fed_stall_account_summary(&self) -> String {
+            self.fed_stall_profiles
+                .iter()
+                .map(|pid| self.fed_account_label(pid))
+                .collect::<Vec<_>>()
+                .join(", ")
         }
 
         fn poll_auth_expiry(&mut self) {
@@ -40719,16 +40734,16 @@ mod gui {
         None
     }
 
-    /// The toolbar's `fed up` status line, or `None` when there is nothing
-    /// worth showing.
+    /// The toolbar line for a fed state, or `None` when there is nothing
+    /// to say.
     ///
-    /// Only a stand-down is red. A retry is amber — it is still working and
-    /// usually fixes itself, so painting it red would train the user to ignore
-    /// the colour that matters.
-    ///
-    /// A free function rather than a method so the colour of each state can be
-    /// asserted without building an `App`.
-    fn fed_status_for(state: &FedState) -> Option<(egui::Color32, String)> {
+    /// `acknowledged` is the account phrase once the user has dismissed a
+    /// stand-down's prompt. Passed in rather than read from `App` so this
+    /// stays pure and its colours stay pinned by tests.
+    fn fed_status_for(
+        state: &FedState,
+        acknowledged: Option<&str>,
+    ) -> Option<(egui::Color32, String)> {
         const RED: egui::Color32 = egui::Color32::from_rgb(220, 80, 80);
         const AMBER: egui::Color32 = egui::Color32::from_rgb(220, 150, 60);
         const GREY: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
@@ -40778,7 +40793,16 @@ mod gui {
                 AMBER,
                 format!("fed up: attempt {attempt} failed — {error} Retrying…"),
             )),
-            FedState::Stalled(error) => Some((RED, format!("fed up: {error}"))),
+            FedState::Stalled(error) => match acknowledged {
+                // Dismissed: drop the alarm, keep the fact. Grey, not amber
+                // -- amber here means "retrying, it usually fixes itself",
+                // and a stand-down is precisely not retrying.
+                Some(who) => Some((
+                    GREY,
+                    format!("fed up: no access to {who} — select it to retry"),
+                )),
+                None => Some((RED, format!("fed up: {error}"))),
+            },
         }
     }
 
@@ -48511,14 +48535,14 @@ mod gui {
         fn a_finished_sign_in_is_green_and_the_steps_before_it_are_not() {
             let green = egui::Color32::from_rgb(120, 180, 120);
             let (color, text) =
-                fed_status_for(&FedState::SigningIn("done".to_string())).expect("a line");
+                fed_status_for(&FedState::SigningIn("done".to_string()), None).expect("a line");
             assert_eq!(color, green);
             assert_eq!(text, "fed up: signing in — done");
             assert!(!text.ends_with('…'), "done is not still happening: {text}");
 
             for step in ["entering-code", "entering-password", "confirming-mfa"] {
                 let (color, text) =
-                    fed_status_for(&FedState::SigningIn(step.to_string())).expect("a line");
+                    fed_status_for(&FedState::SigningIn(step.to_string()), None).expect("a line");
                 assert_ne!(color, green, "{step} is still in progress");
                 assert!(text.ends_with('…'), "{text}");
             }
@@ -48531,21 +48555,50 @@ mod gui {
             let red = egui::Color32::from_rgb(220, 80, 80);
             use ec2_manager::fed_auth::FedError;
             let (color, _) =
-                fed_status_for(&FedState::Stalled(FedError::Command("nope".into()))).expect("line");
+                fed_status_for(&FedState::Stalled(FedError::Command("nope".into())), None)
+                    .expect("line");
             assert_eq!(color, red);
-            let (color, _) = fed_status_for(&FedState::Retrying {
-                error: FedError::Command("nope".into()),
-                attempt: 2,
-            })
+            let (color, _) = fed_status_for(
+                &FedState::Retrying {
+                    error: FedError::Command("nope".into()),
+                    attempt: 2,
+                },
+                None,
+            )
             .expect("line");
             assert_ne!(color, red, "a retry is still working");
-            assert!(fed_status_for(&FedState::Authenticated).is_none());
+            assert!(fed_status_for(&FedState::Authenticated, None).is_none());
 
             // Running is work in progress, in the same yellow the script
             // status bar uses for it — not the grey of something idle.
-            let (color, text) = fed_status_for(&FedState::Running).expect("line");
+            let (color, text) = fed_status_for(&FedState::Running, None).expect("line");
             assert_eq!(color, egui::Color32::from_rgb(255, 205, 0));
             assert!(text.ends_with('…'), "{text}");
+        }
+
+        /// Dismissing the prompt drops the ALARM, not the fact: the line
+        /// stays, in grey, naming the account. A state with no indication
+        /// at all is how a feature comes to look dead -- the lesson this
+        /// repo records three times over for the reaper watcher.
+        #[test]
+        fn an_acknowledged_stand_down_is_grey_and_still_names_the_account() {
+            use ec2_manager::fed_auth::FedError;
+            let red = egui::Color32::from_rgb(220, 80, 80);
+            let amber = egui::Color32::from_rgb(220, 150, 60);
+            let state = FedState::Stalled(FedError::Command("nope".into()));
+            let (color, text) = fed_status_for(&state, Some("PA (1234)")).expect("line");
+            assert_ne!(color, red, "the alarm was dismissed");
+            assert_ne!(color, amber, "amber means retrying, and this is not");
+            assert!(text.contains("PA (1234)"), "{text}");
+        }
+
+        /// A stale acknowledgement must not recolour a live retry or a run
+        /// in progress: it is only ever about a stand-down.
+        #[test]
+        fn an_acknowledgement_only_applies_to_a_stand_down() {
+            let (plain, _) = fed_status_for(&FedState::Running, None).expect("line");
+            let (acked, _) = fed_status_for(&FedState::Running, Some("PA")).expect("line");
+            assert_eq!(plain, acked);
         }
 
         /// A successful dry-run / escalation line under the Alert ID box
