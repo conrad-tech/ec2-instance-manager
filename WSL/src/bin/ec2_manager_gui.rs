@@ -11004,6 +11004,11 @@ mod gui {
         /// "are the credentials currently valid": they can still be valid
         /// while `fed up` fails, and treating that as resolution would spin
         /// the loop straight back into the same failure.
+        ///
+        /// Delegates to `restart_fed_after_stall` so there is one definition
+        /// of "leave a stand-down" -- including clearing the stall prompt,
+        /// which must not go on asking about a run that has already
+        /// restarted.
         fn resume_fed_after_manual_signin(&mut self) {
             if !matches!(self.fed_state, FedState::Stalled(_)) {
                 return;
@@ -11013,16 +11018,7 @@ mod gui {
             if now == stalled_at {
                 return;
             }
-            self.log_info(
-                "fed_auth: credentials were renewed manually — resuming the automatic \
-                 refresh"
-                    .to_string(),
-            );
-            self.fed_stalled_at_mtime = None;
-            self.fed_state = FedState::Idle;
-            // Confirm with a real run rather than assuming; whatever it says
-            // drives the schedule from here.
-            self.fed_next_run_at = Some(Instant::now());
+            self.restart_fed_after_stall("credentials renewed manually");
         }
 
         /// A profile's display name and account id, for a message about it.
@@ -11051,12 +11047,23 @@ mod gui {
         /// fresh one. That is deliberate: a Jitney access request is often
         /// auto-approved within a minute or two, and the 30-second
         /// access-pending interval exists to catch exactly that.
+        ///
+        /// Clears every stand-down prompt field, whichever of the three
+        /// exits from `Stalled` got here -- the Retry button, the prompt's
+        /// own Yes, or a manual sign-in. The stand-down is over the moment
+        /// this runs, and a prompt (or an armed dropdown entry) left behind
+        /// would be asking about, or acting on, a run already back in
+        /// flight.
         fn restart_fed_after_stall(&mut self, why: &str) {
             self.log_info(format!("fed_auth: retrying after stand-down ({why})"));
             self.fed_retrying_since = None;
             self.fed_stalled_at_mtime = None;
+            self.fed_stall_profiles.clear();
+            self.fed_stall_error = None;
+            self.fed_stall_prompt_open = false;
             self.fed_stall_acknowledged = false;
             self.fed_stall_armed.clear();
+            self.pending_fed_retry = false;
             self.fed_next_run_at = Some(Instant::now());
             self.fed_state = FedState::Idle;
         }
