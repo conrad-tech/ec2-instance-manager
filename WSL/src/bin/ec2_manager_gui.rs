@@ -55459,6 +55459,85 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             );
         }
 
+        /// Every exit from `FedState::Stalled` must clear the stall prompt
+        /// state, or a stood-down account's prompt -- and its one-shot
+        /// arming -- survives into a run that has already restarted. This
+        /// plan hit that bug twice under two different shapes: first the
+        /// Retry button and a manual sign-in left the prompt fields behind
+        /// on their own exits from `Stalled`, and then the expiry-triggered
+        /// auto-restart (`fed_expiry_trigger` / `stall_break_reason`) turned
+        /// out to reach `start_fed_run` directly, bypassing
+        /// `restart_fed_after_stall` -- and the fix at the time -- entirely.
+        /// The fix each time was the same property: clear it at every
+        /// chokepoint a run can start from, not at every button that used to
+        /// lead to one. This pins that property so a third exit cannot
+        /// reintroduce either bug.
+        #[test]
+        fn every_exit_from_stalled_clears_the_prompt_state() {
+            // The SHIPPING half of the file only: this test names the very
+            // function it is counting.
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+
+            // start_fed_run is the one function every run passes through,
+            // however it was triggered, and the sole writer of
+            // `FedState::Running` -- so a call inside it covers the path
+            // that reaches here without ever going through
+            // `restart_fed_after_stall` at all.
+            let start = src
+                .find("fn start_fed_run(&mut self, reason: String) {")
+                .expect("start_fed_run");
+            let end = src[start..]
+                .find("\n        fn fed_status_line(&self)")
+                .map(|i| start + i)
+                .expect("the function that follows start_fed_run");
+            let body = &src[start..end];
+            assert!(
+                body.contains("self.clear_stall_prompt_state();"),
+                "start_fed_run must clear the stall prompt state"
+            );
+            // start_fed_run must actually be the sole writer of
+            // FedState::Running for "it covers every trigger" to hold --
+            // checked over the whole shipping file, not just this body.
+            assert_eq!(
+                src.matches("self.fed_state = FedState::Running;").count(),
+                1,
+                "FedState::Running must be set in exactly one place"
+            );
+            assert!(
+                body.contains("self.fed_state = FedState::Running;"),
+                "that one place must be start_fed_run"
+            );
+
+            // restart_fed_after_stall is the other chokepoint: the Retry
+            // button, the prompt's own Yes, and a manual sign-in all go
+            // through it.
+            let start = src
+                .find("fn restart_fed_after_stall(&mut self, why: &str) {")
+                .expect("restart_fed_after_stall");
+            let end = src[start..]
+                .find("\n        /// \"Do you still have access to <account> in Jitney?\"")
+                .map(|i| start + i)
+                .expect("the function that follows restart_fed_after_stall");
+            let body = &src[start..end];
+            assert!(
+                body.contains("self.clear_stall_prompt_state();"),
+                "restart_fed_after_stall must clear the stall prompt state"
+            );
+
+            // And no third path: clear_stall_prompt_state is called from
+            // exactly these two functions (plus its own definition). A
+            // fourth occurrence means a new exit from `Stalled` was added
+            // that does not route through either chokepoint.
+            assert_eq!(
+                src.matches("clear_stall_prompt_state(").count(),
+                3,
+                "clear_stall_prompt_state: one definition plus exactly two \
+                 call sites (start_fed_run, restart_fed_after_stall) -- a \
+                 third call site means a new exit from Stalled that skips it"
+            );
+        }
+
         /// Apply is gated on BOTH a clean set of numbers and a separate tick.
         ///
         /// With no `allowed_users` gate in front of this feature, that
