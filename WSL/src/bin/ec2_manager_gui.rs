@@ -9467,6 +9467,21 @@ mod gui {
         /// still be valid while `fed up` fails, and that must not read as
         /// resolution.
         fed_stalled_at_mtime: Option<SystemTime>,
+        /// Profiles `fed up` left expired when it stood down -- read from
+        /// the credentials file at that moment, so it names exactly what
+        /// the run could not refresh.
+        fed_stall_profiles: Vec<String>,
+        /// `fed`'s own error line, shown verbatim in the prompt.
+        fed_stall_error: Option<String>,
+        /// The prompt is up and unanswered.
+        fed_stall_prompt_open: bool,
+        /// The red line has been dismissed for this stand-down.
+        fed_stall_acknowledged: bool,
+        /// Profiles whose selection in the dropdown starts a run. Consumed
+        /// on the first, so one acknowledgement buys one run.
+        fed_stall_armed: Vec<String>,
+        /// Set by the profile dropdown, consumed by `poll_fed_auth`.
+        pending_fed_retry: bool,
         /// Fed worker → UI.
         fed_tx: Sender<FedEvent>,
         fed_rx: Receiver<FedEvent>,
@@ -10117,6 +10132,12 @@ mod gui {
                 fed_expired_profiles: Vec::new(),
                 fed_expired_checked_at: None,
                 fed_stalled_at_mtime: None,
+                fed_stall_profiles: Vec::new(),
+                fed_stall_error: None,
+                fed_stall_prompt_open: false,
+                fed_stall_acknowledged: false,
+                fed_stall_armed: Vec::new(),
+                pending_fed_retry: false,
                 fed_tx,
                 fed_rx,
                 access_email: features.access_email.clone(),
@@ -10906,6 +10927,12 @@ mod gui {
                 // Once one is cleared, the same account lapsing later is new
                 // information again.
                 self.fed_last_attempt_expired.clear();
+                self.fed_stall_profiles.clear();
+                self.fed_stall_error = None;
+                self.fed_stall_prompt_open = false;
+                self.fed_stall_acknowledged = false;
+                self.fed_stall_armed.clear();
+                self.pending_fed_retry = false;
                 self.close_fed_browser_window();
                 self.fed_state = FedState::Authenticated;
                 // Nothing scheduled: the next run is triggered by the new
@@ -10943,12 +10970,29 @@ mod gui {
                     // Window closed. Stand down and note where the
                     // credentials file was, so a manual sign-in restarts the
                     // loop by itself.
+                    //
+                    // fed's own line, before it is wrapped: `GaveUp`'s
+                    // Display is our sentence about giving up, and what the
+                    // prompt needs to show is what `fed` actually said.
+                    let err_text = err.to_string();
                     let stalled = ec2_manager::fed_auth::FedError::GaveUp(Box::new(err));
                     self.log_error(format!("fed_auth: {stalled}"));
                     self.fed_state = FedState::Stalled(stalled);
                     self.fed_next_run_at = None;
                     self.fed_retrying_since = None;
                     self.fed_stalled_at_mtime = credentials::credentials_mtime();
+                    // Whatever `fed up` left expired is exactly what it could
+                    // not refresh. Read FRESH rather than from
+                    // `fed_expired_profiles`, which is on a 2-second throttle
+                    // and can still name accounts this very run has fixed.
+                    self.fed_stall_profiles =
+                        credentials::profiles_with_expired_sections(&self.config.profiles);
+                    self.fed_stall_error = Some(err_text);
+                    self.fed_stall_acknowledged = false;
+                    self.fed_stall_armed.clear();
+                    // Nothing to name is nothing to ask about; the red line
+                    // stands on its own.
+                    self.fed_stall_prompt_open = !self.fed_stall_profiles.is_empty();
                 }
             }
         }
@@ -10979,6 +11023,136 @@ mod gui {
             // Confirm with a real run rather than assuming; whatever it says
             // drives the schedule from here.
             self.fed_next_run_at = Some(Instant::now());
+        }
+
+        /// A profile's display name and account id, for a message about it.
+        ///
+        /// Falls back to the profile id: a profile the config no longer
+        /// holds is still better named badly than not named at all.
+        fn fed_account_label(&self, profile_id: &str) -> String {
+            match self
+                .config
+                .profiles
+                .iter()
+                .find(|p| p.profile_id == profile_id)
+            {
+                Some(p) if !p.account_id.is_empty() => {
+                    format!("{} ({})", p.display_name, p.account_id)
+                }
+                Some(p) => p.display_name.clone(),
+                None => profile_id.to_string(),
+            }
+        }
+
+        /// Put the refresh back to work after a stand-down.
+        ///
+        /// Any run started from a stand-down gets the FULL retry window --
+        /// `fed_retrying_since` is cleared, so `on_fed_run_finished` opens a
+        /// fresh one. That is deliberate: a Jitney access request is often
+        /// auto-approved within a minute or two, and the 30-second
+        /// access-pending interval exists to catch exactly that.
+        fn restart_fed_after_stall(&mut self, why: &str) {
+            self.log_info(format!("fed_auth: retrying after stand-down ({why})"));
+            self.fed_retrying_since = None;
+            self.fed_stalled_at_mtime = None;
+            self.fed_stall_acknowledged = false;
+            self.fed_stall_armed.clear();
+            self.fed_next_run_at = Some(Instant::now());
+            self.fed_state = FedState::Idle;
+        }
+
+        /// "Do you still have access to <account> in Jitney?"
+        ///
+        /// Raised once per stand-down, naming the accounts `fed up` could
+        /// not refresh. Yes runs immediately; No clears the red line and
+        /// arms the profile dropdown.
+        fn render_fed_stall_prompt(&mut self, ctx: &egui::Context) {
+            // The gate, re-read, not the state -- the same stance every
+            // other window here takes.
+            if !self.fed_auth_enabled {
+                self.fed_stall_prompt_open = false;
+                return;
+            }
+            if !self.fed_stall_prompt_open {
+                return;
+            }
+            let names: Vec<String> = self
+                .fed_stall_profiles
+                .iter()
+                .map(|pid| self.fed_account_label(pid))
+                .collect();
+            let error = self.fed_stall_error.clone();
+            let mut window_open = true;
+            let mut do_retry = false;
+            let mut do_dismiss = false;
+            egui::Window::new("Account access")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(
+                        "fed up refreshed everything it could and then failed. \
+                         It could not refresh:",
+                    );
+                    ui.add_space(4.0);
+                    for name in &names {
+                        ui.monospace(name);
+                    }
+                    ui.add_space(6.0);
+                    // The real error, verbatim. A stand-down caused by a
+                    // network or Okta problem is not an entitlement problem,
+                    // and this line is the only thing on screen that says so
+                    // -- the question below would then be the wrong question.
+                    if let Some(err) = &error {
+                        ui.label("fed reported:");
+                        ui.monospace(err);
+                        ui.add_space(6.0);
+                    }
+                    ui.label(format!(
+                        "Do you still have access to {} in Jitney?",
+                        names.join(", ")
+                    ));
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("Yes — retry now")
+                            .on_hover_text("Run fed up again now")
+                            .clicked()
+                        {
+                            do_retry = true;
+                        }
+                        if ui
+                            .button("No — dismiss")
+                            .on_hover_text(
+                                "Clear the error. Selecting the account in the \
+                                 profile dropdown will retry.",
+                            )
+                            .clicked()
+                        {
+                            do_dismiss = true;
+                        }
+                    });
+                });
+            // Applied after the window is drawn, never during: the closure
+            // borrows `ui` and these take `&mut self`.
+            //
+            // Closing with the X counts as a dismissal, so the one route
+            // back is never lost by reaching for the corner instead of the
+            // button.
+            if do_retry {
+                self.fed_stall_prompt_open = false;
+                self.restart_fed_after_stall("access confirmed from the prompt");
+            } else if do_dismiss || !window_open {
+                self.fed_stall_prompt_open = false;
+                self.fed_stall_acknowledged = true;
+                self.fed_stall_armed = self.fed_stall_profiles.clone();
+                self.log_info(format!(
+                    "fed_auth: stand-down acknowledged for {} — select it in the \
+                     profile dropdown to retry",
+                    self.fed_stall_profiles.join(", ")
+                ));
+            }
         }
 
         /// Close the window the sign-in drove, now the credentials are
@@ -34723,6 +34897,7 @@ mod gui {
                 self.render_power_confirm(ctx);
                 self.render_asg_capacity_dialog(ctx);
                 self.render_pat_dialog(ctx);
+                self.render_fed_stall_prompt(ctx);
                 self.render_script_result_popup(ctx);
                 self.render_alerts_window(ctx);
                 self.render_alert_windows(ctx);
@@ -35119,10 +35294,7 @@ mod gui {
                                         .on_hover_text("Run fed up again now")
                                         .clicked()
                                     {
-                                        self.fed_retrying_since = None;
-                                        self.fed_stalled_at_mtime = None;
-                                        self.fed_next_run_at = Some(Instant::now());
-                                        self.fed_state = FedState::Idle;
+                                        self.restart_fed_after_stall("Retry button");
                                     }
                                 }
                                 // Mid sign-in: the page is already open and
