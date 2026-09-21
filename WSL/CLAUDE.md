@@ -3813,6 +3813,54 @@ so pointing it at a policy shared by another role takes that role's policy with
 it. Deleting something already absent is fine — the verdict checks end state,
 not the delete's exit code.
 
+#### One inaccessible account used to stand the refresh down for good
+
+`fed up` is ONE command for every account a user holds, so an account they
+have lost access to fails the whole run. After `retry_window_secs` the
+refresh stands down into `FedState::Stalled` — and `fed_expiry_trigger`
+returned `None` on that state before reading anything, so **the 24-hour
+expiry of every good account never started a run**. The app worked, stalled
+once, and a day later everything was expired with nothing trying. Restarting
+"fixed" it only because `fed_state` is in memory.
+
+- **A stand-down is broken by an expiry we have NOT already tried for**
+  (`fed_auth::stall_break_reason`). `fed_last_attempt_expired` is cleared
+  only on success and a stand-down only follows a failure, so the
+  inaccessible account is always in it and can never re-trigger itself.
+  That gate is the whole safety property: without it a stood-down refresh
+  starts a run every `retry_interval_secs` for as long as that account
+  stays expired.
+- **Any run started from a stand-down gets the FULL retry window** — the
+  new-expiry one, the prompt's Yes, and the dropdown's. An earlier draft
+  sent it straight back to `Stalled` on the grounds that `fed up` refreshes
+  the good accounts on attempt 1 and the rest is noise. It is not noise: a
+  Jitney request is often auto-approved within one to two minutes, which is
+  exactly what `access_retry_interval_secs` (30) exists to catch.
+- **The prompt names the account by what `fed up` LEFT EXPIRED**, read
+  fresh from the credentials file at the moment of standing down — never
+  parsed out of `fed`'s output, whose patterns this module's own docs admit
+  are best-effort, and never from `fed_expired_profiles`, which is on a
+  2-second throttle and can still name accounts the run has just fixed.
+- **It shows `fed`'s own error line verbatim.** A stand-down caused by a
+  network or Okta problem is not an entitlement problem, and that line is
+  the only thing on screen saying the Jitney question is the wrong
+  question.
+- **Dismissing keeps the line, in grey.** Clearing drops the alarm, not the
+  fact — a state with no indication at all is how a feature comes to look
+  dead, which this file records three times over for the reaper watcher.
+  Grey rather than amber: amber here means "retrying, it usually fixes
+  itself", and a stand-down is precisely not retrying.
+- **The arming is spent on the first pick** (`take_armed_retry`). A
+  dropdown is clicked through casually and each run can open an Okta
+  device-authorization browser window; one acknowledgement buys one run,
+  and a fresh stand-down raises the prompt again.
+- **Nothing here is new machinery for the re-auth reset.**
+  `poll_credentials_changes` already watches the credentials mtime every
+  second and, on a profile moving unauthenticated -> Ok, reloads its cache,
+  calls `forget_resources_for_profile(pid, "auth restored")` — which is what
+  clears `tg_denied_accounts` and the `*_list_failures` cooldowns — and
+  forces a refresh. Losing access again re-enters `handle_profile_expired`.
+
 ### cfg gates for imports
 
 Test-only imports (`std::process::{Child, Command, Stdio}`) are gated with `#[cfg(test)]` to avoid unused-import warnings on both Linux native and Windows cross-compile targets. Similarly, `shell_plan()` is `#[cfg(test)]` since it's only used in tests.
