@@ -26458,6 +26458,20 @@ mod gui {
         /// confirmation; nothing reaches AWS until that is agreed to.
         fn request_instance_power(&mut self, instance: &Instance, action: PowerAction) {
             let label = Self::instance_label(instance);
+            // Refused here rather than only where the entries are drawn.
+            // Two places offer these actions now -- the row menu and the
+            // sub-tab row's `Instance state` button -- and each hides itself
+            // off the allow-list, which makes the gate presentation. This is
+            // the guarantee, and it holds for a third caller added later
+            // without that caller having to remember: the same stance
+            // `terminate_instance` and `request_asg_capacity` take for the
+            // other destructive writes in this app.
+            if !self.instance_power_enabled {
+                self.message =
+                    format!("{} is not enabled for this user", action.verb());
+                self.log_warn(self.message.clone());
+                return;
+            }
             if self
                 .power_in_flight
                 .lock()
@@ -26888,6 +26902,14 @@ mod gui {
         }
 
         fn render_inventory_panel(&mut self, ui: &mut egui::Ui) {
+            // Raised inside the sub-tab row's closure and dispatched after
+            // it, the way the row menu's own entries are: the closure holds
+            // `self` borrowed, and `request_instance_power` wants it again.
+            let mut pending_power: Option<(Instance, PowerAction)> = None;
+            // Cloned before the row is drawn for the same borrow reason --
+            // `selected_instance` hands back a reference into `self`.
+            let power_selection = self.selected_instance().cloned();
+            let instance_power_enabled = self.instance_power_enabled;
             ui.horizontal_wrapped(|ui| {
                 for tab in InventoryTab::all() {
                     if ui
@@ -26897,7 +26919,75 @@ mod gui {
                         self.inventory_tab = tab;
                     }
                 }
+                // `Instance state`, right-aligned on the sub-tab row. Named
+                // for the AWS console's own dropdown, which is where anyone
+                // reaching for it has seen it, and offering the same three
+                // actions the row menu does -- this is a second way to reach
+                // them, never a second way to send them.
+                //
+                // EC2 only: it acts on the EC2 row selection, and offering
+                // `Stop instance` while the S3 bucket list is on screen
+                // names a selection the user cannot see.
+                if instance_power_enabled && self.inventory_tab == InventoryTab::Ec2 {
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let selected = power_selection.is_some();
+                            ui.add_enabled_ui(selected, |ui| {
+                                let menu = ui.menu_button("Instance state", |ui| {
+                                    let Some(instance) = power_selection.as_ref() else {
+                                        return;
+                                    };
+                                    for action in [
+                                        PowerAction::Start,
+                                        PowerAction::Stop,
+                                        PowerAction::Restart,
+                                    ] {
+                                        // The same call the row menu makes,
+                                        // so the two cannot disagree about
+                                        // what is legal. Still a courtesy:
+                                        // the row can be up to 45s stale and
+                                        // the worker re-reads the state
+                                        // before the call goes out.
+                                        let refusal =
+                                            power::action_allowed(&instance.state, action)
+                                                .err();
+                                        let btn = ui.add_enabled(
+                                            refusal.is_none(),
+                                            egui::Button::new(action.label()),
+                                        );
+                                        let btn = match &refusal {
+                                            Some(why) => {
+                                                btn.on_disabled_hover_text(why.clone())
+                                            }
+                                            None => btn,
+                                        };
+                                        if btn.clicked() {
+                                            pending_power =
+                                                Some((instance.clone(), action));
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                                match power_selection.as_ref() {
+                                    Some(instance) => menu.response.on_hover_text(
+                                        format!(
+                                            "Start / Stop / Restart {}",
+                                            Self::instance_label(instance),
+                                        ),
+                                    ),
+                                    None => menu
+                                        .response
+                                        .on_disabled_hover_text("Select an instance first"),
+                                };
+                            });
+                        },
+                    );
+                }
             });
+            if let Some((instance, action)) = pending_power {
+                self.request_instance_power(&instance, action);
+            }
             ui.separator();
 
             // Drawn before the resource sub-tabs' early return, so both are
@@ -52058,38 +52148,124 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert_eq!(hits.len(), 1, "{needle} must appear once, found at lines {hits:?}");
         }
 
-        /// The row menu's Start / Stop / Restart entries must stay behind
-        /// the allow-list. The gate is one `if`, and an edit that moved the
-        /// entries out from under it would arm live start/stop calls for
-        /// everyone with no compile error and nothing on screen to say so.
+        /// Start / Stop / Restart must stay behind the allow-list, and there
+        /// are two places offering them: the Inventory row menu and the
+        /// `Instance state` button on the sub-tab row. An edit that moved
+        /// either out from under its gate would arm live start/stop calls
+        /// for everyone with no compile error and nothing on screen to say
+        /// so.
+        ///
+        /// **It walks the action loops and looks backwards for a gate**,
+        /// rather than finding the first gate and looking forwards. That
+        /// direction is load-bearing now that there are two: the sub-tab
+        /// button sits ~560 lines above the row menu, so a forwards scan
+        /// from the *first* gate would pin the button and stop checking the
+        /// row menu entirely -- passing happily while the row menu's own
+        /// gate was deleted. A test that quietly stops checking the thing
+        /// it is named for is worse than no test.
         #[test]
         fn the_power_menu_entries_stay_behind_the_allow_list() {
-            let src = include_str!("ec2_manager_gui.rs");
-            let gate = "if instance_power_enabled {";
-            let start = src.find(gate).expect("the power menu gate is still there");
-            // The three labels come from `PowerAction::label`, so the menu
-            // is identified by the loop that walks the actions.
-            let body = &src[start..start + 1200];
-            for needle in [
-                "PowerAction::Start,",
-                "PowerAction::Stop,",
-                "PowerAction::Restart,",
-                "power::action_allowed(",
-            ] {
-                assert!(
-                    body.contains(needle),
-                    "{needle} must sit inside the instance_power gate",
-                );
-            }
-            // Counted by assignment lines rather than by substring: a bare
-            // substring would also match this test's own source.
-            let raises = src
-                .lines()
-                .filter(|l| l.trim_start().starts_with("pending_power ="))
-                .count();
+            let whole = include_str!("ec2_manager_gui.rs");
+            // Above the test module only, or this test's own source counts
+            // as an offering of the actions.
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            // No trailing `{`: the sub-tab button's gate carries a second
+            // term (`&& self.inventory_tab == InventoryTab::Ec2`), and
+            // splitting it into nested `if`s to satisfy a test would earn a
+            // `collapsible_if` off clippy for nothing.
+            let gate = "if instance_power_enabled";
+
+            // The three labels come from `PowerAction::label`, so each place
+            // offering them is identified by the loop that walks the actions.
+            let loops: Vec<usize> = src
+                .match_indices("PowerAction::Start,")
+                .map(|(i, _)| i)
+                .collect();
             assert_eq!(
-                raises, 1,
-                "one place raises a power request, so one gate covers it",
+                loops.len(),
+                2,
+                "two places offer the actions -- the row menu and the \
+                 Instance state button -- found at {loops:?}",
+            );
+            assert_eq!(
+                src.matches(gate).count(),
+                2,
+                "each of those two places carries its own gate",
+            );
+
+            for at in loops {
+                let opened = src[..at]
+                    .rfind(gate)
+                    .expect("an action loop with no instance_power gate above it");
+                assert!(
+                    at - opened < 1200,
+                    "the action loop at {at} is {} chars below the nearest \
+                     gate -- too far for that gate to plausibly still be \
+                     open over it",
+                    at - opened,
+                );
+                let body = &src[opened..(at + 900).min(src.len())];
+                for needle in [
+                    "PowerAction::Stop,",
+                    "PowerAction::Restart,",
+                    "power::action_allowed(",
+                ] {
+                    assert!(
+                        body.contains(needle),
+                        "{needle} must sit inside the instance_power gate \
+                         opened at {opened}",
+                    );
+                }
+            }
+        }
+
+        /// Both entry points funnel into `request_instance_power`, and that
+        /// function refuses on the allow-list *itself* rather than trusting
+        /// either caller to have checked -- the stance `terminate_instance`
+        /// and `request_asg_capacity` already take for the other destructive
+        /// writes in this app, so the chokepoint is safe standing alone.
+        ///
+        /// The UI gates above are then presentation: they decide what is on
+        /// screen, and this decides what can actually be sent.
+        #[test]
+        fn the_power_chokepoint_refuses_off_the_allow_list_itself() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let body = method_body(src, "fn request_instance_power(");
+            assert!(
+                body.contains("self.instance_power_enabled"),
+                "request_instance_power must re-check the gate itself",
+            );
+            // Ahead of the confirmation, or a refused request would still
+            // put a dialog on screen offering to run it.
+            let refusal = body
+                .find("self.instance_power_enabled")
+                .expect("the gate check");
+            let confirm = body
+                .find("self.power_confirm = Some(")
+                .expect("the confirmation is still raised here");
+            assert!(
+                refusal < confirm,
+                "the gate must be checked before the confirmation is raised",
+            );
+        }
+
+        /// The `Instance state` button is named for the AWS console's own
+        /// dropdown, which is where anyone reaching for it has seen it. Its
+        /// entries keep `PowerAction::label`, so `Restart (stop -> start)`
+        /// stays deliberately unlike AWS's `Reboot instance`: it is not one.
+        #[test]
+        fn the_instance_state_button_is_named_after_the_aws_console() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            assert!(
+                src.contains("menu_button(\"Instance state\""),
+                "the sub-tab row button is labelled `Instance state`",
+            );
+            assert!(
+                !src.contains("\"Reboot instance\""),
+                "Restart is a stop and a start, never an EC2 reboot -- \
+                 naming it after AWS's reboot would describe the one action \
+                 it specifically is not",
             );
         }
 
