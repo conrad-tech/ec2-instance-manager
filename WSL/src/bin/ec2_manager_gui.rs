@@ -4040,6 +4040,7 @@ mod gui {
                 move |ctx| {
                     spawn_reaper_snapshots(snap_iid, ctx.clone(), timeout, snap_tx)
                 },
+                |ctx| run_ssm_fallback(ctx, &iid, &tx),
             );
             if let Some(code) = outcome {
                 let _ = tx.send(outcome_event(code, &target));
@@ -4765,6 +4766,19 @@ mod gui {
                 note(
                     LogLevel::Error,
                     format!("dry run: could not read {instance} — {e}"),
+                );
+                // A real run would take the EC2 fallback here. Both reads
+                // are describes; the plan is reported and never carried out.
+                let plan = reaper::ssm_fallback_plan(
+                    &instance_asg_group(&ctx.profile, &ctx.region, &instance),
+                    &fetch_instance_state(&ctx.profile, &ctx.region, &instance),
+                );
+                note(
+                    LogLevel::Warn,
+                    format!(
+                        "dry run: a real run would fall back to the EC2 API — {plan:?} \
+                         (nothing was stopped or terminated)"
+                    ),
                 );
                 false
             }
@@ -39481,6 +39495,7 @@ mod gui {
         tx: &Sender<ReaperEvent>,
         exec: impl FnOnce(&AwsContext, &str) -> std::result::Result<String, String>,
         begin_follow_ups: impl FnOnce(&AwsContext),
+        fallback: impl FnOnce(&AwsContext) -> std::result::Result<String, String>,
     ) -> Option<ec2_manager::reaper::OutcomeCode> {
         let note = |level: LogLevel, message: String| {
             let _ = tx.send(ReaperEvent::Note { level, message });
@@ -39537,6 +39552,7 @@ mod gui {
             tx,
             |cmd| exec(&ctx, cmd),
             move || begin_follow_ups(&ctx_for_follow_ups),
+            || fallback(&ctx),
         )
     }
 
@@ -39577,6 +39593,7 @@ mod gui {
         tx: &Sender<ReaperEvent>,
         exec: impl FnOnce(&str) -> std::result::Result<String, String>,
         begin_follow_ups: impl FnOnce(),
+        fallback: impl FnOnce() -> std::result::Result<String, String>,
     ) -> Option<ec2_manager::reaper::OutcomeCode> {
         use ec2_manager::reaper::{self, Verdict};
 
@@ -39642,6 +39659,10 @@ mod gui {
 
         // ---- committed from here: no standing down between `down` and
         // `up -d` would leave the stack down with its watchdog off. ----
+        // An SSM failure of any kind — never delivered, or never reported
+        // back — falls back to cycling the box from the EC2 API, which needs
+        // no agent. See `run_ssm_fallback` for what that means per box.
+        let mut fallback_failed = false;
         let out = match exec(&reaper_fix_command()) {
             Ok(o) => o,
             Err(e) => {
@@ -39649,6 +39670,27 @@ mod gui {
                     LogLevel::Error,
                     format!("reaper: send-command failed on {}: {e}", target.instance_id),
                 );
+                note(
+                    LogLevel::Warn,
+                    format!(
+                        "reaper: SSM could not run the fix on {} — falling back to the \
+                         EC2 API",
+                        target.instance_id
+                    ),
+                );
+                match fallback() {
+                    Ok(msg) => note(
+                        LogLevel::Warn,
+                        format!("reaper: fallback on {}: {msg}", target.instance_id),
+                    ),
+                    Err(why) => {
+                        fallback_failed = true;
+                        note(
+                            LogLevel::Error,
+                            format!("reaper: fallback on {} failed: {why}", target.instance_id),
+                        );
+                    }
+                }
                 String::new()
             }
         };
@@ -39664,6 +39706,12 @@ mod gui {
 
         if reaper_follow_ups_due(&out) {
             begin_follow_ups();
+        }
+
+        // Nothing got the box back: escalate now rather than spend the
+        // stage-2 window watching an alert that has no fix behind it.
+        if fallback_failed {
+            return Some(reaper_failure_tier(on_call));
         }
 
         let verdict = reaper::parse_verdict(&out);
@@ -40070,6 +40118,7 @@ mod gui {
                                             snap_tx,
                                         )
                                     },
+                                    |ctx| run_ssm_fallback(ctx, &iid, &tx_for_thread),
                                 );
                                 if let Some(code) = outcome {
                                     let _ = tx_for_thread.send(outcome_event(code, &target));
@@ -42836,64 +42885,148 @@ mod gui {
                 send_power_call(profile, region, instance_id, false)?;
                 Ok("stop requested — the instance is shutting down".to_string())
             }
-            PowerAction::Restart => {
-                send_power_call(profile, region, instance_id, false)?;
-                let began = Instant::now();
-                loop {
-                    let waited = began.elapsed();
-                    progress(PowerPhase::Stopping {
-                        waited_secs: waited.as_secs(),
-                    });
-                    // A failed read becomes an empty state, which matches
-                    // none of the checks below and simply costs one poll.
-                    // One failed read is not a failed restart — the poll has
-                    // minutes of budget, and giving up on a transient API
-                    // error would abandon a box that is on its way down. A
-                    // read that keeps failing runs out the clock below and is
-                    // reported there, naming the state as unreadable.
-                    let state = fetch_instance_state(profile, region, instance_id)
-                        .unwrap_or_default();
-                    if power::is_stopped(&state) {
-                        break;
-                    }
-                    if power::poll_is_hopeless(&state) {
-                        return Err(format!(
-                            "instance went to '{state}' instead of stopped — not started"
-                        ));
-                    }
-                    if power::stop_timed_out(waited) {
-                        return Err(format!(
-                            "still not stopped after {}s (last seen '{}') — \
-                             the instance was NOT started; start it once it settles",
-                            waited.as_secs(),
-                            if state.is_empty() { "unreadable" } else { &state },
-                        ));
-                    }
-                    std::thread::sleep(Duration::from_secs(power::POLL_INTERVAL_SECS));
-                }
+            PowerAction::Restart => restart_instance(profile, region, instance_id, progress),
+        }
+    }
 
-                // It is down. Hold, so that is visible, then bring it up.
-                let stopped_at = Instant::now();
-                loop {
-                    let left = power::settle_remaining(stopped_at.elapsed());
-                    if left.is_zero() {
-                        break;
-                    }
-                    progress(PowerPhase::Settling {
-                        secs_left: left.as_secs().max(1),
-                    });
-                    std::thread::sleep(Duration::from_secs(1).min(left));
-                }
+    /// Stop, poll until `stopped`, hold [`power::SETTLE_SECS`], start.
+    ///
+    /// Shared by the Inventory Restart and the reaper's SSM fallback, so
+    /// there is one copy of the poll that stops `start-instances` from going
+    /// out while the box is still `stopping`. `progress` is told each phase;
+    /// the caller decides what that means (a status line, or a log line).
+    /// The state pre-check is the caller's — it is done differently by each.
+    fn restart_instance(
+        profile: &str,
+        region: &str,
+        instance_id: &str,
+        progress: impl Fn(PowerPhase),
+    ) -> std::result::Result<String, String> {
+        send_power_call(profile, region, instance_id, false)?;
+        let began = Instant::now();
+        loop {
+            let waited = began.elapsed();
+            progress(PowerPhase::Stopping {
+                waited_secs: waited.as_secs(),
+            });
+            // A failed read becomes an empty state, which matches
+            // none of the checks below and simply costs one poll.
+            // One failed read is not a failed restart — the poll has
+            // minutes of budget, and giving up on a transient API
+            // error would abandon a box that is on its way down. A
+            // read that keeps failing runs out the clock below and is
+            // reported there, naming the state as unreadable.
+            let state = fetch_instance_state(profile, region, instance_id)
+                .unwrap_or_default();
+            if power::is_stopped(&state) {
+                break;
+            }
+            if power::poll_is_hopeless(&state) {
+                return Err(format!(
+                    "instance went to '{state}' instead of stopped — not started"
+                ));
+            }
+            if power::stop_timed_out(waited) {
+                return Err(format!(
+                    "still not stopped after {}s (last seen '{}') — \
+                     the instance was NOT started; start it once it settles",
+                    waited.as_secs(),
+                    if state.is_empty() { "unreadable" } else { &state },
+                ));
+            }
+            std::thread::sleep(Duration::from_secs(power::POLL_INTERVAL_SECS));
+        }
 
-                progress(PowerPhase::Starting);
-                send_power_call(profile, region, instance_id, true).map_err(|e| {
-                    format!("stopped, but the start failed: {e} — the instance is stopped")
-                })?;
-                Ok(format!(
-                    "restarted: stopped after {}s, held {}s, start requested",
-                    began.elapsed().as_secs().saturating_sub(power::SETTLE_SECS),
-                    power::SETTLE_SECS,
-                ))
+        // It is down. Hold, so that is visible, then bring it up.
+        let stopped_at = Instant::now();
+        loop {
+            let left = power::settle_remaining(stopped_at.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            progress(PowerPhase::Settling {
+                secs_left: left.as_secs().max(1),
+            });
+            std::thread::sleep(Duration::from_secs(1).min(left));
+        }
+
+        progress(PowerPhase::Starting);
+        send_power_call(profile, region, instance_id, true).map_err(|e| {
+            format!("stopped, but the start failed: {e} — the instance is stopped")
+        })?;
+        Ok(format!(
+            "restarted: stopped after {}s, held {}s, start requested",
+            began.elapsed().as_secs().saturating_sub(power::SETTLE_SECS),
+            power::SETTLE_SECS,
+        ))
+    }
+
+    /// The reaper's recovery when SSM could not run the fix at all.
+    ///
+    /// Reads the instance's ASG tag and state, lets
+    /// `reaper::ssm_fallback_plan` decide, and carries that out: a stop and
+    /// start for a standalone box (`restart_instance`, the Inventory
+    /// Restart's own sequence), `terminate_instance` for an ASG member so the
+    /// group replaces it, and nothing at all when membership cannot be read.
+    ///
+    /// **Live mode only, checked here.** The one caller already refuses Sim,
+    /// but this stops and terminates real instances and so refuses standing
+    /// alone, as `terminate_instance` and `request_asg_capacity` do.
+    ///
+    /// Phases are logged once each rather than on every 5-second poll.
+    fn run_ssm_fallback(
+        ctx: &AwsContext,
+        instance_id: &str,
+        tx: &Sender<ReaperEvent>,
+    ) -> std::result::Result<String, String> {
+        use ec2_manager::reaper::{self, SsmFallback};
+
+        if ctx.mode != Mode::Live {
+            return Err("refusing: not in Live mode".to_string());
+        }
+        let note = |level: LogLevel, message: String| {
+            let _ = tx.send(ReaperEvent::Note { level, message });
+        };
+        let asg = instance_asg_group(&ctx.profile, &ctx.region, instance_id);
+        let state = fetch_instance_state(&ctx.profile, &ctx.region, instance_id);
+        let plan = reaper::ssm_fallback_plan(&asg, &state);
+        note(
+            LogLevel::Warn,
+            format!(
+                "reaper: {instance_id} is {}, {} — fallback: {plan:?}",
+                state.as_deref().unwrap_or("in an unreadable state"),
+                match &asg {
+                    Ok(Some(g)) => format!("in auto scaling group {g}"),
+                    Ok(None) => "not in an auto scaling group".to_string(),
+                    Err(_) => "ASG membership unreadable".to_string(),
+                },
+            ),
+        );
+        match plan {
+            SsmFallback::Refuse(why) => Err(format!("nothing done — {why}")),
+            SsmFallback::Terminate(group) => {
+                terminate_instance(&ctx.profile, &ctx.region, instance_id, &ctx.mode)?;
+                Ok(format!("terminated; auto scaling group {group} will replace it"))
+            }
+            SsmFallback::Start => {
+                send_power_call(&ctx.profile, &ctx.region, instance_id, true)?;
+                Ok("it was already stopped — start requested".to_string())
+            }
+            SsmFallback::Restart => {
+                let last = std::cell::Cell::new(0u8);
+                restart_instance(&ctx.profile, &ctx.region, instance_id, |phase| {
+                    let kind = match phase {
+                        PowerPhase::Stopping { .. } => 1,
+                        PowerPhase::Settling { .. } => 2,
+                        PowerPhase::Starting => 3,
+                    };
+                    if last.replace(kind) != kind {
+                        note(
+                            LogLevel::Info,
+                            format!("reaper: {instance_id} {}", phase.describe()),
+                        );
+                    }
+                })
             }
         }
     }
@@ -46079,6 +46212,12 @@ mod gui {
         /// UI is gone, and it is always ignored rather than propagated. Tests
         /// that *do* assert on what was reported build a real channel and
         /// keep the receiver.
+        /// The SSM fallback for a test that is not about it: every such test
+        /// hands `exec` an `Ok`, so being called at all is the bug.
+        fn no_fallback() -> std::result::Result<String, String> {
+            panic!("the SSM fallback ran although the fix was delivered")
+        }
+
         fn null_reaper_tx() -> Sender<ReaperEvent> {
             mpsc::channel().0
         }
@@ -46185,7 +46324,8 @@ mod gui {
             let target = test_reaper_target();
             let _ = run_reaper_remediation(&ops, &cfg, &target, false, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 Ok(failing_transcript())
-            }, || {});
+            }, || {},
+                no_fallback,);
             assert!(!ops.log.borrow().contains(&"ack"));
         }
 
@@ -46205,7 +46345,8 @@ mod gui {
             let target = test_reaper_target();
             let _ = run_reaper_remediation(&ops, &cfg, &target, false, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 Ok(failing_transcript())
-            }, || {});
+            }, || {},
+                no_fallback,);
             assert_eq!(ops.log.borrow().iter().filter(|c| **c == "ack").count(), 0);
         }
 
@@ -46220,7 +46361,8 @@ mod gui {
             let target = test_reaper_target();
             let _ = run_reaper_remediation(&ops, &cfg, &target, true, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 Ok(failing_transcript())
-            }, || {});
+            }, || {},
+                no_fallback,);
             let log = ops.log.borrow();
             assert_eq!(log.iter().filter(|c| **c == "ack").count(), 1);
             assert_eq!(log.first(), Some(&"ack"));
@@ -46240,7 +46382,8 @@ mod gui {
             let outcome = run_reaper_remediation(&ops, &cfg, &target, true, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 exec_calls.set(exec_calls.get() + 1);
                 Ok(failing_transcript())
-            }, || {});
+            }, || {},
+                no_fallback,);
             assert_eq!(exec_calls.get(), 0);
             assert!(outcome.is_none());
         }
@@ -46256,7 +46399,8 @@ mod gui {
             let target = test_reaper_target();
             let outcome = run_reaper_remediation(&ops, &cfg, &target, true, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 Ok(failing_transcript())
-            }, || {});
+            }, || {},
+                no_fallback,);
             // Exactly one fetch: the last look. A stage-2 poll would be a
             // second one, and `Verdict::Failed` must return before that
             // loop is ever entered.
@@ -46277,7 +46421,8 @@ mod gui {
             let outcome = run_reaper_remediation(&ops, &cfg, &target, true, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 exec_calls.set(exec_calls.get() + 1);
                 Ok(failing_transcript())
-            }, || {});
+            }, || {},
+                no_fallback,);
             assert_eq!(exec_calls.get(), 1);
             assert!(outcome.is_some());
         }
@@ -46295,7 +46440,8 @@ mod gui {
             let outcome = run_reaper_remediation(&ops, &cfg, &target, false, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 exec_calls.set(exec_calls.get() + 1);
                 Ok(failing_transcript())
-            }, || {});
+            }, || {},
+                no_fallback,);
             assert_eq!(exec_calls.get(), 1);
             assert!(outcome.is_some());
         }
@@ -46341,6 +46487,7 @@ mod gui {
                 &null_reaper_tx(),
                 |_| Ok(applied_transcript()),
                 || begun.set(begun.get() + 1),
+                no_fallback,
             );
             assert_eq!(begun.get(), 1);
         }
@@ -46369,6 +46516,7 @@ mod gui {
                 &null_reaper_tx(),
                 |_| Ok(down),
                 || begun.set(begun.get() + 1),
+                no_fallback,
             );
             assert_eq!(outcome, Some(ec2_manager::reaper::OutcomeCode::Failure));
             assert_eq!(begun.get(), 1, "a failed fix is still worth watching settle");
@@ -46529,6 +46677,7 @@ mod gui {
                     Ok(applied_transcript())
                 },
                 || {},
+                no_fallback,
             );
             assert_eq!(exec_calls.get(), 0, "the poll must stand down");
             assert!(outcome.is_none());
@@ -46547,6 +46696,7 @@ mod gui {
                     Ok(applied_transcript())
                 },
                 || {},
+                no_fallback,
             );
             assert_eq!(exec_calls.get(), 1, "an asked-for run proceeds");
             assert!(outcome.is_some());
@@ -46798,6 +46948,7 @@ mod gui {
                 &null_reaper_tx(),
                 |_| Ok(failing_transcript()),
                 || begun.set(begun.get() + 1),
+                no_fallback,
             );
             assert_eq!(begun.get(), 0);
         }
@@ -46822,6 +46973,7 @@ mod gui {
                 &null_reaper_tx(),
                 |_| Ok(applied_transcript()),
                 || begun.set(begun.get() + 1),
+                no_fallback,
             );
             assert!(outcome.is_none());
             assert_eq!(begun.get(), 0);
@@ -46848,6 +47000,7 @@ mod gui {
                 &tx,
                 |_| Ok(applied_transcript()),
                 || {},
+                no_fallback,
             );
             drop(tx);
             let events: Vec<ReaperEvent> = rx.into_iter().collect();
@@ -46898,6 +47051,7 @@ mod gui {
                 &tx,
                 |_| Ok(applied_transcript()),
                 || {},
+                no_fallback,
             );
             drop(tx);
             let events: Vec<ReaperEvent> = rx.into_iter().collect();
@@ -46910,6 +47064,134 @@ mod gui {
                 .position(|e| matches!(e, ReaperEvent::Note { message, .. } if message.contains("verdict")))
                 .expect("the verdict is reported");
             assert!(transcript_at < verdict_at, "{events:#?}");
+        }
+
+        /// SSM could not run the fix: the EC2 fallback runs, once, and
+        /// BEFORE the follow-up snapshots — they are there to show whether
+        /// the box answers after it was cycled. A fallback that fails
+        /// escalates at once rather than waiting out stage 2 (which would
+        /// also make this test take ten minutes).
+        #[test]
+        fn an_ssm_failure_falls_back_and_a_failed_fallback_escalates_at_once() {
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let order = std::cell::RefCell::new(Vec::new());
+            let (tx, rx) = mpsc::channel();
+            let outcome = run_reaper_remediation(
+                &ops,
+                &cfg,
+                &target,
+                true,
+                ClosedAlert::StandDown,
+                &tx,
+                |_| Err("InvalidInstanceId: not connected".to_string()),
+                || order.borrow_mut().push("follow-ups"),
+                || {
+                    order.borrow_mut().push("fallback");
+                    Err("nothing done — could not read its state".to_string())
+                },
+            );
+            drop(tx);
+            assert_eq!(*order.borrow(), vec!["fallback", "follow-ups"]);
+            assert_eq!(outcome, Some(ec2_manager::reaper::OutcomeCode::Failure));
+            // ack + last look only: no stage-2 polls.
+            assert_eq!(*ops.log.borrow(), vec!["ack", "fetch"]);
+            let notes: Vec<String> = rx
+                .into_iter()
+                .filter_map(|e| match e {
+                    ReaperEvent::Note { message, .. } => Some(message),
+                    _ => None,
+                })
+                .collect();
+            assert!(notes.iter().any(|m| m.contains("falling back")), "{notes:#?}");
+            assert!(notes.iter().any(|m| m.contains("fallback on") && m.contains("failed")), "{notes:#?}");
+        }
+
+        /// Off call a failed fallback is still the quiet tier.
+        #[test]
+        fn a_failed_fallback_off_call_is_the_quiet_tier() {
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let outcome = run_reaper_remediation(
+                &ops,
+                &cfg,
+                &target,
+                false,
+                ClosedAlert::StandDown,
+                &null_reaper_tx(),
+                |_| Err("ssm command timed out after 90s".to_string()),
+                || {},
+                || Err("stopped, but the start failed".to_string()),
+            );
+            assert_eq!(outcome, Some(ec2_manager::reaper::OutcomeCode::FailureQuiet));
+        }
+
+        /// The fallback reaches `remediate_if_authorized`'s own context —
+        /// the one the precondition just checked — not some other account's.
+        #[test]
+        fn the_fallback_is_handed_the_authorised_context() {
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let ctx = AwsContext {
+                mode: Mode::Live,
+                profile: "111111111111".to_string(),
+                account_id: Some("111111111111".to_string()),
+                arn: None,
+                user_id: None,
+                region: "us-east-1".to_string(),
+                auth_status: AuthStatus::Ok,
+            };
+            let seen = std::cell::RefCell::new(None);
+            let _ = remediate_if_authorized(
+                Ok(ctx),
+                &target.account_id,
+                &ops,
+                &cfg,
+                &target,
+                true,
+                ClosedAlert::StandDown,
+                &null_reaper_tx(),
+                |_ctx, _cmd| Err("send-command error".to_string()),
+                |_ctx| {},
+                |ctx| {
+                    *seen.borrow_mut() = Some(ctx.profile.clone());
+                    Err("refused".to_string())
+                },
+            );
+            assert_eq!(seen.borrow().as_deref(), Some("111111111111"));
+        }
+
+        /// The SSM fallback stops and terminates real instances, so it
+        /// refuses outside Live mode on its own — before any AWS read.
+        #[test]
+        fn the_ssm_fallback_refuses_outside_live_mode() {
+            let ctx = AwsContext {
+                mode: Mode::Sim,
+                profile: "111111111111".to_string(),
+                account_id: Some("111111111111".to_string()),
+                arn: None,
+                user_id: None,
+                region: "us-east-1".to_string(),
+                auth_status: AuthStatus::Ok,
+            };
+            let err = run_ssm_fallback(&ctx, "i-0abc123def4567890", &null_reaper_tx())
+                .expect_err("Sim must refuse");
+            assert!(err.contains("Live"), "{err}");
         }
 
         /// A context whose `auth_status` is not `Ok` — the shape
@@ -46951,6 +47233,7 @@ mod gui {
                     Ok(failing_transcript())
                 },
                 |_ctx| {},
+                |_ctx| no_fallback(),
             );
             assert_eq!(exec_calls.get(), 0);
             assert!(ops.log.borrow().is_empty());
@@ -46995,6 +47278,7 @@ mod gui {
                     Ok(failing_transcript())
                 },
                 |_ctx| {},
+                |_ctx| no_fallback(),
             );
             assert_eq!(exec_calls.get(), 0);
             assert!(ops.log.borrow().is_empty());
@@ -47027,6 +47311,7 @@ mod gui {
                     Ok(failing_transcript())
                 },
                 |_ctx| {},
+                |_ctx| no_fallback(),
             );
             assert_eq!(exec_calls.get(), 0);
             assert!(ops.log.borrow().is_empty());
@@ -47069,6 +47354,7 @@ mod gui {
                     Ok(failing_transcript())
                 },
                 |_ctx| {},
+                |_ctx| no_fallback(),
             );
             assert_eq!(exec_calls.get(), 1);
             assert_eq!(ops.log.borrow().iter().filter(|c| **c == "ack").count(), 1);
@@ -47118,6 +47404,7 @@ mod gui {
                     Ok(failing_transcript())
                 },
                 |_ctx| {},
+                |_ctx| no_fallback(),
             );
             assert_eq!(exec_calls.get(), 0);
             assert!(ops.log.borrow().is_empty());

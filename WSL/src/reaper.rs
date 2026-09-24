@@ -987,6 +987,74 @@ pub fn parse_docker_snapshots(output: &str) -> Vec<DockerSnapshot> {
     out
 }
 
+/// What to do when the fix could not be run over SSM at all.
+///
+/// An SSM failure leaves the fix undone — or half done, `compose down`
+/// with no `up -d` — and nothing else in the run can repair it. The box
+/// itself can still be cycled from the EC2 API, which needs no agent:
+///
+/// - **Standalone** (reaper today): a stop and a start, the same sequence
+///   the Inventory Restart menu runs — never `reboot-instances`.
+/// - **In an auto scaling group:** terminate, and let the group replace it.
+///   A stop is the wrong tool there: the group marks a stopped instance
+///   unhealthy and replaces it anyway, on its own schedule.
+/// - **Membership unknown:** neither. A stop on an ASG box can lose it and
+///   a terminate on a standalone one loses it for good, so a guess is the
+///   one thing this must not make.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SsmFallback {
+    /// Running and standalone: stop, wait for `stopped`, hold, start.
+    Restart,
+    /// Already stopped and standalone: only the start is left to do.
+    Start,
+    /// A member of this auto scaling group: terminate it.
+    Terminate(String),
+    /// Nothing is done, for this reason. The run escalates.
+    Refuse(String),
+}
+
+/// Decide the SSM fallback from the instance's ASG tag and its state.
+///
+/// `asg` is the `aws:autoscaling:groupName` read (`Ok(None)` = no tag),
+/// `state` the EC2 state read. Each is a `Result` because either read can
+/// fail, and a failed membership read is a refusal, never "standalone".
+pub fn ssm_fallback_plan(
+    asg: &Result<Option<String>, String>,
+    state: &Result<String, String>,
+) -> SsmFallback {
+    use crate::power::{self, PowerAction};
+
+    let group = match asg {
+        Err(e) => {
+            return SsmFallback::Refuse(format!(
+                "could not tell whether it is in an auto scaling group: {e}"
+            ))
+        }
+        Ok(g) => g,
+    };
+    let state = match state {
+        Ok(s) => s.trim().to_ascii_lowercase(),
+        // Terminate does not depend on the state; a restart does.
+        Err(e) if group.is_none() => {
+            return SsmFallback::Refuse(format!("could not read its state: {e}"))
+        }
+        Err(_) => String::new(),
+    };
+    if power::poll_is_hopeless(&state) {
+        return SsmFallback::Refuse(format!("instance is already {state}"));
+    }
+    if let Some(g) = group {
+        return SsmFallback::Terminate(g.clone());
+    }
+    if power::is_stopped(&state) {
+        return SsmFallback::Start;
+    }
+    match power::action_allowed(&state, PowerAction::Restart) {
+        Ok(()) => SsmFallback::Restart,
+        Err(why) => SsmFallback::Refuse(why),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2470,5 +2538,75 @@ mod tests {
         a.created_at = "2026-08-19T20:12:09Z".to_string();
         let target = match_alert(&a, &cfg()).expect("should match");
         assert_eq!(target.created_at, "2026-08-19T20:12:09Z");
+    }
+
+    #[test]
+    fn a_standalone_running_box_is_restarted() {
+        assert_eq!(
+            ssm_fallback_plan(&Ok(None), &Ok("running".to_string())),
+            SsmFallback::Restart
+        );
+    }
+
+    #[test]
+    fn a_standalone_stopped_box_is_only_started() {
+        assert_eq!(
+            ssm_fallback_plan(&Ok(None), &Ok("stopped".to_string())),
+            SsmFallback::Start
+        );
+    }
+
+    #[test]
+    fn an_asg_member_is_terminated_never_stopped() {
+        for state in ["running", "stopped", "stopping", "pending"] {
+            assert_eq!(
+                ssm_fallback_plan(&Ok(Some("app-asg".to_string())), &Ok(state.to_string())),
+                SsmFallback::Terminate("app-asg".to_string()),
+                "{state}"
+            );
+        }
+        // The state is not needed to terminate, so an unreadable one does
+        // not block it.
+        assert_eq!(
+            ssm_fallback_plan(&Ok(Some("app-asg".to_string())), &Err("boom".to_string())),
+            SsmFallback::Terminate("app-asg".to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_membership_is_refused_whatever_the_state() {
+        // Guessing "standalone" stops an ASG box; guessing "ASG" terminates
+        // a box nothing will replace. Neither is acceptable.
+        for state in ["running", "stopped"] {
+            assert!(matches!(
+                ssm_fallback_plan(&Err("denied".to_string()), &Ok(state.to_string())),
+                SsmFallback::Refuse(ref why) if why.contains("auto scaling group")
+            ));
+        }
+    }
+
+    #[test]
+    fn a_standalone_box_in_an_unusable_state_is_refused() {
+        for state in ["stopping", "pending", "terminated", "shutting-down", "weird"] {
+            assert!(
+                matches!(
+                    ssm_fallback_plan(&Ok(None), &Ok(state.to_string())),
+                    SsmFallback::Refuse(_)
+                ),
+                "{state}"
+            );
+        }
+        assert!(matches!(
+            ssm_fallback_plan(&Ok(None), &Err("boom".to_string())),
+            SsmFallback::Refuse(ref why) if why.contains("state")
+        ));
+    }
+
+    #[test]
+    fn a_terminating_asg_member_is_not_terminated_again() {
+        assert!(matches!(
+            ssm_fallback_plan(&Ok(Some("g".to_string())), &Ok("shutting-down".to_string())),
+            SsmFallback::Refuse(_)
+        ));
     }
 }

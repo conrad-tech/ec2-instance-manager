@@ -666,6 +666,42 @@ that changed; these are evidence for the human who reads the run afterwards.
   ten minutes. `applied_transcript()` exists for this: a fix that ran, carrying
   both listings, whose stack did not come back — so it returns before stage 2.
 
+#### SSM cannot reach the box: stop/start, or terminate
+
+When the fix's `send-command` fails in **any** way — never delivered (agent
+offline, `InvalidInstanceId`) or never reported back (timed out, `Failed`) —
+`run_reaper_remediation` calls a `fallback` that cycles the box from the EC2
+API, which needs no agent. Before this an SSM failure produced an empty
+transcript, `Indeterminate`, a full stage-2 wait and an escalation, with
+nothing tried in between.
+
+- **What it does is `reaper::ssm_fallback_plan`, pure and tested**, over the
+  instance's `aws:autoscaling:groupName` tag and its state. Standalone and
+  running: **stop -> poll `stopped` -> 20s hold -> start**, via
+  `restart_instance` — extracted from `run_power_action`, so the Inventory
+  Restart and this share one copy of the poll that keeps `start-instances`
+  from going out while the box is still `stopping`. Standalone and already
+  stopped: just the start. **In an ASG: `terminate_instance`**, and the group
+  replaces it — a stop there gets the instance marked unhealthy and replaced
+  anyway, on the group's schedule. Reaper boxes are never in an ASG; the
+  branch is for the fixes that come after it.
+- **Membership that cannot be read refuses.** A stop on an ASG box can lose
+  it, a terminate on a standalone one loses it for good; guessing either way
+  is the one thing this must not do.
+- **"Any failure" includes a fix that may have stopped half way** (`compose
+  down` with no `up -d`). Cycling the box is still the best recovery there
+  is, and the alert closing in stage 2 is still what decides success.
+- **A fallback that fails escalates at once**, skipping stage 2 — nothing is
+  behind the alert to wait for. One that succeeds runs stage 2 unchanged.
+- **The follow-up snapshots start after the fallback**, so the +1m/+5m
+  listings answer "did SSM come back after the cycle".
+- **`run_ssm_fallback` refuses outside Live mode itself**, the stance
+  `terminate_instance` and `request_asg_capacity` take. Phases are logged
+  once each, not per 5s poll.
+- **Test Alert Match reports the plan and never carries it out**: when the
+  probe cannot read the box it reads the tag and state (both describes) and
+  logs `a real run would fall back to the EC2 API — Restart`.
+
 #### The alert names a target group, not an instance
 
 `match_alert` required an `i-…` and returned `None` without a word when it
