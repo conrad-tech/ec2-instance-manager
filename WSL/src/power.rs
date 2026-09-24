@@ -47,9 +47,14 @@ impl PowerAction {
         match self {
             Self::Start => "Start instance",
             Self::Stop => "Stop instance",
-            // `->`, never `→`: egui's default font draws nothing for
-            // Unicode's Arrows block.
-            Self::Restart => "Restart (stop -> start)",
+            // Bare `Restart`, at the maintainer's request. It used to read
+            // `Restart (stop -> start)`, which said in the menu that this is
+            // not an EC2 reboot; that sentence now lives only in the
+            // confirmation, which lists the four steps and says outright it
+            // is not `reboot-instances`. So the menu no longer distinguishes
+            // the two and the dialog is the only place that does -- worth
+            // knowing before anything trims the dialog's wording as well.
+            Self::Restart => "Restart",
         }
     }
 
@@ -301,6 +306,11 @@ mod tests {
     /// The restart wording is the whole point of the feature: it is a stop
     /// and a start, not an EC2 reboot, and the dialog has to say so before
     /// anyone agrees to it.
+    ///
+    /// It carries that alone now. The menu label was `Restart (stop ->
+    /// start)` and made the same point one step earlier; it is bare
+    /// `Restart` since, so this is the only place a reader is told, and the
+    /// contrast must not be trimmed out of it.
     #[test]
     fn the_restart_confirmation_spells_out_stop_wait_start() {
         let text = confirm_text(PowerAction::Restart, "i-0abc (web01)");
@@ -323,11 +333,16 @@ mod tests {
         assert!(start.contains("i-0abc (web01)") && start.contains("Start"), "{start}");
     }
 
+    /// The labels are pinned because they are what a person reads before
+    /// stopping a production box. `Restart` is deliberately bare now, so the
+    /// confirmation is the only thing left saying it is not an EC2 reboot --
+    /// `the_restart_confirmation_spells_out_stop_wait_start` below is what
+    /// keeps that true.
     #[test]
-    fn every_action_has_a_menu_label_and_restart_says_it_is_a_stop_start() {
+    fn every_action_has_a_menu_label() {
         assert_eq!(PowerAction::Start.label(), "Start instance");
         assert_eq!(PowerAction::Stop.label(), "Stop instance");
-        assert_eq!(PowerAction::Restart.label(), "Restart (stop -> start)");
+        assert_eq!(PowerAction::Restart.label(), "Restart");
     }
 
     /// egui's default font carries no glyphs from Unicode's Arrows block, so

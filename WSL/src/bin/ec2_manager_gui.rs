@@ -26474,7 +26474,7 @@ mod gui {
             let label = Self::instance_label(instance);
             // Refused here rather than only where the entries are drawn.
             // Two places offer these actions now -- the row menu and the
-            // sub-tab row's `Instance state` button -- and each hides itself
+            // sub-tab row's `Instance State` button -- and each hides itself
             // off the allow-list, which makes the gate presentation. This is
             // the guarantee, and it holds for a third caller added later
             // without that caller having to remember: the same stance
@@ -26933,7 +26933,7 @@ mod gui {
                         self.inventory_tab = tab;
                     }
                 }
-                // `Instance state`, right-aligned on the sub-tab row. Named
+                // `Instance State`, right-aligned on the sub-tab row. Named
                 // for the AWS console's own dropdown, which is where anyone
                 // reaching for it has seen it, and offering the same three
                 // actions the row menu does -- this is a second way to reach
@@ -26948,7 +26948,7 @@ mod gui {
                         |ui| {
                             let selected = power_selection.is_some();
                             ui.add_enabled_ui(selected, |ui| {
-                                let menu = ui.menu_button("Instance state", |ui| {
+                                let menu = ui.menu_button("Instance State", |ui| {
                                     let Some(instance) = power_selection.as_ref() else {
                                         return;
                                     };
@@ -52437,7 +52437,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         /// Start / Stop / Restart must stay behind the allow-list, and there
         /// are two places offering them: the Inventory row menu and the
-        /// `Instance state` button on the sub-tab row. An edit that moved
+        /// `Instance State` button on the sub-tab row. An edit that moved
         /// either out from under its gate would arm live start/stop calls
         /// for everyone with no compile error and nothing on screen to say
         /// so.
@@ -52472,7 +52472,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 loops.len(),
                 2,
                 "two places offer the actions -- the row menu and the \
-                 Instance state button -- found at {loops:?}",
+                 Instance State button -- found at {loops:?}",
             );
             assert_eq!(
                 src.matches(gate).count(),
@@ -52536,17 +52536,20 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             );
         }
 
-        /// The `Instance state` button is named for the AWS console's own
+        /// The `Instance State` button is named for the AWS console's own
         /// dropdown, which is where anyone reaching for it has seen it. Its
-        /// entries keep `PowerAction::label`, so `Restart (stop -> start)`
-        /// stays deliberately unlike AWS's `Reboot instance`: it is not one.
+        /// entries come from `PowerAction::label`, and `Restart` must never
+        /// be renamed to AWS's `Reboot instance`: it is a real stop, a poll
+        /// until the box reports `stopped`, and a start, which is the one
+        /// action that name would misdescribe. The label no longer says so
+        /// itself -- the confirmation does, and `power.rs` pins that.
         #[test]
         fn the_instance_state_button_is_named_after_the_aws_console() {
             let whole = include_str!("ec2_manager_gui.rs");
             let src = &whole[..whole.find("    mod tests {").expect("the test module")];
             assert!(
-                src.contains("menu_button(\"Instance state\""),
-                "the sub-tab row button is labelled `Instance state`",
+                src.contains("menu_button(\"Instance State\""),
+                "the sub-tab row button is labelled `Instance State`",
             );
             assert!(
                 !src.contains("\"Reboot instance\""),
