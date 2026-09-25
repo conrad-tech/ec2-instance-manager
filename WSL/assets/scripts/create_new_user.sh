@@ -3,11 +3,13 @@
 # Creates a brand-new user, generates a PEM private key, and installs the derived public key
 # With --restore: regenerates the key for a user who already exists, replacing
 # their authorized_keys so the key they lost stops working.
+# With --restore --no-key --sudo: only grants sudo to an existing user; their
+# key, authorized_keys and PEM are left exactly as they are.
 
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 --user <username> [--pem <pem_path>] [--force] [--sudo] [--uid <n>] [--restore] [--help]"
+  echo "Usage: $0 --user <username> [--pem <pem_path>] [--force] [--sudo] [--uid <n>] [--restore [--no-key]] [--help]"
   echo " --user <username> Required. New username to create"
   echo " --pem <pem_path> Optional. PEM output path (default: /root/<username>.pem)"
   echo " --force Optional. Overwrite existing PEM file"
@@ -18,6 +20,9 @@ usage() {
   echo " --restore Optional. Restore access for an EXISTING user: require the"
   echo "                    account to exist, replace authorized_keys (revoking"
   echo "                    the lost key) and overwrite any existing PEM."
+  echo " --no-key Optional, with --restore only. Leave the key alone: no new"
+  echo "                    PEM, authorized_keys untouched. Needs --sudo, since"
+  echo "                    otherwise there is nothing to do."
   echo " --help Show this help message"
 }
 
@@ -31,6 +36,8 @@ PEM_PATH=""
 FORCE=0
 SUDO=0
 RESTORE=0
+# --no-key: a restore that does not touch the key (sudo only).
+NO_KEY=0
 # Explicit id from the caller. Empty means allocate one locally.
 WANT_ID=""
 
@@ -67,6 +74,10 @@ while [[ $# -gt 0 ]]; do
       FORCE=1
       shift
       ;;
+    --no-key)
+      NO_KEY=1
+      shift
+      ;;
     --help|-h)
       usage
       exit 0
@@ -90,6 +101,16 @@ if [[ ! "$USERNAME" =~ ^[a-z_][a-z0-9_.-]*[$]?$ ]]; then
   exit 1
 fi
 
+if [[ $NO_KEY -eq 1 && $RESTORE -ne 1 ]]; then
+  echo "ERROR: --no-key only applies to --restore; a new user needs a key."
+  exit 1
+fi
+
+if [[ $NO_KEY -eq 1 && $SUDO -ne 1 ]]; then
+  echo "ERROR: --restore --no-key without --sudo has nothing to do."
+  exit 1
+fi
+
 if [[ -z "$PEM_PATH" ]]; then
   PEM_PATH="/root/${USERNAME}.pem"
 fi
@@ -102,7 +123,7 @@ USER_CREATED=0
 # operator the name was wrong.
 if [[ $RESTORE -eq 1 ]] && ! id "$USERNAME" >/dev/null 2>&1; then
   echo "ERROR: User '$USERNAME' does not exist on this bastion."
-  echo "Use Bastion New User to create them; --restore only regenerates a key."
+  echo "Use Bastion New User to create them; --restore only works on an existing account."
   exit 1
 fi
 
@@ -114,6 +135,40 @@ if id "$USERNAME" >/dev/null 2>&1; then
   echo "User '$USERNAME' already exists. Reusing existing account and home: $HOME_DIR"
 else
   HOME_DIR="$DEFAULT_HOME_DIR"
+fi
+
+# Grant NOPASSWD:ALL through a drop-in file, validated before it is kept.
+configure_sudo() {
+  # Convert dots to hyphens for sudoers filename
+  SUDOERS_SUFFIX="${USERNAME//./-}"
+  SUDOERS_FILE="/etc/sudoers.d/zz-${SUDOERS_SUFFIX}-nopasswd"
+
+  echo ""
+  echo "Configuring sudo access for $USERNAME..."
+
+  SUDOERS_LINE="$USERNAME ALL=(ALL) NOPASSWD:ALL"
+  printf '%s\n' "$SUDOERS_LINE" > "$SUDOERS_FILE"
+
+  # Validate the sudoers file
+  if ! visudo -cf "$SUDOERS_FILE"; then
+    echo "ERROR: Sudoers file validation failed. Please check $SUDOERS_FILE"
+    exit 1
+  fi
+
+  # Set proper permissions and ownership
+  chmod 0440 "$SUDOERS_FILE"
+  chown root:root "$SUDOERS_FILE"
+
+  echo "Sudo access configured successfully at $SUDOERS_FILE"
+}
+
+# Sudo-only restore: everything below this point is about the key, and the
+# whole point of --no-key is that the key they have keeps working.
+if [[ $NO_KEY -eq 1 ]]; then
+  configure_sudo
+  echo ""
+  echo "Granted sudo to: $USERNAME (key and authorized_keys unchanged)"
+  exit 0
 fi
 
 SSH_DIR="${HOME_DIR}/.ssh"
@@ -251,27 +306,7 @@ if command -v restorecon >/dev/null 2>&1; then
 fi
 
 if [[ $SUDO -eq 1 ]]; then
-  # Convert dots to hyphens for sudoers filename
-  SUDOERS_SUFFIX="${USERNAME//./-}"
-  SUDOERS_FILE="/etc/sudoers.d/zz-${SUDOERS_SUFFIX}-nopasswd"
-
-  echo ""
-  echo "Configuring sudo access for $USERNAME..."
-
-  SUDOERS_LINE="$USERNAME ALL=(ALL) NOPASSWD:ALL"
-  printf '%s\n' "$SUDOERS_LINE" > "$SUDOERS_FILE"
-
-  # Validate the sudoers file
-  if ! visudo -cf "$SUDOERS_FILE"; then
-    echo "ERROR: Sudoers file validation failed. Please check $SUDOERS_FILE"
-    exit 1
-  fi
-
-  # Set proper permissions and ownership
-  chmod 0440 "$SUDOERS_FILE"
-  chown root:root "$SUDOERS_FILE"
-
-  echo "Sudo access configured successfully at $SUDOERS_FILE"
+  configure_sudo
 fi
 
 echo ""

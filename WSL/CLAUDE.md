@@ -3571,7 +3571,7 @@ pull, access email) is the create path unchanged. Only the run line and the
 wording differ. Delete is the genuinely separate path, and the code below
 `enqueue_user_script` still keys on `delete: bool` for that reason.
 
-`create_new_user.sh --restore` differs from a plain run in exactly four ways:
+`create_new_user.sh --restore` differs from a plain run in these ways:
 
 - **Refuses a user who does not exist**, before writing anything. Without it a
   typo'd username would quietly create a half-configured account instead of
@@ -3581,8 +3581,32 @@ wording differ. Delete is the genuinely separate path, and the code below
   defeats the exercise.
 - **Implies `--force`**, since the original run left a PEM at the default path
   and refusing it would fail every restore.
-- **Never passes `--sudo`**, so sudoers is untouched and an existing grant
-  survives.
+- **Passes `--sudo` only when ticked.** Unticked, sudoers is untouched and an
+  existing grant survives. (Restore used to never pass it.)
+
+**Reset key and Grant sudo are two checkboxes, and either may be alone.** A
+sudo-only restore (`--restore --no-key --sudo`) exists for a user who still has
+their key and only needs the grant; resetting their key to give them sudo
+would revoke a key that was never lost.
+
+- **`--no-key` exits before any key work** — no `ssh-keygen`, no write to
+  `authorized_keys`, no PEM copy. `configure_sudo` is the whole run.
+  `the_script_supports_a_sudo_only_restore` pins that ordering.
+- **The script refuses the combinations that make no sense**: `--no-key`
+  without `--restore` (a new user needs a key) and `--no-key` without
+  `--sudo` (nothing to do). The dialog disables Restore with neither box
+  ticked (`restore_has_work`), and the run path re-checks it.
+- **A sudo-only restore has no SSH test and no PEM pull** — there is no new
+  key to test with. `CreateUserRun.reset_key` false routes to
+  `run_sudo_verify_worker`, which asks `sudo -n -l -U <user>` on both
+  bastions for `NOPASSWD: ALL` (`sudo_verify_command`). It asks sudo rather
+  than testing for the drop-in file, so a file that does not parse or is
+  shadowed reads as the failure it is. No access email: that is PEM-only.
+- **The secondary grant is the same `sudoers_grant.sh` steps** a create
+  uses, pushed whenever `grant_sudo` is set. The mirror step still runs on a
+  restore and reports benign "already exists" noise, as it always has.
+- The warning line under the boxes is `restore_warning`, and says whether
+  the old key stops working, since that is the part that cannot be undone.
 
 **A protected user can be deleted, but only with a second confirmation.**
 `protected_users` used to make delete impossible without editing

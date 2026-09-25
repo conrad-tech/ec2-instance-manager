@@ -794,6 +794,24 @@ waiting for the shell prompt between lines.
   `MMODAL_ENV` tag is read from the primary bastion).
 - On success the status line reports all tests passed and the saved PEM path.
 
+### Bastion User Restore (`create_new_user.sh --restore`)
+
+For a user who **already exists**. Fails if the account is not there — it never
+creates anyone. Two checkboxes; tick either or both (Restore stays disabled with
+neither):
+
+- **Reset key (new PEM, old key revoked)** — on by default. Generates a new PEM,
+  **replaces** `authorized_keys` so the lost key stops working, and then verifies
+  SSH and pulls the PEM exactly as Bastion New User does.
+- **Grant sudo (NOPASSWD:ALL)** — off by default. Writes the sudoers drop-in on
+  both bastions. Unticked, an existing grant is left alone.
+
+Grant sudo **without** Reset key is a sudo-only restore (`--restore --no-key
+--sudo`): the user's key, `authorized_keys` and PEM are not touched. There is no
+new key to test, so instead of the SSH test the app asks `sudo -l -U <user>` on
+both bastions and reports **Sudo Granted**, or which bastion is missing the
+grant.
+
 ### Bastion User Delete (`delete_user.sh`, admin-gated)
 
 This entry is **hidden unless enabled at build time** (see
@@ -807,12 +825,26 @@ as **Bastion User Delete**; the script it runs is `delete_user.sh`.
   the result.
 
 > **Active users are never deleted.** Before running, a pre-flight check
-> (`who` + `pgrep -u`) runs on **both** bastions; if the user has any login
-> session or running process on either one — or the check can't be verified —
-> the delete is aborted and the status line reports where and why. The script
-> re-checks on the host and refuses (exit 3) as a safety net, and surfaces the
-> real `userdel` error if one occurs. No sessions are ever killed; ask the user
-> to log out and re-run.
+> (`who` + the user's processes) runs on **both** bastions; if the user has any
+> login session or running process on either one — or the check can't be
+> verified — the delete is aborted and the status line lists the processes
+> (pid, age, command) and where. The script re-checks on the host and refuses
+> (exit 3) as a safety net, and surfaces the real `userdel` error if one
+> occurs. No sessions are ever killed; ask the user to log out and re-run.
+>
+> The user's own systemd manager (`systemd --user` / `(sd-pam)`) is **not**
+> counted: `sudo su - <user>` starts one and it can outlive the `exit`. The
+> delete stops it itself before `userdel`.
+>
+> **Note: `who` is not the right check to compare against.** It lists only
+> logins that record a session, and neither `sudo su - <user>` nor an SSM
+> session does, so an empty `who` does not mean the user has nothing running.
+> If a delete is refused and you don't see why, run this on that bastion right
+> after the user exits:
+>
+> ```bash
+> ps -o pid,etime,cmd -u <user>
+> ```
 
 ### Vault IAM Access
 

@@ -1555,10 +1555,15 @@ mod gui {
         /// `MMODAL_ENV` value selected within that account. Empty for accounts
         /// with no environment dimension — then no environment filter applies.
         env_name: String,
-        /// Create mode: whether to pass `--sudo` (grant NOPASSWD:ALL).
-        /// Not offered when restoring — that leaves sudoers alone, so an
-        /// existing grant survives.
+        /// Create and Restore: whether to pass `--sudo` (grant NOPASSWD:ALL).
+        /// Unticked on a restore leaves sudoers alone, so an existing grant
+        /// survives.
         grant_sudo: bool,
+        /// Restore mode: issue a new key and revoke the old one. Unticked
+        /// makes the restore sudo-only (`--no-key`), for a user who still has
+        /// their key and only needs the grant. At least one of this and
+        /// `grant_sudo` must be ticked, or the restore would do nothing.
+        reset_key: bool,
         /// Delete mode: confirmation checkbox — Delete is disabled until set.
         confirm_delete: bool,
         /// Delete mode: a *second* confirmation, shown only when the typed
@@ -1695,6 +1700,10 @@ mod gui {
         /// Restore run. Takes the same path as a create — only the wording
         /// in the log and the result popup differs.
         restore: bool,
+        /// False only for a sudo-only restore: no new key, so there is no
+        /// SSH login to test and no PEM to pull — the grant is checked
+        /// instead (`run_sudo_verify_worker`).
+        reset_key: bool,
         username: String,
         /// Environment/profile_id (used to open the secondary session).
         env: String,
@@ -2590,6 +2599,15 @@ mod gui {
             /// Any error encountered (SSH or PEM pull).
             error: Option<String>,
             /// On-bastion diagnostic report, gathered when SSH didn't pass.
+            diagnostics: Option<String>,
+        },
+        /// Sudo-only restore verification: is the grant in force on each
+        /// bastion. There is no new key, so there is no SSH login to test.
+        SudoGranted {
+            username: String,
+            primary_ok: bool,
+            secondary_ok: bool,
+            /// Each bastion's own answer, gathered when either check failed.
             diagnostics: Option<String>,
         },
         /// delete_user.sh verification (confirm the account is gone).
@@ -5091,21 +5109,50 @@ mod gui {
     /// holding a number the secondary had already spent.
     ///
     /// Restore never carries one: the account already exists and keeps
-    /// whatever uid it has. It never carries `--sudo` either, so an existing
-    /// grant survives untouched rather than being re-applied.
+    /// whatever uid it has. It carries `--sudo` only when ticked, so an
+    /// existing grant is otherwise untouched, and `--no-key` when the key is
+    /// to be left alone (a sudo-only restore). `reset_key` means nothing
+    /// outside a restore: a new user always needs a key.
     fn create_run_line(
         remote_path: &str,
         username: &str,
         mode: UserScriptMode,
         grant_sudo: bool,
+        reset_key: bool,
         uid: Option<u32>,
     ) -> String {
+        let sudo = if grant_sudo { " --sudo" } else { "" };
         if mode.is_restore() {
-            return format!("bash {remote_path} --user {username} --restore");
+            let no_key = if reset_key { "" } else { " --no-key" };
+            return format!("bash {remote_path} --user {username} --restore{no_key}{sudo}");
         }
         let id = uid.map(|u| format!(" --uid {u}")).unwrap_or_default();
-        let sudo = if grant_sudo { " --sudo" } else { "" };
         format!("bash {remote_path} --user {username}{id}{sudo}")
+    }
+
+    /// A restore with neither box ticked has nothing to do.
+    fn restore_has_work(reset_key: bool, grant_sudo: bool) -> bool {
+        reset_key || grant_sudo
+    }
+
+    /// The Restore dialog's warning line, saying what this particular
+    /// combination changes — above all whether the old key stops working.
+    fn restore_warning(reset_key: bool, grant_sudo: bool) -> &'static str {
+        match (reset_key, grant_sudo) {
+            (true, true) => {
+                "⚠ Issues a new key and revokes the old one, and grants sudo. \
+                 Home is left alone; fails if the user does not exist."
+            }
+            (true, false) => {
+                "⚠ Issues a new key for an existing user and revokes their old \
+                 one. Sudo and home are left alone; fails if the user does not exist."
+            }
+            (false, true) => {
+                "Grants sudo only. Their key keeps working and home is left \
+                 alone; fails if the user does not exist."
+            }
+            (false, false) => "Tick Reset key, Grant sudo, or both.",
+        }
     }
 
     /// Bastion New User's pre-flight: bring the two boxes into line, then
@@ -5473,6 +5520,63 @@ mod gui {
             username,
             primary_absent,
             secondary_absent,
+            diagnostics,
+        });
+    }
+
+    /// The check a sudo-only restore is verified by: does `sudo` itself say
+    /// the user holds NOPASSWD:ALL. Asking sudo rather than testing for the
+    /// drop-in file means a file that exists but does not parse — or is
+    /// shadowed by a later rule — reads as the failure it is. Prints the
+    /// listing and the file after the marker so a failure explains itself.
+    /// Always exits 0 so `aws ssm` reports Success either way.
+    fn sudo_verify_command(username: &str) -> String {
+        let suffix = username.replace('.', "-");
+        format!(
+            "if sudo -n -l -U {username} 2>/dev/null | grep -q 'NOPASSWD: ALL'; \
+             then echo CNU_SUDO_OK; else echo CNU_SUDO_MISSING; fi; \
+             sudo -n -l -U {username} 2>&1 | tail -n 5; \
+             ls -l /etc/sudoers.d/zz-{suffix}-nopasswd 2>&1"
+        )
+    }
+
+    /// Post-run verification for a sudo-only restore: run
+    /// `sudo_verify_command` on both bastions. Uses `send-command`, as the
+    /// delete verify does, for the same reason.
+    fn run_sudo_verify_worker(
+        username: String,
+        primary_id: String,
+        secondary_id: String,
+        primary_ctx: AwsContext,
+        secondary_ctx: AwsContext,
+        tx: Sender<VerifyOutcome>,
+    ) {
+        let cmd = sudo_verify_command(&username);
+        let check = |ctx: &AwsContext, id: &str, cmd: &str| -> (bool, String) {
+            match exec_remote_command(&None, ctx, id, cmd, Duration::from_secs(30)) {
+                Ok(out) => (out.contains("CNU_SUDO_OK"), out.trim_end().to_string()),
+                Err(e) => (false, format!("(check failed: {e})")),
+            }
+        };
+        let sec_handle = {
+            let (ctx, id, cmd) = (secondary_ctx.clone(), secondary_id.clone(), cmd.clone());
+            std::thread::spawn(move || check(&ctx, &id, &cmd))
+        };
+        let (primary_ok, p_out) = check(&primary_ctx, &primary_id, &cmd);
+        let (secondary_ok, s_out) = sec_handle
+            .join()
+            .unwrap_or((false, "(secondary check thread panicked)".to_string()));
+        let diagnostics = if primary_ok && secondary_ok {
+            None
+        } else {
+            Some(format!(
+                "[primary {primary_id}]\n{p_out}\n\n[secondary {secondary_id}]\n{s_out}"
+            ))
+        };
+        let _ = tx.send(VerifyOutcome::SudoGranted {
+            username,
+            primary_ok,
+            secondary_ok,
             diagnostics,
         });
     }
@@ -20760,13 +20864,17 @@ mod gui {
                             );
                         }
                         UserScriptMode::Restore => {
+                            ui.checkbox(
+                                &mut dlg.reset_key,
+                                "Reset key (new PEM, old key revoked)",
+                            );
+                            ui.checkbox(&mut dlg.grant_sudo, "Grant sudo (NOPASSWD:ALL)");
                             // Say plainly what a restore destroys: the old
                             // key stops working the moment this runs.
-                            note_label(ui, 
+                            note_label(
+                                ui,
                                 egui::Color32::from_rgb(220, 150, 60),
-                                "⚠ Issues a new key for an existing user and \
-                                 revokes their old one. Sudo and home are left \
-                                 alone; fails if the user does not exist.",
+                                restore_warning(dlg.reset_key, dlg.grant_sudo),
                             );
                         }
                         UserScriptMode::Create => {
@@ -20856,18 +20964,26 @@ mod gui {
                         // confirmation checkbox is ticked — both of them, when
                         // the target is protected — and in every mode while
                         // the account isn't authenticated.
+                        // A restore with both boxes unticked would do nothing.
+                        let restore_has_work = !dlg.mode.is_restore()
+                            || restore_has_work(dlg.reset_key, dlg.grant_sudo);
                         let run_enabled = (!dlg.mode.is_delete()
                             || delete_confirmed(
                                 protected_target,
                                 dlg.confirm_delete,
                                 dlg.confirm_protected,
                             ))
+                            && restore_has_work
                             && auth_warning.is_none();
                         if ui
                             .add_enabled(run_enabled, egui::Button::new(run_label))
                             .on_disabled_hover_text(
                                 auth_warning.clone().unwrap_or_else(|| {
-                                    "Tick the confirmation to enable.".to_string()
+                                    if restore_has_work {
+                                        "Tick the confirmation to enable.".to_string()
+                                    } else {
+                                        "Tick Reset key, Grant sudo, or both.".to_string()
+                                    }
                                 }),
                             )
                             .clicked()
@@ -20936,6 +21052,13 @@ mod gui {
                     self.create_user_dialog = Some(dlg);
                     return;
                 }
+                // Same rule the disabled button shows, enforced where a stale
+                // dialog state cannot get past it.
+                if dlg.mode.is_restore() && !restore_has_work(dlg.reset_key, dlg.grant_sudo) {
+                    dlg.error = Some("Tick Reset key, Grant sudo, or both.".to_string());
+                    self.create_user_dialog = Some(dlg);
+                    return;
+                }
                 if dlg.env_profile_id.is_empty() {
                     dlg.error = Some("Choose an environment.".to_string());
                     self.create_user_dialog = Some(dlg);
@@ -20965,6 +21088,7 @@ mod gui {
                     &dlg.env_profile_id,
                     &dlg.env_name,
                     dlg.grant_sudo,
+                    dlg.reset_key,
                     &dlg.primary_id,
                     &dlg.secondary_id,
                     dlg.confirm_protected,
@@ -22016,8 +22140,6 @@ mod gui {
         /// runs a pre-flight active-session check across both bastions and
         /// only proceeds once it clears (see `poll_script_events`).
         #[allow(clippy::too_many_arguments)]
-        #[allow(clippy::too_many_arguments)]
-        #[allow(clippy::too_many_arguments)]
         fn start_user_script_run(
             &mut self,
             mode: UserScriptMode,
@@ -22025,6 +22147,8 @@ mod gui {
             env: &str,
             env_name: &str,
             grant_sudo: bool,
+            // Restore only: issue a new key. False is a sudo-only restore.
+            reset_key: bool,
             primary_id: &str,
             secondary_id: &str,
             // Delete only: the operator ticked the extra confirmation for a
@@ -22049,6 +22173,7 @@ mod gui {
                     env,
                     env_name,
                     grant_sudo,
+                    reset_key,
                     primary_id,
                     secondary_id,
                     None,
@@ -22213,6 +22338,8 @@ mod gui {
             env: &str,
             env_name: &str,
             grant_sudo: bool,
+            // Restore only: false is a sudo-only restore (`--no-key`).
+            reset_key: bool,
             primary_id: &str,
             secondary_id: &str,
             // uid/gid chosen by the pre-flight from both bastions' tables.
@@ -22266,11 +22393,12 @@ mod gui {
 
                 // Primary: drop the script and run it as root from $HOME.
                 // --restore makes the script require an existing account,
-                // replace authorized_keys and overwrite the old PEM; --sudo
-                // is never combined with it, so an existing grant survives
-                // untouched rather than being re-applied.
-                let run_line =
-                    create_run_line(remote_path, username, mode, grant_sudo, uid);
+                // replace authorized_keys and overwrite the old PEM, unless
+                // --no-key says to leave the key alone; --sudo is added only
+                // when ticked, so an existing grant is otherwise untouched.
+                let run_line = create_run_line(
+                    remote_path, username, mode, grant_sudo, reset_key, uid,
+                );
                 let primary = vec![
                     "sudo su".to_string(),
                     PREP_STEP_SENTINEL.to_string(),
@@ -22396,6 +22524,7 @@ mod gui {
                     self.create_user_run = Some(CreateUserRun {
                         delete,
                         restore: mode.is_restore(),
+                        reset_key: !mode.is_restore() || reset_key,
                         username: username.to_string(),
                         env: env.to_string(),
                         mmodal_env,
@@ -22684,6 +22813,7 @@ mod gui {
                     &pc.env,
                     &pc.env_name,
                     pc.grant_sudo,
+                    true,
                     &pc.primary_id,
                     &pc.secondary_id,
                     outcome.uid,
@@ -22703,6 +22833,7 @@ mod gui {
                             &pd.env,
                             &pd.env_name,
                             false,
+                            true,
                             &pd.primary_id,
                             &pd.secondary_id,
                             None,
@@ -22802,6 +22933,7 @@ mod gui {
                     let tx = self.verify_tx.clone();
                     let delete = run.delete;
                     let restore_run = run.restore;
+                    let sudo_only = run.restore && !run.reset_key;
                     let username = run.username.clone();
                     let mmodal_env = run.mmodal_env.clone();
                     let primary_id = run.primary_id.clone();
@@ -22834,6 +22966,25 @@ mod gui {
                                 secondary_ctx,
                                 primary_channel,
                                 secondary_channel,
+                                tx,
+                            )
+                        });
+                    } else if sudo_only {
+                        self.log_info(format!(
+                            "restore_user: finished, confirming sudo for '{username}' \
+                             on both bastions…"
+                        ));
+                        self.set_script_status(
+                            format!("Confirming sudo for '{username}'…"),
+                            ScriptState::Running,
+                        );
+                        std::thread::spawn(move || {
+                            run_sudo_verify_worker(
+                                username,
+                                primary_id,
+                                secondary_id,
+                                primary_ctx,
+                                secondary_ctx,
                                 tx,
                             )
                         });
@@ -23013,6 +23164,44 @@ mod gui {
                                 msg,
                                 false,
                                 pem_path,
+                                details,
+                            );
+                        }
+                    }
+                    VerifyOutcome::SudoGranted {
+                        username,
+                        primary_ok,
+                        secondary_ok,
+                        diagnostics,
+                    } => {
+                        if primary_ok && secondary_ok {
+                            let msg = format!(
+                                "Sudo granted to '{username}' on both bastions. \
+                                 Their key was left unchanged."
+                            );
+                            self.log_info(msg.clone());
+                            self.show_script_result("Sudo Granted", msg, true, None, None);
+                        } else {
+                            let state = |ok: bool| if ok { "OK" } else { "NOT GRANTED" };
+                            let msg = format!(
+                                "Sudo for '{username}': primary {}, secondary {}. \
+                                 See diagnostics below.",
+                                state(primary_ok),
+                                state(secondary_ok),
+                            );
+                            self.log_error(msg.clone());
+                            let mut details = script_errs.clone();
+                            if let Some(d) = diagnostics {
+                                self.log_error(format!("sudo diagnostics:\n{d}"));
+                                details.push_str(&d);
+                            }
+                            let details =
+                                if details.trim().is_empty() { None } else { Some(details) };
+                            self.show_script_result(
+                                "Sudo Grant Failed",
+                                msg,
+                                false,
+                                None,
                                 details,
                             );
                         }
@@ -35826,6 +36015,7 @@ mod gui {
                                     env_profile_id: env,
                                     env_name,
                                     grant_sudo: false,
+                                    reset_key: true,
                                     confirm_delete: false,
                 confirm_protected: false,
                                     primary_query,
@@ -48828,6 +49018,25 @@ mod gui {
             // Single line, no trailing newline (fed straight to `base64 -d`).
             assert!(!s.contains('\n'), "preflight must stay one line");
             assert!(s.contains("id jane.doe >/dev/null") && s.contains("CNU_ABSENT"));
+            // The user's own systemd manager outlives `su - user; exit`, so a
+            // bare `pgrep -u` blocked deleting somebody already logged out.
+            // It must stay excluded, and leftovers must be named, not PIDs.
+            assert!(!s.contains("pgrep"), "bare pgrep counts the systemd manager");
+            assert!(s.contains("$3==\"(sd-pam)\"{next}"));
+            assert!(s.contains("$3==\"systemd\" && / --user/{next}"));
+            assert!(s.contains("comm=,args="));
+        }
+
+        #[test]
+        fn delete_user_ignores_the_leftover_systemd_manager_but_stops_it() {
+            let s = include_str!("../../assets/scripts/delete_user.sh");
+            assert!(s.contains("$3==\"(sd-pam)\"{next} $3==\"systemd\" && / --user/{next}"));
+            let check = s.find("ACTIVE_PROCS=").expect("activity check");
+            let stop = s.find("systemctl stop \"user@${UID_OF}.service\"").expect("stop");
+            let del = s.find("DEL_ERR=\"$(userdel").expect("userdel");
+            // Stopped only after the check has cleared, and before userdel,
+            // which refuses a user owning any process.
+            assert!(check < stop && stop < del);
         }
 
         #[test]
@@ -48916,6 +49125,7 @@ mod gui {
                 "jane.doe",
                 UserScriptMode::Create,
                 false,
+                true,
                 Some(1013),
             );
             assert_eq!(
@@ -48927,6 +49137,7 @@ mod gui {
                 "/root/create_new_user.sh",
                 "jane.doe",
                 UserScriptMode::Create,
+                true,
                 true,
                 Some(1013),
             );
@@ -48941,25 +49152,85 @@ mod gui {
         #[test]
         fn a_create_with_no_chosen_id_is_unchanged() {
             assert_eq!(
-                create_run_line("/p.sh", "jane.doe", UserScriptMode::Create, false, None),
+                create_run_line("/p.sh", "jane.doe", UserScriptMode::Create, false, true, None),
                 "bash /p.sh --user jane.doe"
             );
             assert_eq!(
-                create_run_line("/p.sh", "jane.doe", UserScriptMode::Create, true, None),
+                create_run_line("/p.sh", "jane.doe", UserScriptMode::Create, true, true, None),
                 "bash /p.sh --user jane.doe --sudo"
             );
         }
 
-        /// Restore allocates nothing and must never re-apply sudo: the account
-        /// exists, keeps its uid, and an existing grant is left alone.
+        /// Restore allocates nothing — the account exists and keeps its uid
+        /// — and carries `--sudo` / `--no-key` exactly as ticked.
         #[test]
-        fn restore_takes_neither_an_id_nor_sudo() {
-            for (sudo, uid) in [(false, None), (true, Some(1013))] {
-                assert_eq!(
-                    create_run_line("/p.sh", "jane.doe", UserScriptMode::Restore, sudo, uid),
-                    "bash /p.sh --user jane.doe --restore"
-                );
-            }
+        fn restore_takes_no_id_and_carries_its_two_options() {
+            let line = |sudo, reset_key| {
+                create_run_line(
+                    "/p.sh",
+                    "jane.doe",
+                    UserScriptMode::Restore,
+                    sudo,
+                    reset_key,
+                    Some(1013),
+                )
+            };
+            assert_eq!(line(false, true), "bash /p.sh --user jane.doe --restore");
+            assert_eq!(line(true, true), "bash /p.sh --user jane.doe --restore --sudo");
+            assert_eq!(
+                line(true, false),
+                "bash /p.sh --user jane.doe --restore --no-key --sudo"
+            );
+        }
+
+        /// `reset_key` belongs to restore alone: a new user always gets a key.
+        #[test]
+        fn a_create_never_carries_no_key() {
+            assert_eq!(
+                create_run_line("/p.sh", "jane.doe", UserScriptMode::Create, false, false, None),
+                "bash /p.sh --user jane.doe"
+            );
+        }
+
+        /// A restore with neither box ticked would do nothing; the warning
+        /// must say plainly whether the old key is revoked.
+        #[test]
+        fn a_restore_needs_something_to_do_and_says_what_it_does() {
+            assert!(!restore_has_work(false, false));
+            assert!(restore_has_work(true, false));
+            assert!(restore_has_work(false, true));
+            assert!(restore_warning(true, false).contains("revokes"));
+            assert!(restore_warning(true, true).contains("revokes"));
+            assert!(restore_warning(true, true).contains("grants sudo"));
+            assert!(!restore_warning(false, true).contains("revokes"));
+            assert!(restore_warning(false, true).contains("key keeps working"));
+        }
+
+        /// The sudo-only verify asks sudo itself, about the named user.
+        #[test]
+        fn the_sudo_verify_asks_sudo_about_the_named_user() {
+            let c = sudo_verify_command("jane.doe");
+            assert!(c.contains("sudo -n -l -U jane.doe"));
+            assert!(c.contains("grep -q 'NOPASSWD: ALL'"));
+            assert!(c.contains("CNU_SUDO_OK") && c.contains("CNU_SUDO_MISSING"));
+            assert!(c.contains("/etc/sudoers.d/zz-jane-doe-nopasswd"));
+        }
+
+        /// The script must accept the flags the run line sends, refuse the
+        /// combinations that make no sense, and exit before any key work on
+        /// a sudo-only restore.
+        #[test]
+        fn the_script_supports_a_sudo_only_restore() {
+            let s = include_str!("../../assets/scripts/create_new_user.sh");
+            assert!(s.contains("    --no-key)"));
+            assert!(s.contains("--no-key only applies to --restore"));
+            assert!(s.contains("--restore --no-key without --sudo has nothing to do"));
+            let early = s
+                .find("if [[ $NO_KEY -eq 1 ]]; then\n  configure_sudo")
+                .expect("early exit");
+            let keygen = s.find("ssh-keygen -t rsa").expect("keygen");
+            let auth = s.find("> \"$AUTH_KEYS\"").expect("authorized_keys");
+            assert!(early < keygen && early < auth, "sudo-only must exit before the key work");
         }
 
         /// `done` is the sign-in script's last word, so it is the one step

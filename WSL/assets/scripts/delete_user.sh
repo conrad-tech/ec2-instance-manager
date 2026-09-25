@@ -81,8 +81,15 @@ if id "$USERNAME" >/dev/null 2>&1; then
   # Refuse to delete a user who is currently active — either a logged-in
   # session or any running process. We do NOT kill their sessions; the
   # admin should ask them to log out and re-run.
+  #
+  # The user's own systemd manager (`systemd --user` and its `(sd-pam)`
+  # helper) is NOT activity: `su - <user>` starts one and it can outlive the
+  # `exit`, so counting it blocked deleting a user who had already logged
+  # out. It is stopped below instead, because userdel refuses a user who
+  # owns any process at all.
   ACTIVE_SESSIONS="$(who 2>/dev/null | awk -v u="$USERNAME" '$1==u {print}')"
-  ACTIVE_PROCS="$(pgrep -u "$USERNAME" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
+  ACTIVE_PROCS="$(ps -u "$USERNAME" -o pid=,etime=,comm=,args= 2>/dev/null \
+    | awk '$3=="(sd-pam)"{next} $3=="systemd" && / --user/{next} {print}')"
   if [[ -n "$ACTIVE_SESSIONS" || -n "$ACTIVE_PROCS" ]]; then
     echo "ABORTED: user '$USERNAME' is currently active on $(hostname); not deleting."
     if [[ -n "$ACTIVE_SESSIONS" ]]; then
@@ -90,10 +97,21 @@ if id "$USERNAME" >/dev/null 2>&1; then
       echo "$ACTIVE_SESSIONS"
     fi
     if [[ -n "$ACTIVE_PROCS" ]]; then
-      echo "Running process PIDs: $ACTIVE_PROCS"
+      echo "Running processes (pid, age, name, command):"
+      echo "$ACTIVE_PROCS"
     fi
     echo "Ask them to log out / stop their processes, then re-run delete."
     exit 3
+  fi
+
+  # Nothing but the leftover user manager, if that: stop it so userdel
+  # does not refuse with "user is currently used by process N".
+  if pgrep -u "$USERNAME" >/dev/null 2>&1; then
+    systemctl stop "user@${UID_OF}.service" >/dev/null 2>&1 || true
+    for _ in 1 2 3 4 5; do
+      pgrep -u "$USERNAME" >/dev/null 2>&1 || break
+      sleep 1
+    done
   fi
 
   # Surface the real userdel error rather than hiding it.
