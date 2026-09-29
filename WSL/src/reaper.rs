@@ -402,6 +402,135 @@ pub enum Verdict {
     Indeterminate(String),
 }
 
+/// The containers a healthy reaper box runs, by exact container name.
+///
+/// Everything else is ignored — in particular
+/// `cassandra-reaper-reaper_db_init-1`, a one-shot init container that runs
+/// for a moment and exits 0 by design. Judging the stack by *every*
+/// container would call that a failure on every healthy box. Names are
+/// compared exactly, so `cassandra` is never satisfied by `cassandra-reaper`
+/// or by the init container.
+///
+/// The one list: [`parse_verdict`], [`stack_health`] and the post-fix watch
+/// all read it, and the watch script is handed these names by the app
+/// rather than carrying its own copy.
+pub const REQUIRED_CONTAINERS: [&str; 2] = ["cassandra-reaper", "cassandra"];
+
+fn is_required(name: &str) -> bool {
+    REQUIRED_CONTAINERS.contains(&name)
+}
+
+/// One line of `reaper_watch.sh`:
+/// `__RE_WATCH__ <name> <status> <startedAt> <restartCount>`, or
+/// `__RE_WATCH__ <name> missing` when docker has no such container.
+pub const RE_WATCH: &str = "__RE_WATCH__";
+
+/// How long the stack must stay up after a fix before the fix counts.
+pub const WATCH_SECS: u64 = 120;
+/// The gap between two checks during the watch.
+pub const WATCH_INTERVAL_SECS: u64 = 15;
+
+/// One required container, as one watch check saw it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainerState {
+    pub name: String,
+    /// docker's `.State.Status` — `running`, `exited`, `restarting`… — or
+    /// `missing`.
+    pub status: String,
+    pub started_at: String,
+    pub restarts: u64,
+}
+
+impl ContainerState {
+    pub fn is_running(&self) -> bool {
+        self.status == "running"
+    }
+}
+
+/// Parse one watch check. `None` when it does not account for every
+/// required container — a check that cannot say is unreadable, never "up".
+pub fn parse_watch(output: &str) -> Option<Vec<ContainerState>> {
+    let mut found: Vec<ContainerState> = Vec::new();
+    for line in output.lines() {
+        let Some(rest) = line.trim().strip_prefix(RE_WATCH) else {
+            continue;
+        };
+        let mut f = rest.split_whitespace();
+        let Some(name) = f.next() else { continue };
+        if !is_required(name) || found.iter().any(|c| c.name == name) {
+            continue;
+        }
+        let status = f.next().unwrap_or("").to_string();
+        if status.is_empty() {
+            continue;
+        }
+        let started_at = f.next().unwrap_or("").to_string();
+        let restarts = f.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+        found.push(ContainerState { name: name.to_string(), status, started_at, restarts });
+    }
+    // In the order of the list, so the log line reads the same every time.
+    let mut ordered = Vec::new();
+    for want in REQUIRED_CONTAINERS {
+        ordered.push(found.iter().find(|c| c.name == want)?.clone());
+    }
+    Some(ordered)
+}
+
+/// Is the stack still up, compared with the first check after the fix?
+///
+/// `Err` names what went down. A container counts as having gone down when
+/// it is not running now, **or** when its start time or restart count moved
+/// since the baseline: a crash that docker restarted between two checks 15s
+/// apart is running at both of them, and only those two fields show it.
+pub fn watch_check(
+    baseline: Option<&[ContainerState]>,
+    now: &[ContainerState],
+) -> std::result::Result<(), String> {
+    let mut down = Vec::new();
+    for c in now {
+        if !c.is_running() {
+            down.push(format!("{} is {}", c.name, c.status));
+            continue;
+        }
+        if let Some(b) = baseline.and_then(|b| b.iter().find(|b| b.name == c.name)) {
+            if b.started_at != c.started_at || c.restarts > b.restarts {
+                down.push(format!("{} restarted during the watch", c.name));
+            }
+        }
+    }
+    if down.is_empty() {
+        Ok(())
+    } else {
+        Err(down.join(", "))
+    }
+}
+
+/// `cassandra-reaper running, cassandra running` — one watch check for the log.
+pub fn describe_watch(states: &[ContainerState]) -> String {
+    states
+        .iter()
+        .map(|c| {
+            if c.restarts > 0 {
+                format!("{} {} (restarts {})", c.name, c.status, c.restarts)
+            } else {
+                format!("{} {}", c.name, c.status)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// How a 2-minute watch ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WatchOutcome {
+    /// Both containers stayed up, unrestarted, to the last check.
+    Held,
+    /// One went down or restarted — or was never up.
+    Dropped(String),
+    /// The last check could not be read, so staying up was never shown.
+    Unconfirmed(String),
+}
+
 /// Is one `compose ps` record a running service?
 fn record_is_running(v: &serde_json::Value) -> bool {
     let state = v.get("State").and_then(|s| s.as_str()).unwrap_or("");
@@ -505,11 +634,24 @@ pub fn stack_health(output: &str) -> StackHealth {
         );
     }
 
-    let down: Vec<&str> = services
-        .iter()
-        .filter(|(_, up)| !up)
-        .map(|(name, _)| name.as_str())
-        .collect();
+    // Only the required containers decide — see `REQUIRED_CONTAINERS`.
+    // A compose listing that omits one says it is not running.
+    let uptimes: Vec<ContainerUptime> =
+        uptimes.into_iter().filter(|u| is_required(&u.name)).collect();
+    let mut down: Vec<String> = Vec::new();
+    for want in REQUIRED_CONTAINERS {
+        let listed = services.iter().find(|(name, _)| name == want);
+        let up = match listed {
+            Some((_, up)) => *up,
+            // No compose block at all: fall back to the uptime lines, which
+            // only running containers produce.
+            None if services.is_empty() => uptimes.iter().any(|u| u.name == want),
+            None => false,
+        };
+        if !up {
+            down.push(want.to_string());
+        }
+    }
     if !down.is_empty() {
         return StackHealth::Down(format!("not running: {}", down.join(", ")));
     }
@@ -664,11 +806,16 @@ pub fn parse_verdict(output: &str) -> Verdict {
         return Verdict::Failed("compose ps listed no services — nothing came back up".to_string());
     }
 
-    let down: Vec<String> = records
-        .iter()
-        .filter(|r| !record_is_running(r))
-        .map(record_name)
-        .collect();
+    // Only the required containers decide; the init container exits by
+    // design. A required one compose did not list at all is down.
+    let mut down: Vec<String> = Vec::new();
+    for want in REQUIRED_CONTAINERS {
+        match records.iter().find(|r| record_name(r) == want) {
+            Some(r) if record_is_running(r) => {}
+            Some(_) => down.push(want.to_string()),
+            None => down.push(format!("{want} (not listed)")),
+        }
+    }
 
     if down.is_empty() {
         Verdict::Success
@@ -1053,6 +1200,80 @@ pub fn ssm_fallback_plan(
         Ok(()) => SsmFallback::Restart,
         Err(why) => SsmFallback::Refuse(why),
     }
+}
+
+/// How long after an off-call remediation starts before its alert may be
+/// acknowledged — long enough for whoever holds the pager to take it first.
+pub const OFF_CALL_ACK_DELAY_SECS: u64 = 60;
+
+/// Work hours for the off-call acknowledge: 08:00 up to (not including)
+/// 17:00, Monday to Friday, on the Chicago wall clock.
+pub const WORK_START_HOUR: u32 = 8;
+pub const WORK_END_HOUR: u32 = 17;
+
+/// Is US daylight saving in force at this instant?
+///
+/// Hand-written rather than a timezone crate: one zone, one rule, and the
+/// whole world's tz database is a lot to ship for it. The rule is the US
+/// one since 2007 — from the second Sunday of March at 02:00 standard time
+/// (08:00 UTC in Central) to the first Sunday of November at 02:00 daylight
+/// time (07:00 UTC). A future change to the law means editing this.
+fn us_central_dst(utc: chrono::DateTime<chrono::Utc>) -> bool {
+    use chrono::{Datelike, NaiveDate, Weekday};
+    let year = utc.year();
+    let (Some(start), Some(end)) = (
+        NaiveDate::from_weekday_of_month_opt(year, 3, Weekday::Sun, 2),
+        NaiveDate::from_weekday_of_month_opt(year, 11, Weekday::Sun, 1),
+    ) else {
+        return false;
+    };
+    let (Some(start), Some(end)) = (start.and_hms_opt(8, 0, 0), end.and_hms_opt(7, 0, 0)) else {
+        return false;
+    };
+    let t = utc.naive_utc();
+    start <= t && t < end
+}
+
+/// The Chicago wall-clock time for a UTC instant: CDT (UTC-5) in summer,
+/// CST (UTC-6) otherwise.
+pub fn central_time(utc: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDateTime {
+    let offset = if us_central_dst(utc) { 5 } else { 6 };
+    utc.naive_utc() - chrono::Duration::hours(offset)
+}
+
+/// Mon–Fri, 08:00 ≤ t < 17:00 Chicago time.
+pub fn in_work_hours(utc: chrono::DateTime<chrono::Utc>) -> bool {
+    use chrono::{Datelike, Timelike, Weekday};
+    let local = central_time(utc);
+    let weekday = !matches!(local.weekday(), Weekday::Sat | Weekday::Sun);
+    weekday && (WORK_START_HOUR..WORK_END_HOUR).contains(&local.hour())
+}
+
+/// Should an off-call machine acknowledge this alert now? `Err` says why not.
+///
+/// Off call the acknowledge is **delayed and limited**, never immediate:
+/// [`OFF_CALL_ACK_DELAY_SECS`] after the remediation starts, the alert is
+/// re-read and acknowledged only if nobody has — the on-call engineer gets
+/// the first minute — and only inside work hours, when someone is at a desk
+/// to see what an acknowledged page is doing. Outside them the page is left
+/// to ring for whoever holds the pager.
+pub fn off_call_ack_due(
+    now: chrono::DateTime<chrono::Utc>,
+    alert: &Alert,
+) -> std::result::Result<(), String> {
+    if alert_is_closed(&alert.status) {
+        return Err("it has closed".to_string());
+    }
+    if alert.acknowledged {
+        return Err("it is already acknowledged".to_string());
+    }
+    if !in_work_hours(now) {
+        return Err(format!(
+            "outside work hours (it is {} Central; Mon–Fri {WORK_START_HOUR}:00–{WORK_END_HOUR}:00)",
+            central_time(now).format("%a %H:%M")
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1474,6 +1695,10 @@ mod tests {
         assert_eq!(find_instance_id("é-0abc1234"), None);
     }
 
+    /// Both required containers running, as `compose ps` NDJSON.
+    const BOTH_UP: &str = "{\"Name\":\"cassandra-reaper\",\"State\":\"running\"}\n\
+                           {\"Name\":\"cassandra\",\"State\":\"running\"}";
+
     fn run_output(ps: &str) -> String {
         format!(
             "{RE_BEGIN}\n__RE_WD_STOPPED__\n__RE_DOWN_OK__\n__RE_UP_OK__\n\
@@ -1483,30 +1708,31 @@ mod tests {
 
     #[test]
     fn every_service_running_is_a_success() {
-        let ps = r#"{"Name":"reaper-api","State":"running"}
-{"Name":"reaper-worker","State":"running"}"#;
+        let ps = r#"{"Name":"cassandra-reaper","State":"running"}
+{"Name":"cassandra","State":"running"}"#;
         assert_eq!(parse_verdict(&run_output(ps)), Verdict::Success);
     }
 
     #[test]
     fn a_json_array_from_compose_is_accepted_too() {
         // Older compose emits one array; newer emits NDJSON. Both are real.
-        let ps = r#"[{"Name":"reaper-api","State":"running"}]"#;
+        let ps = r#"[{"Name":"cassandra-reaper","State":"running"},{"Name":"cassandra","State":"running"}]"#;
         assert_eq!(parse_verdict(&run_output(ps)), Verdict::Success);
     }
 
     #[test]
     fn an_up_status_string_counts_as_running() {
-        let ps = r#"{"Name":"reaper-api","State":"exited","Status":"Up 3 seconds"}"#;
+        let ps = r#"{"Name":"cassandra-reaper","State":"exited","Status":"Up 3 seconds"}
+{"Name":"cassandra","State":"running"}"#;
         assert_eq!(parse_verdict(&run_output(ps)), Verdict::Success);
     }
 
     #[test]
     fn one_service_not_running_is_a_failure_naming_it() {
-        let ps = r#"{"Name":"reaper-api","State":"running"}
-{"Name":"reaper-worker","State":"exited"}"#;
+        let ps = r#"{"Name":"cassandra-reaper","State":"running"}
+{"Name":"cassandra","State":"exited"}"#;
         match parse_verdict(&run_output(ps)) {
-            Verdict::Failed(why) => assert!(why.contains("reaper-worker"), "got {why}"),
+            Verdict::Failed(why) => assert!(why.contains("cassandra"), "got {why}"),
             other => panic!("expected Failed, got {other:?}"),
         }
     }
@@ -1556,7 +1782,7 @@ mod tests {
         let out = format!(
             "{RE_BEGIN}\n__RE_WD_STOPPED__\n__RE_DOWN_OK__\n__RE_UP_FAIL__\n\
              {RE_PS_BEGIN}\n{}\n{RE_PS_END}\n{RE_END}\n",
-            r#"{"Name":"reaper-api","State":"running"}"#
+            BOTH_UP
         );
         assert_eq!(parse_verdict(&out), Verdict::Success);
     }
@@ -1567,7 +1793,7 @@ mod tests {
         let out = format!(
             "{RE_BEGIN}\n__RE_WD_FAIL__\n__RE_DOWN_OK__\n__RE_UP_OK__\n\
              {RE_PS_BEGIN}\n{}\n{RE_PS_END}\n{RE_END}\n",
-            r#"{"Name":"reaper-api","State":"running"}"#
+            BOTH_UP
         );
         assert_eq!(parse_verdict(&out), Verdict::Success);
     }
@@ -1955,6 +2181,9 @@ mod tests {
     /// The read-only half of the fix, run by Test Alert Match.
     const REAPER_PROBE_SH: &str = include_str!("../assets/scripts/reaper_probe.sh");
 
+    /// One check of the post-fix watch.
+    const REAPER_WATCH_SH: &str = include_str!("../assets/scripts/reaper_watch.sh");
+
     #[test]
     fn the_scripts_and_the_parser_name_one_reaper_directory() {
         // The stack lives at /opt/cassandra-reaper. It was /opt/reaper in
@@ -2142,8 +2371,8 @@ mod tests {
         let at = |secs| {
             let out = format!(
                 "{}{}",
-                ps_block(&[("reaper", "running")]),
-                uptime_block(&[("reaper", secs)]),
+                ps_block(&[("cassandra-reaper", "running"), ("cassandra", "running")]),
+                uptime_block(&[("cassandra-reaper", secs), ("cassandra", 118800)]),
             );
             stack_health(&out)
         };
@@ -2178,7 +2407,7 @@ mod tests {
         // Compose says everything is up but no uptimes came back: that is a
         // gap in the evidence, not a healthy box.
         assert!(matches!(
-            stack_health(&ps_block(&[("reaper", "running")])),
+            stack_health(&ps_block(&[("cassandra-reaper", "running"), ("cassandra", "running")])),
             StackHealth::Unknown(_)
         ));
     }
@@ -2299,7 +2528,7 @@ mod tests {
         // having run. This is the test that catches that rename.
         let out = format!(
             "{RE_BEGIN}\n{}__RE_WD_STOPPED__\n__RE_DOWN_OK__\n__RE_UP_OK__\n{}\
-             {RE_PS_BEGIN}\n{{\"Name\":\"reaper\",\"State\":\"running\"}}\n{RE_PS_END}\n{RE_END}\n",
+             {RE_PS_BEGIN}\n{BOTH_UP}\n{RE_PS_END}\n{RE_END}\n",
             snapshot_block("before-fix", "CONTAINER ID   IMAGE\nabc123   reaper:latest"),
             snapshot_block("after-fix", "CONTAINER ID   IMAGE\nabc123   reaper:latest"),
         );
@@ -2608,5 +2837,235 @@ mod tests {
             ssm_fallback_plan(&Ok(Some("g".to_string())), &Ok("shutting-down".to_string())),
             SsmFallback::Refuse(_)
         ));
+    }
+
+    // ---- the required containers, and the post-fix watch ----
+
+    /// The real healthy box: reaper and cassandra up, the init container
+    /// exited 0 — as `docker ps -a` showed it on 2026-09-29.
+    #[test]
+    fn the_exited_init_container_does_not_fail_a_healthy_box() {
+        let ps = r#"{"Name":"cassandra-reaper","State":"running"}
+{"Name":"cassandra-reaper-reaper_db_init-1","State":"exited"}
+{"Name":"cassandra","State":"running"}"#;
+        assert_eq!(parse_verdict(&run_output(ps)), Verdict::Success);
+        let out = format!(
+            "{}{}",
+            ps_block(&[
+                ("cassandra-reaper", "running"),
+                ("cassandra-reaper-reaper_db_init-1", "exited"),
+                ("cassandra", "running"),
+            ]),
+            uptime_block(&[("cassandra-reaper", 480), ("cassandra", 118800)]),
+        );
+        assert!(matches!(stack_health(&out), StackHealth::Steady(_)), "{:?}", stack_health(&out));
+    }
+
+    #[test]
+    fn a_required_container_compose_did_not_list_is_down() {
+        // Only the init container and reaper: cassandra is simply absent.
+        let ps = r#"{"Name":"cassandra-reaper","State":"running"}
+{"Name":"cassandra-reaper-reaper_db_init-1","State":"exited"}"#;
+        match parse_verdict(&run_output(ps)) {
+            Verdict::Failed(why) => assert!(why.contains("cassandra (not listed)"), "{why}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cassandra_is_never_satisfied_by_a_name_that_merely_contains_it() {
+        // `cassandra-reaper` and the init container both contain the word.
+        let ps = r#"{"Name":"cassandra-reaper","State":"running"}
+{"Name":"cassandra-reaper-reaper_db_init-1","State":"running"}"#;
+        assert!(matches!(parse_verdict(&run_output(ps)), Verdict::Failed(_)));
+    }
+
+    fn watch_out(lines: &[&str]) -> String {
+        lines.iter().map(|l| format!("{RE_WATCH} {l}\n")).collect()
+    }
+
+    const T0: &str = "2026-09-29T14:00:00.1Z";
+    const T1: &str = "2026-09-29T14:01:10.5Z";
+
+    #[test]
+    fn a_watch_check_reads_both_required_containers_in_list_order() {
+        let out = watch_out(&[
+            &format!("cassandra running {T0} 0"),
+            "cassandra-reaper-reaper_db_init-1 exited x 0",
+            &format!("cassandra-reaper running {T0} 2"),
+        ]);
+        let got = parse_watch(&out).expect("readable");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].name, "cassandra-reaper");
+        assert_eq!(got[0].restarts, 2);
+        assert_eq!(got[1].name, "cassandra");
+        assert_eq!(describe_watch(&got), "cassandra-reaper running (restarts 2), cassandra running");
+    }
+
+    #[test]
+    fn a_watch_check_missing_a_container_line_is_unreadable_not_up() {
+        let out = watch_out(&[&format!("cassandra-reaper running {T0} 0")]);
+        assert_eq!(parse_watch(&out), None);
+        assert_eq!(parse_watch(""), None);
+        assert_eq!(parse_watch("ssm noise"), None);
+    }
+
+    #[test]
+    fn a_missing_container_is_reported_as_missing_and_down() {
+        let out = watch_out(&[&format!("cassandra-reaper running {T0} 0"), "cassandra missing"]);
+        let now = parse_watch(&out).expect("readable");
+        let why = watch_check(None, &now).expect_err("down");
+        assert!(why.contains("cassandra is missing"), "{why}");
+    }
+
+    #[test]
+    fn both_running_and_unchanged_holds() {
+        let base = parse_watch(&watch_out(&[
+            &format!("cassandra-reaper running {T0} 0"),
+            &format!("cassandra running {T0} 0"),
+        ]))
+        .unwrap();
+        assert_eq!(watch_check(None, &base), Ok(()));
+        assert_eq!(watch_check(Some(&base), &base), Ok(()));
+    }
+
+    #[test]
+    fn a_restart_between_two_checks_counts_as_going_down() {
+        // Running at both checks — only the start time and the restart count
+        // say it died in between.
+        let base = parse_watch(&watch_out(&[
+            &format!("cassandra-reaper running {T0} 0"),
+            &format!("cassandra running {T0} 0"),
+        ]))
+        .unwrap();
+        let moved = parse_watch(&watch_out(&[
+            &format!("cassandra-reaper running {T1} 0"),
+            &format!("cassandra running {T0} 0"),
+        ]))
+        .unwrap();
+        let why = watch_check(Some(&base), &moved).expect_err("restarted");
+        assert!(why.contains("cassandra-reaper restarted"), "{why}");
+        let counted = parse_watch(&watch_out(&[
+            &format!("cassandra-reaper running {T0} 0"),
+            &format!("cassandra running {T0} 1"),
+        ]))
+        .unwrap();
+        let why = watch_check(Some(&base), &counted).expect_err("restarted");
+        assert!(why.contains("cassandra restarted"), "{why}");
+    }
+
+    #[test]
+    fn a_container_that_is_restarting_right_now_is_down() {
+        let now = parse_watch(&watch_out(&[
+            &format!("cassandra-reaper restarting {T0} 3"),
+            &format!("cassandra running {T0} 0"),
+        ]))
+        .unwrap();
+        assert!(watch_check(None, &now).is_err());
+    }
+
+    #[test]
+    fn the_watch_is_two_minutes_of_fifteen_second_checks() {
+        assert_eq!(WATCH_SECS, 120);
+        assert_eq!(WATCH_INTERVAL_SECS, 15);
+        assert_eq!(WATCH_SECS % WATCH_INTERVAL_SECS, 0);
+    }
+
+    #[test]
+    fn the_watch_script_changes_nothing_on_the_box() {
+        // Sent eight times per attempt against production; same contract,
+        // same scan as the probe.
+        let body: String = REAPER_WATCH_SH
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for verb in [
+            "compose down", "compose up", "compose restart", "compose stop",
+            "compose start", "docker rm", "docker kill", "docker stop",
+            "docker start", "docker restart", "systemctl",
+        ] {
+            assert!(!body.contains(verb), "the watch must not run {verb}");
+        }
+        for line in REAPER_WATCH_SH.lines() {
+            let l = line.trim();
+            if l.starts_with('#') {
+                continue;
+            }
+            let stripped = l.replace("2>&1", "").replace("2>/dev/null", "");
+            assert!(!stripped.contains('>'), "the watch must not redirect: {l}");
+        }
+        // The names come from the app, never a copy in the script.
+        for name in REQUIRED_CONTAINERS {
+            assert!(!body.contains(name), "the script must not hardcode {name}");
+        }
+        assert!(body.contains(RE_WATCH));
+    }
+
+    // ---- off-call acknowledge: work hours, Chicago time ----
+
+    fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn work_hours_edges_in_winter_cst() {
+        // 2026-01-14 is a Wednesday. CST = UTC-6, so 08:00 local = 14:00Z.
+        assert!(!in_work_hours(utc("2026-01-14T13:59:59Z")), "07:59:59");
+        assert!(in_work_hours(utc("2026-01-14T14:00:00Z")), "08:00");
+        assert!(in_work_hours(utc("2026-01-14T22:59:59Z")), "16:59:59");
+        assert!(!in_work_hours(utc("2026-01-14T23:00:00Z")), "17:00 is out");
+    }
+
+    #[test]
+    fn work_hours_edges_in_summer_cdt() {
+        // 2026-07-15 is a Wednesday. CDT = UTC-5, so 08:00 local = 13:00Z.
+        assert!(!in_work_hours(utc("2026-07-15T12:59:59Z")));
+        assert!(in_work_hours(utc("2026-07-15T13:00:00Z")));
+        assert!(in_work_hours(utc("2026-07-15T21:59:59Z")));
+        assert!(!in_work_hours(utc("2026-07-15T22:00:00Z")));
+    }
+
+    #[test]
+    fn weekends_are_never_work_hours() {
+        // Sat 2026-07-18 and Sun 2026-07-19, midday Chicago.
+        assert!(!in_work_hours(utc("2026-07-18T17:00:00Z")));
+        assert!(!in_work_hours(utc("2026-07-19T17:00:00Z")));
+        // Friday 16:30 CDT is in.
+        assert!(in_work_hours(utc("2026-07-17T21:30:00Z")));
+        // The day is judged locally, not in UTC: Sunday 23:30 CST is
+        // Monday 05:30Z, and it is still Sunday here.
+        assert!(!in_work_hours(utc("2026-01-19T05:30:00Z")));
+    }
+
+    #[test]
+    fn the_dst_switches_land_on_the_right_sundays() {
+        // 2026: second Sunday of March is the 8th; first Sunday of November
+        // is the 1st.
+        assert!(!us_central_dst(utc("2026-03-08T07:59:59Z")));
+        assert!(us_central_dst(utc("2026-03-08T08:00:00Z")));
+        assert!(us_central_dst(utc("2026-11-01T06:59:59Z")));
+        assert!(!us_central_dst(utc("2026-11-01T07:00:00Z")));
+        // The Monday after each switch, 08:00 local is in.
+        assert!(in_work_hours(utc("2026-03-09T13:00:00Z")), "CDT 08:00");
+        assert!(!in_work_hours(utc("2026-03-09T12:59:00Z")));
+        assert!(in_work_hours(utc("2026-11-02T14:00:00Z")), "CST 08:00");
+        assert!(!in_work_hours(utc("2026-11-02T13:59:00Z")));
+    }
+
+    #[test]
+    fn an_off_call_ack_needs_open_unacknowledged_and_work_hours() {
+        let open = Alert { status: "open".into(), acknowledged: false, ..Default::default() };
+        let wed_10am_cdt = utc("2026-07-15T15:00:00Z");
+        assert_eq!(off_call_ack_due(wed_10am_cdt, &open), Ok(()));
+
+        let acked = Alert { acknowledged: true, ..open.clone() };
+        assert!(off_call_ack_due(wed_10am_cdt, &acked).unwrap_err().contains("already acknowledged"));
+
+        let closed = Alert { status: "closed".into(), ..open.clone() };
+        assert!(off_call_ack_due(wed_10am_cdt, &closed).unwrap_err().contains("closed"));
+
+        let why = off_call_ack_due(utc("2026-07-18T15:00:00Z"), &open).unwrap_err();
+        assert!(why.contains("outside work hours") && why.contains("Sat 10:00"), "{why}");
     }
 }

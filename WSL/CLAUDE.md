@@ -62,7 +62,8 @@ baseline immediately before that work was 1522 tests / 24 warnings, on the
 same tree. (Before phase 1 of the resource browser this line had been stale
 for months, reading 356 tests / 21 warnings.)
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 1531 tests pass, 0 fail (924 lib + 3 CLI + 604 GUI)
+- `cargo test --features gui` — 1562 tests pass, 0 fail (939 lib + 3 CLI + 620 GUI),
+  remeasured 2026-09-29 after the stale-tunnel replacement
 - `cargo clippy --features gui` — no errors; 24 pre-existing style warnings.
   **That is a count of `^warning` lines, which is how the pre-branch baseline
   was measured and why the two are comparable — it is 22 distinct lints (6 lib
@@ -702,6 +703,88 @@ nothing tried in between.
   probe cannot read the box it reads the tag and state (both describes) and
   logs `a real run would fall back to the EC2 API — Restart`.
 
+#### Off call: acknowledge after a minute, in work hours
+
+Reaper used to acknowledge **only** on call. It now also acknowledges off
+call, on narrower terms, at the maintainer's request (2026-09-29). On call is
+unchanged: acknowledged at once, before the fix.
+
+- **Off call the acknowledge is never immediate.** `run_reaper_remediation`
+  calls `off_call_ack`, which is `spawn_off_call_ack`: the fix proceeds, and a
+  thread of its own waits `OFF_CALL_ACK_DELAY_SECS` (60), re-reads the alert
+  and acknowledges it only if `reaper::off_call_ack_due` agrees — **still
+  open, nobody has acknowledged it, and Mon–Fri 08:00 up to 17:00 Chicago
+  time**. The minute is the on-call engineer's to take it first; outside work
+  hours the page is left to ring for whoever holds the pager, which is the old
+  rule's reason and still holds there.
+- **Every outcome is one log line** — acknowledged, or not and why (closed,
+  already acknowledged, `outside work hours (it is Sat 10:00 Central…)`,
+  could not re-read). An alert left ringing says why.
+- **Duplicates get the same rule**, through the same function. A test pins
+  that the duplicate arm reaches `acknowledge_alert` once (on call) and
+  `spawn_off_call_ack` once (off call).
+- **A refused remediation schedules nothing** — Sim, no credentials, a blank
+  account. Those paths log "acknowledge withheld" and return before the ack
+  point, off call as on.
+- **Chicago time is hand-computed** (`us_central_dst`, `central_time`) rather
+  than a timezone crate: one zone, and the US rule since 2007 — second Sunday
+  of March 08:00 UTC to first Sunday of November 07:00 UTC. The day is judged
+  locally, so Sunday 23:30 CST (Monday 05:30Z) is still Sunday. A change to
+  the law means editing that function; the tests pin both 2026 switches.
+- **Reaper only.** Pingdom and unhealthy-host still do nothing at all off
+  call, and Test Alert Match still never acknowledges.
+- The off-call escalation tier is unchanged: still `RE-N`, one quiet message.
+
+#### A fix only counts if the stack stays up for two minutes
+
+`compose ps` reading "running" straight after `up -d` proves the containers
+*started*; a reaper that crashed a minute later was being reported as fixed.
+`run_fix_attempts` now follows every fix with a 2-minute watch and runs the
+fix at most twice:
+
+- attempt 1 comes up and stays up for the watch -> success, on to stage 2
+- attempt 1 does not come up, drops during the watch, or is never confirmed
+  -> `compose down` / `up -d` again, then another watch
+- attempt 2 fails any of those ways -> escalate at once (`RE-F`/`RE-N`),
+  no third fix and no stage-2 wait
+
+- **Healthy is `reaper::REQUIRED_CONTAINERS` — `cassandra-reaper` and
+  `cassandra`, by exact name — and nothing else.** A healthy box also has
+  `cassandra-reaper-reaper_db_init-1`, a one-shot init container that exits 0
+  by design; `parse_verdict` used to demand *every* compose service be
+  running, which would read that as a failed fix. `parse_verdict`,
+  `stack_health` (the Override pre-check and Test Alert Match) and the watch
+  all read the one list. Exact names matter: `cassandra` must never be
+  satisfied by `cassandra-reaper` or by the init container.
+- **The watch is nine checks, `+0s` to `+120s`, 15s apart**
+  (`WATCH_SECS`, `WATCH_INTERVAL_SECS`), each its own send-command running
+  `reaper_watch.sh` — it cannot live in `reaper_fix.sh`, which runs under the
+  90s send-command timeout.
+- **"Went down" includes a restart between two checks.** A container docker
+  restarted in the 15s gap is `running` at both, so each check reports the
+  start time and restart count (`docker inspect`), and `watch_check` compares
+  them with the first readable check. Status alone would miss exactly the
+  crash loop this exists to catch.
+- **An unreadable check is skipped, except the last.** The watch passes only
+  on a readable check at the 2-minute mark; a final unreadable one is
+  `Unconfirmed`, which is treated as not staying up.
+- **The script holds no copy of the names.** `reaper_watch_command`
+  prepends `RE_WATCH_NAMES` from `REQUIRED_CONTAINERS`, the way the snapshot
+  label is prepended; `the_watch_script_changes_nothing_on_the_box` also
+  asserts the script names neither container. It is read-only and scanned
+  like the probe — it runs up to eighteen times per remediation on production.
+- **Each check logs one line** (`watch 1 +45s: cassandra-reaper running,
+  cassandra running`); the `docker ps -a` it carries is logged only for the
+  check that found the stack down.
+- **`__RE_NODIR__` is not retried**, and **the SSM fallback is attempt 1's
+  only**: a first fix that cannot be sent cycles the box and goes to stage 2
+  (the watch rides on the SSM that just failed); a second that cannot be sent
+  escalates.
+- **The +1m/+5m snapshots start once, after the last attempt** — two sets
+  would interleave in the log with nothing saying which fix each belonged to.
+- `watch_reaper_stack` takes its check and its sleep as closures, so the
+  schedule is tested without SSM or two minutes of real time.
+
 #### The alert names a target group, not an instance
 
 `match_alert` required an `i-…` and returned `None` without a word when it
@@ -818,8 +901,9 @@ carries the escalation; every later alert for the same thing is
   meanings that must not share a branch: `AlreadyHandled` (this exact alert,
   already acted on and already acked — do nothing) and `Duplicate` (another
   report of a live incident — **acknowledge**, run nothing).
-- **Off call the acknowledge is still withheld.** Same rule as everywhere else
-  here: silencing a page nobody has taken is the one thing this must not do.
+- **Off call a duplicate gets the delayed, work-hours-only acknowledge** the
+  owning alert gets — see "Off call: acknowledge after a minute, in work
+  hours" below.
 - **`mark_duplicate` deliberately does not touch the incident.** It adds the
   alert to `handled` so it is never reconsidered, and leaves the owner and the
   timestamp alone. Refreshing them would let a steady trickle of duplicates
@@ -2288,6 +2372,39 @@ the tunnel dies.
   `TUNNEL_PROVEN_AFTER` with nothing bound now reads **"not connected —
   alive 2m but no ports bound"** in red, where it used to claim to be
   forwarding.
+- **A session alive with nothing bound is REPLACED, not only reported.**
+  Until 2026-09-29 the poll's alive branch warned once and `continue`d, so
+  the retry existed only for a process that *exited* — and a session that
+  hung without exiting sat there for as long as the app was open. Seen as
+  `alive 23h 57m but no ports bound` on two environments at once: the first
+  sessions dropped together with `Connection corrupted` when the day-old
+  token behind them expired, the poll restarted both inside the same 15s
+  window with that dead token, and the replacements hung. `fed up` could
+  not help — the credentials watcher never touches `port_tunnels`, and
+  `start_port_tunnel` leaves a running process with the same signature
+  alone. Only a manual Stop/Start got them back.
+  - **`tunnel::is_stale` is the rule, pure and tested**: unbound, past the
+    proof window, and older than `stale_wait(prior kills)`. `STALE_BASE_WAIT`
+    (60s) is above the 30s young-death window, so a stale kill can never
+    read as a verdict about the bastion.
+  - **The wait doubles per replacement, capped at `STALE_MAX_WAIT`
+    (15 min)**, and `tunnel_stale_kills` is cleared the moment a session
+    binds. A dead token therefore costs one `aws ssm start-session` per
+    quarter hour rather than one a minute, and the row comes back on its
+    own once the token is renewed — instead of "still retrying" meaning
+    "never".
+  - **`replace_stale_tunnel` files it as a drop** (`tunnel_failures`, the
+    `(dropped N×, last: …)` note), keeps the dead session's stderr, and
+    rotates the bastion through `note_tunnel_failover` like a young death:
+    the hang is usually the token, but the rotation keeps every bastion so
+    trying the other costs nothing. Dropping the `Tunnel` kills the child.
+  - `the_poll_replaces_a_stale_session_and_resets_the_count_once_bound`
+    scans the poll for all three halves — the verdict, the replacement, and
+    the reset — because restoring the old `continue` would look like a
+    tidy-up.
+  - **The `(dropped N×, last: …)` note has no Clear and outlives the
+    recovery on purpose.** It is session-lifetime history, not an error;
+    it is what says a tunnel dropped and was repaired inside one poll.
 - **Tunnels run `ssh -v`.** These processes are invisible and the session
   pane is their only account of themselves, so the handshake belongs in it:
   the failure above is diagnosed exactly by the `ssh -v` a user would run by

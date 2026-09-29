@@ -418,6 +418,7 @@ fn emit_obfuscated_assets() {
         ("reaper_fix.sh.obf", "assets/scripts/reaper_fix.sh"),
         ("reaper_docker_ps.sh.obf", "assets/scripts/reaper_docker_ps.sh"),
         ("reaper_probe.sh.obf", "assets/scripts/reaper_probe.sh"),
+        ("reaper_watch.sh.obf", "assets/scripts/reaper_watch.sh"),
     ];
 
     for (out_name, src) in assets {

@@ -4059,6 +4059,21 @@ mod gui {
                     spawn_reaper_snapshots(snap_iid, ctx.clone(), timeout, snap_tx)
                 },
                 |ctx| run_ssm_fallback(ctx, &iid, &tx),
+                |ctx, attempt| {
+                    watch_reaper_stack(
+                        &iid,
+                        attempt,
+                        &tx,
+                        |label| {
+                            exec_remote_command(&None, ctx, &iid, &reaper_watch_command(label), timeout)
+                        },
+                        std::thread::sleep,
+                    )
+                },
+                {
+                    let (auth, id, tx) = (auth.clone(), target.alert_id.clone(), tx.clone());
+                    move || spawn_off_call_ack(auth, id, tx)
+                },
             );
             if let Some(code) = outcome {
                 let _ = tx.send(outcome_event(code, &target));
@@ -9244,6 +9259,10 @@ mod gui {
         /// beside forwards that do not exist, and killing an unrelated ssh
         /// session does not reset it because it was never measuring that.
         tunnel_bound_at: HashMap<String, Instant>,
+        /// Sessions in a row replaced for never binding, per environment.
+        /// Paces the retry through `tunnel::stale_wait`; cleared the moment
+        /// a session binds.
+        tunnel_stale_kills: HashMap<String, u32>,
         /// Most recent stderr from each environment's session, kept after it
         /// dies so the output that explains a death is still readable.
         ///
@@ -10143,6 +10162,7 @@ mod gui {
                 tunnel_stderr: HashMap::new(),
                 tunnel_bound: HashMap::new(),
                 tunnel_bound_at: HashMap::new(),
+                tunnel_stale_kills: HashMap::new(),
                 tunnel_probes: HashMap::new(),
                 probe_tx,
                 probe_rx,
@@ -13050,6 +13070,76 @@ mod gui {
             }
         }
 
+        /// Replace a session that is alive but has bound nothing for longer
+        /// than its row's wait (`tunnel::stale_wait`).
+        ///
+        /// Recorded as a drop — the window says drops out loud, and a
+        /// session that never connected is one — and the bastion rotates as
+        /// it does for a young death: the hang is usually the token rather
+        /// than the box, but the rotation keeps every bastion, so trying the
+        /// other one costs nothing and covers the case where it is the box.
+        /// The stale count is what paces the next attempt; it is cleared
+        /// the moment a session binds. Dropping `dead` kills the child.
+        fn replace_stale_tunnel(
+            &mut self,
+            row: &PortForwardRow,
+            dead: ec2_manager::tunnel::Tunnel,
+            authed: bool,
+        ) {
+            self.tunnel_probes.remove(&row.key);
+            self.tunnel_bound.remove(&row.key);
+            self.tunnel_bound_at.remove(&row.key);
+            // Keep the final stderr: it is what explains the hang.
+            let final_stderr = dead.errors();
+            if !final_stderr.is_empty() {
+                self.tunnel_stderr.insert(row.key.clone(), final_stderr);
+            }
+            let why = format!(
+                "alive {} but bound nothing ({}); replaced",
+                format_uptime(dead.age()),
+                if authed {
+                    "authenticated, then stopped"
+                } else {
+                    "never finished authenticating"
+                }
+            );
+            let kills = self
+                .tunnel_stale_kills
+                .get(&row.key)
+                .copied()
+                .unwrap_or(0)
+                + 1;
+            self.tunnel_stale_kills.insert(row.key.clone(), kills);
+            let count = self
+                .tunnel_failures
+                .get(&row.key)
+                .map(|(_, n)| *n)
+                .unwrap_or(0)
+                + 1;
+            self.tunnel_failures
+                .insert(row.key.clone(), (why.clone(), count));
+            self.tunnel_errors.insert(row.key.clone(), why.clone());
+            self.note_tunnel_failover(row);
+            let next = if row.bastions.len() > 1 {
+                format!(
+                    ", trying {}",
+                    self.tunnel_attempt_order(row)
+                        .first()
+                        .cloned()
+                        .unwrap_or_default()
+                )
+            } else {
+                String::new()
+            };
+            self.log_warn(format!(
+                "tunnel {}: {why} — session on {} was stale (#{kills}); \
+                 restarting{next}, and the next one gets {} before it is judged",
+                row.label,
+                dead.bastion,
+                format_uptime(ec2_manager::tunnel::stale_wait(kills))
+            ));
+        }
+
         /// Start any enabled tunnel that is not running and now can be.
         ///
         /// This is what makes "authorize the account and the forwards come
@@ -13083,11 +13173,11 @@ mod gui {
                     // `ssh -v` announces each bind it makes, so a forward
                     // another process happens to hold cannot be mistaken for
                     // ours.
-                    let (bound, authed) = self
+                    let (bound, authed, age) = self
                         .port_tunnels
                         .get(&row.key)
-                        .map(|t| (t.bound_forwards() > 0, t.is_authenticated()))
-                        .unwrap_or((false, false));
+                        .map(|t| (t.bound_forwards() > 0, t.is_authenticated(), t.age()))
+                        .unwrap_or((false, false, Duration::ZERO));
                     let was = self.tunnel_bound.insert(row.key.clone(), bound);
                     if bound {
                         self.tunnel_bound_at
@@ -13110,11 +13200,32 @@ mod gui {
                         ));
                     }
                     if bound {
+                        // Working, so the retry pacing starts over.
+                        self.tunnel_stale_kills.remove(&row.key);
                         self.maybe_probe_tunnel(&row);
+                        continue;
                     }
-                    continue;
-                }
-                if let Some(dead) = self.port_tunnels.remove(&row.key) {
+                    // Alive and unbound. Under the proof window ssh has not
+                    // had time to connect; past it, the row's earned wait
+                    // decides. A session that hangs without exiting —
+                    // a token gone stale between one session dropping and
+                    // the next spawning — would otherwise sit here for as
+                    // long as the app is open, and did: 23h 57m.
+                    let kills = self
+                        .tunnel_stale_kills
+                        .get(&row.key)
+                        .copied()
+                        .unwrap_or(0);
+                    if age < TUNNEL_PROVEN_AFTER
+                        || !ec2_manager::tunnel::is_stale(age, bound, kills)
+                    {
+                        continue;
+                    }
+                    if let Some(dead) = self.port_tunnels.remove(&row.key) {
+                        self.replace_stale_tunnel(&row, dead, authed);
+                    }
+                    // Falls through to the restart below.
+                } else if let Some(dead) = self.port_tunnels.remove(&row.key) {
                     self.record_tunnel_death(&row, dead);
                 }
                 let before = self.tunnel_errors.get(&row.key).cloned();
@@ -39614,6 +39725,63 @@ mod gui {
         }
     }
 
+    /// The off-call acknowledge: wait [`reaper::OFF_CALL_ACK_DELAY_SECS`],
+    /// re-read the alert, and acknowledge it only if `off_call_ack_due`
+    /// agrees — still open, nobody has acknowledged it, and it is Mon–Fri
+    /// 08:00–17:00 Chicago time. Every outcome is one log line, so an alert
+    /// left ringing says why.
+    ///
+    /// Its own thread: the remediation it belongs to runs for minutes, and
+    /// the minute has to be measured from when the alert was seen, not from
+    /// when the fix finishes. Dropped rather than joined, like every other
+    /// worker here — closing the app within the minute simply means no
+    /// acknowledge, which is the safe direction.
+    fn spawn_off_call_ack(
+        auth: ec2_manager::alerts::AlertsAuth,
+        alert_id: String,
+        tx: Sender<ReaperEvent>,
+    ) {
+        use ec2_manager::{alerts, reaper};
+        let _ = tx.send(ReaperEvent::Note {
+            level: LogLevel::Info,
+            message: format!(
+                "reaper: off call — {alert_id} will be acknowledged in {}s if nobody has \
+                 and it is work hours",
+                reaper::OFF_CALL_ACK_DELAY_SECS
+            ),
+        });
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(reaper::OFF_CALL_ACK_DELAY_SECS));
+            let (level, message) = match alerts::fetch_alert(&auth, &alert_id) {
+                Err(e) => (
+                    LogLevel::Warn,
+                    format!("reaper: off call — not acknowledging {alert_id}: could not re-read it: {e}"),
+                ),
+                Ok(a) => match reaper::off_call_ack_due(chrono::Utc::now(), &a) {
+                    Err(why) => (
+                        LogLevel::Info,
+                        format!("reaper: off call — not acknowledging {alert_id}: {why}"),
+                    ),
+                    Ok(()) => match alerts::acknowledge_alert(&auth, &alert_id) {
+                        Ok(()) => (
+                            LogLevel::Info,
+                            format!(
+                                "reaper: off call — acknowledged {alert_id} (unacknowledged \
+                                 after {}s, work hours)",
+                                reaper::OFF_CALL_ACK_DELAY_SECS
+                            ),
+                        ),
+                        Err(e) => (
+                            LogLevel::Warn,
+                            format!("reaper: off call — could not acknowledge {alert_id}: {e}"),
+                        ),
+                    },
+                },
+            };
+            let _ = tx.send(ReaperEvent::Note { level, message });
+        });
+    }
+
     /// The failure tier a remediation earns purely from who holds the pager —
     /// shared by every place that has to report "something stopped this from
     /// completing" without yet having a verdict to weigh in.
@@ -39683,9 +39851,11 @@ mod gui {
         on_call: bool,
         on_closed: ClosedAlert,
         tx: &Sender<ReaperEvent>,
-        exec: impl FnOnce(&AwsContext, &str) -> std::result::Result<String, String>,
+        mut exec: impl FnMut(&AwsContext, &str) -> std::result::Result<String, String>,
         begin_follow_ups: impl FnOnce(&AwsContext),
         fallback: impl FnOnce(&AwsContext) -> std::result::Result<String, String>,
+        mut watch: impl FnMut(&AwsContext, u32) -> ec2_manager::reaper::WatchOutcome,
+        off_call_ack: impl FnOnce(),
     ) -> Option<ec2_manager::reaper::OutcomeCode> {
         let note = |level: LogLevel, message: String| {
             let _ = tx.send(ReaperEvent::Note { level, message });
@@ -39743,14 +39913,18 @@ mod gui {
             |cmd| exec(&ctx, cmd),
             move || begin_follow_ups(&ctx_for_follow_ups),
             || fallback(&ctx),
+            |attempt| watch(&ctx, attempt),
+            off_call_ack,
         )
     }
 
     /// Run the remediation and decide what it earned.
     ///
-    /// Order is load-bearing. The acknowledge happens before the fix and only
-    /// on call — acking off call would suppress the real on-call engineer's
-    /// escalation. The last look happens after the acknowledge and *before*
+    /// Order is load-bearing. On call the acknowledge happens before the fix.
+    /// Off call it is never immediate — acking at once would silence the page
+    /// before the real on-call engineer has seen it — so `off_call_ack` is
+    /// called instead, which schedules `spawn_off_call_ack`: re-read after a
+    /// minute, and acknowledge only if nobody has and it is work hours. The last look happens after the acknowledge and *before*
     /// the first mutating command: once `compose down` has run there is no
     /// standing down, because that would leave reaper stopped with its
     /// watchdog off.
@@ -39781,11 +39955,13 @@ mod gui {
         on_call: bool,
         on_closed: ClosedAlert,
         tx: &Sender<ReaperEvent>,
-        exec: impl FnOnce(&str) -> std::result::Result<String, String>,
+        exec: impl FnMut(&str) -> std::result::Result<String, String>,
         begin_follow_ups: impl FnOnce(),
         fallback: impl FnOnce() -> std::result::Result<String, String>,
+        watch: impl FnMut(u32) -> ec2_manager::reaper::WatchOutcome,
+        off_call_ack: impl FnOnce(),
     ) -> Option<ec2_manager::reaper::OutcomeCode> {
-        use ec2_manager::reaper::{self, Verdict};
+        use ec2_manager::reaper;
 
         let note = |level: LogLevel, message: String| {
             let _ = tx.send(ReaperEvent::Note { level, message });
@@ -39813,6 +39989,10 @@ mod gui {
                     format!("reaper: acknowledged alert {}", target.alert_id),
                 );
             }
+        } else {
+            // Scheduled, not done: runs on its own thread while the fix
+            // proceeds, and decides for itself a minute from now.
+            off_call_ack();
         }
 
         // Last look. A sixty-second self-close is real and observed on this
@@ -39849,77 +40029,13 @@ mod gui {
 
         // ---- committed from here: no standing down between `down` and
         // `up -d` would leave the stack down with its watchdog off. ----
-        // An SSM failure of any kind — never delivered, or never reported
-        // back — falls back to cycling the box from the EC2 API, which needs
-        // no agent. See `run_ssm_fallback` for what that means per box.
-        let mut fallback_failed = false;
-        let out = match exec(&reaper_fix_command()) {
-            Ok(o) => o,
-            Err(e) => {
-                note(
-                    LogLevel::Error,
-                    format!("reaper: send-command failed on {}: {e}", target.instance_id),
-                );
-                note(
-                    LogLevel::Warn,
-                    format!(
-                        "reaper: SSM could not run the fix on {} — falling back to the \
-                         EC2 API",
-                        target.instance_id
-                    ),
-                );
-                match fallback() {
-                    Ok(msg) => note(
-                        LogLevel::Warn,
-                        format!("reaper: fallback on {}: {msg}", target.instance_id),
-                    ),
-                    Err(why) => {
-                        fallback_failed = true;
-                        note(
-                            LogLevel::Error,
-                            format!("reaper: fallback on {} failed: {why}", target.instance_id),
-                        );
-                    }
-                }
-                String::new()
-            }
+        let Some(verdict) =
+            run_fix_attempts(target, tx, exec, begin_follow_ups, fallback, watch)
+        else {
+            // Nothing got the stack back and staying up: escalate now rather
+            // than spend the stage-2 window on an alert with no fix behind it.
+            return Some(reaper_failure_tier(on_call));
         };
-
-        // The transcript before the verdict, always: it carries the
-        // before-fix and after-fix `docker ps -a` listings, and it is what a
-        // human needs whichever way the verdict goes.
-        let _ = tx.send(ReaperEvent::Transcript {
-            instance: target.instance_id.clone(),
-            stage: "fix".to_string(),
-            output: out.clone(),
-        });
-
-        if reaper_follow_ups_due(&out) {
-            begin_follow_ups();
-        }
-
-        // Nothing got the box back: escalate now rather than spend the
-        // stage-2 window watching an alert that has no fix behind it.
-        if fallback_failed {
-            return Some(reaper_failure_tier(on_call));
-        }
-
-        let verdict = reaper::parse_verdict(&out);
-        note(
-            LogLevel::Info,
-            format!("reaper: {} verdict {verdict:?}", target.instance_id),
-        );
-
-        if let Verdict::Failed(ref why) = verdict {
-            // Don't spend the stage-2 window on a stack already known to be
-            // down. The follow-up snapshots are already running on their own
-            // thread and are unaffected by this return.
-            note(
-                LogLevel::Error,
-                format!("reaper: {} failed: {why}", target.instance_id),
-            );
-            return Some(reaper_failure_tier(on_call));
-        }
 
         // Stage 2: the symptom going away is the real test.
         let deadline = std::time::Instant::now() + cfg.stage2_window(on_call);
@@ -39947,6 +40063,249 @@ mod gui {
             ),
         );
         Some(reaper::decide_outcome(on_call, &verdict, closed))
+    }
+
+    /// How many times one remediation runs the fix before escalating.
+    const REAPER_FIX_ATTEMPTS: u32 = 2;
+
+    /// The fix, then a 2-minute watch that it stays up — twice at most.
+    ///
+    /// `compose ps` saying "running" straight after `up -d` proves the
+    /// containers started, not that they stay up; a reaper that crashes a
+    /// minute later was reported as fixed. So every fix is followed by
+    /// `watch`, and an attempt only counts when both required containers
+    /// stay up, unrestarted, for [`reaper::WATCH_SECS`].
+    ///
+    /// Attempt 1 not coming up, going down during its watch, or never being
+    /// confirmed runs the fix once more; attempt 2 doing any of those
+    /// escalates (`None`). `Some(verdict)` carries into stage 2.
+    ///
+    /// - **`__RE_NODIR__` is not retried.** Nothing was touched and a second
+    ///   run on the same box says the same thing.
+    /// - **The SSM fallback belongs to attempt 1 only.** If the first fix
+    ///   cannot be sent, the box is cycled from the EC2 API and the run goes
+    ///   straight to stage 2 — the watch rides on the same SSM that just
+    ///   failed. If the *second* fix cannot be sent, the run escalates.
+    /// - **The +1m/+5m snapshots start once, after the last attempt.** Two
+    ///   sets would interleave in the log with nothing saying which fix each
+    ///   belonged to.
+    fn run_fix_attempts(
+        target: &ec2_manager::reaper::Target,
+        tx: &Sender<ReaperEvent>,
+        mut exec: impl FnMut(&str) -> std::result::Result<String, String>,
+        begin_follow_ups: impl FnOnce(),
+        fallback: impl FnOnce() -> std::result::Result<String, String>,
+        mut watch: impl FnMut(u32) -> ec2_manager::reaper::WatchOutcome,
+    ) -> Option<ec2_manager::reaper::Verdict> {
+        use ec2_manager::reaper::{self, Verdict, WatchOutcome};
+
+        let id = &target.instance_id;
+        let note = |level: LogLevel, message: String| {
+            let _ = tx.send(ReaperEvent::Note { level, message });
+        };
+        let mut follow_ups = Some(begin_follow_ups);
+        let mut start_follow_ups = |out: &str| {
+            if reaper_follow_ups_due(out) {
+                if let Some(f) = follow_ups.take() {
+                    f();
+                }
+            }
+        };
+        let mut fallback = Some(fallback);
+
+        for attempt in 1..=REAPER_FIX_ATTEMPTS {
+            let last = attempt == REAPER_FIX_ATTEMPTS;
+            let stage = if attempt == 1 {
+                "fix".to_string()
+            } else {
+                format!("fix (attempt {attempt})")
+            };
+            if attempt > 1 {
+                note(
+                    LogLevel::Warn,
+                    format!("reaper: {id} running compose down / up -d again (attempt {attempt})"),
+                );
+            }
+            let out = match exec(&reaper_fix_command()) {
+                Ok(o) => o,
+                Err(e) => {
+                    note(
+                        LogLevel::Error,
+                        format!("reaper: send-command failed on {id} ({stage}): {e}"),
+                    );
+                    let _ = tx.send(ReaperEvent::Transcript {
+                        instance: id.clone(),
+                        stage: stage.clone(),
+                        output: String::new(),
+                    });
+                    // An SSM failure of any kind — never delivered, or never
+                    // reported back — falls back to cycling the box from the
+                    // EC2 API, which needs no agent. See `run_ssm_fallback`.
+                    let Some(fallback) = fallback.take().filter(|_| attempt == 1) else {
+                        start_follow_ups("");
+                        return None;
+                    };
+                    note(
+                        LogLevel::Warn,
+                        format!("reaper: SSM could not run the fix on {id} — falling back to the EC2 API"),
+                    );
+                    let cycled = fallback();
+                    start_follow_ups("");
+                    return match cycled {
+                        Ok(msg) => {
+                            note(LogLevel::Warn, format!("reaper: fallback on {id}: {msg}"));
+                            Some(Verdict::Indeterminate(
+                                "the fix never ran over SSM; the box was cycled from the EC2 API"
+                                    .to_string(),
+                            ))
+                        }
+                        Err(why) => {
+                            note(LogLevel::Error, format!("reaper: fallback on {id} failed: {why}"));
+                            None
+                        }
+                    };
+                }
+            };
+
+            // The transcript before the verdict, always: it carries the
+            // before-fix and after-fix `docker ps -a` listings, and it is
+            // what a human needs whichever way the verdict goes.
+            let _ = tx.send(ReaperEvent::Transcript {
+                instance: id.clone(),
+                stage: stage.clone(),
+                output: out.clone(),
+            });
+            let verdict = reaper::parse_verdict(&out);
+            note(LogLevel::Info, format!("reaper: {id} {stage} verdict {verdict:?}"));
+
+            if out.contains(reaper::RE_NODIR) {
+                note(LogLevel::Error, format!("reaper: {id} failed: {verdict:?}"));
+                return None;
+            }
+            if let Verdict::Failed(why) = &verdict {
+                note(LogLevel::Error, format!("reaper: {id} did not come up ({stage}): {why}"));
+                if last {
+                    start_follow_ups(&out);
+                    return None;
+                }
+                continue;
+            }
+
+            // `Success` or `Indeterminate`: the box itself decides.
+            note(
+                LogLevel::Info,
+                format!(
+                    "reaper: {id} watching for {}s that cassandra-reaper and cassandra stay up",
+                    reaper::WATCH_SECS
+                ),
+            );
+            match watch(attempt) {
+                WatchOutcome::Held => {
+                    note(
+                        LogLevel::Info,
+                        format!("reaper: {id} stayed up for {}s after the {stage}", reaper::WATCH_SECS),
+                    );
+                    start_follow_ups(&out);
+                    return Some(Verdict::Success);
+                }
+                WatchOutcome::Dropped(why) | WatchOutcome::Unconfirmed(why) => {
+                    note(LogLevel::Error, format!("reaper: {id} did not stay up after the {stage}: {why}"));
+                    if last {
+                        start_follow_ups(&out);
+                        return None;
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// One check of the watch, as a command. The container names and the
+    /// label are prepended as shell assignments — the same way
+    /// `reaper_snapshot_command` hands over its label — so the script holds
+    /// no copy of [`reaper::REQUIRED_CONTAINERS`]. Both are fixed strings
+    /// built here, never user text.
+    fn reaper_watch_command(label: &str) -> String {
+        let script = deobf_asset(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/reaper_watch.sh.obf"
+        )));
+        b64_script_command(&format!(
+            "RE_WATCH_NAMES='{}'\nRE_SNAP_LABEL='{label}'\n{script}",
+            ec2_manager::reaper::REQUIRED_CONTAINERS.join(" ")
+        ))
+    }
+
+    /// Watch the stack for [`reaper::WATCH_SECS`], one check every
+    /// [`reaper::WATCH_INTERVAL_SECS`] — nine checks, at +0s through +120s.
+    ///
+    /// The first readable check is the baseline; a later one whose start
+    /// time or restart count moved is a container that went down in
+    /// between. The first check that finds the stack down ends the watch
+    /// and logs that check's `docker ps -a`. A check that cannot be read is
+    /// logged and skipped — unless it is the last, since the watch only
+    /// passes on a readable check at the 2-minute mark.
+    ///
+    /// `check` runs one check and `sleep` waits, both injected so the whole
+    /// schedule is tested without SSM and without two minutes of real time.
+    fn watch_reaper_stack(
+        instance: &str,
+        attempt: u32,
+        tx: &Sender<ReaperEvent>,
+        mut check: impl FnMut(&str) -> std::result::Result<String, String>,
+        mut sleep: impl FnMut(Duration),
+    ) -> ec2_manager::reaper::WatchOutcome {
+        use ec2_manager::reaper::{self, WatchOutcome};
+
+        let note = |level: LogLevel, message: String| {
+            let _ = tx.send(ReaperEvent::Note { level, message });
+        };
+        let checks = reaper::WATCH_SECS / reaper::WATCH_INTERVAL_SECS;
+        let mut baseline: Option<Vec<reaper::ContainerState>> = None;
+        for k in 0..=checks {
+            if k > 0 {
+                sleep(Duration::from_secs(reaper::WATCH_INTERVAL_SECS));
+            }
+            let label = format!("watch {attempt} +{}s", k * reaper::WATCH_INTERVAL_SECS);
+            let read = check(&label).and_then(|out| match reaper::parse_watch(&out) {
+                Some(states) => Ok((states, out)),
+                None => Err("no state for both containers in the reply".to_string()),
+            });
+            let (states, out) = match read {
+                Ok(r) => r,
+                Err(why) => {
+                    note(LogLevel::Warn, format!("reaper: {instance} {label} could not be read: {why}"));
+                    if k == checks {
+                        return WatchOutcome::Unconfirmed(format!(
+                            "the check at +{}s could not be read: {why}",
+                            reaper::WATCH_SECS
+                        ));
+                    }
+                    continue;
+                }
+            };
+            match reaper::watch_check(baseline.as_deref(), &states) {
+                Ok(()) => {
+                    note(
+                        LogLevel::Info,
+                        format!("reaper: {instance} {label}: {}", reaper::describe_watch(&states)),
+                    );
+                    if baseline.is_none() {
+                        baseline = Some(states);
+                    }
+                }
+                Err(why) => {
+                    note(LogLevel::Error, format!("reaper: {instance} {label}: {why}"));
+                    let _ = tx.send(ReaperEvent::Transcript {
+                        instance: instance.to_string(),
+                        stage: label,
+                        output: out,
+                    });
+                    return WatchOutcome::Dropped(why);
+                }
+            }
+        }
+        WatchOutcome::Held
     }
 
     /// Poll the alert feed and decide what reaper remediation is due.
@@ -40201,21 +40560,27 @@ mod gui {
                                             }
                                         }
                                     } else {
-                                        // Off call the ack is withheld, as it
-                                        // is everywhere else here: silencing
-                                        // a page nobody has taken is the one
-                                        // thing this must not do.
+                                        // Off call: the same delayed,
+                                        // work-hours-only acknowledge the
+                                        // owning alert gets.
                                         let _ = tx.send(ReaperEvent::Note {
                                             level: LogLevel::Info,
                                             message: format!(
                                                 "reaper: {} is a duplicate of {owner} on \
-                                                 {} ({}s ago) — not re-running, and off \
-                                                 call so not acknowledging",
+                                                 {} ({}s ago) — not re-running; off call, \
+                                                 so it is acknowledged in {}s only if \
+                                                 nobody has and it is work hours",
                                                 target.alert_id,
                                                 target.instance_id,
                                                 since_ms / 1000,
+                                                reaper::OFF_CALL_ACK_DELAY_SECS,
                                             ),
                                         });
+                                        spawn_off_call_ack(
+                                            auth.clone(),
+                                            target.alert_id.clone(),
+                                            tx.clone(),
+                                        );
                                     }
                                     // Never reconsidered, and deliberately
                                     // does not touch the incident: the first
@@ -40309,6 +40674,31 @@ mod gui {
                                         )
                                     },
                                     |ctx| run_ssm_fallback(ctx, &iid, &tx_for_thread),
+                                    |ctx, attempt| {
+                                        watch_reaper_stack(
+                                            &iid,
+                                            attempt,
+                                            &tx_for_thread,
+                                            |label| {
+                                                exec_remote_command(
+                                                    &None,
+                                                    ctx,
+                                                    &iid,
+                                                    &reaper_watch_command(label),
+                                                    timeout,
+                                                )
+                                            },
+                                            std::thread::sleep,
+                                        )
+                                    },
+                                    {
+                                        let (auth, id, tx) = (
+                                            auth_for_thread.clone(),
+                                            target.alert_id.clone(),
+                                            tx_for_thread.clone(),
+                                        );
+                                        move || spawn_off_call_ack(auth, id, tx)
+                                    },
                                 );
                                 if let Some(code) = outcome {
                                     let _ = tx_for_thread.send(outcome_event(code, &target));
@@ -46408,6 +46798,13 @@ mod gui {
             panic!("the SSM fallback ran although the fix was delivered")
         }
 
+        /// The post-fix watch for a test that is not about it: every such
+        /// test's fix comes back `Failed` or `__RE_NODIR__`, neither of which
+        /// is watched, so being called at all is the bug.
+        fn no_watch(_attempt: u32) -> ec2_manager::reaper::WatchOutcome {
+            panic!("the watch ran although no fix came up")
+        }
+
         fn null_reaper_tx() -> Sender<ReaperEvent> {
             mpsc::channel().0
         }
@@ -46515,7 +46912,9 @@ mod gui {
             let _ = run_reaper_remediation(&ops, &cfg, &target, false, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 Ok(failing_transcript())
             }, || {},
-                no_fallback,);
+                no_fallback,
+                no_watch,
+                || {},);
             assert!(!ops.log.borrow().contains(&"ack"));
         }
 
@@ -46536,7 +46935,9 @@ mod gui {
             let _ = run_reaper_remediation(&ops, &cfg, &target, false, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 Ok(failing_transcript())
             }, || {},
-                no_fallback,);
+                no_fallback,
+                no_watch,
+                || {},);
             assert_eq!(ops.log.borrow().iter().filter(|c| **c == "ack").count(), 0);
         }
 
@@ -46552,7 +46953,9 @@ mod gui {
             let _ = run_reaper_remediation(&ops, &cfg, &target, true, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 Ok(failing_transcript())
             }, || {},
-                no_fallback,);
+                no_fallback,
+                no_watch,
+                || {},);
             let log = ops.log.borrow();
             assert_eq!(log.iter().filter(|c| **c == "ack").count(), 1);
             assert_eq!(log.first(), Some(&"ack"));
@@ -46573,7 +46976,9 @@ mod gui {
                 exec_calls.set(exec_calls.get() + 1);
                 Ok(failing_transcript())
             }, || {},
-                no_fallback,);
+                no_fallback,
+                no_watch,
+                || {},);
             assert_eq!(exec_calls.get(), 0);
             assert!(outcome.is_none());
         }
@@ -46590,7 +46995,9 @@ mod gui {
             let outcome = run_reaper_remediation(&ops, &cfg, &target, true, ClosedAlert::StandDown, &null_reaper_tx(), |_| {
                 Ok(failing_transcript())
             }, || {},
-                no_fallback,);
+                no_fallback,
+                no_watch,
+                || {},);
             // Exactly one fetch: the last look. A stage-2 poll would be a
             // second one, and `Verdict::Failed` must return before that
             // loop is ever entered.
@@ -46612,7 +47019,9 @@ mod gui {
                 exec_calls.set(exec_calls.get() + 1);
                 Ok(failing_transcript())
             }, || {},
-                no_fallback,);
+                no_fallback,
+                no_watch,
+                || {},);
             assert_eq!(exec_calls.get(), 1);
             assert!(outcome.is_some());
         }
@@ -46631,7 +47040,9 @@ mod gui {
                 exec_calls.set(exec_calls.get() + 1);
                 Ok(failing_transcript())
             }, || {},
-                no_fallback,);
+                no_fallback,
+                no_watch,
+                || {},);
             assert_eq!(exec_calls.get(), 1);
             assert!(outcome.is_some());
         }
@@ -46678,6 +47089,8 @@ mod gui {
                 |_| Ok(applied_transcript()),
                 || begun.set(begun.get() + 1),
                 no_fallback,
+                no_watch,
+                || {},
             );
             assert_eq!(begun.get(), 1);
         }
@@ -46704,9 +47117,11 @@ mod gui {
                 true,
                 ClosedAlert::StandDown,
                 &null_reaper_tx(),
-                |_| Ok(down),
+                |_| Ok(down.clone()),
                 || begun.set(begun.get() + 1),
                 no_fallback,
+                no_watch,
+                || {},
             );
             assert_eq!(outcome, Some(ec2_manager::reaper::OutcomeCode::Failure));
             assert_eq!(begun.get(), 1, "a failed fix is still worth watching settle");
@@ -46868,6 +47283,8 @@ mod gui {
                 },
                 || {},
                 no_fallback,
+                no_watch,
+                || {},
             );
             assert_eq!(exec_calls.get(), 0, "the poll must stand down");
             assert!(outcome.is_none());
@@ -46887,8 +47304,12 @@ mod gui {
                 },
                 || {},
                 no_fallback,
+                no_watch,
+                || {},
             );
-            assert_eq!(exec_calls.get(), 1, "an asked-for run proceeds");
+            // Two: the stack in `applied_transcript` never comes up, so the
+            // fix is run a second time before escalating.
+            assert_eq!(exec_calls.get(), 2, "an asked-for run proceeds");
             assert!(outcome.is_some());
         }
 
@@ -47139,6 +47560,8 @@ mod gui {
                 |_| Ok(failing_transcript()),
                 || begun.set(begun.get() + 1),
                 no_fallback,
+                no_watch,
+                || {},
             );
             assert_eq!(begun.get(), 0);
         }
@@ -47164,6 +47587,8 @@ mod gui {
                 |_| Ok(applied_transcript()),
                 || begun.set(begun.get() + 1),
                 no_fallback,
+                no_watch,
+                || {},
             );
             assert!(outcome.is_none());
             assert_eq!(begun.get(), 0);
@@ -47191,6 +47616,8 @@ mod gui {
                 |_| Ok(applied_transcript()),
                 || {},
                 no_fallback,
+                no_watch,
+                || {},
             );
             drop(tx);
             let events: Vec<ReaperEvent> = rx.into_iter().collect();
@@ -47213,8 +47640,10 @@ mod gui {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(transcripts.len(), 1);
+            // One per attempt: the stack never comes up, so there are two.
+            assert_eq!(transcripts.len(), 2);
             assert_eq!(transcripts[0].0, "fix");
+            assert_eq!(transcripts[1].0, "fix (attempt 2)");
             assert!(transcripts[0].1.contains("__RE_DOCKER_BEGIN__ before-fix"));
             assert!(transcripts[0].1.contains("__RE_DOCKER_BEGIN__ after-fix"));
         }
@@ -47242,6 +47671,8 @@ mod gui {
                 |_| Ok(applied_transcript()),
                 || {},
                 no_fallback,
+                no_watch,
+                || {},
             );
             drop(tx);
             let events: Vec<ReaperEvent> = rx.into_iter().collect();
@@ -47254,6 +47685,312 @@ mod gui {
                 .position(|e| matches!(e, ReaperEvent::Note { message, .. } if message.contains("verdict")))
                 .expect("the verdict is reported");
             assert!(transcript_at < verdict_at, "{events:#?}");
+        }
+
+        /// A fix that came up (both containers running), as `parse_verdict`
+        /// reads it: `Success`, so it goes on to the watch.
+        fn up_transcript() -> String {
+            use ec2_manager::reaper::{RE_BEGIN, RE_END, RE_PS_BEGIN, RE_PS_END};
+            format!(
+                "{RE_BEGIN}\n__RE_WD_STOPPED__\n__RE_DOWN_OK__\n__RE_UP_OK__\n{RE_PS_BEGIN}\n\
+                 {{\"Name\":\"cassandra-reaper\",\"State\":\"running\"}}\n\
+                 {{\"Name\":\"cassandra-reaper-reaper_db_init-1\",\"State\":\"exited\"}}\n\
+                 {{\"Name\":\"cassandra\",\"State\":\"running\"}}\n{RE_PS_END}\n{RE_END}\n"
+            )
+        }
+
+        /// Drive `run_fix_attempts` with a fix that returns `fixes[n]` on its
+        /// n-th run and a watch that returns `watches[n]` on its n-th run.
+        /// Returns the verdict, the fix count, the watch count and the
+        /// follow-up count.
+        fn drive_attempts(
+            fixes: Vec<String>,
+            watches: Vec<ec2_manager::reaper::WatchOutcome>,
+        ) -> (Option<ec2_manager::reaper::Verdict>, usize, usize, usize) {
+            let target = test_reaper_target();
+            let fix_n = std::cell::Cell::new(0usize);
+            let watch_n = std::cell::Cell::new(0usize);
+            let begun = std::cell::Cell::new(0usize);
+            let verdict = run_fix_attempts(
+                &target,
+                &null_reaper_tx(),
+                |_| {
+                    let n = fix_n.get();
+                    fix_n.set(n + 1);
+                    Ok(fixes[n].clone())
+                },
+                || begun.set(begun.get() + 1),
+                no_fallback,
+                |attempt| {
+                    let n = watch_n.get();
+                    // Told the attempt it is watching, which is the fix count.
+                    assert_eq!(attempt as usize, fix_n.get(), "watch is told which attempt");
+                    watch_n.set(n + 1);
+                    watches[n].clone()
+                },
+            );
+            (verdict, fix_n.get(), watch_n.get(), begun.get())
+        }
+
+        #[test]
+        fn a_fix_that_stays_up_for_the_watch_succeeds_first_time() {
+            use ec2_manager::reaper::{Verdict, WatchOutcome};
+            let got = drive_attempts(vec![up_transcript()], vec![WatchOutcome::Held]);
+            assert_eq!(got, (Some(Verdict::Success), 1, 1, 1));
+        }
+
+        #[test]
+        fn a_stack_that_drops_during_the_watch_is_fixed_again_and_can_then_pass() {
+            use ec2_manager::reaper::{Verdict, WatchOutcome};
+            let got = drive_attempts(
+                vec![up_transcript(), up_transcript()],
+                vec![
+                    WatchOutcome::Dropped("cassandra-reaper restarted during the watch".into()),
+                    WatchOutcome::Held,
+                ],
+            );
+            // Follow-ups once, after the last attempt — not once per attempt.
+            assert_eq!(got, (Some(Verdict::Success), 2, 2, 1));
+        }
+
+        #[test]
+        fn dropping_twice_escalates_and_there_is_no_third_fix() {
+            use ec2_manager::reaper::WatchOutcome;
+            let got = drive_attempts(
+                vec![up_transcript(), up_transcript()],
+                vec![
+                    WatchOutcome::Dropped("cassandra is exited".into()),
+                    WatchOutcome::Dropped("cassandra is exited".into()),
+                ],
+            );
+            assert_eq!(got, (None, 2, 2, 1));
+        }
+
+        #[test]
+        fn a_watch_that_was_never_confirmed_counts_as_not_staying_up() {
+            use ec2_manager::reaper::WatchOutcome;
+            let got = drive_attempts(
+                vec![up_transcript(), up_transcript()],
+                vec![
+                    WatchOutcome::Unconfirmed("unreadable".into()),
+                    WatchOutcome::Unconfirmed("unreadable".into()),
+                ],
+            );
+            assert_eq!(got, (None, 2, 2, 1));
+        }
+
+        #[test]
+        fn a_fix_that_never_comes_up_is_run_again_without_a_watch() {
+            use ec2_manager::reaper::{Verdict, WatchOutcome};
+            // Not up after attempt 1: nothing to watch, straight to attempt 2.
+            let got = drive_attempts(
+                vec![applied_transcript(), up_transcript()],
+                vec![WatchOutcome::Held],
+            );
+            assert_eq!(got, (Some(Verdict::Success), 2, 1, 1));
+            // Not up either time: escalate, never watched.
+            let got = drive_attempts(vec![applied_transcript(), applied_transcript()], vec![]);
+            assert_eq!(got, (None, 2, 0, 1));
+        }
+
+        #[test]
+        fn a_box_that_is_not_ours_is_not_fixed_twice() {
+            let got = drive_attempts(vec![failing_transcript(), failing_transcript()], vec![]);
+            assert_eq!(got, (None, 1, 0, 0));
+        }
+
+        #[test]
+        fn a_second_fix_that_cannot_be_sent_escalates_without_the_fallback() {
+            use ec2_manager::reaper::WatchOutcome;
+            let target = test_reaper_target();
+            let n = std::cell::Cell::new(0);
+            let verdict = run_fix_attempts(
+                &target,
+                &null_reaper_tx(),
+                |_| {
+                    n.set(n.get() + 1);
+                    if n.get() == 1 {
+                        Ok(up_transcript())
+                    } else {
+                        Err("ssm command timed out after 90s".to_string())
+                    }
+                },
+                || {},
+                // The fallback is attempt 1's alone.
+                no_fallback,
+                |_| WatchOutcome::Dropped("cassandra is exited".into()),
+            );
+            assert_eq!(verdict, None);
+            assert_eq!(n.get(), 2);
+        }
+
+        fn watch_reply(reaper: &str, cassandra: &str) -> String {
+            format!(
+                "__RE_WATCH__ cassandra-reaper {reaper}\n__RE_WATCH__ cassandra {cassandra}\n"
+            )
+        }
+
+        /// Run `watch_reaper_stack` over canned replies, one per check.
+        fn drive_watch(
+            replies: Vec<std::result::Result<String, String>>,
+        ) -> (ec2_manager::reaper::WatchOutcome, usize, Vec<Duration>) {
+            let n = std::cell::Cell::new(0usize);
+            let slept = std::cell::RefCell::new(Vec::new());
+            let got = watch_reaper_stack(
+                "i-0abc",
+                1,
+                &null_reaper_tx(),
+                |_| {
+                    let i = n.get();
+                    n.set(i + 1);
+                    replies[i].clone()
+                },
+                |d| slept.borrow_mut().push(d),
+            );
+            (got, n.get(), slept.into_inner())
+        }
+
+        const UP0: &str = "running 2026-09-29T14:00:00Z 0";
+
+        #[test]
+        fn the_watch_is_nine_checks_fifteen_seconds_apart() {
+            use ec2_manager::reaper::WatchOutcome;
+            let (got, checks, slept) =
+                drive_watch(vec![Ok(watch_reply(UP0, UP0)); 9]);
+            assert_eq!(got, WatchOutcome::Held);
+            assert_eq!(checks, 9, "+0s through +120s");
+            assert_eq!(slept, vec![Duration::from_secs(15); 8]);
+        }
+
+        #[test]
+        fn the_watch_stops_at_the_first_drop() {
+            use ec2_manager::reaper::WatchOutcome;
+            let mut replies = vec![Ok(watch_reply(UP0, UP0)); 3];
+            replies.push(Ok(watch_reply(UP0, "exited 2026-09-29T14:00:00Z 0")));
+            let (got, checks, _) = drive_watch(replies);
+            assert!(matches!(got, WatchOutcome::Dropped(ref why) if why.contains("cassandra is exited")), "{got:?}");
+            assert_eq!(checks, 4);
+        }
+
+        #[test]
+        fn a_restart_between_checks_ends_the_watch() {
+            use ec2_manager::reaper::WatchOutcome;
+            let mut replies = vec![Ok(watch_reply(UP0, UP0)); 2];
+            replies.push(Ok(watch_reply("running 2026-09-29T14:00:40Z 1", UP0)));
+            let (got, _, _) = drive_watch(replies);
+            assert!(matches!(got, WatchOutcome::Dropped(ref why) if why.contains("restarted")), "{got:?}");
+        }
+
+        #[test]
+        fn an_unreadable_check_is_skipped_but_the_last_one_must_read() {
+            use ec2_manager::reaper::WatchOutcome;
+            // A blip in the middle is survivable.
+            let mut replies = vec![Ok(watch_reply(UP0, UP0)); 9];
+            replies[4] = Err("ssm command timed out".to_string());
+            assert_eq!(drive_watch(replies).0, WatchOutcome::Held);
+            // The final check unreadable: staying up was never shown.
+            let mut replies = vec![Ok(watch_reply(UP0, UP0)); 9];
+            replies[8] = Ok("garbage".to_string());
+            assert!(matches!(drive_watch(replies).0, WatchOutcome::Unconfirmed(_)));
+        }
+
+        #[test]
+        fn the_watch_command_hands_the_script_the_required_names() {
+            use base64::Engine as _;
+            let cmd = reaper_watch_command("watch 1 +0s");
+            // The script travels base64'd; decode whichever token decodes.
+            let decoded: String = cmd
+                .split(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+                .filter_map(|tok| base64::engine::general_purpose::STANDARD.decode(tok).ok())
+                .filter_map(|b| String::from_utf8(b).ok())
+                .collect();
+            assert!(
+                decoded.contains("RE_WATCH_NAMES='cassandra-reaper cassandra'"),
+                "{decoded}"
+            );
+            assert!(decoded.contains("RE_SNAP_LABEL='watch 1 +0s'"), "{decoded}");
+        }
+
+        /// Off call nothing is acknowledged on the spot — the delayed,
+        /// work-hours-only acknowledge is scheduled instead, exactly once.
+        /// On call it is the reverse: acknowledged at once, nothing scheduled.
+        #[test]
+        fn off_call_schedules_the_delayed_ack_and_on_call_acks_at_once() {
+            for on_call in [false, true] {
+                let ops = FakeAlertOps {
+                    log: std::cell::RefCell::new(Vec::new()),
+                    ack_ok: true,
+                    fetch_result: Ok("open"),
+                };
+                let cfg = ec2_manager::features::ReaperFeature::default();
+                let target = test_reaper_target();
+                let scheduled = std::cell::Cell::new(0);
+                let _ = run_reaper_remediation(
+                    &ops,
+                    &cfg,
+                    &target,
+                    on_call,
+                    ClosedAlert::StandDown,
+                    &null_reaper_tx(),
+                    |_| Ok(failing_transcript()),
+                    || {},
+                    no_fallback,
+                    no_watch,
+                    || scheduled.set(scheduled.get() + 1),
+                );
+                let acked = ops.log.borrow().iter().filter(|c| **c == "ack").count();
+                if on_call {
+                    assert_eq!((acked, scheduled.get()), (1, 0), "on call");
+                } else {
+                    assert_eq!((acked, scheduled.get()), (0, 1), "off call");
+                }
+            }
+        }
+
+        /// A refused remediation (no credentials, Sim, blank account) says
+        /// "acknowledge withheld" — and that must stay true off call too: it
+        /// must not schedule the delayed one either.
+        #[test]
+        fn a_refused_remediation_schedules_no_off_call_ack() {
+            let ops = FakeAlertOps {
+                log: std::cell::RefCell::new(Vec::new()),
+                ack_ok: true,
+                fetch_result: Ok("open"),
+            };
+            let cfg = ec2_manager::features::ReaperFeature::default();
+            let target = test_reaper_target();
+            let scheduled = std::cell::Cell::new(0);
+            let _ = remediate_if_authorized(
+                Err(ec2_manager::error::AppError::NotFound("no profile".to_string())),
+                &target.account_id,
+                &ops,
+                &cfg,
+                &target,
+                false,
+                ClosedAlert::StandDown,
+                &null_reaper_tx(),
+                |_ctx, _cmd| Ok(failing_transcript()),
+                |_ctx| {},
+                |_ctx| no_fallback(),
+                |_ctx, n| no_watch(n),
+                || scheduled.set(scheduled.get() + 1),
+            );
+            assert_eq!(scheduled.get(), 0);
+        }
+
+        /// Both off-call paths — the owning alert and its duplicates — go
+        /// through `spawn_off_call_ack`, so neither can drift to an immediate
+        /// acknowledge.
+        #[test]
+        fn the_reaper_poll_acks_duplicates_off_call_through_the_delayed_path() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let start = src.find("fn start_reaper_poll(").expect("start_reaper_poll");
+            let dup = start + src[start..].find("ActDecision::Duplicate").expect("duplicate arm");
+            let arm_end = dup + src[dup..].find("state.mark_duplicate(").expect("arm end");
+            let arm = &src[dup..arm_end];
+            assert_eq!(arm.matches("spawn_off_call_ack(").count(), 1, "{arm}");
+            assert_eq!(arm.matches("acknowledge_alert(").count(), 1, "on call only: {arm}");
         }
 
         /// SSM could not run the fix: the EC2 fallback runs, once, and
@@ -47285,6 +48022,8 @@ mod gui {
                     order.borrow_mut().push("fallback");
                     Err("nothing done — could not read its state".to_string())
                 },
+                no_watch,
+                || {},
             );
             drop(tx);
             assert_eq!(*order.borrow(), vec!["fallback", "follow-ups"]);
@@ -47322,6 +48061,8 @@ mod gui {
                 |_| Err("ssm command timed out after 90s".to_string()),
                 || {},
                 || Err("stopped, but the start failed".to_string()),
+                no_watch,
+                || {},
             );
             assert_eq!(outcome, Some(ec2_manager::reaper::OutcomeCode::FailureQuiet));
         }
@@ -47362,6 +48103,8 @@ mod gui {
                     *seen.borrow_mut() = Some(ctx.profile.clone());
                     Err("refused".to_string())
                 },
+                |_ctx, _n| no_watch(_n),
+                || {},
             );
             assert_eq!(seen.borrow().as_deref(), Some("111111111111"));
         }
@@ -47424,6 +48167,8 @@ mod gui {
                 },
                 |_ctx| {},
                 |_ctx| no_fallback(),
+                |_ctx, _n| no_watch(_n),
+                || {},
             );
             assert_eq!(exec_calls.get(), 0);
             assert!(ops.log.borrow().is_empty());
@@ -47469,6 +48214,8 @@ mod gui {
                 },
                 |_ctx| {},
                 |_ctx| no_fallback(),
+                |_ctx, _n| no_watch(_n),
+                || {},
             );
             assert_eq!(exec_calls.get(), 0);
             assert!(ops.log.borrow().is_empty());
@@ -47502,6 +48249,8 @@ mod gui {
                 },
                 |_ctx| {},
                 |_ctx| no_fallback(),
+                |_ctx, _n| no_watch(_n),
+                || {},
             );
             assert_eq!(exec_calls.get(), 0);
             assert!(ops.log.borrow().is_empty());
@@ -47545,6 +48294,8 @@ mod gui {
                 },
                 |_ctx| {},
                 |_ctx| no_fallback(),
+                |_ctx, _n| no_watch(_n),
+                || {},
             );
             assert_eq!(exec_calls.get(), 1);
             assert_eq!(ops.log.borrow().iter().filter(|c| **c == "ack").count(), 1);
@@ -47595,6 +48346,8 @@ mod gui {
                 },
                 |_ctx| {},
                 |_ctx| no_fallback(),
+                |_ctx, _n| no_watch(_n),
+                || {},
             );
             assert_eq!(exec_calls.get(), 0);
             assert!(ops.log.borrow().is_empty());
@@ -47743,6 +48496,48 @@ mod gui {
         fn tunnel_proven_threshold_sits_between_ssh_startup_and_failover() {
             assert!(TUNNEL_PROVEN_AFTER >= Duration::from_secs(5));
             assert!(TUNNEL_PROVEN_AFTER < Duration::from_secs(30));
+        }
+
+        /// The poll used to warn about an alive session that had bound
+        /// nothing and then `continue` — so a session that hung without
+        /// exiting was never replaced, and a token that expired between one
+        /// session dropping and the next spawning cost a whole day (`alive
+        /// 23h 57m but no ports bound`). The alive branch must ask
+        /// `tunnel::is_stale` and replace the session through one method
+        /// that records it as a drop and rotates the bastion; and a session
+        /// that binds must reset the count pacing the retry, or one bad
+        /// morning would leave the row on the 15-minute wait for the rest
+        /// of the run.
+        #[test]
+        fn the_poll_replaces_a_stale_session_and_resets_the_count_once_bound() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let poll = method_body(src, "fn poll_port_tunnels(&mut self)");
+            assert!(
+                poll.contains("tunnel::is_stale("),
+                "the alive branch must ask whether the session is stale"
+            );
+            assert!(
+                poll.contains("self.replace_stale_tunnel("),
+                "a stale session is replaced, not only warned about"
+            );
+            assert!(
+                poll.contains("self.tunnel_stale_kills.remove(&row.key)"),
+                "a session that binds resets the stale-kill count"
+            );
+            let replace = method_body(src, "fn replace_stale_tunnel(");
+            assert!(
+                replace.contains("self.tunnel_failures"),
+                "a stale kill is a drop, and the window says drops out loud"
+            );
+            assert!(
+                replace.contains("self.note_tunnel_failover(row)"),
+                "a stale session rotates to the other bastion like a young death"
+            );
+            assert!(
+                replace.contains("self.log_warn("),
+                "each replacement is logged"
+            );
         }
 
         /// With no failover recorded the primary is tried first and the

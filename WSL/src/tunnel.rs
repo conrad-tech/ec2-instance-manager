@@ -35,6 +35,40 @@ use crate::forwards::ResolvedForward;
 /// it was there to explain.
 const MAX_STDERR_LINES: usize = 500;
 
+/// How long an alive session may sit with nothing bound before the poll
+/// replaces it.
+///
+/// A session behind the SSM `ProxyCommand` can hang without ever exiting —
+/// a token that expired between the old session dropping and the new one
+/// spawning, a plugin waiting on a prompt nobody can answer — and
+/// [`Tunnel::is_running`] reports that as healthy for as long as the app is
+/// open. Observed as `alive 23h 57m but no ports bound` on a site whose
+/// only retry was "restart it when it exits". Longer than the 30s failover
+/// window, so a stale kill is never mistaken for a session that died young.
+pub const STALE_BASE_WAIT: Duration = Duration::from_secs(60);
+
+/// The most the wait grows to. Each stale session replaced doubles the wait
+/// given to the next, so a dead token costs one `aws ssm start-session`
+/// every 15 minutes rather than one a minute, and still comes back on its
+/// own once `fed up` runs.
+pub const STALE_MAX_WAIT: Duration = Duration::from_secs(15 * 60);
+
+/// How long to give a session before calling it stale, given how many in a
+/// row have already been replaced for never binding.
+pub fn stale_wait(prior_stale_kills: u32) -> Duration {
+    let factor = 1u32.checked_shl(prior_stale_kills).unwrap_or(u32::MAX);
+    STALE_BASE_WAIT
+        .checked_mul(factor)
+        .unwrap_or(STALE_MAX_WAIT)
+        .min(STALE_MAX_WAIT)
+}
+
+/// Whether an alive session should be replaced: unbound, and older than the
+/// wait its row has earned. A bound session is working whatever its age.
+pub fn is_stale(age: Duration, bound: bool, prior_stale_kills: u32) -> bool {
+    !bound && age >= stale_wait(prior_stale_kills)
+}
+
 /// A running background tunnel.
 pub struct Tunnel {
     child: Child,
@@ -273,6 +307,50 @@ mod tests {
     /// A session that has only just been spawned reports a small age. The
     /// caller's failover decision hangs on this: a young corpse means the
     /// bastion never worked, an old one means a good tunnel dropped.
+    /// A session that has bound its forwards is working, and how long it
+    /// has been up says nothing against it — the first sessions on a real
+    /// site ran a full day before the token behind them expired.
+    #[test]
+    fn a_bound_session_is_never_stale() {
+        assert!(!is_stale(Duration::from_secs(24 * 3600), true, 0));
+        assert!(!is_stale(Duration::from_secs(24 * 3600), true, 5));
+    }
+
+    /// An unbound session gets the base wait before it is called stale, so
+    /// a slow SSM handshake is not killed while it is still connecting.
+    #[test]
+    fn an_unbound_session_is_given_the_base_wait_first() {
+        assert!(!is_stale(STALE_BASE_WAIT - Duration::from_secs(1), false, 0));
+        assert!(is_stale(STALE_BASE_WAIT, false, 0));
+    }
+
+    /// Each session replaced for never binding doubles the wait given to
+    /// the next one, up to a cap — so a site whose token is dead keeps
+    /// retrying without spending an `aws ssm start-session` every minute
+    /// for as long as the app is open. A large count must not overflow.
+    #[test]
+    fn each_stale_kill_doubles_the_wait_up_to_the_cap() {
+        assert_eq!(stale_wait(0), STALE_BASE_WAIT);
+        assert_eq!(stale_wait(1), STALE_BASE_WAIT * 2);
+        assert_eq!(stale_wait(2), STALE_BASE_WAIT * 4);
+        assert_eq!(stale_wait(4), STALE_MAX_WAIT);
+        assert_eq!(stale_wait(40), STALE_MAX_WAIT);
+        assert!(!is_stale(STALE_BASE_WAIT, false, 1));
+        assert!(is_stale(STALE_BASE_WAIT * 2, false, 1));
+    }
+
+    /// The base wait has to clear the failover window (30s) — a stale kill
+    /// must never read as a session that "died young", which is a verdict
+    /// about the bastion — and the cap must keep a dead token from being
+    /// retried less often than a person would notice.
+    #[test]
+    fn the_stale_waits_sit_between_the_failover_window_and_patience() {
+        assert!(STALE_BASE_WAIT > Duration::from_secs(30));
+        assert!(STALE_BASE_WAIT <= Duration::from_secs(120));
+        assert!(STALE_MAX_WAIT >= Duration::from_secs(5 * 60));
+        assert!(STALE_MAX_WAIT <= Duration::from_secs(30 * 60));
+    }
+
     #[test]
     fn age_starts_near_zero() {
         let child = Command::new("true")
