@@ -248,17 +248,23 @@ fn parse_pattern(raw: &str) -> Pattern {
     while i < token_chars.len() {
         let ch = token_chars[i];
 
-        let kind = if ch == '\\' {
+        let (kind, skip_quantifier) = if ch == '\\' {
             i += 1;
             let escaped = token_chars.get(i).copied().unwrap_or('\\');
-            AtomKind::Literal(escaped)
+            (AtomKind::Literal(escaped), false)
         } else if ch == '.' {
-            AtomKind::Any
+            (AtomKind::Any, false)
+        } else if ch == '*' {
+            // Standalone * is a wildcard: zero or more of any character
+            (AtomKind::Any, true)
         } else {
-            AtomKind::Literal(ch)
+            (AtomKind::Literal(ch), false)
         };
 
-        let quantifier = if let Some(next) = token_chars.get(i + 1) {
+        let quantifier = if skip_quantifier {
+            // * is already treated as Any + ZeroOrMore
+            Quantifier::ZeroOrMore
+        } else if let Some(next) = token_chars.get(i + 1) {
             match next {
                 '*' => {
                     i += 1;
@@ -671,5 +677,74 @@ mod tests {
         let includes = build_matchers(&["prod".to_string(), "web".to_string()]);
         assert!(text_matches("prod-web-01\n", &includes, &[]));
         assert!(!text_matches("prod-db-01\n", &includes, &[]));
+    }
+
+    #[test]
+    fn wildcard_search_matches_with_asterisk() {
+        let mut a = Instance::new("i-a".to_string(), "running".to_string());
+        a.name = Some("dev-cassandra-01".to_string());
+
+        let mut b = Instance::new("i-b".to_string(), "running".to_string());
+        b.name = Some("dev-cassandra-backup".to_string());
+
+        let mut c = Instance::new("i-c".to_string(), "running".to_string());
+        c.name = Some("prod-cassandra-01".to_string());
+
+        let all = vec![a, b, c];
+
+        // Test: dev-*-cassandra should match both a and b but not c
+        let filtered = apply_filters(
+            &all,
+            &Filters {
+                includes: vec!["dev-*-cassandra".to_string()],
+                ..Filters::default()
+            },
+        );
+
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|i| i.instance_id == "i-a" || i.instance_id == "i-b"));
+    }
+
+    #[test]
+    fn wildcard_search_s3_bucket_pattern() {
+        // Simulate S3 bucket search with wildcard
+        let buckets = vec![
+            "dev-cassandra-01".to_string(),
+            "dev-cassandra-backup".to_string(),
+            "prod-cassandra-01".to_string(),
+            "dev-postgres-db".to_string(),
+        ];
+
+        let matcher = build_matcher("dev-*-cassandra");
+        let matches: Vec<_> = buckets
+            .iter()
+            .filter(|b| text_matches(b, &[matcher.clone()], &[]))
+            .collect();
+
+        assert_eq!(matches.len(), 2);
+        assert!(matches.contains(&&"dev-cassandra-01".to_string()));
+        assert!(matches.contains(&&"dev-cassandra-backup".to_string()));
+    }
+
+    #[test]
+    fn wildcard_pattern_at_start_or_end() {
+        let includes = build_matchers(&["*-cassandra".to_string()]);
+        assert!(text_matches("dev-cassandra", &includes, &[]));
+        assert!(text_matches("prod-cassandra", &includes, &[]));
+        assert!(!text_matches("dev-postgres", &includes, &[]));
+
+        let includes = build_matchers(&["dev-*".to_string()]);
+        assert!(text_matches("dev-cassandra", &includes, &[]));
+        assert!(text_matches("dev-postgres-01", &includes, &[]));
+        assert!(!text_matches("prod-cassandra", &includes, &[]));
+    }
+
+    #[test]
+    fn multiple_wildcards_in_pattern() {
+        let includes = build_matchers(&["*cassandra*".to_string()]);
+        assert!(text_matches("my-cassandra-db", &includes, &[]));
+        assert!(text_matches("cassandra-primary", &includes, &[]));
+        assert!(text_matches("cassandra", &includes, &[]));
+        assert!(!text_matches("postgres-db", &includes, &[]));
     }
 }
