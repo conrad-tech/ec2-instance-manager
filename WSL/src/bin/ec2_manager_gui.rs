@@ -8742,6 +8742,56 @@ mod gui {
         });
     }
 
+    /// Toggle line comments on selected lines or all non-empty lines in the editor.
+    /// Comments/uncomments based on the comment prefix (# for shell, // for code, etc.)
+    fn toggle_line_comments(content: &str, comment_prefix: &str) -> String {
+        let lines: Vec<&str> = content.lines().collect();
+        if lines.is_empty() {
+            return content.to_string();
+        }
+
+        // Determine if we should comment or uncomment by checking the first non-empty line
+        let should_comment = lines
+            .iter()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| !line.trim_start().starts_with(comment_prefix))
+            .unwrap_or(true);
+
+        let result = lines
+            .into_iter()
+            .map(|line| {
+                let trimmed = line.trim_start();
+                if trimmed.is_empty() {
+                    line.to_string()
+                } else if should_comment {
+                    // Add comment prefix with a space
+                    let indent_len = line.len() - trimmed.len();
+                    format!("{}{} {}", &line[..indent_len], comment_prefix, trimmed)
+                } else if trimmed.starts_with(comment_prefix) {
+                    // Remove comment prefix and its trailing space if present
+                    let indent_len = line.len() - trimmed.len();
+                    let rest = &trimmed[comment_prefix.len()..];
+                    let rest = if rest.starts_with(' ') {
+                        &rest[1..]
+                    } else {
+                        rest
+                    };
+                    format!("{}{}", &line[..indent_len], rest)
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // If the original content ended with a newline, preserve it
+        if content.ends_with('\n') && !result.ends_with('\n') {
+            format!("{}\n", result)
+        } else {
+            result
+        }
+    }
+
     pub fn run() {
         install_gui_panic_hook();
         if std::env::args().any(|a| a == "--help" || a == "-h") {
@@ -33804,12 +33854,13 @@ mod gui {
                 .unwrap_or((false, String::new(), 0, false));
 
             // Keyboard shortcuts: Ctrl+F toggles the find bar, Esc closes it,
-            // F3 / Shift+F3 cycle matches.
-            let (ctrl_f, esc_pressed, mut do_next, mut do_prev) = ui.input(|i| {
+            // F3 / Shift+F3 cycle matches, Ctrl+/ toggles line comments.
+            let (ctrl_f, esc_pressed, mut do_next, mut do_prev, mut toggle_comment) = ui.input(|i| {
                 let mut cf = false;
                 let mut esc = false;
                 let mut nx = false;
                 let mut pv = false;
+                let mut tc = false;
                 for e in &i.events {
                     if let egui::Event::Key {
                         key,
@@ -33828,11 +33879,12 @@ mod gui {
                                     nx = true;
                                 }
                             }
+                            egui::Key::Slash if modifiers.ctrl || modifiers.command => tc = true,
                             _ => {}
                         }
                     }
                 }
-                (cf, esc, nx, pv)
+                (cf, esc, nx, pv, tc)
             });
             if ctrl_f {
                 find_open = true;
@@ -34083,6 +34135,17 @@ mod gui {
                                 .code_editor()
                                 .layouter(&mut layouter),
                         );
+
+                        // Handle toggle comment (Ctrl+/)
+                        if toggle_comment {
+                            let comment_prefix = match ext.as_str() {
+                                "sh" | "bash" | "zsh" | "py" | "yaml" | "yml" | "json" => "#",
+                                "js" | "ts" | "tsx" | "jsx" | "java" | "cpp" | "c" | "cc" | "rs" | "go" => "//",
+                                _ => "#",
+                            };
+                            editor_content = toggle_line_comments(&editor_content, comment_prefix);
+                        }
+
                         if response.changed() {
                             if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
                                 if let Some(idx) = fb.active_editor {
