@@ -51,24 +51,29 @@ KEYSTORE_DIR=$(dirname "${KEYSTORE_PATH}")
 # "<not_after_epoch> <SERIAL>" of the first certificate in a keystore.
 cert_facts () {
   local out until_text serial epoch
-  out=$(keytool -list -v -keystore "$1" -storepass "${STORE_PASSWORD}" 2>/dev/null) || return 1
+  # LC_ALL=C: the label matching and date parsing must not depend on the node's locale.
+  out=$(LC_ALL=C keytool -list -v -keystore "$1" -storepass "${STORE_PASSWORD}" 2>/dev/null) || return 1
   until_text=$(printf '%s\n' "${out}" | awk -F'until: ' '/Valid from:/ { print $2; exit }')
   serial=$(printf '%s\n' "${out}" | awk -F': ' '/Serial number:/ { print toupper($2); exit }')
   [ -n "${until_text}" ] || return 1
-  epoch=$(date -u -d "${until_text}" +%s 2>/dev/null) || return 1
+  epoch=$(LC_ALL=C date -u -d "${until_text}" +%s 2>/dev/null) || return 1
   echo "${epoch} ${serial:--}"
 }
 
 echo "__CC_PF_BEGIN__"
 echo "__CC_PF_KEYSTORE__ ${KEYSTORE_PATH}"
 
+# Ownership only: the restore forces mode 600, so a backup's own mode is
+# irrelevant; what matters is that it is owned like the live keystore.
 LIVE_FACTS=""
-[ -f "${KEYSTORE_PATH}" ] && LIVE_FACTS=$(stat -c '%U:%G %a' "${KEYSTORE_PATH}" 2>/dev/null)
+[ -f "${KEYSTORE_PATH}" ] && LIVE_FACTS=$(stat -c '%U:%G' "${KEYSTORE_PATH}" 2>/dev/null)
 
 # Newest first: the suffix is YYYYmmddHHMMSS, so reverse lexical order is
 # reverse chronological order.
 for bak in $(ls -1 "${KEYSTORE_PATH}".bak.* 2>/dev/null | sort -r); do
   ts="${bak##*.bak.}"
+  # cassandra_rollback.sh only accepts a 14-digit timestamp; skip e.g. .bak.old
+  printf '%s' "${ts}" | grep -Eq '^[0-9]{14}$' || continue
   readable=0; opens=0; perms=0; epoch=0; serial="-"
   [ -r "${bak}" ] && readable=1
   if [ "${readable}" = 1 ]; then
@@ -77,7 +82,7 @@ for bak in $(ls -1 "${KEYSTORE_PATH}".bak.* 2>/dev/null | sort -r); do
       epoch="${facts%% *}"
       serial="${facts##* }"
     fi
-    [ "$(stat -c '%U:%G %a' "${bak}" 2>/dev/null)" = "${LIVE_FACTS}" ] && perms=1
+    [ "$(stat -c '%U:%G' "${bak}" 2>/dev/null)" = "${LIVE_FACTS}" ] && perms=1
   fi
   echo "__CC_PF_BACKUP__ ${ts} ${bak} ${epoch} ${serial} ${opens} ${readable} ${perms}"
 done

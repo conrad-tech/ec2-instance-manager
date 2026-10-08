@@ -110,4 +110,28 @@ mod script_tests {
     fn the_rollback_only_accepts_a_numeric_timestamp() {
         assert!(RB.contains("[0-9]{14}"), "the --restore argument must be validated");
     }
+
+    #[test]
+    fn the_preflight_compares_ownership_only_and_lists_only_real_backups() {
+        let lines = code(RB_CHECK);
+        for l in lines.iter().filter(|l| l.contains("stat -c '%U:%G")) {
+            assert!(!l.contains("%a"), "perms check must ignore mode: {l}");
+        }
+        assert!(
+            lines.iter().any(|l| l.contains("stat -c '%U:%G'")),
+            "ownership comparison missing"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("[0-9]{14}") && l.contains("continue")),
+            "non-timestamp .bak.* entries must be skipped"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("LC_ALL=C keytool")),
+            "keytool must run under LC_ALL=C"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("LC_ALL=C date -u")),
+            "date must run under LC_ALL=C"
+        );
+    }
 }
