@@ -580,10 +580,86 @@ impl StabilityWatch {
     }
 }
 
+use serde::{Deserialize, Serialize};
+
+/// What the dialog remembers about the last update or rollback of one
+/// environment, so reopening it later still shows "failed on ..." and has the
+/// pre-update cert to roll back to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastRun {
+    pub when: i64,
+    /// `"update"` or `"rollback"`.
+    pub kind: String,
+    pub nodes: Vec<String>,
+    pub failed: Vec<String>,
+    /// The cert the environment had before an update (what a rollback returns to).
+    pub old_not_after: Option<i64>,
+    pub old_serial: Option<String>,
+}
+
+impl LastRun {
+    /// Compact JSON on one line: `config.ini` is line-based.
+    pub fn to_line(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn from_line(line: &str) -> Option<LastRun> {
+        serde_json::from_str(line.trim()).ok()
+    }
+
+    pub fn summary(&self) -> String {
+        let n = self.nodes.len();
+        let plural = if n == 1 { "node" } else { "nodes" };
+        if self.failed.is_empty() {
+            format!("{}, {n} {plural}, no failures", self.kind)
+        } else {
+            format!("{}, {n} {plural}, failed on {}", self.kind, self.failed.join(", "))
+        }
+    }
+
+    pub fn old_cert(&self) -> Option<OldCert> {
+        self.old_not_after.map(|not_after| OldCert {
+            not_after,
+            serial: self.old_serial.clone(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::Instance;
+
+    #[test]
+    fn a_last_run_round_trips_through_one_line() {
+        let run = LastRun {
+            when: 1_790_000_000,
+            kind: "update".into(),
+            nodes: vec!["cassandra-001".into(), "cassandra-002".into()],
+            failed: vec!["cassandra-002".into()],
+            old_not_after: Some(1_780_000_000),
+            old_serial: Some("0AB1".into()),
+        };
+        let line = run.to_line();
+        assert!(!line.contains('\n'), "config.ini is line-based");
+        assert_eq!(LastRun::from_line(&line), Some(run));
+        assert!(LastRun::from_line("not json").is_none());
+    }
+
+    #[test]
+    fn the_summary_names_the_failures() {
+        let run = LastRun {
+            when: 0,
+            kind: "update".into(),
+            nodes: vec!["a".into(), "b".into(), "c".into()],
+            failed: vec!["b".into()],
+            old_not_after: None,
+            old_serial: None,
+        };
+        assert_eq!(run.summary(), "update, 3 nodes, failed on b");
+        let ok = LastRun { failed: vec![], ..run };
+        assert_eq!(ok.summary(), "update, 3 nodes, no failures");
+    }
 
     fn inst(id: &str, name: &str, env: &str, state: &str) -> Instance {
         let mut i = Instance::new(id.to_string(), state.to_string());

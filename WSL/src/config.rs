@@ -146,6 +146,8 @@ pub struct AppConfig {
     /// "primary_instance_id|secondary_instance_id" (either side may be
     /// empty). Used to pre-fill the dialog on the next run.
     pub bastion_selections: BTreeMap<String, String>,
+    /// Last Cassandra cert run per `<account>.<ENV>`, one JSON line each.
+    pub cassandra_runs: BTreeMap<String, String>,
     /// User-authored scripts shown under the built-in entries in the
     /// Scripts menu ("Add Script"). Order is the menu order.
     pub personal_scripts: Vec<PersonalScript>,
@@ -217,6 +219,7 @@ impl Default for AppConfig {
             tunnel_off: BTreeMap::new(),
             tunnel_dismissed: BTreeMap::new(),
             bastion_selections: BTreeMap::new(),
+            cassandra_runs: BTreeMap::new(),
             personal_scripts: Vec::new(),
             git_pat: None,
             file_browser_paths: BTreeMap::new(),
@@ -706,6 +709,21 @@ impl AppConfig {
         );
     }
 
+    fn cassandra_run_key(account_id: &str, env: &str) -> String {
+        format!("{}.{}", account_id.trim(), env.trim().to_ascii_uppercase())
+    }
+
+    pub fn cassandra_last_run(&self, account_id: &str, env: &str) -> Option<crate::cassandra_cert::LastRun> {
+        self.cassandra_runs
+            .get(&Self::cassandra_run_key(account_id, env))
+            .and_then(|l| crate::cassandra_cert::LastRun::from_line(l))
+    }
+
+    pub fn set_cassandra_last_run(&mut self, account_id: &str, env: &str, run: &crate::cassandra_cert::LastRun) {
+        self.cassandra_runs
+            .insert(Self::cassandra_run_key(account_id, env), run.to_line());
+    }
+
     /// The remembered file-browser path for an instance, if the user has
     /// navigated there before.
     pub fn file_browser_path(&self, instance_id: &str) -> Option<String> {
@@ -985,6 +1003,13 @@ impl AppConfig {
                 if !rest.is_empty() && !value.is_empty() {
                     cfg.bastion_selections
                         .insert(rest.to_string(), value.to_string());
+                }
+                continue;
+            }
+
+            if let Some(rest) = key.strip_prefix("cassandra_run.") {
+                if !rest.is_empty() && !value.is_empty() {
+                    cfg.cassandra_runs.insert(rest.to_string(), value.to_string());
                 }
                 continue;
             }
@@ -1306,6 +1331,9 @@ impl AppConfig {
         }
         for (env, pair) in &self.bastion_selections {
             lines.push(format!("bastion_pair.{env}={pair}"));
+        }
+        for (env, run) in &self.cassandra_runs {
+            lines.push(format!("cassandra_run.{env}={run}"));
         }
         if let Some(ref p) = self.forwards_hosts_file {
             lines.push(format!("forwards_hosts_file={p}"));
@@ -1644,6 +1672,25 @@ fn parse_port_forward_preset(raw: &str) -> Option<PortForwardPreset> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_last_cassandra_run_survives_a_save_and_load() {
+        let mut cfg = AppConfig::default();
+        let run = crate::cassandra_cert::LastRun {
+            when: 5,
+            kind: "rollback".into(),
+            nodes: vec!["cassandra-001".into()],
+            failed: vec![],
+            old_not_after: Some(10),
+            old_serial: None,
+        };
+        cfg.set_cassandra_last_run("123456789012", "dev1", &run);
+        let text = cfg.to_text();
+        assert!(text.contains("cassandra_run.123456789012.DEV1="), "{text}");
+        let back = AppConfig::parse(&text);
+        assert_eq!(back.cassandra_last_run("123456789012", "DEV1"), Some(run));
+        assert_eq!(back.cassandra_last_run("123456789012", "DEV2"), None);
+    }
     use super::*;
 
     /// The whole point of the strict accessors: an account hosting two
