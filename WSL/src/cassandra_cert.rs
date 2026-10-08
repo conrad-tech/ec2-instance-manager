@@ -133,6 +133,197 @@ pub fn assess_selection(all: &[Node], selected: &[String]) -> SelectionAssessmen
     out
 }
 
+use chrono::{DateTime, NaiveDateTime};
+
+/// What `openssl x509 -noout -subject -issuer -dates -serial` reports for the
+/// cert a node is serving. Dates are epoch seconds (UTC).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CertInfo {
+    pub subject: String,
+    pub issuer: String,
+    pub not_before: i64,
+    pub not_after: i64,
+    pub serial: Option<String>,
+}
+
+fn squash(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `Sep  3 07:01:23 2025 GMT` -> epoch seconds. openssl pads single-digit
+/// days with a space, so whitespace is collapsed first.
+fn parse_openssl_date(s: &str) -> Option<i64> {
+    let squashed = squash(s);
+    NaiveDateTime::parse_from_str(&squashed, "%b %d %H:%M:%S %Y GMT")
+        .ok()
+        .map(|d| d.and_utc().timestamp())
+}
+
+/// `None` unless the output carries a parseable `notAfter`: a guess about
+/// when a cert expires is worse than saying nothing was read.
+pub fn parse_openssl(out: &str) -> Option<CertInfo> {
+    let mut subject = String::new();
+    let mut issuer = String::new();
+    let mut not_before = None;
+    let mut not_after = None;
+    let mut serial = None;
+    for line in out.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("subject=") {
+            subject = squash(v);
+        } else if let Some(v) = line.strip_prefix("issuer=") {
+            issuer = squash(v);
+        } else if let Some(v) = line.strip_prefix("notBefore=") {
+            not_before = parse_openssl_date(v);
+        } else if let Some(v) = line.strip_prefix("notAfter=") {
+            not_after = parse_openssl_date(v);
+        } else if let Some(v) = line.strip_prefix("serial=") {
+            let v = v.trim().to_ascii_uppercase();
+            if !v.is_empty() {
+                serial = Some(v);
+            }
+        }
+    }
+    Some(CertInfo {
+        subject,
+        issuer,
+        not_before: not_before?,
+        not_after: not_after?,
+        serial,
+    })
+}
+
+pub fn is_expired(cert: &CertInfo, now: i64) -> bool {
+    cert.not_after <= now
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CertChange {
+    /// A later expiry, same subject and issuer.
+    Renewed,
+    /// The expiry did not move forward.
+    NotRenewed,
+    /// The expiry moved but the cert does not look like the one it replaced.
+    Flagged(Vec<String>),
+}
+
+pub fn compare_certs(before: &CertInfo, after: &CertInfo) -> CertChange {
+    if after.not_after <= before.not_after {
+        return CertChange::NotRenewed;
+    }
+    let mut diffs = Vec::new();
+    if squash(&before.subject) != squash(&after.subject) {
+        diffs.push(format!(
+            "subject changed: {} -> {}",
+            before.subject, after.subject
+        ));
+    }
+    if squash(&before.issuer) != squash(&after.issuer) {
+        diffs.push(format!(
+            "issuer changed: {} -> {}",
+            before.issuer, after.issuer
+        ));
+    }
+    if diffs.is_empty() {
+        CertChange::Renewed
+    } else {
+        CertChange::Flagged(diffs)
+    }
+}
+
+/// The cert a rollback is returning to, as far as it can be identified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OldCert {
+    pub not_after: i64,
+    pub serial: Option<String>,
+}
+
+impl From<&CertInfo> for OldCert {
+    fn from(c: &CertInfo) -> Self {
+        OldCert {
+            not_after: c.not_after,
+            serial: c.serial.clone(),
+        }
+    }
+}
+
+/// Whether what a node serves is `old`. The serial is compared only when both
+/// sides have one (a keystore backup read through keytool may not).
+pub fn served_matches(served: &CertInfo, old: &OldCert) -> bool {
+    served.not_after == old.not_after
+        && match (&served.serial, &old.serial) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+}
+
+/// The environment name as it appears in SSM paths: lowercased.
+pub fn env_domain(env_name: &str) -> String {
+    env_name.trim().to_ascii_lowercase()
+}
+
+/// A token safe to interpolate into a shell command and an SSM path.
+pub fn valid_domain_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+pub fn expand_parameter(template: &str, env_domain: &str) -> Result<String, String> {
+    if !template.contains("$env_domain") {
+        return Err(format!(
+            "parameter template '{template}' has no $env_domain; refusing to guess which parameter it means"
+        ));
+    }
+    if !valid_domain_token(env_domain) {
+        return Err(format!("'{env_domain}' is not a valid environment domain"));
+    }
+    Ok(template.replace("$env_domain", env_domain))
+}
+
+/// `-d` for `cassandra.sh`: `None` (autodetect) when no suffix is configured.
+pub fn domain_arg(env_domain: &str, suffix: &str) -> Result<Option<String>, String> {
+    if suffix.trim().is_empty() {
+        return Ok(None);
+    }
+    let full = format!("{env_domain}{}", suffix.trim());
+    if !valid_domain_token(&full) {
+        return Err(format!("'{full}' is not a valid cert domain"));
+    }
+    Ok(Some(full))
+}
+
+/// `ssm describe-parameters` prints `LastModifiedDate` as ISO-8601 on CLI v2
+/// and as epoch seconds (with a fraction) on v1.
+pub fn parse_param_date(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if let Ok(d) = DateTime::parse_from_rfc3339(s) {
+        return Some(d.timestamp());
+    }
+    s.parse::<f64>().ok().map(|f| f.floor() as i64)
+}
+
+/// A parameter last changed before the current cert was issued has not been
+/// renewed: running the update would reinstall the cert already there.
+pub fn parameter_is_stale(modified: i64, current: &CertInfo) -> bool {
+    modified <= current.not_before
+}
+
+/// Names of unselected nodes that do not serve `result`, `(unreadable)` for
+/// the ones that could not be read.
+pub fn stale_unselected(result: &CertInfo, others: &[(String, Option<CertInfo>)]) -> Vec<String> {
+    let want = OldCert::from(result);
+    others
+        .iter()
+        .filter_map(|(name, cert)| match cert {
+            None => Some(format!("{name} (unreadable)")),
+            Some(c) if !served_matches(c, &want) => Some(name.clone()),
+            Some(_) => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +473,144 @@ mod tests {
         let a = assess_selection(&all, &["i-101".into(), "i-201".into()]);
         assert_eq!(a.dominant_set, Some(1));
         assert_eq!(a.outside, ["i-201"]);
+    }
+
+    const SCREENSHOT: &str = "subject= /CN=*.dev1.example.net\n\
+        issuer= /C=US/O=Example/ST=X/CN=ca.example.net/L=Y\n\
+        notBefore=Sep  3 07:01:23 2025 GMT\n\
+        notAfter=Oct  3 08:01:22 2026 GMT\n\
+        serial=0AB1C2\n";
+
+    #[test]
+    fn the_screenshot_output_parses_including_padded_days() {
+        let c = parse_openssl(SCREENSHOT).expect("parses");
+        assert_eq!(c.subject, "/CN=*.dev1.example.net");
+        assert_eq!(c.serial.as_deref(), Some("0AB1C2"));
+        // `Sep  3 07:01:23 2025 GMT` has a space-padded day.
+        assert_eq!(c.not_before, 1_756_882_883);
+        // `Oct  3 08:01:22 2026 GMT`
+        assert_eq!(c.not_after, 1_791_014_482);
+    }
+
+    #[test]
+    fn unparseable_output_is_none_not_a_guess() {
+        assert!(parse_openssl("").is_none());
+        assert!(parse_openssl("unable to load certificate").is_none());
+        assert!(parse_openssl("notBefore=garbage\nnotAfter=garbage\n").is_none());
+        // No notAfter at all.
+        assert!(parse_openssl("subject= /CN=x\nissuer= /CN=y\n").is_none());
+    }
+
+    #[test]
+    fn expiry_is_judged_against_now() {
+        let c = parse_openssl(SCREENSHOT).unwrap();
+        assert!(is_expired(&c, c.not_after));
+        assert!(is_expired(&c, c.not_after + 1));
+        assert!(!is_expired(&c, c.not_after - 1));
+    }
+
+    fn cert(subject: &str, issuer: &str, after: i64, serial: &str) -> CertInfo {
+        CertInfo {
+            subject: subject.into(),
+            issuer: issuer.into(),
+            not_before: after - 1000,
+            not_after: after,
+            serial: Some(serial.into()),
+        }
+    }
+
+    #[test]
+    fn a_renewal_needs_a_later_expiry_and_the_same_shape() {
+        let before = cert("/CN=*.a", "/CN=ca", 1000, "01");
+        assert_eq!(compare_certs(&before, &cert("/CN=*.a", "/CN=ca", 2000, "02")), CertChange::Renewed);
+        assert_eq!(compare_certs(&before, &cert("/CN=*.a", "/CN=ca", 1000, "01")), CertChange::NotRenewed);
+        assert_eq!(compare_certs(&before, &cert("/CN=*.a", "/CN=ca", 500, "00")), CertChange::NotRenewed);
+    }
+
+    #[test]
+    fn a_new_date_with_a_different_subject_or_issuer_is_flagged() {
+        // The 2026-10 incident: the date moved but the output did not look the same.
+        let before = cert("/CN=*.a", "/CN=ca", 1000, "01");
+        match compare_certs(&before, &cert("/CN=*.b", "/CN=other", 2000, "02")) {
+            CertChange::Flagged(d) => {
+                assert_eq!(d.len(), 2);
+                assert!(d[0].contains("subject"));
+                assert!(d[1].contains("issuer"));
+            }
+            other => panic!("expected Flagged, got {other:?}"),
+        }
+        // Whitespace differences alone are not a change.
+        assert_eq!(
+            compare_certs(&before, &cert("/CN=*.a  ", " /CN=ca", 2000, "02")),
+            CertChange::Renewed
+        );
+    }
+
+    #[test]
+    fn a_served_cert_matches_the_old_one_by_date_and_serial() {
+        let served = cert("/CN=x", "/CN=y", 1000, "AB");
+        assert!(served_matches(&served, &OldCert { not_after: 1000, serial: Some("AB".into()) }));
+        assert!(served_matches(&served, &OldCert { not_after: 1000, serial: None }), "no serial to compare");
+        assert!(!served_matches(&served, &OldCert { not_after: 1000, serial: Some("CD".into()) }));
+        assert!(!served_matches(&served, &OldCert { not_after: 999, serial: None }));
+    }
+
+    #[test]
+    fn the_domain_is_the_lowercased_environment_name() {
+        assert_eq!(env_domain(" DEV1 "), "dev1");
+    }
+
+    #[test]
+    fn a_parameter_template_must_name_the_domain() {
+        assert_eq!(
+            expand_parameter("/certs/$env_domain/key", "dev1").unwrap(),
+            "/certs/dev1/key"
+        );
+        assert!(expand_parameter("/certs/static/key", "dev1").is_err(), "no $env_domain");
+        assert!(expand_parameter("/certs/$env_domain/key", "dev1; rm -rf /").is_err());
+        assert!(expand_parameter("/certs/$env_domain/key", "").is_err());
+    }
+
+    #[test]
+    fn the_cassandra_domain_flag_is_optional() {
+        assert_eq!(domain_arg("dev1", "").unwrap(), None);
+        assert_eq!(domain_arg("dev1", ".net").unwrap(), Some("dev1.net".to_string()));
+        assert!(domain_arg("dev1", "; x").is_err());
+    }
+
+    #[test]
+    fn parameter_dates_parse_from_either_cli_format() {
+        // CLI v2: ISO-8601, fractional seconds dropped.
+        assert_eq!(parse_param_date("2026-10-03T08:01:22.123000+00:00"), Some(1_791_014_482));
+        // A non-UTC offset is honoured.
+        assert_eq!(parse_param_date("2026-10-03T03:01:22-05:00"), Some(1_791_014_482));
+        // CLI v1: epoch seconds with a fraction.
+        assert_eq!(parse_param_date("1791014482.123"), Some(1_791_014_482));
+        assert_eq!(parse_param_date("not a date"), None);
+        assert_eq!(parse_param_date(""), None);
+    }
+
+    #[test]
+    fn a_parameter_older_than_the_current_cert_has_not_been_renewed() {
+        let current = cert("/CN=x", "/CN=y", 5000, "01"); // not_before = 4000
+        assert!(parameter_is_stale(3999, &current));
+        assert!(parameter_is_stale(4000, &current));
+        assert!(!parameter_is_stale(4001, &current));
+    }
+
+    #[test]
+    fn unselected_nodes_still_on_another_cert_are_listed() {
+        let result = cert("/CN=x", "/CN=y", 2000, "02");
+        let same = cert("/CN=x", "/CN=y", 2000, "02");
+        let old = cert("/CN=x", "/CN=y", 1000, "01");
+        let others = vec![
+            ("cassandra-101".to_string(), Some(old)),
+            ("cassandra-102".to_string(), Some(same)),
+            ("cassandra-103".to_string(), None),
+        ];
+        assert_eq!(
+            stale_unselected(&result, &others),
+            ["cassandra-101", "cassandra-103 (unreadable)"]
+        );
     }
 }
