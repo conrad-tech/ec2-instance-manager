@@ -349,11 +349,20 @@ pub struct PreflightRaw {
     pub space_ok: bool,
 }
 
-/// `None` unless both the BEGIN and END markers are present: a preflight cut
-/// short must never read as "no backups found".
+/// `None` unless both the BEGIN and END markers are present and every
+/// `__CC_PF_BACKUP__` line is well formed (7 fields, integer epoch, 0/1 flags):
+/// a preflight cut short or with a dropped backup line must never read as
+/// "no backups found" or let an older backup stand in for the newest.
 pub fn parse_preflight(out: &str) -> Option<PreflightRaw> {
     if !out.contains("__CC_PF_BEGIN__") || !out.contains("__CC_PF_END__") {
         return None;
+    }
+    fn flag(s: &str) -> Option<bool> {
+        match s {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        }
     }
     let mut backups = Vec::new();
     let mut space_ok = false;
@@ -362,16 +371,16 @@ pub fn parse_preflight(out: &str) -> Option<PreflightRaw> {
         if let Some(rest) = line.strip_prefix("__CC_PF_BACKUP__ ") {
             let f: Vec<&str> = rest.split_whitespace().collect();
             if f.len() != 7 {
-                continue;
+                return None;
             }
             backups.push(BackupFact {
                 ts: f[0].to_string(),
                 path: f[1].to_string(),
-                not_after: f[2].parse().unwrap_or(0),
+                not_after: f[2].parse().ok()?,
                 serial: (f[3] != "-").then(|| f[3].to_ascii_uppercase()),
-                opens: f[4] == "1",
-                readable: f[5] == "1",
-                perms_ok: f[6] == "1",
+                opens: flag(f[4])?,
+                readable: flag(f[5])?,
+                perms_ok: flag(f[6])?,
             });
         } else if let Some(rest) = line.strip_prefix("__CC_PF_SPACE__ ") {
             space_ok = rest.trim() == "1";
@@ -1058,5 +1067,49 @@ mod tests {
         assert_eq!(w.observe(0, false), WatchState::Pending);
         assert_eq!(w.observe(240, true), WatchState::Pending);
         assert_eq!(w.observe(300, true), WatchState::Stable);
+    }
+
+    #[test]
+    fn a_malformed_backup_line_fails_the_whole_preflight() {
+        let wrap = |l: &str| format!("__CC_PF_BEGIN__\n{l}\n__CC_PF_SPACE__ 1\n__CC_PF_END__\n");
+        let good = "__CC_PF_BACKUP__ 2 /k.bak.2 1790000000 0AB1 1 1 1";
+        assert!(parse_preflight(&wrap(good)).is_some());
+        assert!(parse_preflight(&wrap("__CC_PF_BACKUP__ 2 /a b/k.bak.2 1790000000 0AB1 1 1 1")).is_none(), "8 fields");
+        assert!(parse_preflight(&wrap("__CC_PF_BACKUP__ 2 /k.bak.2 abc 0AB1 1 1 1")).is_none(), "bad epoch");
+        assert!(parse_preflight(&wrap("__CC_PF_BACKUP__ 2 /k.bak.2 1790000000 0AB1 1 1 2")).is_none(), "bad flag");
+        let unopenable = parse_preflight(&wrap("__CC_PF_BACKUP__ 1 /k.bak.1 0 - 0 1 0")).expect("valid");
+        assert_eq!(unopenable.backups.len(), 1);
+        let mixed = format!(
+            "__CC_PF_BEGIN__\n{good}\n__CC_PF_BACKUP__ 1 /k.bak.1 xyz - 0 1 0\n__CC_PF_END__\n"
+        );
+        assert!(parse_preflight(&mixed).is_none(), "a bad older line still fails");
+    }
+
+    #[test]
+    fn infer_old_cert_tie_goes_to_the_later_expiry() {
+        let a = backup("2", 1000);
+        let b = backup("2", 2000);
+        assert_eq!(infer_old_cert(&[&a, &b]).expect("some").not_after, 2000);
+    }
+
+    #[test]
+    fn a_chosen_backup_that_does_not_exist_is_blocked_by_name() {
+        let raw = PreflightRaw { backups: vec![backup("20260903070123", 1000)], space_ok: true };
+        match classify_preflight(&raw, None, Some("19990101000000"), &OLD) {
+            Verdict::Blocked(why) => assert!(why[0].contains("19990101000000"), "{why:?}"),
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_last_return_code_marker_wins() {
+        assert_eq!(parse_rc("__CC_RC__1\nmore\n__CC_RC__0\n"), Some(0));
+    }
+
+    #[test]
+    fn no_free_space_does_not_block_when_nothing_would_be_written() {
+        let raw = PreflightRaw { backups: vec![], space_ok: false };
+        let served = cert("/CN=x", "/CN=y", 1000, "01");
+        assert_eq!(classify_preflight(&raw, Some(&served), None, &OLD), Verdict::NothingToRollBack);
     }
 }
