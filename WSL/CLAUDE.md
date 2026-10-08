@@ -4043,22 +4043,66 @@ rolling update would split the cluster for its whole duration.
 **Markers, because exit codes are discarded.** `exec_remote_command` drops the
 command's exit status, so every bundled script runs through `invocation`,
 which prints `__CC_RAN__` as the script's first statement and appends
-`__CC_RC__<rc>`. A missing marker (cut stdin, no base64, timeout) is a
+`__CC_RC__<rc>`. A missing marker (cut payload, no base64, timeout) is a
 **failure**, never success.
+
+**The payload: minified, byte-checked, one POSIX line.** `invocation` first
+runs the script through `minify_script` (drops comment-only and blank lines
+and trailing whitespace; heredoc bodies are copied verbatim; a `#` that is not
+a line's first non-blank character is never touched), prepends the
+`echo __CC_RAN__` line (`payload`), and base64-encodes it. The wrapper decodes
+into a `mktemp` file and runs `bash "$f" <shell_quote'd args>` only if the
+file's byte count equals the payload's; otherwise it prints `__CC_TRUNC__`
+with rc 97 (96 if `mktemp` failed), so a cut payload never runs, not even its
+sentinel. The temp file is removed on every path. Why minify: the renew
+send-command was 32,527 chars, over the 32,767-char Windows CreateProcess
+limit once the `aws ssm send-command` arguments are added; minified it is
+24,847. The 24,000-char budget test
+(`the_renew_invocation_fits_the_windows_command_line_budget`) is `#[ignore]`d
+pending a ruling: the minified script is still over it.
+
+**Post-restart verification waits for the port.** `systemctl is-active` says
+`active` as soon as the process is up, well before the native transport
+(9142) listens, so every node that reached Stable has its served cert read
+by `read_cert_retrying`: every 5s until it parses, `VERIFY_DEADLINE_SECS`
+(180) pass, or `exec` fails twice in a row. Apply and rollback both use it;
+the dry run and the unselected-node consistency read stay single reads.
 
 **Rollback preflight** (read-only) gives each node one of three results:
 Restorable (a backup that opens with keytool, is readable, has matching
-ownership, and there is room for the safety copy), Nothing to roll back (no
+ownership, holds the very cert being rolled back to (same expiry; serial
+compared when both are known), and there is room for the safety copy),
+Nothing to roll back (no
 backup, but it already serves the old cert; skipped, no restart), or Blocked
 (which disables Confirm rollback). The rollback first saves the node's current
 stores as `<keystore>.rollback.<TS>`, then restores, then the same
 simultaneous restart and watch. It restores files only and does **not**
 revert the SSM parameters.
 
+The cert rolled back to is the last update's pre-update capture (`LastRun`)
+when there is one; otherwise it is inferred (`infer_old_cert`) from the
+backups CHOSEN on the nodes (each node's newest unless picked otherwise),
+recomputed on every chooser change. A chosen backup holding any other cert
+(e.g. `.bak.T1` after two updates, when the old cert is in `.bak.T2`) or
+whose expiry keytool could not read is Blocked, so it cannot restart a node
+onto a cert that only shows as wrong after the outage. The preflight runs
+keytool with `-J-Duser.timezone=UTC` so `date -u -d` can parse its dates.
+
+**Truststore.** The app never passes `--with-truststore`, so app-driven runs
+leave no truststore backup and rollback's truststore branch applies only to
+backups made by hand. With internode encryption sharing the keystore, the
+untouched truststore must already trust the new chain; an issuer change
+shows as Flagged after the restart.
+
 **Parameters are read with `describe-parameters`, never `get-parameter`**:
 only `LastModifiedDate` is needed, and a value must never be fetched. `-d` is
 passed to `cassandra.sh` only when `domain_suffix` is set; otherwise the
-script autodetects the domain.
+script autodetects the domain. That autodetect only accepts domains ending in
+the script's hardcoded `DOMAIN_SUFFIX="dev1.net"`, so any environment whose
+nodes are not `*.dev1.net` needs `domain_suffix`. `$env_domain` is the
+lowercased environment NAME only, so a `parameters` template spells out the
+rest of the domain as the SSM path has it
+(`/cloudplatform/account/certificate/$env_domain.net/...`).
 
 **No automatic rollback, ever.** A failed or unverified node shows a Roll back
 shortcut that only starts the read-only preflight.
@@ -4094,8 +4138,10 @@ not run before the restart.
 
 Build status for this feature: the dialog panels (Task 10b, with its fix
 round) add 27 tests (11 lib + 16 GUI); `cargo test --features gui` measured
-2026-10-08 on `cassandra-cert-update` at 1074 lib + 3 CLI + 667 GUI, 0 failed,
-with no new build or clippy warnings.
+2026-10-08 on `cassandra-cert-update`, after the final-review fix wave, at
+1094 lib (1 ignored: the 24,000-char budget) + 3 CLI + 668 GUI, 0 failed,
+with no new build warnings. The real-shell wrapper tests run under `bash`
+and `sh` and skip with a printed reason when `bash` is missing.
 
 ### fed_auth: one inaccessible account used to stand the refresh down for good
 
