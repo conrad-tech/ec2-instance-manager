@@ -27076,6 +27076,14 @@ mod gui {
                 | CassandraJob::Preflight { account_id, .. }
                 | CassandraJob::Rollback { account_id, .. } => account_id.clone(),
             };
+            // Checked here first: the shared gate's own wording for a blank
+            // account is about an alert, which this is not.
+            if account_id.trim().is_empty() {
+                let _ = self.proc_tx.send(ProcEvent::Cassandra(CassandraEvent::Failed(
+                    "no account is selected for the Cassandra cert job".into(),
+                )));
+                return;
+            }
             let ctx = match reaper_account_context(&self.options.mode, &self.config, &account_id) {
                 Ok(c) => c,
                 Err(e) => {
@@ -43908,6 +43916,16 @@ mod gui {
             .map_err(|p| format!("{job} panicked: {}", panic_payload_to_string(&*p)))
     }
 
+    /// A panic during apply or rollback may have come after restarts went
+    /// out, so the user is told to look before trying again. Dry run and
+    /// preflight change nothing and keep the short text.
+    fn cassandra_restart_panic_text(panic: String) -> String {
+        format!(
+            "{panic}. Restarts may already have been issued on some nodes: \
+             check each node's service state before retrying."
+        )
+    }
+
     /// The body of `App::start_cassandra_job`'s thread. `ctx` has already
     /// passed the Live-mode and credentials gate. Every remote command goes
     /// through one-shot `send-command` (no control channel), and each job
@@ -43954,18 +43972,26 @@ mod gui {
         match job {
             CassandraJob::DryRun { env, targets, domain_arg, parameters, .. } => {
                 send(CassandraEvent::Log(format!("dry run on {} node(s)", targets.len())));
-                let domain = cassandra_cert::env_domain(&env);
-                let dates: Vec<(String, std::result::Result<i64, String>)> = parameters
-                    .iter()
-                    .map(|template| match cassandra_cert::expand_parameter(template, &domain) {
-                        Err(e) => (template.clone(), Err(e)),
-                        Ok(path) => {
-                            let r = fetch_parameter_modified(&ctx.profile, &ctx.region, &path);
-                            (path, r)
-                        }
-                    })
-                    .collect();
-                send(CassandraEvent::ParamDates(dates));
+                let dates = cassandra_guard("parameter dates", || {
+                    let domain = cassandra_cert::env_domain(&env);
+                    parameters
+                        .iter()
+                        .map(|template| match cassandra_cert::expand_parameter(template, &domain) {
+                            Err(e) => (template.clone(), Err(e)),
+                            Ok(path) => {
+                                let r = fetch_parameter_modified(&ctx.profile, &ctx.region, &path);
+                                (path, r)
+                            }
+                        })
+                        .collect::<Vec<(String, std::result::Result<i64, String>)>>()
+                });
+                match dates {
+                    Ok(dates) => send(CassandraEvent::ParamDates(dates)),
+                    Err(e) => {
+                        send(CassandraEvent::Failed(e));
+                        return;
+                    }
+                }
                 match cassandra_guard("dry run", || {
                     flow::dry_run(&exec, &targets, domain_arg.as_deref())
                 }) {
@@ -43988,7 +44014,7 @@ mod gui {
                         diagnose(flow::apply_failed_nodes(&rep));
                         send(CassandraEvent::Applied(rep));
                     }
-                    Err(e) => send(CassandraEvent::Failed(e)),
+                    Err(e) => send(CassandraEvent::Failed(cassandra_restart_panic_text(e))),
                 }
             }
             CassandraJob::Preflight { targets, .. } => {
@@ -44013,7 +44039,7 @@ mod gui {
                         diagnose(flow::rollback_failed_nodes(&rep));
                         send(CassandraEvent::RolledBack(rep));
                     }
-                    Err(e) => send(CassandraEvent::Failed(e)),
+                    Err(e) => send(CassandraEvent::Failed(cassandra_restart_panic_text(e))),
                 }
             }
         }
@@ -53827,6 +53853,76 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let gate = body.find("reaper_account_context").unwrap();
             let spawn = body.find("thread::spawn").expect("the worker thread");
             assert!(gate < spawn, "the gate must run before the spawn");
+            // A blank account gets the dialog's own words, not the shared
+            // helper's alert-shaped "carries no Account tag".
+            let blank = body
+                .find("no account is selected for the Cassandra cert job")
+                .expect("the blank-account refusal");
+            assert!(blank < gate, "the blank-account check must come before the shared gate");
+        }
+
+        #[test]
+        fn a_cassandra_guard_turns_a_panic_into_a_named_error() {
+            assert_eq!(cassandra_guard("dry run", || 7), Ok(7));
+            let err = cassandra_guard("dry run", || -> i32 { panic!("boom") }).unwrap_err();
+            assert_eq!(err, "dry run panicked: boom");
+        }
+
+        #[test]
+        fn a_panic_after_restarts_may_have_gone_out_says_so() {
+            let text = cassandra_restart_panic_text("apply panicked: boom".into());
+            assert!(text.starts_with("apply panicked: boom. "), "{text}");
+            assert!(text.contains("Restarts may already have been issued"), "{text}");
+            assert!(text.contains("check each node's service state before retrying"), "{text}");
+        }
+
+        /// Every call that could panic in the Cassandra worker sits inside a
+        /// `cassandra_guard(...)` call's parentheses, so every path ends in a
+        /// terminal event and the dialog is never left waiting.
+        #[test]
+        fn every_cassandra_worker_step_runs_under_the_guard() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let body = method_body(src, "fn run_cassandra_job(");
+            // Spans of every `cassandra_guard(` call, by paren depth.
+            let mut spans = Vec::new();
+            for (start, _) in body.match_indices("cassandra_guard(") {
+                let open = start + "cassandra_guard".len();
+                let mut depth = 0i32;
+                let mut end = body.len();
+                for (i, ch) in body[open..].char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = open + i;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                spans.push((start, end));
+            }
+            for needle in [
+                "flow::dry_run(",
+                "flow::apply(",
+                "flow::preflight(",
+                "flow::rollback(",
+                "flow::diagnostics(",
+                "expand_parameter(",
+                "fetch_parameter_modified(",
+            ] {
+                let hits: Vec<usize> = body.match_indices(needle).map(|(i, _)| i).collect();
+                assert!(!hits.is_empty(), "{needle} is not called at all");
+                for at in hits {
+                    assert!(
+                        spans.iter().any(|&(s, e)| s < at && at < e),
+                        "{needle} at byte {at} runs outside cassandra_guard"
+                    );
+                }
+            }
         }
 
         /// Restart is a stop and a start. `ec2 reboot-instances` keeps the
