@@ -4063,23 +4063,39 @@ script autodetects the domain.
 **No automatic rollback, ever.** A failed or unverified node shows a Roll back
 shortcut that only starts the read-only preflight.
 
-**One job at a time.** `cassandra_inflight` records the running job (account,
-environment, kind, start time); a second start is refused with a notice.
-Events are applied to the dialog only when it is on the job's own
-environment (`cassandra_event_applies`), so a result never lands on another
-environment's dialog; the `LastRun` is recorded for the job's environment
-either way. A job still running more than `restart_ceiling_secs` + 10 minutes
-offers "This job looks stuck - forget it", which clears the record (nodes may
-be mid-restart and must be checked by hand).
+**One job at a time, each with a generation id.** `cassandra_inflight`
+records the running job (generation id, account, environment, kind, start
+time); a second start is refused with a notice and takes no id. Ids come from
+`cassandra_next_job_id` (starting at 1, only growing), and every event the
+worker sends carries its job's id (`ProcEvent::Cassandra(id, event)`).
+`cassandra_settle` accepts an event only when its id is the in-flight job's;
+anything else is a **stale** event from a forgotten job and is logged under
+the Cassandra source as "late event from a forgotten job J<id>: ..." (a late
+`Applied` / `RolledBack` keeps its per-node lines) and changes nothing: not the
+in-flight record, not the pending run, not the dialog, and no `LastRun` is
+saved. Without the id, a forgotten job's late terminal event would end the
+next job's record and take its pending run, letting a second restart job
+overlap it on the same nodes. Accepted events are applied to the dialog only
+when it is on the job's own environment (`cassandra_event_applies`); the
+`LastRun` is recorded for the job's environment either way. A job still
+running more than `restart_ceiling_secs` + 10 minutes offers "This job looks
+stuck - forget it", which clears the record, the pending run and every dry run
+/ preflight result and approval in the dialog (nodes may be mid-restart and
+must be checked by hand).
+
+The restart gates are built in one place: `CassandraDialog::apply_gate` /
+`rollback_gate`, from the dialog's own fields, and both the button state and
+the click re-check go through `apply_armed` / `rollback_armed`. A start only
+replaces what the dialog shows once `start_cassandra_job` admitted it.
 
 **Open items.** `env_domain` is the lowercased `accounts.json` environment
 name, unconfirmed against every environment's SSM paths. `nodetool drain` is
 not run before the restart.
 
-Build status for this feature: the dialog panels (Task 10b) add 18 tests
-(10 lib + 8 GUI); `cargo test --features gui` measured 2026-10-08 on
-`cassandra-cert-update` at 1073 lib + 3 CLI + 659 GUI, 0 failed, with no new
-build or clippy warnings.
+Build status for this feature: the dialog panels (Task 10b, with its fix
+round) add 27 tests (11 lib + 16 GUI); `cargo test --features gui` measured
+2026-10-08 on `cassandra-cert-update` at 1074 lib + 3 CLI + 667 GUI, 0 failed,
+with no new build or clippy warnings.
 
 ### fed_auth: one inaccessible account used to stand the refresh down for good
 

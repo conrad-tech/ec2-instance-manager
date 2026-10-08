@@ -518,6 +518,23 @@ fn gate_blocker(gate: &Gate) -> Option<&'static str> {
     }
 }
 
+/// Why Update cert / Roll back (both read-only) cannot start, or `None`:
+/// the restart gate's own checks with no approval needed.
+pub fn start_blocker(
+    selected: &[String],
+    running: bool,
+    needs_confirmation: bool,
+    confirmed: bool,
+) -> Option<&'static str> {
+    gate_blocker(&Gate {
+        selected,
+        running,
+        needs_confirmation,
+        confirmed,
+        approved: true,
+    })
+}
+
 /// Whether a result was taken for exactly the current selection: the
 /// selection recorded when its job was started, the ids the result itself
 /// carries, and the current selection must all be the same set. A result
@@ -1438,5 +1455,16 @@ mod tests {
                 .expect("refused");
             assert!(why.is_ascii() && !why.is_empty());
         }
+    }
+
+    #[test]
+    fn a_read_only_start_uses_the_same_gate_without_the_approval() {
+        let x = ids(&["i-1"]);
+        let none: Vec<String> = Vec::new();
+        assert_eq!(start_blocker(&x, false, false, false), None);
+        assert_eq!(start_blocker(&x, false, true, true), None);
+        assert!(start_blocker(&none, false, false, false).is_some());
+        assert!(start_blocker(&x, true, false, false).is_some());
+        assert!(start_blocker(&x, false, true, false).is_some());
     }
 }
