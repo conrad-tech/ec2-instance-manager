@@ -260,6 +260,26 @@ pub fn served_matches(served: &CertInfo, old: &OldCert) -> bool {
         }
 }
 
+/// Whether a keystore backup holds `old`: the rule `served_matches` uses
+/// (expiry equal, serial compared only when both sides have one).
+pub fn backup_matches(b: &BackupFact, old: &OldCert) -> bool {
+    b.not_after == old.not_after
+        && match (&b.serial, &old.serial) {
+            (Some(a), Some(o)) => a == o,
+            _ => true,
+        }
+}
+
+/// Epoch seconds as local `YYYY-MM-DD HH:MM` (`@<epoch>` if out of range).
+/// ASCII only.
+pub fn local_time(epoch: i64) -> String {
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_opt(epoch, 0).single() {
+        Some(t) => t.format("%Y-%m-%d %H:%M").to_string(),
+        None => format!("@{epoch}"),
+    }
+}
+
 /// The environment name as it appears in SSM paths: lowercased.
 pub fn env_domain(env_name: &str) -> String {
     env_name.trim().to_ascii_lowercase()
@@ -447,6 +467,21 @@ pub fn classify_preflight(
             b.ts
         ));
     }
+    // Only a backup holding the cert being rolled back to may be restored:
+    // an older backup would bring back an even older cert, and that would
+    // only show as the wrong cert after the outage.
+    if b.opens {
+        if b.not_after <= 0 {
+            why.push(format!("cannot tell which cert backup {} holds", b.ts));
+        } else if !backup_matches(b, old) {
+            why.push(format!(
+                "backup {} holds a cert expiring {}, not the one this environment is rolling back to ({})",
+                b.ts,
+                local_time(b.not_after),
+                local_time(old.not_after)
+            ));
+        }
+    }
     if !raw.space_ok {
         why.push("not enough free space for the .rollback safety copy".into());
     }
@@ -608,8 +643,9 @@ pub fn rollback_confirm_enabled(
     rollback_confirm_blocker(gate, verdicts, started_for, result_ids).is_none()
 }
 
-/// The cert the environment is returning to, taken from what the nodes' newest
-/// backups say: the most common expiry, ties going to the later one.
+/// The cert the environment is returning to, taken from what the backups
+/// chosen on the nodes (each node's newest by default) say: the most common
+/// expiry, ties going to the later one.
 pub fn infer_old_cert(newest: &[&BackupFact]) -> Option<OldCert> {
     let mut counts: BTreeMap<i64, (usize, Option<String>)> = BTreeMap::new();
     for b in newest.iter().filter(|b| b.opens && b.not_after > 0) {
@@ -1320,6 +1356,65 @@ mod tests {
         let raw = PreflightRaw { backups: vec![backup("20260903070123", 1000)], space_ok: true };
         match classify_preflight(&raw, None, Some("19990101000000"), &OLD) {
             Verdict::Blocked(why) => assert!(why[0].contains("19990101000000"), "{why:?}"),
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    /// Updates A -> B -> C leave `.bak.T1` = A and `.bak.T2` = B, and the
+    /// last run's pre-update capture is B: only T2 holds the cert rolled back to.
+    fn two_updates() -> (PreflightRaw, OldCert) {
+        let mut t2 = backup("20260202000000", 2000);
+        t2.serial = Some("0B".into());
+        let mut t1 = backup("20260101000000", 1000);
+        t1.serial = Some("0A".into());
+        (
+            PreflightRaw { backups: vec![t2, t1], space_ok: true },
+            OldCert { not_after: 2000, serial: Some("0B".into()) },
+        )
+    }
+
+    #[test]
+    fn an_older_backup_that_is_not_the_old_cert_is_blocked() {
+        let (raw, old) = two_updates();
+        match classify_preflight(&raw, None, Some("20260101000000"), &old) {
+            Verdict::Blocked(why) => {
+                assert_eq!(why.len(), 1, "{why:?}");
+                assert!(why[0].contains("backup 20260101000000 holds a cert expiring"), "{why:?}");
+                assert!(why[0].contains("not the one this environment is rolling back to"), "{why:?}");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+        assert_eq!(
+            classify_preflight(&raw, None, Some("20260202000000"), &old),
+            Verdict::Restorable { ts: "20260202000000".into() }
+        );
+        assert_eq!(
+            classify_preflight(&raw, None, None, &old),
+            Verdict::Restorable { ts: "20260202000000".into() },
+            "the default is the newest backup"
+        );
+    }
+
+    #[test]
+    fn a_backup_with_the_same_expiry_but_another_serial_is_blocked() {
+        let (raw, _) = two_updates();
+        let old = OldCert { not_after: 2000, serial: Some("FF".into()) };
+        assert!(matches!(classify_preflight(&raw, None, None, &old), Verdict::Blocked(_)));
+        // A side without a serial compares by expiry only, as served_matches does.
+        let old = OldCert { not_after: 2000, serial: None };
+        assert!(matches!(classify_preflight(&raw, None, None, &old), Verdict::Restorable { .. }));
+    }
+
+    #[test]
+    fn a_backup_whose_expiry_is_unknown_is_blocked() {
+        let mut b = backup("20260903070123", 0);
+        b.serial = None;
+        let raw = PreflightRaw { backups: vec![b], space_ok: true };
+        match classify_preflight(&raw, None, None, &OLD) {
+            Verdict::Blocked(why) => {
+                assert_eq!(why.len(), 1, "{why:?}");
+                assert!(why[0].contains("cannot tell which cert backup 20260903070123 holds"), "{why:?}");
+            }
             other => panic!("expected Blocked, got {other:?}"),
         }
     }

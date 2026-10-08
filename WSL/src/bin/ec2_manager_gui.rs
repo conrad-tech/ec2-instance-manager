@@ -1733,7 +1733,6 @@ mod gui {
         /// Rollback backup chosen per node: instance id -> backup timestamp.
         chosen_ts: HashMap<String, String>,
         approve_rollback: bool,
-        old_cert: Option<cassandra_cert::OldCert>,
         /// Each node's cert as the dry run read it: instance id -> cert.
         /// Filled when the dry run lands; what an Apply job's `before` takes.
         before: HashMap<String, cassandra_cert::CertInfo>,
@@ -1784,7 +1783,6 @@ mod gui {
                 preflight: None,
                 chosen_ts: HashMap::new(),
                 approve_rollback: false,
-                old_cert: None,
                 before: HashMap::new(),
                 diagnostics: Vec::new(),
                 log: Vec::new(),
@@ -1872,7 +1870,11 @@ mod gui {
 
         /// The cert a rollback returns to, and where it came from.
         fn rollback_old_cert(&self) -> Option<(cassandra_cert::OldCert, &'static str)> {
-            cassandra_old_cert_for(self.last_run.as_ref(), self.preflight.as_deref().unwrap_or(&[]))
+            cassandra_old_cert_for(
+                self.last_run.as_ref(),
+                self.preflight.as_deref().unwrap_or(&[]),
+                &self.chosen_ts,
+            )
         }
 
         /// One verdict per preflight row, under the backups chosen now.
@@ -1938,7 +1940,6 @@ mod gui {
                     self.preflight = None;
                     self.chosen_ts.clear();
                     self.approve_rollback = false;
-                    self.old_cert = None;
                     self.preflight_selection = Some(cassandra_cert::selection_key(&self.selected));
                 }
                 // One dry run / preflight arms one restart.
@@ -1970,7 +1971,6 @@ mod gui {
             self.preflight = None;
             self.preflight_selection = None;
             self.chosen_ts.clear();
-            self.old_cert = None;
         }
     }
 
@@ -28100,7 +28100,6 @@ mod gui {
                             ui.separator();
                             ui.label(egui::RichText::new("Rollback preflight (read-only)").strong());
                             let old = dlg.rollback_old_cert();
-                            dlg.old_cert = old.as_ref().map(|(o, _)| o.clone());
                             match &old {
                                 Some((o, from)) => {
                                     ui.label(format!(
@@ -45827,11 +45826,7 @@ mod gui {
     /// Epoch seconds as local `YYYY-MM-DD HH:MM`, for "Last update" and the
     /// cert dates. ASCII only.
     fn cassandra_local_time(epoch: i64) -> String {
-        use chrono::TimeZone;
-        match chrono::Local.timestamp_opt(epoch, 0).single() {
-            Some(t) => t.format("%Y-%m-%d %H:%M").to_string(),
-            None => format!("@{epoch}"),
-        }
+        cassandra_cert::local_time(epoch)
     }
 
     /// One node's apply outcome as a line of text, and whether it is a
@@ -45913,20 +45908,29 @@ mod gui {
 
     /// The cert the environment returns to, and where it came from: the
     /// last update's pre-update capture when there is one, otherwise the
-    /// most common cert among the nodes' newest backups.
+    /// most common cert among the backups chosen on the nodes (each node's
+    /// newest unless another is picked in `chosen_ts`). Computed on demand,
+    /// so it follows every change of a chooser.
     fn cassandra_old_cert_for(
         last_run: Option<&cassandra_cert::LastRun>,
         preflight: &[cassandra_flow::NodePreflight],
+        chosen_ts: &HashMap<String, String>,
     ) -> Option<(cassandra_cert::OldCert, &'static str)> {
         if let Some(old) = last_run.and_then(|r| r.old_cert()) {
             return Some((old, "the last update's pre-update capture"));
         }
-        let newest: Vec<&cassandra_cert::BackupFact> = preflight
+        let chosen: Vec<&cassandra_cert::BackupFact> = preflight
             .iter()
-            .filter_map(|p| p.raw.as_ref().ok().and_then(|r| r.backups.first()))
+            .filter_map(|p| {
+                let raw = p.raw.as_ref().ok()?;
+                match chosen_ts.get(&p.target.instance_id) {
+                    Some(ts) => raw.backups.iter().find(|b| &b.ts == ts),
+                    None => raw.backups.first(),
+                }
+            })
             .collect();
-        cassandra_cert::infer_old_cert(&newest)
-            .map(|old| (old, "the nodes' newest backups (no pre-update capture is recorded)"))
+        cassandra_cert::infer_old_cert(&chosen)
+            .map(|old| (old, "the backups chosen on the nodes (no pre-update capture is recorded)"))
     }
 
     /// One verdict per preflight row under the backups chosen now. A row
@@ -57477,7 +57481,6 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             dlg.preflight = Some(Vec::new());
             dlg.preflight_selection = Some(vec!["i-1".into()]);
             dlg.chosen_ts.insert("i-1".into(), "1".into());
-            dlg.old_cert = Some(cassandra_cert::OldCert { not_after: 1, serial: None });
             dlg.approve_apply = true;
             dlg.approve_rollback = true;
             dlg.confirm_outside = true;
@@ -57485,7 +57488,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert!(dlg.dry.is_none() && dlg.dry_selection.is_none());
             assert!(dlg.before.is_empty() && dlg.dates.is_empty());
             assert!(dlg.preflight.is_none() && dlg.preflight_selection.is_none());
-            assert!(dlg.chosen_ts.is_empty() && dlg.old_cert.is_none());
+            assert!(dlg.chosen_ts.is_empty());
             assert!(!dlg.approve_apply && !dlg.approve_rollback && !dlg.confirm_outside);
         }
 
@@ -57519,7 +57522,8 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 cass_preflight("i-1", vec![cass_backup("2", 500), cass_backup("1", 400)], None),
                 cass_preflight("i-2", vec![cass_backup("2", 500)], None),
             ];
-            let (old, from) = cassandra_old_cert_for(None, &rows).expect("inferred");
+            let none = HashMap::new();
+            let (old, from) = cassandra_old_cert_for(None, &rows, &none).expect("inferred");
             assert_eq!(old.not_after, 500);
             assert!(from.contains("backup"), "{from}");
             let run = cassandra_cert::LastRun {
@@ -57530,10 +57534,42 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 old_not_after: Some(300),
                 old_serial: Some("AA".into()),
             };
-            let (old, from) = cassandra_old_cert_for(Some(&run), &rows).expect("from the run");
+            let (old, from) = cassandra_old_cert_for(Some(&run), &rows, &none).expect("from the run");
             assert_eq!(old.not_after, 300);
             assert!(from.contains("last update"), "{from}");
-            assert!(cassandra_old_cert_for(None, &[]).is_none());
+            assert!(cassandra_old_cert_for(None, &[], &none).is_none());
+        }
+
+        #[test]
+        fn with_no_last_run_the_old_cert_follows_the_chosen_backups() {
+            // Two updates: backup 1 holds A (400), backup 2 holds B (500).
+            let rows = vec![
+                cass_preflight("i-1", vec![cass_backup("2", 500), cass_backup("1", 400)], None),
+                cass_preflight("i-2", vec![cass_backup("2", 500), cass_backup("1", 400)], None),
+            ];
+            let mut chosen: HashMap<String, String> = HashMap::new();
+            let (old, _) = cassandra_old_cert_for(None, &rows, &chosen).expect("newest by default");
+            assert_eq!(old.not_after, 500);
+            // The older backup chosen on every node: consistently A, restorable.
+            chosen.insert("i-1".into(), "1".into());
+            chosen.insert("i-2".into(), "1".into());
+            let (old, _) = cassandra_old_cert_for(None, &rows, &chosen).expect("chosen");
+            assert_eq!(old.not_after, 400);
+            let v = cassandra_preflight_verdicts(&rows, &chosen, Some(&old));
+            assert!(v.iter().all(|v| matches!(v, cassandra_cert::Verdict::Restorable { .. })), "{v:?}");
+            // A mixed choice: one node does not hold the cert rolled back to.
+            chosen.insert("i-2".into(), "2".into());
+            let (old, _) = cassandra_old_cert_for(None, &rows, &chosen).expect("mixed");
+            let v = cassandra_preflight_verdicts(&rows, &chosen, Some(&old));
+            assert!(v.iter().any(|v| matches!(v, cassandra_cert::Verdict::Blocked(_))), "{v:?}");
+            assert!(!cassandra_cert::can_confirm_rollback(&v));
+            // The dialog recomputes it from its own chooser.
+            let mut dlg = CassandraDialog::new(cass_env_row("111", "DEV1"), Vec::new());
+            dlg.preflight = Some(rows.clone());
+            assert_eq!(dlg.rollback_old_cert().expect("some").0.not_after, 500);
+            dlg.chosen_ts.insert("i-1".into(), "1".into());
+            dlg.chosen_ts.insert("i-2".into(), "1".into());
+            assert_eq!(dlg.rollback_old_cert().expect("some").0.not_after, 400);
         }
 
         #[test]
@@ -57551,7 +57587,14 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             ];
             let mut chosen = HashMap::new();
             let v = cassandra_preflight_verdicts(&rows, &chosen, Some(&old));
-            assert_eq!(v[0], cassandra_cert::Verdict::Restorable { ts: "2".into() }, "newest by default");
+            // The newest backup is checked by default, and it holds a cert
+            // (500) other than the one rolled back to (400).
+            match &v[0] {
+                cassandra_cert::Verdict::Blocked(why) => {
+                    assert!(why[0].contains("backup 2 holds a cert expiring"), "{why:?}")
+                }
+                other => panic!("newest by default, and not the old cert: {other:?}"),
+            }
             assert_eq!(v[1], cassandra_cert::Verdict::NothingToRollBack);
             match &v[2] {
                 cassandra_cert::Verdict::Blocked(why) => assert!(why[0].contains("timed out")),
