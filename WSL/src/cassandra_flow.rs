@@ -55,12 +55,24 @@ pub fn shell_quote(s: &str) -> String {
 /// exit code, so without the marker a failed script is indistinguishable from
 /// a successful one.
 pub fn invocation(script: &str, args: &[&str]) -> String {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(script.as_bytes());
+    // The sentinel is the script's own first statement: empty, partial or cut
+    // stdin (e.g. no `base64`) never prints it, so `script_rc` can tell.
+    let b64 = base64::engine::general_purpose::STANDARD.encode(format!("echo __CC_RAN__\n{script}").as_bytes());
     let quoted: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
     format!(
-        "out=$(echo {b64} | base64 -d | bash -s -- {} 2>&1); rc=$?; echo \"$out\"; echo \"__CC_RC__$rc\"",
+        "out=$(echo {b64} | base64 -d | bash -s -- {} 2>&1); rc=$?; printf '%s\\n' \"$out\"; echo \"__CC_RC__$rc\"",
         quoted.join(" ")
     )
+}
+
+/// A bundled script's exit code, only when the output proves the script ran
+/// (its first statement printed `__CC_RAN__`) and the wrapper reported a code.
+pub(crate) fn script_rc(out: &str) -> Option<i32> {
+    if out.lines().any(|l| l.trim_end() == "__CC_RAN__") {
+        parse_rc(out)
+    } else {
+        None
+    }
 }
 
 /// Run `f` for every target on its own thread, keeping input order.
@@ -127,10 +139,10 @@ pub fn dry_run(exec: ExecFn, targets: &[Target], domain_arg: Option<&str>) -> Ve
         args.push("--dry-run");
         match exec(&t.instance_id, &invocation(&renew_script(), &args), SCRIPT_TIMEOUT) {
             Err(e) => res.detail = format!("dry run could not be sent: {e}"),
-            Ok(out) => match parse_rc(&out) {
+            Ok(out) => match script_rc(&out) {
                 Some(0) => res.dry_run_ok = true,
                 Some(rc) => res.detail = format!("dry run exited {rc}: {}", last_lines(&out, 3)),
-                None => res.detail = "dry run returned no return code (output cut short)".into(),
+                None => res.detail = "dry run returned no return code (the script did not run to completion)".into(),
             },
         }
         res
@@ -347,8 +359,38 @@ mod flow_tests {
         let cmd = invocation("echo hi", &["--dry-run", "-d", "dev1.net"]);
         assert!(cmd.starts_with("out=$(echo "), "{cmd}");
         assert!(cmd.contains("base64 -d | bash -s -- '--dry-run' '-d' 'dev1.net'"), "{cmd}");
+        assert!(cmd.contains("printf '%s\\n' \"$out\""), "{cmd}");
         assert!(cmd.contains("rc=$?"), "{cmd}");
         assert!(cmd.ends_with("echo \"__CC_RC__$rc\""), "{cmd}");
+    }
+
+    #[test]
+    fn the_payload_starts_with_the_ran_sentinel() {
+        use base64::Engine;
+        let cmd = invocation("echo body", &[]);
+        let b64 = cmd.trim_start_matches("out=$(echo ").split(' ').next().unwrap();
+        let text = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(b64).unwrap()).unwrap();
+        assert!(text.starts_with("echo __CC_RAN__\n"), "{text}");
+        assert!(text.ends_with("echo body"), "{text}");
+    }
+
+    #[test]
+    fn script_rc_needs_both_the_ran_line_and_the_code() {
+        assert_eq!(script_rc("__CC_RAN__\n"), None);
+        assert_eq!(script_rc("x\n__CC_RC__0\n"), None);
+        assert_eq!(script_rc("__CC_RAN__\nx\n__CC_RC__3\n"), Some(3));
+        assert_eq!(script_rc("echo __CC_RAN__ done\n__CC_RC__0\n"), None);
+    }
+
+    #[test]
+    fn a_dry_run_that_never_ran_the_script_fails_even_with_rc_zero() {
+        let fake = Fake::new(|_id, cmd| {
+            if cmd.contains("--dry-run") { Ok("__CC_RC__0\n".into()) } else { Ok(check_out("active")) }
+        });
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let out = dry_run(&exec, &[t("i-1", "a")], None);
+        assert!(!out[0].dry_run_ok);
+        assert!(out[0].detail.contains("no return code"), "{}", out[0].detail);
     }
 
     #[test]
@@ -363,7 +405,7 @@ mod flow_tests {
     fn the_dry_run_reads_the_cert_and_runs_the_script_with_dry_run() {
         let fake = Fake::new(|_id, cmd| {
             if cmd.contains("--dry-run") {
-                Ok("INFO: validated\n__CC_RC__0\n".into())
+                Ok("__CC_RAN__\nINFO: validated\n__CC_RC__0\n".into())
             } else {
                 Ok(check_out("active"))
             }
@@ -399,7 +441,7 @@ mod flow_tests {
     fn a_failed_dry_run_on_any_node_fails_the_gate() {
         let fake = Fake::new(|id, cmd| {
             if cmd.contains("--dry-run") {
-                Ok(format!("__CC_RC__{}\n", if id == "i-2" { 1 } else { 0 }))
+                Ok(format!("__CC_RAN__\n__CC_RC__{}\n", if id == "i-2" { 1 } else { 0 }))
             } else {
                 Ok(check_out("active"))
             }
@@ -415,7 +457,7 @@ mod flow_tests {
     fn an_unreachable_node_reports_its_error_and_the_rest_continue() {
         let fake = Fake::new(|id, cmd| {
             if id == "i-1" { return Err("TargetNotConnected".into()); }
-            if cmd.contains("--dry-run") { Ok("__CC_RC__0\n".into()) } else { Ok(check_out("active")) }
+            if cmd.contains("--dry-run") { Ok("__CC_RAN__\n__CC_RC__0\n".into()) } else { Ok(check_out("active")) }
         });
         let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
         let out = dry_run(&exec, &[t("i-1", "a"), t("i-2", "b")], None);
@@ -430,7 +472,7 @@ mod flow_tests {
         // string, so the fake recognises the rollback-check script by its text.
         let rollback_check_b64 = {
             use base64::Engine;
-            base64::engine::general_purpose::STANDARD.encode(rollback_check_script().as_bytes())
+            base64::engine::general_purpose::STANDARD.encode(format!("echo __CC_RAN__\n{}", rollback_check_script()).as_bytes())
         };
         let fake = Fake::new(move |_id, cmd| {
             if cmd.contains(&rollback_check_b64) {
