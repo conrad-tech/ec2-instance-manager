@@ -211,6 +211,15 @@
     "enabled": false,
     "allowed_users": []
   },
+  "_cassandra_cert_comment": "Scripts -> Cassandra Cert: renew (and roll back) the keystore cert on selected Cassandra nodes, then restart them all at once. A cluster-wide restart, so BOTH keys are required: set enabled to true AND name the OS username in allowed_users ([\"*\"] = everyone, [] = nobody). Shipped closed. parameters lists the four SSM parameter path templates; each must contain the literal $env_domain, which is replaced with the environment's lowercased name from accounts.json (the dialog reads only their last-modified time, never their values). domain_suffix is appended to that name to form cassandra.sh -d; leave it empty to pass no -d and let the script autodetect the domain from the node's own keystore. restart_stable_secs is how long a node must stay active after the restart (default 60); restart_ceiling_secs is how long it has to get there (default 300).",
+  "cassandra_cert": {
+    "enabled": false,
+    "allowed_users": [],
+    "parameters": [],
+    "domain_suffix": "",
+    "restart_stable_secs": 60,
+    "restart_ceiling_secs": 300
+  },
   "_resources_comment": "Inventory resource sub-tabs (Target Groups, and later Load Balancers / ASGs / S3 / Route 53). priority_target_groups names the target groups whose Healthy/Total is fetched the moment the list lands, ahead of whatever is on screen -- a case-insensitive substring match against the target group NAME, not its ARN. Example: [\"app-web\", \"app-api\"] answers those before anything else and marks them with a star in the table. Empty prioritises nothing, and health is then filled only for the rows on screen as you scroll. At most 50 are pulled forward however many the patterns match, so a broad pattern like \"prod\" cannot turn a bounded fill into one call per target group. This is a preference and not a permission: the sub-tabs are read-only describe calls and are visible to everyone.",
   "resources": {
     "priority_target_groups": []
