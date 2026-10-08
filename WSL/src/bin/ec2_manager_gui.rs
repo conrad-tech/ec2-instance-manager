@@ -1021,7 +1021,6 @@ mod gui {
     }
 
     /// One Cassandra cert job for `App::start_cassandra_job`.
-    #[allow(dead_code)] // consumed by the dialog panels (Task 10b)
     enum CassandraJob {
         DryRun {
             account_id: String,
@@ -1707,10 +1706,8 @@ mod gui {
 
     /// Modal state for "Scripts -> Cassandra Cert".
     ///
-    /// Task 10a builds the shell (environment, nodes, last run) and fills the
-    /// job fields from `poll_cassandra_events`; the picker, the Update and
-    /// Roll back panels and the result panel (Task 10b) read them.
-    #[allow(dead_code)] // consumed by the dialog panels (Task 10b)
+    /// `poll_cassandra_events` fills the job fields; `render_cassandra_dialog`
+    /// draws the picker, the Update and Roll back panels and the result.
     struct CassandraDialog {
         /// The chosen account + environment. `account_id` is the config
         /// profile id, as in every Scripts dialog, and is what a
@@ -1749,6 +1746,19 @@ mod gui {
         /// A one-line note that is not a job result, e.g. "another job is
         /// still running" when a start was refused.
         notice: Option<String>,
+        /// A red line for a start that was refused before any job, e.g. a
+        /// `domain_suffix` that does not form a valid domain.
+        error: Option<String>,
+        /// The selection (`selection_key`) the dry run held in `dry` was
+        /// started for. Apply needs it to equal the current selection.
+        dry_selection: Option<Vec<String>>,
+        /// The selection the preflight held in `preflight` was started for.
+        preflight_selection: Option<Vec<String>>,
+        /// The window's close button was pressed while a job runs.
+        confirm_close: bool,
+        /// "This job looks stuck - forget it" was pressed; awaiting the
+        /// second click.
+        confirm_forget: bool,
     }
 
     impl CassandraDialog {
@@ -1776,11 +1786,32 @@ mod gui {
                 result: None,
                 last_run: None,
                 notice: None,
+                error: None,
+                dry_selection: None,
+                preflight_selection: None,
+                confirm_close: false,
+                confirm_forget: false,
             }
+        }
+
+        /// The selection changed: every result taken for the old one, and
+        /// every tick given against it, is gone. A dry run or preflight of
+        /// one selection must never arm a restart of another.
+        fn forget_selection_results(&mut self) {
+            self.confirm_outside = false;
+            self.approve_apply = false;
+            self.approve_rollback = false;
+            self.dry = None;
+            self.dry_selection = None;
+            self.dates.clear();
+            self.before.clear();
+            self.preflight = None;
+            self.preflight_selection = None;
+            self.chosen_ts.clear();
+            self.old_cert = None;
         }
     }
 
-    #[allow(dead_code)] // Update / Rollback are set by the dialog panels (Task 10b)
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum CassandraMode {
         Pick,
@@ -1788,15 +1819,25 @@ mod gui {
         Rollback,
     }
 
-    #[allow(dead_code)] // consumed by the dialog panels (Task 10b)
     enum CassandraOutcome {
         Applied(cassandra_flow::ApplyReport),
         RolledBack(cassandra_flow::RollbackReport),
         Error(String),
     }
 
+    /// What a click in the Cassandra dialog asked for, carried out after
+    /// the window is drawn (see `render_cassandra_dialog`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CassandraAction {
+        StartDryRun,
+        StartPreflight,
+        Apply,
+        ConfirmRollback,
+        ForgetStuck,
+        CloseAnyway,
+    }
+
     /// Which kind of Cassandra job is in flight.
-    #[allow(dead_code)] // kinds are started by the dialog panels (Task 10b)
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum CassandraJobKind {
         DryRun,
@@ -1808,13 +1849,26 @@ mod gui {
     /// The one Cassandra job in flight: whose events these are. Jobs are
     /// serialised (`start_cassandra_job` refuses a second), so every
     /// terminal event that arrives belongs to this record.
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    ///
+    /// Equality is the job's identity (account, environment, kind); `since`
+    /// is bookkeeping for the "looks stuck" escape and is not compared.
+    #[derive(Clone, Debug)]
     struct CassandraInflight {
         /// Config profile id, as in `ScriptEnv::account_id`.
         account_id: String,
         env: String,
         kind: CassandraJobKind,
+        /// When the job was admitted.
+        since: Instant,
     }
+
+    impl PartialEq for CassandraInflight {
+        fn eq(&self, other: &Self) -> bool {
+            self.account_id == other.account_id && self.env == other.env && self.kind == other.kind
+        }
+    }
+
+    impl Eq for CassandraInflight {}
 
     impl CassandraInflight {
         fn key(&self) -> (String, String) {
@@ -9614,6 +9668,11 @@ mod gui {
         /// `cassandra_cert.watch_secs()`, `(required, ceiling)`, resolved once
         /// at startup like the gates beside it.
         cassandra_watch_secs: (u64, u64),
+        /// `cassandra_cert.parameters` (the SSM path templates) and
+        /// `cassandra_cert.domain_suffix`, resolved once at startup like
+        /// `cassandra_watch_secs`, for the dry run's job.
+        cassandra_parameters: Vec<String>,
+        cassandra_domain_suffix: String,
         /// A Start / Stop / Restart awaiting confirmation, if any.
         power_confirm: Option<PowerConfirm>,
         /// Instance ids with a power run already going. Shared with the
@@ -10471,6 +10530,8 @@ mod gui {
                 cassandra_inflight: None,
                 cassandra_inbox: Vec::new(),
                 cassandra_watch_secs: features.cassandra_cert.watch_secs(),
+                cassandra_parameters: features.cassandra_cert.parameters.clone(),
+                cassandra_domain_suffix: features.cassandra_cert.domain_suffix.clone(),
                 power_confirm: None,
                 power_in_flight: Arc::new(Mutex::new(HashSet::new())),
                 power_status: None,
@@ -27253,7 +27314,6 @@ mod gui {
         /// spawns nothing and sends nothing. The refusal is logged and shown
         /// as the dialog's `notice`, never as a `Failed` on the inbox, which
         /// would be taken for the running job's own end.
-        #[allow(dead_code)] // consumed by the dialog panels (Task 10b)
         fn start_cassandra_job(&mut self, job: CassandraJob) -> bool {
             if !cassandra_try_start(
                 &mut self.cassandra_inflight,
@@ -27355,20 +27415,15 @@ mod gui {
             dlg.nodes = self.cassandra_nodes_for(&profile_id, &env);
             dlg.last_run = self.config.cassandra_last_run(&profile_id, &env);
             dlg.selected.clear();
-            dlg.confirm_outside = false;
+            dlg.forget_selection_results();
             dlg.mode = CassandraMode::Pick;
-            dlg.dry = None;
-            dlg.dates.clear();
-            dlg.approve_apply = false;
-            dlg.preflight = None;
-            dlg.chosen_ts.clear();
-            dlg.approve_rollback = false;
-            dlg.old_cert = None;
-            dlg.before.clear();
             dlg.diagnostics.clear();
             dlg.log.clear();
             dlg.result = None;
             dlg.notice = None;
+            dlg.error = None;
+            dlg.confirm_close = false;
+            dlg.confirm_forget = false;
             // Running exactly when the job in flight is this environment's.
             dlg.running = cassandra_event_applies(
                 Some(&dlg.scripts_env.key()),
@@ -27378,6 +27433,12 @@ mod gui {
         }
 
         /// Render "Scripts -> Cassandra Cert".
+        ///
+        /// Top to bottom: environment, last run, the node picker and its
+        /// warnings, Update cert / Roll back, progress, the Update or Roll
+        /// back panel, and the result. Buttons only record a
+        /// `CassandraAction`; it is carried out after the window, and the two
+        /// restart actions re-check their gate there before building a job.
         fn render_cassandra_dialog(&mut self, ctx: &egui::Context) {
             // The menu entry is the presentation; this is the guarantee, the
             // same re-check the other gated windows make.
@@ -27391,9 +27452,23 @@ mod gui {
             // Every account is offered (no Vault-style filter); the Exclude
             // Env filter is applied inside `script_environments`.
             dlg.envs = self.script_environments();
+            if !dlg.running {
+                dlg.confirm_close = false;
+                dlg.confirm_forget = false;
+            }
+            let red = egui::Color32::from_rgb(220, 80, 80);
+            let amber = egui::Color32::from_rgb(220, 160, 40);
+            let green = egui::Color32::from_rgb(70, 170, 90);
+            let ceiling = self.cassandra_watch_secs.1;
+            let stuck = dlg.running
+                && self.cassandra_inflight.as_ref().is_some_and(|job| {
+                    cassandra_job_looks_stuck(job.since.elapsed().as_secs(), ceiling)
+                });
+            let now = chrono::Utc::now().timestamp();
 
             let mut window_open = true;
             let mut env_changed = false;
+            let mut action: Option<CassandraAction> = None;
             egui::Window::new("Scripts - Cassandra Cert")
                 .collapsible(false)
                 .resizable(true)
@@ -27430,7 +27505,9 @@ mod gui {
                                             }
                                         }
                                     });
-                            });
+                            })
+                            .response
+                            .on_disabled_hover_text("Locked while a Cassandra job runs on this environment.");
                             if dlg.scripts_env.key() != prev {
                                 env_changed = true;
                             }
@@ -27447,25 +27524,682 @@ mod gui {
                     }
 
                     ui.add_space(6.0);
-                    let running = dlg.nodes.iter().filter(|n| n.running).count();
+                    let running_nodes = dlg.nodes.iter().filter(|n| n.running).count();
                     ui.label(format!(
-                        "{} Cassandra node(s) in this environment, {running} running.",
+                        "{} Cassandra node(s) in this environment, {running_nodes} running.",
                         dlg.nodes.len()
                     ));
                     if dlg.nodes.is_empty() {
                         note_label(
                             ui,
-                            egui::Color32::from_rgb(220, 80, 80),
+                            red,
                             "No cassandra-NNN instance is in this environment's cached \
                              inventory. Load the account's inventory, then reopen.",
                         );
                     }
 
                     if let Some(notice) = &dlg.notice {
-                        note_label(ui, egui::Color32::from_rgb(220, 160, 40), notice.as_str());
+                        note_label(ui, amber, notice.as_str());
+                    }
+                    if let Some(err) = &dlg.error {
+                        note_label(ui, red, err.as_str());
                     }
 
-                    // 10b: node picker, warnings, Update/Roll back panels and result go here
+                    egui::ScrollArea::vertical()
+                        .id_salt("cassandra_cert_body")
+                        .max_height(640.0)
+                        .show(ui, |ui| {
+                        // ---- Node picker (spec 2) ----
+                        let locked = dlg.running;
+                        let before_key = cassandra_cert::selection_key(&dlg.selected);
+                        let shown = cassandra_cert::assess_selection(&dlg.nodes, &dlg.selected);
+                        if !dlg.nodes.is_empty() {
+                            let nodes = dlg.nodes.clone();
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(!locked, egui::Button::new("Select all"))
+                                    .on_hover_text("Tick every running node in this environment.")
+                                    .on_disabled_hover_text("Locked while a Cassandra job runs.")
+                                    .clicked()
+                                {
+                                    dlg.selected = cassandra_cert::selectable_ids(&nodes);
+                                }
+                                if ui
+                                    .add_enabled(!locked && !dlg.selected.is_empty(), egui::Button::new("Clear"))
+                                    .on_disabled_hover_text(if locked {
+                                        "Locked while a Cassandra job runs."
+                                    } else {
+                                        "Nothing is selected."
+                                    })
+                                    .clicked()
+                                {
+                                    dlg.selected.clear();
+                                }
+                            });
+                            let mut sets: BTreeMap<u32, Vec<&cassandra_cert::Node>> = BTreeMap::new();
+                            for n in &nodes {
+                                sets.entry(n.set()).or_default().push(n);
+                            }
+                            for (set, members) in &sets {
+                                let header = format!(
+                                    "{} ({} node{})",
+                                    cassandra_cert::set_label(*set),
+                                    members.len(),
+                                    if members.len() == 1 { "" } else { "s" }
+                                );
+                                egui::CollapsingHeader::new(header)
+                                    .id_salt(("cassandra_set", *set))
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        let set_ids: Vec<String> = members
+                                            .iter()
+                                            .filter(|n| n.running)
+                                            .map(|n| n.instance_id.clone())
+                                            .collect();
+                                        if ui
+                                            .add_enabled(
+                                                !locked && !set_ids.is_empty(),
+                                                egui::Button::new("Select set"),
+                                            )
+                                            .on_hover_text("Tick only this set's running nodes.")
+                                            .on_disabled_hover_text(if locked {
+                                                "Locked while a Cassandra job runs."
+                                            } else {
+                                                "No node of this set is running."
+                                            })
+                                            .clicked()
+                                        {
+                                            dlg.selected = set_ids.clone();
+                                        }
+                                        for n in members {
+                                            let mut ticked = dlg.selected.contains(&n.instance_id);
+                                            let mut text = egui::RichText::new(format!(
+                                                "{} ({}){}",
+                                                n.name,
+                                                n.instance_id,
+                                                if n.running { "" } else { " - stopped" }
+                                            ));
+                                            if shown.outside.contains(&n.instance_id) {
+                                                text = text.color(red);
+                                            }
+                                            let resp = ui
+                                                .add_enabled(
+                                                    n.running && !locked,
+                                                    egui::Checkbox::new(&mut ticked, text),
+                                                )
+                                                .on_disabled_hover_text(if !n.running {
+                                                    "Stopped: only a running node can be reached \
+                                                     over SSM and updated."
+                                                } else {
+                                                    "Locked while a Cassandra job runs."
+                                                });
+                                            if resp.changed() {
+                                                if ticked {
+                                                    dlg.selected.push(n.instance_id.clone());
+                                                } else {
+                                                    dlg.selected.retain(|id| *id != n.instance_id);
+                                                }
+                                            }
+                                        }
+                                    });
+                            }
+                        }
+                        // A new selection voids every result and tick taken for
+                        // the old one: nothing stale may arm a restart.
+                        if cassandra_cert::selection_key(&dlg.selected) != before_key {
+                            dlg.forget_selection_results();
+                        }
+                        let assessment = cassandra_cert::assess_selection(&dlg.nodes, &dlg.selected);
+                        let rollback_mode = dlg.mode == CassandraMode::Rollback;
+                        if !assessment.outside.is_empty() {
+                            let dominant = assessment
+                                .dominant_set
+                                .map(cassandra_cert::set_label)
+                                .unwrap_or_default();
+                            for id in &assessment.outside {
+                                let name = dlg
+                                    .nodes
+                                    .iter()
+                                    .find(|n| n.instance_id == *id)
+                                    .map(|n| n.name.clone())
+                                    .unwrap_or_else(|| id.clone());
+                                note_label(
+                                    ui,
+                                    red,
+                                    format!("{name} is outside {dominant}, where most of the selection is."),
+                                );
+                            }
+                            let keep = match dlg.mode {
+                                CassandraMode::Update => "will keep the old cert".to_string(),
+                                CassandraMode::Rollback => "will keep the new cert".to_string(),
+                                CassandraMode::Pick => "will keep the old cert (on an update) or the \
+                                                        new cert (on a rollback)"
+                                    .to_string(),
+                            };
+                            note_label(
+                                ui,
+                                amber,
+                                format!(
+                                    "One cert serves the whole environment: the nodes you did not \
+                                     select in those sets {keep}."
+                                ),
+                            );
+                        }
+                        if let Some(n) = assessment.all_sets {
+                            note_label(
+                                ui,
+                                amber,
+                                format!(
+                                    "You selected every node in {n} clusters. {} all of them?",
+                                    if rollback_mode { "Roll back" } else { "Update" }
+                                ),
+                            );
+                        }
+                        let needs = assessment.needs_confirmation();
+                        if needs {
+                            ui.add_enabled(
+                                !locked,
+                                egui::Checkbox::new(&mut dlg.confirm_outside, "Yes, I mean this selection"),
+                            )
+                            .on_disabled_hover_text("Locked while a Cassandra job runs.");
+                        }
+
+                        // ---- Update cert / Roll back (spec 3, 5) ----
+                        ui.add_space(6.0);
+                        let start_block = cassandra_start_blocker(
+                            dlg.selected.is_empty(),
+                            dlg.running,
+                            needs,
+                            dlg.confirm_outside,
+                        );
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(start_block.is_none(), egui::Button::new("Update cert"))
+                                .on_hover_text(
+                                    "Read-only first: reads each selected node's cert, runs \
+                                     cassandra.sh --dry-run and reads the SSM parameter dates. \
+                                     Nothing restarts until you press Apply.",
+                                )
+                                .on_disabled_hover_text(start_block.unwrap_or(""))
+                                .clicked()
+                            {
+                                action = Some(CassandraAction::StartDryRun);
+                            }
+                            if ui
+                                .add_enabled(start_block.is_none(), egui::Button::new("Roll back"))
+                                .on_hover_text(
+                                    "Read-only first: checks each selected node's backups. \
+                                     Nothing is restored until you press Confirm rollback.",
+                                )
+                                .on_disabled_hover_text(start_block.unwrap_or(""))
+                                .clicked()
+                            {
+                                action = Some(CassandraAction::StartPreflight);
+                            }
+                        });
+
+                        // ---- Progress, stuck escape, close confirmation ----
+                        if dlg.running {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Running...");
+                            });
+                        }
+                        if !dlg.log.is_empty() {
+                            egui::CollapsingHeader::new("Progress")
+                                .id_salt("cassandra_progress")
+                                .default_open(dlg.running)
+                                .show(ui, |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("cassandra_log")
+                                        .max_height(160.0)
+                                        .stick_to_bottom(true)
+                                        .show(ui, |ui| {
+                                            for line in &dlg.log {
+                                                ui.monospace(line.as_str());
+                                            }
+                                        });
+                                });
+                        }
+                        if stuck {
+                            if !dlg.confirm_forget {
+                                if ui
+                                    .button("This job looks stuck - forget it")
+                                    .on_hover_text(format!(
+                                        "It has run for longer than the restart ceiling ({ceiling}s) \
+                                         plus 10 minutes."
+                                    ))
+                                    .clicked()
+                                {
+                                    dlg.confirm_forget = true;
+                                }
+                            } else {
+                                note_label(
+                                    ui,
+                                    red,
+                                    "Forgetting does not stop the job. The nodes may be mid-restart: \
+                                     check every selected node's Cassandra service by hand before \
+                                     doing anything else.",
+                                );
+                                ui.horizontal(|ui| {
+                                    if ui.button("Forget the job").clicked() {
+                                        action = Some(CassandraAction::ForgetStuck);
+                                    }
+                                    if ui.button("Keep waiting").clicked() {
+                                        dlg.confirm_forget = false;
+                                    }
+                                });
+                            }
+                        }
+                        if dlg.confirm_close && dlg.running {
+                            note_label(
+                                ui,
+                                amber,
+                                "The job keeps running in the background; results are logged under \
+                                 Sources -> Cassandra",
+                            );
+                            ui.horizontal(|ui| {
+                                if ui.button("Close anyway").clicked() {
+                                    action = Some(CassandraAction::CloseAnyway);
+                                }
+                                if ui.button("Keep open").clicked() {
+                                    dlg.confirm_close = false;
+                                }
+                            });
+                        }
+
+                        // ---- Update panel (spec 3) ----
+                        if let (CassandraMode::Update, Some(dry)) = (dlg.mode, dlg.dry.clone()) {
+                            ui.separator();
+                            ui.label(egui::RichText::new("Dry run").strong());
+                            egui::Grid::new("cassandra_dry_grid")
+                                .num_columns(3)
+                                .striped(true)
+                                .spacing([12.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label("Node");
+                                    ui.label("Current cert expires");
+                                    ui.label("Dry run");
+                                    ui.end_row();
+                                    for r in &dry {
+                                        ui.label(r.target.name.as_str());
+                                        match &r.current {
+                                            Some(c) if cassandra_cert::is_expired(c, now) => {
+                                                note_label(
+                                                    ui,
+                                                    red,
+                                                    format!("{} EXPIRED", cassandra_local_time(c.not_after)),
+                                                );
+                                            }
+                                            Some(c) => {
+                                                ui.label(cassandra_local_time(c.not_after));
+                                            }
+                                            None => {
+                                                note_label(ui, red, "current cert unreadable");
+                                            }
+                                        }
+                                        let verdict = match (r.dry_run_ok, r.detail.is_empty()) {
+                                            (true, true) => "passed".to_string(),
+                                            (true, false) => format!("passed: {}", r.detail),
+                                            (false, true) => "failed".to_string(),
+                                            (false, false) => format!("failed: {}", r.detail),
+                                        };
+                                        note_label(ui, if r.dry_run_ok { green } else { red }, verdict);
+                                        ui.end_row();
+                                    }
+                                });
+                            for r in &dry {
+                                egui::CollapsingHeader::new(format!("openssl output: {}", r.target.name))
+                                    .id_salt(("cassandra_raw", r.target.instance_id.as_str()))
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        if r.raw_cert.trim().is_empty() {
+                                            ui.label("(nothing was read)");
+                                        } else {
+                                            ui.monospace(r.raw_cert.as_str());
+                                        }
+                                    });
+                            }
+
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("SSM parameters (last modified)").strong());
+                            // Compared with the earliest issue date among the
+                            // selected nodes' readable certs.
+                            let issued = dry
+                                .iter()
+                                .filter_map(|r| r.current.as_ref())
+                                .min_by_key(|c| c.not_before);
+                            if dlg.dates.is_empty() {
+                                ui.label(
+                                    "No parameter is configured (cassandra_cert.parameters), so none \
+                                     was checked.",
+                                );
+                            }
+                            for (path, when) in &dlg.dates {
+                                match when {
+                                    Ok(t) => {
+                                        let local = cassandra_local_time(*t);
+                                        if issued.is_some_and(|c| cassandra_cert::parameter_is_stale(*t, c)) {
+                                            note_label(
+                                                ui,
+                                                red,
+                                                format!(
+                                                    "{path}: {local} - not renewed since the current \
+                                                     cert was issued"
+                                                ),
+                                            );
+                                        } else {
+                                            ui.label(format!("{path}: {local}"));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        note_label(ui, red, format!("{path}: {e}"));
+                                    }
+                                }
+                            }
+
+                            ui.add_space(4.0);
+                            ui.add_enabled(
+                                !dlg.running,
+                                egui::Checkbox::new(
+                                    &mut dlg.approve_apply,
+                                    "I understand Cassandra restarts on all selected nodes at once; \
+                                     expect a short outage",
+                                ),
+                            )
+                            .on_disabled_hover_text("Locked while a Cassandra job runs.");
+                            let dry_ids: Vec<String> =
+                                dry.iter().map(|r| r.target.instance_id.clone()).collect();
+                            let passed = cassandra_flow::dry_run_passed(&dry);
+                            let gate = cassandra_cert::Gate {
+                                selected: &dlg.selected,
+                                running: dlg.running,
+                                needs_confirmation: needs,
+                                confirmed: dlg.confirm_outside,
+                                approved: dlg.approve_apply,
+                            };
+                            let why = cassandra_cert::apply_blocker(
+                                &gate,
+                                passed,
+                                dlg.dry_selection.as_deref(),
+                                &dry_ids,
+                            );
+                            let enabled = cassandra_cert::apply_enabled(
+                                &gate,
+                                passed,
+                                dlg.dry_selection.as_deref(),
+                                &dry_ids,
+                            );
+                            if ui
+                                .add_enabled(enabled, egui::Button::new("Apply"))
+                                .on_hover_text(
+                                    "Stages the new cert on every selected node, then restarts them \
+                                     all at once and watches them come back.",
+                                )
+                                .on_disabled_hover_text(why.unwrap_or(""))
+                                .clicked()
+                            {
+                                action = Some(CassandraAction::Apply);
+                            }
+                        }
+
+                        // ---- Rollback panel (spec 5) ----
+                        if let (CassandraMode::Rollback, Some(pre)) = (dlg.mode, dlg.preflight.clone()) {
+                            ui.separator();
+                            ui.label(egui::RichText::new("Rollback preflight (read-only)").strong());
+                            let old = cassandra_old_cert_for(dlg.last_run.as_ref(), &pre);
+                            dlg.old_cert = old.as_ref().map(|(o, _)| o.clone());
+                            match &old {
+                                Some((o, from)) => {
+                                    ui.label(format!(
+                                        "Rolling back to the cert that expires {}{}, from {from}.",
+                                        cassandra_local_time(o.not_after),
+                                        o.serial
+                                            .as_deref()
+                                            .map(|s| format!(" (serial {s})"))
+                                            .unwrap_or_default()
+                                    ));
+                                }
+                                None => {
+                                    note_label(
+                                        ui,
+                                        red,
+                                        "The environment's old cert could not be identified: no \
+                                         update is recorded and no node has a readable backup.",
+                                    );
+                                }
+                            }
+                            let verdicts =
+                                cassandra_preflight_verdicts(&pre, &dlg.chosen_ts, dlg.old_cert.as_ref());
+                            let mut chooser_changed = false;
+                            egui::Grid::new("cassandra_preflight_grid")
+                                .num_columns(3)
+                                .striped(true)
+                                .spacing([12.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label("Node");
+                                    ui.label("Result");
+                                    ui.label("Backup");
+                                    ui.end_row();
+                                    for (p, v) in pre.iter().zip(&verdicts) {
+                                        ui.label(p.target.name.as_str());
+                                        match v {
+                                            cassandra_cert::Verdict::Restorable { ts } => {
+                                                note_label(ui, green, format!("Restorable (backup {ts})"));
+                                            }
+                                            cassandra_cert::Verdict::NothingToRollBack => {
+                                                ui.label(
+                                                    "Nothing to roll back: no backup, and it already \
+                                                     serves the old cert. Skipped: no restore, no \
+                                                     restart.",
+                                                );
+                                            }
+                                            cassandra_cert::Verdict::Blocked(why) => {
+                                                note_label(ui, red, format!("Blocked: {}", why.join("; ")));
+                                            }
+                                        }
+                                        match &p.raw {
+                                            Ok(raw) if !raw.backups.is_empty() => {
+                                                let id = p.target.instance_id.clone();
+                                                let current = dlg
+                                                    .chosen_ts
+                                                    .get(&id)
+                                                    .cloned()
+                                                    .unwrap_or_else(|| raw.backups[0].ts.clone());
+                                                let label = |b: &cassandra_cert::BackupFact| {
+                                                    format!(
+                                                        "{} - cert expires {}",
+                                                        b.ts,
+                                                        cassandra_local_time(b.not_after)
+                                                    )
+                                                };
+                                                let selected_text = raw
+                                                    .backups
+                                                    .iter()
+                                                    .find(|b| b.ts == current)
+                                                    .map(label)
+                                                    .unwrap_or_else(|| current.clone());
+                                                let chosen_ts = &mut dlg.chosen_ts;
+                                                ui.add_enabled_ui(!locked, |ui| {
+                                                    egui::ComboBox::from_id_salt(("cassandra_backup", id.as_str()))
+                                                        .selected_text(selected_text)
+                                                        .show_ui(ui, |ui| {
+                                                            for (i, b) in raw.backups.iter().enumerate() {
+                                                                let text = if i == 0 {
+                                                                    format!("{} (newest)", label(b))
+                                                                } else {
+                                                                    label(b)
+                                                                };
+                                                                if ui
+                                                                    .selectable_label(b.ts == current, text)
+                                                                    .clicked()
+                                                                    && b.ts != current
+                                                                {
+                                                                    chosen_ts.insert(id.clone(), b.ts.clone());
+                                                                    chooser_changed = true;
+                                                                }
+                                                            }
+                                                        });
+                                                });
+                                            }
+                                            _ => {
+                                                ui.label("-");
+                                            }
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                            // A new backup choice re-classifies locally (no new
+                            // job) and voids the approval given for the old one.
+                            let verdicts = if chooser_changed {
+                                dlg.approve_rollback = false;
+                                cassandra_preflight_verdicts(&pre, &dlg.chosen_ts, dlg.old_cert.as_ref())
+                            } else {
+                                verdicts
+                            };
+                            if verdicts.iter().any(|v| matches!(v, cassandra_cert::Verdict::Blocked(_))) {
+                                note_label(
+                                    ui,
+                                    amber,
+                                    "A blocked node cannot be rolled back. Either deselect it and \
+                                     press Roll back again (the environment then serves two certs \
+                                     until that node is fixed), or cancel and fix that node first.",
+                                );
+                            } else if cassandra_cert::can_confirm_rollback(&verdicts) {
+                                ui.label(
+                                    "Every selected node can be restored or already serves the old cert.",
+                                );
+                            }
+                            if cassandra_cert::timestamps_disagree(&verdicts) {
+                                note_label(
+                                    ui,
+                                    amber,
+                                    "The nodes to restore would use backups with different \
+                                     timestamps: check that is what you want.",
+                                );
+                            }
+                            ui.label(
+                                "Rollback restores files on the nodes only; it does not revert the \
+                                 SSM parameters",
+                            );
+                            ui.add_space(4.0);
+                            ui.add_enabled(
+                                !dlg.running,
+                                egui::Checkbox::new(
+                                    &mut dlg.approve_rollback,
+                                    "I understand Cassandra restarts on all selected nodes at once; \
+                                     expect a short outage",
+                                ),
+                            )
+                            .on_disabled_hover_text("Locked while a Cassandra job runs.");
+                            let pre_ids: Vec<String> =
+                                pre.iter().map(|p| p.target.instance_id.clone()).collect();
+                            let gate = cassandra_cert::Gate {
+                                selected: &dlg.selected,
+                                running: dlg.running,
+                                needs_confirmation: needs,
+                                confirmed: dlg.confirm_outside,
+                                approved: dlg.approve_rollback,
+                            };
+                            let why = cassandra_cert::rollback_confirm_blocker(
+                                &gate,
+                                &verdicts,
+                                dlg.preflight_selection.as_deref(),
+                                &pre_ids,
+                            );
+                            let enabled = cassandra_cert::rollback_confirm_enabled(
+                                &gate,
+                                &verdicts,
+                                dlg.preflight_selection.as_deref(),
+                                &pre_ids,
+                            );
+                            if ui
+                                .add_enabled(enabled, egui::Button::new("Confirm rollback"))
+                                .on_hover_text(
+                                    "Saves each node's current stores as .rollback.<TS>, restores \
+                                     the chosen backup, then restarts the nodes all at once.",
+                                )
+                                .on_disabled_hover_text(why.unwrap_or(""))
+                                .clicked()
+                            {
+                                action = Some(CassandraAction::ConfirmRollback);
+                            }
+                        }
+
+                        // ---- Result (spec 4, 5) ----
+                        let mut offer_rollback = false;
+                        let stale_line = |ui: &mut egui::Ui, stale: &Option<Vec<String>>| match stale {
+                            None => {
+                                note_label(ui, amber, "Consistency check on unselected nodes was not run.");
+                            }
+                            Some(list) if list.is_empty() => {
+                                ui.label("All unselected nodes serve the same cert.");
+                            }
+                            Some(list) => {
+                                note_label(
+                                    ui,
+                                    amber,
+                                    format!("Unselected nodes that still serve a different cert: {}", list.join(", ")),
+                                );
+                            }
+                        };
+                        match &dlg.result {
+                            Some(CassandraOutcome::Applied(rep)) => {
+                                ui.separator();
+                                ui.label(egui::RichText::new("Update result").strong());
+                                for (t, status) in &rep.nodes {
+                                    let (sev, text) = cassandra_flow::describe_apply_status(status);
+                                    offer_rollback |= sev.is_problem();
+                                    cassandra_severity_label(ui, sev, format!("{}: {text}", t.name));
+                                }
+                                stale_line(ui, &rep.stale);
+                            }
+                            Some(CassandraOutcome::RolledBack(rep)) => {
+                                ui.separator();
+                                ui.label(egui::RichText::new("Rollback result").strong());
+                                for (t, status) in &rep.nodes {
+                                    let (sev, text) = cassandra_flow::describe_rollback_status(status);
+                                    offer_rollback |= sev.is_problem();
+                                    cassandra_severity_label(ui, sev, format!("{}: {text}", t.name));
+                                }
+                                stale_line(ui, &rep.stale);
+                            }
+                            Some(CassandraOutcome::Error(msg)) => {
+                                ui.separator();
+                                note_label(ui, red, format!("The job failed: {msg}"));
+                            }
+                            None => {}
+                        }
+                        for (name, text) in &dlg.diagnostics {
+                            egui::CollapsingHeader::new(format!("Diagnostics: {name}"))
+                                .id_salt(("cassandra_diag", name.as_str()))
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    ui.monospace(text.as_str());
+                                });
+                        }
+                        // Failure hand-off: a shortcut to the read-only preflight,
+                        // never a rollback by itself.
+                        if offer_rollback {
+                            note_label(
+                                ui,
+                                amber,
+                                "Nothing is rolled back automatically. Roll back runs the read-only \
+                                 preflight first.",
+                            );
+                            if ui
+                                .add_enabled(start_block.is_none(), egui::Button::new("Roll back"))
+                                .on_hover_text(
+                                    "Checks the selected nodes' backups; nothing is restored until \
+                                     you press Confirm rollback.",
+                                )
+                                .on_disabled_hover_text(start_block.unwrap_or(""))
+                                .clicked()
+                            {
+                                action = Some(CassandraAction::StartPreflight);
+                            }
+                        }
+                        });
                 });
 
             if env_changed {
@@ -27474,11 +28208,167 @@ mod gui {
                 return;
             }
             if !window_open {
-                // 10b: while `dlg.running`, closing asks for confirmation
-                // first (the job keeps running and still logs either way).
-                return;
+                if !dlg.running {
+                    return;
+                }
+                // The job keeps running and still logs either way; ask first.
+                dlg.confirm_close = true;
+            }
+
+            let mut job: Option<CassandraJob> = None;
+            if let Some(act) = action {
+                let account_id = dlg.scripts_env.account_id.clone();
+                let env = dlg.scripts_env.env.clone();
+                let domain = cassandra_cert::domain_arg(
+                    &cassandra_cert::env_domain(&env),
+                    &self.cassandra_domain_suffix,
+                );
+                let needs = cassandra_cert::assess_selection(&dlg.nodes, &dlg.selected)
+                    .needs_confirmation();
+                let (targets, unselected) = cassandra_split_targets(&dlg.nodes, &dlg.selected);
+                match act {
+                    CassandraAction::CloseAnyway => {
+                        // Dropped; the job and its pending record live on `self`.
+                        return;
+                    }
+                    CassandraAction::ForgetStuck => {
+                        self.cassandra_inflight = None;
+                        self.cassandra_pending_run = None;
+                        dlg.running = false;
+                        dlg.confirm_forget = false;
+                        dlg.confirm_close = false;
+                        dlg.notice = Some(
+                            "The job was forgotten. Its nodes may be mid-restart: check them by hand."
+                                .to_string(),
+                        );
+                        self.log_cassandra(
+                            LogLevel::Warn,
+                            "cassandra: a job that looked stuck was forgotten by the user; its nodes \
+                             may be mid-restart and must be checked by hand",
+                        );
+                    }
+                    CassandraAction::StartDryRun => match domain {
+                        Err(e) => dlg.error = Some(format!("Update cert was not started: {e}")),
+                        Ok(domain_arg) => {
+                            dlg.mode = CassandraMode::Update;
+                            dlg.dry = None;
+                            dlg.before.clear();
+                            dlg.dates.clear();
+                            dlg.approve_apply = false;
+                            dlg.result = None;
+                            dlg.diagnostics.clear();
+                            dlg.log.clear();
+                            dlg.error = None;
+                            dlg.dry_selection = Some(cassandra_cert::selection_key(&dlg.selected));
+                            job = Some(CassandraJob::DryRun {
+                                account_id,
+                                env,
+                                targets,
+                                domain_arg,
+                                parameters: self.cassandra_parameters.clone(),
+                            });
+                        }
+                    },
+                    CassandraAction::StartPreflight => {
+                        dlg.mode = CassandraMode::Rollback;
+                        dlg.preflight = None;
+                        dlg.chosen_ts.clear();
+                        dlg.approve_rollback = false;
+                        dlg.old_cert = None;
+                        dlg.result = None;
+                        dlg.diagnostics.clear();
+                        dlg.log.clear();
+                        dlg.error = None;
+                        dlg.preflight_selection = Some(cassandra_cert::selection_key(&dlg.selected));
+                        job = Some(CassandraJob::Preflight { account_id, env, targets });
+                    }
+                    CassandraAction::Apply => {
+                        let dry = dlg.dry.clone().unwrap_or_default();
+                        let dry_ids: Vec<String> =
+                            dry.iter().map(|r| r.target.instance_id.clone()).collect();
+                        let armed = cassandra_cert::apply_enabled(
+                            &cassandra_cert::Gate {
+                                selected: &dlg.selected,
+                                running: dlg.running,
+                                needs_confirmation: needs,
+                                confirmed: dlg.confirm_outside,
+                                approved: dlg.approve_apply,
+                            },
+                            cassandra_flow::dry_run_passed(&dry),
+                            dlg.dry_selection.as_deref(),
+                            &dry_ids,
+                        );
+                        match (armed, domain) {
+                            (false, _) => {}
+                            (true, Err(e)) => dlg.error = Some(format!("Apply was not started: {e}")),
+                            (true, Ok(domain_arg)) => {
+                                let before: HashMap<String, cassandra_cert::CertInfo> = dry
+                                    .iter()
+                                    .filter_map(|r| {
+                                        r.current.clone().map(|c| (r.target.instance_id.clone(), c))
+                                    })
+                                    .collect();
+                                // One dry run arms one Apply.
+                                dlg.approve_apply = false;
+                                dlg.dry_selection = None;
+                                dlg.result = None;
+                                dlg.diagnostics.clear();
+                                dlg.log.clear();
+                                dlg.error = None;
+                                job = Some(CassandraJob::Apply {
+                                    account_id,
+                                    env,
+                                    targets,
+                                    unselected,
+                                    domain_arg,
+                                    before,
+                                });
+                            }
+                        }
+                    }
+                    CassandraAction::ConfirmRollback => {
+                        let pre = dlg.preflight.clone().unwrap_or_default();
+                        let pre_ids: Vec<String> =
+                            pre.iter().map(|p| p.target.instance_id.clone()).collect();
+                        let verdicts =
+                            cassandra_preflight_verdicts(&pre, &dlg.chosen_ts, dlg.old_cert.as_ref());
+                        let armed = cassandra_cert::rollback_confirm_enabled(
+                            &cassandra_cert::Gate {
+                                selected: &dlg.selected,
+                                running: dlg.running,
+                                needs_confirmation: needs,
+                                confirmed: dlg.confirm_outside,
+                                approved: dlg.approve_rollback,
+                            },
+                            &verdicts,
+                            dlg.preflight_selection.as_deref(),
+                            &pre_ids,
+                        );
+                        if let (true, Some(old)) = (armed, dlg.old_cert.clone()) {
+                            let (restore, skipped) = cassandra_rollback_plan(&pre, &verdicts);
+                            // One preflight arms one rollback.
+                            dlg.approve_rollback = false;
+                            dlg.preflight_selection = None;
+                            dlg.result = None;
+                            dlg.diagnostics.clear();
+                            dlg.log.clear();
+                            dlg.error = None;
+                            job = Some(CassandraJob::Rollback {
+                                account_id,
+                                env,
+                                restore,
+                                skipped,
+                                unselected,
+                                old,
+                            });
+                        }
+                    }
+                }
             }
             self.cassandra_dialog = Some(dlg);
+            if let Some(job) = job {
+                self.start_cassandra_job(job);
+            }
         }
 
         /// Drain `cassandra_inbox`: log every event under
@@ -27515,6 +28405,13 @@ mod gui {
             );
             let dialog_key = self.cassandra_dialog.as_ref().map(|d| d.scripts_env.key());
             let applies = cassandra_event_applies(dialog_key.as_ref(), owner.as_ref());
+            // The job that blocked a refused start has ended: its "still
+            // running" notice no longer holds, on whichever environment.
+            if owner.is_some() && self.cassandra_inflight.is_none() {
+                if let Some(dlg) = self.cassandra_dialog.as_mut() {
+                    dlg.notice = None;
+                }
+            }
             match event {
                 CassandraEvent::Log(m) => {
                     self.log_cassandra(LogLevel::Info, format!("cassandra: {m}"));
@@ -44668,7 +45565,12 @@ mod gui {
                 (account_id, env, CassandraJobKind::Rollback)
             }
         };
-        CassandraInflight { account_id: account_id.clone(), env: env.clone(), kind }
+        CassandraInflight {
+            account_id: account_id.clone(),
+            env: env.clone(),
+            kind,
+            since: Instant::now(),
+        }
     }
 
     /// Admit `job` as the one in flight. False, touching nothing, when
@@ -44762,49 +45664,142 @@ mod gui {
     }
 
     /// One node's apply outcome as a line of text, and whether it is a
-    /// problem (logged as a warning, drawn red by the result panel).
+    /// problem (logged as a warning). The words are the library's, shared
+    /// with the result panel.
     fn cassandra_node_status_text(status: &cassandra_flow::NodeStatus) -> (String, bool) {
-        use cassandra_cert::CertChange;
-        use cassandra_flow::NodeStatus as S;
-        match status {
-            S::StageFailed(e) => (format!("stage failed: {e}"), true),
-            S::NotRestarted => (
-                "not restarted: the new keystore is staged and takes effect at its next restart"
-                    .to_string(),
-                true,
-            ),
-            S::RestartFailed(e) => (format!("restart failed: {e}"), true),
-            S::DidNotStabilise => ("did not stay active after the restart".to_string(), true),
-            S::Up { change: None } => ("up (no earlier cert to compare against)".to_string(), false),
-            S::Up { change: Some(CertChange::Renewed) } => ("renewed".to_string(), false),
-            S::Up { change: Some(CertChange::NotRenewed) } => {
-                ("up, but the cert date did not move".to_string(), true)
-            }
-            S::Up { change: Some(CertChange::Flagged(d)) } => {
-                (format!("up, but the new cert looks different: {}", d.join("; ")), true)
-            }
-            S::Unverified(e) => (format!("up, but the cert could not be read: {e}"), true),
-        }
+        let (severity, text) = cassandra_flow::describe_apply_status(status);
+        (text, severity.is_problem())
     }
 
     /// One node's rollback outcome as a line of text, and whether it is a
     /// problem.
     fn cassandra_rollback_status_text(status: &cassandra_flow::RollbackStatus) -> (String, bool) {
-        use cassandra_flow::RollbackStatus as S;
-        match status {
-            S::RestoreFailed(e) => (format!("restore failed: {e}"), true),
-            S::NotRestarted => (
-                "not restarted: the old stores are restored and take effect at its next restart"
-                    .to_string(),
-                true,
-            ),
-            S::NothingToRollBack => ("nothing to roll back".to_string(), false),
-            S::RestartFailed(e) => (format!("restart failed: {e}"), true),
-            S::DidNotStabilise => ("did not stay active after the restart".to_string(), true),
-            S::Up => ("rolled back".to_string(), false),
-            S::WrongCert(e) => (format!("up, but not serving the old cert: {e}"), true),
-            S::Unverified(e) => (format!("up, but the cert could not be read: {e}"), true),
+        let (severity, text) = cassandra_flow::describe_rollback_status(status);
+        (text, severity.is_problem())
+    }
+
+    /// A result line in its severity's colour: green, plain, amber, red.
+    fn cassandra_severity_label(
+        ui: &mut egui::Ui,
+        severity: cassandra_flow::Severity,
+        text: String,
+    ) {
+        use cassandra_flow::Severity;
+        match severity {
+            Severity::Good => note_label(ui, egui::Color32::from_rgb(70, 170, 90), text),
+            Severity::Neutral => ui.label(text),
+            Severity::Warn => note_label(ui, egui::Color32::from_rgb(220, 160, 40), text),
+            Severity::Bad => note_label(ui, egui::Color32::from_rgb(220, 80, 80), text),
+        };
+    }
+
+    /// A job still "running" this long after its watch's ceiling has almost
+    /// certainly lost its thread or its result: offer to forget it.
+    /// `elapsed_secs` since the job was admitted.
+    fn cassandra_job_looks_stuck(elapsed_secs: u64, ceiling_secs: u64) -> bool {
+        elapsed_secs > ceiling_secs.saturating_add(10 * 60)
+    }
+
+    /// The selected nodes as job targets (node order; stopped nodes never,
+    /// they cannot be reached), and the environment's other running nodes,
+    /// which the consistency check reads.
+    fn cassandra_split_targets(
+        nodes: &[cassandra_cert::Node],
+        selected: &[String],
+    ) -> (Vec<cassandra_flow::Target>, Vec<cassandra_flow::Target>) {
+        let mut chosen = Vec::new();
+        let mut rest = Vec::new();
+        for n in nodes.iter().filter(|n| n.running) {
+            let t = cassandra_flow::Target { instance_id: n.instance_id.clone(), name: n.name.clone() };
+            if selected.contains(&n.instance_id) {
+                chosen.push(t);
+            } else {
+                rest.push(t);
+            }
         }
+        (chosen, rest)
+    }
+
+    /// Why Update cert / Roll back (both read-only) cannot start, or `None`.
+    fn cassandra_start_blocker(
+        nothing_selected: bool,
+        running: bool,
+        needs_confirmation: bool,
+        confirmed: bool,
+    ) -> Option<&'static str> {
+        if running {
+            Some("a Cassandra job is running")
+        } else if nothing_selected {
+            Some("select at least one node first")
+        } else if needs_confirmation && !confirmed {
+            Some("tick the confirmation for the nodes outside the main set first")
+        } else {
+            None
+        }
+    }
+
+    /// The cert the environment returns to, and where it came from: the
+    /// last update's pre-update capture when there is one, otherwise the
+    /// most common cert among the nodes' newest backups.
+    fn cassandra_old_cert_for(
+        last_run: Option<&cassandra_cert::LastRun>,
+        preflight: &[cassandra_flow::NodePreflight],
+    ) -> Option<(cassandra_cert::OldCert, &'static str)> {
+        if let Some(old) = last_run.and_then(|r| r.old_cert()) {
+            return Some((old, "the last update's pre-update capture"));
+        }
+        let newest: Vec<&cassandra_cert::BackupFact> = preflight
+            .iter()
+            .filter_map(|p| p.raw.as_ref().ok().and_then(|r| r.backups.first()))
+            .collect();
+        cassandra_cert::infer_old_cert(&newest)
+            .map(|old| (old, "the nodes' newest backups (no pre-update capture is recorded)"))
+    }
+
+    /// One verdict per preflight row under the backups chosen now. A row
+    /// whose preflight failed, or any row when the old cert is unknown, is
+    /// Blocked: what cannot be judged must not be restored.
+    fn cassandra_preflight_verdicts(
+        preflight: &[cassandra_flow::NodePreflight],
+        chosen_ts: &HashMap<String, String>,
+        old: Option<&cassandra_cert::OldCert>,
+    ) -> Vec<cassandra_cert::Verdict> {
+        preflight
+            .iter()
+            .map(|p| match (&p.raw, old) {
+                (Err(e), _) => cassandra_cert::Verdict::Blocked(vec![format!("preflight failed: {e}")]),
+                (Ok(_), None) => cassandra_cert::Verdict::Blocked(vec![
+                    "the environment's old cert could not be identified".to_string(),
+                ]),
+                (Ok(raw), Some(old)) => cassandra_cert::classify_preflight(
+                    raw,
+                    p.served.as_ref(),
+                    chosen_ts.get(&p.target.instance_id).map(String::as_str),
+                    old,
+                ),
+            })
+            .collect()
+    }
+
+    /// The Rollback job's `restore` (Restorable rows with their backup) and
+    /// `skipped` (Nothing-to-roll-back rows), from rows and their verdicts.
+    fn cassandra_rollback_plan(
+        preflight: &[cassandra_flow::NodePreflight],
+        verdicts: &[cassandra_cert::Verdict],
+    ) -> (Vec<cassandra_flow::RollbackNode>, Vec<cassandra_flow::Target>) {
+        let mut restore = Vec::new();
+        let mut skipped = Vec::new();
+        for (p, v) in preflight.iter().zip(verdicts) {
+            match v {
+                cassandra_cert::Verdict::Restorable { ts } => restore.push(cassandra_flow::RollbackNode {
+                    target: p.target.clone(),
+                    ts: ts.clone(),
+                }),
+                cassandra_cert::Verdict::NothingToRollBack => skipped.push(p.target.clone()),
+                cassandra_cert::Verdict::Blocked(_) => {}
+            }
+        }
+        (restore, skipped)
     }
 
     /// Run `f`, turning a panic into `"<job> panicked: …"`. A Cassandra job
@@ -55896,7 +56891,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         }
 
         fn cass_inflight(account: &str, env: &str, kind: CassandraJobKind) -> CassandraInflight {
-            CassandraInflight { account_id: account.into(), env: env.into(), kind }
+            CassandraInflight { account_id: account.into(), env: env.into(), kind, since: Instant::now() }
         }
 
         fn cass_dry_job(account: &str, env: &str) -> CassandraJob {
@@ -56107,6 +57102,204 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 targets: Vec::new(),
             };
             assert_eq!(cassandra_pending_for(&dry), None);
+        }
+
+        /// Apply and Confirm rollback are armed only by the pure gates, the
+        /// gates are what the click itself re-checks, and the selection
+        /// warnings are drawn. Scans production code only; every needle is
+        /// assembled at run time so this test cannot match its own text.
+        #[test]
+        fn apply_and_rollback_buttons_need_their_gates() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let prod = &whole[..whole.find(&format!("{}{}", "    mod tests ", "{")).expect("tests")];
+            let body = method_body(prod, "fn render_cassandra_dialog");
+            let call = |name: &str| format!("cassandra_cert::{name}(");
+            for name in ["apply_enabled", "rollback_confirm_enabled", "assess_selection", "can_confirm_rollback"] {
+                assert!(body.contains(&call(name)), "render must call {name}");
+            }
+            assert!(
+                body.contains(&format!("cassandra_flow::{}(", "dry_run_passed")),
+                "Apply must be gated on the dry run"
+            );
+            // The click is honoured only after the same gate passes again:
+            // the action arm for each restart button calls its gate.
+            let apply_arm = &body[body
+                .find(&format!("{}::{} =>", "CassandraAction", "Apply"))
+                .expect("Apply action arm")..];
+            let apply_arm = &apply_arm[..apply_arm.find("CassandraAction::").map_or(apply_arm.len(), |i| {
+                apply_arm[i + 1..].find("CassandraAction::").map_or(apply_arm.len(), |j| i + 1 + j)
+            })];
+            assert!(apply_arm.contains(&call("apply_enabled")), "{apply_arm}");
+            let rb_arm = &body[body
+                .find(&format!("{}::{} =>", "CassandraAction", "ConfirmRollback"))
+                .expect("ConfirmRollback action arm")..];
+            let rb_arm = &rb_arm[..rb_arm.find("CassandraAction::").map_or(rb_arm.len(), |i| {
+                rb_arm[i + 1..].find("CassandraAction::").map_or(rb_arm.len(), |j| i + 1 + j)
+            })];
+            assert!(rb_arm.contains(&call("rollback_confirm_enabled")), "{rb_arm}");
+            // The only places a restart job is built are those two arms.
+            for job in ["CassandraJob::Apply {", "CassandraJob::Rollback {"] {
+                assert_eq!(body.matches(job).count(), 1, "{job} built once, in its gated arm");
+            }
+        }
+
+        #[test]
+        fn a_cassandra_job_looks_stuck_only_well_past_its_ceiling() {
+            assert!(!cassandra_job_looks_stuck(0, 300));
+            assert!(!cassandra_job_looks_stuck(300 + 600, 300));
+            assert!(cassandra_job_looks_stuck(300 + 601, 300));
+        }
+
+        /// Recording when a job started does not change whose job it is.
+        #[test]
+        fn the_in_flight_identity_ignores_when_it_started() {
+            let a = cass_inflight("111", "DEV1", CassandraJobKind::Apply);
+            let mut b = a.clone();
+            b.since = a.since + Duration::from_secs(5);
+            assert_eq!(a, b);
+            assert_ne!(a, cass_inflight("111", "DEV1", CassandraJobKind::DryRun));
+        }
+
+        fn cass_node(id: &str, number: u32, running: bool) -> cassandra_cert::Node {
+            cassandra_cert::Node {
+                instance_id: id.into(),
+                name: format!("cassandra-{number:03}"),
+                number,
+                running,
+            }
+        }
+
+        #[test]
+        fn cassandra_targets_split_the_selection_from_the_running_rest() {
+            let nodes = vec![
+                cass_node("i-1", 1, true),
+                cass_node("i-2", 2, true),
+                cass_node("i-3", 101, true),
+                cass_node("i-4", 102, false),
+            ];
+            let (sel, rest) = cassandra_split_targets(&nodes, &["i-3".to_string(), "i-1".to_string()]);
+            let ids = |v: &[cassandra_flow::Target]| v.iter().map(|t| t.instance_id.clone()).collect::<Vec<_>>();
+            assert_eq!(ids(&sel), vec!["i-1", "i-3"], "node order, not click order");
+            assert_eq!(ids(&rest), vec!["i-2"], "a stopped node cannot be read and is not checked");
+            // A stopped node can never become a target, even if its id is passed.
+            let (sel, _) = cassandra_split_targets(&nodes, &["i-4".to_string()]);
+            assert!(sel.is_empty());
+        }
+
+        #[test]
+        fn a_selection_change_forgets_every_result_and_approval() {
+            let mut dlg = CassandraDialog::new(cass_env_row("111", "DEV1"), Vec::new());
+            dlg.dry = Some(Vec::new());
+            dlg.dry_selection = Some(vec!["i-1".into()]);
+            dlg.before.insert("i-1".into(), cass_cert(1, "AA"));
+            dlg.dates = vec![("p".into(), Ok(1))];
+            dlg.preflight = Some(Vec::new());
+            dlg.preflight_selection = Some(vec!["i-1".into()]);
+            dlg.chosen_ts.insert("i-1".into(), "1".into());
+            dlg.old_cert = Some(cassandra_cert::OldCert { not_after: 1, serial: None });
+            dlg.approve_apply = true;
+            dlg.approve_rollback = true;
+            dlg.confirm_outside = true;
+            dlg.forget_selection_results();
+            assert!(dlg.dry.is_none() && dlg.dry_selection.is_none());
+            assert!(dlg.before.is_empty() && dlg.dates.is_empty());
+            assert!(dlg.preflight.is_none() && dlg.preflight_selection.is_none());
+            assert!(dlg.chosen_ts.is_empty() && dlg.old_cert.is_none());
+            assert!(!dlg.approve_apply && !dlg.approve_rollback && !dlg.confirm_outside);
+        }
+
+        fn cass_backup(ts: &str, not_after: i64) -> cassandra_cert::BackupFact {
+            cassandra_cert::BackupFact {
+                ts: ts.into(),
+                path: format!("/k.jks.bak.{ts}"),
+                not_after,
+                serial: None,
+                opens: true,
+                readable: true,
+                perms_ok: true,
+            }
+        }
+
+        fn cass_preflight(
+            id: &str,
+            backups: Vec<cassandra_cert::BackupFact>,
+            served: Option<cassandra_cert::CertInfo>,
+        ) -> cassandra_flow::NodePreflight {
+            cassandra_flow::NodePreflight {
+                target: cass_target(id, id),
+                raw: Ok(cassandra_cert::PreflightRaw { backups, space_ok: true }),
+                served,
+            }
+        }
+
+        #[test]
+        fn the_old_cert_comes_from_the_last_run_else_the_newest_backups() {
+            let rows = vec![
+                cass_preflight("i-1", vec![cass_backup("2", 500), cass_backup("1", 400)], None),
+                cass_preflight("i-2", vec![cass_backup("2", 500)], None),
+            ];
+            let (old, from) = cassandra_old_cert_for(None, &rows).expect("inferred");
+            assert_eq!(old.not_after, 500);
+            assert!(from.contains("backup"), "{from}");
+            let run = cassandra_cert::LastRun {
+                when: 0,
+                kind: "update".into(),
+                nodes: Vec::new(),
+                failed: Vec::new(),
+                old_not_after: Some(300),
+                old_serial: Some("AA".into()),
+            };
+            let (old, from) = cassandra_old_cert_for(Some(&run), &rows).expect("from the run");
+            assert_eq!(old.not_after, 300);
+            assert!(from.contains("last update"), "{from}");
+            assert!(cassandra_old_cert_for(None, &[]).is_none());
+        }
+
+        #[test]
+        fn preflight_verdicts_follow_the_chooser_and_block_what_cannot_be_judged() {
+            let old = cassandra_cert::OldCert { not_after: 400, serial: None };
+            let failed = cassandra_flow::NodePreflight {
+                target: cass_target("i-3", "i-3"),
+                raw: Err("timed out".into()),
+                served: None,
+            };
+            let rows = vec![
+                cass_preflight("i-1", vec![cass_backup("2", 500), cass_backup("1", 400)], None),
+                cass_preflight("i-2", Vec::new(), Some(cass_cert(400, "AA"))),
+                failed,
+            ];
+            let mut chosen = HashMap::new();
+            let v = cassandra_preflight_verdicts(&rows, &chosen, Some(&old));
+            assert_eq!(v[0], cassandra_cert::Verdict::Restorable { ts: "2".into() }, "newest by default");
+            assert_eq!(v[1], cassandra_cert::Verdict::NothingToRollBack);
+            match &v[2] {
+                cassandra_cert::Verdict::Blocked(why) => assert!(why[0].contains("timed out")),
+                other => panic!("{other:?}"),
+            }
+            chosen.insert("i-1".to_string(), "1".to_string());
+            let v = cassandra_preflight_verdicts(&rows, &chosen, Some(&old));
+            assert_eq!(v[0], cassandra_cert::Verdict::Restorable { ts: "1".into() });
+            // No old cert identified: nothing can be judged, so everything blocks.
+            let v = cassandra_preflight_verdicts(&rows, &chosen, None);
+            assert!(v.iter().all(|x| matches!(x, cassandra_cert::Verdict::Blocked(_))));
+
+            let (restore, skipped) = cassandra_rollback_plan(
+                &rows,
+                &cassandra_preflight_verdicts(&rows[..2], &chosen, Some(&old)),
+            );
+            assert_eq!(restore.len(), 1);
+            assert_eq!(restore[0].ts, "1");
+            assert_eq!(skipped.len(), 1);
+            assert_eq!(skipped[0].instance_id, "i-2");
+        }
+
+        #[test]
+        fn starting_a_read_only_job_needs_a_confirmed_selection_and_no_job() {
+            assert!(cassandra_start_blocker(true, false, false, false).is_some());
+            assert!(cassandra_start_blocker(false, true, false, false).is_some());
+            assert!(cassandra_start_blocker(false, false, true, false).is_some());
+            assert!(cassandra_start_blocker(false, false, true, true).is_none());
+            assert!(cassandra_start_blocker(false, false, false, false).is_none());
         }
 
         fn listed(users: &[&str]) -> Vec<String> {
