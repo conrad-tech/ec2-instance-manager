@@ -3990,6 +3990,163 @@ so pointing it at a policy shared by another role takes that role's policy with
 it. Deleting something already absent is fine — the verdict checks end state,
 not the delete's exit code.
 
+### Cassandra Cert (Scripts menu)
+
+Renews the keystore cert on selected Cassandra nodes (`cassandra.sh`, dry run
+first), or rolls them back (`cassandra_rollback.sh`). Restarts the selected
+nodes together, so it is an outage by design.
+
+**Two-key gate, shipped closed.** The entry shows only when
+`cassandra_cert.enabled` is true AND the OS user is on
+`cassandra_cert.allowed_users` (`cassandra_cert_enabled_for`); the shipped
+features.json has `enabled: false` and an empty list. The menu entry is hidden,
+not greyed, and `render_cassandra_dialog` re-checks the gate every frame. The
+gate's startup line goes to the Cassandra log source, never to the shared
+`gates:` line (which everyone reads).
+
+**The Cassandra log source** (`LogSource::Cassandra`) is visible only to users
+**listed by name** in `cassandra_cert.allowed_users` (`is_listed_user`);
+`"*"` does not open it, the same rule as every other gated source. So a
+wildcard-only user gets the feature without seeing its log lines.
+
+**Where the logic lives.** `src/cassandra_cert.rs` is pure (node parsing,
+sets, selection assessment, openssl/preflight parsing, verdicts, the stability
+watch, `LastRun`, and the Apply / Confirm rollback gates `apply_enabled` /
+`rollback_confirm_enabled`). `src/cassandra_flow.rs` is the orchestration over
+an `exec` closure (instance id, command, timeout -> output), tested with a fake.
+The GUI is thin: `CassandraDialog` state, `render_cassandra_dialog`,
+`start_cassandra_job` / `run_cassandra_job` and `poll_cassandra_events`.
+
+**Sets are the hundreds digit** of `cassandra-NNN` (`001-099` is Set 0xx,
+`100-199` Set 1xx...), from the name only. One cert serves a whole
+environment, so selecting across sets, or every node of several sets, shows
+red nodes / "You selected every node in N clusters" and needs a tick.
+
+**Stale results never arm a restart.** The dialog stores the selection a dry
+run / preflight was started for; Apply and Confirm rollback need that, the ids
+the result carries and the current selection to be the same set, plus the
+outage approval, no running job and (when needed) the cross-set tick. Changing
+the selection clears every result and tick; a click re-checks the gate before
+building the job, and one dry run / preflight arms one restart.
+
+**Stage everywhere, then restart.** Apply runs `cassandra.sh --no-restart` on
+every selected node first (it backs up the old stores as
+`<keystore>.bak.<TS>`); if any node fails to stage, **no node is restarted**
+(the rest are `NotRestarted`, holding the staged keystore). Only then is
+`systemctl restart --no-block cassandra` sent to all at the same instant
+(`--no-block` so a send-command is not held for a Cassandra start), and the
+watch polls `systemctl is-active` until each node has been continuously
+`active` for `restart_stable_secs` or fails at `restart_ceiling_secs`. Why:
+nodes on different certs in one environment cannot talk to each other, so a
+rolling update would split the cluster for its whole duration.
+
+**Markers, because exit codes are discarded.** `exec_remote_command` drops the
+command's exit status, so every bundled script runs through `invocation`,
+which prints `__CC_RAN__` as the script's first statement and appends
+`__CC_RC__<rc>`. A missing marker (cut payload, no base64, timeout) is a
+**failure**, never success.
+
+**The payload: minified, byte-checked, one POSIX line.** `invocation` first
+runs the script through `minify_script` (drops comment-only and blank lines
+and trailing whitespace; heredoc bodies are copied verbatim; a `#` that is not
+a line's first non-blank character is never touched), prepends the
+`echo __CC_RAN__` line (`payload`), and base64-encodes it. The wrapper decodes
+into a `mktemp` file and runs `bash "$f" <shell_quote'd args>` only if the
+file's byte count equals the payload's; otherwise it prints `__CC_TRUNC__`
+with rc 97 (96 if `mktemp` failed), so a cut payload never runs, not even its
+sentinel. The temp file is removed on every path. Scripts run from a temp
+file (`bash <file>`), so `$0` is that path. Why minify: the renew
+send-command was 32,527 chars, over the 32,767-char Windows CreateProcess
+limit once the `aws ssm send-command` arguments are added; minified it is
+24,847, leaving ~7.4k of headroom. The budget test
+(`the_renew_invocation_fits_the_windows_command_line_budget`) holds it to
+26,000; if it fails, minify more or switch `ssm_send_command` to
+`--parameters file://` (do not just raise the budget).
+
+**Post-restart verification waits for the port.** `systemctl is-active` says
+`active` as soon as the process is up, well before the native transport
+(9142) listens, so every node that reached Stable has its served cert read
+by `read_cert_retrying`: every 5s until it parses, `VERIFY_DEADLINE_SECS`
+(180) pass, or `exec` fails twice in a row; a node still unreadable then is
+Unverified in both flows (a rollback's WrongCert means a cert was read and is
+not the old one). Apply and rollback both use it;
+the dry run and the unselected-node consistency read stay single reads.
+
+**Rollback preflight** (read-only) gives each node one of three results:
+Restorable (a backup that opens with keytool, is readable, has matching
+ownership, holds the very cert being rolled back to (same expiry; serial
+compared when both are known), and there is room for the safety copy),
+Nothing to roll back (no
+backup, but it already serves the old cert; skipped, no restart), or Blocked
+(which disables Confirm rollback). The rollback first saves the node's current
+stores as `<keystore>.rollback.<TS>`, then restores, then the same
+simultaneous restart and watch. It restores files only and does **not**
+revert the SSM parameters.
+
+The cert rolled back to is the last update's pre-update capture (`LastRun`)
+when there is one; otherwise it is inferred (`infer_old_cert`) from the
+backups CHOSEN on the nodes (each node's newest unless picked otherwise),
+recomputed on every chooser change. A chosen backup holding any other cert
+(e.g. `.bak.T1` after two updates, when the old cert is in `.bak.T2`) or
+whose expiry keytool could not read is Blocked, so it cannot restart a node
+onto a cert that only shows as wrong after the outage. The preflight runs
+keytool with `-J-Duser.timezone=UTC` so `date -u -d` can parse its dates.
+
+**Truststore.** The app never passes `--with-truststore`, so app-driven runs
+leave no truststore backup and rollback's truststore branch applies only to
+backups made by hand. With internode encryption sharing the keystore, the
+untouched truststore must already trust the new chain; an issuer change
+shows as Flagged after the restart.
+
+**Parameters are read with `describe-parameters`, never `get-parameter`**:
+only `LastModifiedDate` is needed, and a value must never be fetched. `-d` is
+passed to `cassandra.sh` only when `domain_suffix` is set; otherwise the
+script autodetects the domain. That autodetect only accepts domains ending in
+the script's hardcoded `DOMAIN_SUFFIX="dev1.net"`, so any environment whose
+nodes are not `*.dev1.net` needs `domain_suffix`. `$env_domain` is the
+lowercased environment NAME only, so a `parameters` template spells out the
+rest of the domain as the SSM path has it
+(`/cloudplatform/account/certificate/$env_domain.net/...`).
+
+**No automatic rollback, ever.** A failed or unverified node shows a Roll back
+shortcut that only starts the read-only preflight.
+
+**One job at a time, each with a generation id.** `cassandra_inflight`
+records the running job (generation id, account, environment, kind, start
+time); a second start is refused with a notice and takes no id. Ids come from
+`cassandra_next_job_id` (starting at 1, only growing), and every event the
+worker sends carries its job's id (`ProcEvent::Cassandra(id, event)`).
+`cassandra_settle` accepts an event only when its id is the in-flight job's;
+anything else is a **stale** event from a forgotten job and is logged under
+the Cassandra source as "late event from a forgotten job J<id>: ..." (a late
+`Applied` / `RolledBack` keeps its per-node lines) and changes nothing: not the
+in-flight record, not the pending run, not the dialog, and no `LastRun` is
+saved. Without the id, a forgotten job's late terminal event would end the
+next job's record and take its pending run, letting a second restart job
+overlap it on the same nodes. Accepted events are applied to the dialog only
+when it is on the job's own environment (`cassandra_event_applies`); the
+`LastRun` is recorded for the job's environment either way. A job still
+running more than `restart_ceiling_secs` + 10 minutes offers "This job looks
+stuck - forget it", which clears the record, the pending run and every dry run
+/ preflight result and approval in the dialog (nodes may be mid-restart and
+must be checked by hand).
+
+The restart gates are built in one place: `CassandraDialog::apply_gate` /
+`rollback_gate`, from the dialog's own fields, and both the button state and
+the click re-check go through `apply_armed` / `rollback_armed`. A start only
+replaces what the dialog shows once `start_cassandra_job` admitted it.
+
+**Open items.** `env_domain` is the lowercased `accounts.json` environment
+name, unconfirmed against every environment's SSM paths. `nodetool drain` is
+not run before the restart.
+
+Build status for this feature: the dialog panels (Task 10b, with its fix
+round) add 27 tests (11 lib + 16 GUI); `cargo test --features gui` measured
+2026-10-08 on `cassandra-cert-update`, after the final-review fix wave, at
+1096 lib + 3 CLI + 668 GUI, 0 failed,
+with no new build warnings. The real-shell wrapper tests run under `bash`
+and `sh` and skip with a printed reason when `bash` is missing.
+
 ### fed_auth: one inaccessible account used to stand the refresh down for good
 
 `fed up` is ONE command for every account a user holds, so an account they

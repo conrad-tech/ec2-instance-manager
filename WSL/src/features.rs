@@ -110,6 +110,8 @@ pub struct Features {
     /// Start / Stop / Restart from the Inventory right-click menu: who may
     /// see the entries.
     pub instance_power: InstancePowerFeature,
+    /// Scripts -> Cassandra Cert: who may see it, and its tunables.
+    pub cassandra_cert: CassandraCertFeature,
     /// Inventory resource sub-tabs: which target groups have their health
     /// fetched first. A preference, not a gate.
     pub resources: ResourcesFeature,
@@ -470,6 +472,70 @@ impl InstancePowerFeature {
     /// True when `user` is named on the allow-list.
     pub fn is_allowed_user(&self, user: &str) -> bool {
         user_in_list(&self.allowed_users, user)
+    }
+}
+
+/// The `cassandra_cert` section of `assets/features.json`.
+///
+/// Gates the Scripts -> Cassandra Cert dialog, which renews (and can roll
+/// back) the keystore cert on selected Cassandra nodes and restarts them.
+/// Both keys are required, as for `instance_power`: a stray `["*"]` must not
+/// arm a cluster-wide restart on its own. Ships closed.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct CassandraCertFeature {
+    /// Master switch. Shipped false.
+    pub enabled: bool,
+    /// OS usernames who may see the entry (case-insensitive). `["*"]` for
+    /// everyone, empty for nobody. Shipped empty.
+    pub allowed_users: Vec<String>,
+    /// The SSM parameter path templates, each containing the literal
+    /// `$env_domain`. Read only for their last-modified time.
+    pub parameters: Vec<String>,
+    /// Appended to the environment's domain to form `cassandra.sh -d`.
+    /// Empty means no `-d` is passed and the script autodetects the domain.
+    pub domain_suffix: String,
+    /// How long a node must stay `active` after the restart. Default 60.
+    pub restart_stable_secs: u64,
+    /// How long a node has to get there before it is failed. Default 300.
+    pub restart_ceiling_secs: u64,
+}
+
+impl Default for CassandraCertFeature {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_users: Vec::new(),
+            parameters: Vec::new(),
+            domain_suffix: String::new(),
+            restart_stable_secs: 60,
+            restart_ceiling_secs: 300,
+        }
+    }
+}
+
+impl CassandraCertFeature {
+    /// True when `user` is named on the allow-list.
+    pub fn is_allowed_user(&self, user: &str) -> bool {
+        user_in_list(&self.allowed_users, user)
+    }
+
+    /// True when `user` is named on the allow-list by name: what decides who
+    /// reads the Cassandra log source. Unlike [`Self::is_allowed_user`],
+    /// `"*"` does not match, the same rule every other gated log source
+    /// follows, so a stray wildcard cannot open the cluster output to all.
+    pub fn is_listed_user(&self, user: &str) -> bool {
+        names_user(&self.allowed_users, user)
+    }
+
+    /// `(required, ceiling)` in seconds, clamped so the watch can succeed:
+    /// at least one second of stability, and a ceiling that leaves at least
+    /// 30s beyond it. A ceiling at or below the requirement could only ever
+    /// fail.
+    pub fn watch_secs(&self) -> (u64, u64) {
+        let required = self.restart_stable_secs.max(1);
+        let ceiling = self.restart_ceiling_secs.max(required + 30);
+        (required, ceiling)
     }
 }
 
@@ -1452,6 +1518,10 @@ impl Default for Features {
             // are required by the gate, so a features.json nobody can parse
             // hands out no power to stop a production instance.
             instance_power: InstancePowerFeature::default(),
+            // Hand-written Default: `enabled` false and an empty allow-list,
+            // both required by the gate, so an unparseable features.json
+            // cannot arm a cluster-wide restart.
+            cassandra_cert: CassandraCertFeature::default(),
             // Derived Default: an empty priority list, which prioritises
             // nothing. This one is not a gate, so there is no fail-closed
             // state to reach — an unreadable features.json simply fetches in
@@ -1614,6 +1684,12 @@ impl Features {
     /// says.
     pub fn instance_power_enabled_for(&self, user: &str) -> bool {
         self.instance_power.enabled && self.instance_power.is_allowed_user(user)
+    }
+
+    /// Whether the Cassandra Cert dialog is offered to `user`: the flag AND
+    /// the name, hidden rather than greyed out, like the power entries.
+    pub fn cassandra_cert_enabled_for(&self, user: &str) -> bool {
+        self.cassandra_cert.enabled && self.cassandra_cert.is_allowed_user(user)
     }
 
     /// True when `name` is on the protected never-delete list (case- and
@@ -1967,6 +2043,50 @@ mod tests {
             "assets/features.json must ship instance_power switched off with \
              an empty allowed_users"
         );
+    }
+
+    #[test]
+    fn cassandra_cert_ships_closed() {
+        let f = Features::default();
+        assert!(!f.cassandra_cert.enabled);
+        assert!(f.cassandra_cert.allowed_users.is_empty());
+        assert!(!f.cassandra_cert_enabled_for("any.user"));
+    }
+
+    #[test]
+    fn cassandra_cert_needs_the_flag_and_the_name() {
+        let mut f = Features::default();
+        f.cassandra_cert.allowed_users = vec!["bconrad".into()];
+        assert!(!f.cassandra_cert_enabled_for("bconrad"), "name alone is not enough");
+        f.cassandra_cert.enabled = true;
+        assert!(f.cassandra_cert_enabled_for("BConrad"), "case-insensitive");
+        assert!(!f.cassandra_cert_enabled_for("someone.else"));
+    }
+
+    #[test]
+    fn cassandra_cert_watch_defaults_and_clamps() {
+        let d = CassandraCertFeature::default();
+        assert_eq!(d.watch_secs(), (60, 300));
+        let odd = CassandraCertFeature {
+            restart_stable_secs: 0,
+            restart_ceiling_secs: 10,
+            ..CassandraCertFeature::default()
+        };
+        // Required is at least 1s; the ceiling always leaves room to succeed.
+        assert_eq!(odd.watch_secs(), (1, 31));
+        let tight = CassandraCertFeature {
+            restart_stable_secs: 120,
+            restart_ceiling_secs: 60,
+            ..CassandraCertFeature::default()
+        };
+        assert_eq!(tight.watch_secs(), (120, 150));
+    }
+
+    #[test]
+    fn the_bundled_features_declare_cassandra_cert_closed() {
+        let f: Features = serde_json::from_str(&bundled_features()).expect("parses");
+        assert!(!f.cassandra_cert.enabled);
+        assert!(f.cassandra_cert.allowed_users.is_empty());
     }
 
     /// Both halves are required, so a stray `["*"]` copied into the file

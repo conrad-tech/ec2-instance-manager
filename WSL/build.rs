@@ -419,6 +419,10 @@ fn emit_obfuscated_assets() {
         ("reaper_docker_ps.sh.obf", "assets/scripts/reaper_docker_ps.sh"),
         ("reaper_probe.sh.obf", "assets/scripts/reaper_probe.sh"),
         ("reaper_watch.sh.obf", "assets/scripts/reaper_watch.sh"),
+        ("cassandra.sh.obf", "assets/scripts/cassandra.sh"),
+        ("cassandra_check.sh.obf", "assets/scripts/cassandra_check.sh"),
+        ("cassandra_rollback_check.sh.obf", "assets/scripts/cassandra_rollback_check.sh"),
+        ("cassandra_rollback.sh.obf", "assets/scripts/cassandra_rollback.sh"),
     ];
 
     for (out_name, src) in assets {
