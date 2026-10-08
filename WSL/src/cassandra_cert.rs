@@ -330,6 +330,242 @@ pub fn stale_unselected(result: &CertInfo, others: &[(String, Option<CertInfo>)]
         .collect()
 }
 
+/// One `__CC_PF_BACKUP__` line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackupFact {
+    pub ts: String,
+    pub path: String,
+    pub not_after: i64,
+    pub serial: Option<String>,
+    pub opens: bool,
+    pub readable: bool,
+    pub perms_ok: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreflightRaw {
+    /// Newest first, as the script lists them.
+    pub backups: Vec<BackupFact>,
+    pub space_ok: bool,
+}
+
+/// `None` unless both the BEGIN and END markers are present: a preflight cut
+/// short must never read as "no backups found".
+pub fn parse_preflight(out: &str) -> Option<PreflightRaw> {
+    if !out.contains("__CC_PF_BEGIN__") || !out.contains("__CC_PF_END__") {
+        return None;
+    }
+    let mut backups = Vec::new();
+    let mut space_ok = false;
+    for line in out.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("__CC_PF_BACKUP__ ") {
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            if f.len() != 7 {
+                continue;
+            }
+            backups.push(BackupFact {
+                ts: f[0].to_string(),
+                path: f[1].to_string(),
+                not_after: f[2].parse().unwrap_or(0),
+                serial: (f[3] != "-").then(|| f[3].to_ascii_uppercase()),
+                opens: f[4] == "1",
+                readable: f[5] == "1",
+                perms_ok: f[6] == "1",
+            });
+        } else if let Some(rest) = line.strip_prefix("__CC_PF_SPACE__ ") {
+            space_ok = rest.trim() == "1";
+        }
+    }
+    Some(PreflightRaw { backups, space_ok })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// A backup passes every check; restore it.
+    Restorable { ts: String },
+    /// No backup, but the node already serves the old cert.
+    NothingToRollBack,
+    /// Cannot be returned to the old cert. Blocks the whole rollback.
+    Blocked(Vec<String>),
+}
+
+pub fn classify_preflight(
+    raw: &PreflightRaw,
+    served: Option<&CertInfo>,
+    chosen_ts: Option<&str>,
+    old: &OldCert,
+) -> Verdict {
+    if raw.backups.is_empty() {
+        return match served {
+            Some(c) if served_matches(c, old) => Verdict::NothingToRollBack,
+            Some(_) => Verdict::Blocked(vec![
+                "no backup on this node and it is serving the new cert".into(),
+            ]),
+            None => Verdict::Blocked(vec![
+                "no backup on this node and the cert it serves could not be read".into(),
+            ]),
+        };
+    }
+    let chosen = match chosen_ts {
+        Some(ts) => raw.backups.iter().find(|b| b.ts == ts),
+        None => raw.backups.first(),
+    };
+    let Some(b) = chosen else {
+        return Verdict::Blocked(vec![format!(
+            "the chosen backup {} does not exist on this node",
+            chosen_ts.unwrap_or("?")
+        )]);
+    };
+    let mut why = Vec::new();
+    if !b.readable {
+        why.push(format!("backup {} is not readable", b.ts));
+    }
+    if !b.opens {
+        why.push(format!(
+            "keytool cannot open backup {} with the store password",
+            b.ts
+        ));
+    }
+    if !b.perms_ok {
+        why.push(format!(
+            "backup {} has a different owner/group from the live keystore",
+            b.ts
+        ));
+    }
+    if !raw.space_ok {
+        why.push("not enough free space for the .rollback safety copy".into());
+    }
+    if why.is_empty() {
+        Verdict::Restorable { ts: b.ts.clone() }
+    } else {
+        Verdict::Blocked(why)
+    }
+}
+
+/// Enabled only when nothing is blocked and at least one node would change.
+pub fn can_confirm_rollback(verdicts: &[Verdict]) -> bool {
+    !verdicts.iter().any(|v| matches!(v, Verdict::Blocked(_)))
+        && verdicts
+            .iter()
+            .any(|v| matches!(v, Verdict::Restorable { .. }))
+}
+
+/// True when the nodes to be restored would use different backup timestamps.
+pub fn timestamps_disagree(verdicts: &[Verdict]) -> bool {
+    let mut seen: Vec<&str> = Vec::new();
+    for v in verdicts {
+        if let Verdict::Restorable { ts } = v {
+            if !seen.contains(&ts.as_str()) {
+                seen.push(ts);
+            }
+        }
+    }
+    seen.len() > 1
+}
+
+/// The cert the environment is returning to, taken from what the nodes' newest
+/// backups say: the most common expiry, ties going to the later one.
+pub fn infer_old_cert(newest: &[&BackupFact]) -> Option<OldCert> {
+    let mut counts: BTreeMap<i64, (usize, Option<String>)> = BTreeMap::new();
+    for b in newest.iter().filter(|b| b.opens && b.not_after > 0) {
+        let e = counts.entry(b.not_after).or_insert((0, b.serial.clone()));
+        e.0 += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1 .0.cmp(&b.1 .0).then(a.0.cmp(&b.0)))
+        .map(|(not_after, (_, serial))| OldCert { not_after, serial })
+}
+
+/// `cassandra_check.sh` output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckRaw {
+    pub cert: Option<CertInfo>,
+    pub active: String,
+}
+
+pub fn parse_check(out: &str) -> Option<CheckRaw> {
+    if !out.contains("__CC_BEGIN__") || !out.contains("__CC_END__") {
+        return None;
+    }
+    let cert_text = out
+        .split("__CC_CERT_BEGIN__")
+        .nth(1)
+        .and_then(|s| s.split("__CC_CERT_END__").next())
+        .unwrap_or("");
+    let active = out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("__CC_ACTIVE__ "))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    Some(CheckRaw {
+        cert: parse_openssl(cert_text),
+        active,
+    })
+}
+
+/// The `__CC_RC__<n>` the app appends to every script invocation. Absent or
+/// unparseable means the verdict is unknown, which callers treat as failure.
+pub fn parse_rc(out: &str) -> Option<i32> {
+    out.lines()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("__CC_RC__"))
+        .and_then(|n| n.trim().parse().ok())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchState {
+    Pending,
+    Stable,
+    Failed,
+}
+
+/// One node's post-restart watch. Pure: the caller supplies `now` (seconds
+/// from any monotonic origin) and whether the node reported `active`.
+#[derive(Clone, Debug)]
+pub struct StabilityWatch {
+    required: u64,
+    ceiling: u64,
+    started: Option<u64>,
+    stable_since: Option<u64>,
+    done: Option<WatchState>,
+}
+
+impl StabilityWatch {
+    pub fn new(required_secs: u64, ceiling_secs: u64) -> Self {
+        Self {
+            required: required_secs,
+            ceiling: ceiling_secs,
+            started: None,
+            stable_since: None,
+            done: None,
+        }
+    }
+
+    pub fn observe(&mut self, now: u64, active: bool) -> WatchState {
+        if let Some(done) = self.done {
+            return done;
+        }
+        let started = *self.started.get_or_insert(now);
+        if active {
+            let since = *self.stable_since.get_or_insert(now);
+            if now.saturating_sub(since) >= self.required {
+                self.done = Some(WatchState::Stable);
+                return WatchState::Stable;
+            }
+        } else {
+            self.stable_since = None;
+        }
+        if now.saturating_sub(started) >= self.ceiling {
+            self.done = Some(WatchState::Failed);
+            return WatchState::Failed;
+        }
+        WatchState::Pending
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,5 +876,187 @@ mod tests {
             stale_unselected(&result, &others),
             ["cassandra-101", "cassandra-103 (unreadable)"]
         );
+    }
+
+    fn backup(ts: &str, not_after: i64) -> BackupFact {
+        BackupFact {
+            ts: ts.into(),
+            path: format!("/etc/cassandra/conf/cassandra-keystore.jks.bak.{ts}"),
+            not_after,
+            serial: Some("01".into()),
+            opens: true,
+            readable: true,
+            perms_ok: true,
+        }
+    }
+
+    const OLD: OldCert = OldCert { not_after: 1000, serial: None };
+
+    #[test]
+    fn the_rollback_check_output_parses() {
+        let out = "__CC_PF_BEGIN__\n\
+            __CC_PF_KEYSTORE__ /etc/cassandra/conf/cassandra-keystore.jks\n\
+            __CC_PF_BACKUP__ 20260903070123 /k.bak.20260903070123 1790000000 0AB1 1 1 1\n\
+            __CC_PF_BACKUP__ 20250903070123 /k.bak.20250903070123 0 - 0 1 0\n\
+            __CC_PF_SPACE__ 1\n__CC_PF_END__\n";
+        let raw = parse_preflight(out).expect("parses");
+        assert_eq!(raw.backups.len(), 2);
+        assert_eq!(raw.backups[0].ts, "20260903070123");
+        assert_eq!(raw.backups[0].not_after, 1_790_000_000);
+        assert_eq!(raw.backups[0].serial.as_deref(), Some("0AB1"));
+        assert!(raw.backups[0].opens && raw.backups[0].perms_ok);
+        assert!(!raw.backups[1].opens && !raw.backups[1].perms_ok);
+        assert_eq!(raw.backups[1].serial, None, "- means no serial");
+        assert!(raw.space_ok);
+    }
+
+    #[test]
+    fn a_truncated_check_is_not_a_preflight() {
+        assert!(parse_preflight("").is_none());
+        assert!(parse_preflight("__CC_PF_BEGIN__\n__CC_PF_SPACE__ 1\n").is_none(), "no END marker");
+    }
+
+    #[test]
+    fn a_clean_backup_is_restorable() {
+        let raw = PreflightRaw { backups: vec![backup("20260903070123", 1000)], space_ok: true };
+        assert_eq!(
+            classify_preflight(&raw, None, None, &OLD),
+            Verdict::Restorable { ts: "20260903070123".into() }
+        );
+    }
+
+    #[test]
+    fn the_chosen_backup_is_the_one_that_is_checked() {
+        let mut bad = backup("20250101000000", 900);
+        bad.opens = false;
+        let raw = PreflightRaw {
+            backups: vec![backup("20260903070123", 1000), bad],
+            space_ok: true,
+        };
+        assert!(matches!(classify_preflight(&raw, None, None, &OLD), Verdict::Restorable { .. }));
+        match classify_preflight(&raw, None, Some("20250101000000"), &OLD) {
+            Verdict::Blocked(why) => assert!(why[0].contains("keytool"), "{why:?}"),
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_failed_check_is_named() {
+        let mut b = backup("20260903070123", 1000);
+        b.readable = false;
+        b.perms_ok = false;
+        let raw = PreflightRaw { backups: vec![b], space_ok: false };
+        match classify_preflight(&raw, None, None, &OLD) {
+            Verdict::Blocked(why) => assert_eq!(why.len(), 3, "{why:?}"),
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_backup_but_already_on_the_old_cert_is_nothing_to_roll_back() {
+        let raw = PreflightRaw { backups: vec![], space_ok: true };
+        let served = cert("/CN=x", "/CN=y", 1000, "01");
+        assert_eq!(classify_preflight(&raw, Some(&served), None, &OLD), Verdict::NothingToRollBack);
+    }
+
+    #[test]
+    fn no_backup_on_the_new_cert_blocks() {
+        let raw = PreflightRaw { backups: vec![], space_ok: true };
+        let served = cert("/CN=x", "/CN=y", 2000, "02");
+        assert!(matches!(
+            classify_preflight(&raw, Some(&served), None, &OLD),
+            Verdict::Blocked(_)
+        ));
+        // And if the served cert cannot be read at all, that is not "fine".
+        assert!(matches!(classify_preflight(&raw, None, None, &OLD), Verdict::Blocked(_)));
+    }
+
+    #[test]
+    fn only_a_blocked_node_stops_the_rollback() {
+        let ok = Verdict::Restorable { ts: "1".into() };
+        let skip = Verdict::NothingToRollBack;
+        let bad = Verdict::Blocked(vec!["x".into()]);
+        assert!(can_confirm_rollback(&[ok.clone(), skip.clone()]));
+        assert!(!can_confirm_rollback(&[ok.clone(), bad]));
+        assert!(!can_confirm_rollback(&[skip.clone()]), "nothing would be restored");
+        assert!(!can_confirm_rollback(&[]));
+        assert!(timestamps_disagree(&[
+            Verdict::Restorable { ts: "1".into() },
+            Verdict::Restorable { ts: "2".into() }
+        ]));
+        assert!(!timestamps_disagree(&[ok.clone(), ok, skip]));
+    }
+
+    #[test]
+    fn the_old_cert_is_the_most_common_newest_backup() {
+        let a = backup("2", 1000);
+        let b = backup("2", 1000);
+        let c = backup("2", 500);
+        let old = infer_old_cert(&[&a, &b, &c]).expect("some");
+        assert_eq!(old.not_after, 1000);
+        assert!(infer_old_cert(&[]).is_none());
+    }
+
+    #[test]
+    fn the_check_script_output_parses() {
+        let out = format!(
+            "__CC_BEGIN__\n__CC_HOST__ h\n__CC_CERT_BEGIN__\n{SCREENSHOT}__CC_CERT_END__\n__CC_ACTIVE__ active\n__CC_END__\n"
+        );
+        let c = parse_check(&out).expect("parses");
+        assert!(c.cert.is_some());
+        assert_eq!(c.active, "active");
+        // A node not serving a cert still reports its service state.
+        let none = "__CC_BEGIN__\n__CC_CERT_BEGIN__\nunable to load\n__CC_CERT_END__\n__CC_ACTIVE__ failed\n__CC_END__\n";
+        let c = parse_check(none).expect("parses");
+        assert!(c.cert.is_none());
+        assert_eq!(c.active, "failed");
+        assert!(parse_check("garbage").is_none());
+    }
+
+    #[test]
+    fn a_missing_return_code_is_a_failure_not_a_success() {
+        assert_eq!(parse_rc("INFO: done\n__CC_RC__0\n"), Some(0));
+        assert_eq!(parse_rc("ERROR: nope\n__CC_RC__1\n"), Some(1));
+        assert_eq!(parse_rc("INFO: still going"), None, "truncated output has no verdict");
+        assert_eq!(parse_rc(""), None);
+        assert_eq!(parse_rc("__CC_RC__abc"), None);
+    }
+
+    #[test]
+    fn a_node_must_stay_active_for_the_whole_requirement() {
+        let mut w = StabilityWatch::new(60, 300);
+        assert_eq!(w.observe(0, false), WatchState::Pending);
+        assert_eq!(w.observe(5, true), WatchState::Pending);
+        assert_eq!(w.observe(64, true), WatchState::Pending, "59s is not 60s");
+        assert_eq!(w.observe(65, true), WatchState::Stable);
+        // Terminal: a later blip does not un-stabilise a node already judged.
+        assert_eq!(w.observe(70, false), WatchState::Stable);
+    }
+
+    #[test]
+    fn leaving_active_restarts_the_clock() {
+        let mut w = StabilityWatch::new(60, 300);
+        assert_eq!(w.observe(0, true), WatchState::Pending);
+        assert_eq!(w.observe(50, false), WatchState::Pending, "flapped at 50s");
+        assert_eq!(w.observe(55, true), WatchState::Pending);
+        assert_eq!(w.observe(114, true), WatchState::Pending);
+        assert_eq!(w.observe(115, true), WatchState::Stable);
+    }
+
+    #[test]
+    fn a_node_that_never_gets_there_fails_at_the_ceiling() {
+        let mut w = StabilityWatch::new(60, 300);
+        assert_eq!(w.observe(0, false), WatchState::Pending);
+        assert_eq!(w.observe(299, false), WatchState::Pending);
+        assert_eq!(w.observe(300, false), WatchState::Failed);
+        assert_eq!(w.observe(310, true), WatchState::Failed, "terminal");
+    }
+
+    #[test]
+    fn reaching_the_requirement_at_the_ceiling_still_counts() {
+        let mut w = StabilityWatch::new(60, 300);
+        assert_eq!(w.observe(0, false), WatchState::Pending);
+        assert_eq!(w.observe(240, true), WatchState::Pending);
+        assert_eq!(w.observe(300, true), WatchState::Stable);
     }
 }
