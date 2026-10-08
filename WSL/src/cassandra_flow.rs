@@ -800,6 +800,12 @@ mod script_tests {
             "keytool must run under LC_ALL=C"
         );
         assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("LC_ALL=C keytool") && l.contains("-J-Duser.timezone=UTC")),
+            "keytool must print its dates in UTC so `date -d` can parse them"
+        );
+        assert!(
             lines.iter().any(|l| l.contains("LC_ALL=C date -u")),
             "date must run under LC_ALL=C"
         );

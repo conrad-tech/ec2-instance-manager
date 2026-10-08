@@ -52,7 +52,9 @@ KEYSTORE_DIR=$(dirname "${KEYSTORE_PATH}")
 cert_facts () {
   local out until_text serial epoch
   # LC_ALL=C: the label matching and date parsing must not depend on the node's locale.
-  out=$(LC_ALL=C keytool -list -v -keystore "$1" -storepass "${STORE_PASSWORD}" 2>/dev/null) || return 1
+  # UTC: keytool prints dates in the JVM's zone, and `date -d` cannot parse
+  # many zone abbreviations, so pin the zone to one it always understands.
+  out=$(LC_ALL=C keytool -J-Duser.timezone=UTC -list -v -keystore "$1" -storepass "${STORE_PASSWORD}" 2>/dev/null) || return 1
   until_text=$(printf '%s\n' "${out}" | awk -F'until: ' '/Valid from:/ { print $2; exit }')
   serial=$(printf '%s\n' "${out}" | awk -F': ' '/Serial number:/ { print toupper($2); exit }')
   [ -n "${until_text}" ] || return 1
