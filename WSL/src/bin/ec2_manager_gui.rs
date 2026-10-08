@@ -45619,7 +45619,7 @@ mod gui {
         let mut counts: Vec<(cassandra_cert::OldCert, usize)> = Vec::new();
         for cert in before.values() {
             let old = cassandra_cert::OldCert::from(cert);
-            match counts.iter_mut().find(|(o, _)| *o == old) {
+            match counts.iter_mut().find(|(o, _)| cassandra_cert::old_cert_eq(o, &old)) {
                 Some((_, n)) => *n += 1,
                 None => counts.push((old, 1)),
             }
@@ -45629,7 +45629,12 @@ mod gui {
             .max_by(|(a, an), (b, bn)| {
                 an.cmp(bn)
                     .then(a.not_after.cmp(&b.not_after))
-                    .then(b.serial.cmp(&a.serial))
+                    .then(
+                        b.serial
+                            .as_deref()
+                            .map(cassandra_cert::normalize_serial)
+                            .cmp(&a.serial.as_deref().map(cassandra_cert::normalize_serial)),
+                    )
             })
             .map(|(o, _)| o)
     }

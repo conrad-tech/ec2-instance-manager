@@ -1979,6 +1979,26 @@ mod flow_tests {
     }
 
     #[test]
+    fn a_rollback_to_a_keytool_style_serial_is_up_when_openssl_prints_a_leading_zero() {
+        let fake = Fake::new(|_id, cmd| {
+            if cmd.contains("is-active") { Ok("active\n".into()) }
+            else if cmd.contains("systemctl restart") { Ok("__CC_RC__0\n".into()) }
+            else if cmd.contains("--restore") { Ok(RESTORED.into()) }
+            else { Ok(cert_out(OLD_AFTER, "0A1B2C3D", "active")) }
+        });
+        let clock = Clock::new();
+        let now = || clock.0.load(Ordering::SeqCst);
+        let sleep = |d: Duration| { clock.0.fetch_add(d.as_secs(), Ordering::SeqCst); };
+        let pacer = Pacer { now: &now, sleep: &sleep };
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let old = OldCert { not_after: old_cert_info().not_after, serial: Some("A1B2C3D".into()) };
+        let restore = [rb_node("i-1", "1")];
+        let input = RollbackInput { restore: &restore, skipped: &[], unselected: &[], old: &old, required_secs: 60, ceiling_secs: 300 };
+        let rep = rollback(&exec, &input, &pacer, &|_| {});
+        assert_eq!(rep.nodes[0].1, RollbackStatus::Up);
+    }
+
+    #[test]
     fn the_dry_run_reads_the_cert_once() {
         let fake = Fake::new(|_id, cmd| {
             if cmd.contains("--dry-run") { Ok(STAGED.into()) } else { Ok(NO_CERT_YET.into()) }

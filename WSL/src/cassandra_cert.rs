@@ -250,24 +250,60 @@ impl From<&CertInfo> for OldCert {
     }
 }
 
+/// A serial in one canonical form: whitespace and `:` separators removed,
+/// uppercased, every leading `0` stripped (all zeros -> "0"). openssl prints
+/// `0A1B2C3D`, keytool `a1b2c3d`; both are `A1B2C3D`. For comparing only:
+/// stored and displayed serials keep their own format.
+pub fn normalize_serial(s: &str) -> String {
+    let hex: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ':')
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    let trimmed = hex.trim_start_matches('0');
+    if trimmed.is_empty() && !hex.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Whether two serials name the same number, whichever tool printed them.
+/// The one place serials are compared.
+pub fn serial_eq(a: &str, b: &str) -> bool {
+    normalize_serial(a) == normalize_serial(b)
+}
+
+/// Serials agree when either side has none (compared only when both do).
+fn serials_agree(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => serial_eq(a, b),
+        _ => true,
+    }
+}
+
+/// Whether two old-cert identities are the same cert: expiry equal, and the
+/// serial present on both or neither and then equal by `serial_eq`. For
+/// grouping identical captures, so "no serial" is its own group.
+pub fn old_cert_eq(a: &OldCert, b: &OldCert) -> bool {
+    a.not_after == b.not_after
+        && match (&a.serial, &b.serial) {
+            (Some(x), Some(y)) => serial_eq(x, y),
+            (None, None) => true,
+            _ => false,
+        }
+}
+
 /// Whether what a node serves is `old`. The serial is compared only when both
 /// sides have one (a keystore backup read through keytool may not).
 pub fn served_matches(served: &CertInfo, old: &OldCert) -> bool {
-    served.not_after == old.not_after
-        && match (&served.serial, &old.serial) {
-            (Some(a), Some(b)) => a == b,
-            _ => true,
-        }
+    served.not_after == old.not_after && serials_agree(&served.serial, &old.serial)
 }
 
 /// Whether a keystore backup holds `old`: the rule `served_matches` uses
 /// (expiry equal, serial compared only when both sides have one).
 pub fn backup_matches(b: &BackupFact, old: &OldCert) -> bool {
-    b.not_after == old.not_after
-        && match (&b.serial, &old.serial) {
-            (Some(a), Some(o)) => a == o,
-            _ => true,
-        }
+    b.not_after == old.not_after && serials_agree(&b.serial, &old.serial)
 }
 
 /// Epoch seconds as local `YYYY-MM-DD HH:MM` (`@<epoch>` if out of range).
@@ -1414,6 +1450,63 @@ mod tests {
             Verdict::Blocked(why) => {
                 assert_eq!(why.len(), 1, "{why:?}");
                 assert!(why[0].contains("cannot tell which cert backup 20260903070123 holds"), "{why:?}");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serials_compare_as_numbers_whichever_tool_printed_them() {
+        assert!(serial_eq("0A1B2C3D", "A1B2C3D"), "openssl keeps leading zeros, keytool drops them");
+        assert!(serial_eq("a1b2c3d", "A1B2C3D"), "case");
+        assert!(serial_eq("0A:1B:2C:3D", "A1B2C3D"), "colons");
+        assert!(serial_eq("  0A1B2C3D\n", "A1B2C3D"), "whitespace");
+        assert!(serial_eq("00", "0"));
+        assert_eq!(normalize_serial("000"), "0");
+        assert!(!serial_eq("AB", "AC"));
+        assert!(!serial_eq("0AB", "AB0"), "different numbers after stripping");
+        assert!(!serial_eq("A1B2C3D", "A1B2C3"), "different lengths");
+    }
+
+    #[test]
+    fn a_leading_zero_serial_from_openssl_matches_keytools_form() {
+        let served = cert("/CN=x", "/CN=y", 1000, "0A1B2C3D");
+        assert!(served_matches(&served, &OldCert { not_after: 1000, serial: Some("A1B2C3D".into()) }));
+        assert!(!served_matches(&served, &OldCert { not_after: 1000, serial: Some("B1B2C3D".into()) }));
+        assert!(old_cert_eq(
+            &OldCert { not_after: 1, serial: Some("0A".into()) },
+            &OldCert { not_after: 1, serial: Some("a".into()) }
+        ));
+        assert!(!old_cert_eq(
+            &OldCert { not_after: 1, serial: Some("0A".into()) },
+            &OldCert { not_after: 1, serial: None }
+        ));
+    }
+
+    #[test]
+    fn a_keytool_backup_serial_matches_the_last_runs_openssl_serial() {
+        let run = LastRun {
+            when: 0,
+            kind: "update".into(),
+            nodes: Vec::new(),
+            failed: Vec::new(),
+            old_not_after: Some(1000),
+            old_serial: Some("0A1B2C3D".into()),
+        };
+        let old = run.old_cert().expect("captured");
+        let mut b = backup("20260903070123", 1000);
+        b.serial = Some("A1B2C3D".into());
+        let raw = PreflightRaw { backups: vec![b.clone()], space_ok: true };
+        assert!(backup_matches(&b, &old));
+        assert_eq!(
+            classify_preflight(&raw, None, None, &old),
+            Verdict::Restorable { ts: "20260903070123".into() }
+        );
+        b.serial = Some("B1B2C3D".into());
+        let raw = PreflightRaw { backups: vec![b], space_ok: true };
+        match classify_preflight(&raw, None, None, &old) {
+            Verdict::Blocked(why) => {
+                assert!(why[0].contains("not the one this environment is rolling back to"), "{why:?}")
             }
             other => panic!("expected Blocked, got {other:?}"),
         }
