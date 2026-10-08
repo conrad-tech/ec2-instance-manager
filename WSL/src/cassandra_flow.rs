@@ -51,19 +51,114 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// A script handed over as base64 on bash's stdin (how every script here
-/// travels), with its arguments quoted and its exit code appended as a
+/// A script with its comment-only and blank lines dropped and trailing
+/// whitespace stripped, so the send-command that carries it stays well under
+/// the Windows command-line limit. Heredoc bodies (`<<TAG`, `<<-TAG`,
+/// `<<'TAG'`, `<<"TAG"`) are copied verbatim up to and including their
+/// closing line; a `#` that is not a line's first non-blank character is
+/// never touched. A leading `#!` line is a comment here and is dropped.
+pub fn minify_script(script: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    // Tags of heredocs opened and not yet closed, in the order bash reads them.
+    let mut pending: std::collections::VecDeque<(String, bool)> = std::collections::VecDeque::new();
+    for line in script.lines() {
+        if let Some((tag, strip_tabs)) = pending.front() {
+            out.push(line);
+            let body = if *strip_tabs { line.trim_start_matches('\t') } else { line };
+            if body == tag {
+                pending.pop_front();
+            }
+            continue;
+        }
+        let kept = line.trim_end();
+        let lead = kept.trim_start();
+        if lead.is_empty() || lead.starts_with('#') {
+            continue;
+        }
+        out.push(kept);
+        pending.extend(heredoc_tags(kept));
+    }
+    let mut text = out.join("\n");
+    if script.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+/// The heredoc tags a line opens, with whether each is `<<-` (leading tabs
+/// stripped from its closing line). `<<<` here-strings are not heredocs.
+fn heredoc_tags(line: &str) -> Vec<(String, bool)> {
+    let b = line.as_bytes();
+    let mut tags = Vec::new();
+    let mut i = 0;
+    while i + 1 < b.len() {
+        if b[i] != b'<' || b[i + 1] != b'<' {
+            i += 1;
+            continue;
+        }
+        if b.get(i + 2) == Some(&b'<') {
+            // A here-string: skip all three.
+            i += 3;
+            continue;
+        }
+        let mut j = i + 2;
+        let strip_tabs = b.get(j) == Some(&b'-');
+        if strip_tabs {
+            j += 1;
+        }
+        while b.get(j).is_some_and(|c| *c == b' ' || *c == b'\t') {
+            j += 1;
+        }
+        let quote = b.get(j).copied().filter(|c| *c == b'\'' || *c == b'"');
+        if quote.is_some() {
+            j += 1;
+        }
+        let start = j;
+        while b.get(j).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') {
+            j += 1;
+        }
+        let ident_ok = j > start && !b[start].is_ascii_digit();
+        let closed = match quote {
+            Some(q) => b.get(j) == Some(&q),
+            None => true,
+        };
+        if ident_ok && closed {
+            tags.push((line[start..j].to_string(), strip_tabs));
+        }
+        i = j.max(i + 2);
+    }
+    tags
+}
+
+/// The exact text a bundled script runs as: minified, with the `__CC_RAN__`
+/// sentinel as its own first statement, so empty, partial or cut input never
+/// prints it and `script_rc` can tell.
+pub(crate) fn payload(script: &str) -> String {
+    format!("echo __CC_RAN__\n{}", minify_script(script))
+}
+
+/// A script handed over as base64, decoded into a temp file whose byte count
+/// is checked before bash runs it (a cut payload never runs, not even its
+/// sentinel), with its arguments quoted and its exit code appended as a
 /// `__CC_RC__<n>` marker. `exec_remote_command` discards the command's own
 /// exit code, so without the marker a failed script is indistinguishable from
-/// a successful one.
+/// a successful one. One POSIX command line: AWS-RunShellScript may run it
+/// under `sh` or `bash`. The temp file is removed on every path that made one.
 pub fn invocation(script: &str, args: &[&str]) -> String {
-    // The sentinel is the script's own first statement: empty, partial or cut
-    // stdin (e.g. no `base64`) never prints it, so `script_rc` can tell.
-    let b64 = base64::engine::general_purpose::STANDARD.encode(format!("echo __CC_RAN__\n{script}").as_bytes());
+    let text = payload(script);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     let quoted: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
+    let mut run = String::from("bash \"$f\"");
+    for q in &quoted {
+        run.push(' ');
+        run.push_str(q);
+    }
     format!(
-        "out=$(echo {b64} | base64 -d | bash -s -- {} 2>&1); rc=$?; printf '%s\\n' \"$out\"; echo \"__CC_RC__$rc\"",
-        quoted.join(" ")
+        "out=__CC_NOTMP__; rc=96; f=$(mktemp) && {{ printf '%s' {b64} | base64 -d > \"$f\"; \
+         if [ \"$(wc -c < \"$f\")\" -eq {n} ]; then out=$({run} 2>&1); rc=$?; \
+         else out=__CC_TRUNC__; rc=97; fi; rm -f \"$f\"; }}; \
+         printf '%s\\n' \"$out\"; echo \"__CC_RC__$rc\"",
+        n = text.len()
     )
 }
 
@@ -916,24 +1011,242 @@ mod flow_tests {
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }
 
+    /// The base64 payload inside an invocation.
+    fn b64_of(cmd: &str) -> &str {
+        cmd.split("printf '%s' ").nth(1).and_then(|r| r.split(' ').next()).expect("a payload")
+    }
+
+    fn decoded(cmd: &str) -> String {
+        use base64::Engine;
+        String::from_utf8(base64::engine::general_purpose::STANDARD.decode(b64_of(cmd)).unwrap()).unwrap()
+    }
+
     #[test]
     fn an_invocation_appends_the_return_code_marker() {
         let cmd = invocation("echo hi", &["--dry-run", "-d", "dev1.net"]);
-        assert!(cmd.starts_with("out=$(echo "), "{cmd}");
-        assert!(cmd.contains("base64 -d | bash -s -- '--dry-run' '-d' 'dev1.net'"), "{cmd}");
+        assert!(cmd.starts_with("out=__CC_NOTMP__; rc=96; f=$(mktemp) && { printf '%s' "), "{cmd}");
+        assert!(cmd.contains("| base64 -d > \"$f\"; "), "{cmd}");
+        let n = payload("echo hi").len();
+        assert!(cmd.contains(&format!("if [ \"$(wc -c < \"$f\")\" -eq {n} ]; then ")), "{cmd}");
+        assert!(cmd.contains("out=$(bash \"$f\" '--dry-run' '-d' 'dev1.net' 2>&1); rc=$?;"), "{cmd}");
+        assert!(cmd.contains("else out=__CC_TRUNC__; rc=97; fi; rm -f \"$f\"; };"), "{cmd}");
         assert!(cmd.contains("printf '%s\\n' \"$out\""), "{cmd}");
-        assert!(cmd.contains("rc=$?"), "{cmd}");
         assert!(cmd.ends_with("echo \"__CC_RC__$rc\""), "{cmd}");
+        assert!(!cmd.contains('\n'), "one command line: {cmd}");
+        for bashism in ["[[", "pipefail", "<<<", "$'"] {
+            assert!(!cmd.contains(bashism), "not POSIX: {bashism}");
+        }
     }
 
     #[test]
     fn the_payload_starts_with_the_ran_sentinel() {
-        use base64::Engine;
         let cmd = invocation("echo body", &[]);
-        let b64 = cmd.trim_start_matches("out=$(echo ").split(' ').next().unwrap();
-        let text = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(b64).unwrap()).unwrap();
+        let text = decoded(&cmd);
         assert!(text.starts_with("echo __CC_RAN__\n"), "{text}");
         assert!(text.ends_with("echo body"), "{text}");
+        assert_eq!(text, payload("echo body"));
+    }
+
+    #[test]
+    fn minify_drops_comment_only_and_blank_lines() {
+        let src = "#!/bin/bash\n# a comment\n\n   # indented comment\necho a   \n\t\necho b\n";
+        assert_eq!(minify_script(src), "echo a\necho b\n");
+    }
+
+    #[test]
+    fn minify_keeps_a_hash_that_is_not_the_first_character() {
+        let src = "x=${y#*.}  # trailing comment\necho \"#not a comment\"\n  n=$#\n";
+        assert_eq!(minify_script(src), "x=${y#*.}  # trailing comment\necho \"#not a comment\"\n  n=$#\n");
+    }
+
+    #[test]
+    fn minify_leaves_heredoc_bodies_verbatim() {
+        let src = "cat <<'USAGE'\nUsage:\n\n  # not a comment here   \nUSAGE\n# dropped\n\
+                   cat <<EOF\n#x\n\nEOF\ncat <<-\"T\" >f\n\t# kept\n\n\tT\necho done\n\
+                   cat <<< \"here\"\n# dropped too\n";
+        assert_eq!(
+            minify_script(src),
+            "cat <<'USAGE'\nUsage:\n\n  # not a comment here   \nUSAGE\n\
+             cat <<EOF\n#x\n\nEOF\ncat <<-\"T\" >f\n\t# kept\n\n\tT\necho done\n\
+             cat <<< \"here\"\n"
+        );
+    }
+
+    #[test]
+    fn the_renew_scripts_usage_heredoc_survives_minifying() {
+        let orig = renew_script();
+        let usage = |s: &str| {
+            let start = s.find("cat <<'USAGE'\n").expect("usage heredoc");
+            let end = s[start..].find("\nUSAGE\n").expect("closed") + start;
+            s[start..end].to_string()
+        };
+        assert_eq!(usage(&minify_script(&orig)), usage(&orig));
+    }
+
+    #[test]
+    fn the_minified_bundled_scripts_keep_every_marker_and_flag() {
+        let renew = minify_script(&renew_script());
+        for flag in ["--dry-run", "--no-restart", "-d DOMAIN", "-p STORE_PASSWORD"] {
+            assert!(renew.contains(flag), "minified cassandra.sh lost `{flag}`");
+        }
+        let check = minify_script(&check_script());
+        for m in ["__CC_BEGIN__", "__CC_CERT_BEGIN__", "__CC_CERT_END__", "__CC_ACTIVE__", "__CC_END__"] {
+            assert!(check.contains(m), "minified check script lost {m}");
+        }
+        let rb_check = minify_script(&rollback_check_script());
+        for m in ["__CC_PF_BEGIN__", "__CC_PF_BACKUP__", "__CC_PF_SPACE__", "__CC_PF_END__", "-J-Duser.timezone=UTC"] {
+            assert!(rb_check.contains(m), "minified rollback check lost {m}");
+        }
+        let rb = minify_script(&rollback_script());
+        for m in ["__CC_RESTORE_OK__", "__CC_RESTORE_FAIL__", "[0-9]{14}"] {
+            assert!(rb.contains(m), "minified rollback lost {m}");
+        }
+        // Every executable line survives, in order: only comments and blank lines go.
+        for (name, s) in [("renew", renew_script()), ("check", check_script()), ("rb_check", rollback_check_script()), ("rb", rollback_script())] {
+            let m = minify_script(&s);
+            let code: Vec<&str> = s.lines().map(str::trim_end).filter(|l| { let t = l.trim_start(); !t.is_empty() && !t.starts_with('#') }).collect();
+            let kept: Vec<&str> = m.lines().map(str::trim_end).filter(|l| { let t = l.trim_start(); !t.is_empty() && !t.starts_with('#') }).collect();
+            assert_eq!(code, kept, "{name}: an executable line changed");
+            assert!(m.len() < s.len(), "{name} did not shrink");
+        }
+    }
+
+    /// `bash` on PATH, or `None` with the reason printed (the test then skips).
+    fn real_bash() -> Option<&'static str> {
+        match std::process::Command::new("bash").arg("-c").arg("exit 0").status() {
+            Ok(st) if st.success() => Some("bash"),
+            _ => {
+                eprintln!("SKIPPED: `bash` is not on PATH, so the real-shell test cannot run");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn the_minified_bundled_scripts_still_parse_under_bash() {
+        use std::io::Write;
+        let Some(bash) = real_bash() else { return };
+        for (name, s) in [("renew", renew_script()), ("check", check_script()), ("rb_check", rollback_check_script()), ("rb", rollback_script())] {
+            let mut child = std::process::Command::new(bash)
+                .arg("-n")
+                .stdin(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn bash -n");
+            child.stdin.take().unwrap().write_all(payload(&s).as_bytes()).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "{name}: bash -n failed: {}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
+    /// A fresh, empty TMPDIR for one real-shell run, removed afterwards; the
+    /// test asserts the wrapper left nothing in it.
+    struct TmpDir(std::path::PathBuf);
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("cc-wrap-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            TmpDir(p)
+        }
+        fn is_empty(&self) -> bool {
+            std::fs::read_dir(&self.0).unwrap().next().is_none()
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Run a wrapper under `shell -c`, with TMPDIR and MARK set; stdout.
+    fn run_wrapper(shell: &str, cmd: &str, tmp: &TmpDir, mark: &std::path::Path) -> String {
+        let out = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(cmd)
+            .env("TMPDIR", &tmp.0)
+            .env("MARK", mark)
+            .output()
+            .expect("run wrapper");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// The shells AWS-RunShellScript may use that exist here.
+    fn shells() -> Vec<&'static str> {
+        ["bash", "sh"]
+            .into_iter()
+            .filter(|s| std::process::Command::new(s).arg("-c").arg("exit 0").status().is_ok_and(|st| st.success()))
+            .collect()
+    }
+
+    const BODY: &str = "#!/bin/bash\n# leaves a mark\ntouch \"$MARK\"\necho BODY_RAN\nexit 3\n";
+
+    #[test]
+    fn the_real_wrapper_runs_a_script_and_reports_its_code() {
+        if real_bash().is_none() { return; }
+        for shell in shells() {
+            let tmp = TmpDir::new(&format!("ok-{shell}"));
+            let mark = tmp.0.join("..").join(format!("cc-mark-ok-{shell}-{}", std::process::id()));
+            let _ = std::fs::remove_file(&mark);
+            let out = run_wrapper(shell, &invocation("echo hello; exit 0", &[]), &tmp, &mark);
+            assert_eq!(out, "__CC_RAN__\nhello\n__CC_RC__0\n", "{shell}");
+            assert_eq!(script_rc(&out), Some(0));
+            let out = run_wrapper(shell, &invocation(BODY, &[]), &tmp, &mark);
+            assert_eq!(out, "__CC_RAN__\nBODY_RAN\n__CC_RC__3\n", "{shell}");
+            assert!(mark.exists(), "{shell}: the body ran");
+            let _ = std::fs::remove_file(&mark);
+            assert!(tmp.is_empty(), "{shell}: the temp file was left behind");
+        }
+    }
+
+    #[test]
+    fn a_cut_payload_never_runs_not_even_its_sentinel() {
+        if real_bash().is_none() { return; }
+        for shell in shells() {
+            let tmp = TmpDir::new(&format!("cut-{shell}"));
+            let mark = tmp.0.join("..").join(format!("cc-mark-cut-{shell}-{}", std::process::id()));
+            let _ = std::fs::remove_file(&mark);
+            let cmd = invocation(BODY, &[]);
+            let b64 = b64_of(&cmd);
+            // A cut on a 4-character boundary decodes cleanly: only the byte count can tell.
+            let cut = cmd.replacen(b64, &b64[..b64.len() - 8], 1);
+            let out = run_wrapper(shell, &cut, &tmp, &mark);
+            assert_eq!(script_rc(&out), None, "{shell}: {out}");
+            assert!(!out.contains("__CC_RAN__") && !out.contains("BODY_RAN"), "{shell}: {out}");
+            assert!(out.contains("__CC_TRUNC__") && out.contains("__CC_RC__97"), "{shell}: {out}");
+            assert!(!mark.exists(), "{shell}: the body ran");
+            assert!(tmp.is_empty(), "{shell}: the temp file was left behind");
+        }
+    }
+
+    #[test]
+    fn the_real_wrapper_passes_arguments_quoted() {
+        if real_bash().is_none() { return; }
+        for shell in shells() {
+            let tmp = TmpDir::new(&format!("args-{shell}"));
+            let mark = tmp.0.join("unused");
+            let script = "printf '[%s]\\n' \"$1\" \"$2\" \"$#\"";
+            let out = run_wrapper(shell, &invocation(script, &["it's", "a b; echo pwned"]), &tmp, &mark);
+            assert_eq!(out, "__CC_RAN__\n[it's]\n[a b; echo pwned]\n[2]\n__CC_RC__0\n", "{shell}");
+            assert!(tmp.is_empty(), "{shell}: the temp file was left behind");
+        }
+    }
+
+    /// The 24,000 budget leaves room for the aws arguments under the 32,767
+    /// Windows limit. Measured at 24,847 after minifying (32,527 before), so
+    /// it is ignored pending a ruling; do not raise the budget here.
+    #[test]
+    #[ignore = "over the 24,000 budget (24,847 measured); awaiting a ruling"]
+    fn the_renew_invocation_fits_the_windows_command_line_budget() {
+        let original = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .encode(format!("echo __CC_RAN__\n{}", renew_script()).as_bytes())
+                .len()
+        };
+        let len = invocation(&renew_script(), &["-d", "dev1.net", "--no-restart"]).len();
+        eprintln!("renew invocation: {len} chars (unminified base64 alone: {original})");
+        assert!(len <= 24_000, "renew invocation is {len} chars, over the 24,000 budget");
     }
 
     #[test]
@@ -1034,7 +1347,7 @@ mod flow_tests {
         // string, so the fake recognises the rollback-check script by its text.
         let rollback_check_b64 = {
             use base64::Engine;
-            base64::engine::general_purpose::STANDARD.encode(format!("echo __CC_RAN__\n{}", rollback_check_script()).as_bytes())
+            base64::engine::general_purpose::STANDARD.encode(payload(&rollback_check_script()).as_bytes())
         };
         let fake = Fake::new(move |_id, cmd| {
             if cmd.contains(&rollback_check_b64) {
@@ -1055,7 +1368,7 @@ mod flow_tests {
     #[test]
     fn a_preflight_with_no_readable_result_is_an_error_not_no_backups() {
         let fake = Fake::new(|_id, cmd| {
-            if cmd.contains("bash -s --") { Ok("garbage".into()) } else { Ok(check_out("active")) }
+            if cmd.contains("base64 -d") { Ok("garbage".into()) } else { Ok(check_out("active")) }
         });
         let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
         let out = preflight(&exec, &[t("i-1", "cassandra-001")]);
@@ -1116,8 +1429,8 @@ mod flow_tests {
     ///
     /// The fakes below tell commands apart by a flag that appears in the
     /// command text (`--no-restart` for staging, `--restore` for a rollback
-    /// restore), never by `bash -s --`: the cert-read command is also a
-    /// `bash -s --` invocation, and answering it as a stage would hide bugs.
+    /// restore), never by the wrapper text: the cert-read command is also a
+    /// bundled-script invocation, and answering it as a stage would hide bugs.
     fn healthy_box() -> Fake {
         Fake::new(|_id, cmd| {
             if cmd.contains("is-active") {
@@ -1303,7 +1616,7 @@ mod flow_tests {
         let fake = Fake::new(|id, cmd| {
             if id == "i-9" {
                 assert!(!cmd.contains("systemctl") || cmd.contains("is-active"), "an unselected node was touched: {cmd}");
-                assert!(!cmd.contains("bash -s -- '"), "an unselected node ran a script with args: {cmd}");
+                assert!(!cmd.contains("bash \"$f\" '"), "an unselected node ran a script with args: {cmd}");
                 return Ok(cert_out(OLD_AFTER, "01", "active"));
             }
             if cmd.contains("is-active") { Ok("active\n".into()) }
