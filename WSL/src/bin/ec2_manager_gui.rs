@@ -4325,10 +4325,18 @@ mod gui {
         override_health: bool,
         in_flight: ReaperInFlight,
         tx: Sender<ReaperEvent>,
+        status_tx: Sender<AlertActionStatus>,
     ) {
         use ec2_manager::{oncall, reaper};
 
         std::thread::spawn(move || {
+            // The confirm dialog put `Running` under the Alert ID box. Only a
+            // message on this channel replaces it, and this function used to
+            // send none -- so the line read "remediating alert ..." for as
+            // long as the window was open. A guard rather than a send at each
+            // `return`: there are a dozen exits, and a thirteenth added later
+            // must not bring the stuck line back.
+            let mut end = RemediationStatusGuard::new(status_tx, &alert_id);
             let note = |level: LogLevel, message: String| {
                 let _ = tx.send(ReaperEvent::Note { level, message });
             };
@@ -4341,6 +4349,9 @@ mod gui {
                          not starting a second one"
                     ),
                 );
+                end.status = AlertActionStatus::Failed(format!(
+                    "a remediation for alert {alert_id} is already running — not starting a second one"
+                ));
                 return;
             };
             let _claim = claim;
@@ -4465,6 +4476,9 @@ mod gui {
                     reaper_health_verdict(&target.instance_id, &transcript);
                 note(level, line);
                 if !needs_fix {
+                    end.status = AlertActionStatus::Ok(format!(
+                        "alert {alert_id}: stack is already up — nothing changed"
+                    ));
                     return;
                 }
             }
@@ -4506,10 +4520,51 @@ mod gui {
                     move || spawn_off_call_ack(auth, id, tx)
                 },
             );
+            end.status = match outcome {
+                Some(reaper::OutcomeCode::Ok) => AlertActionStatus::Ok(format!(
+                    "alert {alert_id}: remediated — the stack is back up"
+                )),
+                Some(_) => AlertActionStatus::Failed(format!(
+                    "alert {alert_id}: remediation did not fix it — escalated; \
+                     see the log under On-Call -> Reaper Down"
+                )),
+                None => AlertActionStatus::Failed(format!(
+                    "alert {alert_id}: remediation did not run — see the log under \
+                     On-Call -> Reaper Down"
+                )),
+            };
             if let Some(code) = outcome {
                 let _ = tx.send(outcome_event(code, &target));
             }
         });
+    }
+
+    /// Reports how a manual remediation ended, whichever way the thread
+    /// leaves -- a `return`, the end of the body, or a panic.
+    ///
+    /// Starts as `Failed`, so a path that forgets to set a status reads as
+    /// "it stopped early", never as success.
+    struct RemediationStatusGuard {
+        tx: Sender<AlertActionStatus>,
+        status: AlertActionStatus,
+    }
+
+    impl RemediationStatusGuard {
+        fn new(tx: Sender<AlertActionStatus>, alert_id: &str) -> Self {
+            Self {
+                tx,
+                status: AlertActionStatus::Failed(format!(
+                    "alert {alert_id}: stopped before a fix ran — see the log under \
+                     On-Call -> Reaper Down"
+                )),
+            }
+        }
+    }
+
+    impl Drop for RemediationStatusGuard {
+        fn drop(&mut self) {
+            let _ = self.tx.send(self.status.clone());
+        }
     }
 
     /// The right-click menu on a row in the Alerts window.
@@ -18468,6 +18523,7 @@ mod gui {
                     override_health,
                     Arc::clone(&self.reaper_in_flight),
                     self.reaper_probe_tx.clone(),
+                    self.dry_run_status_tx.clone(),
                 );
             }
             if do_confirm || do_cancel || !window_open {
@@ -52545,6 +52601,49 @@ mod gui {
             let (acked, acked_text) = fed_status_for(&retrying, Some("PA")).expect("line");
             assert_eq!(plain, acked, "a retry keeps its own colour");
             assert_eq!(plain_text, acked_text, "and its own words");
+        }
+
+        /// The "remediating alert ..." line is `Running`, and only a message
+        /// on the status channel replaces it. A manual remediation sent none,
+        /// so the line stayed up for hours. The guard sends one however the
+        /// thread leaves, and an unset status reads as a failure, never as
+        /// success.
+        #[test]
+        fn a_manual_remediation_always_reports_how_it_ended() {
+            // Left without setting anything -- an early `return`.
+            let (tx, rx) = std::sync::mpsc::channel();
+            drop(RemediationStatusGuard::new(tx, "abc"));
+            let got: Vec<_> = rx.try_iter().collect();
+            assert_eq!(got.len(), 1);
+            assert!(matches!(&got[0], AlertActionStatus::Failed(m) if m.contains("abc")));
+
+            // A status set along the way is the one sent.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut g = RemediationStatusGuard::new(tx, "abc");
+            g.status = AlertActionStatus::Ok("done".into());
+            drop(g);
+            assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![AlertActionStatus::Ok("done".into())]);
+
+            // A panic still reports.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _g = RemediationStatusGuard::new(tx, "abc");
+                panic!("boom");
+            }));
+            assert_eq!(rx.try_iter().count(), 1);
+        }
+
+        /// The thread must be handed the status sender and the guard must be
+        /// created before any exit, or the stuck line comes back.
+        #[test]
+        fn start_reaper_remediation_is_given_the_status_channel() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let body = src.split("fn start_reaper_remediation(").nth(1).unwrap();
+            let body = body.split("struct RemediationStatusGuard").next().unwrap();
+            assert!(body.contains("status_tx: Sender<AlertActionStatus>"));
+            let guard = body.find("RemediationStatusGuard::new").unwrap();
+            let first_return = body.find("return;").unwrap();
+            assert!(guard < first_return);
         }
 
         /// A successful dry-run / escalation line under the Alert ID box
