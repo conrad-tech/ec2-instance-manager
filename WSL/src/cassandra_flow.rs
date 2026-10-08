@@ -2,12 +2,14 @@
 //! (instance id, shell command, timeout -> output), so the sequencing is
 //! tested with a fake instead of AWS. The decisions live in `cassandra_cert`.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use base64::Engine;
 
 use crate::cassandra_cert::{
-    parse_check, parse_preflight, parse_rc, CertInfo, PreflightRaw,
+    compare_certs, parse_check, parse_preflight, parse_rc, served_matches, stale_unselected,
+    CertChange, CertInfo, OldCert, PreflightRaw, StabilityWatch, WatchState,
 };
 use crate::obf_core::obf_transform;
 
@@ -179,6 +181,341 @@ pub fn preflight(exec: ExecFn, targets: &[Target]) -> Vec<NodePreflight> {
         let served = read_cert(exec, t).ok().and_then(|(c, _, _)| c);
         NodePreflight { target: t.clone(), raw, served }
     })
+}
+
+/// Time source for the watch. Tests pass a fake clock whose `sleep` advances
+/// `now`; the GUI passes `Instant`-backed closures and `thread::sleep`.
+pub struct Pacer<'a> {
+    pub now: &'a (dyn Fn() -> u64 + Sync),
+    pub sleep: &'a (dyn Fn(Duration) + Sync),
+}
+
+const POLL: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeStatus {
+    StageFailed(String),
+    /// Another node failed to stage, so this one was left alone.
+    NotRestarted,
+    RestartFailed(String),
+    DidNotStabilise,
+    /// Active for the whole requirement. `change` is `None` when there was no
+    /// "before" capture to compare against.
+    Up { change: Option<CertChange> },
+    /// Active, but the cert could not be read afterwards.
+    Unverified(String),
+}
+
+pub struct ApplyInput<'a> {
+    pub targets: &'a [Target],
+    pub unselected: &'a [Target],
+    pub domain_arg: Option<&'a str>,
+    /// Each selected node's cert from the dry run, by instance id.
+    pub before: &'a HashMap<String, CertInfo>,
+    pub required_secs: u64,
+    pub ceiling_secs: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ApplyReport {
+    pub nodes: Vec<(Target, NodeStatus)>,
+    /// Unselected nodes not serving what the selected ones now do.
+    pub stale: Vec<String>,
+    pub restarted: bool,
+}
+
+/// `systemctl restart --no-block`: returns as soon as systemd has queued it,
+/// so ten nodes' send-commands are not each held for a Cassandra start. The
+/// watch is what proves a node actually came up. A plain command, not a
+/// bundled script, so its verdict is the plain `__CC_RC__` and has no
+/// `__CC_RAN__` sentinel.
+const RESTART_CMD: &str = "systemctl restart --no-block cassandra; echo \"__CC_RC__$?\"";
+const ACTIVE_CMD: &str = "systemctl is-active cassandra";
+
+/// Restart every target at the same moment, then poll until each is judged.
+/// The first observation of every node happens right after the restarts are
+/// issued, so the ceiling is measured from the restart.
+fn restart_and_watch(
+    exec: ExecFn,
+    targets: &[Target],
+    required: u64,
+    ceiling: u64,
+    pacer: &Pacer,
+    emit: &(dyn Fn(String) + Sync),
+) -> Vec<Result<WatchState, String>> {
+    // One thread per node, released together so the restarts are issued in
+    // the same instant rather than one after another.
+    let barrier = std::sync::Barrier::new(targets.len().max(1));
+    let sent: Vec<Result<(), String>> = per_node(targets, &|t| {
+        barrier.wait();
+        match exec(&t.instance_id, RESTART_CMD, QUICK_TIMEOUT) {
+            Err(e) => Err(e),
+            Ok(out) => match parse_rc(&out) {
+                Some(0) => Ok(()),
+                Some(rc) => Err(format!("systemctl restart exited {rc}")),
+                None => Err("restart returned no return code".into()),
+            },
+        }
+    });
+    emit(format!("restart issued to {} node(s)", targets.len()));
+
+    let mut watches: Vec<StabilityWatch> =
+        targets.iter().map(|_| StabilityWatch::new(required, ceiling)).collect();
+    let mut states: Vec<WatchState> = vec![WatchState::Pending; targets.len()];
+    loop {
+        let now = (pacer.now)();
+        let live: Vec<usize> = (0..targets.len())
+            .filter(|&i| sent[i].is_ok() && states[i] == WatchState::Pending)
+            .collect();
+        if live.is_empty() {
+            break;
+        }
+        let subset: Vec<Target> = live.iter().map(|&i| targets[i].clone()).collect();
+        let actives: Vec<bool> = per_node(&subset, &|t| {
+            exec(&t.instance_id, ACTIVE_CMD, QUICK_TIMEOUT)
+                .map(|o| o.trim() == "active")
+                .unwrap_or(false)
+        });
+        for (k, &i) in live.iter().enumerate() {
+            states[i] = watches[i].observe(now, actives[k]);
+            if states[i] != WatchState::Pending {
+                emit(format!("{}: {:?}", targets[i].name, states[i]));
+            }
+        }
+        if live.iter().all(|&i| states[i] != WatchState::Pending) {
+            break;
+        }
+        (pacer.sleep)(POLL);
+    }
+    sent.into_iter().zip(states).map(|(r, s)| r.map(|_| s)).collect()
+}
+
+pub fn apply(
+    exec: ExecFn,
+    input: &ApplyInput,
+    pacer: &Pacer,
+    emit: &(dyn Fn(String) + Sync),
+) -> ApplyReport {
+    // 1. Stage everywhere. cassandra.sh backs up the old stores itself.
+    let mut args: Vec<&str> = Vec::new();
+    if let Some(d) = input.domain_arg {
+        args.extend(["-d", d]);
+    }
+    args.push("--no-restart");
+    let staged: Vec<Result<(), String>> = per_node(input.targets, &|t| {
+        match exec(&t.instance_id, &invocation(&renew_script(), &args), SCRIPT_TIMEOUT) {
+            Err(e) => Err(format!("could not be sent: {e}")),
+            Ok(out) => match script_rc(&out) {
+                Some(0) => Ok(()),
+                Some(rc) => Err(format!("exited {rc}: {}", last_lines(&out, 3))),
+                None => Err("returned no return code (the script did not run to completion)".into()),
+            },
+        }
+    });
+    emit(format!("staged {} node(s)", staged.iter().filter(|r| r.is_ok()).count()));
+
+    // 2. One failure and nobody restarts: half a cluster on a new keystore is
+    //    worse than none.
+    if input.targets.is_empty() || staged.iter().any(|r| r.is_err()) {
+        let nodes = input
+            .targets
+            .iter()
+            .cloned()
+            .zip(staged)
+            .map(|(t, r)| match r {
+                Ok(()) => (t, NodeStatus::NotRestarted),
+                Err(e) => (t, NodeStatus::StageFailed(e)),
+            })
+            .collect();
+        return ApplyReport { nodes, stale: Vec::new(), restarted: false };
+    }
+
+    // 3-4. Restart together and watch.
+    let watched = restart_and_watch(exec, input.targets, input.required_secs, input.ceiling_secs, pacer, emit);
+
+    // 5. Verify what each node serves now.
+    let certs: Vec<Result<Option<CertInfo>, String>> =
+        per_node(input.targets, &|t| read_cert(exec, t).map(|(c, _, _)| c));
+    let mut reference: Option<CertInfo> = None;
+    let nodes: Vec<(Target, NodeStatus)> = input
+        .targets
+        .iter()
+        .cloned()
+        .zip(watched)
+        .zip(certs)
+        .map(|((t, w), c)| {
+            let st = match w {
+                Err(e) => NodeStatus::RestartFailed(e),
+                Ok(WatchState::Failed) | Ok(WatchState::Pending) => NodeStatus::DidNotStabilise,
+                Ok(WatchState::Stable) => match c {
+                    Err(e) => NodeStatus::Unverified(e),
+                    Ok(None) => NodeStatus::Unverified("the node serves no readable cert".into()),
+                    Ok(Some(after)) => {
+                        let change = input.before.get(&t.instance_id).map(|b| compare_certs(b, &after));
+                        if reference.is_none() && change == Some(CertChange::Renewed) {
+                            reference = Some(after);
+                        }
+                        NodeStatus::Up { change }
+                    }
+                },
+            };
+            (t, st)
+        })
+        .collect();
+
+    // The reference for "the others still serve the old cert" is the first
+    // selected node that came up renewed.
+    let stale = match reference {
+        Some(result) => {
+            let others: Vec<(String, Option<CertInfo>)> = per_node(input.unselected, &|t| {
+                (t.name.clone(), read_cert(exec, t).ok().and_then(|(c, _, _)| c))
+            });
+            stale_unselected(&result, &others)
+        }
+        None => Vec::new(),
+    };
+    ApplyReport { nodes, stale, restarted: true }
+}
+
+#[derive(Clone, Debug)]
+pub struct RollbackNode {
+    pub target: Target,
+    /// The backup timestamp chosen for this node.
+    pub ts: String,
+}
+
+pub struct RollbackInput<'a> {
+    pub restore: &'a [RollbackNode],
+    /// Nodes the preflight found already on the old cert; left untouched.
+    pub skipped: &'a [Target],
+    pub unselected: &'a [Target],
+    pub old: &'a OldCert,
+    pub required_secs: u64,
+    pub ceiling_secs: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RollbackStatus {
+    RestoreFailed(String),
+    NotRestarted,
+    NothingToRollBack,
+    RestartFailed(String),
+    DidNotStabilise,
+    /// Active for the whole requirement and serving the old cert.
+    Up,
+    /// Came up, but not on the old cert.
+    WrongCert(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct RollbackReport {
+    pub nodes: Vec<(Target, RollbackStatus)>,
+    pub stale: Vec<String>,
+    pub restarted: bool,
+}
+
+/// A restore succeeded only if the script ran, said so, said nothing of
+/// failure, and exited 0. Anything else is a failure, with the best reason.
+fn restore_verdict(out: &str) -> Result<(), String> {
+    if let Some(reason) = out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("__CC_RESTORE_FAIL__"))
+    {
+        return Err(format!("restore failed: {}", reason.trim()));
+    }
+    if out.contains("__CC_RESTORE_OK__") && script_rc(out) == Some(0) {
+        Ok(())
+    } else {
+        Err(format!("no restore confirmation: {}", last_lines(out, 3)))
+    }
+}
+
+pub fn rollback(
+    exec: ExecFn,
+    input: &RollbackInput,
+    pacer: &Pacer,
+    emit: &(dyn Fn(String) + Sync),
+) -> RollbackReport {
+    let skipped: Vec<(Target, RollbackStatus)> = input
+        .skipped
+        .iter()
+        .cloned()
+        .map(|t| (t, RollbackStatus::NothingToRollBack))
+        .collect();
+    let restore_targets: Vec<Target> = input.restore.iter().map(|r| r.target.clone()).collect();
+
+    // 1. Restore everywhere first. The script saves .rollback copies itself.
+    let restored: Vec<Result<(), String>> = std::thread::scope(|s| {
+        let hs: Vec<_> = input
+            .restore
+            .iter()
+            .map(|r| {
+                s.spawn(move || {
+                    exec(
+                        &r.target.instance_id,
+                        &invocation(&rollback_script(), &["--restore", &r.ts]),
+                        SCRIPT_TIMEOUT,
+                    )
+                    .map_err(|e| format!("could not be sent: {e}"))
+                    .and_then(|out| restore_verdict(&out))
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().expect("restore worker panicked")).collect()
+    });
+    emit(format!("restored {} node(s)", restored.iter().filter(|r| r.is_ok()).count()));
+
+    if restore_targets.is_empty() || restored.iter().any(|r| r.is_err()) {
+        let mut nodes: Vec<(Target, RollbackStatus)> = restore_targets
+            .into_iter()
+            .zip(restored)
+            .map(|(t, r)| match r {
+                Ok(()) => (t, RollbackStatus::NotRestarted),
+                Err(e) => (t, RollbackStatus::RestoreFailed(e)),
+            })
+            .collect();
+        nodes.extend(skipped);
+        return RollbackReport { nodes, stale: Vec::new(), restarted: false };
+    }
+
+    // 2. Restart together, watch, verify against the cert rolled back to.
+    let watched = restart_and_watch(exec, &restore_targets, input.required_secs, input.ceiling_secs, pacer, emit);
+    let certs: Vec<Result<Option<CertInfo>, String>> =
+        per_node(&restore_targets, &|t| read_cert(exec, t).map(|(c, _, _)| c));
+    let mut nodes: Vec<(Target, RollbackStatus)> = restore_targets
+        .iter()
+        .cloned()
+        .zip(watched)
+        .zip(certs)
+        .map(|((t, w), c)| {
+            let st = match w {
+                Err(e) => RollbackStatus::RestartFailed(e),
+                Ok(WatchState::Failed) | Ok(WatchState::Pending) => RollbackStatus::DidNotStabilise,
+                Ok(WatchState::Stable) => match c {
+                    Ok(Some(served)) if served_matches(&served, input.old) => RollbackStatus::Up,
+                    Ok(Some(_)) => RollbackStatus::WrongCert("it is not serving the cert rolled back to".into()),
+                    Ok(None) => RollbackStatus::WrongCert("it serves no readable cert".into()),
+                    Err(e) => RollbackStatus::WrongCert(e),
+                },
+            };
+            (t, st)
+        })
+        .collect();
+    nodes.extend(skipped);
+
+    // 3. Unselected nodes still on the cert being rolled away from.
+    let others: Vec<(String, Option<CertInfo>)> = per_node(input.unselected, &|t| {
+        (t.name.clone(), read_cert(exec, t).ok().and_then(|(c, _, _)| c))
+    });
+    let stale: Vec<String> = others
+        .into_iter()
+        .filter_map(|(name, c)| match c {
+            None => Some(format!("{name} (unreadable)")),
+            Some(c) if !served_matches(&c, input.old) => Some(name),
+            Some(_) => None,
+        })
+        .collect();
+    RollbackReport { nodes, stale, restarted: true }
 }
 
 #[cfg(test)]
@@ -498,5 +835,381 @@ mod flow_tests {
         let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
         let out = preflight(&exec, &[t("i-1", "cassandra-001")]);
         assert!(out[0].raw.is_err());
+    }
+
+    use crate::cassandra_cert::parse_openssl;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A pacer on a fake clock: `sleep` advances it, `now` reads it.
+    struct Clock(AtomicU64);
+    impl Clock {
+        fn new() -> Self { Clock(AtomicU64::new(0)) }
+    }
+
+    fn cert_out(after: &str, serial: &str, active: &str) -> String {
+        format!(
+            "__CC_BEGIN__\n__CC_CERT_BEGIN__\nsubject= /CN=*.a\nissuer= /CN=ca\nnotBefore=Sep  3 07:01:23 2025 GMT\nnotAfter={after}\nserial={serial}\n__CC_CERT_END__\n__CC_ACTIVE__ {active}\n__CC_END__\n"
+        )
+    }
+    const OLD_AFTER: &str = "Oct  3 08:01:22 2026 GMT";
+    const NEW_AFTER: &str = "Nov  3 08:01:22 2027 GMT";
+    /// A stage / restore that ran and succeeded (the script printed its sentinel).
+    const STAGED: &str = "__CC_RAN__\nINFO: staged\n__CC_RC__0\n";
+    const RESTORED: &str = "__CC_RAN__\n__CC_RESTORE_OK__ 20260903070123\n__CC_RC__0\n";
+
+    fn run_apply(
+        fake: &Fake,
+        targets: &[Target],
+        unselected: &[Target],
+        before: &HashMap<String, CertInfo>,
+    ) -> ApplyReport {
+        let clock = Clock::new();
+        let now = || clock.0.load(Ordering::SeqCst);
+        let sleep = |d: Duration| { clock.0.fetch_add(d.as_secs(), Ordering::SeqCst); };
+        let pacer = Pacer { now: &now, sleep: &sleep };
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let input = ApplyInput {
+            targets,
+            unselected,
+            domain_arg: Some("dev1.net"),
+            before,
+            required_secs: 60,
+            ceiling_secs: 300,
+        };
+        apply(&exec, &input, &pacer, &|_| {})
+    }
+
+    fn old_cert_info() -> CertInfo {
+        parse_openssl(&format!("subject= /CN=*.a\nissuer= /CN=ca\nnotBefore=Sep  3 07:01:23 2025 GMT\nnotAfter={OLD_AFTER}\nserial=01\n")).unwrap()
+    }
+
+    fn before_map(ids: &[&str]) -> HashMap<String, CertInfo> {
+        ids.iter().map(|id| (id.to_string(), old_cert_info())).collect()
+    }
+
+    /// A box that stages fine, restarts fine, comes up active, and serves the new cert afterwards.
+    ///
+    /// The fakes below tell commands apart by a flag that appears in the
+    /// command text (`--no-restart` for staging, `--restore` for a rollback
+    /// restore), never by `bash -s --`: the cert-read command is also a
+    /// `bash -s --` invocation, and answering it as a stage would hide bugs.
+    fn healthy_box() -> Fake {
+        Fake::new(|_id, cmd| {
+            if cmd.contains("is-active") {
+                Ok("active\n".into())
+            } else if cmd.contains("systemctl restart") {
+                Ok("__CC_RC__0\n".into())
+            } else if cmd.contains("--no-restart") {
+                Ok(STAGED.into())
+            } else {
+                Ok(cert_out(NEW_AFTER, "02", "active"))
+            }
+        })
+    }
+
+    #[test]
+    fn a_healthy_run_stages_restarts_watches_and_verifies() {
+        let fake = healthy_box();
+        let targets = [t("i-1", "cassandra-001"), t("i-2", "cassandra-002")];
+        let rep = run_apply(&fake, &targets, &[], &before_map(&["i-1", "i-2"]));
+        assert!(rep.restarted);
+        for (_, st) in &rep.nodes {
+            assert_eq!(st, &NodeStatus::Up { change: Some(CertChange::Renewed) });
+        }
+        // Staging uses --no-restart and the configured domain.
+        let c = fake.commands_for("i-1");
+        assert!(c.iter().any(|c| c.contains("'-d' 'dev1.net' '--no-restart'")), "{c:?}");
+    }
+
+    #[test]
+    fn nothing_is_restarted_if_any_node_fails_to_stage() {
+        let fake = Fake::new(|id, cmd| {
+            if cmd.contains("is-active") || cmd.contains("systemctl restart") {
+                panic!("a restart-phase command ran: {cmd}");
+            }
+            if cmd.contains("--no-restart") {
+                let rc = if id == "i-2" { 1 } else { 0 };
+                return Ok(format!("__CC_RAN__\n__CC_RC__{rc}\n"));
+            }
+            Ok(cert_out(OLD_AFTER, "01", "active"))
+        });
+        let targets = [t("i-1", "cassandra-001"), t("i-2", "cassandra-002")];
+        let rep = run_apply(&fake, &targets, &[], &before_map(&["i-1", "i-2"]));
+        assert!(!rep.restarted);
+        assert!(matches!(rep.nodes[0].1, NodeStatus::NotRestarted));
+        assert!(matches!(rep.nodes[1].1, NodeStatus::StageFailed(_)));
+    }
+
+    #[test]
+    fn a_stage_with_no_return_code_counts_as_failed() {
+        let fake = Fake::new(|_id, cmd| {
+            if cmd.contains("--no-restart") { return Ok("__CC_RAN__\nINFO: building...".into()); }
+            Ok(cert_out(OLD_AFTER, "01", "active"))
+        });
+        let rep = run_apply(&fake, &[t("i-1", "a")], &[], &before_map(&["i-1"]));
+        assert!(!rep.restarted);
+        assert!(matches!(rep.nodes[0].1, NodeStatus::StageFailed(_)));
+    }
+
+    #[test]
+    fn a_stage_that_never_ran_the_script_fails_even_with_rc_zero_and_blocks_every_restart() {
+        // rc 0 but no __CC_RAN__: e.g. `base64` missing, so bash read nothing.
+        let fake = Fake::new(|id, cmd| {
+            if cmd.contains("is-active") || cmd.contains("systemctl restart") {
+                panic!("a restart-phase command ran: {cmd}");
+            }
+            if cmd.contains("--no-restart") {
+                return Ok(if id == "i-2" { "__CC_RC__0\n".into() } else { STAGED.into() });
+            }
+            Ok(cert_out(OLD_AFTER, "01", "active"))
+        });
+        let targets = [t("i-1", "a"), t("i-2", "b")];
+        let rep = run_apply(&fake, &targets, &[], &before_map(&["i-1", "i-2"]));
+        assert!(!rep.restarted);
+        assert!(matches!(rep.nodes[0].1, NodeStatus::NotRestarted));
+        assert!(matches!(rep.nodes[1].1, NodeStatus::StageFailed(_)));
+    }
+
+    #[test]
+    fn every_node_is_restarted_at_the_same_moment() {
+        // A barrier inside the fake's restart reply only releases when ALL
+        // restarts are in flight together; a sequential loop would deadlock.
+        use std::sync::{Arc, Barrier};
+        let barrier = Arc::new(Barrier::new(3));
+        let b = barrier.clone();
+        let fake = Fake::new(move |_id, cmd| {
+            if cmd.contains("systemctl restart") {
+                b.wait();
+                Ok("__CC_RC__0\n".into())
+            } else if cmd.contains("is-active") {
+                Ok("active\n".into())
+            } else if cmd.contains("--no-restart") {
+                Ok(STAGED.into())
+            } else {
+                Ok(cert_out(NEW_AFTER, "02", "active"))
+            }
+        });
+        let targets = [t("i-1", "a"), t("i-2", "b"), t("i-3", "c")];
+        let rep = run_apply(&fake, &targets, &[], &before_map(&["i-1", "i-2", "i-3"]));
+        assert!(rep.restarted);
+    }
+
+    #[test]
+    fn restart_uses_no_block_so_the_send_command_stays_short() {
+        let fake = healthy_box();
+        run_apply(&fake, &[t("i-1", "a")], &[], &before_map(&["i-1"]));
+        assert!(fake.commands_for("i-1").iter().any(|c| c.contains("systemctl restart --no-block cassandra")));
+    }
+
+    #[test]
+    fn a_node_that_flaps_does_not_pass_the_watch() {
+        // Active, then failed, then active: the clock must restart.
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let fake = Fake::new(move |_id, cmd| {
+            if cmd.contains("is-active") {
+                let n = polls.fetch_add(1, Ordering::SeqCst);
+                // 5s polls: active for the first 10 (50s), one failure, then active.
+                Ok(if n == 10 { "failed\n" } else { "active\n" }.into())
+            } else if cmd.contains("systemctl restart") {
+                Ok("__CC_RC__0\n".into())
+            } else if cmd.contains("--no-restart") {
+                Ok(STAGED.into())
+            } else {
+                Ok(cert_out(NEW_AFTER, "02", "active"))
+            }
+        });
+        let clock = Clock::new();
+        let now = || clock.0.load(Ordering::SeqCst);
+        let sleep = |d: Duration| { clock.0.fetch_add(d.as_secs(), Ordering::SeqCst); };
+        let pacer = Pacer { now: &now, sleep: &sleep };
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let before = before_map(&["i-1"]);
+        let targets = [t("i-1", "a")];
+        let input = ApplyInput { targets: &targets, unselected: &[], domain_arg: None, before: &before, required_secs: 60, ceiling_secs: 300 };
+        let rep = apply(&exec, &input, &pacer, &|_| {});
+        assert!(matches!(rep.nodes[0].1, NodeStatus::Up { .. }));
+        // It took more than 60s of fake time: the flap restarted the clock.
+        assert!(clock.0.load(Ordering::SeqCst) >= 110, "took {}s", clock.0.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_node_that_never_comes_up_is_failed_at_the_ceiling() {
+        let fake = Fake::new(|_id, cmd| {
+            if cmd.contains("is-active") { Ok("activating\n".into()) }
+            else if cmd.contains("systemctl restart") { Ok("__CC_RC__0\n".into()) }
+            else if cmd.contains("--no-restart") { Ok(STAGED.into()) }
+            else { Ok(cert_out(OLD_AFTER, "01", "failed")) }
+        });
+        let rep = run_apply(&fake, &[t("i-1", "a")], &[], &before_map(&["i-1"]));
+        assert_eq!(rep.nodes[0].1, NodeStatus::DidNotStabilise);
+    }
+
+    #[test]
+    fn a_new_date_on_a_different_cert_shape_is_flagged() {
+        let fake = Fake::new(|_id, cmd| {
+            if cmd.contains("is-active") { Ok("active\n".into()) }
+            else if cmd.contains("systemctl restart") { Ok("__CC_RC__0\n".into()) }
+            else if cmd.contains("--no-restart") { Ok(STAGED.into()) }
+            else {
+                Ok(format!("__CC_BEGIN__\n__CC_CERT_BEGIN__\nsubject= /CN=different\nissuer= /CN=ca\nnotBefore=Sep  3 07:01:23 2025 GMT\nnotAfter={NEW_AFTER}\nserial=02\n__CC_CERT_END__\n__CC_ACTIVE__ active\n__CC_END__\n"))
+            }
+        });
+        let rep = run_apply(&fake, &[t("i-1", "a")], &[], &before_map(&["i-1"]));
+        assert!(matches!(&rep.nodes[0].1, NodeStatus::Up { change: Some(CertChange::Flagged(_)) }));
+    }
+
+    #[test]
+    fn a_failed_restart_command_is_reported_and_the_others_still_judged() {
+        let fake = Fake::new(|id, cmd| {
+            if cmd.contains("is-active") { Ok("active\n".into()) }
+            else if cmd.contains("systemctl restart") {
+                Ok(if id == "i-1" { "__CC_RC__1\n" } else { "__CC_RC__0\n" }.into())
+            }
+            else if cmd.contains("--no-restart") { Ok(STAGED.into()) }
+            else { Ok(cert_out(NEW_AFTER, "02", "active")) }
+        });
+        let rep = run_apply(&fake, &[t("i-1", "a"), t("i-2", "b")], &[], &before_map(&["i-1", "i-2"]));
+        assert!(matches!(rep.nodes[0].1, NodeStatus::RestartFailed(_)));
+        assert!(matches!(rep.nodes[1].1, NodeStatus::Up { .. }));
+    }
+
+    #[test]
+    fn unselected_nodes_are_read_never_changed() {
+        let fake = Fake::new(|id, cmd| {
+            if id == "i-9" {
+                assert!(!cmd.contains("systemctl") || cmd.contains("is-active"), "an unselected node was touched: {cmd}");
+                assert!(!cmd.contains("bash -s -- '"), "an unselected node ran a script with args: {cmd}");
+                return Ok(cert_out(OLD_AFTER, "01", "active"));
+            }
+            if cmd.contains("is-active") { Ok("active\n".into()) }
+            else if cmd.contains("systemctl restart") { Ok("__CC_RC__0\n".into()) }
+            else if cmd.contains("--no-restart") { Ok(STAGED.into()) }
+            else { Ok(cert_out(NEW_AFTER, "02", "active")) }
+        });
+        let rep = run_apply(&fake, &[t("i-1", "cassandra-001")], &[t("i-9", "cassandra-101")], &before_map(&["i-1"]));
+        assert_eq!(rep.stale, ["cassandra-101"], "still on the old cert");
+    }
+
+    fn run_rollback(fake: &Fake, restore: &[RollbackNode], skipped: &[Target], unselected: &[Target]) -> RollbackReport {
+        let clock = Clock::new();
+        let now = || clock.0.load(Ordering::SeqCst);
+        let sleep = |d: Duration| { clock.0.fetch_add(d.as_secs(), Ordering::SeqCst); };
+        let pacer = Pacer { now: &now, sleep: &sleep };
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let old = OldCert::from(&old_cert_info());
+        let input = RollbackInput { restore, skipped, unselected, old: &old, required_secs: 60, ceiling_secs: 300 };
+        rollback(&exec, &input, &pacer, &|_| {})
+    }
+
+    fn rb_node(id: &str, ts: &str) -> RollbackNode {
+        RollbackNode { target: t(id, id), ts: ts.into() }
+    }
+
+    #[test]
+    fn a_rollback_restores_everywhere_before_any_restart() {
+        let fake = Fake::new(|_id, cmd| {
+            if cmd.contains("is-active") { Ok("active\n".into()) }
+            else if cmd.contains("systemctl restart") { Ok("__CC_RC__0\n".into()) }
+            else if cmd.contains("--restore") { Ok(RESTORED.into()) }
+            else { Ok(cert_out(OLD_AFTER, "01", "active")) }
+        });
+        let rep = run_rollback(&fake, &[rb_node("i-1", "20260903070123")], &[], &[]);
+        assert!(rep.restarted);
+        assert_eq!(rep.nodes[0].1, RollbackStatus::Up);
+        assert!(fake.commands_for("i-1").iter().any(|c| c.contains("'--restore' '20260903070123'")));
+    }
+
+    #[test]
+    fn a_failed_restore_stops_every_restart_and_surfaces_the_reason() {
+        let fake = Fake::new(|id, cmd| {
+            if cmd.contains("is-active") || cmd.contains("systemctl restart") {
+                panic!("restart-phase command after a failed restore: {cmd}");
+            }
+            if cmd.contains("--restore") {
+                return Ok(if id == "i-2" {
+                    "__CC_RAN__\n__CC_RESTORE_FAIL__ no space\n__CC_RC__0\n".into()
+                } else {
+                    RESTORED.into()
+                });
+            }
+            Ok(cert_out(NEW_AFTER, "02", "active"))
+        });
+        let rep = run_rollback(&fake, &[rb_node("i-1", "20260903070123"), rb_node("i-2", "20260903070123")], &[], &[]);
+        assert!(!rep.restarted);
+        assert_eq!(rep.nodes[0].1, RollbackStatus::NotRestarted);
+        match &rep.nodes[1].1 {
+            RollbackStatus::RestoreFailed(why) => assert!(why.contains("no space"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_restore_that_reports_both_ok_and_fail_is_a_failure() {
+        let fake = Fake::new(|_id, cmd| {
+            if cmd.contains("is-active") || cmd.contains("systemctl restart") {
+                panic!("restart-phase command after a failed restore: {cmd}");
+            }
+            Ok("__CC_RAN__\n__CC_RESTORE_OK__ 1\n__CC_RESTORE_FAIL__ half done\n__CC_RC__0\n".into())
+        });
+        let rep = run_rollback(&fake, &[rb_node("i-1", "1")], &[], &[]);
+        assert!(!rep.restarted);
+        assert!(matches!(&rep.nodes[0].1, RollbackStatus::RestoreFailed(w) if w.contains("half done")));
+    }
+
+    #[test]
+    fn a_restore_that_never_ran_the_script_fails_even_with_ok_marker_and_rc_zero() {
+        let fake = Fake::new(|_id, cmd| {
+            if cmd.contains("is-active") || cmd.contains("systemctl restart") {
+                panic!("restart-phase command after a failed restore: {cmd}");
+            }
+            // No __CC_RAN__: the pipeline failed before bash ran anything.
+            Ok("__CC_RESTORE_OK__ 1\n__CC_RC__0\n".into())
+        });
+        let rep = run_rollback(&fake, &[rb_node("i-1", "1")], &[], &[]);
+        assert!(!rep.restarted);
+        assert!(matches!(rep.nodes[0].1, RollbackStatus::RestoreFailed(_)));
+    }
+
+    #[test]
+    fn skipped_nodes_are_neither_restored_nor_restarted() {
+        let fake = Fake::new(|id, cmd| {
+            if id == "i-skip" {
+                assert!(!cmd.contains("--restore") && !cmd.contains("systemctl restart"), "{cmd}");
+                return Ok(cert_out(OLD_AFTER, "01", "active"));
+            }
+            if cmd.contains("is-active") { Ok("active\n".into()) }
+            else if cmd.contains("systemctl restart") { Ok("__CC_RC__0\n".into()) }
+            else if cmd.contains("--restore") { Ok(RESTORED.into()) }
+            else { Ok(cert_out(OLD_AFTER, "01", "active")) }
+        });
+        let rep = run_rollback(&fake, &[rb_node("i-1", "20260903070123")], &[t("i-skip", "cassandra-009")], &[]);
+        assert!(rep.restarted);
+        assert!(rep.nodes.iter().any(|(tg, st)| tg.instance_id == "i-skip" && *st == RollbackStatus::NothingToRollBack));
+    }
+
+    #[test]
+    fn a_rollback_is_verified_against_the_old_cert() {
+        // The node comes back serving the NEW cert: the restore did not take.
+        let fake = Fake::new(|_id, cmd| {
+            if cmd.contains("is-active") { Ok("active\n".into()) }
+            else if cmd.contains("systemctl restart") { Ok("__CC_RC__0\n".into()) }
+            else if cmd.contains("--restore") { Ok(RESTORED.into()) }
+            else { Ok(cert_out(NEW_AFTER, "02", "active")) }
+        });
+        let rep = run_rollback(&fake, &[rb_node("i-1", "20260903070123")], &[], &[]);
+        assert!(matches!(rep.nodes[0].1, RollbackStatus::WrongCert(_)));
+    }
+
+    #[test]
+    fn unselected_nodes_still_on_the_new_cert_are_stale_after_a_rollback() {
+        let fake = Fake::new(|id, cmd| {
+            if id == "i-9" { return Ok(cert_out(NEW_AFTER, "02", "active")); }
+            if cmd.contains("is-active") { Ok("active\n".into()) }
+            else if cmd.contains("systemctl restart") { Ok("__CC_RC__0\n".into()) }
+            else if cmd.contains("--restore") { Ok(RESTORED.into()) }
+            else { Ok(cert_out(OLD_AFTER, "01", "active")) }
+        });
+        let rep = run_rollback(&fake, &[rb_node("i-1", "1")], &[], &[t("i-9", "cassandra-101")]);
+        assert_eq!(rep.stale, ["cassandra-101"]);
     }
 }
