@@ -478,6 +478,119 @@ pub fn timestamps_disagree(verdicts: &[Verdict]) -> bool {
     seen.len() > 1
 }
 
+/// A selection as the gates compare it: sorted and deduplicated instance ids,
+/// so the same nodes ticked in another order are the same selection.
+pub fn selection_key(selected: &[String]) -> Vec<String> {
+    let mut key = selected.to_vec();
+    key.sort();
+    key.dedup();
+    key
+}
+
+/// What both restart buttons (Apply, Confirm rollback) need from the dialog
+/// besides their own result.
+#[derive(Clone, Copy, Debug)]
+pub struct Gate<'a> {
+    /// The instance ids ticked right now.
+    pub selected: &'a [String],
+    /// A Cassandra job is in flight.
+    pub running: bool,
+    /// `SelectionAssessment::needs_confirmation()` for `selected`.
+    pub needs_confirmation: bool,
+    /// The red-node / every-cluster tick.
+    pub confirmed: bool,
+    /// The outage approval tick.
+    pub approved: bool,
+}
+
+/// Why `gate` alone refuses a restart, checked first by both buttons.
+fn gate_blocker(gate: &Gate) -> Option<&'static str> {
+    if gate.running {
+        Some("a Cassandra job is running")
+    } else if gate.selected.is_empty() {
+        Some("no node is selected")
+    } else if gate.needs_confirmation && !gate.confirmed {
+        Some("tick the confirmation for the nodes outside the main set")
+    } else if !gate.approved {
+        Some("tick the outage approval first")
+    } else {
+        None
+    }
+}
+
+/// Whether a result was taken for exactly the current selection: the
+/// selection recorded when its job was started, the ids the result itself
+/// carries, and the current selection must all be the same set. A result
+/// for another selection (or a late result of a forgotten job) never counts.
+fn result_matches(selected: &[String], started_for: Option<&[String]>, result_ids: &[String]) -> bool {
+    let now = selection_key(selected);
+    started_for.is_some_and(|s| selection_key(s) == now) && selection_key(result_ids) == now
+}
+
+/// Why Apply is disabled, or `None` when it may restart the nodes.
+/// `dry_passed` is `cassandra_flow::dry_run_passed` of the dry run held;
+/// `started_for` is the selection the dry run was started for and
+/// `result_ids` the instance ids its rows carry.
+pub fn apply_blocker(
+    gate: &Gate,
+    dry_passed: bool,
+    started_for: Option<&[String]>,
+    result_ids: &[String],
+) -> Option<&'static str> {
+    if let Some(why) = gate_blocker(gate) {
+        return Some(why);
+    }
+    if !result_matches(gate.selected, started_for, result_ids) {
+        return Some("the dry run does not cover the current selection: run Update cert again");
+    }
+    if !dry_passed {
+        return Some("the dry run did not pass on every selected node");
+    }
+    None
+}
+
+pub fn apply_enabled(
+    gate: &Gate,
+    dry_passed: bool,
+    started_for: Option<&[String]>,
+    result_ids: &[String],
+) -> bool {
+    apply_blocker(gate, dry_passed, started_for, result_ids).is_none()
+}
+
+/// Why Confirm rollback is disabled, or `None` when it may restart the
+/// nodes. `verdicts` are the preflight's, one per selected node, under the
+/// backups currently chosen.
+pub fn rollback_confirm_blocker(
+    gate: &Gate,
+    verdicts: &[Verdict],
+    started_for: Option<&[String]>,
+    result_ids: &[String],
+) -> Option<&'static str> {
+    if let Some(why) = gate_blocker(gate) {
+        return Some(why);
+    }
+    if !result_matches(gate.selected, started_for, result_ids) {
+        return Some("the preflight does not cover the current selection: run Roll back again");
+    }
+    if verdicts.iter().any(|v| matches!(v, Verdict::Blocked(_))) {
+        return Some("a selected node is blocked");
+    }
+    if !can_confirm_rollback(verdicts) {
+        return Some("no selected node has anything to restore");
+    }
+    None
+}
+
+pub fn rollback_confirm_enabled(
+    gate: &Gate,
+    verdicts: &[Verdict],
+    started_for: Option<&[String]>,
+    result_ids: &[String],
+) -> bool {
+    rollback_confirm_blocker(gate, verdicts, started_for, result_ids).is_none()
+}
+
 /// The cert the environment is returning to, taken from what the nodes' newest
 /// backups say: the most common expiry, ties going to the later one.
 pub fn infer_old_cert(newest: &[&BackupFact]) -> Option<OldCert> {
@@ -1204,5 +1317,126 @@ mod tests {
         let raw = PreflightRaw { backups: vec![], space_ok: false };
         let served = cert("/CN=x", "/CN=y", 1000, "01");
         assert_eq!(classify_preflight(&raw, Some(&served), None, &OLD), Verdict::NothingToRollBack);
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn open_gate(selected: &[String]) -> Gate<'_> {
+        Gate {
+            selected,
+            running: false,
+            needs_confirmation: false,
+            confirmed: false,
+            approved: true,
+        }
+    }
+
+    #[test]
+    fn a_selection_key_is_sorted_and_deduplicated() {
+        assert_eq!(selection_key(&ids(&["i-2", "i-1", "i-2"])), ids(&["i-1", "i-2"]));
+        assert!(selection_key(&[]).is_empty());
+    }
+
+    #[test]
+    fn apply_is_enabled_only_for_the_selection_the_dry_run_covered() {
+        let x = ids(&["i-1", "i-2"]);
+        let x_key = selection_key(&x);
+        // Same nodes in another order: still the dry run's selection.
+        let x_reordered = ids(&["i-2", "i-1"]);
+        assert!(apply_enabled(&open_gate(&x_reordered), true, Some(&x_key), &x_key));
+        // Selection Y (one node more, one node less, or other nodes): never.
+        for y in [ids(&["i-1", "i-2", "i-3"]), ids(&["i-1"]), ids(&["i-3", "i-4"])] {
+            assert!(!apply_enabled(&open_gate(&y), true, Some(&x_key), &x_key), "{y:?}");
+        }
+        // No dry run started at all.
+        assert!(!apply_enabled(&open_gate(&x), true, None, &x_key));
+        // Results that are not the run that was started (e.g. a forgotten
+        // job's late result) do not count either.
+        let other = selection_key(&ids(&["i-9"]));
+        assert!(!apply_enabled(&open_gate(&x), true, Some(&x_key), &other));
+    }
+
+    #[test]
+    fn a_failed_dry_run_on_any_node_disables_apply() {
+        use crate::cassandra_flow::{dry_run_passed, NodeDryRun, Target};
+        let row = |id: &str, ok: bool| NodeDryRun {
+            target: Target { instance_id: id.into(), name: id.into() },
+            current: None,
+            raw_cert: String::new(),
+            dry_run_ok: ok,
+            detail: String::new(),
+        };
+        let x = ids(&["i-1", "i-2"]);
+        let key = selection_key(&x);
+        let good = vec![row("i-1", true), row("i-2", true)];
+        let bad = vec![row("i-1", true), row("i-2", false)];
+        assert!(apply_enabled(&open_gate(&x), dry_run_passed(&good), Some(&key), &key));
+        assert!(!apply_enabled(&open_gate(&x), dry_run_passed(&bad), Some(&key), &key));
+        assert_eq!(
+            apply_blocker(&open_gate(&x), dry_run_passed(&bad), Some(&key), &key),
+            Some("the dry run did not pass on every selected node")
+        );
+    }
+
+    #[test]
+    fn apply_needs_the_approval_no_running_job_and_the_confirmation() {
+        let x = ids(&["i-1"]);
+        let key = selection_key(&x);
+        let unapproved = Gate { approved: false, ..open_gate(&x) };
+        assert!(!apply_enabled(&unapproved, true, Some(&key), &key));
+        let running = Gate { running: true, ..open_gate(&x) };
+        assert!(!apply_enabled(&running, true, Some(&key), &key));
+        let unconfirmed = Gate { needs_confirmation: true, confirmed: false, ..open_gate(&x) };
+        assert!(!apply_enabled(&unconfirmed, true, Some(&key), &key));
+        let confirmed = Gate { needs_confirmation: true, confirmed: true, ..open_gate(&x) };
+        assert!(apply_enabled(&confirmed, true, Some(&key), &key));
+        let empty: Vec<String> = Vec::new();
+        assert!(!apply_enabled(&open_gate(&empty), true, Some(&[]), &[]));
+    }
+
+    #[test]
+    fn confirm_rollback_needs_a_matching_preflight_and_no_blocked_node() {
+        let x = ids(&["i-1", "i-2"]);
+        let key = selection_key(&x);
+        let ok = vec![
+            Verdict::Restorable { ts: "1".into() },
+            Verdict::NothingToRollBack,
+        ];
+        assert!(rollback_confirm_enabled(&open_gate(&x), &ok, Some(&key), &key));
+        // A preflight of X never arms a rollback of Y.
+        let y = ids(&["i-1", "i-3"]);
+        assert!(!rollback_confirm_enabled(&open_gate(&y), &ok, Some(&key), &key));
+        assert!(!rollback_confirm_enabled(&open_gate(&x), &ok, None, &key));
+        // Any blocked node disables it.
+        let blocked = vec![Verdict::Restorable { ts: "1".into() }, Verdict::Blocked(vec!["x".into()])];
+        assert!(!rollback_confirm_enabled(&open_gate(&x), &blocked, Some(&key), &key));
+        // Nothing to restore anywhere: nothing to confirm.
+        let none = vec![Verdict::NothingToRollBack, Verdict::NothingToRollBack];
+        assert!(!rollback_confirm_enabled(&open_gate(&x), &none, Some(&key), &key));
+        // Approval, running and the outside-the-set confirmation.
+        assert!(!rollback_confirm_enabled(&Gate { approved: false, ..open_gate(&x) }, &ok, Some(&key), &key));
+        assert!(!rollback_confirm_enabled(&Gate { running: true, ..open_gate(&x) }, &ok, Some(&key), &key));
+        let unconfirmed = Gate { needs_confirmation: true, ..open_gate(&x) };
+        assert!(!rollback_confirm_enabled(&unconfirmed, &ok, Some(&key), &key));
+    }
+
+    #[test]
+    fn every_gate_refusal_says_why_in_ascii() {
+        let x = ids(&["i-1"]);
+        let key = selection_key(&x);
+        let gates = [
+            Gate { running: true, ..open_gate(&x) },
+            Gate { approved: false, ..open_gate(&x) },
+            Gate { needs_confirmation: true, ..open_gate(&x) },
+        ];
+        for g in &gates {
+            let why = apply_blocker(g, true, Some(&key), &key).expect("refused");
+            assert!(why.is_ascii() && !why.is_empty());
+            let why = rollback_confirm_blocker(g, &[Verdict::Restorable { ts: "1".into() }], Some(&key), &key)
+                .expect("refused");
+            assert!(why.is_ascii() && !why.is_empty());
+        }
     }
 }

@@ -582,6 +582,96 @@ pub fn diagnostics(exec: ExecFn, targets: &[Target]) -> Vec<(String, String)> {
     })
 }
 
+/// How a result line is drawn: green, plain, amber or red.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    Good,
+    Neutral,
+    Warn,
+    Bad,
+}
+
+impl Severity {
+    /// Worth a warning in the log and the Roll back shortcut in the dialog.
+    pub fn is_problem(self) -> bool {
+        matches!(self, Severity::Warn | Severity::Bad)
+    }
+}
+
+/// One node's apply outcome in words, for the result panel and the log.
+/// ASCII only.
+pub fn describe_apply_status(status: &NodeStatus) -> (Severity, String) {
+    match status {
+        NodeStatus::StageFailed(e) => (Severity::Bad, format!("stage failed: {e}")),
+        NodeStatus::NotRestarted => (
+            Severity::Warn,
+            "not restarted (another node failed to stage): left on the newly staged \
+             keystore; it switches cert at its next restart; backup is `<keystore>.bak.<TS>`"
+                .to_string(),
+        ),
+        NodeStatus::RestartFailed(e) => (Severity::Bad, format!("restart outcome unknown: {e}")),
+        NodeStatus::DidNotStabilise => (
+            Severity::Bad,
+            "did not stay active for the required time after the restart".to_string(),
+        ),
+        NodeStatus::Up { change: Some(CertChange::Renewed) } => {
+            (Severity::Good, "Renewed: up, serving the new cert".to_string())
+        }
+        NodeStatus::Up { change: Some(CertChange::NotRenewed) } => (
+            Severity::Bad,
+            "Not renewed: up, but the expiry date did not move".to_string(),
+        ),
+        NodeStatus::Up { change: Some(CertChange::Flagged(diffs)) } => (
+            Severity::Bad,
+            format!("Flagged: up, but the new cert looks different: {}", diffs.join("; ")),
+        ),
+        NodeStatus::Up { change: None } => (
+            Severity::Warn,
+            "up, but there was no before capture to compare the cert against".to_string(),
+        ),
+        NodeStatus::Unverified(e) => (
+            Severity::Bad,
+            format!("unverified: up, but the cert could not be read: {e}"),
+        ),
+    }
+}
+
+/// One node's rollback outcome in words. ASCII only.
+pub fn describe_rollback_status(status: &RollbackStatus) -> (Severity, String) {
+    match status {
+        RollbackStatus::RestoreFailed(e) => (Severity::Bad, format!("restore failed: {e}")),
+        RollbackStatus::NotRestarted => (
+            Severity::Warn,
+            "not restarted (another node failed to restore): left on the restored old \
+             stores, still serving the cert it had; the stores it had are saved as \
+             `<keystore>.rollback.<TS>`"
+                .to_string(),
+        ),
+        RollbackStatus::NothingToRollBack => (
+            Severity::Neutral,
+            "Nothing to roll back: it already served the old cert; left untouched".to_string(),
+        ),
+        RollbackStatus::RestartFailed(e) => {
+            (Severity::Bad, format!("restart outcome unknown: {e}"))
+        }
+        RollbackStatus::DidNotStabilise => (
+            Severity::Bad,
+            "did not stay active for the required time after the restart".to_string(),
+        ),
+        RollbackStatus::Up => (
+            Severity::Good,
+            "Rolled back: up, serving the old cert".to_string(),
+        ),
+        RollbackStatus::WrongCert(e) => {
+            (Severity::Bad, format!("up, but not serving the old cert: {e}"))
+        }
+        RollbackStatus::Unverified(e) => (
+            Severity::Bad,
+            format!("unverified: up, but the cert could not be read: {e}"),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod script_tests {
     const RENEW: &str = include_str!("../assets/scripts/cassandra.sh");
@@ -1434,5 +1524,130 @@ mod flow_tests {
             "systemctl status cassandra --no-pager -l 2>&1 | tail -n 20; echo ----; \
              journalctl -u cassandra -n 30 --no-pager 2>&1 | tail -n 30"
         );
+    }
+}
+
+#[cfg(test)]
+mod describe_tests {
+    use super::*;
+    use crate::cassandra_cert::CertChange;
+
+    fn apply(s: NodeStatus) -> (Severity, String) {
+        describe_apply_status(&s)
+    }
+
+    fn rollback(s: RollbackStatus) -> (Severity, String) {
+        describe_rollback_status(&s)
+    }
+
+    #[test]
+    fn every_apply_status_has_its_own_words() {
+        let (sev, text) = apply(NodeStatus::StageFailed("rc 3".into()));
+        assert_eq!(sev, Severity::Bad);
+        assert!(text.contains("stage failed") && text.contains("rc 3"), "{text}");
+
+        let (sev, text) = apply(NodeStatus::NotRestarted);
+        assert_eq!(sev, Severity::Warn);
+        assert!(text.contains("left on the newly staged keystore"), "{text}");
+        assert!(text.contains("switches cert at its next restart"), "{text}");
+        assert!(text.contains("<keystore>.bak.<TS>"), "{text}");
+
+        let (sev, text) = apply(NodeStatus::RestartFailed("timeout".into()));
+        assert_eq!(sev, Severity::Bad);
+        assert_eq!(text, "restart outcome unknown: timeout");
+
+        let (sev, text) = apply(NodeStatus::DidNotStabilise);
+        assert_eq!(sev, Severity::Bad);
+        assert!(text.contains("did not stay active"), "{text}");
+
+        let (sev, text) = apply(NodeStatus::Up { change: Some(CertChange::Renewed) });
+        assert_eq!(sev, Severity::Good);
+        assert!(text.contains("Renewed"), "{text}");
+
+        let (sev, text) = apply(NodeStatus::Up { change: Some(CertChange::NotRenewed) });
+        assert_eq!(sev, Severity::Bad);
+        assert!(text.contains("the expiry date did not move"), "{text}");
+
+        let (sev, text) = apply(NodeStatus::Up {
+            change: Some(CertChange::Flagged(vec!["subject changed: a -> b".into()])),
+        });
+        assert_eq!(sev, Severity::Bad);
+        assert!(text.contains("subject changed: a -> b"), "{text}");
+
+        let (sev, text) = apply(NodeStatus::Up { change: None });
+        assert_eq!(sev, Severity::Warn);
+        assert!(text.contains("no before capture"), "{text}");
+
+        let (sev, text) = apply(NodeStatus::Unverified("no output".into()));
+        assert_eq!(sev, Severity::Bad);
+        assert!(text.contains("unverified") && text.contains("no output"), "{text}");
+    }
+
+    #[test]
+    fn every_rollback_status_has_its_own_words() {
+        let (sev, text) = rollback(RollbackStatus::RestoreFailed("no space".into()));
+        assert_eq!(sev, Severity::Bad);
+        assert!(text.contains("restore failed") && text.contains("no space"), "{text}");
+
+        let (sev, text) = rollback(RollbackStatus::NotRestarted);
+        assert_eq!(sev, Severity::Warn);
+        assert!(text.contains("left on the restored old stores"), "{text}");
+        assert!(text.contains("<keystore>.rollback.<TS>"), "{text}");
+
+        let (sev, text) = rollback(RollbackStatus::NothingToRollBack);
+        assert_eq!(sev, Severity::Neutral);
+        assert!(text.contains("Nothing to roll back"), "{text}");
+
+        let (sev, text) = rollback(RollbackStatus::RestartFailed("timeout".into()));
+        assert_eq!(sev, Severity::Bad);
+        assert_eq!(text, "restart outcome unknown: timeout");
+
+        let (sev, _) = rollback(RollbackStatus::DidNotStabilise);
+        assert_eq!(sev, Severity::Bad);
+
+        let (sev, text) = rollback(RollbackStatus::Up);
+        assert_eq!(sev, Severity::Good);
+        assert!(text.contains("Rolled back"), "{text}");
+
+        let (sev, text) = rollback(RollbackStatus::WrongCert("serial 02".into()));
+        assert_eq!(sev, Severity::Bad);
+        assert!(text.contains("serial 02"), "{text}");
+
+        let (sev, text) = rollback(RollbackStatus::Unverified("no output".into()));
+        assert_eq!(sev, Severity::Bad);
+        assert!(text.contains("unverified"), "{text}");
+    }
+
+    #[test]
+    fn a_problem_is_a_warning_or_worse() {
+        assert!(Severity::Bad.is_problem());
+        assert!(Severity::Warn.is_problem());
+        assert!(!Severity::Good.is_problem());
+        assert!(!Severity::Neutral.is_problem());
+    }
+
+    #[test]
+    fn status_texts_are_ascii() {
+        let all = [
+            apply(NodeStatus::StageFailed("e".into())),
+            apply(NodeStatus::NotRestarted),
+            apply(NodeStatus::RestartFailed("e".into())),
+            apply(NodeStatus::DidNotStabilise),
+            apply(NodeStatus::Up { change: None }),
+            apply(NodeStatus::Up { change: Some(CertChange::Renewed) }),
+            apply(NodeStatus::Up { change: Some(CertChange::NotRenewed) }),
+            apply(NodeStatus::Unverified("e".into())),
+            rollback(RollbackStatus::RestoreFailed("e".into())),
+            rollback(RollbackStatus::NotRestarted),
+            rollback(RollbackStatus::NothingToRollBack),
+            rollback(RollbackStatus::RestartFailed("e".into())),
+            rollback(RollbackStatus::DidNotStabilise),
+            rollback(RollbackStatus::Up),
+            rollback(RollbackStatus::WrongCert("e".into())),
+            rollback(RollbackStatus::Unverified("e".into())),
+        ];
+        for (_, text) in all {
+            assert!(text.is_ascii(), "{text}");
+        }
     }
 }
