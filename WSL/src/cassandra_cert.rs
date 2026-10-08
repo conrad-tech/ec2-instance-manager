@@ -184,6 +184,9 @@ pub fn parse_openssl(out: &str) -> Option<CertInfo> {
             }
         }
     }
+    if subject.is_empty() || issuer.is_empty() {
+        return None;
+    }
     Some(CertInfo {
         subject,
         issuer,
@@ -264,7 +267,7 @@ pub fn env_domain(env_name: &str) -> String {
 
 /// A token safe to interpolate into a shell command and an SSM path.
 pub fn valid_domain_token(s: &str) -> bool {
-    !s.is_empty()
+    s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
         && s.len() <= 63
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
@@ -301,7 +304,10 @@ pub fn parse_param_date(s: &str) -> Option<i64> {
     if let Ok(d) = DateTime::parse_from_rfc3339(s) {
         return Some(d.timestamp());
     }
-    s.parse::<f64>().ok().map(|f| f.floor() as i64)
+    s.parse::<f64>()
+        .ok()
+        .filter(|f| f.is_finite() && *f >= 1.0 && *f < 1e11)
+        .map(|f| f.floor() as i64)
 }
 
 /// A parameter last changed before the current cert was issued has not been
@@ -502,6 +508,25 @@ mod tests {
     }
 
     #[test]
+    fn output_missing_any_of_the_four_fields_is_none() {
+        assert!(parse_openssl("notBefore=Sep  3 07:01:23 2025 GMT\nnotAfter=Oct  3 08:01:22 2026 GMT\n").is_none());
+        let no_issuer = "subject= /CN=x\nnotBefore=Sep  3 07:01:23 2025 GMT\nnotAfter=Oct  3 08:01:22 2026 GMT\n";
+        assert!(parse_openssl(no_issuer).is_none());
+        let no_before = "subject= /CN=x\nissuer= /CN=y\nnotAfter=Oct  3 08:01:22 2026 GMT\n";
+        assert!(parse_openssl(no_before).is_none());
+    }
+
+    #[test]
+    fn domain_tokens_must_start_alphanumeric() {
+        for bad in ["-x", ".dev1", ""] {
+            assert!(!valid_domain_token(bad), "{bad}");
+        }
+        for ok in ["dev1", "dev1.net", "a-b.c"] {
+            assert!(valid_domain_token(ok), "{ok}");
+        }
+    }
+
+    #[test]
     fn expiry_is_judged_against_now() {
         let c = parse_openssl(SCREENSHOT).unwrap();
         assert!(is_expired(&c, c.not_after));
@@ -587,6 +612,9 @@ mod tests {
         // CLI v1: epoch seconds with a fraction.
         assert_eq!(parse_param_date("1791014482.123"), Some(1_791_014_482));
         assert_eq!(parse_param_date("not a date"), None);
+        for bad in ["inf", "NaN", "1e30", "-5", "0"] {
+            assert_eq!(parse_param_date(bad), None, "{bad}");
+        }
         assert_eq!(parse_param_date(""), None);
     }
 
