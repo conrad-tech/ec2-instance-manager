@@ -31,6 +31,7 @@ mod gui {
         self, AutoScalingGroup, CapacityEffect, ScalingActivity, ScalingPolicy, ScheduledAction,
     };
     use ec2_manager::aws_context::build_context_with_profile;
+    use ec2_manager::{cassandra_cert, cassandra_flow};
     use ec2_manager::config::AppConfig;
     use ec2_manager::credentials;
     use ec2_manager::script_env::ScriptEnv;
@@ -976,6 +977,64 @@ mod gui {
             profile_id: String,
             found: Option<String>,
             searched: usize,
+        },
+        /// One step of a Scripts -> Cassandra Cert job. The handler only
+        /// queues it on `cassandra_inbox`: cluster activity must not reach
+        /// the shared App log, which users off the allow-list can read.
+        Cassandra(CassandraEvent),
+    }
+
+    /// What a Cassandra cert job reports, in order. Every job ends with
+    /// exactly one of `ParamDates`+`DryRun`, `Preflight`, `Applied`,
+    /// `RolledBack` or `Failed`; `Diagnostics`, when sent, comes before the
+    /// `Applied` / `RolledBack` it explains.
+    #[allow(dead_code)] // consumed by the Cassandra dialog (Task 10)
+    enum CassandraEvent {
+        Log(String),
+        /// `(parameter path, last modified)` per configured template. A
+        /// template that does not expand stays as itself, with the reason.
+        ParamDates(Vec<(String, std::result::Result<i64, String>)>),
+        DryRun(Vec<cassandra_flow::NodeDryRun>),
+        Preflight(Vec<cassandra_flow::NodePreflight>),
+        Applied(cassandra_flow::ApplyReport),
+        RolledBack(cassandra_flow::RollbackReport),
+        /// `(node name, status + journal tail)` for each node the run left
+        /// failing. Read-only, gathered before the report is sent.
+        Diagnostics(Vec<(String, String)>),
+        Failed(String),
+    }
+
+    /// One Cassandra cert job for `App::start_cassandra_job`.
+    #[allow(dead_code)] // consumed by the Cassandra dialog (Task 10)
+    enum CassandraJob {
+        DryRun {
+            account_id: String,
+            env: String,
+            targets: Vec<cassandra_flow::Target>,
+            domain_arg: Option<String>,
+            /// Raw `cassandra_cert.parameters` templates; the worker expands them.
+            parameters: Vec<String>,
+        },
+        Apply {
+            account_id: String,
+            env: String,
+            targets: Vec<cassandra_flow::Target>,
+            unselected: Vec<cassandra_flow::Target>,
+            domain_arg: Option<String>,
+            before: HashMap<String, cassandra_cert::CertInfo>,
+        },
+        Preflight {
+            account_id: String,
+            env: String,
+            targets: Vec<cassandra_flow::Target>,
+        },
+        Rollback {
+            account_id: String,
+            env: String,
+            restore: Vec<cassandra_flow::RollbackNode>,
+            skipped: Vec<cassandra_flow::Target>,
+            unselected: Vec<cassandra_flow::Target>,
+            old: cassandra_cert::OldCert,
         },
     }
 
@@ -9384,6 +9443,14 @@ mod gui {
         /// `allowed_users` gate — the lookup must not run per frame, and the
         /// answer cannot change while the app is up.
         instance_power_enabled: bool,
+        /// Cassandra job events waiting for the dialog, oldest first. Kept
+        /// here rather than logged: the dialog logs them under its own
+        /// allow-listed source.
+        #[allow(dead_code)] // consumed by the Cassandra dialog (Task 10)
+        cassandra_inbox: Vec<CassandraEvent>,
+        /// `cassandra_cert.watch_secs()`, `(required, ceiling)`, resolved once
+        /// at startup like the gates beside it.
+        cassandra_watch_secs: (u64, u64),
         /// A Start / Stop / Restart awaiting confirmation, if any.
         power_confirm: Option<PowerConfirm>,
         /// Instance ids with a power run already going. Shared with the
@@ -10234,6 +10301,8 @@ mod gui {
                 pending_script_delete: None,
                 instance_power_enabled: features
                     .instance_power_enabled_for(&ec2_manager::features::current_os_user()),
+                cassandra_inbox: Vec::new(),
+                cassandra_watch_secs: features.cassandra_cert.watch_secs(),
                 power_confirm: None,
                 power_in_flight: Arc::new(Mutex::new(HashSet::new())),
                 power_status: None,
@@ -24596,6 +24665,13 @@ mod gui {
                             self.enqueue_refresh(&profile_id, true, true);
                         }
                     }
+                    ProcEvent::Cassandra(event) => {
+                        // Queued, not logged: see `ProcEvent::Cassandra`.
+                        self.cassandra_inbox.push(event);
+                        if let Some(c) = &self.egui_ctx {
+                            c.request_repaint();
+                        }
+                    }
                     ProcEvent::RegionSearchNote { level, message } => {
                         self.log(level, message);
                     }
@@ -26985,6 +27061,32 @@ mod gui {
                     c.request_repaint();
                 }
             });
+        }
+
+        /// Run one Cassandra cert job on its own thread, reporting on
+        /// `proc_tx` as `ProcEvent::Cassandra`. Live mode only, and only with
+        /// credentials: the reaper's account gate, reused rather than written
+        /// twice, runs before anything is spawned, so a refusal is one
+        /// `Failed` and nothing else.
+        #[allow(dead_code)] // consumed by the Cassandra dialog (Task 10)
+        fn start_cassandra_job(&mut self, job: CassandraJob) {
+            let account_id = match &job {
+                CassandraJob::DryRun { account_id, .. }
+                | CassandraJob::Apply { account_id, .. }
+                | CassandraJob::Preflight { account_id, .. }
+                | CassandraJob::Rollback { account_id, .. } => account_id.clone(),
+            };
+            let ctx = match reaper_account_context(&self.options.mode, &self.config, &account_id) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = self.proc_tx.send(ProcEvent::Cassandra(CassandraEvent::Failed(e)));
+                    return;
+                }
+            };
+            let watch = self.cassandra_watch_secs;
+            let tx = self.proc_tx.clone();
+            let egui_ctx = self.egui_ctx.clone();
+            std::thread::spawn(move || run_cassandra_job(job, &ctx, watch, &tx, &egui_ctx));
         }
 
         /// An inventory load has just landed. If it came back empty, go and
@@ -43753,6 +43855,170 @@ mod gui {
         cmd
     }
 
+    /// When an SSM parameter last changed, as unix seconds.
+    ///
+    /// `describe-parameters` only, which returns metadata and never the
+    /// value: the dialog needs a date, and the value is a private key that
+    /// has no business in this process. A source scan in `mod tests` holds
+    /// the file to that.
+    fn fetch_parameter_modified(
+        profile: &str,
+        region: &str,
+        name: &str,
+    ) -> std::result::Result<i64, String> {
+        let output = aws_command()
+            .args([
+                "ssm",
+                "describe-parameters",
+                "--profile",
+                profile,
+                "--region",
+                region,
+                "--parameter-filters",
+                &format!("Key=Name,Option=Equals,Values={name}"),
+                "--query",
+                "Parameters[0].LastModifiedDate",
+                "--output",
+                "text",
+            ])
+            .output()
+            .map_err(|e| format!("describe-parameters failed: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "describe-parameters error: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if text.is_empty() || text == "None" {
+            return Err(format!("parameter {name} was not found"));
+        }
+        cassandra_cert::parse_param_date(&text)
+            .ok_or_else(|| format!("could not read a date from '{text}'"))
+    }
+
+    /// Run `f`, turning a panic into `"<job> panicked: …"`. A Cassandra job
+    /// may already have issued restarts when something panics, and the
+    /// dialog must hear that it ended rather than spin forever.
+    fn cassandra_guard<T>(
+        job: &str,
+        f: impl FnOnce() -> T,
+    ) -> std::result::Result<T, String> {
+        panic::catch_unwind(AssertUnwindSafe(f))
+            .map_err(|p| format!("{job} panicked: {}", panic_payload_to_string(&*p)))
+    }
+
+    /// The body of `App::start_cassandra_job`'s thread. `ctx` has already
+    /// passed the Live-mode and credentials gate. Every remote command goes
+    /// through one-shot `send-command` (no control channel), and each job
+    /// ends with exactly one terminal event — see `CassandraEvent`.
+    fn run_cassandra_job(
+        job: CassandraJob,
+        ctx: &AwsContext,
+        (required_secs, ceiling_secs): (u64, u64),
+        tx: &Sender<ProcEvent>,
+        egui_ctx: &Option<egui::Context>,
+    ) {
+        use cassandra_flow as flow;
+        let send = |e: CassandraEvent| {
+            let _ = tx.send(ProcEvent::Cassandra(e));
+            if let Some(c) = egui_ctx {
+                c.request_repaint();
+            }
+        };
+        let exec = |id: &str, cmd: &str, timeout: Duration| -> std::result::Result<String, String> {
+            exec_remote_command(&None, ctx, id, cmd, timeout)
+        };
+        // A real monotonic clock that advances: the watch's stability and
+        // ceiling are measured on it.
+        let started = Instant::now();
+        let now = || started.elapsed().as_secs();
+        let sleep = |d: Duration| std::thread::sleep(d);
+        let pacer = flow::Pacer { now: &now, sleep: &sleep };
+        let emit = |m: String| send(CassandraEvent::Log(m));
+        // Diagnostics for whatever the run left failing, sent before its report.
+        let diagnose = |failing: Vec<flow::Target>| {
+            if failing.is_empty() {
+                return;
+            }
+            send(CassandraEvent::Log(format!(
+                "reading status and journal from {} failing node(s)",
+                failing.len()
+            )));
+            match cassandra_guard("diagnostics", || flow::diagnostics(&exec, &failing)) {
+                Ok(d) => send(CassandraEvent::Diagnostics(d)),
+                Err(e) => send(CassandraEvent::Log(e)),
+            }
+        };
+
+        match job {
+            CassandraJob::DryRun { env, targets, domain_arg, parameters, .. } => {
+                send(CassandraEvent::Log(format!("dry run on {} node(s)", targets.len())));
+                let domain = cassandra_cert::env_domain(&env);
+                let dates: Vec<(String, std::result::Result<i64, String>)> = parameters
+                    .iter()
+                    .map(|template| match cassandra_cert::expand_parameter(template, &domain) {
+                        Err(e) => (template.clone(), Err(e)),
+                        Ok(path) => {
+                            let r = fetch_parameter_modified(&ctx.profile, &ctx.region, &path);
+                            (path, r)
+                        }
+                    })
+                    .collect();
+                send(CassandraEvent::ParamDates(dates));
+                match cassandra_guard("dry run", || {
+                    flow::dry_run(&exec, &targets, domain_arg.as_deref())
+                }) {
+                    Ok(out) => send(CassandraEvent::DryRun(out)),
+                    Err(e) => send(CassandraEvent::Failed(e)),
+                }
+            }
+            CassandraJob::Apply { targets, unselected, domain_arg, before, .. } => {
+                send(CassandraEvent::Log(format!("apply on {} node(s)", targets.len())));
+                let input = flow::ApplyInput {
+                    targets: &targets,
+                    unselected: &unselected,
+                    domain_arg: domain_arg.as_deref(),
+                    before: &before,
+                    required_secs,
+                    ceiling_secs,
+                };
+                match cassandra_guard("apply", || flow::apply(&exec, &input, &pacer, &emit)) {
+                    Ok(rep) => {
+                        diagnose(flow::apply_failed_nodes(&rep));
+                        send(CassandraEvent::Applied(rep));
+                    }
+                    Err(e) => send(CassandraEvent::Failed(e)),
+                }
+            }
+            CassandraJob::Preflight { targets, .. } => {
+                send(CassandraEvent::Log(format!("rollback preflight on {} node(s)", targets.len())));
+                match cassandra_guard("preflight", || flow::preflight(&exec, &targets)) {
+                    Ok(out) => send(CassandraEvent::Preflight(out)),
+                    Err(e) => send(CassandraEvent::Failed(e)),
+                }
+            }
+            CassandraJob::Rollback { restore, skipped, unselected, old, .. } => {
+                send(CassandraEvent::Log(format!("rollback on {} node(s)", restore.len())));
+                let input = flow::RollbackInput {
+                    restore: &restore,
+                    skipped: &skipped,
+                    unselected: &unselected,
+                    old: &old,
+                    required_secs,
+                    ceiling_secs,
+                };
+                match cassandra_guard("rollback", || flow::rollback(&exec, &input, &pacer, &emit)) {
+                    Ok(rep) => {
+                        diagnose(flow::rollback_failed_nodes(&rep));
+                        send(CassandraEvent::RolledBack(rep));
+                    }
+                    Err(e) => send(CassandraEvent::Failed(e)),
+                }
+            }
+        }
+    }
+
     /// The `--parameters` argument for a one-shot `AWS-RunShellScript`.
     ///
     /// **JSON, not the CLI's shorthand `commands=["…"]`.** Shorthand ends a
@@ -53518,6 +53784,49 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 "read the environment through `instance.env`, which resolves the \
                  account's own tag key: {offenders:?}"
             );
+        }
+
+        /// The Cassandra Cert dialog needs only when an SSM parameter last
+        /// changed. Reading its VALUE would put a private key in this process.
+        #[test]
+        fn describe_parameters_is_the_only_ssm_parameter_call() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let prod = &src[..src.find("    mod tests {").unwrap_or(src.len())];
+            assert!(!prod.contains("get-parameter"), "the GUI must never read a parameter's value");
+            assert!(prod.contains("describe-parameters"));
+            let body = method_body(prod, "fn fetch_parameter_modified(");
+            assert!(body.contains("\"describe-parameters\""), "{body}");
+        }
+
+        /// The value-reading calls in every spelling: the CLI verbs
+        /// (`get-parameter`, `get-parameters`, `get-parameters-by-path`) and
+        /// the API action names a `--cli-input-json` or SDK call would use.
+        #[test]
+        fn nothing_outside_the_tests_reads_a_parameter_value() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let prod = &src[..src.find("    mod tests {").expect("the test module")];
+            // Assembled, so the scan does not match its own source.
+            let banned = [format!("get-{}", "parameter"), format!("Get{}", "Parameter")];
+            for (n, line) in prod.lines().enumerate() {
+                for b in &banned {
+                    assert!(!line.contains(b.as_str()), "line {}: {}", n + 1, line.trim());
+                }
+            }
+        }
+
+        #[test]
+        fn the_cassandra_job_refuses_anything_but_live_mode() {
+            // The shipping half only: the signature string below would
+            // otherwise be found here, in this test, and it would pass
+            // without the method existing.
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let body = method_body(src, "fn start_cassandra_job(");
+            assert!(body.contains("reaper_account_context"), "must reuse the live/credentials gate");
+            // The gate comes before the thread, so a refusal spawns nothing.
+            let gate = body.find("reaper_account_context").unwrap();
+            let spawn = body.find("thread::spawn").expect("the worker thread");
+            assert!(gate < spawn, "the gate must run before the spawn");
         }
 
         /// Restart is a stop and a start. `ec2 reboot-instances` keeps the

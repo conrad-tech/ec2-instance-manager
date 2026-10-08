@@ -526,6 +526,62 @@ pub fn rollback(
     RollbackReport { nodes, stale, restarted }
 }
 
+/// Selected nodes an apply left in a state worth diagnosing. `NotRestarted`
+/// is not one: that node was deliberately left alone. An `Up` node counts
+/// when its cert did not move forward or looks wrong.
+pub fn apply_failed_nodes(report: &ApplyReport) -> Vec<Target> {
+    report
+        .nodes
+        .iter()
+        .filter(|(_, s)| match s {
+            NodeStatus::StageFailed(_)
+            | NodeStatus::RestartFailed(_)
+            | NodeStatus::DidNotStabilise
+            | NodeStatus::Unverified(_) => true,
+            NodeStatus::Up { change } => {
+                matches!(change, Some(CertChange::NotRenewed) | Some(CertChange::Flagged(_)))
+            }
+            NodeStatus::NotRestarted => false,
+        })
+        .map(|(t, _)| t.clone())
+        .collect()
+}
+
+/// Nodes a rollback left in a state worth diagnosing.
+pub fn rollback_failed_nodes(report: &RollbackReport) -> Vec<Target> {
+    report
+        .nodes
+        .iter()
+        .filter(|(_, s)| match s {
+            RollbackStatus::RestoreFailed(_)
+            | RollbackStatus::RestartFailed(_)
+            | RollbackStatus::DidNotStabilise
+            | RollbackStatus::WrongCert(_)
+            | RollbackStatus::Unverified(_) => true,
+            RollbackStatus::NotRestarted | RollbackStatus::NothingToRollBack | RollbackStatus::Up => false,
+        })
+        .map(|(t, _)| t.clone())
+        .collect()
+}
+
+/// The one read-only look at a failing node: the unit's status and its
+/// recent journal, both bounded.
+pub const DIAGNOSTICS_CMD: &str = "systemctl status cassandra --no-pager -l 2>&1 | tail -n 20; echo ----; \
+     journalctl -u cassandra -n 30 --no-pager 2>&1 | tail -n 30";
+const DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Run `DIAGNOSTICS_CMD` on every target at once. `(node name, text)`; a
+/// failed read is kept as the text, so a node is never silently missing.
+pub fn diagnostics(exec: ExecFn, targets: &[Target]) -> Vec<(String, String)> {
+    per_node(targets, &|t| {
+        let text = match exec(&t.instance_id, DIAGNOSTICS_CMD, DIAGNOSTICS_TIMEOUT) {
+            Ok(out) => out,
+            Err(e) => format!("diagnostics could not be read: {e}"),
+        };
+        (t.name.clone(), text)
+    })
+}
+
 #[cfg(test)]
 mod script_tests {
     const RENEW: &str = include_str!("../assets/scripts/cassandra.sh");
@@ -1319,5 +1375,64 @@ mod flow_tests {
         });
         let rep = run_rollback(&fake, &[rb_node("i-1", "1")], &[], &[]);
         assert!(matches!(&rep.nodes[0].1, RollbackStatus::Unverified(e) if e.contains("timed out")));
+    }
+
+    #[test]
+    fn an_apply_counts_every_bad_outcome_as_failing_and_nothing_else() {
+        let rep = ApplyReport {
+            nodes: vec![
+                (t("i-1", "a"), NodeStatus::StageFailed("x".into())),
+                (t("i-2", "b"), NodeStatus::NotRestarted),
+                (t("i-3", "c"), NodeStatus::RestartFailed("x".into())),
+                (t("i-4", "d"), NodeStatus::DidNotStabilise),
+                (t("i-5", "e"), NodeStatus::Up { change: None }),
+                (t("i-6", "f"), NodeStatus::Up { change: Some(CertChange::Renewed) }),
+                (t("i-7", "g"), NodeStatus::Up { change: Some(CertChange::NotRenewed) }),
+                (t("i-8", "h"), NodeStatus::Up { change: Some(CertChange::Flagged(vec!["s".into()])) }),
+                (t("i-9", "i"), NodeStatus::Unverified("x".into())),
+            ],
+            stale: None,
+            restarted: true,
+        };
+        let ids: Vec<String> = apply_failed_nodes(&rep).into_iter().map(|t| t.instance_id).collect();
+        assert_eq!(ids, ["i-1", "i-3", "i-4", "i-7", "i-8", "i-9"]);
+    }
+
+    #[test]
+    fn a_rollback_counts_every_bad_outcome_as_failing_and_nothing_else() {
+        let rep = RollbackReport {
+            nodes: vec![
+                (t("i-1", "a"), RollbackStatus::RestoreFailed("x".into())),
+                (t("i-2", "b"), RollbackStatus::NotRestarted),
+                (t("i-3", "c"), RollbackStatus::NothingToRollBack),
+                (t("i-4", "d"), RollbackStatus::RestartFailed("x".into())),
+                (t("i-5", "e"), RollbackStatus::DidNotStabilise),
+                (t("i-6", "f"), RollbackStatus::Up),
+                (t("i-7", "g"), RollbackStatus::WrongCert("x".into())),
+                (t("i-8", "h"), RollbackStatus::Unverified("x".into())),
+            ],
+            stale: None,
+            restarted: true,
+        };
+        let ids: Vec<String> = rollback_failed_nodes(&rep).into_iter().map(|t| t.instance_id).collect();
+        assert_eq!(ids, ["i-1", "i-4", "i-5", "i-7", "i-8"]);
+    }
+
+    #[test]
+    fn diagnostics_run_the_one_read_only_command_on_each_node_and_keep_errors() {
+        let fake = Fake::new(|id, _cmd| {
+            if id == "i-2" { Err("timed out".into()) } else { Ok("Active: failed\n".into()) }
+        });
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let out = diagnostics(&exec, &[t("i-1", "cassandra-001"), t("i-2", "cassandra-002")]);
+        assert_eq!(out[0], ("cassandra-001".to_string(), "Active: failed\n".to_string()));
+        assert_eq!(out[1].0, "cassandra-002");
+        assert!(out[1].1.contains("timed out"), "{}", out[1].1);
+        assert_eq!(fake.commands_for("i-1"), [DIAGNOSTICS_CMD]);
+        assert_eq!(
+            DIAGNOSTICS_CMD,
+            "systemctl status cassandra --no-pager -l 2>&1 | tail -n 20; echo ----; \
+             journalctl -u cassandra -n 30 --no-pager 2>&1 | tail -n 30"
+        );
     }
 }
