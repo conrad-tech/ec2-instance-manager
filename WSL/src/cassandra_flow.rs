@@ -94,7 +94,12 @@ pub(crate) fn per_node<T: Send>(
 fn read_cert(exec: ExecFn, t: &Target) -> Result<(Option<CertInfo>, String, String), String> {
     let cmd = invocation(&check_script(), &[]);
     let out = exec(&t.instance_id, &cmd, QUICK_TIMEOUT)?;
-    let raw = parse_check(&out).ok_or_else(|| "the cert check returned no readable result".to_string())?;
+    cert_from_check(&out)
+}
+
+/// The cert, service state and raw openssl text in a check script's output.
+fn cert_from_check(out: &str) -> Result<(Option<CertInfo>, String, String), String> {
+    let raw = parse_check(out).ok_or_else(|| "the cert check returned no readable result".to_string())?;
     let cert_text = out
         .split("__CC_CERT_BEGIN__")
         .nth(1)
@@ -191,6 +196,68 @@ pub struct Pacer<'a> {
 }
 
 const POLL: Duration = Duration::from_secs(5);
+
+/// How long after a node is judged Stable its served cert may take to become
+/// readable. `systemctl is-active` says `active` as soon as the process is
+/// up, well before the native transport listens.
+pub const VERIFY_DEADLINE_SECS: u64 = 180;
+
+/// The cert `t` serves, read every `POLL` until it parses, `deadline_secs`
+/// have passed, or `exec` itself has failed twice in a row; the last outcome
+/// either way (`Ok(None)`: the check ran but no cert could be read).
+pub fn read_cert_retrying(
+    exec: ExecFn,
+    t: &Target,
+    pacer: &Pacer,
+    deadline_secs: u64,
+) -> Result<Option<CertInfo>, String> {
+    let start = (pacer.now)();
+    // A hard bound on attempts as well, so a clock that never moves cannot
+    // keep this loop alive.
+    let max_attempts = deadline_secs / POLL.as_secs() + 2;
+    let mut exec_errors = 0;
+    let mut last: Result<Option<CertInfo>, String> = Ok(None);
+    for _ in 0..max_attempts {
+        let cmd = invocation(&check_script(), &[]);
+        last = match exec(&t.instance_id, &cmd, QUICK_TIMEOUT) {
+            Err(e) => {
+                exec_errors += 1;
+                Err(e)
+            }
+            Ok(out) => {
+                exec_errors = 0;
+                cert_from_check(&out).map(|(c, _, _)| c)
+            }
+        };
+        if matches!(last, Ok(Some(_))) || exec_errors >= 2 {
+            break;
+        }
+        if (pacer.now)().saturating_sub(start) >= deadline_secs {
+            break;
+        }
+        (pacer.sleep)(POLL);
+    }
+    last
+}
+
+/// Post-restart verification: the served cert of every node that reached
+/// Stable, retried until readable; `None` for the others, which are judged
+/// by their watch alone.
+fn verify_stable(
+    exec: ExecFn,
+    targets: &[Target],
+    watched: &[Result<WatchState, String>],
+    pacer: &Pacer,
+) -> Vec<Option<Result<Option<CertInfo>, String>>> {
+    let stable: Vec<usize> = (0..targets.len())
+        .filter(|&i| matches!(watched[i], Ok(WatchState::Stable)))
+        .collect();
+    let subset: Vec<Target> = stable.iter().map(|&i| targets[i].clone()).collect();
+    let mut read = per_node(&subset, &|t| read_cert_retrying(exec, t, pacer, VERIFY_DEADLINE_SECS)).into_iter();
+    (0..targets.len())
+        .map(|i| if stable.contains(&i) { read.next() } else { None })
+        .collect()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeStatus {
@@ -339,9 +406,8 @@ pub fn apply(
     let watched = restart_and_watch(exec, input.targets, input.required_secs, input.ceiling_secs, pacer, emit);
     let restarted = watched.iter().any(|w| w.is_ok());
 
-    // 5. Verify what each node serves now.
-    let certs: Vec<Result<Option<CertInfo>, String>> =
-        per_node(input.targets, &|t| read_cert(exec, t).map(|(c, _, _)| c));
+    // 5. Verify what each Stable node serves now, waiting for its port.
+    let certs = verify_stable(exec, input.targets, &watched, pacer);
     let mut reference: Option<CertInfo> = None;
     let nodes: Vec<(Target, NodeStatus)> = input
         .targets
@@ -353,7 +419,7 @@ pub fn apply(
             let st = match w {
                 Err(e) => NodeStatus::RestartFailed(e),
                 Ok(WatchState::Failed) | Ok(WatchState::Pending) => NodeStatus::DidNotStabilise,
-                Ok(WatchState::Stable) => match c {
+                Ok(WatchState::Stable) => match c.unwrap_or(Ok(None)) {
                     Err(e) => NodeStatus::Unverified(e),
                     Ok(None) => NodeStatus::Unverified("the node serves no readable cert".into()),
                     Ok(Some(after)) => {
@@ -495,8 +561,7 @@ pub fn rollback(
     // 2. Restart together, watch, verify against the cert rolled back to.
     let watched = restart_and_watch(exec, &restore_targets, input.required_secs, input.ceiling_secs, pacer, emit);
     let restarted = watched.iter().any(|w| w.is_ok());
-    let certs: Vec<Result<Option<CertInfo>, String>> =
-        per_node(&restore_targets, &|t| read_cert(exec, t).map(|(c, _, _)| c));
+    let certs = verify_stable(exec, &restore_targets, &watched, pacer);
     let mut nodes: Vec<(Target, RollbackStatus)> = restore_targets
         .iter()
         .cloned()
@@ -506,7 +571,7 @@ pub fn rollback(
             let st = match w {
                 Err(e) => RollbackStatus::RestartFailed(e),
                 Ok(WatchState::Failed) | Ok(WatchState::Pending) => RollbackStatus::DidNotStabilise,
-                Ok(WatchState::Stable) => match c {
+                Ok(WatchState::Stable) => match c.unwrap_or(Ok(None)) {
                     Ok(Some(served)) if served_matches(&served, input.old) => RollbackStatus::Up,
                     Ok(Some(_)) => RollbackStatus::WrongCert("it is not serving the cert rolled back to".into()),
                     Ok(None) => RollbackStatus::WrongCert("it serves no readable cert".into()),
@@ -1471,6 +1536,117 @@ mod flow_tests {
         });
         let rep = run_rollback(&fake, &[rb_node("i-1", "1")], &[], &[]);
         assert!(matches!(&rep.nodes[0].1, RollbackStatus::Unverified(e) if e.contains("timed out")));
+    }
+
+    /// Check-script output with the service up but no cert yet: the native
+    /// transport is not listening, so openssl printed nothing usable.
+    const NO_CERT_YET: &str = "__CC_BEGIN__\n__CC_CERT_BEGIN__\nconnect: Connection refused\n__CC_CERT_END__\n__CC_ACTIVE__ active\n__CC_END__\n";
+
+    /// A box that comes up at once but whose port answers only after
+    /// `unreadable` cert reads (`usize::MAX`: never). `after` is the cert
+    /// it then serves; `restore` answers the rollback's restore.
+    fn slow_port_box(unreadable: usize, after: &'static str, serial: &'static str) -> (Fake, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = reads.clone();
+        let fake = Fake::new(move |_id, cmd| {
+            if cmd.contains("is-active") { Ok("active\n".into()) }
+            else if cmd.contains("systemctl restart") { Ok("__CC_RC__0\n".into()) }
+            else if cmd.contains("--no-restart") { Ok(STAGED.into()) }
+            else if cmd.contains("--restore") { Ok(RESTORED.into()) }
+            else if r.fetch_add(1, Ordering::SeqCst) < unreadable { Ok(NO_CERT_YET.into()) }
+            else { Ok(cert_out(after, serial, "active")) }
+        });
+        (fake, reads)
+    }
+
+    fn fake_pacer_run<T>(f: impl FnOnce(&Pacer) -> T) -> (T, u64) {
+        let clock = Clock::new();
+        let now = || clock.0.load(Ordering::SeqCst);
+        let sleep = |d: Duration| { clock.0.fetch_add(d.as_secs(), Ordering::SeqCst); };
+        let pacer = Pacer { now: &now, sleep: &sleep };
+        let out = f(&pacer);
+        (out, clock.0.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn the_cert_is_read_again_until_the_port_answers() {
+        let (fake, reads) = slow_port_box(4, NEW_AFTER, "02");
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let (got, elapsed) = fake_pacer_run(|p| read_cert_retrying(&exec, &t("i-1", "a"), p, VERIFY_DEADLINE_SECS));
+        assert_eq!(got.expect("read").expect("a cert").not_after, parse_openssl(&format!("subject= /CN=*.a\nissuer= /CN=ca\nnotBefore=Sep  3 07:01:23 2025 GMT\nnotAfter={NEW_AFTER}\nserial=02\n")).unwrap().not_after);
+        assert_eq!(reads.load(Ordering::SeqCst), 5);
+        assert_eq!(elapsed, 20, "four 5s waits");
+    }
+
+    #[test]
+    fn a_cert_that_never_appears_gives_up_at_the_deadline() {
+        let (fake, reads) = slow_port_box(usize::MAX, NEW_AFTER, "02");
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let (got, elapsed) = fake_pacer_run(|p| read_cert_retrying(&exec, &t("i-1", "a"), p, 180));
+        assert_eq!(got, Ok(None));
+        assert!((180..=185).contains(&elapsed), "stopped at {elapsed}s");
+        assert!(reads.load(Ordering::SeqCst) <= 38, "bounded: {} reads", reads.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn two_exec_errors_in_a_row_end_the_retries() {
+        let n = std::sync::atomic::AtomicUsize::new(0);
+        let fake = Fake::new(move |_id, _cmd| {
+            match n.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(NO_CERT_YET.into()),
+                1 => Err("TargetNotConnected".into()),
+                2 => Ok(NO_CERT_YET.into()),
+                _ => Err("timed out".into()),
+            }
+        });
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let (got, _) = fake_pacer_run(|p| read_cert_retrying(&exec, &t("i-1", "a"), p, 180));
+        assert_eq!(got, Err("timed out".to_string()), "one error alone is retried");
+        assert_eq!(fake.commands_for("i-1").len(), 5);
+    }
+
+    #[test]
+    fn an_apply_waits_for_the_port_before_judging_the_cert() {
+        let (fake, _) = slow_port_box(3, NEW_AFTER, "02");
+        let rep = run_apply(&fake, &[t("i-1", "a")], &[], &before_map(&["i-1"]));
+        assert_eq!(rep.nodes[0].1, NodeStatus::Up { change: Some(CertChange::Renewed) });
+    }
+
+    #[test]
+    fn an_apply_whose_port_never_answers_is_unverified() {
+        let (fake, _) = slow_port_box(usize::MAX, NEW_AFTER, "02");
+        let rep = run_apply(&fake, &[t("i-1", "a")], &[], &before_map(&["i-1"]));
+        assert!(matches!(rep.nodes[0].1, NodeStatus::Unverified(_)), "{:?}", rep.nodes[0].1);
+    }
+
+    #[test]
+    fn an_apply_with_exec_failing_twice_is_unverified_with_the_error() {
+        let fake = Fake::new(|_id, cmd| {
+            if cmd.contains("is-active") { Ok("active\n".into()) }
+            else if cmd.contains("systemctl restart") { Ok("__CC_RC__0\n".into()) }
+            else if cmd.contains("--no-restart") { Ok(STAGED.into()) }
+            else { Err("TargetNotConnected".into()) }
+        });
+        let rep = run_apply(&fake, &[t("i-1", "a")], &[], &before_map(&["i-1"]));
+        assert!(matches!(&rep.nodes[0].1, NodeStatus::Unverified(e) if e.contains("TargetNotConnected")), "{:?}", rep.nodes[0].1);
+    }
+
+    #[test]
+    fn a_rollback_waits_for_the_port_before_judging_the_cert() {
+        let (fake, _) = slow_port_box(3, OLD_AFTER, "01");
+        let rep = run_rollback(&fake, &[rb_node("i-1", "1")], &[], &[]);
+        assert_eq!(rep.nodes[0].1, RollbackStatus::Up);
+    }
+
+    #[test]
+    fn the_dry_run_reads_the_cert_once() {
+        let fake = Fake::new(|_id, cmd| {
+            if cmd.contains("--dry-run") { Ok(STAGED.into()) } else { Ok(NO_CERT_YET.into()) }
+        });
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let out = dry_run(&exec, &[t("i-1", "a")], None);
+        assert!(out[0].current.is_none());
+        assert_eq!(fake.commands_for("i-1").len(), 2, "one cert read, one dry run");
     }
 
     #[test]
