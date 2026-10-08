@@ -935,8 +935,8 @@ overruled both.
   silently.
 - **Always enabled once an alert id is typed.** It used to be disabled under
   `reaper.dry_run`; that field no longer exists.
-- **The confirmation names the alert, lists the three commands, and says the
-  watchdog is left stopped and that being on call means acknowledging first.**
+- **The confirmation names the alert, lists the two commands, and says that
+  being on call means acknowledging first.**
   It cannot name the instance: resolution is two AWS calls away and happens
   after the click. It says so, and points at Test Alert Match.
 
@@ -1011,11 +1011,11 @@ so one parser reads both.
   hard way: a real box with three containers reported a bare `__RE_NODIR__`
   and nothing else. `both_scripts_list_the_containers_before_the_directory_guard`
   pins the new order and `the_fix_still_checks_the_directory_before_it_changes_anything`
-  pins the half that is load-bearing — the watchdog stop and the compose
-  commands stay behind the guard.
-- **`systemctl is-active`, never `status`.** It reports and nothing else. Worth
-  having because the fix leaves the watchdog stopped on purpose, so a box found
-  with it inactive is the trace of an earlier remediation rather than a fault.
+  pins the half that is load-bearing — the compose commands stay behind
+  the guard.
+- **`systemctl is-active`, never `status`.** It reports and nothing else. The
+  fix no longer touches the watchdog, so inactive means something else stopped
+  it (older fix runs left it stopped).
 - **The state summary is `compose_services`, not `parse_verdict`.** The verdict
   answers "did the fix work" and words its failure as `not running after
   restart` — a restart the probe never performed, and a sentence in the log
@@ -1342,7 +1342,7 @@ run.** Run Remediation and Override are unchanged.
   alert: fetch, identify, match, resolve the target group to an instance, and
   read the box with `reaper_probe.sh` — `docker ps -a`, `compose ps`, the
   watchdog, container uptimes — then escalate as though the fix had failed. No
-  watchdog stop, no `compose down`, no `compose up -d`. For a pingdom alert:
+  `compose down`, no `compose up -d`. For a pingdom alert:
   fetch and identify, which is all a pingdom decision has ever needed, then
   escalate. No ten-minute wait.
 - **It never acknowledges**, either watcher. Acking silences a live page, and

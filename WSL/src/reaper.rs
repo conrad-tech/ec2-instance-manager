@@ -964,8 +964,7 @@ pub enum OutcomeCode {
     /// Off call: one message, no calls. The official page is already running
     /// for whoever does hold the pager.
     FailureQuiet,
-    /// Both stages passed. One quiet message: a box is running with its
-    /// watchdog deliberately left stopped.
+    /// Both stages passed. One quiet message: the box is running again.
     Ok,
     /// Daily canary — proof the whole chain is alive.
     Canary,
@@ -2049,8 +2048,7 @@ mod tests {
     fn the_script_never_enables_errexit_in_any_form() {
         // Any spelling of exit-on-error -- `-e`, `-o errexit`, or a combined
         // short form like `-eu`/`-ue` -- would exit on a failing `down` and
-        // never reach `up -d`, stranding reaper stopped with its watchdog
-        // off. A literal grep for "set -e" only catches the first spelling,
+        // never reach `up -d`, stranding reaper stopped. A literal grep for "set -e" only catches the first spelling,
         // so this walks every `set` invocation's flags instead.
         let mut saw_set_u = false;
         for line in REAPER_FIX_SH.lines() {
@@ -2107,11 +2105,13 @@ mod tests {
     }
 
     #[test]
-    fn the_script_never_restarts_the_watchdog() {
-        // Leaving it stopped is deliberate: it is what makes a *successful* fix
-        // worth reporting at all.
-        assert!(!REAPER_FIX_SH.contains("start reaper-watchdog"));
-        assert!(!REAPER_FIX_SH.contains("restart reaper-watchdog"));
+    fn the_script_never_touches_the_watchdog() {
+        // The watchdog keeps running through a fix; stopping, starting or
+        // restarting it is not this script's business. Comments are skipped:
+        // the script explains the omission in one.
+        for line in REAPER_FIX_SH.lines().filter(|l| !l.trim_start().starts_with('#')) {
+            assert!(!line.contains("reaper-watchdog"), "touches the watchdog: {line}");
+        }
     }
 
     #[test]
@@ -2162,10 +2162,10 @@ mod tests {
 
     #[test]
     fn the_script_snapshots_docker_before_any_fix_and_again_after_it() {
-        // "Before it runs any fixes" means before the watchdog is stopped --
-        // that is the first thing on the box this script changes.
+        // "Before it runs any fixes" means before `compose down` -- that is
+        // the first thing on the box this script changes.
         let pre = REAPER_FIX_SH.find("snapshot before-fix").expect("pre-fix snapshot");
-        let wd = REAPER_FIX_SH.find("stop reaper-watchdog").expect("stops the watchdog");
+        let wd = REAPER_FIX_SH.find("compose down").expect("takes the stack down");
         let up = REAPER_FIX_SH.find("compose up -d").expect("brings the stack up");
         let post = REAPER_FIX_SH.find("snapshot after-fix").expect("post-fix snapshot");
         // The *echo*, not the marker: both scripts also name it in a comment
@@ -2290,11 +2290,11 @@ mod tests {
     #[test]
     fn the_fix_still_checks_the_directory_before_it_changes_anything() {
         // The half of the guard's job that is load-bearing: the listing may
-        // move above it, the watchdog stop and the compose commands may not.
+        // move above it, the compose commands may not.
         let guard = REAPER_FIX_SH
             .find(&format!("-d {REAPER_DIR}"))
             .expect("has the check");
-        for changing in ["stop reaper-watchdog", "compose down", "compose up -d"] {
+        for changing in ["compose down", "compose up -d"] {
             let at = REAPER_FIX_SH
                 .find(changing)
                 .unwrap_or_else(|| panic!("the fix runs {changing}"));

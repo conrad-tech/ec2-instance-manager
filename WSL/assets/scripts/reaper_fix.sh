@@ -3,8 +3,8 @@
 #
 # One shot on purpose. Split across several send-commands there would be a
 # window between `down` and `up -d` in which a dropped session or a closed
-# GUI leaves reaper stopped *and* its watchdog off. As a single command,
-# nothing on the PC side can produce that state.
+# GUI leaves reaper stopped between the two. As a single command, nothing on
+# the PC side can produce that state.
 #
 # `set -u` is on, but the exit-on-error flag deliberately is not: turning it
 # on would make a failing `down` exit before `up -d` ever runs, which is
@@ -53,13 +53,7 @@ fi
 
 cd /opt/cassandra-reaper || { echo "__RE_NODIR__"; echo "__RE_END__"; exit 0; }
 
-# Left stopped on purpose. The watchdog would race the restart, and a box
-# running without it is the reason a *successful* fix is still reported.
-if systemctl stop reaper-watchdog 2>&1; then
-  echo "__RE_WD_STOPPED__"
-else
-  echo "__RE_WD_FAIL__"
-fi
+# The watchdog is deliberately not touched: it stays running throughout.
 
 # stdout only, deliberately -- same reasoning as the `compose ps` block
 # below. `get-command-invocation` caps StandardOutputContent at 24KB, and

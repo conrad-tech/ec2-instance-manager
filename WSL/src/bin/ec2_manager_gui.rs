@@ -3784,9 +3784,8 @@ mod gui {
             .find_map(|l| l.trim().strip_prefix("__RE_WD_STATE__"))
         {
             let state = state.trim();
-            // The fix leaves the watchdog stopped on purpose, so a box found
-            // with it inactive is the trace of an earlier remediation rather
-            // than a fault.
+            // The fix no longer touches the watchdog, so inactive here means
+            // it was stopped by something else (older fix runs left it so).
             out.push(format!("reaper probe: {instance} reaper-watchdog is {state}"));
         }
 
@@ -4140,7 +4139,7 @@ mod gui {
             .on_hover_text(
                 "Reaper alerts only.\n\n\
                  Remediate this alert now, as if it had just come in: acknowledge \
-                 (only if you are on call), stop the watchdog, compose down, \
+                 (only if you are on call), compose down, \
                  compose up -d, then watch for the alert to close.\n\n\
                  A pingdom alert has no fix to run — use Test Alert Match for those.\n\n\
                  Works on an open, closed, acknowledged or unacknowledged alert, and \
@@ -4265,8 +4264,8 @@ mod gui {
     /// * **reaper** — fetch, identify, match, resolve the target group to an
     ///   instance, and read the box with `reaper_probe.sh` (`docker ps -a`,
     ///   `compose ps`, the watchdog's state, container uptimes). Everything
-    ///   `run_reaper_remediation` does apart from stopping the watchdog and
-    ///   the `compose down` / `compose up -d`.
+    ///   `run_reaper_remediation` does apart from the `compose down` /
+    ///   `compose up -d`.
     /// * **unhealthy host** — fetch, identify, resolve the target group, read
     ///   its health, and report what `plan` would terminate at the first
     ///   check. No acknowledge, no terminate.
@@ -17888,8 +17887,8 @@ mod gui {
 
         /// Render the Run Remediation confirmation.
         ///
-        /// The one place a person is told, before it happens, that this stops
-        /// a watchdog and takes a stack down and back up on a production box.
+        /// The one place a person is told, before it happens, that this takes
+        /// a stack down and back up on a production box.
         /// It can only name the **alert**, not the instance: which box the
         /// alert resolves to is two AWS calls away and is not known until the
         /// run starts. Test Alert Match is how you learn that first, and the
@@ -17923,17 +17922,12 @@ mod gui {
                     ui.monospace(&alert_id);
                     ui.add_space(6.0);
                     ui.label("On that instance this will run:");
-                    ui.monospace("systemctl stop reaper-watchdog");
                     ui.monospace("docker compose down");
                     ui.monospace("docker compose up -d");
                     ui.add_space(6.0);
-                    // Both are real consequences a person can be surprised
-                    // by: the watchdog is deliberately never restarted, and
+                    // A real consequence a person can be surprised by:
                     // acknowledging silences whoever is actually on call.
-                    ui.label(
-                        "The watchdog is left stopped afterwards, by design. \
-                         If you are on call the alert is acknowledged first.",
-                    );
+                    ui.label("If you are on call the alert is acknowledged first.");
                     ui.label(
                         "Which instance that is has not been resolved yet — \
                          use Test Alert Match first if you want to see it.",
@@ -20123,7 +20117,7 @@ mod gui {
                                 .on_hover_text(
                                     "Reaper alerts only.\n\n\
                  Remediate this alert now, as if it had just come in: acknowledge \
-                 (only if you are on call), stop the watchdog, compose down, \
+                 (only if you are on call), compose down, \
                  compose up -d, then watch for the alert to close.\n\n\
                  A pingdom alert has no fix to run — use Test Alert Match for those.\n\n\
                  Works on an open, closed, acknowledged or unacknowledged alert, and \
@@ -39989,8 +39983,7 @@ mod gui {
     /// called instead, which schedules `spawn_off_call_ack`: re-read after a
     /// minute, and acknowledge only if nobody has and it is work hours. The last look happens after the acknowledge and *before*
     /// the first mutating command: once `compose down` has run there is no
-    /// standing down, because that would leave reaper stopped with its
-    /// watchdog off.
+    /// standing down, because that would leave reaper stopped.
     ///
     /// `exec` is the one-shot remote command; it is a closure rather than an
     /// `AwsContext` + `exec_remote_command` call so a test can substitute a
@@ -40091,7 +40084,7 @@ mod gui {
         }
 
         // ---- committed from here: no standing down between `down` and
-        // `up -d` would leave the stack down with its watchdog off. ----
+        // `up -d` would leave the stack down. ----
         let Some(verdict) =
             run_fix_attempts(target, tx, exec, begin_follow_ups, fallback, watch)
         else {
@@ -46616,8 +46609,7 @@ mod gui {
         }
 
         /// Split across several send-commands there is a window between
-        /// `down` and `up -d` where a dropped session leaves reaper stopped
-        /// with its watchdog off.
+        /// `down` and `up -d` where a dropped session leaves reaper stopped.
         #[test]
         fn the_remediation_command_is_one_base64_shot() {
             let cmd = reaper_fix_command();
