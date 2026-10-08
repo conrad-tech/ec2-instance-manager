@@ -4,6 +4,7 @@ pub mod asg;
 pub mod atlassian_http;
 pub mod aws_cli;
 pub mod aws_context;
+pub mod cassandra_cert;
 pub mod config;
 pub mod connection_tabs;
 pub mod credentials;
