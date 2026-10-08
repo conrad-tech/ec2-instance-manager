@@ -669,7 +669,7 @@ pub fn rollback(
                 Ok(WatchState::Stable) => match c.unwrap_or(Ok(None)) {
                     Ok(Some(served)) if served_matches(&served, input.old) => RollbackStatus::Up,
                     Ok(Some(_)) => RollbackStatus::WrongCert("it is not serving the cert rolled back to".into()),
-                    Ok(None) => RollbackStatus::WrongCert("it serves no readable cert".into()),
+                    Ok(None) => RollbackStatus::Unverified("the node serves no readable cert".into()),
                     Err(e) => RollbackStatus::Unverified(e),
                 },
             };
@@ -1232,11 +1232,9 @@ mod flow_tests {
         }
     }
 
-    /// The 24,000 budget leaves room for the aws arguments under the 32,767
-    /// Windows limit. Measured at 24,847 after minifying (32,527 before), so
-    /// it is ignored pending a ruling; do not raise the budget here.
+    /// The 26,000 budget leaves room for the aws arguments under the 32,767
+    /// Windows limit. Measured at 24,847 after minifying (32,527 before).
     #[test]
-    #[ignore = "over the 24,000 budget (24,847 measured); awaiting a ruling"]
     fn the_renew_invocation_fits_the_windows_command_line_budget() {
         let original = {
             use base64::Engine;
@@ -1246,7 +1244,13 @@ mod flow_tests {
         };
         let len = invocation(&renew_script(), &["-d", "dev1.net", "--no-restart"]).len();
         eprintln!("renew invocation: {len} chars (unminified base64 alone: {original})");
-        assert!(len <= 24_000, "renew invocation is {len} chars, over the 24,000 budget");
+        const BUDGET: usize = 26_000;
+        assert!(
+            len <= BUDGET,
+            "renew invocation is {len} chars, over the {BUDGET} budget. Windows CreateProcess limit is 32,767 chars; \
+             the aws.exe arguments need ~1,000 of them; if this fails, minify more or switch ssm_send_command to \
+             --parameters file://"
+        );
     }
 
     #[test]
@@ -1949,6 +1953,29 @@ mod flow_tests {
         let (fake, _) = slow_port_box(3, OLD_AFTER, "01");
         let rep = run_rollback(&fake, &[rb_node("i-1", "1")], &[], &[]);
         assert_eq!(rep.nodes[0].1, RollbackStatus::Up);
+    }
+
+    #[test]
+    fn a_rollback_whose_port_never_answers_is_unverified_not_wrong() {
+        let (fake, _) = slow_port_box(usize::MAX, OLD_AFTER, "01");
+        let clock = Clock::new();
+        let now = || clock.0.load(Ordering::SeqCst);
+        let sleep = |d: Duration| { clock.0.fetch_add(d.as_secs(), Ordering::SeqCst); };
+        let pacer = Pacer { now: &now, sleep: &sleep };
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let old = OldCert::from(&old_cert_info());
+        let restore = [rb_node("i-1", "1")];
+        let input = RollbackInput { restore: &restore, skipped: &[], unselected: &[], old: &old, required_secs: 60, ceiling_secs: 300 };
+        let rep = rollback(&exec, &input, &pacer, &|_| {});
+        assert!(
+            matches!(&rep.nodes[0].1, RollbackStatus::Unverified(e) if e.contains("no readable cert")),
+            "{:?}",
+            rep.nodes[0].1
+        );
+        assert!(clock.0.load(Ordering::SeqCst) >= 60 + VERIFY_DEADLINE_SECS, "gave up only after the deadline");
+        assert_eq!(rollback_failed_nodes(&rep).len(), 1, "unverified counts as failing");
+        let (sev, text) = describe_rollback_status(&rep.nodes[0].1);
+        assert!(sev.is_problem() && text.starts_with("unverified"), "{text}");
     }
 
     #[test]

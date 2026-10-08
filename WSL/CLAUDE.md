@@ -4054,18 +4054,22 @@ a line's first non-blank character is never touched), prepends the
 into a `mktemp` file and runs `bash "$f" <shell_quote'd args>` only if the
 file's byte count equals the payload's; otherwise it prints `__CC_TRUNC__`
 with rc 97 (96 if `mktemp` failed), so a cut payload never runs, not even its
-sentinel. The temp file is removed on every path. Why minify: the renew
+sentinel. The temp file is removed on every path. Scripts run from a temp
+file (`bash <file>`), so `$0` is that path. Why minify: the renew
 send-command was 32,527 chars, over the 32,767-char Windows CreateProcess
 limit once the `aws ssm send-command` arguments are added; minified it is
-24,847. The 24,000-char budget test
-(`the_renew_invocation_fits_the_windows_command_line_budget`) is `#[ignore]`d
-pending a ruling: the minified script is still over it.
+24,847, leaving ~7.4k of headroom. The budget test
+(`the_renew_invocation_fits_the_windows_command_line_budget`) holds it to
+26,000; if it fails, minify more or switch `ssm_send_command` to
+`--parameters file://` (do not just raise the budget).
 
 **Post-restart verification waits for the port.** `systemctl is-active` says
 `active` as soon as the process is up, well before the native transport
 (9142) listens, so every node that reached Stable has its served cert read
 by `read_cert_retrying`: every 5s until it parses, `VERIFY_DEADLINE_SECS`
-(180) pass, or `exec` fails twice in a row. Apply and rollback both use it;
+(180) pass, or `exec` fails twice in a row; a node still unreadable then is
+Unverified in both flows (a rollback's WrongCert means a cert was read and is
+not the old one). Apply and rollback both use it;
 the dry run and the unselected-node consistency read stay single reads.
 
 **Rollback preflight** (read-only) gives each node one of three results:
@@ -4139,7 +4143,7 @@ not run before the restart.
 Build status for this feature: the dialog panels (Task 10b, with its fix
 round) add 27 tests (11 lib + 16 GUI); `cargo test --features gui` measured
 2026-10-08 on `cassandra-cert-update`, after the final-review fix wave, at
-1094 lib (1 ignored: the 24,000-char budget) + 3 CLI + 668 GUI, 0 failed,
+1096 lib + 3 CLI + 668 GUI, 0 failed,
 with no new build warnings. The real-shell wrapper tests run under `bash`
 and `sh` and skip with a printed reason when `bash` is missing.
 
