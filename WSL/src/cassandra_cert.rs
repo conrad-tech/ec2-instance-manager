@@ -118,7 +118,9 @@ pub fn assess_selection(all: &[Node], selected: &[String]) -> SelectionAssessmen
         ..Default::default()
     };
     if counts.len() > 1 {
-        if chosen.len() == all.len() {
+        // "All" means every selectable (running) node; stopped ones can't be ticked.
+        let every_selectable = selectable_ids(all).iter().all(|id| selected.contains(id));
+        if every_selectable {
             out.all_sets = Some(counts.len());
         } else {
             out.outside = chosen
@@ -261,5 +263,24 @@ mod tests {
         assert_eq!(a.all_sets, Some(2));
         assert!(a.outside.is_empty(), "the one confirmation replaces per-node flags");
         assert!(a.needs_confirmation());
+    }
+
+    #[test]
+    fn select_all_ignores_stopped_nodes() {
+        let mut all = two_sets();
+        all[4].running = false; // i-102 stopped
+        let sel: Vec<String> = selectable_ids(&all);
+        let a = assess_selection(&all, &sel);
+        assert_eq!(a.all_sets, Some(2));
+        assert!(a.outside.is_empty());
+        assert!(a.needs_confirmation());
+    }
+
+    #[test]
+    fn a_tie_between_sets_one_and_two_goes_to_one() {
+        let all = vec![node("i-101", 101), node("i-201", 201), node("i-202", 202)];
+        let a = assess_selection(&all, &["i-101".into(), "i-201".into()]);
+        assert_eq!(a.dominant_set, Some(1));
+        assert_eq!(a.outside, ["i-201"]);
     }
 }
