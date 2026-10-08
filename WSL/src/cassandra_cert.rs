@@ -319,12 +319,17 @@ pub fn parameter_is_stale(modified: i64, current: &CertInfo) -> bool {
 /// Names of unselected nodes that do not serve `result`, `(unreadable)` for
 /// the ones that could not be read.
 pub fn stale_unselected(result: &CertInfo, others: &[(String, Option<CertInfo>)]) -> Vec<String> {
-    let want = OldCert::from(result);
+    stale_against(&OldCert::from(result), others)
+}
+
+/// Names of nodes in `others` that do not serve `want`, `(unreadable)` for
+/// the ones that could not be read.
+pub fn stale_against(want: &OldCert, others: &[(String, Option<CertInfo>)]) -> Vec<String> {
     others
         .iter()
         .filter_map(|(name, cert)| match cert {
             None => Some(format!("{name} (unreadable)")),
-            Some(c) if !served_matches(c, &want) => Some(name.clone()),
+            Some(c) if !served_matches(c, want) => Some(name.clone()),
             Some(_) => None,
         })
         .collect()
@@ -885,6 +890,18 @@ mod tests {
             stale_unselected(&result, &others),
             ["cassandra-101", "cassandra-103 (unreadable)"]
         );
+    }
+
+    #[test]
+    fn stale_against_compares_with_an_old_cert_and_flags_unreadable() {
+        let want = OldCert { not_after: 1000, serial: Some("01".into()) };
+        let others = vec![
+            ("a".to_string(), Some(cert("/CN=x", "/CN=y", 1000, "01"))),
+            ("b".to_string(), Some(cert("/CN=x", "/CN=y", 2000, "02"))),
+            ("c".to_string(), None),
+        ];
+        assert_eq!(stale_against(&want, &others), ["b", "c (unreadable)"]);
+        assert!(stale_against(&want, &[]).is_empty());
     }
 
     fn backup(ts: &str, not_after: i64) -> BackupFact {

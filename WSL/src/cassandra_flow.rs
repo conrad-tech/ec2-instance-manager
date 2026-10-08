@@ -8,7 +8,7 @@ use std::time::Duration;
 use base64::Engine;
 
 use crate::cassandra_cert::{
-    compare_certs, parse_check, parse_preflight, parse_rc, served_matches, stale_unselected,
+    compare_certs, parse_check, parse_preflight, parse_rc, served_matches, stale_against, stale_unselected,
     CertChange, CertInfo, OldCert, PreflightRaw, StabilityWatch, WatchState,
 };
 use crate::obf_core::obf_transform;
@@ -195,7 +195,9 @@ const POLL: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeStatus {
     StageFailed(String),
-    /// Another node failed to stage, so this one was left alone.
+    /// Another node failed to stage, so this one was left alone: it holds the
+    /// newly staged keystore and will switch cert at its next restart; the
+    /// previous stores are backed up as `<keystore>.bak.<TS>`.
     NotRestarted,
     RestartFailed(String),
     DidNotStabilise,
@@ -219,8 +221,11 @@ pub struct ApplyInput<'a> {
 #[derive(Clone, Debug)]
 pub struct ApplyReport {
     pub nodes: Vec<(Target, NodeStatus)>,
-    /// Unselected nodes not serving what the selected ones now do.
-    pub stale: Vec<String>,
+    /// Unselected nodes not serving what the selected ones now do. `None` means
+    /// the check was NOT run (no restart, or no selected node came up with a
+    /// readable cert to compare against); `Some(vec![])` means it ran and every
+    /// unselected node is consistent.
+    pub stale: Option<Vec<String>>,
     pub restarted: bool,
 }
 
@@ -257,7 +262,7 @@ fn restart_and_watch(
             },
         }
     });
-    emit(format!("restart issued to {} node(s)", targets.len()));
+    emit(format!("restart issued to {} node(s)", sent.iter().filter(|r| r.is_ok()).count()));
 
     let mut watches: Vec<StabilityWatch> =
         targets.iter().map(|_| StabilityWatch::new(required, ceiling)).collect();
@@ -327,11 +332,12 @@ pub fn apply(
                 Err(e) => (t, NodeStatus::StageFailed(e)),
             })
             .collect();
-        return ApplyReport { nodes, stale: Vec::new(), restarted: false };
+        return ApplyReport { nodes, stale: None, restarted: false };
     }
 
     // 3-4. Restart together and watch.
     let watched = restart_and_watch(exec, input.targets, input.required_secs, input.ceiling_secs, pacer, emit);
+    let restarted = watched.iter().any(|w| w.is_ok());
 
     // 5. Verify what each node serves now.
     let certs: Vec<Result<Option<CertInfo>, String>> =
@@ -352,7 +358,11 @@ pub fn apply(
                     Ok(None) => NodeStatus::Unverified("the node serves no readable cert".into()),
                     Ok(Some(after)) => {
                         let change = input.before.get(&t.instance_id).map(|b| compare_certs(b, &after));
-                        if reference.is_none() && change == Some(CertChange::Renewed) {
+                        // Whatever came up and could be read is what the
+                        // unselected nodes are compared with, renewed or not:
+                        // a flagged or unrenewed result is exactly when the
+                        // others matter.
+                        if reference.is_none() {
                             reference = Some(after);
                         }
                         NodeStatus::Up { change }
@@ -363,18 +373,14 @@ pub fn apply(
         })
         .collect();
 
-    // The reference for "the others still serve the old cert" is the first
-    // selected node that came up renewed.
-    let stale = match reference {
-        Some(result) => {
-            let others: Vec<(String, Option<CertInfo>)> = per_node(input.unselected, &|t| {
-                (t.name.clone(), read_cert(exec, t).ok().and_then(|(c, _, _)| c))
-            });
-            stale_unselected(&result, &others)
-        }
-        None => Vec::new(),
-    };
-    ApplyReport { nodes, stale, restarted: true }
+    // Read-only: the check script only, never a change.
+    let stale = reference.map(|result| {
+        let others: Vec<(String, Option<CertInfo>)> = per_node(input.unselected, &|t| {
+            (t.name.clone(), read_cert(exec, t).ok().and_then(|(c, _, _)| c))
+        });
+        stale_unselected(&result, &others)
+    });
+    ApplyReport { nodes, stale, restarted }
 }
 
 #[derive(Clone, Debug)]
@@ -397,20 +403,28 @@ pub struct RollbackInput<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RollbackStatus {
     RestoreFailed(String),
+    /// The node holds the restored old stores but has not been restarted, so it
+    /// still serves the cert it had before; the stores it had before are saved
+    /// as `<keystore>.rollback.<TS>`.
     NotRestarted,
     NothingToRollBack,
     RestartFailed(String),
     DidNotStabilise,
     /// Active for the whole requirement and serving the old cert.
     Up,
-    /// Came up, but not on the old cert.
+    /// Came up and the cert was read, but it is not the old cert.
     WrongCert(String),
+    /// Came up, but the cert could not be read afterwards.
+    Unverified(String),
 }
 
 #[derive(Clone, Debug)]
 pub struct RollbackReport {
     pub nodes: Vec<(Target, RollbackStatus)>,
-    pub stale: Vec<String>,
+    /// Unselected nodes not serving the cert rolled back to. `None` means the
+    /// check was NOT run (the restore aborted or no restart was sent);
+    /// `Some(vec![])` means it ran and every unselected node is consistent.
+    pub stale: Option<Vec<String>>,
     pub restarted: bool,
 }
 
@@ -475,11 +489,12 @@ pub fn rollback(
             })
             .collect();
         nodes.extend(skipped);
-        return RollbackReport { nodes, stale: Vec::new(), restarted: false };
+        return RollbackReport { nodes, stale: None, restarted: false };
     }
 
     // 2. Restart together, watch, verify against the cert rolled back to.
     let watched = restart_and_watch(exec, &restore_targets, input.required_secs, input.ceiling_secs, pacer, emit);
+    let restarted = watched.iter().any(|w| w.is_ok());
     let certs: Vec<Result<Option<CertInfo>, String>> =
         per_node(&restore_targets, &|t| read_cert(exec, t).map(|(c, _, _)| c));
     let mut nodes: Vec<(Target, RollbackStatus)> = restore_targets
@@ -495,7 +510,7 @@ pub fn rollback(
                     Ok(Some(served)) if served_matches(&served, input.old) => RollbackStatus::Up,
                     Ok(Some(_)) => RollbackStatus::WrongCert("it is not serving the cert rolled back to".into()),
                     Ok(None) => RollbackStatus::WrongCert("it serves no readable cert".into()),
-                    Err(e) => RollbackStatus::WrongCert(e),
+                    Err(e) => RollbackStatus::Unverified(e),
                 },
             };
             (t, st)
@@ -503,19 +518,12 @@ pub fn rollback(
         .collect();
     nodes.extend(skipped);
 
-    // 3. Unselected nodes still on the cert being rolled away from.
+    // 3. Unselected nodes still on the cert being rolled away from (read-only).
     let others: Vec<(String, Option<CertInfo>)> = per_node(input.unselected, &|t| {
         (t.name.clone(), read_cert(exec, t).ok().and_then(|(c, _, _)| c))
     });
-    let stale: Vec<String> = others
-        .into_iter()
-        .filter_map(|(name, c)| match c {
-            None => Some(format!("{name} (unreadable)")),
-            Some(c) if !served_matches(&c, input.old) => Some(name),
-            Some(_) => None,
-        })
-        .collect();
-    RollbackReport { nodes, stale, restarted: true }
+    let stale = if restarted { Some(stale_against(input.old, &others)) } else { None };
+    RollbackReport { nodes, stale, restarted }
 }
 
 #[cfg(test)]
@@ -1087,7 +1095,7 @@ mod flow_tests {
             else { Ok(cert_out(NEW_AFTER, "02", "active")) }
         });
         let rep = run_apply(&fake, &[t("i-1", "cassandra-001")], &[t("i-9", "cassandra-101")], &before_map(&["i-1"]));
-        assert_eq!(rep.stale, ["cassandra-101"], "still on the old cert");
+        assert_eq!(rep.stale, Some(vec!["cassandra-101".to_string()]), "still on the old cert");
     }
 
     fn run_rollback(fake: &Fake, restore: &[RollbackNode], skipped: &[Target], unselected: &[Target]) -> RollbackReport {
@@ -1210,6 +1218,106 @@ mod flow_tests {
             else { Ok(cert_out(OLD_AFTER, "01", "active")) }
         });
         let rep = run_rollback(&fake, &[rb_node("i-1", "1")], &[], &[t("i-9", "cassandra-101")]);
-        assert_eq!(rep.stale, ["cassandra-101"]);
+        assert_eq!(rep.stale, Some(vec!["cassandra-101".to_string()]));
+    }
+
+    fn flagged_box(unselected_after: &'static str) -> Fake {
+        Fake::new(move |id, cmd| {
+            if id == "i-9" { return Ok(cert_out(unselected_after, if unselected_after == NEW_AFTER { "02" } else { "01" }, "active")); }
+            if cmd.contains("is-active") { Ok("active\n".into()) }
+            else if cmd.contains("systemctl restart") { Ok("__CC_RC__0\n".into()) }
+            else if cmd.contains("--no-restart") { Ok(STAGED.into()) }
+            else {
+                Ok(format!("__CC_BEGIN__\n__CC_CERT_BEGIN__\nsubject= /CN=different\nissuer= /CN=ca\nnotBefore=Sep  3 07:01:23 2025 GMT\nnotAfter={NEW_AFTER}\nserial=02\n__CC_CERT_END__\n__CC_ACTIVE__ active\n__CC_END__\n"))
+            }
+        })
+    }
+
+    #[test]
+    fn a_flagged_result_still_checks_the_unselected_nodes() {
+        let fake = flagged_box(OLD_AFTER);
+        let rep = run_apply(&fake, &[t("i-1", "a")], &[t("i-9", "cassandra-101")], &before_map(&["i-1"]));
+        assert!(matches!(&rep.nodes[0].1, NodeStatus::Up { change: Some(CertChange::Flagged(_)) }));
+        assert_eq!(rep.stale, Some(vec!["cassandra-101".to_string()]));
+        let fake = flagged_box(NEW_AFTER);
+        let rep = run_apply(&fake, &[t("i-1", "a")], &[t("i-9", "cassandra-101")], &before_map(&["i-1"]));
+        assert_eq!(rep.stale, Some(vec![]));
+    }
+
+    #[test]
+    fn with_no_before_capture_the_unselected_nodes_are_still_checked() {
+        let fake = healthy_box();
+        let rep = run_apply(&fake, &[t("i-1", "a")], &[t("i-9", "cassandra-101")], &HashMap::new());
+        assert!(matches!(rep.nodes[0].1, NodeStatus::Up { change: None }));
+        assert!(rep.stale.is_some());
+    }
+
+    #[test]
+    fn nothing_up_means_the_consistency_check_was_not_run() {
+        let fake = Fake::new(|id, cmd| {
+            assert_ne!(id, "i-9", "unselected node read although nothing came up");
+            if cmd.contains("is-active") { Ok("activating\n".into()) }
+            else if cmd.contains("systemctl restart") { Ok("__CC_RC__0\n".into()) }
+            else if cmd.contains("--no-restart") { Ok(STAGED.into()) }
+            else { Ok(cert_out(OLD_AFTER, "01", "failed")) }
+        });
+        let rep = run_apply(&fake, &[t("i-1", "a")], &[t("i-9", "cassandra-101")], &before_map(&["i-1"]));
+        assert_eq!(rep.nodes[0].1, NodeStatus::DidNotStabilise);
+        assert_eq!(rep.stale, None);
+    }
+
+    #[test]
+    fn no_unselected_nodes_is_a_checked_result() {
+        let rep = run_apply(&healthy_box(), &[t("i-1", "a")], &[], &before_map(&["i-1"]));
+        assert_eq!(rep.stale, Some(vec![]));
+    }
+
+    #[test]
+    fn restarted_is_false_when_no_restart_was_sent_ok() {
+        let fake = Fake::new(|_id, cmd| {
+            if cmd.contains("systemctl restart") { Ok("__CC_RC__1\n".into()) }
+            else if cmd.contains("--no-restart") { Ok(STAGED.into()) }
+            else { Ok(cert_out(OLD_AFTER, "01", "active")) }
+        });
+        let rep = run_apply(&fake, &[t("i-1", "a")], &[t("i-9", "b")], &before_map(&["i-1"]));
+        assert!(!rep.restarted);
+        assert!(matches!(rep.nodes[0].1, NodeStatus::RestartFailed(_)));
+        assert_eq!(rep.stale, None);
+    }
+
+    #[test]
+    fn an_aborted_rollback_did_not_check_the_unselected_nodes() {
+        let fake = Fake::new(|id, cmd| {
+            assert_ne!(id, "i-9");
+            assert!(!cmd.contains("is-active") && !cmd.contains("systemctl restart"));
+            Ok("__CC_RAN__\n__CC_RESTORE_FAIL__ x\n__CC_RC__0\n".into())
+        });
+        let rep = run_rollback(&fake, &[rb_node("i-1", "1")], &[], &[t("i-9", "cassandra-101")]);
+        assert!(!rep.restarted);
+        assert_eq!(rep.stale, None);
+    }
+
+    #[test]
+    fn a_rollback_with_no_unselected_nodes_is_a_checked_result() {
+        let fake = Fake::new(|_id, cmd| {
+            if cmd.contains("is-active") { Ok("active\n".into()) }
+            else if cmd.contains("systemctl restart") { Ok("__CC_RC__0\n".into()) }
+            else if cmd.contains("--restore") { Ok(RESTORED.into()) }
+            else { Ok(cert_out(OLD_AFTER, "01", "active")) }
+        });
+        let rep = run_rollback(&fake, &[rb_node("i-1", "1")], &[], &[]);
+        assert_eq!(rep.stale, Some(vec![]));
+    }
+
+    #[test]
+    fn an_unreadable_cert_after_a_rollback_is_unverified_not_wrong() {
+        let fake = Fake::new(|_id, cmd| {
+            if cmd.contains("is-active") { Ok("active\n".into()) }
+            else if cmd.contains("systemctl restart") { Ok("__CC_RC__0\n".into()) }
+            else if cmd.contains("--restore") { Ok(RESTORED.into()) }
+            else { Err("timed out".into()) }
+        });
+        let rep = run_rollback(&fake, &[rb_node("i-1", "1")], &[], &[]);
+        assert!(matches!(&rep.nodes[0].1, RollbackStatus::Unverified(e) if e.contains("timed out")));
     }
 }
