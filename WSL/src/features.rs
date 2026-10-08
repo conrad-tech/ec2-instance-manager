@@ -520,6 +520,14 @@ impl CassandraCertFeature {
         user_in_list(&self.allowed_users, user)
     }
 
+    /// True when `user` is named on the allow-list by name: what decides who
+    /// reads the Cassandra log source. Unlike [`Self::is_allowed_user`],
+    /// `"*"` does not match, the same rule every other gated log source
+    /// follows, so a stray wildcard cannot open the cluster output to all.
+    pub fn is_listed_user(&self, user: &str) -> bool {
+        names_user(&self.allowed_users, user)
+    }
+
     /// `(required, ceiling)` in seconds, clamped so the watch can succeed:
     /// at least one second of stability, and a ceiling that leaves at least
     /// 30s beyond it. A ceiling at or below the requirement could only ever
