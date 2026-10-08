@@ -1746,6 +1746,38 @@ mod gui {
         result: Option<CassandraOutcome>,
         /// The persisted last update / rollback of this environment.
         last_run: Option<cassandra_cert::LastRun>,
+        /// A one-line note that is not a job result, e.g. "another job is
+        /// still running" when a start was refused.
+        notice: Option<String>,
+    }
+
+    impl CassandraDialog {
+        /// A fresh dialog on `scripts_env`; nodes and last run are filled by
+        /// `cassandra_reload_nodes`.
+        fn new(scripts_env: ScriptEnv, envs: Vec<ScriptEnv>) -> Self {
+            CassandraDialog {
+                scripts_env,
+                envs,
+                nodes: Vec::new(),
+                selected: Vec::new(),
+                confirm_outside: false,
+                mode: CassandraMode::Pick,
+                dry: None,
+                dates: Vec::new(),
+                approve_apply: false,
+                preflight: None,
+                chosen_ts: HashMap::new(),
+                approve_rollback: false,
+                old_cert: None,
+                before: HashMap::new(),
+                diagnostics: Vec::new(),
+                log: Vec::new(),
+                running: false,
+                result: None,
+                last_run: None,
+                notice: None,
+            }
+        }
     }
 
     #[allow(dead_code)] // Update / Rollback are set by the dialog panels (Task 10b)
@@ -1761,6 +1793,33 @@ mod gui {
         Applied(cassandra_flow::ApplyReport),
         RolledBack(cassandra_flow::RollbackReport),
         Error(String),
+    }
+
+    /// Which kind of Cassandra job is in flight.
+    #[allow(dead_code)] // kinds are started by the dialog panels (Task 10b)
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CassandraJobKind {
+        DryRun,
+        Apply,
+        Preflight,
+        Rollback,
+    }
+
+    /// The one Cassandra job in flight: whose events these are. Jobs are
+    /// serialised (`start_cassandra_job` refuses a second), so every
+    /// terminal event that arrives belongs to this record.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct CassandraInflight {
+        /// Config profile id, as in `ScriptEnv::account_id`.
+        account_id: String,
+        env: String,
+        kind: CassandraJobKind,
+    }
+
+    impl CassandraInflight {
+        fn key(&self) -> (String, String) {
+            (self.account_id.clone(), self.env.clone())
+        }
     }
 
     /// What an Apply or Rollback job needs to record its `LastRun` when it
@@ -9544,6 +9603,10 @@ mod gui {
         /// it finishes, set when a job starts. Kept outside the dialog so a
         /// run that ends after the window was closed is still recorded.
         cassandra_pending_run: Option<CassandraPendingRun>,
+        /// The Cassandra job in flight, if any. Set when a job starts, cleared
+        /// by its terminal event. Its `(account, env)` is what decides whether
+        /// an event may touch the open dialog.
+        cassandra_inflight: Option<CassandraInflight>,
         /// Cassandra job events waiting for the dialog, oldest first. Kept
         /// here rather than logged: `poll_cassandra_events` logs them under
         /// their own allow-listed source.
@@ -10405,6 +10468,7 @@ mod gui {
                     .cassandra_cert_enabled_for(&ec2_manager::features::current_os_user()),
                 cassandra_dialog: None,
                 cassandra_pending_run: None,
+                cassandra_inflight: None,
                 cassandra_inbox: Vec::new(),
                 cassandra_watch_secs: features.cassandra_cert.watch_secs(),
                 power_confirm: None,
@@ -27184,11 +27248,34 @@ mod gui {
         /// credentials: the reaper's account gate, reused rather than written
         /// twice, runs before anything is spawned, so a refusal is one
         /// `Failed` and nothing else.
+        ///
+        /// One job at a time: while another is in flight this returns false,
+        /// spawns nothing and sends nothing. The refusal is logged and shown
+        /// as the dialog's `notice`, never as a `Failed` on the inbox, which
+        /// would be taken for the running job's own end.
         #[allow(dead_code)] // consumed by the dialog panels (Task 10b)
-        fn start_cassandra_job(&mut self, job: CassandraJob) {
-            // Kept before any refusal below: a refusal is a `Failed`, which
-            // clears it again in `poll_cassandra_events`.
-            self.cassandra_pending_run = cassandra_pending_for(&job);
+        fn start_cassandra_job(&mut self, job: CassandraJob) -> bool {
+            if !cassandra_try_start(
+                &mut self.cassandra_inflight,
+                &mut self.cassandra_pending_run,
+                &job,
+            ) {
+                let msg = "another Cassandra job is still running; wait for it to finish";
+                self.log_cassandra(LogLevel::Warn, format!("cassandra: {msg}"));
+                if let Some(dlg) = self.cassandra_dialog.as_mut() {
+                    dlg.notice = Some(msg.to_string());
+                }
+                return false;
+            }
+            // From here the job is in flight: the gate refusals below are its
+            // own `Failed`, which clears the record in `poll_cassandra_events`.
+            let started = cassandra_job_identity(&job).key();
+            if let Some(dlg) = self.cassandra_dialog.as_mut() {
+                if dlg.scripts_env.key() == started {
+                    dlg.running = true;
+                    dlg.notice = None;
+                }
+            }
             let account_id = match &job {
                 CassandraJob::DryRun { account_id, .. }
                 | CassandraJob::Apply { account_id, .. }
@@ -27201,19 +27288,20 @@ mod gui {
                 let _ = self.proc_tx.send(ProcEvent::Cassandra(CassandraEvent::Failed(
                     "no account is selected for the Cassandra cert job".into(),
                 )));
-                return;
+                return true;
             }
             let ctx = match reaper_account_context(&self.options.mode, &self.config, &account_id) {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = self.proc_tx.send(ProcEvent::Cassandra(CassandraEvent::Failed(e)));
-                    return;
+                    return true;
                 }
             };
             let watch = self.cassandra_watch_secs;
             let tx = self.proc_tx.clone();
             let egui_ctx = self.egui_ctx.clone();
             std::thread::spawn(move || run_cassandra_job(job, &ctx, watch, &tx, &egui_ctx));
+            true
         }
 
         /// The environment's Cassandra nodes from the account's cached
@@ -27233,7 +27321,12 @@ mod gui {
                 return;
             }
             let envs = self.script_environments();
-            let (profile_id, env_name) = self.default_script_environment();
+            // A job in flight pins the dialog to its environment, so reopening
+            // mid-run shows that run's progress and result.
+            let (profile_id, env_name) = match &self.cassandra_inflight {
+                Some(job) => job.key(),
+                None => self.default_script_environment(),
+            };
             let scripts_env = envs
                 .iter()
                 .find(|e| e.account_id == profile_id && e.env == env_name)
@@ -27244,27 +27337,7 @@ mod gui {
                     env: env_name,
                     label: String::new(),
                 });
-            self.cassandra_dialog = Some(CassandraDialog {
-                scripts_env,
-                envs,
-                nodes: Vec::new(),
-                selected: Vec::new(),
-                confirm_outside: false,
-                mode: CassandraMode::Pick,
-                dry: None,
-                dates: Vec::new(),
-                approve_apply: false,
-                preflight: None,
-                chosen_ts: HashMap::new(),
-                approve_rollback: false,
-                old_cert: None,
-                before: HashMap::new(),
-                diagnostics: Vec::new(),
-                log: Vec::new(),
-                running: false,
-                result: None,
-                last_run: None,
-            });
+            self.cassandra_dialog = Some(CassandraDialog::new(scripts_env, envs));
             self.cassandra_reload_nodes();
         }
 
@@ -27295,6 +27368,12 @@ mod gui {
             dlg.diagnostics.clear();
             dlg.log.clear();
             dlg.result = None;
+            dlg.notice = None;
+            // Running exactly when the job in flight is this environment's.
+            dlg.running = cassandra_event_applies(
+                Some(&dlg.scripts_env.key()),
+                self.cassandra_inflight.as_ref(),
+            );
             self.cassandra_dialog = Some(dlg);
         }
 
@@ -27382,6 +27461,10 @@ mod gui {
                         );
                     }
 
+                    if let Some(notice) = &dlg.notice {
+                        note_label(ui, egui::Color32::from_rgb(220, 160, 40), notice.as_str());
+                    }
+
                     // 10b: node picker, warnings, Update/Roll back panels and result go here
                 });
 
@@ -27419,11 +27502,23 @@ mod gui {
             }
         }
 
+        /// Log one event, and apply it to the open dialog only when the
+        /// dialog is on the environment of the job that sent it (see
+        /// `cassandra_event_applies`): a result must never land on another
+        /// environment's dialog. The `LastRun` of a finished Apply / Rollback
+        /// is recorded for the job's own environment either way.
         fn handle_cassandra_event(&mut self, event: CassandraEvent) {
+            let (owner, finished) = cassandra_settle(
+                &mut self.cassandra_inflight,
+                &mut self.cassandra_pending_run,
+                &event,
+            );
+            let dialog_key = self.cassandra_dialog.as_ref().map(|d| d.scripts_env.key());
+            let applies = cassandra_event_applies(dialog_key.as_ref(), owner.as_ref());
             match event {
                 CassandraEvent::Log(m) => {
                     self.log_cassandra(LogLevel::Info, format!("cassandra: {m}"));
-                    if let Some(dlg) = self.cassandra_dialog.as_mut() {
+                    if let Some(dlg) = self.cassandra_dialog.as_mut().filter(|_| applies) {
                         dlg.log.push(m);
                         let over = dlg.log.len().saturating_sub(CASSANDRA_INBOX_CAP);
                         dlg.log.drain(..over);
@@ -27445,7 +27540,7 @@ mod gui {
                             ),
                         }
                     }
-                    if let Some(dlg) = self.cassandra_dialog.as_mut() {
+                    if let Some(dlg) = self.cassandra_dialog.as_mut().filter(|_| applies) {
                         dlg.dates = dates;
                     }
                 }
@@ -27476,7 +27571,7 @@ mod gui {
                         LogLevel::Info,
                         format!("cassandra: dry run done, {passed} of {} passed", rows.len()),
                     );
-                    if let Some(dlg) = self.cassandra_dialog.as_mut() {
+                    if let Some(dlg) = self.cassandra_dialog.as_mut().filter(|_| applies) {
                         dlg.before = rows
                             .iter()
                             .filter_map(|r| {
@@ -27509,7 +27604,7 @@ mod gui {
                         LogLevel::Info,
                         format!("cassandra: preflight done on {} node(s)", rows.len()),
                     );
-                    if let Some(dlg) = self.cassandra_dialog.as_mut() {
+                    if let Some(dlg) = self.cassandra_dialog.as_mut().filter(|_| applies) {
                         dlg.preflight = Some(rows);
                         dlg.running = false;
                     }
@@ -27527,8 +27622,8 @@ mod gui {
                         );
                     }
                     let failed = cassandra_flow::apply_failed_nodes(&rep);
-                    self.cassandra_record_run(&failed);
-                    if let Some(dlg) = self.cassandra_dialog.as_mut() {
+                    self.cassandra_record_run(finished, &failed);
+                    if let Some(dlg) = self.cassandra_dialog.as_mut().filter(|_| applies) {
                         dlg.result = Some(CassandraOutcome::Applied(rep));
                         dlg.running = false;
                     }
@@ -27549,8 +27644,8 @@ mod gui {
                         );
                     }
                     let failed = cassandra_flow::rollback_failed_nodes(&rep);
-                    self.cassandra_record_run(&failed);
-                    if let Some(dlg) = self.cassandra_dialog.as_mut() {
+                    self.cassandra_record_run(finished, &failed);
+                    if let Some(dlg) = self.cassandra_dialog.as_mut().filter(|_| applies) {
                         dlg.result = Some(CassandraOutcome::RolledBack(rep));
                         dlg.running = false;
                     }
@@ -27562,14 +27657,15 @@ mod gui {
                             format!("cassandra: diagnostics {name}:\n{text}"),
                         );
                     }
-                    if let Some(dlg) = self.cassandra_dialog.as_mut() {
+                    if let Some(dlg) = self.cassandra_dialog.as_mut().filter(|_| applies) {
                         dlg.diagnostics = diag;
                     }
                 }
                 CassandraEvent::Failed(msg) => {
+                    // `cassandra_settle` already cleared the in-flight
+                    // record and dropped this job's pending run.
                     self.log_cassandra(LogLevel::Error, format!("cassandra: {msg}"));
-                    self.cassandra_pending_run = None;
-                    if let Some(dlg) = self.cassandra_dialog.as_mut() {
+                    if let Some(dlg) = self.cassandra_dialog.as_mut().filter(|_| applies) {
                         dlg.result = Some(CassandraOutcome::Error(msg));
                         dlg.running = false;
                     }
@@ -27580,8 +27676,12 @@ mod gui {
         /// Persist the finished Apply / Rollback as the environment's
         /// `LastRun`, from what `start_cassandra_job` kept, and show it in
         /// the dialog when it is still on that environment.
-        fn cassandra_record_run(&mut self, failed: &[cassandra_flow::Target]) {
-            let Some(pending) = self.cassandra_pending_run.take() else {
+        fn cassandra_record_run(
+            &mut self,
+            pending: Option<CassandraPendingRun>,
+            failed: &[cassandra_flow::Target],
+        ) {
+            let Some(pending) = pending else {
                 self.log_cassandra(
                     LogLevel::Warn,
                     "cassandra: a run finished with no record of its start; last run not saved",
@@ -27599,7 +27699,12 @@ mod gui {
             );
             self.config
                 .set_cassandra_last_run(&pending.account_id, &pending.env, &run);
-            let _ = self.config.save();
+            if let Err(e) = self.config.save() {
+                self.log_cassandra(
+                    LogLevel::Warn,
+                    format!("cassandra: last run not saved to config.ini: {e}"),
+                );
+            }
             if let Some(dlg) = self.cassandra_dialog.as_mut() {
                 if dlg.scripts_env.key() == (pending.account_id.clone(), pending.env.clone()) {
                     dlg.last_run = Some(run);
@@ -44551,6 +44656,83 @@ mod gui {
         }
     }
 
+    /// Whose job this is: the account/environment and kind.
+    fn cassandra_job_identity(job: &CassandraJob) -> CassandraInflight {
+        let (account_id, env, kind) = match job {
+            CassandraJob::DryRun { account_id, env, .. } => (account_id, env, CassandraJobKind::DryRun),
+            CassandraJob::Apply { account_id, env, .. } => (account_id, env, CassandraJobKind::Apply),
+            CassandraJob::Preflight { account_id, env, .. } => {
+                (account_id, env, CassandraJobKind::Preflight)
+            }
+            CassandraJob::Rollback { account_id, env, .. } => {
+                (account_id, env, CassandraJobKind::Rollback)
+            }
+        };
+        CassandraInflight { account_id: account_id.clone(), env: env.clone(), kind }
+    }
+
+    /// Admit `job` as the one in flight. False, touching nothing, when
+    /// another job is already in flight. Otherwise records it, and its
+    /// pending `LastRun` when it is an Apply or Rollback.
+    fn cassandra_try_start(
+        inflight: &mut Option<CassandraInflight>,
+        pending: &mut Option<CassandraPendingRun>,
+        job: &CassandraJob,
+    ) -> bool {
+        if inflight.is_some() {
+            return false;
+        }
+        *inflight = Some(cassandra_job_identity(job));
+        *pending = cassandra_pending_for(job);
+        true
+    }
+
+    /// Account for one event against the in-flight job. Returns the job the
+    /// event belongs to (the in-flight record as it was), and, for an
+    /// `Applied` / `RolledBack` / `Failed`, the pending run it takes away
+    /// (to be recorded, or dropped for `Failed`). A terminal event (`DryRun`,
+    /// `Preflight`, `Applied`, `RolledBack`, `Failed`) clears the in-flight
+    /// record. Jobs are serialised, so a terminal event is always the
+    /// in-flight job's; a refused start never reaches the inbox.
+    fn cassandra_settle(
+        inflight: &mut Option<CassandraInflight>,
+        pending: &mut Option<CassandraPendingRun>,
+        event: &CassandraEvent,
+    ) -> (Option<CassandraInflight>, Option<CassandraPendingRun>) {
+        let owner = inflight.clone();
+        let terminal = matches!(
+            event,
+            CassandraEvent::DryRun(_)
+                | CassandraEvent::Preflight(_)
+                | CassandraEvent::Applied(_)
+                | CassandraEvent::RolledBack(_)
+                | CassandraEvent::Failed(_)
+        );
+        if terminal {
+            *inflight = None;
+        }
+        let finished = match event {
+            CassandraEvent::Applied(_) | CassandraEvent::RolledBack(_) | CassandraEvent::Failed(_) => {
+                pending.take()
+            }
+            _ => None,
+        };
+        (owner, finished)
+    }
+
+    /// Whether an event of the job `owner` may change the dialog open on
+    /// `dialog_key`: only when both exist and are the same account and
+    /// environment.
+    fn cassandra_event_applies(
+        dialog_key: Option<&(String, String)>,
+        owner: Option<&CassandraInflight>,
+    ) -> bool {
+        match (dialog_key, owner) {
+            (Some(key), Some(job)) => *key == job.key(),
+            _ => false,
+        }
+    }
+
     /// The `LastRun` for a finished job: `failed` is the names of the nodes
     /// `apply_failed_nodes` / `rollback_failed_nodes` picked out.
     fn cassandra_last_run(
@@ -55711,6 +55893,173 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 }
             );
             assert_eq!(run.summary(), "update, 3 nodes, failed on cassandra-102, cassandra-103");
+        }
+
+        fn cass_inflight(account: &str, env: &str, kind: CassandraJobKind) -> CassandraInflight {
+            CassandraInflight { account_id: account.into(), env: env.into(), kind }
+        }
+
+        fn cass_dry_job(account: &str, env: &str) -> CassandraJob {
+            CassandraJob::DryRun {
+                account_id: account.into(),
+                env: env.into(),
+                targets: Vec::new(),
+                domain_arg: None,
+                parameters: Vec::new(),
+            }
+        }
+
+        fn cass_apply_job(account: &str, env: &str) -> CassandraJob {
+            CassandraJob::Apply {
+                account_id: account.into(),
+                env: env.into(),
+                targets: vec![cass_target("i-1", "cassandra-101")],
+                unselected: Vec::new(),
+                domain_arg: None,
+                before: HashMap::new(),
+            }
+        }
+
+        fn cass_env_row(account: &str, env: &str) -> ScriptEnv {
+            ScriptEnv {
+                account_id: account.into(),
+                account_label: account.into(),
+                env: env.into(),
+                label: env.into(),
+            }
+        }
+
+        /// An event touches the dialog only when the dialog is open on the
+        /// environment of the job that sent it.
+        #[test]
+        fn a_cassandra_event_applies_only_to_its_own_environments_dialog() {
+            let job = cass_inflight("111", "DEV1", CassandraJobKind::DryRun);
+            let same = ("111".to_string(), "DEV1".to_string());
+            let other_env = ("111".to_string(), "DEV2".to_string());
+            let other_account = ("222".to_string(), "DEV1".to_string());
+            assert!(cassandra_event_applies(Some(&same), Some(&job)));
+            assert!(!cassandra_event_applies(Some(&other_env), Some(&job)));
+            assert!(!cassandra_event_applies(Some(&other_account), Some(&job)));
+            assert!(!cassandra_event_applies(None, Some(&job)), "dialog closed");
+            assert!(!cassandra_event_applies(Some(&same), None), "no job to own it");
+        }
+
+        /// Start records the job; a second start is refused and changes
+        /// nothing; progress keeps it; its terminal event clears it.
+        #[test]
+        fn the_cassandra_in_flight_record_follows_one_job_at_a_time() {
+            let mut inflight = None;
+            let mut pending = None;
+            assert!(cassandra_try_start(&mut inflight, &mut pending, &cass_dry_job("111", "DEV1")));
+            let started = cass_inflight("111", "DEV1", CassandraJobKind::DryRun);
+            assert_eq!(inflight, Some(started.clone()));
+            assert_eq!(pending, None, "a dry run leaves no LastRun");
+
+            // Refused while one is in flight: nothing moves.
+            assert!(!cassandra_try_start(&mut inflight, &mut pending, &cass_apply_job("222", "DEV2")));
+            assert_eq!(inflight, Some(started.clone()));
+            assert_eq!(pending, None);
+
+            // Progress is the job's, and does not end it.
+            let (owner, _) =
+                cassandra_settle(&mut inflight, &mut pending, &CassandraEvent::Log("x".into()));
+            assert_eq!(owner, Some(started.clone()));
+            let (owner, _) =
+                cassandra_settle(&mut inflight, &mut pending, &CassandraEvent::ParamDates(Vec::new()));
+            assert_eq!(owner, Some(started.clone()));
+            assert!(inflight.is_some());
+
+            // Its terminal event ends it.
+            let (owner, _) =
+                cassandra_settle(&mut inflight, &mut pending, &CassandraEvent::DryRun(Vec::new()));
+            assert_eq!(owner, Some(started));
+            assert_eq!(inflight, None);
+
+            // A gate refusal after admission is the job's own Failed: it ends it.
+            assert!(cassandra_try_start(&mut inflight, &mut pending, &cass_dry_job("111", "DEV1")));
+            cassandra_settle(&mut inflight, &mut pending, &CassandraEvent::Failed("no creds".into()));
+            assert_eq!(inflight, None);
+        }
+
+        /// A dry run started during an Apply is refused, so the Apply's
+        /// pending LastRun survives, and only the Apply's own end takes it.
+        #[test]
+        fn a_running_applys_pending_run_survives_until_its_own_end() {
+            let mut inflight = None;
+            let mut pending = None;
+            assert!(cassandra_try_start(&mut inflight, &mut pending, &cass_apply_job("111", "DEV1")));
+            let want = pending.clone().expect("an apply leaves a record");
+            assert_eq!(want.kind, "update");
+
+            assert!(!cassandra_try_start(&mut inflight, &mut pending, &cass_dry_job("111", "DEV2")));
+            assert_eq!(pending, Some(want.clone()), "not overwritten by the refused start");
+
+            // Diagnostics come before the report and take nothing.
+            let (_, finished) =
+                cassandra_settle(&mut inflight, &mut pending, &CassandraEvent::Diagnostics(Vec::new()));
+            assert_eq!(finished, None);
+            assert_eq!(pending, Some(want.clone()));
+
+            let rep = cassandra_flow::ApplyReport { nodes: Vec::new(), stale: None, restarted: true };
+            let (owner, finished) =
+                cassandra_settle(&mut inflight, &mut pending, &CassandraEvent::Applied(rep));
+            assert_eq!(owner.map(|o| o.kind), Some(CassandraJobKind::Apply));
+            assert_eq!(finished, Some(want));
+            assert_eq!(pending, None);
+            assert_eq!(inflight, None);
+        }
+
+        /// End to end through the App: a dry run of DEV1 landing while the
+        /// dialog is on DEV2 is logged but does not reach DEV2's dialog, and
+        /// a refused start leaves the running job alone.
+        #[test]
+        fn a_stale_dry_run_never_reaches_another_environments_dialog() {
+            let mut app = Ec2GuiApp::new(GuiOptions {
+                mode: Mode::Sim,
+                region: None,
+                dry_run: true,
+                debug: false,
+                wsl_auto_setup: false,
+            });
+            app.cassandra_cert_enabled = true;
+            app.cassandra_inflight = Some(cass_inflight("111", "DEV1", CassandraJobKind::DryRun));
+            app.cassandra_dialog =
+                Some(CassandraDialog::new(cass_env_row("111", "DEV2"), Vec::new()));
+
+            // A second start is refused without touching the running job.
+            assert!(!app.start_cassandra_job(cass_apply_job("111", "DEV2")));
+            assert_eq!(
+                app.cassandra_inflight,
+                Some(cass_inflight("111", "DEV1", CassandraJobKind::DryRun))
+            );
+            assert_eq!(app.cassandra_pending_run, None);
+            assert!(app.cassandra_dialog.as_ref().unwrap().notice.is_some());
+
+            let row = cassandra_flow::NodeDryRun {
+                target: cass_target("i-1", "cassandra-101"),
+                current: Some(cass_cert(1_700_000_000, "AA")),
+                raw_cert: String::new(),
+                dry_run_ok: true,
+                detail: String::new(),
+            };
+            app.cassandra_inbox.push(CassandraEvent::DryRun(vec![row.clone()]));
+            app.poll_cassandra_events();
+            let dlg = app.cassandra_dialog.as_ref().unwrap();
+            assert!(dlg.dry.is_none(), "DEV1's dry run must not land on DEV2");
+            assert!(dlg.before.is_empty());
+            assert_eq!(app.cassandra_inflight, None, "the job ended all the same");
+            assert!(app.logs.iter().any(|l| l.source == LogSource::Cassandra
+                && l.message.contains("dry run done, 1 of 1 passed")));
+
+            // The same event for the dialog's own environment does land.
+            app.cassandra_inflight = Some(cass_inflight("111", "DEV2", CassandraJobKind::DryRun));
+            app.cassandra_dialog.as_mut().unwrap().running = true;
+            app.cassandra_inbox.push(CassandraEvent::DryRun(vec![row]));
+            app.poll_cassandra_events();
+            let dlg = app.cassandra_dialog.as_ref().unwrap();
+            assert!(dlg.dry.is_some());
+            assert!(dlg.before.contains_key("i-1"));
+            assert!(!dlg.running);
         }
 
         /// A rollback's `LastRun` names the restored and the skipped nodes and
