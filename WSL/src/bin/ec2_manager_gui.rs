@@ -14914,7 +14914,7 @@ mod gui {
             // a stale one, is left as it is.
             let primary_filter = self.primary_bastion_filter.clone();
             if let Some((id, name)) =
-                sole_bastion_candidate(&available, &primary_filter, &primary_id)
+                default_primary_bastion(&available, &primary_filter, &primary_id)
             {
                 primary_label = if name.trim().is_empty() {
                     id.clone()
@@ -14930,7 +14930,7 @@ mod gui {
             // therefore fills the primary and leaves the secondary empty,
             // which is the correct answer there.
             let secondary_filter = self.secondary_bastion_filter.clone();
-            if let Some((id, name)) = sole_secondary_bastion(
+            if let Some((id, name)) = default_secondary_bastion(
                 &available,
                 &secondary_filter,
                 &primary_id,
@@ -17569,7 +17569,7 @@ mod gui {
             // With exactly one bastion on offer there is no choice to make,
             // so make it. Only fills an empty field, so a cached pick is
             // never overwritten — see `sole_bastion_candidate`.
-            if let Some((id, _)) = sole_bastion_candidate(
+            if let Some((id, _)) = default_primary_bastion(
                 &available,
                 &self.primary_bastion_filter,
                 primary_id.as_str(),
@@ -17579,7 +17579,7 @@ mod gui {
             // Same for the secondary, which excludes the primary — a
             // one-bastion environment fills the primary and leaves this
             // empty. See `sole_secondary_bastion`.
-            if let Some((id, _)) = sole_secondary_bastion(
+            if let Some((id, _)) = default_secondary_bastion(
                 &available,
                 &self.secondary_bastion_filter,
                 primary_id.as_str(),
@@ -44547,6 +44547,67 @@ mod gui {
             .cloned()
             .collect();
         sole_bastion_candidate(&pool, filter, chosen)
+    }
+
+    /// Name suffix the primary bastion is expected to carry.
+    const PRIMARY_BASTION_SUFFIX: &str = "bastion";
+    /// Name suffix the secondary bastion is expected to carry.
+    const SECONDARY_BASTION_SUFFIX: &str = "DeployServer";
+
+    /// The single candidate whose name ends with `suffix` (case-insensitive).
+    /// More than one match is no better than none, so it declines.
+    fn unique_suffix_match(
+        candidates: Vec<(String, String)>,
+        suffix: &str,
+    ) -> Option<(String, String)> {
+        let suffix = suffix.to_ascii_lowercase();
+        let mut hits = candidates
+            .into_iter()
+            .filter(|(_, name)| name.trim().to_ascii_lowercase().ends_with(&suffix));
+        let first = hits.next()?;
+        hits.next().is_none().then_some(first)
+    }
+
+    /// Primary default: the sole candidate, else the one named `*bastion`.
+    /// Only fills an empty field, like `sole_bastion_candidate`.
+    fn default_primary_bastion(
+        instances: &[(String, String)],
+        filter: &str,
+        chosen: &str,
+    ) -> Option<(String, String)> {
+        if !chosen.trim().is_empty() {
+            return None;
+        }
+        sole_bastion_candidate(instances, filter, chosen).or_else(|| {
+            unique_suffix_match(
+                bastion_candidates(instances, filter),
+                PRIMARY_BASTION_SUFFIX,
+            )
+        })
+    }
+
+    /// Secondary default: the sole candidate, else the one named
+    /// `*DeployServer`, never the chosen primary.
+    fn default_secondary_bastion(
+        instances: &[(String, String)],
+        filter: &str,
+        primary_id: &str,
+        chosen: &str,
+    ) -> Option<(String, String)> {
+        if !chosen.trim().is_empty() {
+            return None;
+        }
+        sole_secondary_bastion(instances, filter, primary_id, chosen).or_else(|| {
+            let pool: Vec<(String, String)> = instances
+                .iter()
+                .filter(|(id, _)| id.as_str() != primary_id)
+                .cloned()
+                .collect();
+            unique_suffix_match(
+                bastion_candidates(&pool, filter),
+                SECONDARY_BASTION_SUFFIX,
+            )
+        })
     }
 
     /// Height of the per-environment session-output pane before it scrolls.
