@@ -256,8 +256,27 @@ mod tests {
 
     /// The placeholder domain is nested two levels down, inside an array of
     /// environments — the scan has to reach it wherever it was copied to.
+    /// The shipped template declares environments by `domain`, so that is the
+    /// path the report names.
     #[test]
     fn a_placeholder_domain_is_named_with_its_path() {
+        let raw = r#"[{
+            "label": "Dev",
+            "account_id": "918273645500",
+            "environments": [
+                { "name": "DEV1", "domain": "dev1.YOUR-COMPANY.com" }
+            ]
+        }]"#;
+        let found = check_accounts_json(raw);
+        assert!(
+            found.iter().any(|p| p.contains("[0].environments[0].domain")),
+            "{found:#?}"
+        );
+    }
+
+    /// An environment-level `vault_addr` override is still scanned too.
+    #[test]
+    fn a_placeholder_environment_vault_addr_is_still_named() {
         let raw = r#"[{
             "label": "Dev",
             "account_id": "918273645500",
@@ -270,6 +289,17 @@ mod tests {
             found.iter().any(|p| p.contains("[0].environments[0].vault_addr")),
             "{found:#?}"
         );
+    }
+
+    /// A real domain on an environment is configuration, not a placeholder.
+    #[test]
+    fn a_configured_environment_domain_is_accepted() {
+        let raw = r#"[{
+            "label": "Dev",
+            "account_id": "918273645500",
+            "environments": [ { "name": "DEV1", "domain": "dev1.acme.net" } ]
+        }]"#;
+        assert!(check_accounts_json(raw).is_empty(), "{:#?}", check_accounts_json(raw));
     }
 
     /// Most of features.json by volume is `_*_comment` prose, and that prose

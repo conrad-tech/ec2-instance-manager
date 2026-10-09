@@ -132,6 +132,7 @@ mod tests {
             .map(|n| AccountEnvironment {
                 name: (*n).to_string(),
                 vault_addr: None,
+                domain: None,
             })
             .collect()
     }

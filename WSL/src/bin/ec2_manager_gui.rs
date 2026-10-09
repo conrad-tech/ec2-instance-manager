@@ -1029,7 +1029,10 @@ mod gui {
             account_id: String,
             env: String,
             targets: Vec<cassandra_flow::Target>,
-            domain_arg: Option<String>,
+            /// The environment's `accounts.json` domain, validated
+            /// (`cassandra_domain`): the `-d` value and what `$env_domain`
+            /// expands to.
+            domain: String,
             /// Raw `cassandra_cert.parameters` templates; the worker expands them.
             parameters: Vec<String>,
         },
@@ -1038,7 +1041,8 @@ mod gui {
             env: String,
             targets: Vec<cassandra_flow::Target>,
             unselected: Vec<cassandra_flow::Target>,
-            domain_arg: Option<String>,
+            /// The `-d` value, as for `DryRun`.
+            domain: String,
             before: HashMap<String, cassandra_cert::CertInfo>,
         },
         Preflight {
@@ -1641,6 +1645,14 @@ mod gui {
         /// their key and only needs the grant. At least one of this and
         /// `grant_sudo` must be ticked, or the restore would do nothing.
         reset_key: bool,
+        /// Create and Restore: email the login details when the run finishes.
+        /// Unticked, the result popup still offers a Send Email button.
+        send_email: bool,
+        /// Create and Restore (with a key reset): build the account around a
+        /// PEM the operator supplies instead of generating a new one.
+        use_own_pem: bool,
+        /// The PEM chosen with the file picker.
+        own_pem_path: String,
         /// Delete mode: confirmation checkbox — Delete is disabled until set.
         confirm_delete: bool,
         /// Delete mode: a *second* confirmation, shown only when the typed
@@ -1748,8 +1760,8 @@ mod gui {
         /// A one-line note that is not a job result, e.g. "another job is
         /// still running" when a start was refused.
         notice: Option<String>,
-        /// A red line for a start that was refused before any job, e.g. a
-        /// `domain_suffix` that does not form a valid domain.
+        /// A red line for a start that was refused before any job, e.g. an
+        /// environment with no (or an invalid) `domain` in accounts.json.
         error: Option<String>,
         /// The selection (`selection_key`) the dry run held in `dry` was
         /// started for. Apply needs it to equal the current selection.
@@ -2164,6 +2176,30 @@ mod gui {
         secondary_output: Option<String>,
         /// Set once the verify worker has been spawned.
         verify_started: bool,
+        /// Run the access-email script automatically when this finishes.
+        send_email: bool,
+    }
+
+    /// Per-run options that ride along from the dialog to `enqueue_user_script`
+    /// (through the create pre-flight, which parks them in `PendingCreate`).
+    #[derive(Clone, Default)]
+    struct CreateExtras {
+        /// Email the login details automatically at the end.
+        send_email: bool,
+        /// Base64 of the operator's own private key, already validated and
+        /// normalised by `validate_own_pem`. `Some` means "install this key
+        /// instead of generating one".
+        own_pem_b64: Option<String>,
+    }
+
+    /// Everything `send_access_email.ps1` needs, kept on the result popup so
+    /// the Send Email button can run it later.
+    struct EmailJob {
+        username: String,
+        mmodal_env: String,
+        primary_id: String,
+        secondary_id: String,
+        pem: String,
     }
 
     /// A delete request awaiting its pre-flight active-session check. Once
@@ -2212,6 +2248,9 @@ mod gui {
         email_copied: bool,
         /// Progress/result of the automatic send, when `auto_run` is on.
         email_status: Option<EmailStatus>,
+        /// Set after a successful create/restore with the access email
+        /// enabled -- powers the Send Email button.
+        email_job: Option<EmailJob>,
     }
 
     /// Visual state of the Scripts status line in the Connections toolbar.
@@ -2995,6 +3034,7 @@ mod gui {
         grant_sudo: bool,
         primary_id: String,
         secondary_id: String,
+        extras: CreateExtras,
     }
 
     /// Result of the create pre-flight: align the bastions, then pick the
@@ -5629,6 +5669,54 @@ mod gui {
         }
         let id = uid.map(|u| format!(" --uid {u}")).unwrap_or_default();
         format!("bash {remote_path} --user {username}{id}{sudo}")
+    }
+
+    /// Largest private key accepted from the picker. A 4096-bit RSA PEM is
+    /// ~3.2 KB; this only stops someone picking the wrong file.
+    const OWN_PEM_MAX_BYTES: usize = 16 * 1024;
+
+    /// Check a PEM the operator picked and return it in the form the bastion
+    /// needs: LF line endings and a trailing newline.
+    ///
+    /// Refuses what would only fail later, on the box, after the account is
+    /// half made: a public key or certificate, a passphrase-protected key
+    /// (`ssh-keygen -y` would wait on a prompt), and anything that is not text.
+    /// CRLF is stripped because a key saved on Windows otherwise fails to load
+    /// with `invalid format`.
+    fn validate_own_pem(raw: &[u8]) -> std::result::Result<Vec<u8>, String> {
+        if raw.is_empty() {
+            return Err("that file is empty".to_string());
+        }
+        if raw.len() > OWN_PEM_MAX_BYTES {
+            return Err("that file is too large to be a private key".to_string());
+        }
+        let text = std::str::from_utf8(raw)
+            .map_err(|_| "that file is not a text PEM private key".to_string())?;
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let text = text.trim();
+        if !text.starts_with("-----BEGIN ") || !text.contains("PRIVATE KEY-----") {
+            return Err(
+                "that does not look like a private key (expected a -----BEGIN ... PRIVATE KEY----- file)"
+                    .to_string(),
+            );
+        }
+        if text.contains("ENCRYPTED") || text.contains("Proc-Type: 4,ENCRYPTED") {
+            return Err(
+                "that key is passphrase-protected; the bastions need a key without a passphrase"
+                    .to_string(),
+            );
+        }
+        Ok(format!("{text}\n").into_bytes())
+    }
+
+    /// The terminal step that puts the operator's key where `--use-pem` looks.
+    ///
+    /// Leading space + the `HISTCONTROL=ignorespace` the prep step exports keeps
+    /// it out of history, the subshell keeps the `umask` from outliving the
+    /// write, and the trailing `clear` wipes the key's base64 off the screen --
+    /// the same hygiene the git PAT gets.
+    fn own_pem_write_step(username: &str, b64: &str) -> String {
+        format!(" ( umask 077; echo '{b64}' | base64 -d > /root/{username}.pem ); clear")
     }
 
     /// A restore with neither box ticked has nothing to do.
@@ -9894,11 +9982,9 @@ mod gui {
         /// `cassandra_cert.watch_secs()`, `(required, ceiling)`, resolved once
         /// at startup like the gates beside it.
         cassandra_watch_secs: (u64, u64),
-        /// `cassandra_cert.parameters` (the SSM path templates) and
-        /// `cassandra_cert.domain_suffix`, resolved once at startup like
-        /// `cassandra_watch_secs`, for the dry run's job.
+        /// `cassandra_cert.parameters` (the SSM path templates), resolved
+        /// once at startup like `cassandra_watch_secs`, for the dry run's job.
         cassandra_parameters: Vec<String>,
-        cassandra_domain_suffix: String,
         /// A Start / Stop / Restart awaiting confirmation, if any.
         power_confirm: Option<PowerConfirm>,
         /// Instance ids with a power run already going. Shared with the
@@ -10758,7 +10844,6 @@ mod gui {
                 cassandra_next_job_id: 0,
                 cassandra_watch_secs: features.cassandra_cert.watch_secs(),
                 cassandra_parameters: features.cassandra_cert.parameters.clone(),
-                cassandra_domain_suffix: features.cassandra_cert.domain_suffix.clone(),
                 power_confirm: None,
                 power_in_flight: Arc::new(Mutex::new(HashSet::new())),
                 power_status: None,
@@ -16187,11 +16272,17 @@ mod gui {
                             let bundled_envs =
                                 ec2_manager::accounts::environments_for(&account_id, &[]);
                             for env in &bundled_envs {
+                                // The effective address, not the declared
+                                // field: a domain-only environment has no
+                                // `vault_addr` and still has a Vault.
+                                let shown = ec2_manager::accounts::vault_addr_for(
+                                    &account_id,
+                                    &env.name,
+                                    &dlg.environments,
+                                );
                                 ui.horizontal(|ui| {
                                     ui.monospace(&env.name);
-                                    ui.weak(
-                                        env.vault_addr.as_deref().unwrap_or("(no Vault)"),
-                                    );
+                                    ui.weak(shown.as_deref().unwrap_or("(no Vault)"));
                                     ui.weak("(built in)");
                                 });
                             }
@@ -16201,11 +16292,14 @@ mod gui {
                                 if env.account_id != account_id {
                                     continue;
                                 }
+                                let shown = ec2_manager::accounts::vault_addr_for(
+                                    &account_id,
+                                    &env.name,
+                                    &dlg.environments,
+                                );
                                 ui.horizontal(|ui| {
                                     ui.monospace(&env.name);
-                                    ui.weak(
-                                        env.vault_addr.as_deref().unwrap_or("(no Vault)"),
-                                    );
+                                    ui.weak(shown.as_deref().unwrap_or("(no Vault)"));
                                     if ui.small_button("x").on_hover_text("Remove").clicked() {
                                         remove = Some(i);
                                     }
@@ -16666,9 +16760,14 @@ mod gui {
                             let account_id = wiz.steps[idx].account_id.clone();
                             let mut remove: Option<usize> = None;
                             for (i, env) in wiz.steps[idx].environments.iter().enumerate() {
+                                let shown = ec2_manager::accounts::vault_addr_for(
+                                    &account_id,
+                                    &env.name,
+                                    &wiz.steps[idx].environments,
+                                );
                                 ui.horizontal(|ui| {
                                     ui.monospace(&env.name);
-                                    ui.weak(env.vault_addr.as_deref().unwrap_or("(no Vault)"));
+                                    ui.weak(shown.as_deref().unwrap_or("(no Vault)"));
                                     if ui.small_button("x").on_hover_text("Remove").clicked() {
                                         remove = Some(i);
                                     }
@@ -21454,6 +21553,9 @@ mod gui {
             let instances = self.env_instances(&dlg.env_profile_id, &dlg.env_name);
             let primary_filter = self.primary_bastion_filter.clone();
             let secondary_filter = self.secondary_bastion_filter.clone();
+            // Offered only when the automatic send exists at all; otherwise the
+            // box would do nothing.
+            let email_offered = self.access_email.enabled && self.access_email.auto_run;
             // Auth per row, and for the current selection. Precomputed here
             // because the window closure below borrows `dlg`, not `self`.
             let env_auth: Vec<AuthStatus> = environments
@@ -21563,6 +21665,12 @@ mod gui {
                                 "Reset key (new PEM, old key revoked)",
                             );
                             ui.checkbox(&mut dlg.grant_sudo, "Grant sudo (NOPASSWD:ALL)");
+                            if dlg.reset_key {
+                                Self::own_pem_ui(ui, &mut dlg, true);
+                            }
+                            if email_offered && dlg.reset_key {
+                                ui.checkbox(&mut dlg.send_email, "Email login details");
+                            }
                             // Say plainly what a restore destroys: the old
                             // key stops working the moment this runs.
                             note_label(
@@ -21573,6 +21681,10 @@ mod gui {
                         }
                         UserScriptMode::Create => {
                             ui.checkbox(&mut dlg.grant_sudo, "Grant sudo (NOPASSWD:ALL)");
+                            Self::own_pem_ui(ui, &mut dlg, false);
+                            if email_offered {
+                                ui.checkbox(&mut dlg.send_email, "Email login details");
+                            }
                         }
                     }
                     ui.add_space(6.0);
@@ -21768,6 +21880,39 @@ mod gui {
                     self.create_user_dialog = Some(dlg);
                     return;
                 }
+                // The operator's own key, when asked for: read and checked here,
+                // before anything is created, so a bad file is a message in this
+                // dialog rather than a half-made account.
+                let own_pem_applies = dlg.use_own_pem
+                    && (!dlg.mode.is_restore() || dlg.reset_key)
+                    && !dlg.mode.is_delete();
+                let mut own_pem_b64 = None;
+                if own_pem_applies {
+                    if dlg.own_pem_path.trim().is_empty() {
+                        dlg.error = Some("Choose the PEM file to use, or untick Use my own PEM.".to_string());
+                        self.create_user_dialog = Some(dlg);
+                        return;
+                    }
+                    let checked = std::fs::read(dlg.own_pem_path.trim())
+                        .map_err(|e| format!("could not read the PEM: {e}"))
+                        .and_then(|raw| validate_own_pem(&raw));
+                    match checked {
+                        Ok(bytes) => {
+                            use base64::Engine;
+                            own_pem_b64 =
+                                Some(base64::engine::general_purpose::STANDARD.encode(bytes));
+                        }
+                        Err(why) => {
+                            dlg.error = Some(why);
+                            self.create_user_dialog = Some(dlg);
+                            return;
+                        }
+                    }
+                }
+                let extras = CreateExtras {
+                    send_email: dlg.send_email,
+                    own_pem_b64,
+                };
                 // Remember the selection for next time, per environment.
                 self.config.set_bastion_selection(
                     &dlg.env_profile_id,
@@ -21786,12 +21931,46 @@ mod gui {
                     &dlg.primary_id,
                     &dlg.secondary_id,
                     dlg.confirm_protected,
+                    extras,
                 );
                 self.create_user_dialog = None;
                 return;
             }
 
             self.create_user_dialog = Some(dlg);
+        }
+
+        /// "Use my own PEM": build the account around a key the operator
+        /// already has, instead of generating one. On a restore it puts a user
+        /// back on the key they were using before a new one was issued.
+        fn own_pem_ui(ui: &mut egui::Ui, dlg: &mut CreateUserDialog, restoring: bool) {
+            ui.checkbox(
+                &mut dlg.use_own_pem,
+                if restoring {
+                    "Restore to a PEM I choose (instead of generating a new one)"
+                } else {
+                    "Use my own PEM (instead of generating a new one)"
+                },
+            )
+            .on_hover_text(
+                "The public key is derived from this file and installed for the user, so \
+                 nothing changes on their side. The private key is also copied to the \
+                 bastions the way a generated one is. It must not be passphrase-protected.",
+            );
+            if dlg.use_own_pem {
+                ui.horizontal(|ui| {
+                    if ui.button("Choose PEM file...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_file() {
+                            dlg.own_pem_path = path.to_string_lossy().to_string();
+                        }
+                    }
+                    if dlg.own_pem_path.is_empty() {
+                        ui.weak("no file chosen");
+                    } else {
+                        ui.monospace(&dlg.own_pem_path);
+                    }
+                });
+            }
         }
 
         /// A labelled dropdown (`choose ▾`) for picking one bastion. The
@@ -22848,6 +23027,8 @@ mod gui {
             // Delete only: the operator ticked the extra confirmation for a
             // name on the protected list.
             confirm_protected: bool,
+            // Create and Restore: email at the end, and/or the operator's own key.
+            extras: CreateExtras,
         ) {
             if mode.is_delete() {
                 self.begin_delete_preflight(
@@ -22871,6 +23052,7 @@ mod gui {
                     primary_id,
                     secondary_id,
                     None,
+                    extras,
                 );
             } else {
                 self.begin_create_preflight(
@@ -22880,6 +23062,7 @@ mod gui {
                     grant_sudo,
                     primary_id,
                     secondary_id,
+                    extras,
                 );
             }
         }
@@ -22907,6 +23090,7 @@ mod gui {
             grant_sudo: bool,
             primary_id: &str,
             secondary_id: &str,
+            extras: CreateExtras,
         ) {
             let ctx = self
                 .profile_inventory_cache
@@ -22926,6 +23110,7 @@ mod gui {
                 grant_sudo,
                 primary_id: primary_id.to_string(),
                 secondary_id: secondary_id.to_string(),
+                extras,
             });
             self.log_info(format!(
                 "create_new_user: checking that {primary_id} and {secondary_id} agree \
@@ -23039,6 +23224,7 @@ mod gui {
             // uid/gid chosen by the pre-flight from both bastions' tables.
             // `None` for delete and restore, neither of which allocates.
             uid: Option<u32>,
+            extras: CreateExtras,
         ) {
             use base64::Engine;
             let delete = mode.is_delete();
@@ -23090,16 +23276,29 @@ mod gui {
                 // replace authorized_keys and overwrite the old PEM, unless
                 // --no-key says to leave the key alone; --sudo is added only
                 // when ticked, so an existing grant is otherwise untouched.
-                let run_line = create_run_line(
+                let mut run_line = create_run_line(
                     remote_path, username, mode, grant_sudo, reset_key, uid,
                 );
-                let primary = vec![
+                let mut primary = vec![
                     "sudo su".to_string(),
                     PREP_STEP_SENTINEL.to_string(),
                     // `cd ~` folded into the write (see delete branch note).
                     format!("cd ~ && echo '{b64}' | base64 -d > {remote_path}"),
-                    run_line,
                 ];
+                // The operator's own key: placed before the script runs, which
+                // is told to use it rather than generate one. Only where a key
+                // is being written at all -- a sudo-only restore touches none.
+                if let Some(pem_b64) = extras.own_pem_b64.as_deref() {
+                    if !mode.is_restore() || reset_key {
+                        primary.push(own_pem_write_step(username, pem_b64));
+                        run_line.push_str(" --use-pem");
+                        self.log_info(format!(
+                            "{}: using the operator's own PEM for '{username}' (no new key generated)",
+                            mode.log_action()
+                        ));
+                    }
+                }
+                primary.push(run_line);
 
                 // Secondary: mirror the UID/GID from the shared EFS home.
                 // These are the same commands the primary script echoes.
@@ -23237,6 +23436,7 @@ mod gui {
                         primary_output: None,
                         secondary_output: None,
                         verify_started: false,
+                        send_email: extras.send_email,
                     });
                 } else {
                     self.create_user_run = None;
@@ -23335,6 +23535,7 @@ mod gui {
                 email_cmd: None,
                 email_copied: false,
                 email_status: None,
+                email_job: None,
             });
         }
 
@@ -23347,6 +23548,7 @@ mod gui {
             let mut do_close = false;
             let mut open_downloads = false;
             let mut email_copied_now = false;
+            let mut send_email_now = false;
             egui::Window::new(&popup.title)
                 .collapsible(false)
                 .resizable(false)
@@ -23393,6 +23595,19 @@ mod gui {
                         ui.horizontal(|ui| {
                             if ui.button("📂 Open Downloads folder").clicked() {
                                 open_downloads = true;
+                            }
+                            // Runs the same automatic send the checkbox would have.
+                            if popup.email_job.is_some() {
+                                let busy = matches!(popup.email_status, Some(EmailStatus::Sending));
+                                let sent = matches!(popup.email_status, Some(EmailStatus::Sent { .. }));
+                                if !sent
+                                    && ui
+                                        .add_enabled(!busy, egui::Button::new("✉ Send Email"))
+                                        .on_hover_text("Email the login details and PEM to the user now.")
+                                        .clicked()
+                                {
+                                    send_email_now = true;
+                                }
                             }
                             // "Send Email Command" — copies the send command for
                             // the chosen terminal; the user runs it themselves.
@@ -23454,6 +23669,29 @@ mod gui {
             if email_copied_now {
                 popup.email_copied = true;
             }
+            if send_email_now {
+                if let Some(job) = &popup.email_job {
+                    let started = start_access_email(
+                        &self.access_email,
+                        &job.username,
+                        &job.mmodal_env,
+                        &job.primary_id,
+                        &job.secondary_id,
+                        &job.pem,
+                        EmailRunChannels {
+                            status: self.email_tx.clone(),
+                            log: self.script_log_tx.clone(),
+                        },
+                    );
+                    popup.email_status = Some(if started {
+                        EmailStatus::Sending
+                    } else {
+                        EmailStatus::Failed {
+                            error: "the Outlook automation is Windows only here".to_string(),
+                        }
+                    });
+                }
+            }
             // Keep the popup open unless the user dismissed it (Close or X);
             // clicking "Open Downloads" leaves it up.
             if !do_close && window_open {
@@ -23511,6 +23749,7 @@ mod gui {
                     &pc.primary_id,
                     &pc.secondary_id,
                     outcome.uid,
+                    pc.extras,
                 );
             }
 
@@ -23531,6 +23770,7 @@ mod gui {
                             &pd.primary_id,
                             &pd.secondary_id,
                             None,
+                            CreateExtras::default(),
                         );
                     } else {
                         self.log_error(outcome.report.clone());
@@ -23796,8 +24036,19 @@ mod gui {
                                 ),
                                 _ => None,
                             };
+                            let email_job = match (&pem_path, &finished) {
+                                (Some(pem), Some(run)) if email_cmd.is_some() => Some(EmailJob {
+                                    username: username.clone(),
+                                    mmodal_env: run.mmodal_env.clone(),
+                                    primary_id: run.primary_id.clone(),
+                                    secondary_id: run.secondary_id.clone(),
+                                    pem: pem.clone(),
+                                }),
+                                _ => None,
+                            };
                             let mut auto_email = false;
-                            if self.access_email.enabled && self.access_email.auto_run {
+                            let send_now = finished.as_ref().is_some_and(|r| r.send_email);
+                            if self.access_email.enabled && self.access_email.auto_run && send_now {
                                 if let (Some(pem), Some(run)) = (&pem_path, &finished) {
                                     auto_email = start_access_email(
                                         &self.access_email,
@@ -23822,6 +24073,7 @@ mod gui {
                             );
                             if let Some(popup) = &mut self.script_result_popup {
                                 popup.email_cmd = email_cmd;
+                                popup.email_job = email_job;
                                 if auto_email {
                                     popup.email_status = Some(EmailStatus::Sending);
                                 }
@@ -27691,6 +27943,13 @@ mod gui {
                     cassandra_job_looks_stuck(job.since.elapsed().as_secs(), ceiling)
                 });
             let now = chrono::Utc::now().timestamp();
+            let domain_state = cassandra_domain(
+                ec2_manager::accounts::declared_domain_for(
+                    &dlg.scripts_env.account_id,
+                    &dlg.scripts_env.env,
+                )
+                .as_deref(),
+            );
 
             let mut window_open = true;
             let mut env_changed = false;
@@ -27747,6 +28006,16 @@ mod gui {
                             cassandra_local_time(run.when),
                             run.summary()
                         ));
+                    }
+                    // The domain an update would use, or why there is none.
+                    // Rollback does not need it.
+                    match &domain_state {
+                        Ok(d) => {
+                            ui.label(format!("Domain: {d}"));
+                        }
+                        Err(e) => {
+                            note_label(ui, red, e.as_str());
+                        }
                     }
 
                     ui.add_space(6.0);
@@ -28422,9 +28691,10 @@ mod gui {
             if let Some(act) = action {
                 let account_id = dlg.scripts_env.account_id.clone();
                 let env = dlg.scripts_env.env.clone();
-                let domain = cassandra_cert::domain_arg(
-                    &cassandra_cert::env_domain(&env),
-                    &self.cassandra_domain_suffix,
+                // Update and Apply need the environment's domain; rollback
+                // and preflight do not, so a missing one blocks only those.
+                let domain = cassandra_domain(
+                    ec2_manager::accounts::declared_domain_for(&account_id, &env).as_deref(),
                 );
                 let (targets, unselected) = cassandra_split_targets(&dlg.nodes, &dlg.selected);
                 match act {
@@ -28453,12 +28723,12 @@ mod gui {
                     }
                     CassandraAction::StartDryRun => match domain {
                         Err(e) => dlg.error = Some(format!("Update cert was not started: {e}")),
-                        Ok(domain_arg) => {
+                        Ok(domain) => {
                             job = Some(CassandraJob::DryRun {
                                 account_id,
                                 env,
                                 targets,
-                                domain_arg,
+                                domain,
                                 parameters: self.cassandra_parameters.clone(),
                             });
                         }
@@ -28471,7 +28741,7 @@ mod gui {
                         match (dlg.apply_armed(), domain) {
                             (false, _) => {}
                             (true, Err(e)) => dlg.error = Some(format!("Apply was not started: {e}")),
-                            (true, Ok(domain_arg)) => {
+                            (true, Ok(domain)) => {
                                 let before: HashMap<String, cassandra_cert::CertInfo> = dlg
                                     .dry
                                     .as_deref()
@@ -28486,7 +28756,7 @@ mod gui {
                                     env,
                                     targets,
                                     unselected,
-                                    domain_arg,
+                                    domain,
                                     before,
                                 });
                             }
@@ -38009,6 +38279,9 @@ mod gui {
                                     env_name,
                                     grant_sudo: false,
                                     reset_key: true,
+                                    send_email: true,
+                                    use_own_pem: false,
+                                    own_pem_path: String::new(),
                                     confirm_delete: false,
                 confirm_protected: false,
                                     primary_query,
@@ -45920,6 +46193,28 @@ mod gui {
         elapsed_secs > ceiling_secs.saturating_add(10 * 60)
     }
 
+    /// The domain an update / apply runs with, from the environment's
+    /// `domain` in accounts.json as declared (`accounts::declared_domain_for`):
+    /// the `-d` value and what `$env_domain` expands to. `Err` is the red line
+    /// the dialog shows, and nothing that needs the domain is started.
+    /// Manage Accounts environments never have one.
+    fn cassandra_domain(declared: Option<&str>) -> std::result::Result<String, String> {
+        let Some(raw) = declared.map(str::trim).filter(|d| !d.is_empty()) else {
+            return Err(
+                "this environment has no domain in accounts.json: add a \"domain\" to its entry"
+                    .to_string(),
+            );
+        };
+        match ec2_manager::accounts::clean_domain(raw) {
+            Some(d) => cassandra_cert::domain_arg(&d),
+            None => Err(format!(
+                "this environment's domain in accounts.json, '{raw}', is not a valid domain \
+                 (letters, digits, '.' and '-', starting with a letter or digit, at most 253 \
+                 characters)"
+            )),
+        }
+    }
+
     /// The selected nodes as job targets (node order; stopped nodes never,
     /// they cannot be reached), and the environment's other running nodes,
     /// which the consistency check reads.
@@ -46099,10 +46394,12 @@ mod gui {
         };
 
         match job {
-            CassandraJob::DryRun { env, targets, domain_arg, parameters, .. } => {
-                send(CassandraEvent::Log(format!("dry run on {} node(s)", targets.len())));
+            CassandraJob::DryRun { targets, domain, parameters, .. } => {
+                send(CassandraEvent::Log(format!(
+                    "dry run on {} node(s), domain {domain}",
+                    targets.len()
+                )));
                 let dates = cassandra_guard("parameter dates", || {
-                    let domain = cassandra_cert::env_domain(&env);
                     parameters
                         .iter()
                         .map(|template| match cassandra_cert::expand_parameter(template, &domain) {
@@ -46122,18 +46419,18 @@ mod gui {
                     }
                 }
                 match cassandra_guard("dry run", || {
-                    flow::dry_run(&exec, &targets, domain_arg.as_deref())
+                    flow::dry_run(&exec, &targets, Some(domain.as_str()))
                 }) {
                     Ok(out) => send(CassandraEvent::DryRun(out)),
                     Err(e) => send(CassandraEvent::Failed(e)),
                 }
             }
-            CassandraJob::Apply { targets, unselected, domain_arg, before, .. } => {
+            CassandraJob::Apply { targets, unselected, domain, before, .. } => {
                 send(CassandraEvent::Log(format!("apply on {} node(s)", targets.len())));
                 let input = flow::ApplyInput {
                     targets: &targets,
                     unselected: &unselected,
-                    domain_arg: domain_arg.as_deref(),
+                    domain_arg: Some(domain.as_str()),
                     before: &before,
                     required_secs,
                     ceiling_secs,
@@ -52603,6 +52900,52 @@ mod gui {
             assert_eq!(plain_text, acked_text, "and its own words");
         }
 
+        const FAKE_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----\nMIIEabc\n-----END RSA PRIVATE KEY-----";
+
+        #[test]
+        fn an_own_pem_is_normalised_to_lf_with_a_trailing_newline() {
+            let crlf = FAKE_KEY.replace('\n', "\r\n");
+            let out = validate_own_pem(crlf.as_bytes()).unwrap();
+            let out = String::from_utf8(out).unwrap();
+            assert!(!out.contains('\r'));
+            assert!(out.ends_with("-----END RSA PRIVATE KEY-----\n"));
+        }
+
+        #[test]
+        fn an_own_pem_that_cannot_work_is_refused_before_anything_is_created() {
+            assert!(validate_own_pem(b"").is_err());
+            assert!(validate_own_pem(b"ssh-rsa AAAAB3 user@host").is_err());
+            assert!(validate_own_pem(b"-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----").is_err());
+            assert!(validate_own_pem(&[0xff, 0xfe, 0x00]).is_err());
+            assert!(validate_own_pem(&vec![b'a'; OWN_PEM_MAX_BYTES + 1]).is_err());
+            let enc = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nabc\n-----END ENCRYPTED PRIVATE KEY-----";
+            assert!(validate_own_pem(enc.as_bytes()).unwrap_err().contains("passphrase"));
+            let legacy = "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,AB\nabc\n-----END RSA PRIVATE KEY-----";
+            assert!(validate_own_pem(legacy.as_bytes()).is_err());
+            assert!(validate_own_pem(FAKE_KEY.as_bytes()).is_ok());
+        }
+
+        #[test]
+        fn the_own_pem_step_hides_the_key_and_keeps_umask_local() {
+            let step = own_pem_write_step("jane.doe", "QUJD");
+            assert!(step.starts_with(' '), "leading space keeps it out of history");
+            assert!(step.contains("( umask 077;") && step.contains(" );"), "umask must not outlive the write");
+            assert!(step.contains("> /root/jane.doe.pem"));
+            assert!(step.ends_with("clear"), "the key must not stay on screen");
+        }
+
+        #[test]
+        fn the_create_script_can_use_a_supplied_key_instead_of_generating_one() {
+            let script = include_str!("../../assets/scripts/create_new_user.sh");
+            assert!(script.contains("--use-pem)"));
+            let use_pem = script.find("Using the supplied PEM").expect("use-pem branch");
+            let keygen = script.find("ssh-keygen -t rsa").expect("keygen");
+            let derive = script.find("ssh-keygen -y -P").expect("derive");
+            assert!(use_pem < derive && keygen < derive);
+            // The "PEM already exists" refusal must not trip on the supplied file.
+            assert!(script.contains("$USE_PEM -ne 1 && -e \"$PEM_PATH\""));
+        }
+
         /// The "remediating alert ..." line is `Running`, and only a message
         /// on the status channel replaces it. A manual remediation sent none,
         /// so the line stayed up for hours. The guard sends one however the
@@ -57111,7 +57454,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 env: "DEV1".into(),
                 targets: targets.clone(),
                 unselected: Vec::new(),
-                domain_arg: None,
+                domain: "dev1.example.net".into(),
                 before,
             };
             let pending = cassandra_pending_for(&job).expect("an apply leaves a record");
@@ -57174,12 +57517,40 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             }
         }
 
+        /// The update's domain is the accounts.json one, as written; an
+        /// environment without one (every Manage Accounts environment) gets
+        /// the red line, and so does one whose domain is not valid.
+        #[test]
+        fn the_cassandra_domain_comes_from_accounts_json_or_says_why_not() {
+            assert_eq!(cassandra_domain(Some("Dev1.Example.net")).as_deref(), Ok("Dev1.Example.net"));
+            assert_eq!(cassandra_domain(Some(" dev1.example.net. ")).as_deref(), Ok("dev1.example.net"));
+            let none = cassandra_domain(None).unwrap_err();
+            assert!(none.contains("no domain in accounts.json"), "{none}");
+            assert!(none.contains("add a \"domain\""), "{none}");
+            assert_eq!(cassandra_domain(Some("   ")).unwrap_err(), none, "blank is no domain");
+            let bad = cassandra_domain(Some("dev1; rm -rf /")).unwrap_err();
+            assert!(bad.contains("'dev1; rm -rf /'") && bad.contains("not a valid domain"), "{bad}");
+        }
+
+        /// The suffix setting existed only because the domain was unknown;
+        /// the click path now reads the accounts.json domain instead.
+        #[test]
+        fn the_cassandra_start_path_reads_the_accounts_json_domain() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let prod = &src[..src.find("mod tests {").expect("tests module")];
+            assert!(!prod.contains("domain_suffix"), "domain_suffix is gone");
+            assert!(!prod.contains("env_domain(&"), "the lowercased-name rule is gone");
+            let body = method_body(prod, "fn render_cassandra_dialog");
+            assert!(body.contains("declared_domain_for("), "the click path resolves the domain");
+            assert!(body.contains("cassandra_domain("), "and validates it the one way");
+        }
+
         fn cass_dry_job(account: &str, env: &str) -> CassandraJob {
             CassandraJob::DryRun {
                 account_id: account.into(),
                 env: env.into(),
                 targets: Vec::new(),
-                domain_arg: None,
+                domain: "dev1.example.net".into(),
                 parameters: Vec::new(),
             }
         }
@@ -57190,7 +57561,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 env: env.into(),
                 targets: vec![cass_target("i-1", "cassandra-101")],
                 unselected: Vec::new(),
-                domain_arg: None,
+                domain: "dev1.example.net".into(),
                 before: HashMap::new(),
             }
         }
@@ -61961,6 +62332,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let bundled = [ec2_manager::accounts::AccountEnvironment {
                 name: "DEV1".to_string(),
                 vault_addr: Some("https://vault.dev1".to_string()),
+                domain: None,
             }];
             // Case-insensitively, like every other environment comparison.
             let problem = environment_name_problem("dev1 ", &[], &bundled, "111");

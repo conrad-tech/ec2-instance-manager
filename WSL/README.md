@@ -455,8 +455,8 @@ The file is an array of account objects:
     "sort_order": 1,
     "color":      "#2ea043",
     "environments": [
-      { "name": "DEV1", "vault_addr": "https://vault.dev1.example.com:8200" },
-      { "name": "DEV2", "vault_addr": "https://vault.dev2.example.com:8200" }
+      { "name": "DEV1", "domain": "dev1.example.com" },
+      { "name": "DEV2", "domain": "dev2.example.com" }
     ]
   },
   {
@@ -490,7 +490,8 @@ The file is an array of account objects:
 ]
 ```
 
-Above: **Dev** declares two environments with their own Vault servers, **QA**
+Above: **Dev** declares two environments by domain, so each gets its own Vault
+server at `https://vault.<domain>:8200`, **QA**
 declares two that share one account-level Vault server, and **Staging** /
 **Prod** are single-environment accounts that declare none — see
 [Accounts with one environment](#accounts-with-one-environment).
@@ -505,10 +506,13 @@ declares two that share one account-level Vault server, and **Staging** /
 | `sort_order`   | No       | Display order in legend and dropdowns (lower = first). Omit for alphabetical. |
 | `color`        | No       | Hex color code for tab coloring (e.g. `"#2ea043"`). Omit for auto-assignment. |
 | `vault_addr`   | No       | Account-level Vault server URL. Used by every environment in the account that doesn't set its own. |
-| `environments` | No       | Environments hosted in this account, as `{ "name": …, "vault_addr": … }` objects. `name` must match the instances' **`MMODAL_ENV`** tag (case-insensitive). Omit for single-environment accounts. |
+| `environments` | No       | Environments hosted in this account, as `{ "name": …, "domain": …, "vault_addr": … }` objects. `name` must match the instances' **`MMODAL_ENV`** tag (case-insensitive). `domain` is the environment's DNS domain (e.g. `dev1.example.com`): its Vault server defaults to `https://vault.<domain>:8200`, and Cassandra Cert uses it as written. `vault_addr` (optional) overrides the derived Vault address. Omit for single-environment accounts. |
 
-`vault_addr` resolves in this order: the selected environment's own value, then
-the account-level value, then blank. It only pre-fills the
+`vault_addr` resolves in this order: the selected environment's own
+`vault_addr`, then `https://vault.<domain>:8200` from its `domain`, then an
+address added for that environment through Manage Accounts, then the
+account-level value, then blank. A `domain` that is not a valid domain name is
+ignored rather than turned into an address. It only pre-fills the
 [Vault IAM Access](#vault-iam-access) dialog and is always editable there.
 
 ### Environments within an account
@@ -525,7 +529,7 @@ The dropdown lists environments **by name** (`DEV1`, `DEV2`, …), not
 - every distinct `MMODAL_ENV` value found in that account's loaded inventory.
 
 So a new environment appears as soon as its instances do — declaring it in
-`accounts.json` is only needed to give it a `vault_addr`.
+`accounts.json` is only needed to give it a `domain` (or a `vault_addr`).
 
 Environments hidden with the toolbar's **Exclude Env** dropdown are left out, so
 the Scripts dialogs offer the same environments the Inventory page is showing.
@@ -544,7 +548,7 @@ row and behaves exactly as it did before this change. Two cases:
 
 - **The instances are tagged** (one `MMODAL_ENV` value across the account) — the
   environment is discovered automatically. Declare it in `environments` only if
-  it needs its own `vault_addr`; otherwise set `vault_addr` at the account level,
+  it needs its own `domain` or `vault_addr`; otherwise set `vault_addr` at the account level,
   as **Staging** does above.
 - **The instances are untagged** — there is nothing to discover, so the account
   itself is the single entry, **labelled with the account name** (there is no

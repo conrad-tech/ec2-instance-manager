@@ -490,11 +490,10 @@ pub struct CassandraCertFeature {
     /// everyone, empty for nobody. Shipped empty.
     pub allowed_users: Vec<String>,
     /// The SSM parameter path templates, each containing the literal
-    /// `$env_domain`. Read only for their last-modified time.
+    /// `$env_domain`, which is replaced with the environment's `domain` from
+    /// `accounts.json` exactly as written. Read only for their last-modified
+    /// time. The same domain is always passed to `cassandra.sh -d`.
     pub parameters: Vec<String>,
-    /// Appended to the environment's domain to form `cassandra.sh -d`.
-    /// Empty means no `-d` is passed and the script autodetects the domain.
-    pub domain_suffix: String,
     /// How long a node must stay `active` after the restart. Default 60.
     pub restart_stable_secs: u64,
     /// How long a node has to get there before it is failed. Default 300.
@@ -507,7 +506,6 @@ impl Default for CassandraCertFeature {
             enabled: false,
             allowed_users: Vec::new(),
             parameters: Vec::new(),
-            domain_suffix: String::new(),
             restart_stable_secs: 60,
             restart_ceiling_secs: 300,
         }

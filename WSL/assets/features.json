@@ -211,12 +211,11 @@
     "enabled": false,
     "allowed_users": []
   },
-  "_cassandra_cert_comment": "Scripts -> Cassandra Cert: renew (and roll back) the keystore cert on selected Cassandra nodes, then restart them all at once. A cluster-wide restart, so BOTH keys are required: set enabled to true AND name the OS username in allowed_users ([\"*\"] = everyone, [] = nobody). Shipped closed. parameters lists the four SSM parameter path templates; each must contain the literal $env_domain, which is replaced with the environment's lowercased name from accounts.json (the dialog reads only their last-modified time, never their values). domain_suffix is appended to that name to form cassandra.sh -d; leave it empty to pass no -d and let the script autodetect the domain from the node's own keystore. NB cassandra.sh hardcodes DOMAIN_SUFFIX=\"dev1.net\" for that autodetect and rejects any other domain, so any environment whose nodes are not *.dev1.net needs domain_suffix set (e.g. \".net\"). Likewise the app lowercases the environment NAME only and adds nothing else, so a parameters template must spell out the full domain exactly as the SSM path uses it, e.g. /cloudplatform/account/certificate/$env_domain.net/... restart_stable_secs is how long a node must stay active after the restart (default 60); restart_ceiling_secs is how long it has to get there (default 300).",
+  "_cassandra_cert_comment": "Scripts -> Cassandra Cert: renew (and roll back) the keystore cert on selected Cassandra nodes, then restart them all at once. A cluster-wide restart, so BOTH keys are required: set enabled to true AND name the OS username in allowed_users ([\"*\"] = everyone, [] = nobody). Shipped closed. parameters lists the four SSM parameter path templates; each must contain the literal $env_domain, which is replaced with the environment's domain from accounts.json (its \"domain\" field) exactly as written, with nothing lowercased or appended, e.g. /cloudplatform/account/certificate/$env_domain/... (the dialog reads only their last-modified time, never their values). cassandra.sh is always passed -d <domain> with that same domain. An environment with no domain in accounts.json (including every environment added through Manage Accounts) cannot run an update; rollback does not need the domain. restart_stable_secs is how long a node must stay active after the restart (default 60); restart_ceiling_secs is how long it has to get there (default 300).",
   "cassandra_cert": {
     "enabled": false,
     "allowed_users": [],
     "parameters": [],
-    "domain_suffix": "",
     "restart_stable_secs": 60,
     "restart_ceiling_secs": 300
   },

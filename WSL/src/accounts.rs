@@ -42,11 +42,40 @@ struct AccountEntry {
 /// `name` must match the instances' `MMODAL_ENV` tag (compared
 /// case-insensitively and trimmed) — that is what narrows the bastion
 /// dropdowns in the Scripts dialogs to a single environment.
+///
+/// `domain` is the environment's DNS domain (`dev1.example.net`). It gives the
+/// environment its default Vault address ([`default_vault_addr`]) and is what
+/// Cassandra Cert expands `$env_domain` to and passes `cassandra.sh -d`.
+/// `vault_addr`, when also given, overrides the derived address. Environments
+/// the user declares through Manage Accounts never carry a domain.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct AccountEnvironment {
     pub name: String,
     #[serde(default)]
     pub vault_addr: Option<String>,
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+/// Port of the Vault address derived from an environment's `domain`.
+pub const DEFAULT_VAULT_PORT: u16 = 8200;
+
+/// The Vault address an environment with `domain` and no explicit
+/// `vault_addr` uses: `https://vault.<domain>:8200`.
+pub fn default_vault_addr(domain: &str) -> String {
+    format!("https://vault.{domain}:{DEFAULT_VAULT_PORT}")
+}
+
+/// A declared domain, trimmed with one trailing `.` dropped, or `None` when
+/// it is blank or not a valid domain token. An invalid domain must never be
+/// silently turned into a Vault URL or a shell argument, so it reads as
+/// absent and resolution falls through to the next level. The character rule
+/// is Cassandra Cert's ([`crate::cassandra_cert::valid_domain_token`]), the
+/// one consumer that interpolates it into a command.
+pub fn clean_domain(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    let t = t.strip_suffix('.').unwrap_or(t);
+    (!t.is_empty() && crate::cassandra_cert::valid_domain_token(t)).then(|| t.to_string())
 }
 
 fn accounts_path() -> Option<PathBuf> {
@@ -111,6 +140,7 @@ fn environments_in(json: &str, account_id: &str) -> Vec<AccountEnvironment> {
                 .map(|e| AccountEnvironment {
                     name: e.name.trim().to_string(),
                     vault_addr: non_blank(&e.vault_addr),
+                    domain: e.domain.as_deref().and_then(clean_domain),
                 })
                 .collect()
         })
@@ -139,19 +169,29 @@ fn environments_in_with_user(
         envs.push(AccountEnvironment {
             name: u.name.trim().to_string(),
             vault_addr: non_blank(&u.vault_addr),
+            // Manage Accounts environments carry an address only.
+            domain: None,
         });
     }
     envs
 }
 
-/// Vault address across four levels, most specific first:
+/// Vault address across five levels, most specific first:
 ///
-/// 1. the environment's declared address in `accounts.json`,
-/// 2. the environment's address in the user's own declarations,
-/// 3. the account-wide declared address,
-/// 4. nothing.
+/// 1. the environment's declared `vault_addr` in `accounts.json` (an
+///    explicit override),
+/// 2. the address derived from the environment's declared `domain`
+///    ([`default_vault_addr`]: `https://vault.<domain>:8200`); a domain that
+///    [`clean_domain`] rejects counts as absent and falls through,
+/// 3. the environment's address in the user's own declarations,
+/// 4. the account-wide declared address,
+/// 5. nothing.
 ///
-/// **All four levels are resolved here, in one pass.** There used to be a
+/// Levels 1 and 2 are both the *declared* environment level -- the curated
+/// value -- so a declared domain beats the user's own address for the same
+/// environment, exactly as a declared address always has.
+///
+/// **All levels are resolved here, in one pass.** There used to be a
 /// second, bundled-only resolver alongside this one; it collapsed levels 1
 /// and 3, so layering the user on top of it would have put a user's
 /// *environment* address below the *account-wide* declaration -- less
@@ -176,12 +216,14 @@ fn vault_addr_in_with_user(
     let entry = entries.as_ref().and_then(|e| find_entry(e, account_id));
 
     if !env.trim().is_empty() {
-        if let Some(declared) = entry
+        let declared_env = entry
             .and_then(|e| e.environments.as_ref())
-            .and_then(|envs| envs.iter().find(|e| env_eq(&e.name, env)))
-            .and_then(|e| non_blank(&e.vault_addr))
-        {
+            .and_then(|envs| envs.iter().find(|e| env_eq(&e.name, env)));
+        if let Some(declared) = declared_env.and_then(|e| non_blank(&e.vault_addr)) {
             return Some(declared);
+        }
+        if let Some(domain) = declared_env.and_then(|e| e.domain.as_deref()).and_then(clean_domain) {
+            return Some(default_vault_addr(&domain));
         }
         if let Some(from_user) = user
             .iter()
@@ -206,8 +248,46 @@ pub fn environments_for(account_id: &str, user: &[UserEnvironment]) -> Vec<Accou
     environments_in_with_user(&bundled_accounts(), account_id, user)
 }
 
-/// Vault address for an account/environment pair. Environment level beats
-/// account level, and within each the declared value beats the user's.
+/// The declared `domain` of one environment in `json`, cleaned by
+/// [`clean_domain`] (so kept exactly as written apart from trimming and one
+/// trailing dot). The environment is matched case-insensitively and trimmed,
+/// like the Vault lookup. There is no account-level domain, and user-declared
+/// environments have none, so this reads `accounts.json` only.
+fn domain_in(json: &str, account_id: &str, env: &str) -> Option<String> {
+    declared_domain_in(json, account_id, env).and_then(|d| clean_domain(&d))
+}
+
+/// The `domain` an environment declares, trimmed but NOT validated, or `None`
+/// when it declares none (or a blank one). For saying why a declared domain
+/// was refused; everything that uses a domain goes through [`domain_in`].
+fn declared_domain_in(json: &str, account_id: &str, env: &str) -> Option<String> {
+    if env.trim().is_empty() {
+        return None;
+    }
+    let entries = serde_json::from_str::<Vec<AccountEntry>>(json).ok()?;
+    let declared = find_entry(&entries, account_id)?
+        .environments
+        .as_ref()?
+        .iter()
+        .find(|e| env_eq(&e.name, env))?;
+    non_blank(&declared.domain)
+}
+
+/// The bundled `accounts.json` domain of an account/environment pair, or
+/// `None` when it declares none (or an invalid one). See [`domain_in`].
+pub fn domain_for(account_id: &str, env: &str) -> Option<String> {
+    domain_in(&bundled_accounts(), account_id, env)
+}
+
+/// The bundled `accounts.json` domain exactly as declared (trimmed, not
+/// validated). See [`declared_domain_in`].
+pub fn declared_domain_for(account_id: &str, env: &str) -> Option<String> {
+    declared_domain_in(&bundled_accounts(), account_id, env)
+}
+
+/// Vault address for an account/environment pair, resolved by
+/// [`vault_addr_in_with_user`]: declared address, then declared domain, then
+/// the user's address, then the account-wide one.
 pub fn vault_addr_for(
     account_id: &str,
     env: &str,
@@ -709,7 +789,7 @@ mod tests {
         );
     }
 
-    /// The four-level precedence, at the level that is easy to get backwards:
+    /// The precedence, at the level that is easy to get backwards:
     /// a user entry for an environment beats the account-wide declaration,
     /// because it is more specific -- the same reason an environment-level
     /// `vault_addr` already beats it.
@@ -756,6 +836,158 @@ mod tests {
             vault_addr_in_with_user(ENV_JSON, "999", "SBX", &user).as_deref(),
             Some("https://vault.sbx")
         );
+    }
+
+    /// Accounts whose environments declare a `domain`: DOM1 by domain alone,
+    /// DOM2 with both a domain and an explicit address, DOM3 with neither,
+    /// BAD with a domain that is not a valid token, DOT with a trailing dot.
+    const DOMAIN_JSON: &str = r#"[
+        {
+            "label": "Dom",
+            "account_id": "333",
+            "vault_addr": "https://vault.acct",
+            "environments": [
+                { "name": "DOM1", "domain": "dom1.Example.net" },
+                { "name": "DOM2", "domain": "dom2.example.net", "vault_addr": "https://vault.override:9000" },
+                { "name": "DOM3" },
+                { "name": "BAD", "domain": "bad domain; rm -rf /" },
+                { "name": "DOT", "domain": " dot.example.net. " },
+                { "name": "BLANK", "domain": "   " }
+            ]
+        }
+    ]"#;
+
+    #[test]
+    fn the_default_vault_address_is_vault_dot_domain_on_8200() {
+        assert_eq!(DEFAULT_VAULT_PORT, 8200);
+        assert_eq!(default_vault_addr("dev1.example.net"), "https://vault.dev1.example.net:8200");
+    }
+
+    #[test]
+    fn a_declared_domain_derives_the_vault_address() {
+        assert_eq!(
+            vault_addr_in_with_user(DOMAIN_JSON, "333", "DOM1", &[]).as_deref(),
+            Some("https://vault.dom1.Example.net:8200")
+        );
+    }
+
+    #[test]
+    fn an_explicit_vault_addr_beats_the_domain() {
+        assert_eq!(
+            vault_addr_in_with_user(DOMAIN_JSON, "333", "DOM2", &[]).as_deref(),
+            Some("https://vault.override:9000")
+        );
+    }
+
+    /// A declared domain is a declared environment-level value, so it beats
+    /// both a user's own address for that environment and the account-wide one.
+    #[test]
+    fn a_declared_domain_beats_a_user_address_and_the_account_level() {
+        let user = [user_env("333", "dom1", Some("https://vault.mine"))];
+        assert_eq!(
+            vault_addr_in_with_user(DOMAIN_JSON, "333", "DOM1", &user).as_deref(),
+            Some("https://vault.dom1.Example.net:8200")
+        );
+    }
+
+    #[test]
+    fn a_domain_does_not_leak_into_another_environment() {
+        assert_eq!(
+            vault_addr_in_with_user(DOMAIN_JSON, "333", "DOM3", &[]).as_deref(),
+            Some("https://vault.acct")
+        );
+        assert_eq!(
+            vault_addr_in_with_user(DOMAIN_JSON, "333", "", &[]).as_deref(),
+            Some("https://vault.acct")
+        );
+    }
+
+    /// An invalid declared domain must never be turned into a URL; it falls
+    /// through to the next level instead.
+    #[test]
+    fn an_invalid_domain_falls_through_to_the_next_level() {
+        assert_eq!(
+            vault_addr_in_with_user(DOMAIN_JSON, "333", "BAD", &[]).as_deref(),
+            Some("https://vault.acct")
+        );
+        let user = [user_env("333", "BAD", Some("https://vault.mine"))];
+        assert_eq!(
+            vault_addr_in_with_user(DOMAIN_JSON, "333", "BAD", &user).as_deref(),
+            Some("https://vault.mine")
+        );
+    }
+
+    #[test]
+    fn a_trailing_dot_on_the_domain_is_dropped() {
+        assert_eq!(domain_in(DOMAIN_JSON, "333", "DOT").as_deref(), Some("dot.example.net"));
+        assert_eq!(
+            vault_addr_in_with_user(DOMAIN_JSON, "333", "DOT", &[]).as_deref(),
+            Some("https://vault.dot.example.net:8200")
+        );
+    }
+
+    #[test]
+    fn the_domain_lookup_matches_the_environment_case_insensitively() {
+        assert_eq!(domain_in(DOMAIN_JSON, "333", " dom1 ").as_deref(), Some("dom1.Example.net"));
+        assert_eq!(
+            vault_addr_in_with_user(DOMAIN_JSON, "333", "dom1", &[]).as_deref(),
+            Some("https://vault.dom1.Example.net:8200")
+        );
+    }
+
+    #[test]
+    fn the_domain_is_kept_exactly_as_written() {
+        assert_eq!(domain_in(DOMAIN_JSON, "333", "DOM1").as_deref(), Some("dom1.Example.net"));
+    }
+
+    #[test]
+    fn domain_lookup_is_none_when_missing_blank_or_invalid() {
+        assert_eq!(domain_in(DOMAIN_JSON, "333", "DOM3"), None, "no domain declared");
+        assert_eq!(domain_in(DOMAIN_JSON, "333", "BLANK"), None, "blank domain");
+        assert_eq!(domain_in(DOMAIN_JSON, "333", "BAD"), None, "invalid domain");
+        assert_eq!(domain_in(DOMAIN_JSON, "333", "NOPE"), None, "undeclared environment");
+        assert_eq!(domain_in(DOMAIN_JSON, "333", ""), None, "no environment");
+        assert_eq!(domain_in(DOMAIN_JSON, "999", "DOM1"), None, "unknown account");
+        assert_eq!(domain_in("not json", "333", "DOM1"), None);
+    }
+
+    #[test]
+    fn the_declared_domain_is_returned_unvalidated_for_reporting() {
+        assert_eq!(
+            declared_domain_in(DOMAIN_JSON, "333", "bad").as_deref(),
+            Some("bad domain; rm -rf /")
+        );
+        assert_eq!(declared_domain_in(DOMAIN_JSON, "333", "BLANK"), None);
+        assert_eq!(declared_domain_in(DOMAIN_JSON, "333", "DOM3"), None);
+    }
+
+    #[test]
+    fn clean_domain_trims_and_validates() {
+        assert_eq!(clean_domain(" a.b.net. ").as_deref(), Some("a.b.net"));
+        assert_eq!(clean_domain("Dev1.Example-Company.net").as_deref(), Some("Dev1.Example-Company.net"));
+        assert_eq!(clean_domain(""), None);
+        assert_eq!(clean_domain("."), None);
+        assert_eq!(clean_domain("-a.net"), None);
+        assert_eq!(clean_domain("a b.net"), None);
+        assert_eq!(clean_domain("a.net/x"), None);
+    }
+
+    /// A declared domain is "has Vault" as much as a declared address is.
+    #[test]
+    fn a_domain_only_environment_has_vault() {
+        assert!(env_has_vault_in(DOMAIN_JSON, "333", "DOM1", &[]));
+        assert!(!env_has_vault_in(r#"[{"label":"A","account_id":"1","environments":[{"name":"E","domain":"bad domain"}]}]"#, "1", "E", &[]));
+    }
+
+    #[test]
+    fn environments_carry_their_domain() {
+        let envs = environments_in(DOMAIN_JSON, "333");
+        assert_eq!(envs[0].domain.as_deref(), Some("dom1.Example.net"));
+        assert_eq!(envs[2].domain, None);
+        let user = [user_env("333", "USR", Some("https://vault.mine"))];
+        let envs = environments_in_with_user(DOMAIN_JSON, "333", &user);
+        assert_eq!(envs.last().unwrap().name, "USR");
+        assert_eq!(envs.last().unwrap().domain, None, "user environments have no domain");
     }
 
     #[test]

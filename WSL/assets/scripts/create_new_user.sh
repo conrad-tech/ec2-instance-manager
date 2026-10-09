@@ -9,11 +9,14 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 --user <username> [--pem <pem_path>] [--force] [--sudo] [--uid <n>] [--restore [--no-key]] [--help]"
+  echo "Usage: $0 --user <username> [--pem <pem_path>] [--force] [--sudo] [--uid <n>] [--use-pem] [--restore [--no-key]] [--help]"
   echo " --user <username> Required. New username to create"
   echo " --pem <pem_path> Optional. PEM output path (default: /root/<username>.pem)"
   echo " --force Optional. Overwrite existing PEM file"
   echo " --sudo Optional. Configure sudo access (NOPASSWD:ALL)"
+  echo " --use-pem Optional. Do NOT generate a key: use the private key already"
+  echo "                    at the --pem path (default /root/<username>.pem) and"
+  echo "                    install the public key derived from it."
   echo " --uid <n> Optional. Create with this uid AND gid. Chosen by the app"
   echo "                    from BOTH bastions' tables; without it the script"
   echo "                    picks one this bastion can see (see pick_shared_id)."
@@ -38,6 +41,8 @@ SUDO=0
 RESTORE=0
 # --no-key: a restore that does not touch the key (sudo only).
 NO_KEY=0
+# --use-pem: the caller placed the private key at PEM_PATH; do not generate one.
+USE_PEM=0
 # Explicit id from the caller. Empty means allocate one locally.
 WANT_ID=""
 
@@ -76,6 +81,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-key)
       NO_KEY=1
+      shift
+      ;;
+    --use-pem)
+      USE_PEM=1
       shift
       ;;
     --help|-h)
@@ -183,7 +192,7 @@ fi
 mkdir -p /efs/home
 chmod 755 /efs /efs/home
 
-if [[ -e "$PEM_PATH" && $FORCE -ne 1 ]]; then
+if [[ $USE_PEM -ne 1 && -e "$PEM_PATH" && $FORCE -ne 1 ]]; then
   echo "ERROR: PEM file already exists at $PEM_PATH"
   echo "Use --force to overwrite or provide --pem <new_path>."
   exit 1
@@ -191,13 +200,23 @@ fi
 
 mkdir -p "$(dirname "$PEM_PATH")"
 
-echo "Generating PEM private key at $PEM_PATH ..."
-ssh-keygen -t rsa -b 4096 -m PEM -N "" -f "$PEM_PATH" -C "${USERNAME}@$(hostname)-$(date +%F)" >/dev/null
-chmod 600 "$PEM_PATH"
+if [[ $USE_PEM -eq 1 ]]; then
+  if [[ ! -s "$PEM_PATH" ]]; then
+    echo "ERROR: --use-pem but no private key was found at $PEM_PATH"
+    exit 1
+  fi
+  chmod 600 "$PEM_PATH"
+  echo "Using the supplied PEM at $PEM_PATH (no new key generated)."
+else
+  echo "Generating PEM private key at $PEM_PATH ..."
+  ssh-keygen -t rsa -b 4096 -m PEM -N "" -f "$PEM_PATH" -C "${USERNAME}@$(hostname)-$(date +%F)" >/dev/null
+  chmod 600 "$PEM_PATH"
+fi
 
-PUB_KEY="$(ssh-keygen -y -f "$PEM_PATH")"
+# -P "" so a passphrase-protected key fails here instead of waiting on a prompt.
+PUB_KEY="$(ssh-keygen -y -P "" -f "$PEM_PATH" </dev/null 2>/dev/null)"
 if [[ -z "$PUB_KEY" ]]; then
-  echo "ERROR: Failed to derive public key from PEM."
+  echo "ERROR: Failed to derive public key from PEM (is it encrypted or not a private key?)."
   exit 1
 fi
 

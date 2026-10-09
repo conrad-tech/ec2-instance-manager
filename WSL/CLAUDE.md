@@ -3890,8 +3890,10 @@ dropdowns to instances carrying that tag value.
 
 `src/script_env.rs` builds the dropdown rows as the **union** of the
 environments declared in `accounts.json` (`environments: [{name, vault_addr}]`)
-and those discovered from the tags in the account's inventory. Three cases that
-are easy to break:
+and those discovered from the tags in the account's inventory. (An entry can
+now also carry `domain` -- `{name, domain, vault_addr}` -- see "Vault IAM
+Access" for how it sets the Vault address.) Three cases that are easy to
+break:
 
 - **Declared spelling wins** on a case-insensitive collision, so a `DEV1` in
   accounts.json and a `dev1` tag are one row, labelled as the admin wrote it.
@@ -3971,8 +3973,23 @@ ARNs are validated rather than escaped: anything containing quotes, `$`,
 backticks or whitespace is rejected, since it is interpolated into a
 double-quoted shell argument.
 
-`vault_addr` resolves environment-level → account-level → blank, via
-`accounts::vault_addr_for`. `ProfileConfig` is deliberately not extended with
+`vault_addr` resolves via `accounts::vault_addr_for`
+(`vault_addr_in_with_user`), most specific first:
+
+1. the environment's declared `vault_addr` in accounts.json (an override),
+2. `https://vault.<domain>:8200` from the environment's declared `domain`
+   (`default_vault_addr`, `DEFAULT_VAULT_PORT`); a domain `clean_domain`
+   rejects is treated as absent and falls through -- an invalid domain is
+   never turned into a URL,
+3. the user's own (Manage Accounts / config.ini) address for that environment,
+4. the account-level `vault_addr`,
+5. blank.
+
+Levels 1-2 are both the declared environment level, so a declared domain beats
+a user's address for the same environment, as a declared address always has.
+`env_has_vault` stays thin over the same resolver. The Manage Accounts and
+new-account wizard lists show this **effective** address, not the raw field,
+so a domain-only environment does not read "(no Vault)". `ProfileConfig` is deliberately not extended with
 it; it flows into config.ini persistence and the tab UI, neither of which needs
 Vault settings.
 
@@ -4099,14 +4116,33 @@ untouched truststore must already trust the new chain; an issuer change
 shows as Flagged after the restart.
 
 **Parameters are read with `describe-parameters`, never `get-parameter`**:
-only `LastModifiedDate` is needed, and a value must never be fetched. `-d` is
-passed to `cassandra.sh` only when `domain_suffix` is set; otherwise the
-script autodetects the domain. That autodetect only accepts domains ending in
-the script's hardcoded `DOMAIN_SUFFIX="dev1.net"`, so any environment whose
-nodes are not `*.dev1.net` needs `domain_suffix`. `$env_domain` is the
-lowercased environment NAME only, so a `parameters` template spells out the
-rest of the domain as the SSM path has it
-(`/cloudplatform/account/certificate/$env_domain.net/...`).
+only `LastModifiedDate` is needed, and a value must never be fetched.
+
+**The domain comes from `accounts.json`.** Each environment entry there
+carries `"domain": "dev1.example.net"` beside its `name`
+(`accounts::domain_for` / `declared_domain_for`). `$env_domain` in the four
+`parameters` templates expands to that domain **exactly as written** --
+trimmed, one trailing `.` dropped, case preserved, nothing appended -- so a
+template reads `/cloudplatform/account/certificate/$env_domain/...`. The same
+domain is **always** passed to `cassandra.sh` as `-d <domain>`, so the
+script's own autodetect (and its hardcoded `DOMAIN_SUFFIX="dev1.net"`) is no
+longer relied on; with `-d` the script's CN check compares `*.<domain>`
+case-sensitively, so write the domain as the cert's CN has it.
+`cassandra_cert.domain_suffix` is **gone** -- it existed only because the
+domain was unknown. The check is `cassandra_domain` in the GUI over
+`cassandra_cert::domain_arg` / `valid_domain_token` (alphanumeric first, then
+alphanumerics `.` `-`, at most **253** chars: a whole DNS name, not one
+63-char label).
+
+- **No domain, no update.** An environment with no `domain` (or a blank one)
+  shows a red line in the dialog header -- `this environment has no domain in
+  accounts.json: add a "domain" to its entry` -- and Update cert / Apply
+  set the same line and start nothing. An invalid domain is refused the same
+  way, naming it and the rule. The header shows `Domain: <domain>` otherwise.
+- **Rollback and preflight do not need it** and keep working without one.
+- **Manage Accounts environments never have a domain**: they carry a
+  `vault_addr` only (config.ini is not extended), so Cassandra Cert shows the
+  "no domain" line for them.
 
 **No automatic rollback, ever.** A failed or unverified node shows a Roll back
 shortcut that only starts the read-only preflight.
@@ -4136,9 +4172,9 @@ The restart gates are built in one place: `CassandraDialog::apply_gate` /
 the click re-check go through `apply_armed` / `rollback_armed`. A start only
 replaces what the dialog shows once `start_cassandra_job` admitted it.
 
-**Open items.** `env_domain` is the lowercased `accounts.json` environment
-name, unconfirmed against every environment's SSM paths. `nodetool drain` is
-not run before the restart.
+**Open items.** `nodetool drain` is not run before the restart. (The old
+open item -- `$env_domain` being the lowercased environment name, unconfirmed
+against the SSM paths -- is resolved: it is now the declared `domain`.)
 
 Build status for this feature: the dialog panels (Task 10b, with its fix
 round) add 27 tests (11 lib + 16 GUI); `cargo test --features gui` measured

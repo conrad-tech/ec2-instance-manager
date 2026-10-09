@@ -316,41 +316,41 @@ pub fn local_time(epoch: i64) -> String {
     }
 }
 
-/// The environment name as it appears in SSM paths: lowercased.
-pub fn env_domain(env_name: &str) -> String {
-    env_name.trim().to_ascii_lowercase()
-}
-
-/// A token safe to interpolate into a shell command and an SSM path.
+/// A token safe to interpolate into a shell command and an SSM path: an
+/// alphanumeric first character, then alphanumerics, `.` and `-`, at most
+/// 253 characters (a whole DNS name; 63 is one label, and a real
+/// multi-label domain is routinely longer than that).
 pub fn valid_domain_token(s: &str) -> bool {
     s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && s.len() <= 63
+        && s.len() <= 253
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
 }
 
-pub fn expand_parameter(template: &str, env_domain: &str) -> Result<String, String> {
+/// Expand `$env_domain` in an SSM parameter template with the environment's
+/// `accounts.json` domain, exactly as written (no case change, nothing
+/// appended).
+pub fn expand_parameter(template: &str, domain: &str) -> Result<String, String> {
     if !template.contains("$env_domain") {
         return Err(format!(
             "parameter template '{template}' has no $env_domain; refusing to guess which parameter it means"
         ));
     }
-    if !valid_domain_token(env_domain) {
-        return Err(format!("'{env_domain}' is not a valid environment domain"));
+    if !valid_domain_token(domain) {
+        return Err(format!("'{domain}' is not a valid domain"));
     }
-    Ok(template.replace("$env_domain", env_domain))
+    Ok(template.replace("$env_domain", domain))
 }
 
-/// `-d` for `cassandra.sh`: `None` (autodetect) when no suffix is configured.
-pub fn domain_arg(env_domain: &str, suffix: &str) -> Result<Option<String>, String> {
-    if suffix.trim().is_empty() {
-        return Ok(None);
+/// The `-d` value for `cassandra.sh`: the environment's domain, validated.
+/// The app always passes it; it no longer leaves the domain to the
+/// script's own autodetection.
+pub fn domain_arg(domain: &str) -> Result<String, String> {
+    let d = domain.trim();
+    if !valid_domain_token(d) {
+        return Err(format!("'{d}' is not a valid domain"));
     }
-    let full = format!("{env_domain}{}", suffix.trim());
-    if !valid_domain_token(&full) {
-        return Err(format!("'{full}' is not a valid cert domain"));
-    }
-    Ok(Some(full))
+    Ok(d.to_string())
 }
 
 /// `ssm describe-parameters` prints `LastModifiedDate` as ISO-8601 on CLI v2
@@ -1108,27 +1108,47 @@ mod tests {
         assert!(!served_matches(&served, &OldCert { not_after: 999, serial: None }));
     }
 
+    /// A real multi-label domain is longer than one DNS label's 63 chars; the
+    /// cap is the whole name's 253.
     #[test]
-    fn the_domain_is_the_lowercased_environment_name() {
-        assert_eq!(env_domain(" DEV1 "), "dev1");
+    fn a_domain_token_may_be_a_long_multi_label_domain() {
+        let long = format!("{}.{}.example-company.net", "a".repeat(60), "b".repeat(60));
+        assert!(long.len() > 63);
+        assert!(valid_domain_token(&long));
+        assert!(valid_domain_token(&"a".repeat(253)));
+        assert!(!valid_domain_token(&"a".repeat(254)));
     }
 
     #[test]
     fn a_parameter_template_must_name_the_domain() {
         assert_eq!(
-            expand_parameter("/certs/$env_domain/key", "dev1").unwrap(),
-            "/certs/dev1/key"
+            expand_parameter("/certs/$env_domain/key", "dev1.net").unwrap(),
+            "/certs/dev1.net/key"
         );
         assert!(expand_parameter("/certs/static/key", "dev1").is_err(), "no $env_domain");
         assert!(expand_parameter("/certs/$env_domain/key", "dev1; rm -rf /").is_err());
         assert!(expand_parameter("/certs/$env_domain/key", "").is_err());
+        let err = expand_parameter("/certs/$env_domain/key", "x y").unwrap_err();
+        assert!(err.contains("not a valid domain"), "{err}");
+    }
+
+    /// `$env_domain` is the accounts.json domain exactly as written: no
+    /// lowercasing, nothing appended.
+    #[test]
+    fn the_domain_is_expanded_exactly_as_written() {
+        assert_eq!(
+            expand_parameter("/c/$env_domain/k", "Dev1.Example.net").unwrap(),
+            "/c/Dev1.Example.net/k"
+        );
     }
 
     #[test]
-    fn the_cassandra_domain_flag_is_optional() {
-        assert_eq!(domain_arg("dev1", "").unwrap(), None);
-        assert_eq!(domain_arg("dev1", ".net").unwrap(), Some("dev1.net".to_string()));
-        assert!(domain_arg("dev1", "; x").is_err());
+    fn the_cassandra_domain_flag_is_the_validated_domain() {
+        assert_eq!(domain_arg("dev1.example.net").unwrap(), "dev1.example.net");
+        assert_eq!(domain_arg(" Dev1.Example.net ").unwrap(), "Dev1.Example.net");
+        assert!(domain_arg("; x").is_err());
+        assert!(domain_arg("").is_err());
+        assert!(domain_arg("-dev1.net").is_err());
     }
 
     #[test]

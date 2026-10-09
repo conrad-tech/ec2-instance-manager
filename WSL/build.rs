@@ -607,7 +607,8 @@ fn validate_not_template() {
         "\nBuild failed: the bundled configuration is still this repo's template:\n{}\n\n\
          assets/accounts.json must name the AWS accounts this build is for — label,\n\
          account_id, region, sort_order and color per account, plus each account's\n\
-         environments and their vault_addr. See README \"Account configuration\".\n\n\
+         environments and their domain (Vault defaults to https://vault.<domain>:8200;\n\
+         vault_addr overrides it). See README \"Account configuration\".\n\n\
          assets/features.json must name your site wherever a feature is switched on:\n\
          personal_scripts.git_host and its default_scripts (checked only once\n\
          personal_scripts.allowed_users names somebody), and access_email's mail\n\

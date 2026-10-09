@@ -8,11 +8,11 @@
     "environments": [
       {
         "name": "DEV1",
-        "vault_addr": "https://vault.dev1.YOUR-COMPANY.com:8200"
+        "domain": "dev1.YOUR-COMPANY.com"
       },
       {
         "name": "DEV2",
-        "vault_addr": "https://vault.dev2.YOUR-COMPANY.com:8200"
+        "domain": "dev2.YOUR-COMPANY.com"
       }
     ]
   },
