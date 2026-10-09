@@ -327,6 +327,27 @@ pub fn valid_domain_token(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
 }
 
+/// The four SSM parameters `cassandra.sh` reads to build the keystore, as
+/// templates. They are the very paths the script fetches
+/// (`/cloudplatform/account/certificate/<domain>/<name>`), so the dialog's
+/// "last modified" check looks at what an update will actually pull. Used when
+/// `cassandra_cert.parameters` is empty; a configured list still wins.
+pub const DEFAULT_PARAMETER_TEMPLATES: [&str; 4] = [
+    "/cloudplatform/account/certificate/$env_domain/certificate_body",
+    "/cloudplatform/account/certificate/$env_domain/certificate_chain",
+    "/cloudplatform/account/certificate/$env_domain/certificate_private_key",
+    "/cloudplatform/account/certificate/$env_domain/passphrase",
+];
+
+/// The parameter templates to check: the configured ones, else the script's own.
+pub fn parameter_templates(configured: &[String]) -> Vec<String> {
+    if configured.is_empty() {
+        DEFAULT_PARAMETER_TEMPLATES.iter().map(|t| t.to_string()).collect()
+    } else {
+        configured.to_vec()
+    }
+}
+
 /// Expand `$env_domain` in an SSM parameter template with the environment's
 /// `accounts.json` domain, exactly as written (no case change, nothing
 /// appended).

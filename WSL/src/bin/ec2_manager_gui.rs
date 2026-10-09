@@ -11044,7 +11044,9 @@ mod gui {
                 cassandra_inbox: Vec::new(),
                 cassandra_next_job_id: 0,
                 cassandra_watch_secs: features.cassandra_cert.watch_secs(),
-                cassandra_parameters: features.cassandra_cert.parameters.clone(),
+                cassandra_parameters: cassandra_cert::parameter_templates(
+                    &features.cassandra_cert.parameters,
+                ),
                 power_confirm: None,
                 power_in_flight: Arc::new(Mutex::new(HashSet::new())),
                 power_status: None,
@@ -28923,8 +28925,7 @@ mod gui {
                                 .min_by_key(|c| c.not_before);
                             if dlg.dates.is_empty() {
                                 ui.label(
-                                    "No parameter is configured (cassandra_cert.parameters), so none \
-                                     was checked.",
+                                    "No parameter was checked.",
                                 );
                             }
                             for (path, when) in &dlg.dates {
