@@ -12130,7 +12130,8 @@ mod gui {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     ui.label(
                         "fed up refreshed everything it could and then failed. \
@@ -14324,7 +14325,8 @@ mod gui {
                 .resizable(true)
                 .default_width(560.0)
                 .open(&mut open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     ui.label(
                         "These names have no entry in your hosts file. The \
@@ -15255,7 +15257,8 @@ mod gui {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     // `bastion_combo_ui` is an associated function (no
                     // `self`), unlike the module-level helpers below it.
@@ -15658,7 +15661,8 @@ mod gui {
                     .collapsible(false)
                     .resizable(false)
                     .open(&mut still_open)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .pivot(egui::Align2::CENTER_CENTER)
+                    .default_pos(ctx.content_rect().center())
                     .show(ctx, |ui| {
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -15688,7 +15692,8 @@ mod gui {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     ui.label(format!("Instance: {}", dlg.instance_id));
                     ui.label(format!(
@@ -16056,7 +16061,8 @@ mod gui {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     ui.label("Account:");
                     let current_label = self
@@ -16254,7 +16260,8 @@ mod gui {
                 .resizable(true)
                 .default_width(560.0)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     ui.label("Order decides how accounts appear in the legend and every dropdown.");
                     ui.separator();
@@ -16815,7 +16822,8 @@ mod gui {
                 .resizable(true)
                 .default_width(560.0)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     // ONE scroll area around the whole body. The environments
                     // list is unbounded and this window cannot be dragged, so
@@ -17276,7 +17284,8 @@ mod gui {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     ui.label("Remote SSM browser default path:");
                     let mut remote = self
@@ -18699,7 +18708,8 @@ mod gui {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     // "unacknowledged", not "open": eligibility deliberately
                     // includes an `acked`-status row whose `acknowledged`
@@ -18755,7 +18765,8 @@ mod gui {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     ui.label("Remediate the instance this alert resolves to?");
                     ui.add_space(4.0);
@@ -21489,7 +21500,8 @@ mod gui {
                 .resizable(true)
                 .default_width(560.0)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Name:");
@@ -21650,7 +21662,8 @@ mod gui {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     ui.label(format!("Are you sure you want to delete '{name}'?"));
                     ui.add_space(4.0);
@@ -21688,7 +21701,8 @@ mod gui {
                 .resizable(false)
                 .default_width(460.0)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     if let Some(reason) = &dlg.reason {
                         ui.label(reason.clone());
@@ -21790,7 +21804,8 @@ mod gui {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     egui::Grid::new("cnu_grid")
                         .num_columns(2)
@@ -22265,7 +22280,8 @@ mod gui {
                         egui::Window::new("Checking Jira ticket")
                             .collapsible(false)
                             .resizable(false)
-                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                            .pivot(egui::Align2::CENTER_CENTER)
+                            .default_pos(ctx.content_rect().center())
                             .show(ctx, |ui| {
                                 ui.label(format!("Checking {ticket} against '{}'…", gate.username));
                                 if ui.button("Cancel").clicked() {
@@ -22314,7 +22330,8 @@ mod gui {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     for (i, line) in lines.iter().enumerate() {
                         if i == 0 {
@@ -22371,7 +22388,8 @@ mod gui {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     ui.label("The PEM file name suggests a different environment:");
                     ui.add_space(4.0);
@@ -22714,7 +22732,8 @@ mod gui {
                 .collapsible(false)
                 .resizable(true)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     egui::Grid::new("user_sync_grid")
                         .num_columns(2)
@@ -22980,7 +22999,8 @@ mod gui {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     egui::Grid::new("vault_iam_grid")
                         .num_columns(2)
@@ -24084,7 +24104,8 @@ mod gui {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     let color = if popup.success {
                         egui::Color32::from_rgb(90, 200, 90)
@@ -28226,7 +28247,8 @@ mod gui {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     ui.label(power::confirm_text(pending.action, &pending.label));
                     ui.add_space(4.0);
@@ -31506,7 +31528,8 @@ mod gui {
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     ui.label(egui::RichText::new(&pending.name).strong());
                     ui.label(format!(
@@ -37997,7 +38020,8 @@ mod gui {
                         egui::Window::new("Active Connections")
                             .collapsible(false)
                             .resizable(false)
-                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                            .pivot(egui::Align2::CENTER_CENTER)
+                            .default_pos(ctx.content_rect().center())
                             .show(ctx, |ui| {
                                 ui.label(format!(
                                     "There {} {} active connection{}. \
@@ -38104,7 +38128,8 @@ mod gui {
                         .collapsible(false)
                         .resizable(false)
                         .open(&mut open)
-                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .pivot(egui::Align2::CENTER_CENTER)
+                        .default_pos(ctx.content_rect().center())
                         .show(ctx, |ui| {
                             ui.label("The following WSL prerequisites need to be installed:");
                             ui.add_space(4.0);
