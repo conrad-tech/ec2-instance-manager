@@ -28522,7 +28522,9 @@ mod gui {
                 .collapsible(false)
                 .resizable(true)
                 .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                // Opens centred but stays draggable: `anchor` would pin it.
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
                     egui::Grid::new("cassandra_cert_grid")
                         .num_columns(2)
