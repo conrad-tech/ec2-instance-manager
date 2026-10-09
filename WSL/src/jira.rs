@@ -917,6 +917,82 @@ pub fn validate_issue_key(key: &str) -> Result<()> {
     }
 }
 
+/// How a ticket relates to the person an account is being made for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TicketMatch {
+    /// The reporter is that person -- they raised it themselves.
+    Reporter,
+    /// Someone else raised it (an admin, on the person's behalf) and the
+    /// summary names the person.
+    Summary,
+    /// Neither of the above, but the description names the person.
+    Description,
+    /// Nothing on the ticket names them.
+    NoMatch,
+}
+
+/// Lowercase alphanumeric words. Punctuation, dots, dashes and the comma in
+/// "Last, First" all just separate words.
+fn name_words(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The name an account is for, read off its username: `jane.doe` is
+/// (`jane`, `doe`). A trailing number (`jane.doe2`) is a collision suffix and
+/// is dropped; a middle part is ignored. A username with no dot is returned as
+/// a single word, which then has to appear as that word.
+fn username_name(username: &str) -> (String, Option<String>) {
+    let mut parts: Vec<String> = username
+        .trim()
+        .to_lowercase()
+        .split('.')
+        .map(|p| p.trim_end_matches(|c: char| c.is_ascii_digit()).to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let first = if parts.is_empty() { String::new() } else { parts.remove(0) };
+    (first, parts.pop())
+}
+
+/// Whether `text` names the person: both their first and last name as whole
+/// words (in either order, so "Doe, Jane" works), or -- for a username with no
+/// dot -- that one word, or the username itself written out.
+fn text_names(text: &str, username: &str) -> bool {
+    let (first, last) = username_name(username);
+    if first.is_empty() {
+        return false;
+    }
+    let words = name_words(text);
+    let has = |w: &str| words.iter().any(|x| x == w);
+    if text.to_lowercase().contains(&username.trim().to_lowercase()) && username.contains('.') {
+        return true;
+    }
+    match last {
+        Some(last) => has(&first) && has(&last),
+        None => has(&first),
+    }
+}
+
+/// Decide how well a ticket matches the person an account is being made for.
+///
+/// The reporter is the strongest signal -- a full first and last name. When
+/// someone else is the reporter (an admin raising it for the user) the answer
+/// comes from the summary, then the description.
+pub fn ticket_match(issue: &Issue, username: &str) -> TicketMatch {
+    if text_names(&issue.reporter, username) {
+        TicketMatch::Reporter
+    } else if text_names(&issue.summary, username) {
+        TicketMatch::Summary
+    } else if text_names(&issue.description, username) {
+        TicketMatch::Description
+    } else {
+        TicketMatch::NoMatch
+    }
+}
+
 /// The transition id goes into a JSON request body, so it is whitelisted for
 /// the same reason the key is. Jira's transition ids are numeric strings.
 fn validate_transition_id(id: &str) -> Result<()> {
@@ -2873,5 +2949,67 @@ mod tests {
         // An open ticket has neither.
         let open = r#"{"key":"OPS-3","fields":{"summary":"s"}}"#;
         assert_eq!(parse_issue(open).expect("parses").closed, "");
+    }
+}
+
+#[cfg(test)]
+mod ticket_match_tests {
+    use super::*;
+
+    fn issue(reporter: &str, summary: &str, description: &str) -> Issue {
+        Issue {
+            key: "CATDO-1".into(),
+            reporter: reporter.into(),
+            summary: summary.into(),
+            description: description.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_reporter_is_the_strongest_match() {
+        let i = issue("Jane Doe", "Bastion access", "");
+        assert_eq!(ticket_match(&i, "jane.doe"), TicketMatch::Reporter);
+        // "Last, First" ordering.
+        let i = issue("Doe, Jane", "Bastion access", "");
+        assert_eq!(ticket_match(&i, "jane.doe"), TicketMatch::Reporter);
+    }
+
+    #[test]
+    fn a_different_reporter_falls_back_to_the_summary_then_the_description() {
+        let i = issue("Admin Person", "Bastion access for Jane Doe", "");
+        assert_eq!(ticket_match(&i, "jane.doe"), TicketMatch::Summary);
+        let i = issue("Admin Person", "Bastion access", "Please create an account for Jane Doe in DEV1.");
+        assert_eq!(ticket_match(&i, "jane.doe"), TicketMatch::Description);
+        let i = issue("Admin Person", "Bastion access", "for jane.doe");
+        assert_eq!(ticket_match(&i, "jane.doe"), TicketMatch::Description);
+    }
+
+    #[test]
+    fn a_first_name_alone_is_not_a_match() {
+        // Two Janes: the first name is not enough, the last has to be there too.
+        let i = issue("Jane Smith", "Access for Jane Smith", "");
+        assert_eq!(ticket_match(&i, "jane.doe"), TicketMatch::NoMatch);
+        let i = issue("Admin", "Access", "Jane from finance");
+        assert_eq!(ticket_match(&i, "jane.doe"), TicketMatch::NoMatch);
+    }
+
+    #[test]
+    fn words_are_whole_words() {
+        // "doe" inside "doerr" is somebody else.
+        let i = issue("Jane Doerr", "x", "");
+        assert_eq!(ticket_match(&i, "jane.doe"), TicketMatch::NoMatch);
+    }
+
+    #[test]
+    fn a_collision_suffix_on_the_username_is_ignored() {
+        let i = issue("Jane Doe", "x", "");
+        assert_eq!(ticket_match(&i, "jane.doe2"), TicketMatch::Reporter);
+    }
+
+    #[test]
+    fn a_username_with_no_name_to_read_matches_nothing() {
+        let i = issue("Jane Doe", "x", "y");
+        assert_eq!(ticket_match(&i, ""), TicketMatch::NoMatch);
     }
 }

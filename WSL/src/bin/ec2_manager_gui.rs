@@ -1651,8 +1651,21 @@ mod gui {
         /// Create and Restore (with a key reset): build the account around a
         /// PEM the operator supplies instead of generating a new one.
         use_own_pem: bool,
+        /// The Jira ticket the access was requested in. Required to create,
+        /// optional to restore; goes in the email subject.
+        ticket: String,
+        /// (ticket, username) already checked against Jira, or accepted
+        /// despite the check, so Run does not ask twice.
+        ticket_ack: Option<(String, String)>,
         /// The PEM chosen with the file picker.
         own_pem_path: String,
+        /// (PEM path, account, environment) the operator has already said is
+        /// fine despite the file name naming a different environment. Keyed on
+        /// all three so changing the file or the environment asks again.
+        pem_env_ack: Option<(String, String, String)>,
+        /// Run as soon as the dialog is next drawn -- set when the operator
+        /// answers the PEM-environment prompt.
+        run_now: bool,
         /// Delete mode: confirmation checkbox — Delete is disabled until set.
         confirm_delete: bool,
         /// Delete mode: a *second* confirmation, shown only when the typed
@@ -2178,6 +2191,95 @@ mod gui {
         verify_started: bool,
         /// Run the access-email script automatically when this finishes.
         send_email: bool,
+        /// Jira ticket for the email subject; empty when none was given.
+        ticket: String,
+    }
+
+    /// What Jira said about the ticket typed into the dialog.
+    enum TicketLookup {
+        Found(Box<ec2_manager::jira::Issue>),
+        /// Jira has no such ticket -- almost certainly a typo.
+        NotFound,
+        /// The check itself did not work (network, permissions).
+        Failed(String),
+    }
+
+    enum TicketCheckState {
+        /// Waiting on the lookup thread.
+        Checking(Receiver<TicketLookup>),
+        /// The ticket does not look right; these lines say why, and the
+        /// operator decides.
+        Ask(Vec<String>),
+    }
+
+    /// The create/restore dialog, parked while its ticket is checked against
+    /// Jira or while the operator decides about a ticket that does not look
+    /// like it is for this person.
+    struct TicketCheck {
+        dlg: CreateUserDialog,
+        username: String,
+        state: TicketCheckState,
+    }
+
+    /// What to do with a ticket once Jira has answered.
+    #[derive(Debug, PartialEq, Eq)]
+    enum TicketVerdict {
+        /// Open, and it names this person. Carry on.
+        Verified(String),
+        /// No such ticket. Back to the dialog with an error.
+        NotFound,
+        /// Ask first, with these lines.
+        Ask(Vec<String>),
+    }
+
+    /// Pure, so every outcome is pinned by a test rather than by the window.
+    fn ticket_verdict(found: &TicketLookup, ticket: &str, username: &str) -> TicketVerdict {
+        use ec2_manager::jira::{ticket_match, TicketMatch};
+        match found {
+            TicketLookup::NotFound => TicketVerdict::NotFound,
+            TicketLookup::Failed(why) => TicketVerdict::Ask(vec![
+                format!("Jira could not be asked about {ticket}: {why}"),
+                "The ticket has not been checked.".to_string(),
+            ]),
+            TicketLookup::Found(issue) => {
+                let how = ticket_match(issue, username);
+                let closed = issue.status_category == "done";
+                let mut lines = vec![
+                    format!("{}: {}", issue.key, issue.summary),
+                    format!("Reporter: {}", if issue.reporter.is_empty() { "unknown" } else { &issue.reporter }),
+                    format!("Status: {}", issue.status),
+                ];
+                if how == TicketMatch::NoMatch {
+                    lines.insert(
+                        0,
+                        format!(
+                            "{ticket} does not appear to be for '{username}' -- neither its reporter, \
+                             summary nor description names them."
+                        ),
+                    );
+                    return TicketVerdict::Ask(lines);
+                }
+                if closed {
+                    lines.insert(0, format!("{ticket} is closed ({}).", issue.status));
+                    return TicketVerdict::Ask(lines);
+                }
+                TicketVerdict::Verified(match how {
+                    TicketMatch::Reporter => "its reporter is this person".to_string(),
+                    TicketMatch::Summary => "its summary names this person".to_string(),
+                    _ => "its description names this person".to_string(),
+                })
+            }
+        }
+    }
+
+    /// A Run that was held back because the chosen PEM's file name names a
+    /// different environment from the one selected.
+    struct PemEnvPrompt {
+        dlg: CreateUserDialog,
+        /// The PEM's file name, for the message.
+        file_name: String,
+        /// The environment the name points at, as `accounts.json`/the tags spell it.
+        hinted_env: String,
     }
 
     /// Per-run options that ride along from the dialog to `enqueue_user_script`
@@ -2186,6 +2288,8 @@ mod gui {
     struct CreateExtras {
         /// Email the login details automatically at the end.
         send_email: bool,
+        /// Jira ticket for the email subject; empty when none was given.
+        ticket: String,
         /// Base64 of the operator's own private key, already validated and
         /// normalised by `validate_own_pem`. `Some` means "install this key
         /// instead of generating one".
@@ -2200,6 +2304,7 @@ mod gui {
         primary_id: String,
         secondary_id: String,
         pem: String,
+        ticket: String,
     }
 
     /// A delete request awaiting its pre-flight active-session check. Once
@@ -3022,6 +3127,11 @@ mod gui {
         clear: bool,
         /// Human-readable summary shown when not clear (or on check error).
         report: String,
+        /// Where the user's PEM was saved before the delete, so it can be
+        /// restored later. `None` when the user had no PEM to save.
+        saved_pem: Option<String>,
+        /// What happened to the PEM, for the log: saved, or why not.
+        pem_note: String,
     }
 
     /// A create waiting on its pre-flight, held while the two bastions are
@@ -5993,6 +6103,7 @@ mod gui {
     /// probed concurrently.
     fn run_delete_preflight_worker(
         username: String,
+        mmodal_env: String,
         primary_id: String,
         secondary_id: String,
         primary_ctx: AwsContext,
@@ -6039,7 +6150,76 @@ mod gui {
             }
             r
         };
-        let _ = tx.send(PreflightOutcome { clear, report });
+        if !clear {
+            let _ = tx.send(PreflightOutcome {
+                clear,
+                report,
+                saved_pem: None,
+                pem_note: String::new(),
+            });
+            return;
+        }
+        // Keep the user's key before the account and its home go. Saved as
+        // `<user>-<ENV>.pem`, the name Create uses, so Restore with "my own
+        // PEM" picks the environment up from the file name.
+        //
+        // A key that exists and cannot be saved stops the delete: the home is
+        // removed with it and there is no getting the key back. A user with no
+        // key at all is not a reason to refuse, so that is a note, not a stop.
+        let present = exec_remote_command(
+            &None,
+            &primary_ctx,
+            &primary_id,
+            &user_pem_present_command(&username),
+            Duration::from_secs(30),
+        );
+        let outcome = match present {
+            Err(e) => Err(format!(
+                "could not check for {username}'s PEM on {primary_id}: {e}"
+            )),
+            Ok(out) if out.contains("PEM_ABSENT") => Ok(None),
+            Ok(out) if out.contains("PEM_PRESENT") => {
+                pull_pem_to_downloads(&primary_ctx, &primary_id, &username, &mmodal_env)
+                    .map(Some)
+            }
+            Ok(out) => Err(format!(
+                "could not tell whether {username} has a PEM: {}",
+                out.lines().next().unwrap_or("").trim()
+            )),
+        };
+        let _ = tx.send(match outcome {
+            Ok(Some(path)) => PreflightOutcome {
+                clear: true,
+                report: String::new(),
+                pem_note: format!("saved {username}'s PEM to {path} before deleting"),
+                saved_pem: Some(path),
+            },
+            Ok(None) => PreflightOutcome {
+                clear: true,
+                report: String::new(),
+                saved_pem: None,
+                pem_note: format!("{username} has no PEM on {primary_id}; nothing to save"),
+            },
+            Err(why) => PreflightOutcome {
+                clear: false,
+                report: format!(
+                    "Delete aborted for '{username}': their PEM could not be saved first, \
+                     so nothing was deleted. {why}"
+                ),
+                saved_pem: None,
+                pem_note: String::new(),
+            },
+        });
+    }
+
+    /// Whether the user's own copy of their key exists, read as the user: the
+    /// home is on EFS at 0700 and root is squashed there. Prints one of two
+    /// markers so an unreadable answer is neither.
+    fn user_pem_present_command(username: &str) -> String {
+        format!(
+            "if sudo -n -u {username} test -f /efs/home/{username}/.ssh/{username}.pem; \
+             then echo PEM_PRESENT; else echo PEM_ABSENT; fi"
+        )
     }
 
     /// Post-delete verification: confirm the account is gone on both
@@ -7727,8 +7907,9 @@ mod gui {
         primary_id: &str,
         secondary_id: &str,
         pem_path: &str,
+        ticket: &str,
     ) -> Vec<(&'static str, String)> {
-        vec![
+        let mut args = vec![
             ("-Username", username.to_string()),
             ("-EnvTag", env.to_string()),
             ("-Primary", primary_id.to_string()),
@@ -7770,7 +7951,13 @@ mod gui {
             ("-PermissionService", cfg.encrypt_permission_service.to_string()),
             ("-SmimeFlag", cfg.encrypt_smime_flag.to_string()),
             ("-EncryptSendKeys", cfg.encrypt_sendkeys.clone()),
-        ]
+        ];
+        // Only when there is one: a restore may have none, and the script's
+        // own default (empty) then leaves the subject as it always was.
+        if !ticket.trim().is_empty() {
+            args.push(("-Ticket", ticket.trim().to_string()));
+        }
+        args
     }
 
     /// Spawn `send_access_email.ps1` for the automatic path (Windows only).
@@ -7797,6 +7984,7 @@ mod gui {
         primary_id: &str,
         secondary_id: &str,
         pem_path: &str,
+        ticket: &str,
     ) -> std::result::Result<std::process::Child, String> {
         // `std::result::Result` is spelled out because the crate's own
         // `Result<T>` alias (src/error.rs) is in scope and takes one parameter.
@@ -7813,7 +8001,7 @@ mod gui {
         cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(&path);
         for (flag, value) in
-            access_email_args(cfg, username, env, primary_id, secondary_id, pem_path)
+            access_email_args(cfg, username, env, primary_id, secondary_id, pem_path, ticket)
         {
             cmd.arg(flag).arg(value);
         }
@@ -7852,6 +8040,7 @@ mod gui {
         primary_id: &str,
         secondary_id: &str,
         pem_path: &str,
+        ticket: &str,
         channels: EmailRunChannels,
     ) -> bool {
         let EmailRunChannels { status: tx, log: log_tx } = channels;
@@ -7862,7 +8051,7 @@ mod gui {
         let _ = log_tx.send(access_email_config_summary(cfg));
         #[cfg(target_os = "windows")]
         {
-            match launch_access_email(cfg, username, env, primary_id, secondary_id, pem_path) {
+            match launch_access_email(cfg, username, env, primary_id, secondary_id, pem_path, ticket) {
                 Ok(mut child) => {
                     std::thread::spawn(move || {
                         use std::io::BufRead;
@@ -7913,7 +8102,7 @@ mod gui {
         // leave the popup without a status line rather than showing a failure.
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (cfg, env, primary_id, secondary_id, pem_path, tx, log_tx);
+            let _ = (cfg, env, primary_id, secondary_id, pem_path, ticket, tx, log_tx);
             eprintln!(
                 "start_access_email: skipped for {username} (the Outlook automation is Windows only)"
             );
@@ -7937,12 +8126,13 @@ mod gui {
         primary_id: &str,
         secondary_id: &str,
         pem_path: &str,
+        ticket: &str,
     ) -> Option<EmailCommand> {
         if !cfg.enabled {
             return None;
         }
         let script = access_email_script_path().to_string_lossy().into_owned();
-        let args = access_email_args(cfg, username, env, primary_id, secondary_id, pem_path);
+        let args = access_email_args(cfg, username, env, primary_id, secondary_id, pem_path, ticket);
 
         // bash single-quote (escape embedded single quotes): 'a'\''b'.
         let bash_q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
@@ -9821,6 +10011,14 @@ mod gui {
         edit_menu_flash_start: Option<Instant>,
         /// Active "Scripts → create_new_user.sh" dialog, if any.
         create_user_dialog: Option<CreateUserDialog>,
+        /// The create/restore dialog, parked while the operator decides what
+        /// to do about a PEM whose name points at another environment.
+        pem_env_prompt: Option<PemEnvPrompt>,
+        /// See [`TicketCheck`].
+        ticket_check: Option<TicketCheck>,
+        /// Where the PEM of the user being deleted was saved, for the result
+        /// popup. Set when the pre-flight clears, taken when the delete reports.
+        delete_saved_pem: Option<String>,
         /// Active "Scripts → Vault IAM Access" dialog, if any.
         vault_iam_dialog: Option<VaultIamDialog>,
         /// In-flight Vault IAM Access run, awaiting its verdict marker.
@@ -10788,6 +10986,9 @@ mod gui {
                 show_file_browser_defaults: false,
                 edit_menu_flash_start: None,
                 create_user_dialog: None,
+                pem_env_prompt: None,
+                ticket_check: None,
+                delete_saved_pem: None,
                 vault_iam_dialog: None,
                 vault_iam_run: None,
                 vault_iam_enabled: features
@@ -21576,7 +21777,9 @@ mod gui {
             };
 
             let mut window_open = true;
-            let mut do_run = false;
+            // Set when the operator answered the PEM-environment prompt: the
+            // Run they already pressed carries on rather than asking twice.
+            let mut do_run = std::mem::take(&mut dlg.run_now);
             let mut do_cancel = false;
             let mut env_changed = false;
 
@@ -21605,6 +21808,23 @@ mod gui {
                                 user_box.request_focus();
                             }
                             ui.end_row();
+
+                            // Where the access was asked for. Required to
+                            // create, optional to restore, and it ends up in
+                            // the email subject. Not shown for a delete.
+                            if !dlg.mode.is_delete() {
+                                ui.label(if dlg.mode.is_restore() {
+                                    "Jira ticket (optional):"
+                                } else {
+                                    "Jira ticket:"
+                                });
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut dlg.ticket)
+                                        .hint_text("CATDO-123")
+                                        .desired_width(320.0),
+                                );
+                                ui.end_row();
+                            }
 
                             ui.label("Environment:");
                             let env_label = environments
@@ -21865,6 +22085,28 @@ mod gui {
                     self.create_user_dialog = Some(dlg);
                     return;
                 }
+                // The ticket's shape is settled here, before any waiting; whether
+                // it is the right ticket is asked of Jira further down.
+                if !dlg.mode.is_delete() {
+                    let ticket = dlg.ticket.trim().to_ascii_uppercase();
+                    if ticket.is_empty() {
+                        if !dlg.mode.is_restore() {
+                            dlg.error = Some(
+                                "Enter the Jira ticket number this access was requested in (e.g. CATDO-123)."
+                                    .to_string(),
+                            );
+                            self.create_user_dialog = Some(dlg);
+                            return;
+                        }
+                    } else if ec2_manager::jira::validate_issue_key(&ticket).is_err() {
+                        dlg.error = Some(format!(
+                            "'{ticket}' is not a Jira ticket number (expected something like CATDO-123)."
+                        ));
+                        self.create_user_dialog = Some(dlg);
+                        return;
+                    }
+                    dlg.ticket = ticket;
+                }
                 if dlg.env_profile_id.is_empty() {
                     dlg.error = Some("Choose an environment.".to_string());
                     self.create_user_dialog = Some(dlg);
@@ -21880,6 +22122,41 @@ mod gui {
                     self.create_user_dialog = Some(dlg);
                     return;
                 }
+                // With a Jira login, ask Jira whether this ticket is about this
+                // person. Done on a thread (the dialog is parked, not frozen);
+                // the answer either carries on with this Run or asks first.
+                if !dlg.mode.is_delete()
+                    && !dlg.ticket.is_empty()
+                    && self.jira_enabled
+                    && dlg.ticket_ack.as_ref() != Some(&(dlg.ticket.clone(), username.clone()))
+                {
+                    let (site, key) = (self.jira_site.clone(), dlg.ticket.clone());
+                    let (tx, rx) = mpsc::channel();
+                    std::thread::spawn(move || {
+                        let found = match ec2_manager::jira::fetch_issue(&site, &key) {
+                            Ok(issue) => TicketLookup::Found(Box::new(issue)),
+                            Err(e) => {
+                                let why = e.to_string();
+                                if why.contains("404") {
+                                    TicketLookup::NotFound
+                                } else {
+                                    TicketLookup::Failed(why)
+                                }
+                            }
+                        };
+                        let _ = tx.send(found);
+                    });
+                    self.log_info(format!(
+                        "jira: checking {} against '{username}' before running",
+                        dlg.ticket
+                    ));
+                    self.ticket_check = Some(TicketCheck {
+                        username: username.clone(),
+                        dlg,
+                        state: TicketCheckState::Checking(rx),
+                    });
+                    return;
+                }
                 // The operator's own key, when asked for: read and checked here,
                 // before anything is created, so a bad file is a message in this
                 // dialog rather than a half-made account.
@@ -21892,6 +22169,37 @@ mod gui {
                         dlg.error = Some("Choose the PEM file to use, or untick Use my own PEM.".to_string());
                         self.create_user_dialog = Some(dlg);
                         return;
+                    }
+                    // A key saved as `<user>-<ENV>.pem` says where it belongs.
+                    // Running it somewhere else is possible and sometimes right,
+                    // but never by accident, so stop and ask.
+                    let ack_key = (
+                        dlg.own_pem_path.trim().to_string(),
+                        dlg.env_profile_id.clone(),
+                        dlg.env_name.clone(),
+                    );
+                    if dlg.pem_env_ack.as_ref() != Some(&ack_key) {
+                        let file_name = std::path::Path::new(dlg.own_pem_path.trim())
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let mut names: Vec<String> = self
+                            .script_environments()
+                            .into_iter()
+                            .map(|e| e.env)
+                            .filter(|e| !e.trim().is_empty())
+                            .collect();
+                        names.dedup();
+                        if let Some(hinted) = ec2_manager::script_env::env_named_in(&file_name, &names) {
+                            if !ec2_manager::script_env::env_eq(&hinted, &dlg.env_name) {
+                                self.pem_env_prompt = Some(PemEnvPrompt {
+                                    dlg,
+                                    file_name,
+                                    hinted_env: hinted,
+                                });
+                                return;
+                            }
+                        }
                     }
                     let checked = std::fs::read(dlg.own_pem_path.trim())
                         .map_err(|e| format!("could not read the PEM: {e}"))
@@ -21911,6 +22219,7 @@ mod gui {
                 }
                 let extras = CreateExtras {
                     send_email: dlg.send_email,
+                    ticket: if dlg.mode.is_delete() { String::new() } else { dlg.ticket.clone() },
                     own_pem_b64,
                 };
                 // Remember the selection for next time, per environment.
@@ -21938,6 +22247,209 @@ mod gui {
             }
 
             self.create_user_dialog = Some(dlg);
+        }
+
+        /// Drives [`TicketCheck`]: wait for Jira, then either carry on with the
+        /// Run already pressed, send the operator back with an error, or ask.
+        fn render_ticket_check(&mut self, ctx: &egui::Context) {
+            let Some(mut gate) = self.ticket_check.take() else {
+                return;
+            };
+            let ticket = gate.dlg.ticket.clone();
+            if let TicketCheckState::Checking(rx) = &gate.state {
+                match rx.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => {
+                        let mut cancel = false;
+                        egui::Window::new("Checking Jira ticket")
+                            .collapsible(false)
+                            .resizable(false)
+                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                            .show(ctx, |ui| {
+                                ui.label(format!("Checking {ticket} against '{}'…", gate.username));
+                                if ui.button("Cancel").clicked() {
+                                    cancel = true;
+                                }
+                            });
+                        ctx.request_repaint_after(Duration::from_millis(150));
+                        if cancel {
+                            self.create_user_dialog = Some(gate.dlg);
+                        } else {
+                            self.ticket_check = Some(gate);
+                        }
+                        return;
+                    }
+                    Ok(found) => match ticket_verdict(&found, &ticket, &gate.username) {
+                        TicketVerdict::Verified(how) => {
+                            self.log_info(format!("jira: {ticket} accepted for '{}' -- {how}", gate.username));
+                            gate.dlg.ticket_ack = Some((ticket, gate.username.clone()));
+                            gate.dlg.error = None;
+                            gate.dlg.run_now = true;
+                            self.create_user_dialog = Some(gate.dlg);
+                            return;
+                        }
+                        TicketVerdict::NotFound => {
+                            gate.dlg.error = Some(format!("Jira has no ticket {ticket}. Check the number."));
+                            self.create_user_dialog = Some(gate.dlg);
+                            return;
+                        }
+                        TicketVerdict::Ask(lines) => gate.state = TicketCheckState::Ask(lines),
+                    },
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        gate.state = TicketCheckState::Ask(vec![
+                            format!("The check of {ticket} stopped unexpectedly."),
+                            "The ticket has not been checked.".to_string(),
+                        ]);
+                    }
+                }
+            }
+            let TicketCheckState::Ask(lines) = &gate.state else {
+                self.create_user_dialog = Some(gate.dlg);
+                return;
+            };
+            let (mut go, mut back) = (false, false);
+            let mut open = true;
+            egui::Window::new("Check the Jira ticket")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    for (i, line) in lines.iter().enumerate() {
+                        if i == 0 {
+                            note_label(ui, egui::Color32::from_rgb(220, 150, 60), line);
+                        } else {
+                            ui.label(line);
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(format!("Continue with {ticket}")).clicked() {
+                            go = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            back = true;
+                        }
+                    });
+                });
+            if go {
+                self.log_warn(format!(
+                    "jira: continuing with {ticket} for '{}' although it was not confirmed",
+                    gate.username
+                ));
+                gate.dlg.ticket_ack = Some((ticket, gate.username.clone()));
+                gate.dlg.error = None;
+                gate.dlg.run_now = true;
+                self.create_user_dialog = Some(gate.dlg);
+            } else if back || !open {
+                self.create_user_dialog = Some(gate.dlg);
+            } else {
+                self.ticket_check = Some(gate);
+            }
+        }
+
+        /// The prompt shown when the chosen PEM's file name points at a
+        /// different environment from the selected one.
+        ///
+        /// Three answers, none of them the default: run on the environment the
+        /// name points at, run on the selected one anyway, or back out. Either
+        /// "run" answer carries on with the Run already pressed.
+        fn render_pem_env_prompt(&mut self, ctx: &egui::Context) {
+            let Some(prompt) = self.pem_env_prompt.take() else {
+                return;
+            };
+            let PemEnvPrompt { mut dlg, file_name, hinted_env } = prompt;
+            let current = if dlg.env_name.trim().is_empty() {
+                "no environment".to_string()
+            } else {
+                dlg.env_name.trim().to_string()
+            };
+            let mut answer: Option<u8> = None; // 1 = hinted env, 2 = current, 3 = cancel
+            let mut window_open = true;
+            egui::Window::new("PEM may belong to another environment")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("The PEM file name suggests a different environment:");
+                    ui.add_space(4.0);
+                    ui.monospace(&file_name);
+                    ui.add_space(6.0);
+                    note_label(
+                        ui,
+                        egui::Color32::from_rgb(220, 150, 60),
+                        format!(
+                            "It appears to be for {}, but {} is selected for user '{}'.",
+                            script_env_label_text(&hinted_env),
+                            script_env_label_text(&current),
+                            dlg.username.trim()
+                        ),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(format!("Run on {}", script_env_label_text(&hinted_env)))
+                            .clicked()
+                        {
+                            answer = Some(1);
+                        }
+                        if ui
+                            .button(format!("Use {} anyway", script_env_label_text(&current)))
+                            .clicked()
+                        {
+                            answer = Some(2);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            answer = Some(3);
+                        }
+                    });
+                });
+            if !window_open {
+                answer = Some(3);
+            }
+            match answer {
+                None => self.pem_env_prompt = Some(PemEnvPrompt { dlg, file_name, hinted_env }),
+                // Back to the dialog, nothing run, nothing changed.
+                Some(3) => self.create_user_dialog = Some(dlg),
+                Some(choice) => {
+                    if choice == 1 {
+                        // Prefer the same account, then any account that has it.
+                        let rows = self.script_environments();
+                        let target = rows
+                            .iter()
+                            .find(|r| {
+                                r.account_id == dlg.env_profile_id
+                                    && ec2_manager::script_env::env_eq(&r.env, &hinted_env)
+                            })
+                            .or_else(|| {
+                                rows.iter()
+                                    .find(|r| ec2_manager::script_env::env_eq(&r.env, &hinted_env))
+                            });
+                        if let Some(row) = target {
+                            dlg.env_profile_id = row.account_id.clone();
+                            dlg.env_name = row.env.clone();
+                            // The old environment's bastions do not apply.
+                            let (account, env) = (dlg.env_profile_id.clone(), dlg.env_name.clone());
+                            self.load_bastion_pair(
+                                &account,
+                                &env,
+                                &mut dlg.primary_id,
+                                &mut dlg.primary_query,
+                                &mut dlg.secondary_id,
+                                &mut dlg.secondary_query,
+                            );
+                        }
+                    }
+                    dlg.pem_env_ack = Some((
+                        dlg.own_pem_path.trim().to_string(),
+                        dlg.env_profile_id.clone(),
+                        dlg.env_name.clone(),
+                    ));
+                    dlg.error = None;
+                    dlg.run_now = true;
+                    self.create_user_dialog = Some(dlg);
+                }
+            }
         }
 
         /// "Use my own PEM": build the account around a key the operator
@@ -23178,6 +23690,20 @@ mod gui {
                 primary_id: primary_id.to_string(),
                 secondary_id: secondary_id.to_string(),
             });
+            // The tag the saved PEM is named with. The dialog's environment is
+            // authoritative; an account with none falls back to the primary
+            // bastion's own tag, as Create does.
+            let mmodal_env = if env_name.trim().is_empty() {
+                self.profile_inventory_cache
+                    .get(env)
+                    .and_then(|(inv, _)| {
+                        inv.instances.iter().find(|i| i.instance_id == primary_id)
+                    })
+                    .and_then(instance_env)
+                    .unwrap_or_default()
+            } else {
+                env_name.trim().to_string()
+            };
             let tx = self.preflight_tx.clone();
             let username_owned = username.to_string();
             let primary = primary_id.to_string();
@@ -23185,7 +23711,8 @@ mod gui {
             let primary_ctx = ctx.clone();
             let secondary_ctx = ctx;
             self.log_info(format!(
-                "delete_user: pre-flight active-session check for '{username}'"
+                "delete_user: pre-flight active-session check for '{username}', then \
+                 saving their PEM to Downloads"
             ));
             // New run: forget the previous run's tabs.
             self.script_status_tabs.clear();
@@ -23196,6 +23723,7 @@ mod gui {
             std::thread::spawn(move || {
                 run_delete_preflight_worker(
                     username_owned,
+                    mmodal_env,
                     primary,
                     secondary,
                     primary_ctx,
@@ -23437,6 +23965,7 @@ mod gui {
                         secondary_output: None,
                         verify_started: false,
                         send_email: extras.send_email,
+                        ticket: extras.ticket.clone(),
                     });
                 } else {
                     self.create_user_run = None;
@@ -23678,6 +24207,7 @@ mod gui {
                         &job.primary_id,
                         &job.secondary_id,
                         &job.pem,
+                        &job.ticket,
                         EmailRunChannels {
                             status: self.email_tx.clone(),
                             log: self.script_log_tx.clone(),
@@ -23760,6 +24290,11 @@ mod gui {
                             "delete_user: no active sessions; deleting '{}'",
                             pd.username
                         ));
+                        if !outcome.pem_note.is_empty() {
+                            self.log_info(format!("delete_user: {}", outcome.pem_note));
+                        }
+                        // Shown on the result popup once the delete is confirmed.
+                        self.delete_saved_pem = outcome.saved_pem.clone();
                         self.enqueue_user_script(
                             UserScriptMode::Delete,
                             &pd.username,
@@ -24033,6 +24568,7 @@ mod gui {
                                     &run.primary_id,
                                     &run.secondary_id,
                                     pem,
+                                    &run.ticket,
                                 ),
                                 _ => None,
                             };
@@ -24043,6 +24579,7 @@ mod gui {
                                     primary_id: run.primary_id.clone(),
                                     secondary_id: run.secondary_id.clone(),
                                     pem: pem.clone(),
+                                    ticket: run.ticket.clone(),
                                 }),
                                 _ => None,
                             };
@@ -24057,6 +24594,7 @@ mod gui {
                                         &run.primary_id,
                                         &run.secondary_id,
                                         pem,
+                                        &run.ticket,
                                         EmailRunChannels {
                                             status: self.email_tx.clone(),
                                             log: self.script_log_tx.clone(),
@@ -24159,15 +24697,19 @@ mod gui {
                         diagnostics,
                     } => {
                         if primary_absent && secondary_absent {
-                            let msg = format!(
+                            let saved = self.delete_saved_pem.take();
+                            let mut msg = format!(
                                 "User '{username}' deleted (confirmed removed from both bastions)."
                             );
+                            if saved.is_some() {
+                                msg.push_str(" Their PEM was saved first, so they can be restored.");
+                            }
                             self.log_info(msg.clone());
                             self.show_script_result(
                                 "User Deleted",
                                 msg,
                                 true,
-                                None,
+                                saved,
                                 None,
                             );
                         } else {
@@ -24188,11 +24730,12 @@ mod gui {
                             }
                             let details =
                                 if details.trim().is_empty() { None } else { Some(details) };
+                            let saved = self.delete_saved_pem.take();
                             self.show_script_result(
                                 "Delete Incomplete",
                                 msg,
                                 false,
-                                None,
+                                saved,
                                 details,
                             );
                         }
@@ -27852,13 +28395,26 @@ mod gui {
                 .unwrap_or_default()
         }
 
+        /// The environments the Cassandra Cert dialog offers: only those
+        /// `accounts.json` declares a domain for. An update needs that domain,
+        /// and the other rows (discovered from inventory tags, or added by
+        /// hand) can never run one -- they only showed up as lookalike
+        /// duplicates of the declared ones.
+        fn cassandra_environments(&mut self) -> Vec<ScriptEnv> {
+            let mut envs = self.script_environments();
+            envs.retain(|e| {
+                ec2_manager::accounts::declared_domain_for(&e.account_id, &e.env).is_some()
+            });
+            envs
+        }
+
         /// Open "Scripts -> Cassandra Cert" on the default environment (the
         /// selected account's first), like every other Scripts dialog.
         fn open_cassandra_dialog(&mut self) {
             if !self.cassandra_cert_enabled {
                 return;
             }
-            let envs = self.script_environments();
+            let envs = self.cassandra_environments();
             // A job in flight pins the dialog to its environment, so reopening
             // mid-run shows that run's progress and result.
             let (profile_id, env_name) = match &self.cassandra_inflight {
@@ -27869,6 +28425,12 @@ mod gui {
                 .iter()
                 .find(|e| e.account_id == profile_id && e.env == env_name)
                 .cloned()
+                // The default may be an environment with no declared domain,
+                // which the dropdown no longer offers: start on the first
+                // one it does (never when a job pins the dialog).
+                .or_else(|| {
+                    envs.first().filter(|_| self.cassandra_inflight.is_none()).cloned()
+                })
                 .unwrap_or(ScriptEnv {
                     account_id: profile_id,
                     account_label: String::new(),
@@ -27929,7 +28491,7 @@ mod gui {
             };
             // Every account is offered (no Vault-style filter); the Exclude
             // Env filter is applied inside `script_environments`.
-            dlg.envs = self.script_environments();
+            dlg.envs = self.cassandra_environments();
             if !dlg.running {
                 dlg.confirm_close = false;
                 dlg.confirm_forget = false;
@@ -37484,6 +38046,8 @@ mod gui {
                 self.render_discovery_wizard(ctx);
                 self.render_file_browser_defaults_dialog(ctx);
                 self.render_create_user_dialog(ctx);
+                self.render_pem_env_prompt(ctx);
+                self.render_ticket_check(ctx);
                 self.render_vault_iam_dialog(ctx);
                 self.poll_cassandra_events();
                 self.render_cassandra_dialog(ctx);
@@ -38028,7 +38592,7 @@ mod gui {
                             .selected_text(format!("Scripts ({script_count})"))
                             .show_ui(ui, |ui| {
                                 if ui
-                                    .selectable_label(false, "Bastion New User…")
+                                    .selectable_label(false, "Bastion New User")
                                     .on_hover_text(
                                         "Create a user on both bastions: makes the \
                                          account and its /efs/home directory, \
@@ -38041,7 +38605,7 @@ mod gui {
                                     ui.close();
                                 }
                                 if ui
-                                    .selectable_label(false, "Bastion User Restore…")
+                                    .selectable_label(false, "Bastion User Restore")
                                     .on_hover_text(
                                         "Issue a new key to a user who already \
                                          exists — for someone who lost their PEM. \
@@ -38057,7 +38621,7 @@ mod gui {
                                 }
                                 if self.allow_delete_user
                                     && ui
-                                        .selectable_label(false, "Bastion User Delete…")
+                                        .selectable_label(false, "Bastion User Delete")
                                         .on_hover_text(
                                             "Permanently remove a user from both \
                                              bastions — the account, its keys and \
@@ -38072,7 +38636,7 @@ mod gui {
                                 }
                                 if self.user_sync_enabled
                                     && ui
-                                        .selectable_label(false, "Bastion User Sync…")
+                                        .selectable_label(false, "Bastion User Sync")
                                         .on_hover_text(
                                             "Compare the accounts on both bastions and \
                                              create the ones missing from either, using \
@@ -38089,7 +38653,7 @@ mod gui {
                                 }
                                 if self.vault_iam_enabled
                                     && ui
-                                        .selectable_label(false, "Vault IAM Access…")
+                                        .selectable_label(false, "Vault IAM Access")
                                         .on_hover_text(
                                             "Create a Vault policy and an AWS auth \
                                              role bound to an IAM role, then read \
@@ -38104,7 +38668,7 @@ mod gui {
                                 }
                                 if self.vault_iam_delete_enabled
                                     && ui
-                                        .selectable_label(false, "Vault IAM Delete…")
+                                        .selectable_label(false, "Vault IAM Delete")
                                         .on_hover_text(
                                             "Remove a Vault auth role and its \
                                              policy, then confirm neither reads \
@@ -38122,7 +38686,7 @@ mod gui {
                                 // instance power entries.
                                 if self.cassandra_cert_enabled
                                     && ui
-                                        .selectable_label(false, "Cassandra Cert...")
+                                        .selectable_label(false, "Cassandra Cert Update")
                                         .on_hover_text(
                                             "Renew the keystore cert on selected \
                                              Cassandra nodes (dry run first), or \
@@ -38192,7 +38756,7 @@ mod gui {
                                 // Add Script is available to everyone.
                                 ui.separator();
                                 if ui
-                                    .selectable_label(false, "Add Script…")
+                                    .selectable_label(false, "Add Custom Script")
                                     .on_hover_text(
                                         "Save your own shell snippet with an \
                                          optional hotkey. It pastes into the \
@@ -38281,7 +38845,11 @@ mod gui {
                                     reset_key: true,
                                     send_email: true,
                                     use_own_pem: false,
+                                    ticket: String::new(),
+                                    ticket_ack: None,
                                     own_pem_path: String::new(),
+                                    pem_env_ack: None,
+                                    run_now: false,
                                     confirm_delete: false,
                 confirm_protected: false,
                                     primary_query,
@@ -43748,6 +44316,17 @@ mod gui {
     ///
     /// An account with no environment dimension keeps its account label as
     /// written: that row names an account, not an environment.
+    /// An environment name as the dialogs display it (uppercase), for text that
+    /// has a bare name rather than a row. "no environment" is a phrase, not a
+    /// name, and is left alone.
+    fn script_env_label_text(name: &str) -> String {
+        if name == "no environment" {
+            name.to_string()
+        } else {
+            name.to_uppercase()
+        }
+    }
+
     fn script_env_label(row: &ScriptEnv) -> String {
         if row.env.is_empty() {
             row.label.clone()
@@ -52155,7 +52734,7 @@ mod gui {
         #[test]
         fn build_email_command_is_none_when_the_feature_is_disabled() {
             assert!(
-                build_email_command(&access_email_cfg(false), "jdoe", "DEV1", "i-1", "i-2", "/p.pem")
+                build_email_command(&access_email_cfg(false), "jdoe", "DEV1", "i-1", "i-2", "/p.pem", "")
                     .is_none()
             );
         }
@@ -52163,7 +52742,7 @@ mod gui {
         #[test]
         fn build_email_command_passes_every_arg_to_the_helper_script() {
             let cmd =
-                build_email_command(&access_email_cfg(true), "jdoe", "DEV1", "i-1", "i-2", "/p.pem")
+                build_email_command(&access_email_cfg(true), "jdoe", "DEV1", "i-1", "i-2", "/p.pem", "")
                     .expect("enabled config builds a command");
             // WSL and Git Bash both shell out to the Windows powershell.exe.
             assert_eq!(cmd.wsl, cmd.git_bash);
@@ -52197,7 +52776,7 @@ mod gui {
             // never shift and the script's default stays a plain empty string.
             let mut cfg = access_email_cfg(true);
             cfg.email_domains.clear();
-            let cmd = build_email_command(&cfg, "jdoe", "DEV1", "i-1", "i-2", "/p.pem")
+            let cmd = build_email_command(&cfg, "jdoe", "DEV1", "i-1", "i-2", "/p.pem", "")
                 .expect("enabled config builds a command");
             assert!(cmd.wsl.contains("-Domain ''"), "{}", cmd.wsl);
             assert!(cmd.powershell.contains("-Domain ''"), "{}", cmd.powershell);
@@ -52215,7 +52794,7 @@ mod gui {
             if !cfg.enabled {
                 return; // disabled builds legitimately produce no command
             }
-            let cmd = build_email_command(cfg, "john.smith", "DEV1", "i-1", "i-2", "/p.pem")
+            let cmd = build_email_command(cfg, "john.smith", "DEV1", "i-1", "i-2", "/p.pem", "")
                 .expect("an enabled config builds a command");
             let expected_domains = format!("-Domain '{}'", cfg.email_domains.join(","));
             assert!(
@@ -52243,7 +52822,7 @@ mod gui {
             // a mailbox it then rejects, or reject one it never looked for.
             let mut cfg = access_email_cfg(true);
             cfg.email_local_suffixes = vec![".cw".to_string()];
-            let cmd = build_email_command(&cfg, "test.user", "DEV1", "i-1", "i-2", "/p.pem")
+            let cmd = build_email_command(&cfg, "test.user", "DEV1", "i-1", "i-2", "/p.pem", "")
                 .expect("enabled config builds a command");
             assert!(cmd.wsl.contains("-LocalSuffixes '.cw'"), "{}", cmd.wsl);
             assert!(cmd.powershell.contains("-LocalSuffixes '.cw'"), "{}", cmd.powershell);
@@ -52254,7 +52833,7 @@ mod gui {
         fn several_suffixes_are_passed_as_one_comma_separated_argument() {
             let mut cfg = access_email_cfg(true);
             cfg.email_local_suffixes = vec![".cw".to_string(), "-ext".to_string()];
-            let cmd = build_email_command(&cfg, "test.user", "DEV1", "i-1", "i-2", "/p.pem")
+            let cmd = build_email_command(&cfg, "test.user", "DEV1", "i-1", "i-2", "/p.pem", "")
                 .expect("enabled config builds a command");
             assert!(cmd.wsl.contains("-LocalSuffixes '.cw,-ext'"), "{}", cmd.wsl);
         }
@@ -52263,7 +52842,7 @@ mod gui {
         fn no_suffixes_still_passes_the_flag_empty() {
             // The script reads it unconditionally; omitting the flag entirely
             // would leave the parameter at whatever a stale copy defaults to.
-            let cmd = build_email_command(&access_email_cfg(true), "test.user", "DEV1", "i-1", "i-2", "/p.pem")
+            let cmd = build_email_command(&access_email_cfg(true), "test.user", "DEV1", "i-1", "i-2", "/p.pem", "")
                 .expect("enabled config builds a command");
             assert!(cmd.wsl.contains("-LocalSuffixes ''"), "{}", cmd.wsl);
         }
@@ -52272,7 +52851,7 @@ mod gui {
         fn several_domains_are_passed_as_one_comma_separated_argument() {
             let mut cfg = access_email_cfg(true);
             cfg.email_domains = vec!["a.com".to_string(), "b.com".to_string()];
-            let cmd = build_email_command(&cfg, "jdoe", "DEV1", "i-1", "i-2", "/p.pem")
+            let cmd = build_email_command(&cfg, "jdoe", "DEV1", "i-1", "i-2", "/p.pem", "")
                 .expect("enabled config builds a command");
             assert!(cmd.wsl.contains("-Domain 'a.com,b.com'"), "{}", cmd.wsl);
             assert!(
@@ -52287,7 +52866,7 @@ mod gui {
             // -Quiet suppresses the script's own message boxes. That is right
             // for the auto-run path, where the GUI shows the outcome, but wrong
             // for a command the user runs by hand in a terminal.
-            let cmd = build_email_command(&access_email_cfg(true), "jdoe", "DEV1", "i-1", "i-2", "/p.pem")
+            let cmd = build_email_command(&access_email_cfg(true), "jdoe", "DEV1", "i-1", "i-2", "/p.pem", "")
                 .expect("enabled config builds a command");
             assert!(!cmd.wsl.contains("-Quiet"), "{}", cmd.wsl);
             assert!(!cmd.powershell.contains("-Quiet"), "{}", cmd.powershell);
@@ -52304,8 +52883,7 @@ mod gui {
                 "DEV1",
                 "i-1",
                 "i-2",
-                "/p.pem",
-            )
+                "/p.pem", "")
             .expect("enabled config builds a command");
             assert!(cmd.wsl.contains(r"-Username 'o'\''brien'"), "{}", cmd.wsl);
             assert!(cmd.powershell.contains("-Username 'o''brien'"), "{}", cmd.powershell);
@@ -52944,6 +53522,139 @@ mod gui {
             assert!(use_pem < derive && keygen < derive);
             // The "PEM already exists" refusal must not trip on the supplied file.
             assert!(script.contains("$USE_PEM -ne 1 && -e \"$PEM_PATH\""));
+        }
+
+        #[test]
+        fn a_pem_name_naming_an_environment_is_read_as_that_environment() {
+            use ec2_manager::script_env::env_named_in;
+            let names: Vec<String> = ["DEV1", "DEV10", "PROD", "DEV1-EAST"]
+                .iter().map(|s| s.to_string()).collect();
+            assert_eq!(env_named_in("jane.doe-DEV1.pem", &names).as_deref(), Some("DEV1"));
+            assert_eq!(env_named_in("jane.doe-dev10.pem", &names).as_deref(), Some("DEV10"));
+            // Whole tokens only: not DEV1 out of DEV10, not PROD out of product.
+            assert_eq!(env_named_in("jane_product.pem", &names), None);
+            // Longest wins.
+            assert_eq!(env_named_in("jane-DEV1-EAST.pem", &names).as_deref(), Some("DEV1-EAST"));
+            assert_eq!(env_named_in("jane.pem", &names), None);
+            assert_eq!(env_named_in("jane-DEV1.pem", &[]), None);
+            assert_eq!(env_named_in("jane-DEV1.pem", &["".to_string()]), None);
+        }
+
+        #[test]
+        fn running_with_an_own_pem_is_held_back_when_its_name_names_another_environment() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let body = src.split("fn render_create_user_dialog(").nth(1).unwrap();
+            let body = body.split("fn render_pem_env_prompt(").next().unwrap();
+            let check = body.find("env_named_in").expect("the name check");
+            let read = body.find("std::fs::read(dlg.own_pem_path").expect("the read");
+            let start = body.find("self.start_user_script_run(").expect("the start");
+            assert!(check < read && read < start, "ask before the key is read or anything is created");
+            assert!(body.contains("pem_env_ack"), "an answered prompt must not ask twice");
+        }
+
+        #[test]
+        fn a_delete_saves_the_users_pem_before_anything_is_removed() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let body = src.split("fn run_delete_preflight_worker(").nth(1).unwrap();
+            let body = body.split("fn user_pem_present_command(").next().unwrap();
+            let active = body.find("let clear = ").expect("the active check");
+            let pull = body.find("pull_pem_to_downloads(").expect("the save");
+            assert!(active < pull, "only a user who is not logged in is saved and deleted");
+            // A key that exists but cannot be saved stops the delete.
+            assert!(body.contains("clear: false"));
+            assert!(body.contains("nothing was deleted"));
+        }
+
+        #[test]
+        fn the_saved_pem_is_named_for_the_user_and_environment() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let body = src.split("fn pull_pem_to_downloads(").nth(1).unwrap();
+            let body = body.split("fn extract_script_errors(").next().unwrap();
+            assert!(body.contains("format!(\"{username}-{env_part}.pem\")"));
+        }
+
+        #[test]
+        fn the_pem_presence_check_reads_as_the_user_and_names_both_answers() {
+            let cmd = user_pem_present_command("jane.doe");
+            assert!(cmd.contains("sudo -n -u jane.doe test -f /efs/home/jane.doe/.ssh/jane.doe.pem"));
+            assert!(cmd.contains("PEM_PRESENT") && cmd.contains("PEM_ABSENT"));
+        }
+
+        fn found(reporter: &str, summary: &str, description: &str, category: &str) -> TicketLookup {
+            TicketLookup::Found(Box::new(ec2_manager::jira::Issue {
+                key: "CATDO-9".into(),
+                reporter: reporter.into(),
+                summary: summary.into(),
+                description: description.into(),
+                status: if category == "done" { "Closed".into() } else { "Open".into() },
+                status_category: category.into(),
+                ..Default::default()
+            }))
+        }
+
+        #[test]
+        fn an_open_ticket_raised_by_the_person_is_accepted() {
+            let v = ticket_verdict(&found("Jane Doe", "Bastion", "", "new"), "CATDO-9", "jane.doe");
+            assert!(matches!(v, TicketVerdict::Verified(h) if h.contains("reporter")));
+        }
+
+        #[test]
+        fn an_admin_raising_it_for_them_is_accepted_on_the_summary_or_description() {
+            let v = ticket_verdict(&found("Admin P", "Access for Jane Doe", "", "indeterminate"), "CATDO-9", "jane.doe");
+            assert!(matches!(v, TicketVerdict::Verified(h) if h.contains("summary")));
+            let v = ticket_verdict(&found("Admin P", "Access", "User: Jane Doe", "new"), "CATDO-9", "jane.doe");
+            assert!(matches!(v, TicketVerdict::Verified(h) if h.contains("description")));
+        }
+
+        #[test]
+        fn a_ticket_that_does_not_name_them_asks_before_going_on() {
+            let v = ticket_verdict(&found("Bob Jones", "Something else", "", "new"), "CATDO-9", "jane.doe");
+            match v {
+                TicketVerdict::Ask(lines) => {
+                    assert!(lines[0].contains("does not appear to be for 'jane.doe'"));
+                    assert!(lines.iter().any(|l| l.contains("Reporter: Bob Jones")));
+                }
+                other => panic!("expected Ask, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_closed_ticket_asks_even_when_it_names_them() {
+            let v = ticket_verdict(&found("Jane Doe", "Bastion", "", "done"), "CATDO-9", "jane.doe");
+            assert!(matches!(v, TicketVerdict::Ask(l) if l[0].contains("is closed")));
+        }
+
+        #[test]
+        fn a_missing_ticket_is_refused_and_a_failed_check_asks() {
+            assert_eq!(ticket_verdict(&TicketLookup::NotFound, "CATDO-9", "jane.doe"), TicketVerdict::NotFound);
+            let v = ticket_verdict(&TicketLookup::Failed("timed out".into()), "CATDO-9", "jane.doe");
+            assert!(matches!(v, TicketVerdict::Ask(l) if l[0].contains("timed out")));
+        }
+
+        #[test]
+        fn the_ticket_travels_to_the_email_script_and_its_subject() {
+            let cfg = access_email_cfg(true);
+            let with = access_email_args(&cfg, "jane.doe", "DEV1", "i-1", "i-2", "/p.pem", " catdo-9 ");
+            assert!(with.iter().any(|(f, v)| *f == "-Ticket" && v == "catdo-9"));
+            let without = access_email_args(&cfg, "jane.doe", "DEV1", "i-1", "i-2", "/p.pem", "");
+            assert!(!without.iter().any(|(f, _)| *f == "-Ticket"), "no ticket, no flag");
+            let ps1 = include_str!("../../assets/scripts/send_access_email.ps1");
+            assert!(ps1.contains("[string]$Ticket"));
+            assert!(ps1.contains("$subject = \"$subject ($Ticket)\""));
+        }
+
+        #[test]
+        fn a_create_needs_a_ticket_and_a_restore_does_not() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let body = src.split("fn render_create_user_dialog(").nth(1).unwrap();
+            let body = body.split("fn render_ticket_check(").next().unwrap();
+            // Blank is refused only when this is not a restore.
+            assert!(body.contains("if ticket.is_empty() {\n                        if !dlg.mode.is_restore() {"));
+            // The shape is checked whenever one was typed, restore included.
+            assert!(body.contains("validate_issue_key(&ticket)"));
+            // And Jira is asked only for a ticket that was given.
+            assert!(body.contains("&& !dlg.ticket.is_empty()\n                    && self.jira_enabled"));
+            assert!(body.contains("\"Jira ticket (optional):\""));
         }
 
         /// The "remediating alert ..." line is `Running`, and only a message

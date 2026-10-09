@@ -22,3 +22,6 @@ WSL/docs/superpowers/plans/2026-08-17-reaper-auto-remediation.md
 # tracked above this line stay tracked -- a .gitignore rule does not untrack
 # anything, and CLAUDE.md refers to some of them by name.
 WSL/docs/
+
+# Terminal Paste Image folder
+/.cp-images

@@ -47,6 +47,8 @@ param(
     [string]$Candidates      = "",   # comma-separated locals to probe: jsmith,jsmith2,...
     [string]$LocalSuffixes   = "",   # comma-separated markers the local part may
                                      #   also carry, e.g. ".cw" -> jsmith.cw
+    [string]$Ticket          = "",   # Jira ticket the access was requested in;
+                                     #   appended to the subject when given
     [switch]$Quiet,                  # suppress message boxes (GUI shows status)
     [string]$TemplateGuid      = "",   # RMS/IRM template GUID (tenant-specific)
     [int]   $Permission        = 0,    # MailItem.Permission value to set (0=skip)
@@ -109,7 +111,9 @@ $mail = $outlook.CreateItem(0)   # olMailItem
 # The MMODAL_ENV tag is not consistently cased across instances, so uppercase
 # it here rather than trusting whatever the tag happened to hold.
 $envUpper = "$EnvTag".ToUpper()
-$mail.Subject = "Bastion Access for $envUpper"
+$subject = "Bastion Access for $envUpper"
+if ($Ticket) { $subject = "$subject ($Ticket)" }
+$mail.Subject = $subject
 $mail.Body = @"
 Hello $firstName,
 

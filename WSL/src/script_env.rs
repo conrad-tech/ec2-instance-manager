@@ -46,6 +46,39 @@ pub fn env_eq(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
 }
 
+/// The environment a file name appears to belong to, if it names one.
+///
+/// A PEM is usually saved as `<user>-<ENV>.pem`, so the name says which
+/// environment the key was made for. `names` are the environments the app
+/// knows; one is "named" when it appears in `file_name` as a whole token --
+/// bounded by anything that is not a letter or digit -- so `DEV1` is not read
+/// out of `DEV10` and `prod` is not read out of `product`. Case-insensitive.
+/// The longest name wins, for the same reason (`DEV1` inside `DEV1-EAST`).
+pub fn env_named_in(file_name: &str, names: &[String]) -> Option<String> {
+    let hay = file_name.to_ascii_lowercase();
+    let bytes = hay.as_bytes();
+    let mut best: Option<&String> = None;
+    for name in names {
+        let needle = name.trim().to_ascii_lowercase();
+        if needle.is_empty() || best.is_some_and(|b| b.trim().len() >= needle.len()) {
+            continue;
+        }
+        let mut from = 0;
+        while let Some(rel) = hay[from..].find(&needle) {
+            let start = from + rel;
+            let end = start + needle.len();
+            let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+            let after_ok = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                best = Some(name);
+                break;
+            }
+            from = start + 1;
+        }
+    }
+    best.cloned()
+}
+
 /// Whether an instance carrying `tag` belongs to environment `env`.
 ///
 /// An empty `env` matches everything: that is the untagged-account case, where
