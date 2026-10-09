@@ -26,6 +26,16 @@ for target in "${HOST}" "${IP}" 127.0.0.1; do
   case "${CERT_OUT}" in subject*) break ;; esac
 done
 echo "${CERT_OUT}"
+# No cert came back: show whether Cassandra is even installed. A missing unit
+# prints "Unit cassandra.service could not be found." This runs as root, so no
+# sudo is needed.
+case "${CERT_OUT}" in
+  subject*) ;;
+  *)
+    echo "--- systemctl status cassandra ---"
+    systemctl status cassandra --no-pager 2>&1 | head -n 15
+    ;;
+esac
 echo "__CC_CERT_END__"
 echo "__CC_ACTIVE__ $(systemctl is-active cassandra 2>&1)"
 echo "__CC_END__"

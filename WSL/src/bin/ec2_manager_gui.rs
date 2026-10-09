@@ -28929,7 +28929,10 @@ mod gui {
                             for r in &dry {
                                 egui::CollapsingHeader::new(format!("openssl output: {}", r.target.name))
                                     .id_salt(("cassandra_raw", r.target.instance_id.as_str()))
-                                    .default_open(false)
+                                    // Open when the cert was unreadable: the output then
+                                    // carries `systemctl status cassandra`, which says
+                                    // whether Cassandra is installed at all.
+                                    .default_open(r.current.is_none() && !r.raw_cert.trim().is_empty())
                                     .show(ui, |ui| {
                                         if r.raw_cert.trim().is_empty() {
                                             ui.label("(nothing was read)");
@@ -28966,7 +28969,13 @@ mod gui {
                                                 ),
                                             );
                                         } else {
-                                            ui.label(format!("{path}: {local}"));
+                                            // Green within 30 days, red beyond.
+                                            let color = if cassandra_cert::parameter_is_fresh(*t, now) {
+                                                green
+                                            } else {
+                                                red
+                                            };
+                                            note_label(ui, color, format!("{path}: {local}"));
                                         }
                                     }
                                     Err(e) => {

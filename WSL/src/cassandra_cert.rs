@@ -393,6 +393,15 @@ pub fn parameter_is_stale(modified: i64, current: &CertInfo) -> bool {
     modified <= current.not_before
 }
 
+/// How recent a parameter must be to count as fresh in the dialog.
+pub const PARAMETER_FRESH_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// Whether a parameter was modified within the last 30 days of `now` (both
+/// unix seconds). A date in the future counts as fresh.
+pub fn parameter_is_fresh(modified: i64, now: i64) -> bool {
+    now - modified <= PARAMETER_FRESH_SECS
+}
+
 /// Names of unselected nodes that do not serve `result`, `(unreadable)` for
 /// the ones that could not be read.
 pub fn stale_unselected(result: &CertInfo, others: &[(String, Option<CertInfo>)]) -> Vec<String> {
@@ -1695,5 +1704,13 @@ mod tests {
         assert!(start_blocker(&none, false, false, false).is_some());
         assert!(start_blocker(&x, true, false, false).is_some());
         assert!(start_blocker(&x, false, true, false).is_some());
+    }
+    #[test]
+    fn a_parameter_is_fresh_for_thirty_days() {
+        let now = 1_800_000_000;
+        assert!(parameter_is_fresh(now - 29 * 86_400, now));
+        assert!(parameter_is_fresh(now - 30 * 86_400, now));
+        assert!(!parameter_is_fresh(now - 30 * 86_400 - 1, now));
+        assert!(parameter_is_fresh(now + 60, now));
     }
 }
