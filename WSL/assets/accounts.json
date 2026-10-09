@@ -1,5 +1,6 @@
 [
   {
+    "_comment": "Dev: two environments in one account. Each environment's name must match its instances' MMODAL_ENV tag (case-insensitive). 'domain' is the environment's DNS domain: it gives the environment its Vault address by default (https://vault.<domain>:8200), and Cassandra Cert uses it for its SSM parameter paths ($env_domain) and for cassandra.sh -d, so write it exactly as it appears in the cert (case matters).",
     "label": "Dev",
     "account_id": "123456789012",
     "region": "us-east-1",
@@ -17,27 +18,45 @@
     ]
   },
   {
+    "_comment": "Staging: STG2 shows the override. An explicit vault_addr beats the domain-derived address, so use it when an environment's Vault is on a non-standard port or host. STG1 just uses its domain.",
     "label": "Staging",
     "account_id": "234567890123",
     "region": "us-east-1",
     "sort_order": 1,
     "color": "#c8b41e",
-    "vault_addr": "https://vault.staging.YOUR-COMPANY.com:8200",
     "environments": [
       {
-        "name": "STG1"
+        "name": "STG1",
+        "domain": "stg1.YOUR-COMPANY.com"
       },
       {
-        "name": "STG2"
+        "name": "STG2",
+        "domain": "stg2.YOUR-COMPANY.com",
+        "vault_addr": "https://vault-stg2.YOUR-COMPANY.com:8300"
       }
     ]
   },
   {
+    "_comment": "Prod: an account with a single environment still lists it, so it gets a domain (Vault address and Cassandra Cert both come from it).",
     "label": "Prod",
     "account_id": "345678901234",
     "region": "us-east-1",
     "sort_order": 3,
     "color": "#c82828",
-    "vault_addr": "https://vault.prod.YOUR-COMPANY.com:8200"
+    "environments": [
+      {
+        "name": "PROD",
+        "domain": "prod.YOUR-COMPANY.com"
+      }
+    ]
+  },
+  {
+    "_comment": "Sandbox: the older style, still supported. With no 'environments', an account-level vault_addr is the Vault address for the whole account. Without a domain, Cassandra Cert has nothing to work from for this account.",
+    "label": "Sandbox",
+    "account_id": "456789012345",
+    "region": "us-east-1",
+    "sort_order": 4,
+    "color": "#6e7681",
+    "vault_addr": "https://vault.sandbox.YOUR-COMPANY.com:8200"
   }
 ]

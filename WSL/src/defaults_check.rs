@@ -44,7 +44,12 @@ const PLACEHOLDER_MARKERS: [&str; 8] = [
 
 /// The account numbers in the shipped `accounts.json`. They are in AWS's own
 /// documentation range and belong to nobody.
-const TEMPLATE_ACCOUNT_IDS: [&str; 3] = ["123456789012", "234567890123", "345678901234"];
+const TEMPLATE_ACCOUNT_IDS: [&str; 4] = [
+    "123456789012",
+    "234567890123",
+    "345678901234",
+    "456789012345",
+];
 
 /// The mail domains the shipped `features.json` puts in
 /// `access_email.email_domains`.
