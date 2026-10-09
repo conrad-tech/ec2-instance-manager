@@ -28910,7 +28910,12 @@ mod gui {
                                                 );
                                             }
                                             Some(c) => {
-                                                ui.label(cassandra_local_time(c.not_after));
+                                                let color = match cassandra_cert::expiry_tier(c.not_after, now) {
+                                                    cassandra_cert::ExpiryTier::Good => green,
+                                                    cassandra_cert::ExpiryTier::Soon => amber,
+                                                    cassandra_cert::ExpiryTier::Critical => red,
+                                                };
+                                                note_label(ui, color, cassandra_local_time(c.not_after));
                                             }
                                             None => {
                                                 note_label(ui, red, "current cert unreadable");
@@ -28959,24 +28964,29 @@ mod gui {
                                 match when {
                                     Ok(t) => {
                                         let local = cassandra_local_time(*t);
-                                        if issued.is_some_and(|c| cassandra_cert::parameter_is_stale(*t, c)) {
-                                            note_label(
-                                                ui,
-                                                red,
-                                                format!(
-                                                    "{path}: {local} - not renewed since the current \
-                                                     cert was issued"
-                                                ),
-                                            );
-                                        } else {
-                                            // Green within 30 days, red beyond.
-                                            let color = if cassandra_cert::parameter_is_fresh(*t, now) {
-                                                green
+                                        // Only the date is coloured; the path stays plain.
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 0.0;
+                                            ui.label(format!("{path}: "));
+                                            if issued.is_some_and(|c| cassandra_cert::parameter_is_stale(*t, c)) {
+                                                note_label(
+                                                    ui,
+                                                    red,
+                                                    format!(
+                                                        "{local} - not renewed since the current \
+                                                         cert was issued"
+                                                    ),
+                                                );
                                             } else {
-                                                red
-                                            };
-                                            note_label(ui, color, format!("{path}: {local}"));
-                                        }
+                                                // Green within 30 days, red beyond.
+                                                let color = if cassandra_cert::parameter_is_fresh(*t, now) {
+                                                    green
+                                                } else {
+                                                    red
+                                                };
+                                                note_label(ui, color, local);
+                                            }
+                                        });
                                     }
                                     Err(e) => {
                                         note_label(ui, red, format!("{path}: {e}"));

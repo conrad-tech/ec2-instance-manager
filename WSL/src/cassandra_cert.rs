@@ -393,6 +393,30 @@ pub fn parameter_is_stale(modified: i64, current: &CertInfo) -> bool {
     modified <= current.not_before
 }
 
+/// How close a cert is to expiring, for the dialog's colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpiryTier {
+    /// 30 or more whole days left.
+    Good,
+    /// 6 to 29 whole days left.
+    Soon,
+    /// 5 or fewer whole days left (expired included).
+    Critical,
+}
+
+/// Tier of a cert expiring at `not_after` (unix seconds) as of `now`, by whole
+/// days remaining.
+pub fn expiry_tier(not_after: i64, now: i64) -> ExpiryTier {
+    let days = (not_after - now).div_euclid(86_400);
+    if days >= 30 {
+        ExpiryTier::Good
+    } else if days > 5 {
+        ExpiryTier::Soon
+    } else {
+        ExpiryTier::Critical
+    }
+}
+
 /// How recent a parameter must be to count as fresh in the dialog.
 pub const PARAMETER_FRESH_SECS: i64 = 30 * 24 * 60 * 60;
 
@@ -1712,5 +1736,17 @@ mod tests {
         assert!(parameter_is_fresh(now - 30 * 86_400, now));
         assert!(!parameter_is_fresh(now - 30 * 86_400 - 1, now));
         assert!(parameter_is_fresh(now + 60, now));
+    }
+    #[test]
+    fn expiry_tiers_follow_whole_days_left() {
+        let now = 1_800_000_000;
+        let d = 86_400;
+        assert_eq!(expiry_tier(now + 30 * d, now), ExpiryTier::Good);
+        assert_eq!(expiry_tier(now + 30 * d - 1, now), ExpiryTier::Soon);
+        assert_eq!(expiry_tier(now + 29 * d, now), ExpiryTier::Soon);
+        assert_eq!(expiry_tier(now + 6 * d, now), ExpiryTier::Soon);
+        assert_eq!(expiry_tier(now + 6 * d - 1, now), ExpiryTier::Critical);
+        assert_eq!(expiry_tier(now + 5 * d, now), ExpiryTier::Critical);
+        assert_eq!(expiry_tier(now - d, now), ExpiryTier::Critical);
     }
 }
