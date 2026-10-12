@@ -1026,6 +1026,9 @@ mod gui {
         Scheduled(Vec<(cassandra_flow::Target, std::result::Result<(), String>)>),
         /// Per-node outcome of removing the restart cron job (terminal).
         Cancelled(Vec<(cassandra_flow::Target, std::result::Result<(), String>)>),
+        /// The after-restart checks of a scheduled restart (terminal). The
+        /// cron job did the restart; this only watched and verified.
+        Watched(cassandra_flow::ApplyReport),
         Failed(String),
     }
 
@@ -1087,6 +1090,16 @@ mod gui {
             account_id: String,
             env: String,
             targets: Vec<cassandra_flow::Target>,
+        },
+        /// Watch and verify the nodes after their scheduled (cron) restart.
+        /// Issues no restart: the cron job already did.
+        WatchScheduled {
+            account_id: String,
+            env: String,
+            targets: Vec<cassandra_flow::Target>,
+            /// Each node's cert before the restart, by instance id, rebuilt
+            /// from the record (`cassandra_before_map`).
+            before: HashMap<String, cassandra_cert::CertInfo>,
         },
     }
 
@@ -2139,6 +2152,7 @@ mod gui {
         Rollback,
         Schedule,
         CancelSchedule,
+        WatchScheduled,
     }
 
     /// The one Cassandra job in flight: whose events these are. Jobs are
@@ -10285,6 +10299,17 @@ mod gui {
         /// `Cancelled` says what happened. Cleared by that result, by its
         /// `Failed` and by Forget.
         cassandra_schedule_undo: Option<(bool, String)>,
+        /// Finished after-restart checks of a scheduled restart, by
+        /// `(account, env)`, shown in the "Scheduled restart" window until
+        /// the user confirms. In memory only: the record's
+        /// `AwaitingConfirm` state is what survives a relaunch.
+        cassandra_watch_results: BTreeMap<(String, String), cassandra_flow::ApplyReport>,
+        /// When a failed scheduled-restart check may be started again, by
+        /// `(account, env)` (`CASSANDRA_WATCH_RETRY`).
+        cassandra_watch_retry_at: HashMap<(String, String), Instant>,
+        /// `(account, env)` already logged as waiting for credentials;
+        /// removed when its checks start (`cassandra_auth_wait_first`).
+        cassandra_auth_wait_logged: HashSet<(String, String)>,
         /// The Cassandra job in flight, if any. Set when a job starts, cleared
         /// by its terminal event. Its `(account, env)` is what decides whether
         /// an event may touch the open dialog.
@@ -10652,6 +10677,19 @@ mod gui {
             }
             // Environment colors are always on — there is no toggle.
             config.account_colors_enabled = true;
+            // A scheduled restart whose checks were running when the app
+            // closed goes back to Scheduled, so the monitor runs them again.
+            let mut interrupted_checks = false;
+            for (account, env, mut rec) in config.all_cassandra_schedules() {
+                if rec.state == cassandra_cert::SchedState::Checking {
+                    rec.state = cassandra_cert::SchedState::Scheduled;
+                    config.set_cassandra_schedule(&account, &env, &rec);
+                    interrupted_checks = true;
+                }
+            }
+            if interrupted_checks {
+                let _ = config.save();
+            }
             let initial_hidden_envs: std::collections::HashSet<String> =
                 config.excluded_envs.iter().map(|s| s.to_ascii_lowercase()).collect();
             let dependencies = dependency_status();
@@ -11161,6 +11199,9 @@ mod gui {
                 cassandra_pending_run: None,
                 cassandra_schedule_dialog: None,
                 cassandra_pending_schedule: None,
+                cassandra_watch_results: BTreeMap::new(),
+                cassandra_watch_retry_at: HashMap::new(),
+                cassandra_auth_wait_logged: HashSet::new(),
                 cassandra_schedule_undo: None,
                 cassandra_inflight: None,
                 cassandra_inbox: Vec::new(),
@@ -28509,7 +28550,8 @@ mod gui {
                 | CassandraJob::Preflight { account_id, .. }
                 | CassandraJob::Rollback { account_id, .. }
                 | CassandraJob::Schedule { account_id, .. }
-                | CassandraJob::CancelSchedule { account_id, .. } => account_id.clone(),
+                | CassandraJob::CancelSchedule { account_id, .. }
+                | CassandraJob::WatchScheduled { account_id, .. } => account_id.clone(),
             };
             // Checked here first: the shared gate's own wording for a blank
             // account is about an alert, which this is not.
@@ -29698,6 +29740,222 @@ mod gui {
             cassandra_schedule_rows_of(&self.config)
         }
 
+        /// Whether `account_id` (a PROFILE id, as the Scripts rows and the
+        /// schedule record carry it) has valid credentials right now: the
+        /// same live lookup the resource tabs use (`pool_account_is_authed`).
+        /// Not gated on the Cassandra Cert feature.
+        fn cassandra_account_auth_ok(&self, account_id: &str) -> bool {
+            let sim = self.options.mode == Mode::Sim;
+            let live = self
+                .profile_auth_infos
+                .iter()
+                .find(|a| a.profile_id == account_id)
+                .map(|a| a.auth_status);
+            let context_status = self
+                .context
+                .as_ref()
+                .filter(|_| self.selected_profile.as_deref() == Some(account_id))
+                .map(|c| c.auth_status)
+                .or_else(|| self.profile_inventory_cache.get(account_id).map(|(_, c)| c.auth_status))
+                .unwrap_or(AuthStatus::Missing);
+            pool_account_is_authed(live, context_status, sim)
+        }
+
+        /// Log, once per change, that a scheduled restart is due but its
+        /// account has no valid credentials. The checks start by themselves
+        /// when the credentials come back (`poll_cassandra_schedules`).
+        fn cassandra_note_waiting_for_auth(&mut self, account_id: &str, env: &str) {
+            let key = (account_id.to_string(), env.to_string());
+            if cassandra_auth_wait_first(&mut self.cassandra_auth_wait_logged, &key) {
+                self.log_cassandra(LogLevel::Warn, cassandra_auth_wait_text(env));
+            }
+        }
+
+        /// The scheduled-restart monitor, once per frame after
+        /// `poll_cassandra_events`. Starts the after-restart checks (a
+        /// `WatchScheduled` job, which issues no restart) when
+        /// `schedule_phase` says they are due, waits for credentials without
+        /// failing, and puts back a record left in Checking with nothing in
+        /// flight. Ungated: the cron job fired whoever is at the keyboard.
+        fn poll_cassandra_schedules(&mut self) {
+            if self.cassandra_inflight.is_some() {
+                return;
+            }
+            let rows = self.cassandra_schedule_rows();
+            if rows.is_empty() {
+                return;
+            }
+            let now = chrono::Utc::now().timestamp();
+            for (account_id, env, mut rec) in rows {
+                let key = (account_id.clone(), env.clone());
+                // Nothing is in flight, so checks recorded as running have
+                // lost their job (it was forgotten as stuck): run them again
+                // after the backoff.
+                if rec.state == cassandra_cert::SchedState::Checking {
+                    if cassandra_set_schedule_state(
+                        &mut self.config,
+                        &account_id,
+                        &env,
+                        cassandra_cert::SchedState::Scheduled,
+                    ) {
+                        let _ = self.config.save();
+                    }
+                    let retry_at = Instant::now() + CASSANDRA_WATCH_RETRY;
+                    self.cassandra_watch_retry_at.insert(key.clone(), retry_at);
+                    self.log_cassandra(
+                        LogLevel::Warn,
+                        format!("cassandra: {env} scheduled restart checks lost their job; they will run again"),
+                    );
+                    rec.state = cassandra_cert::SchedState::Scheduled;
+                }
+                let auth_ok = self.cassandra_account_auth_ok(&account_id);
+                match cassandra_cert::schedule_phase(&rec, now, auth_ok) {
+                    cassandra_cert::SchedulePhase::Waiting
+                    | cassandra_cert::SchedulePhase::ChecksRunning
+                    | cassandra_cert::SchedulePhase::NeedsConfirm => {}
+                    cassandra_cert::SchedulePhase::AwaitingAuth => {
+                        self.cassandra_note_waiting_for_auth(&account_id, &env);
+                    }
+                    cassandra_cert::SchedulePhase::StartChecks => {
+                        if !cassandra_watch_retry_due(&self.cassandra_watch_retry_at, &key, Instant::now()) {
+                            continue;
+                        }
+                        if self.cassandra_auth_wait_logged.remove(&key) {
+                            self.log_cassandra(
+                                LogLevel::Info,
+                                format!("cassandra: {env} credentials are back; starting the scheduled restart checks"),
+                            );
+                        }
+                        let targets = rec
+                            .nodes
+                            .iter()
+                            .map(|n| cassandra_flow::Target { instance_id: n.instance_id.clone(), name: n.name.clone() })
+                            .collect();
+                        let job = CassandraJob::WatchScheduled {
+                            account_id: account_id.clone(),
+                            env: env.clone(),
+                            targets,
+                            before: cassandra_before_map(&rec),
+                        };
+                        if self.start_cassandra_job(job) {
+                            self.cassandra_watch_retry_at.remove(&key);
+                            if cassandra_set_schedule_state(
+                                &mut self.config,
+                                &account_id,
+                                &env,
+                                cassandra_cert::SchedState::Checking,
+                            ) {
+                                let _ = self.config.save();
+                            }
+                            self.log_cassandra(
+                                LogLevel::Info,
+                                format!("cassandra: {env} scheduled restart time passed; checking the nodes"),
+                            );
+                        }
+                        break; // one job at a time
+                    }
+                }
+            }
+        }
+
+        /// The "Scheduled restart" window: one section per schedule whose
+        /// checks are running or wait for confirmation. It shows itself every
+        /// frame while such a record exists and has no close button, so the
+        /// confirmation cannot be lost; Confirm complete removes the record
+        /// (and with it the toolbar notice). Ungated, like the monitor.
+        fn render_cassandra_schedule_result(&mut self, ctx: &egui::Context) {
+            let rows: Vec<(String, String, cassandra_cert::ScheduleRecord)> = self
+                .cassandra_schedule_rows()
+                .into_iter()
+                .filter(|(_, _, r)| {
+                    matches!(
+                        r.state,
+                        cassandra_cert::SchedState::Checking | cassandra_cert::SchedState::AwaitingConfirm
+                    )
+                })
+                .collect();
+            if rows.is_empty() {
+                return;
+            }
+            let amber = egui::Color32::from_rgb(220, 160, 40);
+            let mut confirm: Option<(String, String)> = None;
+            let mut checking = false;
+            let results = &self.cassandra_watch_results;
+            egui::Window::new("Scheduled restart")
+                .id(egui::Id::new("cassandra_scheduled_restart_result"))
+                .collapsible(false)
+                .resizable(false)
+                // Opens centred but stays draggable: `anchor` would pin it.
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
+                .show(ctx, |ui| {
+                    for (i, (account, env, rec)) in rows.iter().enumerate() {
+                        if i > 0 {
+                            ui.separator();
+                        }
+                        ui.strong(format!(
+                            "{}: Cassandra restart scheduled for {}",
+                            env.to_uppercase(),
+                            cassandra_local_time(rec.when)
+                        ));
+                        if rec.state == cassandra_cert::SchedState::Checking {
+                            checking = true;
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Checking the nodes after the scheduled restart...");
+                            });
+                            continue;
+                        }
+                        match results.get(&(account.clone(), env.clone())) {
+                            Some(rep) => {
+                                for (t, status) in &rep.nodes {
+                                    let (severity, text) = cassandra_flow::describe_apply_status(status);
+                                    cassandra_severity_label(ui, severity, format!("{}: {text}", t.name));
+                                }
+                                if let Some(stale) = rep.stale.as_ref().filter(|s| !s.is_empty()) {
+                                    note_label(
+                                        ui,
+                                        amber,
+                                        format!("Still serving the old cert: {}", stale.join(", ")),
+                                    );
+                                }
+                            }
+                            None => {
+                                note_label(
+                                    ui,
+                                    amber,
+                                    "The checks finished before the app was restarted and their result was \
+                                     not kept. Check the nodes, then confirm.",
+                                );
+                            }
+                        }
+                        if ui
+                            .button("Confirm complete")
+                            .on_hover_text("Close this scheduled restart and clear its notice")
+                            .clicked()
+                        {
+                            confirm = Some((account.clone(), env.clone()));
+                        }
+                    }
+                });
+            if checking {
+                ctx.request_repaint_after(Duration::from_secs(1));
+            }
+            if let Some((account, env)) = confirm {
+                self.config.clear_cassandra_schedule(&account, &env);
+                if let Err(e) = self.config.save() {
+                    self.log_cassandra(
+                        LogLevel::Warn,
+                        format!("cassandra: confirmed schedule not saved to config.ini: {e}"),
+                    );
+                }
+                let key = (account, env);
+                self.cassandra_watch_results.remove(&key);
+                self.cassandra_watch_retry_at.remove(&key);
+                self.log_cassandra(LogLevel::Info, format!("cassandra: {} scheduled restart confirmed", key.1));
+            }
+        }
+
         /// Open the Schedule restart window to move an existing schedule:
         /// every node of the saved record (no per-node subset), prefilled
         /// with the record's current local date and time. Needs no Cassandra
@@ -30255,10 +30513,71 @@ mod gui {
                         }
                     }
                 }
+                CassandraEvent::Watched(rep) => {
+                    for (t, status) in &rep.nodes {
+                        let (text, bad) = cassandra_node_status_text(status);
+                        let level = if bad { LogLevel::Warn } else { LogLevel::Info };
+                        self.log_cassandra(level, format!("cassandra: scheduled restart {}: {text}", t.name));
+                    }
+                    if let Some(stale) = rep.stale.as_ref().filter(|s| !s.is_empty()) {
+                        self.log_cassandra(
+                            LogLevel::Warn,
+                            format!("cassandra: still serve the old cert: {}", stale.join(", ")),
+                        );
+                    }
+                    // The checks are done; the record waits for the user's
+                    // confirmation in the "Scheduled restart" window.
+                    if cassandra_set_schedule_state(
+                        &mut self.config,
+                        &owner.account_id,
+                        &owner.env,
+                        cassandra_cert::SchedState::AwaitingConfirm,
+                    ) {
+                        if let Err(e) = self.config.save() {
+                            self.log_cassandra(
+                                LogLevel::Warn,
+                                format!("cassandra: schedule state not saved to config.ini: {e}"),
+                            );
+                        }
+                    }
+                    self.log_cassandra(
+                        LogLevel::Info,
+                        format!("cassandra: {} scheduled restart checks done; confirm them", owner.env),
+                    );
+                    self.cassandra_watch_retry_at.remove(&owner.key());
+                    self.cassandra_watch_results.insert(owner.key(), rep);
+                    if let Some(dlg) = self.cassandra_dialog.as_mut().filter(|_| applies) {
+                        dlg.running = false;
+                    }
+                }
                 CassandraEvent::Failed(msg) => {
                     // `cassandra_settle` already cleared the in-flight
                     // record and dropped this job's pending run.
                     self.log_cassandra(LogLevel::Error, format!("cassandra: {msg}"));
+                    // Failed checks of a scheduled restart go back to
+                    // Scheduled: the monitor retries them after the backoff
+                    // (and waits for credentials if they lapsed). Never left
+                    // stuck in Checking.
+                    if owner.kind == CassandraJobKind::WatchScheduled {
+                        if cassandra_set_schedule_state(
+                            &mut self.config,
+                            &owner.account_id,
+                            &owner.env,
+                            cassandra_cert::SchedState::Scheduled,
+                        ) {
+                            let _ = self.config.save();
+                        }
+                        let retry_at = Instant::now() + CASSANDRA_WATCH_RETRY;
+                        self.cassandra_watch_retry_at.insert(owner.key(), retry_at);
+                        self.log_cassandra(
+                            LogLevel::Warn,
+                            format!(
+                                "cassandra: {} scheduled restart checks failed; retrying in {}s",
+                                owner.env,
+                                CASSANDRA_WATCH_RETRY.as_secs()
+                            ),
+                        );
+                    }
                     // A Schedule job that failed before its per-node result
                     // saves nothing.
                     if owner.kind == CassandraJobKind::Schedule {
@@ -30289,6 +30608,8 @@ mod gui {
                         } else if matches!(owner.kind, CassandraJobKind::Schedule | CassandraJobKind::CancelSchedule) {
                             // The staged result stays: the user may still act on it.
                             dlg.error = Some(format!("Scheduling failed: {msg}"));
+                        } else if owner.kind == CassandraJobKind::WatchScheduled {
+                            dlg.error = Some(format!("Scheduled restart checks failed (will retry): {msg}"));
                         } else {
                             dlg.result = Some(CassandraOutcome::Error(msg));
                         }
@@ -38836,8 +39157,10 @@ mod gui {
                 self.render_ticket_check(ctx);
                 self.render_vault_iam_dialog(ctx);
                 self.poll_cassandra_events();
+                self.poll_cassandra_schedules();
                 self.render_cassandra_dialog(ctx);
                 self.render_cassandra_schedule_dialog(ctx);
+                self.render_cassandra_schedule_result(ctx);
                 self.poll_user_sync();
                 self.render_user_sync_dialog(ctx);
                 self.render_script_editor(ctx);
@@ -47475,12 +47798,14 @@ mod gui {
             // A restart now changes no cert: the update it belongs to was
             // the stage, so it records no `LastRun` of its own.
             // Scheduling changes no cert either; its record is
-            // `cassandra_pending_schedule`, not a `LastRun`.
+            // `cassandra_pending_schedule`, not a `LastRun`. The checks after
+            // a scheduled restart only watch; the record is the schedule's.
             CassandraJob::DryRun { .. }
             | CassandraJob::Preflight { .. }
             | CassandraJob::RestartNow { .. }
             | CassandraJob::Schedule { .. }
-            | CassandraJob::CancelSchedule { .. } => None,
+            | CassandraJob::CancelSchedule { .. }
+            | CassandraJob::WatchScheduled { .. } => None,
         }
     }
 
@@ -47499,6 +47824,9 @@ mod gui {
             CassandraJob::Schedule { account_id, env, .. } => (account_id, env, CassandraJobKind::Schedule),
             CassandraJob::CancelSchedule { account_id, env, .. } => {
                 (account_id, env, CassandraJobKind::CancelSchedule)
+            }
+            CassandraJob::WatchScheduled { account_id, env, .. } => {
+                (account_id, env, CassandraJobKind::WatchScheduled)
             }
         };
         CassandraInflight {
@@ -47560,6 +47888,7 @@ mod gui {
                 | CassandraEvent::RolledBack(_)
                 | CassandraEvent::Scheduled(_)
                 | CassandraEvent::Cancelled(_)
+                | CassandraEvent::Watched(_)
                 | CassandraEvent::Failed(_)
         );
         if terminal {
@@ -47634,6 +47963,17 @@ mod gui {
                     Err(e) => format!("{pre}: cancel {}: {e} (ignored)", t.name),
                 })
                 .collect(),
+            CassandraEvent::Watched(rep) => rep
+                .nodes
+                .iter()
+                .map(|(t, st)| {
+                    format!(
+                        "{pre}: scheduled restart check {}: {} (ignored)",
+                        t.name,
+                        cassandra_node_status_text(st).0
+                    )
+                })
+                .collect(),
             CassandraEvent::Failed(m) => vec![format!("{pre}: failed: {m}")],
         }
     }
@@ -47701,6 +48041,60 @@ mod gui {
             rec.state == cassandra_cert::SchedState::Scheduled && now < rec.when,
             true,
         )
+    }
+
+    /// Each scheduled node's cert before the restart, by instance id, rebuilt
+    /// from the openssl text the record saved. A blank or unparsable capture
+    /// is skipped: that node is verified without a before cert.
+    fn cassandra_before_map(rec: &cassandra_cert::ScheduleRecord) -> HashMap<String, cassandra_cert::CertInfo> {
+        rec.nodes
+            .iter()
+            .filter_map(|n| cassandra_cert::parse_openssl(&n.before_cert).map(|c| (n.instance_id.clone(), c)))
+            .collect()
+    }
+
+    /// Move the saved schedule of `(account_id, env)` to `state`, keeping
+    /// everything else. `false`, changing nothing, when there is no record:
+    /// a state change never invents one. The caller saves the config.
+    fn cassandra_set_schedule_state(
+        config: &mut AppConfig,
+        account_id: &str,
+        env: &str,
+        state: cassandra_cert::SchedState,
+    ) -> bool {
+        let Some(mut rec) = config.cassandra_schedule(account_id, env) else {
+            return false;
+        };
+        rec.state = state;
+        config.set_cassandra_schedule(account_id, env, &rec);
+        true
+    }
+
+    /// How long a failed scheduled-restart check waits before the monitor
+    /// starts it again, so a persistent failure is not retried every frame.
+    const CASSANDRA_WATCH_RETRY: Duration = Duration::from_secs(60);
+
+    /// Whether the checks of `key` may start at `now`: never failed, or the
+    /// backoff after the last failure has run out.
+    fn cassandra_watch_retry_due(
+        retry_at: &HashMap<(String, String), Instant>,
+        key: &(String, String),
+        now: Instant,
+    ) -> bool {
+        retry_at.get(key).is_none_or(|at| now >= *at)
+    }
+
+    /// `true` the first time `key` is seen waiting for credentials since it
+    /// last stopped waiting: the auth-wait line is logged once per change,
+    /// never every frame.
+    fn cassandra_auth_wait_first(seen: &mut HashSet<(String, String)>, key: &(String, String)) -> bool {
+        seen.insert(key.clone())
+    }
+
+    /// The log line for a scheduled restart whose time has come while its
+    /// account has no valid credentials. ASCII only.
+    fn cassandra_auth_wait_text(env: &str) -> String {
+        format!("cassandra: {env} restart time reached; waiting for credentials")
     }
 
     /// One node's apply outcome as a line of text, and whether it is a
@@ -48193,6 +48587,28 @@ mod gui {
                 send(CassandraEvent::Log(format!("cancelling the restart on {} node(s)", targets.len())));
                 match cassandra_guard("cancel schedule", || flow::cancel_restart(&exec, &targets)) {
                     Ok(rows) => send(CassandraEvent::Cancelled(rows)),
+                    Err(e) => send(CassandraEvent::Failed(e)),
+                }
+            }
+            CassandraJob::WatchScheduled { targets, before, .. } => {
+                send(CassandraEvent::Log(format!(
+                    "checking {} node(s) after the scheduled restart",
+                    targets.len()
+                )));
+                // Watch + verify only: the cron job on each node did the restart.
+                let input = flow::RestartInput {
+                    targets: &targets,
+                    unselected: &[],
+                    before: &before,
+                    required_secs,
+                    ceiling_secs,
+                    issue_restart: false,
+                };
+                match cassandra_guard("scheduled checks", || flow::restart_nodes(&exec, &input, &pacer, &emit)) {
+                    Ok(rep) => {
+                        diagnose(flow::apply_failed_nodes(&rep));
+                        send(CassandraEvent::Watched(rep));
+                    }
                     Err(e) => send(CassandraEvent::Failed(e)),
                 }
             }
@@ -59916,6 +60332,212 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 assert!(!body.contains("cassandra_cert_enabled"), "{f}");
                 assert!(!body.contains("self.cassandra_dialog.as_ref().expect"), "{f}");
             }
+        }
+
+        #[test]
+        fn the_before_certs_are_rebuilt_from_the_saved_openssl_text() {
+            let rec = cassandra_cert::ScheduleRecord {
+                when: 1,
+                state: cassandra_cert::SchedState::Scheduled,
+                nodes: vec![
+                    cassandra_cert::ScheduledNode {
+                        instance_id: "i-1".into(),
+                        name: "a".into(),
+                        before_cert: "subject= /CN=*.a\nissuer= /CN=ca\nnotBefore=Sep  3 07:01:23 2025 GMT\nnotAfter=Oct  3 08:01:22 2026 GMT\nserial=01\n".into(),
+                    },
+                    cassandra_cert::ScheduledNode { instance_id: "i-2".into(), name: "b".into(), before_cert: String::new() },
+                ],
+                domain: "d.net".into(),
+            };
+            let map = cassandra_before_map(&rec);
+            assert!(map.contains_key("i-1"));
+            assert!(!map.contains_key("i-2"), "a blank capture is not a before cert");
+        }
+
+        #[test]
+        fn a_watch_job_is_terminal_records_no_last_run_and_never_issues_a_restart() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let body = method_body(src, "fn run_cassandra_job(");
+            let arm = &body[body.find("CassandraJob::WatchScheduled {").expect("the watch arm")..];
+            assert!(arm.contains("issue_restart: false"), "{arm}");
+            let mut inflight = None;
+            let mut pending = None;
+            let mut next = 0u64;
+            let job = CassandraJob::WatchScheduled {
+                account_id: "111".into(),
+                env: "DEV1".into(),
+                targets: vec![],
+                before: HashMap::new(),
+            };
+            let id = cassandra_try_start(&mut inflight, &mut pending, &mut next, &job).expect("admitted");
+            assert!(pending.is_none());
+            let ev = CassandraEvent::Watched(cassandra_flow::ApplyReport { nodes: vec![], stale: None, restarted: true });
+            cassandra_settle(&mut inflight, &mut pending, id, &ev).expect("settles");
+            assert!(inflight.is_none());
+        }
+
+        #[test]
+        fn the_monitor_starts_checks_only_when_the_phase_says_so() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let body = method_body(src, "fn poll_cassandra_schedules(");
+            assert!(body.contains("schedule_phase("), "{body}");
+            assert!(body.contains("SchedulePhase::StartChecks"), "{body}");
+            assert!(body.contains("SchedulePhase::AwaitingAuth"), "{body}");
+            assert!(!body.contains("restart_nodes("), "the monitor starts a job; it never restarts directly");
+        }
+
+        /// An app that exited while the checks ran left the record in
+        /// `Checking`; the next launch puts it back to `Scheduled` so the
+        /// checks run again.
+        #[test]
+        fn a_schedule_left_checking_by_a_closed_app_is_rechecked_on_launch() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let body = method_body(src, "fn new(options: GuiOptions) -> Self");
+            let at = body.find("SchedState::Checking").expect("App::new resets interrupted checks");
+            let after = &body[at..];
+            assert!(after.contains("state = cassandra_cert::SchedState::Scheduled"), "{after}");
+            assert!(after.contains("config.set_cassandra_schedule("), "{after}");
+        }
+
+        /// Each step of a scheduled restart's life is one state change on
+        /// the saved record; a missing record changes nothing.
+        #[test]
+        fn a_scheduled_restart_moves_through_its_states_on_the_saved_record() {
+            use cassandra_cert::SchedState;
+            let mut config = AppConfig::default();
+            assert!(!cassandra_set_schedule_state(&mut config, "111", "DEV1", SchedState::Checking));
+            assert!(config.cassandra_schedule("111", "DEV1").is_none(), "no record is invented");
+            let rec = cassandra_cert::ScheduleRecord {
+                when: 1_000,
+                state: SchedState::Scheduled,
+                nodes: vec![],
+                domain: "d.net".into(),
+            };
+            config.set_cassandra_schedule("111", "DEV1", &rec);
+            for state in [SchedState::Checking, SchedState::AwaitingConfirm, SchedState::Scheduled] {
+                assert!(cassandra_set_schedule_state(&mut config, "111", "DEV1", state));
+                let got = config.cassandra_schedule("111", "DEV1").expect("kept");
+                assert_eq!(got.state, state);
+                assert_eq!(got.when, 1_000, "only the state changes");
+            }
+        }
+
+        /// A failed check goes back to `Scheduled` (the monitor retries it,
+        /// and waits for credentials if they lapsed), but not before a 60 s
+        /// backoff, so a persistent failure is not retried every frame.
+        #[test]
+        fn a_failed_scheduled_check_is_retried_after_a_backoff() {
+            let key = ("111".to_string(), "DEV1".to_string());
+            let mut retry: HashMap<(String, String), Instant> = HashMap::new();
+            let now = Instant::now();
+            assert!(cassandra_watch_retry_due(&retry, &key, now), "never failed: due");
+            retry.insert(key.clone(), now + CASSANDRA_WATCH_RETRY);
+            assert!(!cassandra_watch_retry_due(&retry, &key, now));
+            assert!(cassandra_watch_retry_due(&retry, &key, now + CASSANDRA_WATCH_RETRY));
+            assert_eq!(CASSANDRA_WATCH_RETRY, Duration::from_secs(60));
+
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let handle = method_body(src, "fn handle_cassandra_event(");
+            let failed = &handle[handle.find("CassandraEvent::Failed(msg) =>").expect("the Failed arm")..];
+            assert!(failed.contains("owner.kind == CassandraJobKind::WatchScheduled"), "{failed}");
+            assert!(failed.contains("SchedState::Scheduled"), "{failed}");
+            assert!(failed.contains("self.cassandra_watch_retry_at.insert("), "{failed}");
+            let monitor = method_body(src, "fn poll_cassandra_schedules(");
+            let start = &monitor[monitor.find("SchedulePhase::StartChecks =>").expect("the arm")..];
+            let due = start.find("cassandra_watch_retry_due(").expect("the backoff is checked");
+            assert!(due < start.find("self.start_cassandra_job(").expect("the start"), "checked first");
+            // A record left in Checking with nothing in flight (a forgotten
+            // job) is put back too, never left stuck.
+            assert!(monitor.contains("SchedState::Checking"), "{monitor}");
+        }
+
+        /// The finished checks wait for the user's confirmation; a late
+        /// event of a forgotten watch is only logged.
+        #[test]
+        fn finished_checks_wait_for_confirmation() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let handle = method_body(src, "fn handle_cassandra_event(");
+            let arm = &handle[handle.find("CassandraEvent::Watched(rep) =>").expect("the Watched arm")..];
+            let arm = &arm[..arm.find("CassandraEvent::Failed(msg) =>").unwrap_or(arm.len())];
+            assert!(arm.contains("SchedState::AwaitingConfirm"), "{arm}");
+            assert!(arm.contains("self.cassandra_watch_results.insert("), "{arm}");
+            assert!(!arm.contains("cassandra_record_run("), "a watch records no LastRun");
+
+            let rep = cassandra_flow::ApplyReport {
+                nodes: vec![(cass_target("i-1", "cassandra-101"), cassandra_flow::NodeStatus::Staged)],
+                stale: None,
+                restarted: true,
+            };
+            let lines = cassandra_stale_event_lines(4, &CassandraEvent::Watched(rep));
+            assert!(lines.iter().all(|l| l.contains("forgotten job J4") && l.contains("(ignored)")), "{lines:?}");
+            assert!(lines.iter().any(|l| l.contains("cassandra-101")), "{lines:?}");
+        }
+
+        /// The checks and the confirmation stay reachable with the feature
+        /// gate shut: the cron job fired whoever is at the keyboard.
+        #[test]
+        fn scheduled_checks_and_confirmation_ignore_the_cassandra_gate() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            for f in [
+                "fn poll_cassandra_schedules(",
+                "fn render_cassandra_schedule_result(",
+                "fn cassandra_account_auth_ok(",
+                "fn cassandra_note_waiting_for_auth(",
+            ] {
+                let body = method_body(src, f);
+                assert!(!body.contains("cassandra_cert_enabled"), "{f}");
+            }
+            let handle = method_body(src, "fn handle_cassandra_event(");
+            let arm = &handle[handle.find("CassandraEvent::Watched(rep) =>").expect("the Watched arm")..];
+            let arm = &arm[..arm.find("CassandraEvent::Failed(msg) =>").unwrap_or(arm.len())];
+            assert!(!arm.contains("cassandra_cert_enabled"), "{arm}");
+        }
+
+        /// The auth wait uses the resource tabs' live lookup and logs once
+        /// per change, never every frame.
+        #[test]
+        fn the_auth_wait_logs_once_per_change() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            assert!(method_body(src, "fn cassandra_account_auth_ok(").contains("pool_account_is_authed("));
+            let monitor = method_body(src, "fn poll_cassandra_schedules(");
+            assert!(monitor.contains("self.cassandra_auth_wait_logged.remove("), "cleared when checks start");
+
+            let mut seen = HashSet::new();
+            let key = ("111".to_string(), "DEV1".to_string());
+            assert!(cassandra_auth_wait_first(&mut seen, &key));
+            assert!(!cassandra_auth_wait_first(&mut seen, &key), "the second frame says nothing");
+            let text = cassandra_auth_wait_text("DEV1");
+            assert_eq!(text, "cassandra: DEV1 restart time reached; waiting for credentials");
+        }
+
+        /// The result window is draggable, ASCII, cannot be lost while a
+        /// record needs it, and Confirm complete removes the record.
+        #[test]
+        fn the_scheduled_restart_window_is_draggable_and_confirm_removes_the_record() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let body = method_body(src, "fn render_cassandra_schedule_result(");
+            assert!(body.is_ascii(), "ASCII-only UI strings");
+            assert!(body.contains("egui::Window::new(\"Scheduled restart\")"), "{body}");
+            assert!(body.contains(".pivot(") && body.contains(".default_pos("), "{body}");
+            assert!(!body.contains(".anchor("), "{body}");
+            assert!(body.contains("Checking the nodes after the scheduled restart..."), "{body}");
+            assert!(body.contains("cassandra_severity_label("), "{body}");
+            assert!(body.contains("describe_apply_status("), "{body}");
+            assert!(body.contains("\"Confirm complete\""), "{body}");
+            assert!(body.contains("self.config.clear_cassandra_schedule("), "{body}");
+            assert!(body.contains("self.cassandra_watch_results.remove("), "{body}");
+            assert!(body.contains("scheduled restart confirmed"), "{body}");
+            assert!(body.contains("request_repaint_after("), "{body}");
+            assert!(src.contains("self.poll_cassandra_schedules();"), "the monitor runs every frame");
+            assert!(src.contains("self.render_cassandra_schedule_result(ctx);"), "the window renders every frame");
         }
 
         /// Start records the job; a second start is refused and changes
