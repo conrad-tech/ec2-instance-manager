@@ -47086,17 +47086,43 @@ mod gui {
                     "dry run on {} node(s), domain {domain}",
                     targets.len()
                 )));
-                let dates = cassandra_guard("parameter dates", || {
-                    parameters
-                        .iter()
-                        .map(|template| match cassandra_cert::expand_parameter(template, &domain) {
-                            Err(e) => (template.clone(), Err(e)),
-                            Ok(path) => {
-                                let r = fetch_parameter_modified(&ctx.profile, &ctx.region, &path);
-                                (path, r)
-                            }
+                // The parameter lookups (one `aws` process each) run side by
+                // side, and alongside the per-node dry run rather than before
+                // it: neither needs the other's result.
+                let (dates, dry) = std::thread::scope(|s| {
+                    let dates_worker = s.spawn(|| {
+                        cassandra_guard("parameter dates", || {
+                            std::thread::scope(|inner| {
+                                let handles: Vec<_> = parameters
+                                    .iter()
+                                    .map(|template| {
+                                        let domain = domain.as_str();
+                                        inner.spawn(move || {
+                                            match cassandra_cert::expand_parameter(template, domain) {
+                                                Err(e) => (template.clone(), Err(e)),
+                                                Ok(path) => {
+                                                    let r = fetch_parameter_modified(
+                                                        &ctx.profile,
+                                                        &ctx.region,
+                                                        &path,
+                                                    );
+                                                    (path, r)
+                                                }
+                                            }
+                                        })
+                                    })
+                                    .collect();
+                                handles
+                                    .into_iter()
+                                    .map(|h| h.join().expect("parameter worker panicked"))
+                                    .collect::<Vec<(String, std::result::Result<i64, String>)>>()
+                            })
                         })
-                        .collect::<Vec<(String, std::result::Result<i64, String>)>>()
+                    });
+                    let dry = cassandra_guard("dry run", || {
+                        flow::dry_run(&exec, &targets, Some(domain.as_str()))
+                    });
+                    (dates_worker.join().expect("parameter dates worker panicked"), dry)
                 });
                 match dates {
                     Ok(dates) => send(CassandraEvent::ParamDates(dates)),
@@ -47105,9 +47131,7 @@ mod gui {
                         return;
                     }
                 }
-                match cassandra_guard("dry run", || {
-                    flow::dry_run(&exec, &targets, Some(domain.as_str()))
-                }) {
+                match dry {
                     Ok(out) => send(CassandraEvent::DryRun(out)),
                     Err(e) => send(CassandraEvent::Failed(e)),
                 }
@@ -47223,6 +47247,8 @@ mod gui {
                 return Err(format!("ssm command timed out after {}s", timeout.as_secs()));
             }
             std::thread::sleep(Duration::from_millis(100));
+            // Status and output in one call: the poll that sees "Success"
+            // already has the output, so there is no second `aws` process.
             let output = aws_command()
                 .args([
                     "ssm",
@@ -47236,35 +47262,23 @@ mod gui {
                     "--instance-id",
                     instance_id,
                     "--query",
-                    "Status",
+                    "[Status, StandardOutputContent]",
                     "--output",
-                    "text",
+                    "json",
                 ])
                 .output()
                 .map_err(|e| format!("ssm get-command-invocation failed: {e}"))?;
-            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // Either field can come back null (no output yet), so both are optional.
+            let parsed: Option<Vec<Option<String>>> = serde_json::from_slice(&output.stdout).ok();
+            let status = parsed
+                .as_ref()
+                .and_then(|v| v.first())
+                .cloned()
+                .flatten()
+                .unwrap_or_default();
             match status.as_str() {
                 "Success" => {
-                    let out = aws_command()
-                        .args([
-                            "ssm",
-                            "get-command-invocation",
-                            "--profile",
-                            profile,
-                            "--region",
-                            region,
-                            "--command-id",
-                            command_id,
-                            "--instance-id",
-                            instance_id,
-                            "--query",
-                            "StandardOutputContent",
-                            "--output",
-                            "text",
-                        ])
-                        .output()
-                        .map_err(|e| format!("ssm get output failed: {e}"))?;
-                    return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+                    return Ok(parsed.and_then(|mut v| v.pop()).flatten().unwrap_or_default());
                 }
                 "Failed" | "Cancelled" | "TimedOut" => {
                     return Err(format!("ssm command ended with status: {status}"));
