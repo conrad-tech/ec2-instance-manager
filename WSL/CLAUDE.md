@@ -4010,8 +4010,8 @@ not the delete's exit code.
 ### Cassandra Cert (Scripts menu)
 
 Renews the keystore cert on selected Cassandra nodes (`cassandra.sh`, dry run
-first), or rolls them back (`cassandra_rollback.sh`). Restarts the selected
-nodes together, so it is an outage by design.
+first, then stage-only), restarts or schedules the restart, or rolls them back
+(`cassandra_rollback.sh`). A restart is an outage for the nodes restarted.
 
 **Two-key gate, shipped closed.** The entry shows only when
 `cassandra_cert.enabled` is true AND the OS user is on
@@ -4029,7 +4029,7 @@ wildcard-only user gets the feature without seeing its log lines.
 **Where the logic lives.** `src/cassandra_cert.rs` is pure (node parsing,
 sets, selection assessment, openssl/preflight parsing, verdicts, the stability
 watch, `LastRun`, and the Apply / Confirm rollback gates `apply_enabled` /
-`rollback_confirm_enabled`). `src/cassandra_flow.rs` is the orchestration over
+`rollback_confirm_enabled`, plus the schedule record and time rules). `src/cassandra_flow.rs` is the orchestration over
 an `exec` closure (instance id, command, timeout -> output), tested with a fake.
 The GUI is thin: `CassandraDialog` state, `render_cassandra_dialog`,
 `start_cassandra_job` / `run_cassandra_job` and `poll_cassandra_events`.
@@ -4041,21 +4041,76 @@ red nodes / "You selected every node in N clusters" and needs a tick.
 
 **Stale results never arm a restart.** The dialog stores the selection a dry
 run / preflight was started for; Apply and Confirm rollback need that, the ids
-the result carries and the current selection to be the same set, plus the
-outage approval, no running job and (when needed) the cross-set tick. Changing
+the result carries and the current selection to be the same set, plus
+no running job and (when needed) the cross-set tick. Changing
 the selection clears every result and tick; a click re-checks the gate before
 building the job, and one dry run / preflight arms one restart.
 
-**Stage everywhere, then restart.** Apply runs `cassandra.sh --no-restart` on
-every selected node first (it backs up the old stores as
-`<keystore>.bak.<TS>`); if any node fails to stage, **no node is restarted**
-(the rest are `NotRestarted`, holding the staged keystore). Only then is
-`systemctl restart --no-block cassandra` sent to all at the same instant
-(`--no-block` so a send-command is not held for a Cassandra start), and the
-watch polls `systemctl is-active` until each node has been continuously
-`active` for `restart_stable_secs` or fails at `restart_ceiling_secs`. Why:
-nodes on different certs in one environment cannot talk to each other, so a
-rolling update would split the cluster for its whole duration.
+**Stage, then restart: Update cert never restarts.** The flow is Dry-run
+(read-only) -> Update cert -> per node **Restart now** / **Schedule restart**
+(and "for all nodes"). Update cert runs `cassandra.sh --no-restart` on every
+selected node (`ApplyInput.restart: false`, each node ends `NodeStatus::Staged`;
+it backs up the old stores as `<keystore>.bak.<TS>`). The old restart-all
+outage checkbox is gone. `cassandra_flow::restart_nodes` does restart + watch +
+verify (the watch polls `systemctl is-active` until each node has been
+continuously `active` for `restart_stable_secs` or fails at
+`restart_ceiling_secs`), or watch + verify only when `issue_restart` is false
+(used after a scheduled restart, where cron issued the restart).
+
+**One failed node means nobody restarts -- now by gating the buttons.**
+`CassandraDialog::restart_now_armed()` needs nothing running, a non-empty
+`before` (the dry run's certs), `staged_selection` equal to the current
+selection, and every node `Staged`. A selection change, an environment reload
+or ForgetStuck clears `staged_selection`, so a stale stage never arms a
+restart. Why: nodes on different certs cannot talk to each other. Restarting
+one at a time leaves the cluster on mixed certs until the last is done (the UI
+says so); Schedule for all nodes moves them together.
+
+**Scheduling a restart** (`assets/scripts/cassandra_schedule.sh`:
+`--at EPOCH | --cancel | --show`) writes one cron file,
+`/etc/cron.d/cassandra-cert-restart`, root-owned 644. The name uses hyphens
+only: Debian ignores `cron.d` names containing dots. The node converts the
+epoch with its own `date`, so its timezone cannot shift the hour. The job
+always `rm -f`s its own file first and restarts only within an hour after the
+scheduled epoch (`%` is written `\%`), so a stale file can never fire a year
+later. `--at` refuses an epoch under 60 s ahead; the app is stricter
+(`validate_schedule_time`: 2 minutes .. 60 days, `MIN_LEAD_SECS` /
+`MAX_LEAD_SECS`) because cron has no year and a far date would match an earlier
+anniversary.
+
+**Persistence: `config.ini` key `cassandra_schedule.<account>.<ENV>`** holds one
+JSON line (`ScheduleRecord`: `when`, `state` Scheduled / Checking /
+AwaitingConfirm, `nodes` with the dry run's raw openssl text as `before_cert`
+so the comparison survives an app restart, and `domain`). It is written only
+after EVERY node confirms. A partial first-time failure undoes the nodes that
+took it and writes no record; a failed Reschedule cancels EVERY node in the
+record (`cassandra_schedule_undo`: a node that took the new time lost the old
+one, so cancelling only those would leave the rest to fire alone) and clears
+the record only when the whole cancel confirms
+(`cassandra_cancel_clears_record`); a failed Cancel keeps the record.
+
+**While a record exists** Dry-run, Update cert, Restart now and Confirm
+rollback are refused (`CASSANDRA_SCHEDULED_REFUSAL`: re-staging would change
+the keystore under the queued restart). The read-only Roll back preflight
+stays open: a rollback swaps the keystore and restarts, and the queued cron
+would then restart a second time.
+
+**Top bar and monitor.** Each scheduled environment gets a Reschedule / Cancel
+chip right of Close All, live only while state is Scheduled and now < `when`
+(`cassandra_chip_actions`; `cassandra_reschedule_allowed` re-checks on submit,
+and a reschedule after the restart time is refused). The flashing yellow notice
+is not dismissible for the life of the record. `cassandra_schedule_rows` is
+UNGATED on purpose: a live cron restart must stay visible and cancellable even
+if the user relaunched without Cassandra Cert access; only Reschedule is gated.
+The monitor, checks and confirm window are gate-independent.
+`poll_cassandra_schedules` starts watch-only checks (`CassandraJob::WatchScheduled`)
+at `when + CHECK_GRACE_SECS` (90 s, cron fires on the minute and Cassandra
+takes a moment to go down) once `schedule_phase` says StartChecks. It waits for
+auth (logged once per change) and never fails for it. A failed check returns
+the record to Scheduled with a 60 s backoff (`CASSANDRA_WATCH_RETRY`); records
+left in Checking by a closed app are reset to Scheduled at launch. The
+"Scheduled restart" window has no close button, shows pass/fail per node, a red
+summary when any node is a problem, and Confirm complete removes the record.
 
 **Markers, because exit codes are discarded.** `exec_remote_command` drops the
 command's exit status, so every bundled script runs through `invocation`,
@@ -4176,11 +4231,12 @@ replaces what the dialog shows once `start_cassandra_job` admitted it.
 open item -- `$env_domain` being the lowercased environment name, unconfirmed
 against the SSM paths -- is resolved: it is now the declared `domain`.)
 
-Build status for this feature: the dialog panels (Task 10b, with its fix
-round) add 27 tests (11 lib + 16 GUI); `cargo test --features gui` measured
-2026-10-08 on `cassandra-cert-update`, after the final-review fix wave, at
-1096 lib + 3 CLI + 668 GUI, 0 failed,
-with no new build warnings. The real-shell wrapper tests run under `bash`
+Build status for this feature: `cargo test --features gui` measured
+2026-10-12 on `cassandra-restart-scheduling` at 1142 lib + 3 CLI + 724 GUI,
+0 failed. Test builds carry 3 pre-existing warnings (1 lib duplicated
+attribute, 2 GUI unneeded `mut`); the plain GUI build and the Windows
+release cross-compile (`x86_64-pc-windows-gnu`) each show 1 GUI unused-`mut`
+warning and finish. The real-shell wrapper tests run under `bash`
 and `sh` and skip with a printed reason when `bash` is missing.
 
 ### fed_auth: one inaccessible account used to stand the refresh down for good
