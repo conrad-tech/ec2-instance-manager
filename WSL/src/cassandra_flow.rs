@@ -45,6 +45,9 @@ pub fn rollback_check_script() -> String {
 pub fn rollback_script() -> String {
     asset(include_bytes!(concat!(env!("OUT_DIR"), "/cassandra_rollback.sh.obf")))
 }
+pub fn schedule_script() -> String {
+    asset(include_bytes!(concat!(env!("OUT_DIR"), "/cassandra_schedule.sh.obf")))
+}
 
 /// POSIX single-quote an argument.
 pub fn shell_quote(s: &str) -> String {
@@ -184,6 +187,66 @@ pub(crate) fn per_node<T: Send>(
             .map(|h| h.join().expect("node worker panicked"))
             .collect()
     })
+}
+
+/// What the schedule script said: the epoch it holds, `None` for no cron file,
+/// or the node's own failure text. A reply that never ran the script is an error.
+fn parse_schedule_reply(out: &str) -> Result<Option<i64>, String> {
+    let Some(rc) = script_rc(out) else {
+        return Err("the schedule script did not run to completion".to_string());
+    };
+    for line in out.lines().map(str::trim) {
+        if let Some(reason) = line.strip_prefix("__CC_SCHED_FAIL__") {
+            return Err(reason.trim().to_string());
+        }
+    }
+    for line in out.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("__CC_SCHED_SET__") {
+            return rest
+                .trim()
+                .parse::<i64>()
+                .map(Some)
+                .map_err(|_| format!("unreadable schedule time '{}'", rest.trim()));
+        }
+        if line.starts_with("__CC_SCHED_NONE__") {
+            return Ok(None);
+        }
+    }
+    Err(format!("no schedule answer (exit {rc}): {}", last_lines(out, 3)))
+}
+
+fn run_schedule(exec: ExecFn, t: &Target, args: &[&str]) -> Result<Option<i64>, String> {
+    exec(&t.instance_id, &invocation(&schedule_script(), args), QUICK_TIMEOUT)
+        .map_err(|e| format!("could not be sent: {e}"))
+        .and_then(|out| parse_schedule_reply(&out))
+}
+
+/// Put the one-shot restart cron job on every node, at `epoch` (unix seconds).
+pub fn schedule_restart(exec: ExecFn, targets: &[Target], epoch: i64) -> Vec<(Target, Result<(), String>)> {
+    let at = epoch.to_string();
+    per_node(targets, &|t| {
+        let r = run_schedule(exec, t, &["--at", &at]).and_then(|got| match got {
+            Some(e) if e == epoch => Ok(()),
+            other => Err(format!("the node reports {other:?} instead of {epoch}")),
+        });
+        (t.clone(), r)
+    })
+}
+
+/// Remove the cron job from every node (removing nothing is fine).
+pub fn cancel_restart(exec: ExecFn, targets: &[Target]) -> Vec<(Target, Result<(), String>)> {
+    per_node(targets, &|t| {
+        let r = run_schedule(exec, t, &["--cancel"]).and_then(|got| match got {
+            None => Ok(()),
+            Some(_) => Err("the cron job is still there".to_string()),
+        });
+        (t.clone(), r)
+    })
+}
+
+/// What each node holds: `Ok(Some(epoch))` scheduled, `Ok(None)` nothing.
+pub fn read_schedule(exec: ExecFn, targets: &[Target]) -> Vec<(Target, Result<Option<i64>, String>)> {
+    per_node(targets, &|t| (t.clone(), run_schedule(exec, t, &["--show"])))
 }
 
 fn read_cert(exec: ExecFn, t: &Target) -> Result<(Option<CertInfo>, String, String), String> {
@@ -902,6 +965,7 @@ mod script_tests {
     const CHECK: &str = include_str!("../assets/scripts/cassandra_check.sh");
     const RB_CHECK: &str = include_str!("../assets/scripts/cassandra_rollback_check.sh");
     const RB: &str = include_str!("../assets/scripts/cassandra_rollback.sh");
+    const SCHED: &str = include_str!("../assets/scripts/cassandra_schedule.sh");
 
     /// Executable lines only: comments name the commands a script must never
     /// run, and that prose is worth keeping.
@@ -939,8 +1003,36 @@ mod script_tests {
     }
 
     #[test]
+    fn the_schedule_script_only_ever_touches_its_own_cron_file() {
+        for line in code(SCHED) {
+            // The printf line holds the cron job's text (`rm -f %s`), not a command
+            // this script runs, so the `rm ` scan skips it.
+            let is_printf = line.starts_with("printf");
+            // Every write redirect (outside 2>/dev/null) targets the one file.
+            let cleaned = line.replace("2>/dev/null", "").replace("2>&1", "");
+            if let Some(at) = cleaned.find('>') {
+                assert!(cleaned[at..].contains("CRON_FILE"), "writes elsewhere: {line}");
+            }
+            if line.contains("rm ") && !is_printf {
+                assert!(line.contains("CRON_FILE"), "removes something else: {line}");
+            }
+            for verb in ["mv ", "cp ", "tee ", "sed -i", "mkdir ", "truncate ", "dd "] {
+                assert!(!line.contains(verb), "{verb}: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_schedule_script_names_the_cron_file_and_removes_it_before_restarting() {
+        assert!(SCHED.contains("CRON_FILE=/etc/cron.d/cassandra-cert-restart"));
+        let job = SCHED.find("rm -f %s; systemctl restart cassandra").expect("the cron line");
+        assert!(job > 0);
+        assert!(!SCHED.contains("CRON_FILE=/etc/cron.d/cassandra.cert"), "no dots in a cron.d name");
+    }
+
+    #[test]
     fn no_script_enables_errexit() {
-        for (name, s) in [("renew", RENEW), ("check", CHECK), ("rb_check", RB_CHECK), ("rb", RB)] {
+        for (name, s) in [("renew", RENEW), ("check", CHECK), ("rb_check", RB_CHECK), ("rb", RB), ("schedule", SCHED)] {
             for line in code(s) {
                 if let Some(rest) = line.strip_prefix("set ") {
                     for flag in rest.split_whitespace() {
@@ -1069,6 +1161,62 @@ mod flow_tests {
         format!("__CC_BEGIN__\n__CC_CERT_BEGIN__\n{CERT}__CC_CERT_END__\n__CC_ACTIVE__ {active}\n__CC_END__\n")
     }
 
+    fn sched_out(line: &str) -> String {
+        format!("__CC_RAN__\n{line}\n__CC_RC__0\n")
+    }
+
+    #[test]
+    fn scheduling_sends_the_epoch_to_every_node() {
+        let fake = Fake::new(|_id, cmd| {
+            assert!(cmd.contains("'--at' '1900000000'"), "{cmd}");
+            Ok(sched_out("__CC_SCHED_SET__ 1900000000"))
+        });
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let out = schedule_restart(&exec, &[t("i-1", "a"), t("i-2", "b")], 1_900_000_000);
+        assert!(out.iter().all(|(_, r)| r.is_ok()), "{out:?}");
+    }
+
+    #[test]
+    fn a_failed_schedule_names_the_reason_for_that_node_only() {
+        let fake = Fake::new(|id, _cmd| {
+            if id == "i-2" {
+                Ok("__CC_RAN__\n__CC_SCHED_FAIL__ no active cron daemon (cron or crond)\n__CC_RC__3\n".into())
+            } else {
+                Ok(sched_out("__CC_SCHED_SET__ 1900000000"))
+            }
+        });
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let out = schedule_restart(&exec, &[t("i-1", "a"), t("i-2", "b")], 1_900_000_000);
+        assert!(out[0].1.is_ok());
+        assert!(out[1].1.as_ref().unwrap_err().contains("no active cron daemon"), "{:?}", out[1].1);
+    }
+
+    #[test]
+    fn a_reply_without_the_ran_sentinel_is_a_failure_not_a_schedule() {
+        let fake = Fake::new(|_id, _cmd| Ok("__CC_SCHED_SET__ 1900000000\n".into()));
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let out = schedule_restart(&exec, &[t("i-1", "a")], 1_900_000_000);
+        assert!(out[0].1.is_err());
+    }
+
+    #[test]
+    fn cancel_and_show_read_back_what_the_node_says() {
+        let fake = Fake::new(|id, cmd| {
+            if cmd.contains("'--show'") {
+                if id == "i-1" { Ok(sched_out("__CC_SCHED_SET__ 1900000000")) } else { Ok(sched_out("__CC_SCHED_NONE__")) }
+            } else {
+                assert!(cmd.contains("'--cancel'"), "{cmd}");
+                Ok(sched_out("__CC_SCHED_NONE__"))
+            }
+        });
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let shown = read_schedule(&exec, &[t("i-1", "a"), t("i-2", "b")]);
+        assert_eq!(shown[0].1, Ok(Some(1_900_000_000)));
+        assert_eq!(shown[1].1, Ok(None));
+        let cancelled = cancel_restart(&exec, &[t("i-1", "a")]);
+        assert!(cancelled[0].1.is_ok());
+    }
+
     #[test]
     fn a_shell_argument_is_quoted_not_trusted() {
         assert_eq!(shell_quote("dev1.net"), "'dev1.net'");
@@ -1166,7 +1314,7 @@ mod flow_tests {
             assert!(rb.contains(m), "minified rollback lost {m}");
         }
         // Every executable line survives, in order: only comments and blank lines go.
-        for (name, s) in [("renew", renew_script()), ("check", check_script()), ("rb_check", rollback_check_script()), ("rb", rollback_script())] {
+        for (name, s) in [("renew", renew_script()), ("check", check_script()), ("rb_check", rollback_check_script()), ("rb", rollback_script()), ("schedule", schedule_script())] {
             let m = minify_script(&s);
             let code: Vec<&str> = s.lines().map(str::trim_end).filter(|l| { let t = l.trim_start(); !t.is_empty() && !t.starts_with('#') }).collect();
             let kept: Vec<&str> = m.lines().map(str::trim_end).filter(|l| { let t = l.trim_start(); !t.is_empty() && !t.starts_with('#') }).collect();
@@ -1190,7 +1338,7 @@ mod flow_tests {
     fn the_minified_bundled_scripts_still_parse_under_bash() {
         use std::io::Write;
         let Some(bash) = real_bash() else { return };
-        for (name, s) in [("renew", renew_script()), ("check", check_script()), ("rb_check", rollback_check_script()), ("rb", rollback_script())] {
+        for (name, s) in [("renew", renew_script()), ("check", check_script()), ("rb_check", rollback_check_script()), ("rb", rollback_script()), ("schedule", schedule_script())] {
             let mut child = std::process::Command::new(bash)
                 .arg("-n")
                 .stdin(std::process::Stdio::piped())
@@ -1342,6 +1490,7 @@ mod flow_tests {
         assert!(check_script().contains("__CC_CERT_BEGIN__"));
         assert!(rollback_check_script().contains("__CC_PF_BEGIN__"));
         assert!(rollback_script().contains("__CC_RESTORE_OK__"));
+        assert!(schedule_script().contains("__CC_SCHED_SET__"));
     }
 
     #[test]

@@ -423,6 +423,7 @@ fn emit_obfuscated_assets() {
         ("cassandra_check.sh.obf", "assets/scripts/cassandra_check.sh"),
         ("cassandra_rollback_check.sh.obf", "assets/scripts/cassandra_rollback_check.sh"),
         ("cassandra_rollback.sh.obf", "assets/scripts/cassandra_rollback.sh"),
+        ("cassandra_schedule.sh.obf", "assets/scripts/cassandra_schedule.sh"),
     ];
 
     for (out_name, src) in assets {
