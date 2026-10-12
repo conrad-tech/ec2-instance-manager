@@ -148,6 +148,8 @@ pub struct AppConfig {
     pub bastion_selections: BTreeMap<String, String>,
     /// Last Cassandra cert run per `<account>.<ENV>`, one JSON line each.
     pub cassandra_runs: BTreeMap<String, String>,
+    /// Pending Cassandra restart per `<account>.<ENV>`, one JSON line each.
+    pub cassandra_schedules: BTreeMap<String, String>,
     /// User-authored scripts shown under the built-in entries in the
     /// Scripts menu ("Add Script"). Order is the menu order.
     pub personal_scripts: Vec<PersonalScript>,
@@ -220,6 +222,7 @@ impl Default for AppConfig {
             tunnel_dismissed: BTreeMap::new(),
             bastion_selections: BTreeMap::new(),
             cassandra_runs: BTreeMap::new(),
+            cassandra_schedules: BTreeMap::new(),
             personal_scripts: Vec::new(),
             git_pat: None,
             file_browser_paths: BTreeMap::new(),
@@ -724,6 +727,34 @@ impl AppConfig {
             .insert(Self::cassandra_run_key(account_id, env), run.to_line());
     }
 
+    pub fn cassandra_schedule(&self, account_id: &str, env: &str) -> Option<crate::cassandra_cert::ScheduleRecord> {
+        self.cassandra_schedules
+            .get(&Self::cassandra_run_key(account_id, env))
+            .and_then(|l| crate::cassandra_cert::ScheduleRecord::from_line(l))
+    }
+
+    pub fn set_cassandra_schedule(&mut self, account_id: &str, env: &str, rec: &crate::cassandra_cert::ScheduleRecord) {
+        self.cassandra_schedules
+            .insert(Self::cassandra_run_key(account_id, env), rec.to_line());
+    }
+
+    pub fn clear_cassandra_schedule(&mut self, account_id: &str, env: &str) {
+        self.cassandra_schedules.remove(&Self::cassandra_run_key(account_id, env));
+    }
+
+    /// Every pending schedule as `(account_id, ENV, record)`. The key is
+    /// `<account>.<ENV>`; an account id carries no dot.
+    pub fn all_cassandra_schedules(&self) -> Vec<(String, String, crate::cassandra_cert::ScheduleRecord)> {
+        self.cassandra_schedules
+            .iter()
+            .filter_map(|(k, v)| {
+                let (account, env) = k.split_once('.')?;
+                let rec = crate::cassandra_cert::ScheduleRecord::from_line(v)?;
+                Some((account.to_string(), env.to_string(), rec))
+            })
+            .collect()
+    }
+
     /// The remembered file-browser path for an instance, if the user has
     /// navigated there before.
     pub fn file_browser_path(&self, instance_id: &str) -> Option<String> {
@@ -1003,6 +1034,13 @@ impl AppConfig {
                 if !rest.is_empty() && !value.is_empty() {
                     cfg.bastion_selections
                         .insert(rest.to_string(), value.to_string());
+                }
+                continue;
+            }
+
+            if let Some(rest) = key.strip_prefix("cassandra_schedule.") {
+                if !rest.is_empty() && !value.is_empty() {
+                    cfg.cassandra_schedules.insert(rest.to_string(), value.to_string());
                 }
                 continue;
             }
@@ -1334,6 +1372,9 @@ impl AppConfig {
         }
         for (env, run) in &self.cassandra_runs {
             lines.push(format!("cassandra_run.{env}={run}"));
+        }
+        for (env, rec) in &self.cassandra_schedules {
+            lines.push(format!("cassandra_schedule.{env}={rec}"));
         }
         if let Some(ref p) = self.forwards_hosts_file {
             lines.push(format!("forwards_hosts_file={p}"));
@@ -1672,6 +1713,21 @@ fn parse_port_forward_preset(raw: &str) -> Option<PortForwardPreset> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_cassandra_schedule_persists_per_environment_and_clears() {
+        use crate::cassandra_cert::{SchedState, ScheduleRecord};
+        let mut cfg = AppConfig::default();
+        let rec = ScheduleRecord { when: 42, state: SchedState::Scheduled, nodes: vec![], domain: "d.net".into() };
+        cfg.set_cassandra_schedule("123456789012", "dev1", &rec);
+        let back = AppConfig::parse(&cfg.to_text());
+        assert_eq!(back.cassandra_schedule("123456789012", "DEV1"), Some(rec.clone()));
+        assert_eq!(back.cassandra_schedule("123456789012", "DEV2"), None);
+        assert_eq!(back.all_cassandra_schedules().len(), 1);
+        let mut back = back;
+        back.clear_cassandra_schedule("123456789012", "dev1");
+        assert_eq!(back.cassandra_schedule("123456789012", "DEV1"), None);
+    }
 
     #[test]
     fn the_last_cassandra_run_survives_a_save_and_load() {

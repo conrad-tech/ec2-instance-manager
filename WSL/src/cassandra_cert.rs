@@ -881,9 +881,134 @@ impl LastRun {
     }
 }
 
+/// A scheduled restart must be far enough ahead for cron to see it, and close
+/// enough that its month/day cannot match an earlier anniversary (cron has no year).
+pub const MIN_LEAD_SECS: i64 = 120;
+pub const MAX_LEAD_SECS: i64 = 60 * 24 * 3600;
+/// cron fires on the minute and Cassandra takes a moment to go down: the
+/// checks start this long after the scheduled time.
+pub const CHECK_GRACE_SECS: i64 = 90;
+
+pub fn validate_schedule_time(when: i64, now: i64) -> Result<(), String> {
+    if when <= now {
+        return Err("The restart time must be in the future.".to_string());
+    }
+    if when - now < MIN_LEAD_SECS {
+        return Err("The restart must be at least 2 minutes from now.".to_string());
+    }
+    if when - now > MAX_LEAD_SECS {
+        return Err("The restart must be within 60 days (cron has no year).".to_string());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SchedState {
+    /// The cron job is on the nodes; the time has not come (or checks have not started).
+    Scheduled,
+    /// The time passed and the up-checks are running.
+    Checking,
+    /// The checks finished; waiting for the user to confirm.
+    AwaitingConfirm,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledNode {
+    pub instance_id: String,
+    pub name: String,
+    /// The raw openssl text the dry run read for this node ("" if unknown),
+    /// so the after-restart comparison survives an app restart.
+    pub before_cert: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleRecord {
+    pub when: i64,
+    pub state: SchedState,
+    pub nodes: Vec<ScheduledNode>,
+    pub domain: String,
+}
+
+impl ScheduleRecord {
+    pub fn to_line(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+    pub fn from_line(line: &str) -> Option<ScheduleRecord> {
+        serde_json::from_str(line.trim()).ok()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchedulePhase {
+    Waiting,
+    /// Due, but the account is not authorised yet: wait, do not fail.
+    AwaitingAuth,
+    StartChecks,
+    ChecksRunning,
+    NeedsConfirm,
+}
+
+pub fn schedule_phase(rec: &ScheduleRecord, now: i64, auth_ok: bool) -> SchedulePhase {
+    match rec.state {
+        SchedState::Checking => SchedulePhase::ChecksRunning,
+        SchedState::AwaitingConfirm => SchedulePhase::NeedsConfirm,
+        SchedState::Scheduled if now < rec.when + CHECK_GRACE_SECS => SchedulePhase::Waiting,
+        SchedState::Scheduled if !auth_ok => SchedulePhase::AwaitingAuth,
+        SchedState::Scheduled => SchedulePhase::StartChecks,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_schedule_time_must_be_inside_the_lead_window() {
+        let now = 1_800_000_000;
+        assert!(validate_schedule_time(now + MIN_LEAD_SECS, now).is_ok());
+        assert!(validate_schedule_time(now + MAX_LEAD_SECS, now).is_ok());
+        let soon = validate_schedule_time(now + MIN_LEAD_SECS - 1, now).unwrap_err();
+        assert!(soon.contains("at least 2 minutes"), "{soon}");
+        let past = validate_schedule_time(now - 5, now).unwrap_err();
+        assert!(past.contains("future"), "{past}");
+        let far = validate_schedule_time(now + MAX_LEAD_SECS + 1, now).unwrap_err();
+        assert!(far.contains("60 days"), "{far}");
+    }
+
+    fn rec(state: SchedState) -> ScheduleRecord {
+        ScheduleRecord {
+            when: 1_000,
+            state,
+            nodes: vec![ScheduledNode {
+                instance_id: "i-1".into(),
+                name: "cassandra-001".into(),
+                before_cert: "notAfter=Oct  3 08:01:22 2026 GMT".into(),
+            }],
+            domain: "dev1.example.net".into(),
+        }
+    }
+
+    #[test]
+    fn a_record_round_trips_through_one_line() {
+        let r = rec(SchedState::Scheduled);
+        let line = r.to_line();
+        assert!(!line.contains('\n'));
+        assert_eq!(ScheduleRecord::from_line(&line), Some(r));
+        assert_eq!(ScheduleRecord::from_line("not json"), None);
+    }
+
+    #[test]
+    fn the_phase_follows_time_auth_and_state() {
+        let r = rec(SchedState::Scheduled);
+        assert_eq!(schedule_phase(&r, 999, true), SchedulePhase::Waiting);
+        // Due, but cron needs its grace.
+        assert_eq!(schedule_phase(&r, 1_000 + CHECK_GRACE_SECS - 1, true), SchedulePhase::Waiting);
+        assert_eq!(schedule_phase(&r, 1_000 + CHECK_GRACE_SECS, false), SchedulePhase::AwaitingAuth);
+        assert_eq!(schedule_phase(&r, 1_000 + CHECK_GRACE_SECS, true), SchedulePhase::StartChecks);
+        assert_eq!(schedule_phase(&rec(SchedState::Checking), 5_000, false), SchedulePhase::ChecksRunning);
+        assert_eq!(schedule_phase(&rec(SchedState::AwaitingConfirm), 5_000, false), SchedulePhase::NeedsConfirm);
+    }
+
     use crate::models::Instance;
 
     #[test]
