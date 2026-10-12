@@ -1024,8 +1024,8 @@ mod script_tests {
 
     #[test]
     fn the_schedule_script_names_the_cron_file_and_removes_it_before_restarting() {
-        assert!(SCHED.contains("CRON_FILE=/etc/cron.d/cassandra-cert-restart"));
-        let job = SCHED.find("rm -f %s; systemctl restart cassandra").expect("the cron line");
+        assert!(SCHED.contains("CRON_FILE=\"${CASSANDRA_CRON_FILE:-/etc/cron.d/cassandra-cert-restart}\""));
+        let job = SCHED.find("rm -f %s; %s && systemctl restart cassandra").expect("the cron line");
         assert!(job > 0);
         assert!(!SCHED.contains("CRON_FILE=/etc/cron.d/cassandra.cert"), "no dots in a cron.d name");
     }
@@ -1332,6 +1332,53 @@ mod flow_tests {
                 None
             }
         }
+    }
+
+    #[test]
+    fn the_real_schedule_script_refuses_the_past_and_writes_a_self_guarded_job() {
+        let Some(bash) = real_bash() else { return };
+        let dir = std::env::temp_dir().join(format!("cc-sched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("systemctl");
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let script = dir.join("sched.sh");
+        std::fs::write(&script, schedule_script()).unwrap();
+        let cron = dir.join("cron-file");
+        let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
+        let run = |args: &[&str]| -> String {
+            let o = std::process::Command::new(bash)
+                .arg(&script).args(args)
+                .env("PATH", &path)
+                .env("CASSANDRA_CRON_FILE", &cron)
+                .output().expect("run schedule script");
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+        let past = run(&["--at", &(now - 100).to_string()]);
+        assert!(past.contains("__CC_SCHED_FAIL__"), "{past}");
+        assert!(!cron.exists(), "a past time must write nothing");
+
+        let when = (now + 7200).to_string();
+        let set = run(&["--at", &when]);
+        assert!(set.contains(&format!("__CC_SCHED_SET__ {when}")), "{set}");
+        let text = std::fs::read_to_string(&cron).unwrap();
+        let job = text.lines().find(|l| l.contains("systemctl restart cassandra")).expect("job line");
+        assert!(job.contains("rm -f "), "{job}");
+        assert!(job.contains("date +\\%s"), "the percent must be escaped for cron: {job}");
+        assert!(job.find("rm -f").unwrap() < job.find("systemctl restart").unwrap(), "{job}");
+        assert!(job.contains(&format!("-lt {}", now + 7200 + 3600)), "{job}");
+
+        assert!(run(&["--show"]).contains(&format!("__CC_SCHED_SET__ {when}")));
+        assert!(run(&["--cancel"]).contains("__CC_SCHED_NONE__"));
+        assert!(!cron.exists());
+        assert!(run(&["--show"]).contains("__CC_SCHED_NONE__"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
