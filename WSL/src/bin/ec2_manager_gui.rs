@@ -28395,17 +28395,32 @@ mod gui {
                 ));
                 return true;
             }
-            let ctx = match reaper_account_context(&self.options.mode, &self.config, &account_id) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = self.proc_tx.send(ProcEvent::Cassandra(job_id, CassandraEvent::Failed(e)));
-                    return true;
-                }
-            };
             let watch = self.cassandra_watch_secs;
             let tx = self.proc_tx.clone();
             let egui_ctx = self.egui_ctx.clone();
-            std::thread::spawn(move || run_cassandra_job(job, job_id, &ctx, watch, &tx, &egui_ctx));
+            // The live/credentials gate reads credential files and checks
+            // auth, which takes seconds: it runs on the worker so the click
+            // shows the job running at once instead of freezing the dialog.
+            let mode = self.options.mode.clone();
+            let config = self.config.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(ProcEvent::Cassandra(
+                    job_id,
+                    CassandraEvent::Log(format!("checking credentials for account {account_id}")),
+                ));
+                if let Some(c) = &egui_ctx {
+                    c.request_repaint();
+                }
+                match reaper_account_context(&mode, &config, &account_id) {
+                    Ok(ctx) => run_cassandra_job(job, job_id, &ctx, watch, &tx, &egui_ctx),
+                    Err(e) => {
+                        let _ = tx.send(ProcEvent::Cassandra(job_id, CassandraEvent::Failed(e)));
+                        if let Some(c) = &egui_ctx {
+                            c.request_repaint();
+                        }
+                    }
+                }
+            });
             true
         }
 
@@ -57196,10 +57211,12 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let src = &whole[..whole.find("    mod tests {").expect("the test module")];
             let body = method_body(src, "fn start_cassandra_job(");
             assert!(body.contains("reaper_account_context"), "must reuse the live/credentials gate");
-            // The gate comes before the thread, so a refusal spawns nothing.
+            // The gate runs on the worker (it takes seconds and would freeze
+            // the click), and the job only runs when it passes.
             let gate = body.find("reaper_account_context").unwrap();
             let spawn = body.find("thread::spawn").expect("the worker thread");
-            assert!(gate < spawn, "the gate must run before the spawn");
+            let run = body.find("run_cassandra_job(").expect("the job run");
+            assert!(spawn < gate && gate < run, "the gate must guard the job inside the worker");
             // A blank account gets the dialog's own words, not the shared
             // helper's alert-shaped "carries no Account tag".
             let blank = body
