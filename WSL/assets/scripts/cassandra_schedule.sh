@@ -31,12 +31,16 @@ case "${MODE}" in
     fi
     ;;
   cancel)
+    # "absent" tells the app no restart was queued: near the scheduled time
+    # that can mean the job already ran, so the app keeps its checks.
+    WAS=absent
+    if [ -e "${CRON_FILE}" ]; then WAS=removed; fi
     rm -f "${CRON_FILE}"
     if [ -e "${CRON_FILE}" ]; then
       echo "__CC_SCHED_FAIL__ could not remove ${CRON_FILE}"
       exit 1
     fi
-    echo "__CC_SCHED_NONE__"
+    echo "__CC_SCHED_NONE__ ${WAS}"
     ;;
   at)
     case "${EPOCH}" in

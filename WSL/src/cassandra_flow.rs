@@ -233,13 +233,38 @@ pub fn schedule_restart(exec: ExecFn, targets: &[Target], epoch: i64) -> Vec<(Ta
     })
 }
 
-/// Remove the cron job from every node (removing nothing is fine).
-pub fn cancel_restart(exec: ExecFn, targets: &[Target]) -> Vec<(Target, Result<(), String>)> {
+/// What a cancel found on one node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// A cron file was there and is gone now.
+    Removed,
+    /// There was no cron file to remove. Close to the scheduled time that
+    /// can mean the job already ran (it removes its own file first).
+    Absent,
+}
+
+/// A `--cancel` reply: `__CC_SCHED_NONE__ removed` or `__CC_SCHED_NONE__
+/// absent`. A bare `__CC_SCHED_NONE__` (no word) cannot say which, so it is
+/// read as `Absent`: the safe side, which keeps the record and its checks.
+fn parse_cancel_reply(out: &str) -> Result<CancelOutcome, String> {
+    match parse_schedule_reply(out)? {
+        Some(_) => Err("the cron job is still there".to_string()),
+        None => {
+            let removed = out.lines().map(str::trim).any(|l| {
+                l.strip_prefix("__CC_SCHED_NONE__").is_some_and(|rest| rest.trim() == "removed")
+            });
+            Ok(if removed { CancelOutcome::Removed } else { CancelOutcome::Absent })
+        }
+    }
+}
+
+/// Remove the cron job from every node. Removing nothing is not an error:
+/// it is reported as `Absent`, so the caller can tell it from a removal.
+pub fn cancel_restart(exec: ExecFn, targets: &[Target]) -> Vec<(Target, Result<CancelOutcome, String>)> {
     per_node(targets, &|t| {
-        let r = run_schedule(exec, t, &["--cancel"]).and_then(|got| match got {
-            None => Ok(()),
-            Some(_) => Err("the cron job is still there".to_string()),
-        });
+        let r = exec(&t.instance_id, &invocation(&schedule_script(), &["--cancel"]), QUICK_TIMEOUT)
+            .map_err(|e| format!("could not be sent: {e}"))
+            .and_then(|out| parse_cancel_reply(&out));
         (t.clone(), r)
     })
 }
@@ -1025,8 +1050,11 @@ mod script_tests {
     #[test]
     fn the_schedule_script_names_the_cron_file_and_removes_it_before_restarting() {
         assert!(SCHED.contains("CRON_FILE=\"${CASSANDRA_CRON_FILE:-/etc/cron.d/cassandra-cert-restart}\""));
-        let job = SCHED.find("rm -f %s; %s && systemctl restart cassandra").expect("the cron line");
-        assert!(job > 0);
+        // The job's format removes its file first, then runs the guarded
+        // restart, and the printf fills those two slots in that order.
+        let fmt = SCHED.find("rm -f %s; %s && systemctl restart cassandra").expect("the cron line");
+        let args = SCHED[fmt..].find("\"${FIELDS}\" \"${CRON_FILE}\" \"${GUARD}\"").expect("the printf args");
+        assert!(args > 0, "the arguments follow the format");
         assert!(!SCHED.contains("CRON_FILE=/etc/cron.d/cassandra.cert"), "no dots in a cron.d name");
     }
 
@@ -1206,15 +1234,29 @@ mod flow_tests {
                 if id == "i-1" { Ok(sched_out("__CC_SCHED_SET__ 1900000000")) } else { Ok(sched_out("__CC_SCHED_NONE__")) }
             } else {
                 assert!(cmd.contains("'--cancel'"), "{cmd}");
-                Ok(sched_out("__CC_SCHED_NONE__"))
+                if id == "i-1" { Ok(sched_out("__CC_SCHED_NONE__ removed")) } else { Ok(sched_out("__CC_SCHED_NONE__ absent")) }
             }
         });
         let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
         let shown = read_schedule(&exec, &[t("i-1", "a"), t("i-2", "b")]);
         assert_eq!(shown[0].1, Ok(Some(1_900_000_000)));
         assert_eq!(shown[1].1, Ok(None));
-        let cancelled = cancel_restart(&exec, &[t("i-1", "a")]);
-        assert!(cancelled[0].1.is_ok());
+        let cancelled = cancel_restart(&exec, &[t("i-1", "a"), t("i-2", "b")]);
+        assert_eq!(cancelled[0].1, Ok(CancelOutcome::Removed));
+        assert_eq!(cancelled[1].1, Ok(CancelOutcome::Absent));
+    }
+
+    #[test]
+    fn a_cancel_reply_says_whether_a_cron_file_was_removed() {
+        assert_eq!(parse_cancel_reply(&sched_out("__CC_SCHED_NONE__ removed")), Ok(CancelOutcome::Removed));
+        assert_eq!(parse_cancel_reply(&sched_out("__CC_SCHED_NONE__ absent")), Ok(CancelOutcome::Absent));
+        // The bare form cannot say which: read as Absent (keeps the checks).
+        assert_eq!(parse_cancel_reply(&sched_out("__CC_SCHED_NONE__")), Ok(CancelOutcome::Absent));
+        assert!(parse_cancel_reply(&sched_out("__CC_SCHED_SET__ 1900000000")).is_err());
+        assert!(parse_cancel_reply("__CC_SCHED_NONE__ removed\n").is_err(), "no ran sentinel");
+        // The show/schedule parser still accepts both NONE forms.
+        assert_eq!(parse_schedule_reply(&sched_out("__CC_SCHED_NONE__ absent")), Ok(None));
+        assert_eq!(parse_schedule_reply(&sched_out("__CC_SCHED_NONE__")), Ok(None));
     }
 
     #[test]
@@ -1375,8 +1417,13 @@ mod flow_tests {
         assert!(job.contains(&format!("-lt {}", now + 7200 + 3600)), "{job}");
 
         assert!(run(&["--show"]).contains(&format!("__CC_SCHED_SET__ {when}")));
-        assert!(run(&["--cancel"]).contains("__CC_SCHED_NONE__"));
+        let removed = run(&["--cancel"]);
+        assert!(removed.contains("__CC_SCHED_NONE__ removed"), "{removed}");
         assert!(!cron.exists());
+        // A second cancel finds nothing and says so (still a success).
+        let absent = run(&["--cancel"]);
+        assert!(absent.contains("__CC_SCHED_NONE__ absent"), "{absent}");
+        assert!(!absent.contains("__CC_SCHED_FAIL__"), "{absent}");
         assert!(run(&["--show"]).contains("__CC_SCHED_NONE__"));
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1729,6 +1729,32 @@ mod tests {
         assert_eq!(back.cassandra_schedule("123456789012", "DEV1"), None);
     }
 
+    /// The record's openssl text carries `=` and newlines: the line-based
+    /// config must give it back byte for byte.
+    #[test]
+    fn a_cassandra_schedule_with_real_openssl_text_round_trips() {
+        use crate::cassandra_cert::{SchedState, ScheduleRecord, ScheduledNode};
+        let cert = "subject= /CN=*.dev1.example.net\nissuer= /C=US/O=Example CA/CN=Example=Issuing CA\nnotBefore=Sep  3 07:01:23 2025 GMT\nnotAfter=Oct  3 08:01:22 2026 GMT\nserial=0A1B2C3D\n";
+        let rec = ScheduleRecord {
+            when: 1_900_000_000,
+            state: SchedState::AwaitingConfirm,
+            nodes: vec![
+                ScheduledNode { instance_id: "i-1".into(), name: "cassandra-001".into(), before_cert: cert.into() },
+                ScheduledNode { instance_id: "i-2".into(), name: "cassandra-002".into(), before_cert: String::new() },
+            ],
+            domain: "dev1.example.net".into(),
+        };
+        let mut cfg = AppConfig::default();
+        cfg.set_cassandra_schedule("123456789012", "DEV1", &rec);
+        let text = cfg.to_text();
+        let line = text.lines().find(|l| l.starts_with("cassandra_schedule.")).expect("one line");
+        assert!(line.contains("notAfter="), "{line}");
+        let back = AppConfig::parse(&text);
+        let got = back.cassandra_schedule("123456789012", "DEV1").expect("kept");
+        assert_eq!(got, rec);
+        assert_eq!(got.nodes[0].before_cert, cert);
+    }
+
     #[test]
     fn the_last_cassandra_run_survives_a_save_and_load() {
         let mut cfg = AppConfig::default();
