@@ -1801,6 +1801,11 @@ mod gui {
         /// Per-node outcome of Restart now, by instance id. Cleared when a
         /// dry run or Update cert starts and when the selection changes.
         node_results: HashMap<String, cassandra_flow::NodeStatus>,
+        /// The selection (`selection_key`) the last Update cert (stage) job
+        /// was started for. Restart now needs it to equal the current
+        /// selection; cleared with every other result when the selection
+        /// changes or a stuck job is forgotten.
+        staged_selection: Option<Vec<String>>,
     }
 
     impl CassandraDialog {
@@ -1833,6 +1838,7 @@ mod gui {
                 confirm_forget: false,
                 unchecked_stopped: Vec::new(),
                 node_results: HashMap::new(),
+                staged_selection: None,
             }
         }
 
@@ -1850,6 +1856,19 @@ mod gui {
                 self.needs_confirmation(),
                 self.confirm_outside,
             )
+        }
+
+        /// Whether Restart now may be offered and honoured: the result held
+        /// is a stage report where every node staged, it was staged for
+        /// exactly the current selection (nothing since has voided it), the
+        /// dry run's "before" certs are still held, and nothing is running.
+        /// The one predicate the render and the click re-check both use.
+        fn restart_now_armed(&self) -> bool {
+            !self.running
+                && !self.before.is_empty()
+                && self.staged_selection.as_deref()
+                    == Some(cassandra_cert::selection_key(&self.selected).as_slice())
+                && matches!(&self.result, Some(CassandraOutcome::Applied(rep)) if cassandra_all_staged(rep))
         }
 
         /// The gate Apply is judged by, built only from the dialog's own
@@ -1975,6 +1994,7 @@ mod gui {
                     self.before.clear();
                     self.dates.clear();
                     self.node_results.clear();
+                    self.staged_selection = None;
                     self.dry_selection = Some(cassandra_cert::selection_key(&self.selected));
                 }
                 CassandraAction::StartPreflight => {
@@ -1987,6 +2007,9 @@ mod gui {
                 // One dry run / preflight arms one restart.
                 CassandraAction::Apply => {
                     self.node_results.clear();
+                    // What this stage was run for: the selection Restart now
+                    // must still match.
+                    self.staged_selection = Some(cassandra_cert::selection_key(&self.selected));
                     self.dry_selection = None;
                     self.unchecked_stopped = stopped;
                 }
@@ -2007,6 +2030,7 @@ mod gui {
             self.confirm_outside = false;
             self.approve_rollback = false;
             self.node_results.clear();
+            self.staged_selection = None;
             self.dry = None;
             self.dry_selection = None;
             self.dates.clear();
@@ -29234,7 +29258,7 @@ mod gui {
                                 ui.separator();
                                 ui.label(egui::RichText::new("Update result").strong());
                                 // Restarts are offered only when every node staged.
-                                let offer_restart = cassandra_all_staged(rep) && !dlg.running;
+                                let offer_restart = dlg.restart_now_armed();
                                 if offer_restart {
                                     ui.weak(
                                         "Restarting nodes one at a time leaves the cluster on mixed certs \
@@ -29250,7 +29274,9 @@ mod gui {
                                         offer_rollback |= sev.is_problem();
                                         cassandra_severity_label(ui, sev, format!("{} restart: {text}", t.name));
                                     }
-                                    if offer_restart {
+                                    // A node already restarted is not offered a
+                                    // second, avoidable outage.
+                                    if offer_restart && !dlg.node_results.contains_key(&t.instance_id) {
                                         ui.horizontal(|ui| {
                                             if ui
                                                 .button("Restart now")
@@ -29434,7 +29460,7 @@ mod gui {
                             .find(|n| &n.instance_id == instance_id)
                             .map(|n| cassandra_flow::Target { instance_id: n.instance_id.clone(), name: n.name.clone() });
                         // Honoured only while the state that offered it still holds.
-                        if let (Some(target), true) = (target, cassandra_all_staged_in(&dlg)) {
+                        if let (Some(target), true) = (target, dlg.restart_now_armed()) {
                             job = Some(CassandraJob::RestartNow {
                                 account_id,
                                 env,
@@ -46965,12 +46991,6 @@ mod gui {
             && rep.nodes.iter().all(|(_, st)| matches!(st, cassandra_flow::NodeStatus::Staged))
     }
 
-    /// `cassandra_all_staged` of the result the dialog holds now: a Restart
-    /// now click is honoured only while the state that offered it still holds.
-    fn cassandra_all_staged_in(dlg: &CassandraDialog) -> bool {
-        matches!(&dlg.result, Some(CassandraOutcome::Applied(rep)) if cassandra_all_staged(rep))
-    }
-
     /// One node's rollback outcome as a line of text, and whether it is a
     /// problem.
     fn cassandra_rollback_status_text(status: &cassandra_flow::RollbackStatus) -> (String, bool) {
@@ -58604,6 +58624,79 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let (_, finished) = cassandra_settle(&mut inflight, &mut pending, id, &ev).expect("settles");
             assert!(finished.is_none());
             assert!(inflight.is_none(), "the restart is terminal");
+        }
+
+        /// A dialog that has just staged its selection (i-1, i-2) and holds
+        /// the all-staged report: Restart now is offered.
+        fn cass_staged_dialog() -> CassandraDialog {
+            let mut d = cass_armed_apply_dialog();
+            d.before.insert("i-1".into(), cass_cert(1_700_000_000, "AA"));
+            d.before.insert("i-2".into(), cass_cert(1_700_000_000, "AA"));
+            d.job_started(CassandraAction::Apply, Vec::new());
+            d.result = Some(CassandraOutcome::Applied(cassandra_flow::ApplyReport {
+                nodes: vec![
+                    (cass_target("i-1", "cassandra-001"), cassandra_flow::NodeStatus::Staged),
+                    (cass_target("i-2", "cassandra-002"), cassandra_flow::NodeStatus::Staged),
+                ],
+                stale: None,
+                restarted: false,
+            }));
+            d
+        }
+
+        #[test]
+        fn restart_now_is_armed_by_a_fresh_stage_of_the_current_selection() {
+            let d = cass_staged_dialog();
+            assert!(d.restart_now_armed());
+            let mut d = cass_staged_dialog();
+            d.running = true;
+            assert!(!d.restart_now_armed(), "a job is running");
+            let mut d = cass_staged_dialog();
+            d.before.clear();
+            assert!(!d.restart_now_armed(), "no before certs: the renewal check would be lost");
+        }
+
+        #[test]
+        fn a_selection_change_disarms_restart_now() {
+            // As the UI does it: the selection moves, then the results are forgotten.
+            let mut d = cass_staged_dialog();
+            d.selected.retain(|id| id != "i-2");
+            d.forget_selection_results();
+            assert!(!d.restart_now_armed());
+            // Even back to the staged set: the stage was voided.
+            d.selected.push("i-2".into());
+            assert!(!d.restart_now_armed());
+            // And without the forget, a different selection still does not match.
+            let mut d = cass_staged_dialog();
+            d.selected.push("i-3".into());
+            assert!(!d.restart_now_armed());
+            // The click re-check is this same predicate.
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let body = method_body(src, "fn render_cassandra_dialog");
+            let arm = &body[body.find("CassandraAction::RestartNow(ref instance_id)").expect("the arm")..];
+            let arm = &arm[..arm.find("CassandraAction::ConfirmRollback").expect("next arm")];
+            assert!(arm.contains("dlg.restart_now_armed()"), "{arm}");
+            assert!(body.contains("let offer_restart = dlg.restart_now_armed();"));
+        }
+
+        #[test]
+        fn forgetting_a_stuck_job_disarms_restart_now() {
+            let mut d = cass_staged_dialog();
+            // What the ForgetStuck arm does to the dialog.
+            d.running = false;
+            d.forget_selection_results();
+            assert!(!d.restart_now_armed());
+        }
+
+        #[test]
+        fn a_restart_now_start_keeps_the_staged_result_and_clears_the_error() {
+            let mut d = cass_staged_dialog();
+            d.error = Some("old".into());
+            d.job_started(CassandraAction::RestartNow("i-1".into()), Vec::new());
+            assert!(matches!(d.result, Some(CassandraOutcome::Applied(_))));
+            assert!(d.error.is_none());
+            assert!(d.restart_now_armed(), "the next node can still be restarted");
         }
 
         #[test]
