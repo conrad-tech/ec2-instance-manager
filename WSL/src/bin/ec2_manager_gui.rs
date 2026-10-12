@@ -10280,6 +10280,11 @@ mod gui {
         /// config only when its `Scheduled` event reports every node
         /// confirmed. Cleared on `Failed`, on a refused start and on Forget.
         cassandra_pending_schedule: Option<(String, String, cassandra_cert::ScheduleRecord)>,
+        /// The undo `CancelSchedule` in flight after a failed Schedule:
+        /// `(was a reschedule, the nodes the schedule failed on)`, so its
+        /// `Cancelled` says what happened. Cleared by that result, by its
+        /// `Failed` and by Forget.
+        cassandra_schedule_undo: Option<(bool, String)>,
         /// The Cassandra job in flight, if any. Set when a job starts, cleared
         /// by its terminal event. Its `(account, env)` is what decides whether
         /// an event may touch the open dialog.
@@ -11156,6 +11161,7 @@ mod gui {
                 cassandra_pending_run: None,
                 cassandra_schedule_dialog: None,
                 cassandra_pending_schedule: None,
+                cassandra_schedule_undo: None,
                 cassandra_inflight: None,
                 cassandra_inbox: Vec::new(),
                 cassandra_next_job_id: 0,
@@ -28750,8 +28756,9 @@ mod gui {
                             ui,
                             amber,
                             format!(
-                                "Restart scheduled for {} on {} node(s). Dry-run, Update cert and \
-                                 Restart now are refused until it is cancelled or done.",
+                                "Restart scheduled for {} on {} node(s). Dry-run, Update cert, \
+                                 Restart now and Confirm rollback are refused until it is cancelled \
+                                 or done.",
                                 cassandra_local_time(rec.when),
                                 rec.nodes.len()
                             ),
@@ -29323,12 +29330,16 @@ mod gui {
                             let why = dlg.rollback_blocker();
                             let enabled = dlg.rollback_armed();
                             if ui
-                                .add_enabled(enabled, egui::Button::new("Confirm rollback"))
+                                .add_enabled(enabled && !scheduled, egui::Button::new("Confirm rollback"))
                                 .on_hover_text(
                                     "Saves each node's current stores as .rollback.<TS>, restores \
                                      the chosen backup, then restarts the nodes all at once.",
                                 )
-                                .on_disabled_hover_text(why.unwrap_or(""))
+                                .on_disabled_hover_text(if scheduled {
+                                    CASSANDRA_SCHEDULED_REFUSAL
+                                } else {
+                                    why.unwrap_or("")
+                                })
                                 .clicked()
                             {
                                 action = Some(CassandraAction::ConfirmRollback);
@@ -29530,6 +29541,7 @@ mod gui {
                         self.cassandra_pending_run = None;
                         // A forgotten Schedule job's late result writes no record.
                         self.cassandra_pending_schedule = None;
+                        self.cassandra_schedule_undo = None;
                         dlg.running = false;
                         dlg.confirm_forget = false;
                         dlg.confirm_close = false;
@@ -29640,8 +29652,12 @@ mod gui {
                         }
                     }
                     CassandraAction::ConfirmRollback => {
+                        // A rollback swaps the keystore and restarts the
+                        // nodes; the queued cron would restart them again.
+                        if scheduled {
+                            dlg.error = Some(CASSANDRA_SCHEDULED_REFUSAL.to_string());
                         // The click is honoured only if the gate still holds.
-                        if let (true, Some((old, _))) = (dlg.rollback_armed(), dlg.rollback_old_cert()) {
+                        } else if let (true, Some((old, _))) = (dlg.rollback_armed(), dlg.rollback_old_cert()) {
                             let pre = dlg.preflight.clone().unwrap_or_default();
                             let (restore, skipped) =
                                 cassandra_rollback_plan(&pre, &dlg.rollback_verdicts());
@@ -30082,7 +30098,7 @@ mod gui {
                             ),
                         }
                     } else {
-                        // Some nodes may hold the cron job and some not: undo the lot, say so.
+                        // Some nodes may hold the cron job and some not: undo, say so.
                         self.log_cassandra(
                             LogLevel::Warn,
                             format!("cassandra: scheduling failed on: {}", failed.join("; ")),
@@ -30090,20 +30106,12 @@ mod gui {
                     }
                     if let Some(dlg) = self.cassandra_dialog.as_mut().filter(|_| applies) {
                         dlg.running = false;
-                        if !failed.is_empty() {
-                            let undo = if rows.iter().any(|(_, r)| r.is_ok()) {
-                                " The nodes that took it are being cancelled."
-                            } else {
-                                ""
-                            };
-                            dlg.error = Some(format!(
-                                "The restart was not scheduled: {}.{undo}",
-                                failed.join("; ")
-                            ));
-                        }
                     }
                     if !failed.is_empty() {
-                        self.cassandra_undo_partial_schedule(&owner, &rows);
+                        let text = self.cassandra_undo_partial_schedule(&owner, &rows, failed.join("; "));
+                        if let Some(dlg) = self.cassandra_dialog.as_mut().filter(|_| applies) {
+                            dlg.error = Some(text);
+                        }
                     }
                 }
                 CassandraEvent::Cancelled(rows) => {
@@ -30120,19 +30128,13 @@ mod gui {
                             ),
                         }
                     }
+                    let record = self.config.cassandra_schedule(&owner.account_id, &owner.env);
+                    let undo = self.cassandra_schedule_undo.take();
                     if failed.is_empty() {
                         // The record goes only when every node it names was
-                        // cancelled. The undo of a partial schedule names a
-                        // subset (and usually no record exists for it).
-                        let covered = self
-                            .config
-                            .cassandra_schedule(&owner.account_id, &owner.env)
-                            .is_some_and(|rec| {
-                                rec.nodes
-                                    .iter()
-                                    .all(|n| rows.iter().any(|(t, _)| t.instance_id == n.instance_id))
-                            });
-                        if covered {
+                        // cancelled. The undo of a first schedule names a
+                        // subset (and no record exists for it).
+                        if cassandra_cancel_clears_record(record.as_ref(), &rows) {
                             self.config.clear_cassandra_schedule(&owner.account_id, &owner.env);
                             if let Err(e) = self.config.save() {
                                 self.log_cassandra(
@@ -30149,14 +30151,44 @@ mod gui {
                             format!("cassandra: could not cancel on: {}", failed.join("; ")),
                         );
                     }
+                    let not_cancelled = failed.join("; ");
+                    let text = match (undo, failed.is_empty(), record.is_some()) {
+                        (Some((true, why)), true, _) => Some(format!(
+                            "The reschedule failed on: {why}. The restart was cancelled on every node; \
+                             schedule it again."
+                        )),
+                        (Some((true, why)), false, _) => Some(format!(
+                            "The reschedule failed on: {why}, and the restart could not be cancelled on: \
+                             {not_cancelled}. The schedule record is kept; check those nodes' cron by hand."
+                        )),
+                        (Some((false, why)), true, _) => Some(format!(
+                            "The restart was not scheduled: {why}. It was cancelled on the nodes that took it."
+                        )),
+                        (Some((false, why)), false, false) => Some(format!(
+                            "The restart was not scheduled: {why}. These nodes still hold a restart with \
+                             no record: {not_cancelled}. Check them by hand."
+                        )),
+                        (Some((false, why)), false, true) => Some(format!(
+                            "The restart was not scheduled: {why}, and could not be cancelled on: \
+                             {not_cancelled}. Check those nodes' cron by hand."
+                        )),
+                        (None, true, _) => None,
+                        (None, false, true) => Some(format!(
+                            "Cancel did not reach every node: {not_cancelled}. The schedule record is \
+                             kept; check those nodes' cron by hand."
+                        )),
+                        (None, false, false) => Some(format!(
+                            "Cancel did not reach every node: {not_cancelled}. These nodes still hold a \
+                             restart with no record; check them by hand."
+                        )),
+                    };
+                    if let Some(t) = &text {
+                        self.log_cassandra(LogLevel::Warn, format!("cassandra: {t}"));
+                    }
                     if let Some(dlg) = self.cassandra_dialog.as_mut().filter(|_| applies) {
                         dlg.running = false;
-                        if !failed.is_empty() {
-                            dlg.error = Some(format!(
-                                "Cancel did not reach every node: {}. Any schedule record is kept; check \
-                                 those nodes' cron by hand.",
-                                failed.join("; ")
-                            ));
+                        if text.is_some() {
+                            dlg.error = text;
                         }
                     }
                 }
@@ -30169,11 +30201,28 @@ mod gui {
                     if owner.kind == CassandraJobKind::Schedule {
                         self.cassandra_pending_schedule = None;
                     }
+                    let undo_failed = (owner.kind == CassandraJobKind::CancelSchedule)
+                        .then(|| self.cassandra_schedule_undo.take())
+                        .flatten();
+                    if let Some((_, why)) = &undo_failed {
+                        self.log_cassandra(
+                            LogLevel::Error,
+                            format!(
+                                "cassandra: the schedule failed on {why} and the cancel that undoes it \
+                                 failed too; nodes may still hold a restart: check their cron by hand"
+                            ),
+                        );
+                    }
                     if let Some(dlg) = self.cassandra_dialog.as_mut().filter(|_| applies) {
                         if owner.kind == CassandraJobKind::RestartNow {
                             // Keep the staged result (and its per-node buttons)
                             // on screen; say what happened to this restart.
                             dlg.error = Some(format!("Restart now failed: {msg}"));
+                        } else if let Some((_, why)) = undo_failed {
+                            dlg.error = Some(format!(
+                                "The schedule failed on: {why}, and cancelling it failed: {msg}. Nodes may \
+                                 still hold a restart; check their cron by hand."
+                            ));
                         } else if matches!(owner.kind, CassandraJobKind::Schedule | CassandraJobKind::CancelSchedule) {
                             // The staged result stays: the user may still act on it.
                             dlg.error = Some(format!("Scheduling failed: {msg}"));
@@ -30186,39 +30235,53 @@ mod gui {
             }
         }
 
-        /// A Schedule job reached some nodes and not others: cancel it on
-        /// the ones that took it, so no node restarts alone. Nothing is in
-        /// flight (the `Scheduled` event just settled the job), so the
-        /// cancel is admitted; its own `Cancelled` event reports any node it
-        /// could not reach.
+        /// A Schedule job failed on some node (`failed`): undo it so no
+        /// node restarts alone. A reschedule cancels every node of the saved
+        /// record; a first schedule cancels the nodes that took it (see
+        /// `cassandra_schedule_undo`). Nothing is in flight (the `Scheduled`
+        /// event just settled the job), so the cancel is admitted; its own
+        /// `Cancelled` says how it went. Returns the dialog's line for now.
         fn cassandra_undo_partial_schedule(
             &mut self,
             owner: &CassandraInflight,
             rows: &[(cassandra_flow::Target, std::result::Result<(), String>)],
-        ) {
-            let took: Vec<cassandra_flow::Target> =
-                rows.iter().filter(|(_, r)| r.is_ok()).map(|(t, _)| t.clone()).collect();
-            if took.is_empty() {
-                return;
-            }
+            failed: String,
+        ) -> String {
+            let existing = self.config.cassandra_schedule(&owner.account_id, &owner.env);
+            let Some((targets, reschedule)) = cassandra_schedule_undo(existing.as_ref(), rows) else {
+                return format!("The restart was not scheduled: {failed}.");
+            };
+            let names = targets.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ");
             self.log_cassandra(
                 LogLevel::Warn,
-                format!(
-                    "cassandra: cancelling the partial schedule on: {}",
-                    took.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
-                ),
+                if reschedule {
+                    format!("cassandra: the reschedule failed; cancelling the restart on every node: {names}")
+                } else {
+                    format!("cassandra: cancelling the partial schedule on: {names}")
+                },
             );
             let job = CassandraJob::CancelSchedule {
                 account_id: owner.account_id.clone(),
                 env: owner.env.clone(),
-                targets: took,
+                targets,
             };
-            if !self.start_cassandra_job(job) {
+            if self.start_cassandra_job(job) {
+                self.cassandra_schedule_undo = Some((reschedule, failed.clone()));
+                if reschedule {
+                    format!("The reschedule failed on: {failed}. Cancelling the restart on every node...")
+                } else {
+                    format!("The restart was not scheduled: {failed}. Cancelling it on the nodes that took it...")
+                }
+            } else {
                 self.log_cassandra(
                     LogLevel::Error,
-                    "cassandra: the partial schedule could not be cancelled; some nodes still hold \
-                     the restart cron job: remove it by hand",
+                    "cassandra: the failed schedule could not be undone; nodes may still hold the \
+                     restart cron job: remove it by hand",
                 );
+                format!(
+                    "The schedule failed on: {failed}, and could not be undone. Nodes may still hold a \
+                     restart; check their cron by hand."
+                )
             }
         }
 
@@ -47570,6 +47633,49 @@ mod gui {
         (tomorrow.format("%Y-%m-%d").to_string(), "02:00".to_string())
     }
 
+    /// What to cancel after a Schedule job failed on some node, and
+    /// whether it was a reschedule. A reschedule (a record already exists)
+    /// cancels EVERY node in the record: the nodes that took the new time
+    /// lost the old one, so cancelling only them would leave the rest to
+    /// restart alone at the old time. A first schedule (no record) cancels
+    /// only the nodes that took it. `None` when there is nothing to cancel.
+    fn cassandra_schedule_undo(
+        existing: Option<&cassandra_cert::ScheduleRecord>,
+        rows: &[(cassandra_flow::Target, std::result::Result<(), String>)],
+    ) -> Option<(Vec<cassandra_flow::Target>, bool)> {
+        match existing {
+            Some(rec) => {
+                let all: Vec<cassandra_flow::Target> = rec
+                    .nodes
+                    .iter()
+                    .map(|n| cassandra_flow::Target { instance_id: n.instance_id.clone(), name: n.name.clone() })
+                    .collect();
+                (!all.is_empty()).then_some((all, true))
+            }
+            None => {
+                let took: Vec<cassandra_flow::Target> =
+                    rows.iter().filter(|(_, r)| r.is_ok()).map(|(t, _)| t.clone()).collect();
+                (!took.is_empty()).then_some((took, false))
+            }
+        }
+    }
+
+    /// Whether a cancel result removes the saved record: every row
+    /// confirmed AND the rows cover every node the record names. A subset
+    /// cancel, or one that failed anywhere, keeps it: a node may still
+    /// restart at the recorded time.
+    fn cassandra_cancel_clears_record(
+        rec: Option<&cassandra_cert::ScheduleRecord>,
+        rows: &[(cassandra_flow::Target, std::result::Result<(), String>)],
+    ) -> bool {
+        rows.iter().all(|(_, r)| r.is_ok())
+            && rec.is_some_and(|rec| {
+                rec.nodes
+                    .iter()
+                    .all(|n| rows.iter().any(|(t, _)| t.instance_id == n.instance_id))
+            })
+    }
+
     /// The failed rows of a schedule / cancel result as `name: error`.
     fn cassandra_failed_rows(rows: &[(cassandra_flow::Target, std::result::Result<(), String>)]) -> Vec<String> {
         rows.iter()
@@ -59450,7 +59556,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let arm = &body[body.find("CassandraAction::OpenSchedule(ref only) =>").expect("the arm")..];
             let arm = &arm[..arm.find("CassandraAction::ConfirmRollback =>").expect("next arm")];
             assert!(arm.contains("dlg.restart_now_armed()"), "{arm}");
-            for act in ["CassandraAction::StartDryRun =>", "CassandraAction::Apply =>", "CassandraAction::RestartNow(ref instance_id) =>", "CassandraAction::OpenSchedule(ref only) =>"] {
+            for act in ["CassandraAction::StartDryRun =>", "CassandraAction::Apply =>", "CassandraAction::RestartNow(ref instance_id) =>", "CassandraAction::OpenSchedule(ref only) =>", "CassandraAction::ConfirmRollback =>"] {
                 let a = &body[body.find(act).expect(act)..];
                 let a = &a[..a.find("\n                    CassandraAction::").unwrap_or(a.len())];
                 assert!(a.contains("CASSANDRA_SCHEDULED_REFUSAL"), "{act} must refuse while scheduled");
@@ -59459,6 +59565,94 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 body.matches("on_disabled_hover_text(CASSANDRA_SCHEDULED_REFUSAL)").count() >= 1,
                 "the disabled buttons say why"
             );
+        }
+
+        /// Confirm rollback swaps the keystore and restarts the nodes, so it
+        /// is refused (button and click) while a restart is scheduled; the
+        /// read-only Roll back preflight stays open.
+        #[test]
+        fn confirm_rollback_is_refused_while_a_restart_is_scheduled() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let body = method_body(src, "fn render_cassandra_dialog(");
+            assert!(body.contains(".add_enabled(enabled && !scheduled, egui::Button::new(\"Confirm rollback\"))"));
+            let btn = &body[body.find("egui::Button::new(\"Confirm rollback\")").expect("button")..];
+            let btn = &btn[..btn.find(".clicked()").expect("click")];
+            assert!(btn.contains("CASSANDRA_SCHEDULED_REFUSAL"), "{btn}");
+            let arm = &body[body.find("CassandraAction::ConfirmRollback =>").expect("arm")..];
+            let refuse = arm.find("CASSANDRA_SCHEDULED_REFUSAL").expect("the click refuses");
+            let job = arm.find("CassandraJob::Rollback").expect("the job");
+            assert!(refuse < job, "the refusal comes before the job is built");
+            // The preflight is read-only and stays available.
+            let pre = &body[body.find("CassandraAction::StartPreflight =>").expect("preflight arm")..];
+            let pre = &pre[..pre.find("\n                    CassandraAction::").unwrap_or(pre.len())];
+            assert!(!pre.contains("CASSANDRA_SCHEDULED_REFUSAL"));
+        }
+
+        fn sched_rows(ok: &[&str], bad: &[&str]) -> Vec<(cassandra_flow::Target, std::result::Result<(), String>)> {
+            ok.iter()
+                .map(|i| (cass_target(i, i), Ok(())))
+                .chain(bad.iter().map(|i| (cass_target(i, i), Err("rc 3".to_string()))))
+                .collect()
+        }
+
+        fn sched_record(ids: &[&str]) -> cassandra_cert::ScheduleRecord {
+            cassandra_cert::ScheduleRecord {
+                when: 1_900_000_000,
+                state: cassandra_cert::SchedState::Scheduled,
+                nodes: ids
+                    .iter()
+                    .map(|i| cassandra_cert::ScheduledNode {
+                        instance_id: i.to_string(),
+                        name: i.to_string(),
+                        before_cert: String::new(),
+                    })
+                    .collect(),
+                domain: "dev1.example.net".into(),
+            }
+        }
+
+        /// A failed reschedule cancels every node of the saved record (the
+        /// nodes that took the new time lost the old one), and the record
+        /// survives until a cancel confirms on all of them.
+        #[test]
+        fn a_failed_reschedule_cancels_every_record_node_and_keeps_the_record_until_confirmed() {
+            let rec = sched_record(&["i-1", "i-2", "i-3"]);
+            let rows = sched_rows(&["i-1", "i-2"], &["i-3"]);
+            let (targets, reschedule) = cassandra_schedule_undo(Some(&rec), &rows).expect("an undo");
+            assert!(reschedule);
+            let ids: Vec<&str> = targets.iter().map(|t| t.instance_id.as_str()).collect();
+            assert_eq!(ids, ["i-1", "i-2", "i-3"]);
+            // Even when no node took the new time, the old one is in doubt.
+            assert!(cassandra_schedule_undo(Some(&rec), &sched_rows(&[], &["i-1", "i-2", "i-3"])).is_some());
+            // The cancel of all three, one failing: the record is kept.
+            assert!(!cassandra_cancel_clears_record(Some(&rec), &sched_rows(&["i-1", "i-2"], &["i-3"])));
+            // A subset cancel (the old, wrong undo): kept.
+            assert!(!cassandra_cancel_clears_record(Some(&rec), &sched_rows(&["i-1", "i-2"], &[])));
+            // Every node confirmed: removed.
+            assert!(cassandra_cancel_clears_record(Some(&rec), &sched_rows(&["i-1", "i-2", "i-3"], &[])));
+        }
+
+        /// A first schedule that fails on some node cancels only the nodes
+        /// that took it, and no record is written (the write happens only
+        /// when every node confirmed).
+        #[test]
+        fn a_failed_first_schedule_cancels_only_the_nodes_that_took_it() {
+            let rows = sched_rows(&["i-1"], &["i-2"]);
+            let (targets, reschedule) = cassandra_schedule_undo(None, &rows).expect("an undo");
+            assert!(!reschedule);
+            let ids: Vec<&str> = targets.iter().map(|t| t.instance_id.as_str()).collect();
+            assert_eq!(ids, ["i-1"]);
+            assert!(cassandra_schedule_undo(None, &sched_rows(&[], &["i-1", "i-2"])).is_none());
+            assert!(!cassandra_cancel_clears_record(None, &sched_rows(&["i-1"], &[])), "no record to clear");
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let handle = method_body(src, "fn handle_cassandra_event(");
+            let arm = &handle[handle.find("CassandraEvent::Scheduled(rows) =>").expect("the arm")..];
+            let arm = &arm[..arm.find("CassandraEvent::Cancelled(rows) =>").expect("next arm")];
+            let write = arm.find("set_cassandra_schedule(").expect("the write");
+            let undo = arm.find("cassandra_undo_partial_schedule(").expect("the undo");
+            assert!(arm[..write].contains("if failed.is_empty()") && write < undo);
         }
 
         /// The schedule window is draggable (`pivot` + `default_pos`), never
