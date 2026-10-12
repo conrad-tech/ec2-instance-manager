@@ -4040,11 +4040,13 @@ environment, so selecting across sets, or every node of several sets, shows
 red nodes / "You selected every node in N clusters" and needs a tick.
 
 **Stale results never arm a restart.** The dialog stores the selection a dry
-run / preflight was started for; Apply and Confirm rollback need that, the ids
-the result carries and the current selection to be the same set, plus
-no running job and (when needed) the cross-set tick. Changing
-the selection clears every result and tick; a click re-checks the gate before
-building the job, and one dry run / preflight arms one restart.
+run / preflight was started for; Update cert needs the dry run's selection,
+and Confirm rollback the preflight's, to equal the ids the result carries and
+the current selection, plus no running job and (when needed) the cross-set
+tick. Changing the selection clears every result and tick; a click re-checks
+the gate before building the job. One dry run arms one stage (Update cert),
+and one preflight arms one Confirm rollback; the restart after a stage is
+gated separately (`restart_now_armed`, below).
 
 **Stage, then restart: Update cert never restarts.** The flow is Dry-run
 (read-only) -> Update cert -> per node **Restart now** / **Schedule restart**
@@ -4060,9 +4062,19 @@ continuously `active` for `restart_stable_secs` or fails at
 **One failed node means nobody restarts -- now by gating the buttons.**
 `CassandraDialog::restart_now_armed()` needs nothing running, a non-empty
 `before` (the dry run's certs), `staged_selection` equal to the current
-selection, and every node `Staged`. A selection change, an environment reload
-or ForgetStuck clears `staged_selection`, so a stale stage never arms a
-restart. Why: nodes on different certs cannot talk to each other. Restarting
+selection, every node `Staged`, and **no `node_results` entry that is a
+problem** (`describe_apply_status(..).0.is_problem()`: RestartFailed,
+DidNotStabilise, NotRenewed, Flagged, Unverified) -- once one node's restart
+went wrong the others get no Restart now or Schedule restart, only the Roll
+back shortcut. A selection change, an environment reload or ForgetStuck clears
+`staged_selection`, so a stale stage never arms a restart; so does cron taking
+over (`schedule_took_over`: when a schedule record is saved, and again on
+Confirm complete, which also marks each node's checked outcome in
+`node_results`), so nodes cron restarted are never offered Restart now again
+until a new Dry-run + Update cert. Restart now is also off while a Schedule
+restart window is open for the same environment, and the Schedule submit
+drops any node that already has a `node_results` entry (refusing when none is
+left), so no node gets a manual restart and then a cron one. Why: nodes on different certs cannot talk to each other. Restarting
 one at a time leaves the cluster on mixed certs until the last is done (the UI
 says so); Schedule for all nodes moves them together.
 
@@ -4082,24 +4094,65 @@ anniversary.
 JSON line (`ScheduleRecord`: `when`, `state` Scheduled / Checking /
 AwaitingConfirm, `nodes` with the dry run's raw openssl text as `before_cert`
 so the comparison survives an app restart, and `domain`). It is written only
-after EVERY node confirms. A partial first-time failure undoes the nodes that
+after EVERY node confirms -- except the orphan records below. A partial first-time failure undoes the nodes that
 took it and writes no record; a failed Reschedule cancels EVERY node in the
 record (`cassandra_schedule_undo`: a node that took the new time lost the old
 one, so cancelling only those would leave the rest to fire alone) and clears
 the record only when the whole cancel confirms
 (`cassandra_cancel_clears_record`); a failed Cancel keeps the record.
 
-**While a record exists** Dry-run, Update cert, Restart now and Confirm
-rollback are refused (`CASSANDRA_SCHEDULED_REFUSAL`: re-staging would change
-the keystore under the queued restart). The read-only Roll back preflight
-stays open: a rollback swaps the keystore and restarts, and the queued cron
-would then restart a second time.
+**Orphan records: a cron job no record covers is never left invisible.** Three
+paths could leave the job on nodes with no record (so no notice, no checks,
+and Dry-run / Update cert / Confirm rollback not refused): the undo of a
+failed first schedule that cannot reach every node, a late `Scheduled` (or
+`Failed`) from a Schedule job that was forgotten as stuck
+(`cassandra_forgotten_schedules`, keyed by job id), and a Schedule job that
+ends in `Failed` part-way. Each saves a `ScheduleRecord`
+(`cassandra_orphan_record`: state Scheduled, the attempted time, every node
+that MAY hold the job, `before_cert` where known) through
+`cassandra_save_orphan_record`, which **never overwrites an existing record**
+(`cassandra_put_orphan_record`) and puts a line on the status bar. The notice,
+the Cancel chip (which retries the removal) and every refusal come back; a
+cancel of a node with no cron file still succeeds. A failed Reschedule keeps
+the live record it already has. Cost, accepted: a record may name a cron job
+that is not really there, and the user cancels it.
+
+**Cancel says whether it removed anything.** `--cancel` prints
+`__CC_SCHED_NONE__ removed` or `__CC_SCHED_NONE__ absent`
+(`cassandra_flow::CancelOutcome`; a bare `__CC_SCHED_NONE__` reads as Absent,
+the safe side). When a user Cancel of the live record confirms everywhere but
+a node was **absent** once the lock window had begun, that node's job may
+already have run (it removes its own file first): the record is kept for
+exactly the absent nodes (`cassandra_record_kept_after_cancel`) and the user
+is told "<node> had no restart queued (it may already have run): the checks
+will still run", so the checks and Confirm complete take over. An absent file
+earlier than that cannot be a fired job and the cancel clears normally.
+
+**While a record exists** Dry-run, Update cert, Restart now, Schedule restart
+and Confirm rollback are refused (`CASSANDRA_SCHEDULED_REFUSAL`: re-staging
+would change the keystore under the queued restart). Confirm rollback is
+refused because a rollback swaps the keystore and restarts, and the queued
+cron would then restart a second time; the read-only Roll back preflight
+stays open.
 
 **Top bar and monitor.** Each scheduled environment gets a Reschedule / Cancel
-chip right of Close All, live only while state is Scheduled and now < `when`
-(`cassandra_chip_actions`; `cassandra_reschedule_allowed` re-checks on submit,
-and a reschedule after the restart time is refused). The flashing yellow notice
-is not dismissible for the life of the record. `cassandra_schedule_rows` is
+chip right of Close All, live only while state is Scheduled and now <
+`when - CASSANDRA_SCHEDULE_LOCK_SECS` (120 s, = `MIN_LEAD_SECS`;
+`cassandra_chip_actions`, and `cassandra_reschedule_allowed` re-checks the
+same rule on submit and every frame the window is open). The lock exists
+because cron fires on the minute (up to 59 s before `when`) and an SSM round
+trip takes seconds: a last-second Cancel could report success over a restart
+that already ran, and a last-second Reschedule could queue a second outage. A
+Cancel click refused because another job runs is said on the status line
+(`self.message`), not only in the log. The flashing yellow notice is not
+dismissible for the life of the record, and is phase-aware
+(`cassandra_notice_text_for`): before the time it names the restart time;
+after it, "checks waiting for credentials" / "checks waiting (credential
+status unknown)" / "checks starting" / "checks failed, retrying", then
+"checking the nodes" and "checks finished - confirm in the Scheduled restart
+window". When an account's auth status cannot be resolved at all
+(`cassandra_account_auth_state` is `None`), the wait log line says so rather
+than implying expired credentials. `cassandra_schedule_rows` is
 UNGATED on purpose: a live cron restart must stay visible and cancellable even
 if the user relaunched without Cassandra Cert access; only Reschedule is gated.
 The monitor, checks and confirm window are gate-independent.
@@ -4191,8 +4244,8 @@ alphanumerics `.` `-`, at most **253** chars: a whole DNS name, not one
 
 - **No domain, no update.** An environment with no `domain` (or a blank one)
   shows a red line in the dialog header -- `this environment has no domain in
-  accounts.json: add a "domain" to its entry` -- and Update cert / Apply
-  set the same line and start nothing. An invalid domain is refused the same
+  accounts.json: add a "domain" to its entry` -- and Dry-run and Update cert
+  show the same line and start nothing (as does opening Schedule restart). An invalid domain is refused the same
   way, naming it and the rule. The header shows `Domain: <domain>` otherwise.
 - **Rollback and preflight do not need it** and keep working without one.
 - **Manage Accounts environments never have a domain**: they carry a
@@ -4222,9 +4275,11 @@ stuck - forget it", which clears the record, the pending run and every dry run
 / preflight result and approval in the dialog (nodes may be mid-restart and
 must be checked by hand).
 
-The restart gates are built in one place: `CassandraDialog::apply_gate` /
-`rollback_gate`, from the dialog's own fields, and both the button state and
-the click re-check go through `apply_armed` / `rollback_armed`. A start only
+The gates are built from the dialog's own fields, each in one place, and the
+button state and the click re-check use the same predicate:
+`apply_gate` / `apply_armed` for Update cert (a stage: it restarts nothing),
+`rollback_gate` / `rollback_armed` for Confirm rollback, and
+`restart_now_armed` for Restart now and Schedule restart. A start only
 replaces what the dialog shows once `start_cassandra_job` admitted it.
 
 **Open items.** `nodetool drain` is not run before the restart. (The old
@@ -4232,8 +4287,8 @@ open item -- `$env_domain` being the lowercased environment name, unconfirmed
 against the SSM paths -- is resolved: it is now the declared `domain`.)
 
 Build status for this feature: `cargo test --features gui` measured
-2026-10-12 on `cassandra-restart-scheduling` at 1142 lib + 3 CLI + 724 GUI,
-0 failed. Test builds carry 3 pre-existing warnings (1 lib duplicated
+2026-10-12 on `cassandra-restart-scheduling` (after the final review fixes)
+at 1144 lib + 3 CLI + 733 GUI, 0 failed. Test builds carry 3 pre-existing warnings (1 lib duplicated
 attribute, 2 GUI unneeded `mut`); the plain GUI build and the Windows
 release cross-compile (`x86_64-pc-windows-gnu`) each show 1 GUI unused-`mut`
 warning and finish. The real-shell wrapper tests run under `bash`
