@@ -29878,6 +29878,7 @@ mod gui {
                 return;
             }
             let amber = egui::Color32::from_rgb(220, 160, 40);
+            let red = egui::Color32::from_rgb(220, 80, 80);
             let mut confirm: Option<(String, String)> = None;
             let mut checking = false;
             let results = &self.cassandra_watch_results;
@@ -29918,6 +29919,10 @@ mod gui {
                                         amber,
                                         format!("Still serving the old cert: {}", stale.join(", ")),
                                     );
+                                }
+                                let problems = cassandra_problem_nodes(rep);
+                                if problems > 0 {
+                                    note_label(ui, red, cassandra_problem_note(problems));
                                 }
                             }
                             None => {
@@ -30023,6 +30028,19 @@ mod gui {
             let Some(mut sd) = self.cassandra_schedule_dialog.take() else {
                 return;
             };
+            if sd.reschedule {
+                let (account_id, env) = &sd.env_key;
+                let rec = self.config.cassandra_schedule(account_id, env);
+                if !cassandra_reschedule_allowed(rec.as_ref(), chrono::Utc::now().timestamp()) {
+                    // The time came (or the record changed) while the window
+                    // was open: it can no longer be moved, so close it.
+                    self.log_cassandra(
+                        LogLevel::Warn,
+                        format!("cassandra: {env} reschedule closed: {CASSANDRA_RESCHEDULE_TOO_LATE}"),
+                    );
+                    return;
+                }
+            }
             let red = egui::Color32::from_rgb(220, 80, 80);
             let busy = self.cassandra_inflight.is_some();
             let mut window_open = true;
@@ -30098,14 +30116,18 @@ mod gui {
                             if targets.is_empty() {
                                 Err("No node to schedule.".to_string())
                             } else if sd.reschedule {
-                                // Every node of the existing record, at the new time.
+                                // Every node of the existing record, at the new
+                                // time, and only while it can still be moved.
                                 match existing {
+                                    None => Err("There is no schedule to change any more.".to_string()),
+                                    Some(_) if !cassandra_reschedule_allowed(existing.as_ref(), now) => {
+                                        Err(CASSANDRA_RESCHEDULE_TOO_LATE.to_string())
+                                    }
                                     Some(mut rec) => {
                                         rec.when = epoch;
                                         rec.state = cassandra_cert::SchedState::Scheduled;
                                         Ok(rec)
                                     }
-                                    None => Err("There is no schedule to change any more.".to_string()),
                                 }
                             } else if existing.is_some() {
                                 Err(CASSANDRA_SCHEDULED_REFUSAL.to_string())
@@ -30540,8 +30562,9 @@ mod gui {
                             );
                         }
                     }
+                    let problems = cassandra_problem_nodes(&rep);
                     self.log_cassandra(
-                        LogLevel::Info,
+                        if problems > 0 { LogLevel::Warn } else { LogLevel::Info },
                         format!("cassandra: {} scheduled restart checks done; confirm them", owner.env),
                     );
                     self.cassandra_watch_retry_at.remove(&owner.key());
@@ -48043,6 +48066,30 @@ mod gui {
         )
     }
 
+    /// Whether a Reschedule may still change `rec` at `now`: the record
+    /// exists, is still Scheduled and its time has not come
+    /// (`cassandra_chip_actions`). Re-checked on the record as it is when
+    /// the user submits, and every frame the window is open: once the cron
+    /// job fired, a second schedule is a second outage.
+    fn cassandra_reschedule_allowed(rec: Option<&cassandra_cert::ScheduleRecord>, now: i64) -> bool {
+        rec.is_some_and(|r| cassandra_chip_actions(r, now).0)
+    }
+
+    /// Why a Reschedule was refused once its restart time had come. ASCII only.
+    const CASSANDRA_RESCHEDULE_TOO_LATE: &str =
+        "The restart time has passed; this schedule can no longer be changed.";
+
+    /// How many nodes of a finished check did not come back cleanly.
+    fn cassandra_problem_nodes(rep: &cassandra_flow::ApplyReport) -> usize {
+        rep.nodes.iter().filter(|(_, st)| cassandra_node_status_text(st).1).count()
+    }
+
+    /// The red line above Confirm complete when `n` nodes failed their
+    /// checks. ASCII only.
+    fn cassandra_problem_note(n: usize) -> String {
+        format!("{n} node(s) did not come back cleanly: check them before confirming")
+    }
+
     /// Each scheduled node's cert before the restart, by instance id, rebuilt
     /// from the openssl text the record saved. A blank or unparsable capture
     /// is skipped: that node is verified without a before cert.
@@ -60538,6 +60585,64 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert!(body.contains("request_repaint_after("), "{body}");
             assert!(src.contains("self.poll_cassandra_schedules();"), "the monitor runs every frame");
             assert!(src.contains("self.render_cassandra_schedule_result(ctx);"), "the window renders every frame");
+        }
+
+        /// A reschedule is only allowed on a record still Scheduled and
+        /// before its time: once the cron job fired, a second schedule
+        /// would be a second outage on nodes already restarted.
+        #[test]
+        fn a_reschedule_is_refused_once_the_restart_time_has_passed() {
+            use cassandra_cert::{SchedState, ScheduleRecord};
+            let rec = |state| ScheduleRecord { when: 1_000, state, nodes: vec![], domain: "d.net".into() };
+            assert!(cassandra_reschedule_allowed(Some(&rec(SchedState::Scheduled)), 999));
+            assert!(!cassandra_reschedule_allowed(Some(&rec(SchedState::Scheduled)), 1_000), "at the time");
+            assert!(!cassandra_reschedule_allowed(Some(&rec(SchedState::Scheduled)), 1_050), "inside the grace");
+            assert!(!cassandra_reschedule_allowed(Some(&rec(SchedState::Checking)), 500));
+            assert!(!cassandra_reschedule_allowed(Some(&rec(SchedState::AwaitingConfirm)), 500));
+            assert!(!cassandra_reschedule_allowed(None, 500), "no record");
+
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let body = method_body(src, "fn render_cassandra_schedule_dialog(");
+            // Each frame: a reschedule the record no longer allows is closed.
+            let take = body.find("self.cassandra_schedule_dialog.take()").expect("the take");
+            let frame = body[take..].find("cassandra_reschedule_allowed(").expect("checked every frame");
+            let submit = body.find("if submit {").expect("the submit");
+            assert!(take + frame < submit, "the per-frame check comes before the window");
+            // And again on the record read at submit time.
+            let arm = &body[submit..];
+            let arm = &arm[arm.find("} else if sd.reschedule {").expect("the reschedule arm")..];
+            let arm = &arm[..arm.find("} else if existing.is_some()").expect("next arm")];
+            assert!(arm.contains("cassandra_reschedule_allowed(existing.as_ref(), now)"), "{arm}");
+            assert!(arm.contains(CASSANDRA_RESCHEDULE_TOO_LATE) || arm.contains("CASSANDRA_RESCHEDULE_TOO_LATE"), "{arm}");
+            assert!(CASSANDRA_RESCHEDULE_TOO_LATE.is_ascii());
+        }
+
+        /// Nodes that did not come back cleanly are counted and called out
+        /// above Confirm complete.
+        #[test]
+        fn failed_scheduled_checks_are_called_out_before_confirming() {
+            let ok = (cass_target("i-1", "cassandra-101"), cassandra_flow::NodeStatus::Staged);
+            let bad = (
+                cass_target("i-2", "cassandra-102"),
+                cassandra_flow::NodeStatus::StageFailed("boom".into()),
+            );
+            let rep = |nodes| cassandra_flow::ApplyReport { nodes, stale: None, restarted: true };
+            assert_eq!(cassandra_problem_nodes(&rep(vec![ok.clone()])), 0);
+            assert_eq!(cassandra_problem_nodes(&rep(vec![ok, bad])), 1);
+            assert_eq!(
+                cassandra_problem_note(2),
+                "2 node(s) did not come back cleanly: check them before confirming"
+            );
+
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let window = method_body(src, "fn render_cassandra_schedule_result(");
+            let note = window.find("cassandra_problem_note(").expect("the summary line");
+            assert!(note < window.find("\"Confirm complete\"").expect("the button"), "above the button");
+            let handle = method_body(src, "fn handle_cassandra_event(");
+            let arm = &handle[handle.find("CassandraEvent::Watched(rep) =>").expect("the Watched arm")..];
+            assert!(arm.contains("cassandra_problem_nodes(&rep)"), "the done line is a Warn when nodes failed");
         }
 
         /// Start records the job; a second start is refused and changes
