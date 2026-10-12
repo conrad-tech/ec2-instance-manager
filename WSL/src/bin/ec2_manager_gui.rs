@@ -1006,7 +1006,7 @@ mod gui {
 
     /// What a Cassandra cert job reports, in order. Every job ends with
     /// exactly one of `ParamDates`+`DryRun`, `Preflight`, `Applied`,
-    /// `RolledBack` or `Failed`; `Diagnostics`, when sent, comes before the
+    /// `Restarted`, `RolledBack` or `Failed`; `Diagnostics`, when sent, comes before the
     /// `Applied` / `RolledBack` it explains.
     enum CassandraEvent {
         Log(String),
@@ -1016,6 +1016,8 @@ mod gui {
         DryRun(Vec<cassandra_flow::NodeDryRun>),
         Preflight(Vec<cassandra_flow::NodePreflight>),
         Applied(cassandra_flow::ApplyReport),
+        /// `ApplyReport` of one node's Restart now.
+        Restarted(cassandra_flow::ApplyReport),
         RolledBack(cassandra_flow::RollbackReport),
         /// `(node name, status + journal tail)` for each node the run left
         /// failing. Read-only, gathered before the report is sent.
@@ -1043,6 +1045,14 @@ mod gui {
             unselected: Vec<cassandra_flow::Target>,
             /// The `-d` value, as for `DryRun`.
             domain: String,
+            before: HashMap<String, cassandra_cert::CertInfo>,
+        },
+        /// Restart one staged node now, then watch and verify it.
+        RestartNow {
+            account_id: String,
+            env: String,
+            target: cassandra_flow::Target,
+            /// The node's cert as the dry run read it, by instance id.
             before: HashMap<String, cassandra_cert::CertInfo>,
         },
         Preflight {
@@ -1753,7 +1763,6 @@ mod gui {
         dry: Option<Vec<cassandra_flow::NodeDryRun>>,
         /// `(parameter path, last modified)` from the dry run.
         dates: Vec<(String, std::result::Result<i64, String>)>,
-        approve_apply: bool,
         preflight: Option<Vec<cassandra_flow::NodePreflight>>,
         /// Rollback backup chosen per node: instance id -> backup timestamp.
         chosen_ts: HashMap<String, String>,
@@ -1789,6 +1798,9 @@ mod gui {
         /// Stopped unselected nodes when the last restart job started: its
         /// consistency check could not read them.
         unchecked_stopped: Vec<String>,
+        /// Per-node outcome of Restart now, by instance id. Cleared when a
+        /// dry run or Update cert starts and when the selection changes.
+        node_results: HashMap<String, cassandra_flow::NodeStatus>,
     }
 
     impl CassandraDialog {
@@ -1804,7 +1816,6 @@ mod gui {
                 mode: CassandraMode::Pick,
                 dry: None,
                 dates: Vec::new(),
-                approve_apply: false,
                 preflight: None,
                 chosen_ts: HashMap::new(),
                 approve_rollback: false,
@@ -1821,6 +1832,7 @@ mod gui {
                 confirm_close: false,
                 confirm_forget: false,
                 unchecked_stopped: Vec::new(),
+                node_results: HashMap::new(),
             }
         }
 
@@ -1842,14 +1854,15 @@ mod gui {
 
         /// The gate Apply is judged by, built only from the dialog's own
         /// fields. The one place it is built: render and click both use
-        /// `apply_blocker` / `apply_armed`.
+        /// `apply_blocker` / `apply_armed`. `approved` is always true: the
+        /// outage checkbox is gone; Update cert only stages.
         fn apply_gate(&self) -> cassandra_cert::Gate<'_> {
             cassandra_cert::Gate {
                 selected: &self.selected,
                 running: self.running,
                 needs_confirmation: self.needs_confirmation(),
                 confirmed: self.confirm_outside,
-                approved: self.approve_apply,
+                approved: true,
             }
         }
 
@@ -1947,7 +1960,11 @@ mod gui {
         /// environment's stopped unselected nodes, which a restart job's
         /// consistency check cannot read.
         fn job_started(&mut self, act: CassandraAction, stopped: Vec<String>) {
-            self.result = None;
+            // A Restart now acts on the staged result: it stays on screen,
+            // with its per-node buttons, while the one node restarts.
+            if !matches!(act, CassandraAction::RestartNow(_)) {
+                self.result = None;
+            }
             self.diagnostics.clear();
             self.log.clear();
             self.error = None;
@@ -1957,7 +1974,7 @@ mod gui {
                     self.dry = None;
                     self.before.clear();
                     self.dates.clear();
-                    self.approve_apply = false;
+                    self.node_results.clear();
                     self.dry_selection = Some(cassandra_cert::selection_key(&self.selected));
                 }
                 CassandraAction::StartPreflight => {
@@ -1969,7 +1986,7 @@ mod gui {
                 }
                 // One dry run / preflight arms one restart.
                 CassandraAction::Apply => {
-                    self.approve_apply = false;
+                    self.node_results.clear();
                     self.dry_selection = None;
                     self.unchecked_stopped = stopped;
                 }
@@ -1978,6 +1995,7 @@ mod gui {
                     self.preflight_selection = None;
                     self.unchecked_stopped = stopped;
                 }
+                CassandraAction::RestartNow(_) => {}
                 CassandraAction::ForgetStuck | CassandraAction::CloseAnyway => {}
             }
         }
@@ -1987,8 +2005,8 @@ mod gui {
         /// one selection must never arm a restart of another.
         fn forget_selection_results(&mut self) {
             self.confirm_outside = false;
-            self.approve_apply = false;
             self.approve_rollback = false;
+            self.node_results.clear();
             self.dry = None;
             self.dry_selection = None;
             self.dates.clear();
@@ -2014,11 +2032,13 @@ mod gui {
 
     /// What a click in the Cassandra dialog asked for, carried out after
     /// the window is drawn (see `render_cassandra_dialog`).
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     enum CassandraAction {
         StartDryRun,
         StartPreflight,
         Apply,
+        /// Restart this one staged node now (its instance id).
+        RestartNow(String),
         ConfirmRollback,
         ForgetStuck,
         CloseAnyway,
@@ -2029,6 +2049,7 @@ mod gui {
     enum CassandraJobKind {
         DryRun,
         Apply,
+        RestartNow,
         Preflight,
         Rollback,
     }
@@ -28383,6 +28404,7 @@ mod gui {
             let account_id = match &job {
                 CassandraJob::DryRun { account_id, .. }
                 | CassandraJob::Apply { account_id, .. }
+                | CassandraJob::RestartNow { account_id, .. }
                 | CassandraJob::Preflight { account_id, .. }
                 | CassandraJob::Rollback { account_id, .. } => account_id.clone(),
             };
@@ -28807,11 +28829,10 @@ mod gui {
                         let start_block = dlg.start_blocker();
                         ui.horizontal(|ui| {
                             if ui
-                                .add_enabled(start_block.is_none(), egui::Button::new("Update cert"))
+                                .add_enabled(start_block.is_none(), egui::Button::new("Dry-run"))
                                 .on_hover_text(
-                                    "Read-only first: reads each selected node's cert, runs \
-                                     cassandra.sh --dry-run and reads the SSM parameter dates. \
-                                     Nothing restarts until you press Apply.",
+                                    "Reads each node's cert and runs the renewal script with \
+                                     --dry-run; changes nothing. Also reads the SSM parameter dates.",
                                 )
                                 .on_disabled_hover_text(start_block.unwrap_or(""))
                                 .clicked()
@@ -29010,29 +29031,21 @@ mod gui {
                             }
 
                             ui.add_space(4.0);
-                            ui.add_enabled(
-                                !dlg.running,
-                                egui::Checkbox::new(
-                                    &mut dlg.approve_apply,
-                                    "I understand Cassandra restarts on all selected nodes at once; \
-                                     expect a short outage",
-                                ),
-                            )
-                            .on_disabled_hover_text("Locked while a Cassandra job runs.");
                             // The same two methods the click re-checks.
                             let why = dlg.apply_blocker();
                             let enabled = dlg.apply_armed();
                             if ui
-                                .add_enabled(enabled, egui::Button::new("Apply"))
+                                .add_enabled(enabled, egui::Button::new("Update cert"))
                                 .on_hover_text(
-                                    "Stages the new cert on every selected node, then restarts them \
-                                     all at once and watches them come back.",
+                                    "Stages the new cert on every selected node and backs up the \
+                                     old stores. Nothing is restarted; restart each node afterwards.",
                                 )
                                 .on_disabled_hover_text(why.unwrap_or(""))
                                 .clicked()
                             {
                                 action = Some(CassandraAction::Apply);
                             }
+                            note_label(ui, amber, "This stages the new cert only. It will not restart the service.");
                         }
 
                         // ---- Rollback panel (spec 5) ----
@@ -29178,7 +29191,7 @@ mod gui {
                                 !dlg.running,
                                 egui::Checkbox::new(
                                     &mut dlg.approve_rollback,
-                                    "I understand Cassandra restarts on all selected nodes at once; \
+                                    "I understand the rollback restarts Cassandra on all selected nodes at once; \
                                      expect a short outage",
                                 ),
                             )
@@ -29220,13 +29233,44 @@ mod gui {
                             Some(CassandraOutcome::Applied(rep)) => {
                                 ui.separator();
                                 ui.label(egui::RichText::new("Update result").strong());
+                                // Restarts are offered only when every node staged.
+                                let offer_restart = cassandra_all_staged(rep) && !dlg.running;
+                                if offer_restart {
+                                    ui.weak(
+                                        "Restarting nodes one at a time leaves the cluster on mixed certs \
+                                         until the last one is done.",
+                                    );
+                                }
                                 for (t, status) in &rep.nodes {
                                     let (sev, text) = cassandra_flow::describe_apply_status(status);
                                     offer_rollback |= sev.is_problem();
                                     cassandra_severity_label(ui, sev, format!("{}: {text}", t.name));
+                                    if let Some(after) = dlg.node_results.get(&t.instance_id) {
+                                        let (sev, text) = cassandra_flow::describe_apply_status(after);
+                                        offer_rollback |= sev.is_problem();
+                                        cassandra_severity_label(ui, sev, format!("{} restart: {text}", t.name));
+                                    }
+                                    if offer_restart {
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .button("Restart now")
+                                                .on_hover_text(
+                                                    "Restarts Cassandra on this node only, then waits for it \
+                                                     to stay up and reads the cert it serves.",
+                                                )
+                                                .clicked()
+                                            {
+                                                action = Some(CassandraAction::RestartNow(t.instance_id.clone()));
+                                            }
+                                        });
+                                    }
                                 }
-                                stale_line(ui, &rep.stale);
-                                if !dlg.unchecked_stopped.is_empty() {
+                                // A stage-only run has no consistency check and
+                                // no unselected-node read to report.
+                                if rep.restarted {
+                                    stale_line(ui, &rep.stale);
+                                }
+                                if rep.restarted && !dlg.unchecked_stopped.is_empty() {
                                     note_label(
                                         ui,
                                         amber,
@@ -29309,7 +29353,7 @@ mod gui {
             }
 
             let mut job: Option<CassandraJob> = None;
-            if let Some(act) = action {
+            if let Some(act) = action.clone() {
                 let account_id = dlg.scripts_env.account_id.clone();
                 let env = dlg.scripts_env.env.clone();
                 // Update and Apply need the environment's domain; rollback
@@ -29343,7 +29387,7 @@ mod gui {
                         );
                     }
                     CassandraAction::StartDryRun => match domain {
-                        Err(e) => dlg.error = Some(format!("Update cert was not started: {e}")),
+                        Err(e) => dlg.error = Some(format!("Dry-run was not started: {e}")),
                         Ok(domain) => {
                             job = Some(CassandraJob::DryRun {
                                 account_id,
@@ -29361,7 +29405,7 @@ mod gui {
                         // The click is honoured only if the gate still holds.
                         match (dlg.apply_armed(), domain) {
                             (false, _) => {}
-                            (true, Err(e)) => dlg.error = Some(format!("Apply was not started: {e}")),
+                            (true, Err(e)) => dlg.error = Some(format!("Update cert was not started: {e}")),
                             (true, Ok(domain)) => {
                                 let before: HashMap<String, cassandra_cert::CertInfo> = dlg
                                     .dry
@@ -29381,6 +29425,22 @@ mod gui {
                                     before,
                                 });
                             }
+                        }
+                    }
+                    CassandraAction::RestartNow(ref instance_id) => {
+                        let target = dlg
+                            .nodes
+                            .iter()
+                            .find(|n| &n.instance_id == instance_id)
+                            .map(|n| cassandra_flow::Target { instance_id: n.instance_id.clone(), name: n.name.clone() });
+                        // Honoured only while the state that offered it still holds.
+                        if let (Some(target), true) = (target, cassandra_all_staged_in(&dlg)) {
+                            job = Some(CassandraJob::RestartNow {
+                                account_id,
+                                env,
+                                target,
+                                before: dlg.before.clone(),
+                            });
                         }
                     }
                     CassandraAction::ConfirmRollback => {
@@ -29600,6 +29660,19 @@ mod gui {
                         dlg.running = false;
                     }
                 }
+                CassandraEvent::Restarted(rep) => {
+                    for (t, status) in &rep.nodes {
+                        let (text, bad) = cassandra_node_status_text(status);
+                        let level = if bad { LogLevel::Warn } else { LogLevel::Info };
+                        self.log_cassandra(level, format!("cassandra: restart {}: {text}", t.name));
+                    }
+                    if let Some(dlg) = self.cassandra_dialog.as_mut().filter(|_| applies) {
+                        for (t, status) in rep.nodes {
+                            dlg.node_results.insert(t.instance_id, status);
+                        }
+                        dlg.running = false;
+                    }
+                }
                 CassandraEvent::Diagnostics(diag) => {
                     for (name, text) in &diag {
                         self.log_cassandra(
@@ -29616,7 +29689,13 @@ mod gui {
                     // record and dropped this job's pending run.
                     self.log_cassandra(LogLevel::Error, format!("cassandra: {msg}"));
                     if let Some(dlg) = self.cassandra_dialog.as_mut().filter(|_| applies) {
-                        dlg.result = Some(CassandraOutcome::Error(msg));
+                        if owner.kind == CassandraJobKind::RestartNow {
+                            // Keep the staged result (and its per-node buttons)
+                            // on screen; say what happened to this restart.
+                            dlg.error = Some(format!("Restart now failed: {msg}"));
+                        } else {
+                            dlg.result = Some(CassandraOutcome::Error(msg));
+                        }
                         dlg.running = false;
                     }
                 }
@@ -38751,9 +38830,10 @@ mod gui {
                                         .selectable_label(false, "Cassandra Cert Update")
                                         .on_hover_text(
                                             "Renew the keystore cert on selected \
-                                             Cassandra nodes (dry run first), or \
-                                             roll them back. Restarts the selected \
-                                             nodes together: expect a short outage.",
+                                             Cassandra nodes (dry run first; the \
+                                             update only stages it, then each node \
+                                             is restarted on request), or roll them \
+                                             back (restarts them together).",
                                         )
                                         .clicked()
                                 {
@@ -46690,7 +46770,11 @@ mod gui {
                     old: Some(old.clone()),
                 })
             }
-            CassandraJob::DryRun { .. } | CassandraJob::Preflight { .. } => None,
+            // A restart now changes no cert: the update it belongs to was
+            // the stage, so it records no `LastRun` of its own.
+            CassandraJob::DryRun { .. } | CassandraJob::Preflight { .. } | CassandraJob::RestartNow { .. } => {
+                None
+            }
         }
     }
 
@@ -46699,6 +46783,7 @@ mod gui {
         let (account_id, env, kind) = match job {
             CassandraJob::DryRun { account_id, env, .. } => (account_id, env, CassandraJobKind::DryRun),
             CassandraJob::Apply { account_id, env, .. } => (account_id, env, CassandraJobKind::Apply),
+            CassandraJob::RestartNow { account_id, env, .. } => (account_id, env, CassandraJobKind::RestartNow),
             CassandraJob::Preflight { account_id, env, .. } => {
                 (account_id, env, CassandraJobKind::Preflight)
             }
@@ -46746,7 +46831,7 @@ mod gui {
     /// Otherwise returns the owning job (the in-flight record as it was)
     /// and, for an `Applied` / `RolledBack` / `Failed`, the pending run it
     /// takes away (to be recorded, or dropped for `Failed`). A terminal event
-    /// (`DryRun`, `Preflight`, `Applied`, `RolledBack`, `Failed`) of the
+    /// (`DryRun`, `Preflight`, `Applied`, `Restarted`, `RolledBack`, `Failed`) of the
     /// in-flight job clears its record. A refused start never reaches the
     /// inbox and has no id.
     fn cassandra_settle(
@@ -46761,6 +46846,7 @@ mod gui {
             CassandraEvent::DryRun(_)
                 | CassandraEvent::Preflight(_)
                 | CassandraEvent::Applied(_)
+                | CassandraEvent::Restarted(_)
                 | CassandraEvent::RolledBack(_)
                 | CassandraEvent::Failed(_)
         );
@@ -46802,6 +46888,11 @@ mod gui {
                 v.push(format!("{pre}: update finished; nothing was recorded for it"));
                 v
             }
+            CassandraEvent::Restarted(rep) => rep
+                .nodes
+                .iter()
+                .map(|(t, st)| format!("{pre}: restart {}: {} (ignored)", t.name, cassandra_node_status_text(st).0))
+                .collect(),
             CassandraEvent::RolledBack(rep) => {
                 let mut v: Vec<String> = rep
                     .nodes
@@ -46864,6 +46955,20 @@ mod gui {
     fn cassandra_node_status_text(status: &cassandra_flow::NodeStatus) -> (String, bool) {
         let (severity, text) = cassandra_flow::describe_apply_status(status);
         (text, severity.is_problem())
+    }
+
+    /// Every node staged and none failed: the only state in which a restart
+    /// (now or scheduled) is offered. One failed node means nobody restarts:
+    /// half a cluster on a new keystore is worse than none.
+    fn cassandra_all_staged(rep: &cassandra_flow::ApplyReport) -> bool {
+        !rep.nodes.is_empty()
+            && rep.nodes.iter().all(|(_, st)| matches!(st, cassandra_flow::NodeStatus::Staged))
+    }
+
+    /// `cassandra_all_staged` of the result the dialog holds now: a Restart
+    /// now click is honoured only while the state that offered it still holds.
+    fn cassandra_all_staged_in(dlg: &CassandraDialog) -> bool {
+        matches!(&dlg.result, Some(CassandraOutcome::Applied(rep)) if cassandra_all_staged(rep))
     }
 
     /// One node's rollback outcome as a line of text, and whether it is a
@@ -47160,12 +47265,32 @@ mod gui {
                     before: &before,
                     required_secs,
                     ceiling_secs,
-                    restart: true,
+                    // Update cert only stages; restarts are per node (Restart now).
+                    restart: false,
                 };
                 match cassandra_guard("apply", || flow::apply(&exec, &input, &pacer, &emit)) {
                     Ok(rep) => {
                         diagnose(flow::apply_failed_nodes(&rep));
                         send(CassandraEvent::Applied(rep));
+                    }
+                    Err(e) => send(CassandraEvent::Failed(cassandra_restart_panic_text(e))),
+                }
+            }
+            CassandraJob::RestartNow { target, before, .. } => {
+                send(CassandraEvent::Log(format!("restarting {}", target.name)));
+                let targets = [target];
+                let input = flow::RestartInput {
+                    targets: &targets,
+                    unselected: &[],
+                    before: &before,
+                    required_secs,
+                    ceiling_secs,
+                    issue_restart: true,
+                };
+                match cassandra_guard("restart now", || flow::restart_nodes(&exec, &input, &pacer, &emit)) {
+                    Ok(rep) => {
+                        diagnose(flow::apply_failed_nodes(&rep));
+                        send(CassandraEvent::Restarted(rep));
                     }
                     Err(e) => send(CassandraEvent::Failed(cassandra_restart_panic_text(e))),
                 }
@@ -57275,6 +57400,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 "flow::apply(",
                 "flow::preflight(",
                 "flow::rollback(",
+                "flow::restart_nodes(",
                 "flow::diagnostics(",
                 "expand_parameter(",
                 "fetch_parameter_modified(",
@@ -58441,6 +58567,64 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert!(!cassandra_event_applies(Some(&same), None), "no job to own it");
         }
 
+        #[test]
+        fn restarts_are_offered_only_when_every_node_staged() {
+            use cassandra_flow::{ApplyReport, NodeStatus, Target};
+            let t = |i: &str| Target { instance_id: i.into(), name: i.into() };
+            let ok = ApplyReport {
+                nodes: vec![(t("i-1"), NodeStatus::Staged), (t("i-2"), NodeStatus::Staged)],
+                stale: None,
+                restarted: false,
+            };
+            assert!(cassandra_all_staged(&ok));
+            let one_failed = ApplyReport {
+                nodes: vec![(t("i-1"), NodeStatus::Staged), (t("i-2"), NodeStatus::StageFailed("rc 3".into()))],
+                stale: None,
+                restarted: false,
+            };
+            assert!(!cassandra_all_staged(&one_failed));
+            let empty = ApplyReport { nodes: vec![], stale: None, restarted: false };
+            assert!(!cassandra_all_staged(&empty));
+        }
+
+        #[test]
+        fn a_restart_now_job_is_a_terminal_event_that_records_no_last_run() {
+            let mut inflight = None;
+            let mut pending = None;
+            let mut next = 0u64;
+            let job = CassandraJob::RestartNow {
+                account_id: "111".into(),
+                env: "DEV1".into(),
+                target: cassandra_flow::Target { instance_id: "i-1".into(), name: "a".into() },
+                before: HashMap::new(),
+            };
+            let id = cassandra_try_start(&mut inflight, &mut pending, &mut next, &job).expect("admitted");
+            assert!(pending.is_none(), "a restart is not an update: no LastRun");
+            let ev = CassandraEvent::Restarted(cassandra_flow::ApplyReport { nodes: vec![], stale: None, restarted: true });
+            let (_, finished) = cassandra_settle(&mut inflight, &mut pending, id, &ev).expect("settles");
+            assert!(finished.is_none());
+            assert!(inflight.is_none(), "the restart is terminal");
+        }
+
+        #[test]
+        fn update_cert_never_asks_for_the_restart_checkbox_and_says_it_will_not_restart() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            assert!(!src.contains("I understand Cassandra restarts on all selected nodes"));
+            assert!(src.contains("This stages the new cert only. It will not restart the service."));
+            assert!(src.contains("\"Dry-run\""));
+        }
+
+        #[test]
+        fn a_stage_job_runs_without_restarting() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let body = method_body(src, "fn run_cassandra_job(");
+            let apply_arm = &body[body.find("CassandraJob::Apply {").expect("the apply arm")..];
+            let apply_arm = &apply_arm[..apply_arm.find("CassandraJob::Preflight").expect("next arm")];
+            assert!(apply_arm.contains("restart: false"), "{apply_arm}");
+        }
+
         /// Start records the job; a second start is refused and changes
         /// nothing; progress keeps it; its terminal event clears it.
         #[test]
@@ -58799,7 +58983,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             dlg.preflight = Some(Vec::new());
             dlg.preflight_selection = Some(vec!["i-1".into()]);
             dlg.chosen_ts.insert("i-1".into(), "1".into());
-            dlg.approve_apply = true;
+            dlg.node_results.insert("i-1".into(), cassandra_flow::NodeStatus::Staged);
             dlg.approve_rollback = true;
             dlg.confirm_outside = true;
             dlg.forget_selection_results();
@@ -58807,7 +58991,8 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert!(dlg.before.is_empty() && dlg.dates.is_empty());
             assert!(dlg.preflight.is_none() && dlg.preflight_selection.is_none());
             assert!(dlg.chosen_ts.is_empty());
-            assert!(!dlg.approve_apply && !dlg.approve_rollback && !dlg.confirm_outside);
+            assert!(dlg.node_results.is_empty());
+            assert!(!dlg.approve_rollback && !dlg.confirm_outside);
         }
 
         fn cass_backup(ts: &str, not_after: i64) -> cassandra_cert::BackupFact {
@@ -58956,14 +59141,13 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         }
 
         /// A dialog whose Apply is armed: one set, a passed dry run started
-        /// for exactly this selection, approved, nothing running.
+        /// for exactly this selection, nothing running.
         fn cass_armed_apply_dialog() -> CassandraDialog {
             let mut dlg = CassandraDialog::new(cass_env_row("111", "DEV1"), Vec::new());
             dlg.nodes = vec![cass_node("i-1", 1, true), cass_node("i-2", 2, true), cass_node("i-3", 101, true)];
             dlg.selected = vec!["i-2".into(), "i-1".into()];
             dlg.dry = Some(vec![cass_dry_row("i-1", true), cass_dry_row("i-2", true)]);
             dlg.dry_selection = Some(vec!["i-1".into(), "i-2".into()]);
-            dlg.approve_apply = true;
             dlg
         }
 
@@ -58973,10 +59157,6 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let ok = cass_armed_apply_dialog();
             assert!(ok.apply_armed(), "{:?}", ok.apply_blocker());
             assert_eq!(ok.apply_blocker(), None);
-
-            let mut d = cass_armed_apply_dialog();
-            d.approve_apply = false;
-            assert!(!d.apply_armed(), "approval unticked");
 
             let mut d = cass_armed_apply_dialog();
             d.running = true;
@@ -59099,10 +59279,12 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert_eq!(rollback.matches(&gate).count(), 1);
             let approved = format!("{}{}", "approved", ":");
             assert_eq!(prod.matches(&approved).count(), 2);
-            assert!(apply.contains(&format!("{approved} self.approve_apply")), "{apply}");
+            // Update cert only stages, so its gate needs no outage approval;
+            // the rollback (which restarts) still does.
+            assert!(apply.contains(&format!("{approved} {}", "true")), "{apply}");
             assert!(rollback.contains(&format!("{approved} self.approve_rollback")), "{rollback}");
             assert!(!prod.contains(&format!("{approved} {}", "dlg.")));
-            assert!(!prod.contains(&format!("{approved} {}", "true")));
+            assert_eq!(prod.matches(&format!("{approved} {}", "true")).count(), 1);
         }
 
         /// Only an admitted start replaces what the dialog shows.
@@ -59111,7 +59293,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let mut d = cass_armed_apply_dialog();
             d.job_started(CassandraAction::Apply, vec!["cassandra-009".into()]);
             assert!(!d.apply_armed(), "one dry run arms one Apply");
-            assert!(!d.approve_apply && d.dry_selection.is_none());
+            assert!(d.dry_selection.is_none());
             assert_eq!(d.unchecked_stopped, vec!["cassandra-009".to_string()]);
 
             let mut d = cass_armed_apply_dialog();
