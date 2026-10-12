@@ -29690,16 +29690,12 @@ mod gui {
         }
 
         /// Every saved Cassandra restart schedule, soonest first, as
-        /// `(account_id, env, record)`. Empty while the Cassandra Cert gate
-        /// is shut, so the toolbar chip and notice stay as invisible as the
-        /// rest of the feature.
+        /// `(account_id, env, record)`. Deliberately NOT gated on the
+        /// Cassandra Cert feature: the cron job sits on the nodes whoever is
+        /// at the keyboard, so the notice must show for the whole life of
+        /// the record. Only the Reschedule action carries the gate.
         fn cassandra_schedule_rows(&self) -> Vec<(String, String, cassandra_cert::ScheduleRecord)> {
-            if !self.cassandra_cert_enabled {
-                return Vec::new();
-            }
-            let mut v = self.config.all_cassandra_schedules();
-            v.sort_by_key(|(_, _, r)| r.when);
-            v
+            cassandra_schedule_rows_of(&self.config)
         }
 
         /// Open the Schedule restart window to move an existing schedule:
@@ -29707,6 +29703,10 @@ mod gui {
         /// with the record's current local date and time. Needs no Cassandra
         /// dialog; the submit path rebuilds the record from config.
         fn open_cassandra_reschedule(&mut self, account_id: &str, env: &str, rec: &cassandra_cert::ScheduleRecord) {
+            // The window is closed while the gate is shut, so do not open it.
+            if !self.cassandra_cert_enabled {
+                return;
+            }
             use chrono::TimeZone;
             let (date, time) = match chrono::Local.timestamp_opt(rec.when, 0).single() {
                 Some(t) => (t.format("%Y-%m-%d").to_string(), t.format("%H:%M").to_string()),
@@ -39040,6 +39040,9 @@ mod gui {
                 // Set by the toolbar's ✖ and acted on after the panel, so
                 // the clear does not borrow `self` inside its own closure.
                 let mut clear_status = false;
+                // Saved Cassandra restart schedules, read once per frame for
+                // the toolbar chip, `has_status` and the notice lines.
+                let cassandra_rows = self.cassandra_schedule_rows();
                 egui::TopBottomPanel::top("top").show(ctx, |ui| {
                     egui::MenuBar::new().ui(ui, |ui| {
                         let edit_menu_resp = ui.menu_button("Edit", |ui| {
@@ -39810,22 +39813,33 @@ mod gui {
                         }
 
                         // Pending Cassandra cert restarts: one Reschedule / Cancel pair per environment.
+                        // The rows are ungated (the cron job fires either way);
+                        // Reschedule carries the feature gate because its
+                        // window is closed while the gate is shut. Cancel does
+                        // not: anyone looking at a pending restart may stop it
+                        // (the worker's live/credentials gate still applies).
                         let now = chrono::Utc::now().timestamp();
-                        for (account, env, rec) in self.cassandra_schedule_rows() {
-                            let (can_change, _) = cassandra_chip_actions(&rec, now);
+                        for (account, env, rec) in &cassandra_rows {
+                            let (can_change, _) = cassandra_chip_actions(rec, now);
                             let hover = if can_change {
                                 "Change or cancel the scheduled Cassandra restart"
                             } else {
                                 "Locked: the scheduled time has been reached"
                             };
+                            let can_reschedule = can_change && self.cassandra_cert_enabled;
+                            let reschedule_hover = if can_change && !self.cassandra_cert_enabled {
+                                "Rescheduling needs Cassandra Cert access; Cancel still works"
+                            } else {
+                                hover
+                            };
                             let label = env.to_uppercase();
                             if ui
-                                .add_enabled(can_change, egui::Button::new(format!("Reschedule {label}")))
-                                .on_hover_text(hover)
-                                .on_disabled_hover_text(hover)
+                                .add_enabled(can_reschedule, egui::Button::new(format!("Reschedule {label}")))
+                                .on_hover_text(reschedule_hover)
+                                .on_disabled_hover_text(reschedule_hover)
                                 .clicked()
                             {
-                                self.open_cassandra_reschedule(&account, &env, &rec);
+                                self.open_cassandra_reschedule(account, env, rec);
                             }
                             if ui
                                 .add_enabled(can_change, egui::Button::new(format!("Cancel {label}")))
@@ -39833,7 +39847,7 @@ mod gui {
                                 .on_disabled_hover_text(hover)
                                 .clicked()
                             {
-                                self.start_cassandra_cancel(&account, &env, &rec);
+                                self.start_cassandra_cancel(account, env, rec);
                             }
                         }
                     });
@@ -39849,7 +39863,7 @@ mod gui {
                     || self.script_status_highlight.is_some()
                     || self.unhealthy_host_notice.is_some()
                     || self.instance_age_notice.is_some()
-                    || !self.cassandra_schedule_rows().is_empty()
+                    || !cassandra_rows.is_empty()
                     || !self.message.is_empty();
                 if has_status {
                     let status_color = |state: &ScriptState, ui: &egui::Ui| match state {
@@ -39906,12 +39920,11 @@ mod gui {
                             // for the whole life of its record. Not clearable
                             // (no Clear, no x): `has_clearable_status` leaves
                             // it out on purpose.
-                            let schedules = self.cassandra_schedule_rows();
-                            for (_, env, rec) in &schedules {
+                            for (_, env, rec) in &cassandra_rows {
                                 let colour = flashing_yellow(ui);
                                 note_label(ui, colour, cassandra_notice_text(&env.to_uppercase(), rec.when));
                             }
-                            if !schedules.is_empty() {
+                            if !cassandra_rows.is_empty() {
                                 // Keep the flash animating while any schedule exists.
                                 ctx.request_repaint_after(std::time::Duration::from_millis(500));
                             }
@@ -47668,6 +47681,14 @@ mod gui {
             "{env}: Cassandra will be restarted for the cert update on {}",
             cassandra_local_time(when)
         )
+    }
+
+    /// Every saved schedule in `config`, soonest first. Pure over the
+    /// config and ungated (see `App::cassandra_schedule_rows`).
+    fn cassandra_schedule_rows_of(config: &AppConfig) -> Vec<(String, String, cassandra_cert::ScheduleRecord)> {
+        let mut v = config.all_cassandra_schedules();
+        v.sort_by_key(|(_, _, r)| r.when);
+        v
     }
 
     /// `(can_change, notice_visible)`. A schedule can be rescheduled or
@@ -59811,7 +59832,9 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             // At or after the time the cron job has fired (or is firing): no more changes.
             assert_eq!(cassandra_chip_actions(&rec(SchedState::Scheduled), 1_000), (false, true));
             assert_eq!(cassandra_chip_actions(&rec(SchedState::Checking), 2_000), (false, true));
-            // After the user confirms the record is gone, so nothing shows.
+            // Awaiting confirmation: still locked. The second element is
+            // always true: the notice shows while the record exists, and
+            // goes only when the record is removed (confirm or cancel).
             assert_eq!(cassandra_chip_actions(&rec(SchedState::AwaitingConfirm), 2_000), (false, true));
         }
 
@@ -59822,7 +59845,77 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let close_all = src.find("let close_all = ui.add_enabled(").expect("Close All");
             let chip = src.find("cassandra_chip_actions(").expect("the chip");
             assert!(chip > close_all, "the chip is drawn after Close All");
-            assert!(src.contains("self.cassandra_schedule_rows().is_empty()"), "the notice joins has_status");
+            // Read once per frame and shared by the chip, `has_status` and the notice.
+            assert!(src.contains("let cassandra_rows = self.cassandra_schedule_rows();"));
+            assert!(src.contains("|| !cassandra_rows.is_empty()"), "the notice joins has_status");
+            // The notice line flashes and carries the notice text.
+            let line = &src[src.find("for (_, env, rec) in &cassandra_rows").expect("the notice loop")..];
+            let line = &line[..line.find("if !self.message.is_empty()").expect("the next line")];
+            assert!(line.contains("flashing_yellow(ui)"), "{line}");
+            assert!(line.contains("note_label(ui, colour, cassandra_notice_text("), "{line}");
+            assert!(line.contains("request_repaint_after("), "{line}");
+            // No clear control: the Clear button follows `has_clearable_status`,
+            // which never counts a schedule, and the notice draws no x.
+            assert!(!line.contains("button"), "{line}");
+            let clearable = method_body(src, "fn has_clearable_status(");
+            assert!(!clearable.contains("cassandra"), "{clearable}");
+        }
+
+        /// A saved schedule is listed whatever the feature gate says: the
+        /// cron job fires either way, so the notice must too.
+        #[test]
+        fn schedule_rows_are_listed_with_the_cassandra_gate_shut() {
+            let rec = |when| cassandra_cert::ScheduleRecord {
+                when,
+                state: cassandra_cert::SchedState::Scheduled,
+                nodes: vec![],
+                domain: "d.net".into(),
+            };
+            let mut config = AppConfig::default();
+            config.set_cassandra_schedule("222", "DEV2", &rec(2_000));
+            config.set_cassandra_schedule("111", "DEV1", &rec(1_000));
+            let rows = cassandra_schedule_rows_of(&config);
+            let whens: Vec<i64> = rows.iter().map(|(_, _, r)| r.when).collect();
+            assert_eq!(whens, [1_000, 2_000], "soonest first");
+
+            let mut app = Ec2GuiApp::new(GuiOptions {
+                mode: Mode::Sim,
+                region: None,
+                dry_run: true,
+                debug: false,
+                wsl_auto_setup: false,
+            });
+            app.cassandra_cert_enabled = false;
+            app.config.set_cassandra_schedule("999999999999", "GATETEST", &rec(3_000));
+            assert!(
+                app.cassandra_schedule_rows().iter().any(|(a, _, r)| a == "999999999999" && r.when == 3_000),
+                "the gate must not hide a pending restart"
+            );
+
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let body = method_body(src, "fn cassandra_schedule_rows(");
+            assert!(!body.contains("cassandra_cert_enabled"), "{body}");
+        }
+
+        /// Reschedule carries the feature gate (its window is closed while
+        /// the gate is shut); Cancel does not, and its job path needs no
+        /// gate or dialog.
+        #[test]
+        fn reschedule_carries_the_gate_and_cancel_does_not() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let chip = &src[src.find("for (account, env, rec) in &cassandra_rows").expect("the chip loop")..];
+            let chip = &chip[..chip.find("let has_status").expect("the status list")];
+            assert!(chip.contains("let can_reschedule = can_change && self.cassandra_cert_enabled;"), "{chip}");
+            assert!(chip.contains("add_enabled(can_reschedule, egui::Button::new(format!(\"Reschedule"), "{chip}");
+            assert!(chip.contains("add_enabled(can_change, egui::Button::new(format!(\"Cancel"), "{chip}");
+            assert!(method_body(src, "fn open_cassandra_reschedule(").contains("if !self.cassandra_cert_enabled"));
+            for f in ["fn start_cassandra_cancel(", "fn start_cassandra_job("] {
+                let body = method_body(src, f);
+                assert!(!body.contains("cassandra_cert_enabled"), "{f}");
+                assert!(!body.contains("self.cassandra_dialog.as_ref().expect"), "{f}");
+            }
         }
 
         /// Start records the job; a second start is refused and changes
