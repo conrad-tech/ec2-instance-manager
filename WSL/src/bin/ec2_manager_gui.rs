@@ -47160,6 +47160,7 @@ mod gui {
                     before: &before,
                     required_secs,
                     ceiling_secs,
+                    restart: true,
                 };
                 match cassandra_guard("apply", || flow::apply(&exec, &input, &pacer, &emit)) {
                     Ok(rep) => {
