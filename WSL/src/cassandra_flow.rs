@@ -275,22 +275,47 @@ pub fn read_schedule(exec: ExecFn, targets: &[Target]) -> Vec<(Target, Result<Op
 }
 
 fn read_cert(exec: ExecFn, t: &Target) -> Result<(Option<CertInfo>, String, String), String> {
-    let cmd = invocation(&check_script(), &[]);
-    let out = exec(&t.instance_id, &cmd, QUICK_TIMEOUT)?;
-    cert_from_check(&out)
+    read_check(exec, t).map(|c| (c.cert, c.active, c.raw))
 }
 
-/// The cert, service state and raw openssl text in a check script's output.
-fn cert_from_check(out: &str) -> Result<(Option<CertInfo>, String, String), String> {
-    let raw = parse_check(out).ok_or_else(|| "the cert check returned no readable result".to_string())?;
-    let cert_text = out
+/// Everything the check script reports about one node.
+struct NodeCheck {
+    cert: Option<CertInfo>,
+    active: String,
+    /// The raw openssl text between the cert markers.
+    raw: String,
+    /// When the node's live keystore file was last modified (unix seconds).
+    keystore_modified: Option<i64>,
+}
+
+fn read_check(exec: ExecFn, t: &Target) -> Result<NodeCheck, String> {
+    let cmd = invocation(&check_script(), &[]);
+    let out = exec(&t.instance_id, &cmd, QUICK_TIMEOUT)?;
+    check_from_output(&out)
+}
+
+/// The cert, service state, raw openssl text and keystore time in a check
+/// script's output.
+fn check_from_output(out: &str) -> Result<NodeCheck, String> {
+    let parsed = parse_check(out).ok_or_else(|| "the cert check returned no readable result".to_string())?;
+    let raw = out
         .split("__CC_CERT_BEGIN__")
         .nth(1)
         .and_then(|s| s.split("__CC_CERT_END__").next())
         .unwrap_or("")
         .trim()
         .to_string();
-    Ok((raw.cert, raw.active, cert_text))
+    Ok(NodeCheck {
+        cert: parsed.cert,
+        active: parsed.active,
+        raw,
+        keystore_modified: parsed.keystore_modified,
+    })
+}
+
+/// The cert, service state and raw openssl text in a check script's output.
+fn cert_from_check(out: &str) -> Result<(Option<CertInfo>, String, String), String> {
+    check_from_output(out).map(|c| (c.cert, c.active, c.raw))
 }
 
 #[derive(Clone, Debug)]
@@ -299,6 +324,9 @@ pub struct NodeDryRun {
     pub current: Option<CertInfo>,
     /// The raw openssl text, kept so the "after" output can be compared by eye.
     pub raw_cert: String,
+    /// When the node's live keystore was last modified (unix seconds): the
+    /// last time a cert was installed there. `None` when it could not be read.
+    pub keystore_modified: Option<i64>,
     pub dry_run_ok: bool,
     pub detail: String,
 }
@@ -309,13 +337,15 @@ pub fn dry_run(exec: ExecFn, targets: &[Target], domain_arg: Option<&str>) -> Ve
             target: t.clone(),
             current: None,
             raw_cert: String::new(),
+            keystore_modified: None,
             dry_run_ok: false,
             detail: String::new(),
         };
-        match read_cert(exec, t) {
-            Ok((cert, _active, raw)) => {
-                res.current = cert;
-                res.raw_cert = raw;
+        match read_check(exec, t) {
+            Ok(check) => {
+                res.current = check.cert;
+                res.raw_cert = check.raw;
+                res.keystore_modified = check.keystore_modified;
             }
             Err(e) => {
                 res.detail = format!("could not read the current cert: {e}");
@@ -1605,6 +1635,25 @@ mod flow_tests {
         let cmds = fake.commands_for("i-1");
         assert!(cmds.iter().any(|c| c.contains("'--dry-run'") && c.contains("'-d' 'dev1.net'")));
         assert!(dry_run_passed(&out));
+    }
+
+    #[test]
+    fn the_dry_run_row_carries_when_the_keystore_was_last_modified() {
+        let fake = Fake::new(|id, cmd| {
+            if cmd.contains("'--dry-run'") {
+                Ok("__CC_RAN__\n__CC_RC__0\n".into())
+            } else if id == "i-1" {
+                Ok(format!("{}__CC_KEYSTORE_MTIME__ 1786000000\n", cert_out("Oct  3 08:01:22 2026 GMT", "01", "active")
+                    .replace("__CC_ACTIVE__", "__CC_ACTIVE_X__"))
+                    .replace("__CC_ACTIVE_X__ active\n__CC_END__\n", "__CC_ACTIVE__ active\n__CC_END__\n"))
+            } else {
+                Ok(cert_out("Oct  3 08:01:22 2026 GMT", "01", "active"))
+            }
+        });
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let out = dry_run(&exec, &[t("i-1", "cassandra-001"), t("i-2", "cassandra-002")], Some("dev1.net"));
+        assert_eq!(out[0].keystore_modified, Some(1_786_000_000));
+        assert_eq!(out[1].keystore_modified, None, "a node whose script did not say stays unknown");
     }
 
     #[test]

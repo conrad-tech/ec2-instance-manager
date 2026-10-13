@@ -7,6 +7,27 @@
 # the cert it replaced even when the expiry date is unchanged.
 set -u
 
+# The keystore this node actually reads, out of cassandra.yaml (the same lookup
+# the renew and rollback scripts use), so its modified time can say when the
+# cert was last installed here.
+detect_keystore_path () {
+  local config_file detected
+  for config_file in /etc/cassandra/conf/cassandra.yaml /etc/cassandra/cassandra.yaml; do
+    if [ -f "${config_file}" ]; then
+      detected=$(awk '
+        /^client_encryption_options:/ { in_block = 1; next }
+        /^[^[:space:]#]/ { in_block = 0 }
+        in_block && $1 == "keystore:" { print $2; exit }
+      ' "${config_file}")
+      if [ -n "${detected}" ]; then
+        echo "${detected}"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
 HOST=$(hostname -f 2>/dev/null || hostname)
 
 echo "__CC_BEGIN__"
@@ -37,5 +58,7 @@ case "${CERT_OUT}" in
     ;;
 esac
 echo "__CC_CERT_END__"
+KEYSTORE_PATH=$(detect_keystore_path) || KEYSTORE_PATH=/etc/cassandra/conf/cassandra-keystore.jks
+echo "__CC_KEYSTORE_MTIME__ $(stat -c %Y "${KEYSTORE_PATH}" 2>/dev/null)"
 echo "__CC_ACTIVE__ $(systemctl is-active cassandra 2>&1)"
 echo "__CC_END__"

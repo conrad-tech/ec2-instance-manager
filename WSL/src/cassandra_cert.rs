@@ -780,6 +780,10 @@ pub fn infer_old_cert(newest: &[&BackupFact]) -> Option<OldCert> {
 pub struct CheckRaw {
     pub cert: Option<CertInfo>,
     pub active: String,
+    /// When the live keystore file was last modified on the node (unix
+    /// seconds): the last time a cert was installed there. `None` when the
+    /// script could not read it (older script, no keystore, unreadable).
+    pub keystore_modified: Option<i64>,
 }
 
 pub fn parse_check(out: &str) -> Option<CheckRaw> {
@@ -797,9 +801,15 @@ pub fn parse_check(out: &str) -> Option<CheckRaw> {
         .unwrap_or("")
         .trim()
         .to_string();
+    let keystore_modified = out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("__CC_KEYSTORE_MTIME__"))
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|t| *t > 0);
     Some(CheckRaw {
         cert: parse_openssl(cert_text),
         active,
+        keystore_modified,
     })
 }
 
@@ -1796,6 +1806,7 @@ mod tests {
             target: Target { instance_id: id.into(), name: id.into() },
             current: None,
             raw_cert: String::new(),
+            keystore_modified: None,
             dry_run_ok: ok,
             detail: String::new(),
         };
@@ -1917,5 +1928,19 @@ mod tests {
         assert_eq!(expiry_tier(now + 6 * d - 1, now), ExpiryTier::Critical);
         assert_eq!(expiry_tier(now + 5 * d, now), ExpiryTier::Critical);
         assert_eq!(expiry_tier(now - d, now), ExpiryTier::Critical);
+    }
+    #[test]
+    fn the_check_reports_when_the_keystore_was_last_modified() {
+        let base = "__CC_BEGIN__\n__CC_CERT_BEGIN__\nsubject= /CN=*.a\nissuer= /CN=ca\nnotBefore=Sep  3 07:01:23 2025 GMT\nnotAfter=Oct  3 08:01:22 2026 GMT\nserial=01\n__CC_CERT_END__\n";
+        let with = format!("{base}__CC_KEYSTORE_MTIME__ 1786000000\n__CC_ACTIVE__ active\n__CC_END__\n");
+        assert_eq!(parse_check(&with).unwrap().keystore_modified, Some(1_786_000_000));
+        // The script could not stat the keystore: an empty value, not zero.
+        let blank = format!("{base}__CC_KEYSTORE_MTIME__ \n__CC_ACTIVE__ active\n__CC_END__\n");
+        assert_eq!(parse_check(&blank).unwrap().keystore_modified, None);
+        // An older script that never printed the marker.
+        let old = format!("{base}__CC_ACTIVE__ active\n__CC_END__\n");
+        assert_eq!(parse_check(&old).unwrap().keystore_modified, None);
+        let junk = format!("{base}__CC_KEYSTORE_MTIME__ soon\n__CC_ACTIVE__ active\n__CC_END__\n");
+        assert_eq!(parse_check(&junk).unwrap().keystore_modified, None);
     }
 }

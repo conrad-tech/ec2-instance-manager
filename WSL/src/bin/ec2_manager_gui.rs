@@ -29152,16 +29152,32 @@ mod gui {
                             ui.separator();
                             ui.label(egui::RichText::new("Dry run").strong());
                             egui::Grid::new("cassandra_dry_grid")
-                                .num_columns(3)
+                                .num_columns(4)
                                 .striped(true)
                                 .spacing([12.0, 4.0])
                                 .show(ui, |ui| {
                                     ui.label("Node");
+                                    ui.label("Cert last updated");
                                     ui.label("Current cert expires");
                                     ui.label("Dry run");
                                     ui.end_row();
                                     for r in &dry {
                                         ui.label(r.target.name.as_str());
+                                        // When a cert was last installed on the node:
+                                        // its live keystore's modified time. Plain
+                                        // text: how long ago says nothing about health.
+                                        match r.keystore_modified {
+                                            Some(t) => {
+                                                ui.label(format!(
+                                                    "{} ({})",
+                                                    cassandra_local_time(t),
+                                                    cassandra_cert::relative_age(t, now)
+                                                ));
+                                            }
+                                            None => {
+                                                ui.weak("unknown");
+                                            }
+                                        }
                                         match &r.current {
                                             Some(c) if cassandra_cert::is_expired(c, now) => {
                                                 note_label(
@@ -48211,6 +48227,27 @@ mod gui {
         }
     }
 
+    /// `(instance id, name)` of every node `job` acts on.
+    fn cassandra_job_targets(job: &CassandraJob) -> Vec<(String, String)> {
+        let pairs = |ts: &[cassandra_flow::Target]| {
+            ts.iter().map(|t| (t.instance_id.clone(), t.name.clone())).collect()
+        };
+        match job {
+            CassandraJob::DryRun { targets, .. }
+            | CassandraJob::Apply { targets, .. }
+            | CassandraJob::Preflight { targets, .. }
+            | CassandraJob::Schedule { targets, .. }
+            | CassandraJob::CancelSchedule { targets, .. }
+            | CassandraJob::WatchScheduled { targets, .. } => pairs(targets),
+            CassandraJob::RestartNow { target, .. } => {
+                vec![(target.instance_id.clone(), target.name.clone())]
+            }
+            CassandraJob::Rollback { restore, .. } => {
+                restore.iter().map(|r| (r.target.instance_id.clone(), r.target.name.clone())).collect()
+            }
+        }
+    }
+
     /// The flashing word for what a job is doing. "Updating" is the Update
     /// cert stage, "Restarting" a Restart now.
     fn cassandra_activity_word(kind: CassandraJobKind) -> &'static str {
@@ -49055,8 +49092,21 @@ mod gui {
                 c.request_repaint();
             }
         };
+        // Every command logs where its time went (send vs polling), so a slow
+        // dry run can be read off the log: which node, which command, how long.
+        let names: HashMap<String, String> = cassandra_job_targets(&job).into_iter().collect();
         let exec = |id: &str, cmd: &str, timeout: Duration| -> std::result::Result<String, String> {
-            exec_remote_command(&None, ctx, id, cmd, timeout)
+            let began = Instant::now();
+            let (res, t) = ssm_exec_timed(&ctx.profile, &ctx.region, id, cmd, timeout);
+            let node = names.get(id).map(String::as_str).unwrap_or(id);
+            send(CassandraEvent::Log(cassandra_timing_line(
+                node,
+                cassandra_command_label(cmd),
+                &t,
+                began.elapsed(),
+                res.is_ok(),
+            )));
+            res
         };
         // A real monotonic clock that advances: the watch's stability and
         // ceiling are measured on it.
@@ -49089,9 +49139,11 @@ mod gui {
                 // The parameter lookups (one `aws` process each) run side by
                 // side, and alongside the per-node dry run rather than before
                 // it: neither needs the other's result.
+                let dry_began = Instant::now();
                 let (dates, dry) = std::thread::scope(|s| {
                     let dates_worker = s.spawn(|| {
-                        cassandra_guard("parameter dates", || {
+                        let began = Instant::now();
+                        let out = cassandra_guard("parameter dates", || {
                             std::thread::scope(|inner| {
                                 let handles: Vec<_> = parameters
                                     .iter()
@@ -49101,11 +49153,17 @@ mod gui {
                                             match cassandra_cert::expand_parameter(template, domain) {
                                                 Err(e) => (template.clone(), Err(e)),
                                                 Ok(path) => {
+                                                    let began = Instant::now();
                                                     let r = fetch_parameter_modified(
                                                         &ctx.profile,
                                                         &ctx.region,
                                                         &path,
                                                     );
+                                                    send(CassandraEvent::Log(format!(
+                                                        "timing parameter lookup {path}: {:.1}s, {}",
+                                                        began.elapsed().as_secs_f64(),
+                                                        if r.is_ok() { "ok" } else { "failed" },
+                                                    )));
                                                     (path, r)
                                                 }
                                             }
@@ -49117,11 +49175,21 @@ mod gui {
                                     .map(|h| h.join().expect("parameter worker panicked"))
                                     .collect::<Vec<(String, std::result::Result<i64, String>)>>()
                             })
-                        })
+                        });
+                        send(CassandraEvent::Log(format!(
+                            "timing: all parameter lookups finished after {:.1}s",
+                            began.elapsed().as_secs_f64()
+                        )));
+                        out
                     });
+                    let nodes_began = Instant::now();
                     let dry = cassandra_guard("dry run", || {
                         flow::dry_run(&exec, &targets, Some(domain.as_str()))
                     });
+                    send(CassandraEvent::Log(format!(
+                        "timing: all node checks finished after {:.1}s",
+                        nodes_began.elapsed().as_secs_f64()
+                    )));
                     (dates_worker.join().expect("parameter dates worker panicked"), dry)
                 });
                 match dates {
@@ -49131,6 +49199,10 @@ mod gui {
                         return;
                     }
                 }
+                send(CassandraEvent::Log(format!(
+                    "timing: dry run took {:.1}s in total",
+                    dry_began.elapsed().as_secs_f64()
+                )));
                 match dry {
                     Ok(out) => send(CassandraEvent::DryRun(out)),
                     Err(e) => send(CassandraEvent::Failed(e)),
@@ -49261,6 +49333,77 @@ mod gui {
         serde_json::json!({ "commands": [command] }).to_string()
     }
 
+    /// Where the time of one SSM command went: the `send-command` call, then
+    /// the polling until it finished (each poll is an `aws` process).
+    #[derive(Clone, Copy, Debug, Default)]
+    struct SsmTiming {
+        send: Duration,
+        wait: Duration,
+        polls: u32,
+    }
+
+    /// `exec_remote_command` without the control channel, timed.
+    fn ssm_exec_timed(
+        profile: &str,
+        region: &str,
+        instance_id: &str,
+        command: &str,
+        timeout: Duration,
+    ) -> (std::result::Result<String, String>, SsmTiming) {
+        let mut t = SsmTiming::default();
+        let began = Instant::now();
+        let sent = ssm_send_command(profile, region, instance_id, command);
+        t.send = began.elapsed();
+        let command_id = match sent {
+            Ok(id) => id,
+            Err(e) => return (Err(e), t),
+        };
+        let waited = Instant::now();
+        let out = ssm_wait_for_command_counted(profile, region, instance_id, &command_id, timeout, &mut t.polls);
+        t.wait = waited.elapsed();
+        (out, t)
+    }
+
+    /// A short name for what a Cassandra command does, from its text. The
+    /// bundled scripts travel base64'd, so this goes by the flags and verbs
+    /// that stay visible.
+    fn cassandra_command_label(cmd: &str) -> &'static str {
+        if cmd.contains("systemctl restart") {
+            "restart"
+        } else if cmd.contains("'--dry-run'") {
+            "renew --dry-run"
+        } else if cmd.contains("'--no-restart'") {
+            "stage (--no-restart)"
+        } else if cmd.contains("'--at'") {
+            "schedule --at"
+        } else if cmd.contains("'--cancel'") {
+            "schedule --cancel"
+        } else if cmd.contains("'--show'") {
+            "schedule --show"
+        } else if cmd.contains("'--restore'") {
+            "rollback restore"
+        } else if cmd.contains("is-active") {
+            "is-active"
+        } else if cmd.contains("base64 -d") {
+            "check script (cert / backups)"
+        } else {
+            "command"
+        }
+    }
+
+    /// One log line saying where a command's time went:
+    /// `timing cassandra-001 renew --dry-run: send 1.2s + wait 9.4s (6 polls) = 10.6s, ok`.
+    fn cassandra_timing_line(node: &str, label: &str, t: &SsmTiming, total: Duration, ok: bool) -> String {
+        format!(
+            "timing {node} {label}: send {:.1}s + wait {:.1}s ({} polls) = {:.1}s, {}",
+            t.send.as_secs_f64(),
+            t.wait.as_secs_f64(),
+            t.polls,
+            total.as_secs_f64(),
+            if ok { "ok" } else { "failed" },
+        )
+    }
+
     fn ssm_send_command(
         profile: &str,
         region: &str,
@@ -49302,12 +49445,26 @@ mod gui {
         command_id: &str,
         timeout: Duration,
     ) -> std::result::Result<String, String> {
+        ssm_wait_for_command_counted(profile, region, instance_id, command_id, timeout, &mut 0)
+    }
+
+    /// `ssm_wait_for_command`, also counting how many `get-command-invocation`
+    /// polls (one `aws` process each) it took.
+    fn ssm_wait_for_command_counted(
+        profile: &str,
+        region: &str,
+        instance_id: &str,
+        command_id: &str,
+        timeout: Duration,
+        polls: &mut u32,
+    ) -> std::result::Result<String, String> {
         let deadline = Instant::now() + timeout;
         loop {
             if Instant::now() > deadline {
                 return Err(format!("ssm command timed out after {}s", timeout.as_secs()));
             }
             std::thread::sleep(Duration::from_millis(100));
+            *polls += 1;
             // Status and output in one call: the poll that sees "Success"
             // already has the output, so there is no second `aws` process.
             let output = aws_command()
@@ -60643,6 +60800,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 target: cassandra_flow::Target { instance_id: "i-1".into(), name: "cassandra-001".into() },
                 current: None,
                 raw_cert: "notAfter=Oct  3 08:01:22 2026 GMT".into(),
+                keystore_modified: None,
                 dry_run_ok: true,
                 detail: String::new(),
             }]);
@@ -61448,6 +61606,47 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 .ends_with("checks finished - confirm in the Scheduled restart window"));
         }
 
+        #[test]
+        fn a_command_is_named_by_what_it_does_for_the_timing_log() {
+            assert_eq!(cassandra_command_label("systemctl restart --no-block cassandra; echo"), "restart");
+            assert_eq!(cassandra_command_label("bash \"$f\" '-d' 'x.net' '--dry-run'"), "renew --dry-run");
+            assert_eq!(cassandra_command_label("bash \"$f\" '-d' 'x.net' '--no-restart'"), "stage (--no-restart)");
+            assert_eq!(cassandra_command_label("bash \"$f\" '--at' '1'"), "schedule --at");
+            assert_eq!(cassandra_command_label("bash \"$f\" '--cancel'"), "schedule --cancel");
+            assert_eq!(cassandra_command_label("systemctl is-active cassandra"), "is-active");
+            assert_eq!(cassandra_command_label("printf x | base64 -d > \"$f\"; bash \"$f\""), "check script (cert / backups)");
+            assert_eq!(cassandra_command_label("uptime"), "command");
+        }
+
+        #[test]
+        fn the_timing_line_says_where_the_time_went() {
+            let t = SsmTiming {
+                send: Duration::from_millis(1_240),
+                wait: Duration::from_millis(9_400),
+                polls: 6,
+            };
+            let line = cassandra_timing_line("cassandra-001", "renew --dry-run", &t, Duration::from_millis(10_700), true);
+            assert_eq!(line, "timing cassandra-001 renew --dry-run: send 1.2s + wait 9.4s (6 polls) = 10.7s, ok");
+            let bad = cassandra_timing_line("cassandra-002", "is-active", &SsmTiming::default(), Duration::from_secs(2), false);
+            assert!(bad.ends_with("failed") && bad.is_ascii(), "{bad}");
+        }
+
+        #[test]
+        fn the_dry_run_logs_its_phases() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let body = method_body(src, "fn run_cassandra_job(");
+            for needle in [
+                "timing: all parameter lookups finished after",
+                "timing: all node checks finished after",
+                "timing: dry run took",
+                "timing parameter lookup",
+                "cassandra_timing_line(",
+            ] {
+                assert!(body.contains(needle), "{needle}");
+            }
+        }
+
         /// When the scheduled time is reached the notice says Restarting, with
         /// what is restarting and why, until the checks take over.
         #[test]
@@ -61776,6 +61975,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 target: cass_target("i-1", "cassandra-101"),
                 current: Some(cass_cert(1_700_000_000, "AA")),
                 raw_cert: String::new(),
+                keystore_modified: None,
                 dry_run_ok: true,
                 detail: String::new(),
             };
@@ -62097,6 +62297,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 target: cass_target(id, id),
                 current: Some(cass_cert(1_700_000_000, "AA")),
                 raw_cert: String::new(),
+                keystore_modified: None,
                 dry_run_ok: ok,
                 detail: String::new(),
             }
