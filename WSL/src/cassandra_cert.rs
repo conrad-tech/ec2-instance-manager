@@ -417,13 +417,40 @@ pub fn expiry_tier(not_after: i64, now: i64) -> ExpiryTier {
     }
 }
 
-/// How recent a parameter must be to count as fresh in the dialog.
-pub const PARAMETER_FRESH_SECS: i64 = 30 * 24 * 60 * 60;
+/// What a parameter's upload date says about deploying it, judged against the
+/// cert the nodes serve now. Age alone says nothing: a cert valid until 2032
+/// uploaded months ago is exactly as deployable as one uploaded yesterday.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParameterVerdict {
+    /// Uploaded after the installed cert was issued: an update would install something new.
+    NewerThanInstalled,
+    /// Not newer than the installed cert: an update would reinstall what is already there.
+    NotNewerThanInstalled,
+    /// No node's current cert could be read, so there is nothing to compare with.
+    NothingToCompare,
+}
 
-/// Whether a parameter was modified within the last 30 days of `now` (both
-/// unix seconds). A date in the future counts as fresh.
-pub fn parameter_is_fresh(modified: i64, now: i64) -> bool {
-    now - modified <= PARAMETER_FRESH_SECS
+/// `issued` is the earliest `notBefore` among the selected nodes' readable certs.
+pub fn parameter_verdict(modified: i64, issued: Option<i64>) -> ParameterVerdict {
+    match issued {
+        None => ParameterVerdict::NothingToCompare,
+        Some(not_before) if modified <= not_before => ParameterVerdict::NotNewerThanInstalled,
+        Some(_) => ParameterVerdict::NewerThanInstalled,
+    }
+}
+
+/// "today", "3 days ago", "2 months ago", "1 year ago": how long ago `modified`
+/// was, relative to `now` (both unix seconds). Shown beside the date as plain
+/// text, never coloured: age is not a health signal.
+pub fn relative_age(modified: i64, now: i64) -> String {
+    let days = (now - modified).max(0) / 86_400;
+    let plural = |n: i64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
+    match days {
+        0 => "today".to_string(),
+        1..=59 => plural(days, "day"),
+        60..=729 => plural(days / 30, "month"),
+        _ => plural(days / 365, "year"),
+    }
 }
 
 /// Names of unselected nodes that do not serve `result`, `(unreadable)` for
@@ -1855,12 +1882,29 @@ mod tests {
         assert!(start_blocker(&x, false, true, false).is_some());
     }
     #[test]
-    fn a_parameter_is_fresh_for_thirty_days() {
+    fn a_parameter_is_judged_by_the_installed_cert_not_by_its_age() {
+        // Uploaded after the nodes' cert was issued: deployable, however old the upload.
+        assert_eq!(parameter_verdict(5_000, Some(4_000)), ParameterVerdict::NewerThanInstalled);
+        // Not newer than the installed cert (equal counts): an update changes nothing.
+        assert_eq!(parameter_verdict(4_000, Some(4_000)), ParameterVerdict::NotNewerThanInstalled);
+        assert_eq!(parameter_verdict(3_000, Some(4_000)), ParameterVerdict::NotNewerThanInstalled);
+        // No readable node cert: no verdict, no colour.
+        assert_eq!(parameter_verdict(5_000, None), ParameterVerdict::NothingToCompare);
+    }
+
+    #[test]
+    fn relative_age_reads_in_plain_words() {
         let now = 1_800_000_000;
-        assert!(parameter_is_fresh(now - 29 * 86_400, now));
-        assert!(parameter_is_fresh(now - 30 * 86_400, now));
-        assert!(!parameter_is_fresh(now - 30 * 86_400 - 1, now));
-        assert!(parameter_is_fresh(now + 60, now));
+        let d = 86_400;
+        assert_eq!(relative_age(now, now), "today");
+        assert_eq!(relative_age(now - d, now), "1 day ago");
+        assert_eq!(relative_age(now - 45 * d, now), "45 days ago");
+        assert_eq!(relative_age(now - 60 * d, now), "2 months ago");
+        assert_eq!(relative_age(now - 400 * d, now), "13 months ago");
+        assert_eq!(relative_age(now - 730 * d, now), "2 years ago");
+        // A date in the future never reads negative.
+        assert_eq!(relative_age(now + d, now), "today");
+        assert!(relative_age(now - 5 * d, now).is_ascii());
     }
     #[test]
     fn expiry_tiers_follow_whole_days_left() {

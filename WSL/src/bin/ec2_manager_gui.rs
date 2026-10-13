@@ -29218,23 +29218,36 @@ mod gui {
                                         ui.horizontal_wrapped(|ui| {
                                             ui.spacing_mut().item_spacing.x = 0.0;
                                             ui.label(format!("{path}: "));
-                                            if issued.is_some_and(|c| cassandra_cert::parameter_is_stale(*t, c)) {
-                                                note_label(
-                                                    ui,
-                                                    red,
-                                                    format!(
-                                                        "{local} - not renewed since the current \
-                                                         cert was issued"
-                                                    ),
-                                                );
-                                            } else {
-                                                // Green within 30 days, red beyond.
-                                                let color = if cassandra_cert::parameter_is_fresh(*t, now) {
-                                                    green
-                                                } else {
-                                                    red
-                                                };
-                                                note_label(ui, color, local);
+                                            let age = cassandra_cert::relative_age(*t, now);
+                                            match cassandra_cert::parameter_verdict(
+                                                *t,
+                                                issued.map(|c| c.not_before),
+                                            ) {
+                                                cassandra_cert::ParameterVerdict::NewerThanInstalled => {
+                                                    note_label(
+                                                        ui,
+                                                        green,
+                                                        format!(
+                                                            "{local} ({age}) - newer than the installed \
+                                                             cert, ready to deploy"
+                                                        ),
+                                                    );
+                                                }
+                                                cassandra_cert::ParameterVerdict::NotNewerThanInstalled => {
+                                                    note_label(
+                                                        ui,
+                                                        amber,
+                                                        format!(
+                                                            "{local} ({age}) - not newer than the \
+                                                             installed cert; updating would reinstall \
+                                                             the same cert"
+                                                        ),
+                                                    );
+                                                }
+                                                cassandra_cert::ParameterVerdict::NothingToCompare => {
+                                                    // No node cert to compare with: no verdict, no colour.
+                                                    ui.label(format!("{local} ({age})"));
+                                                }
                                             }
                                         });
                                     }
