@@ -2207,6 +2207,9 @@ mod gui {
         account_id: String,
         env: String,
         kind: CassandraJobKind,
+        /// The names of the nodes the job acts on, for the "Updating ..." /
+        /// "Restarting ..." line. Not compared.
+        nodes: Vec<String>,
         /// When the job was admitted.
         since: Instant,
     }
@@ -28752,6 +28755,11 @@ mod gui {
                 && self.cassandra_inflight.as_ref().is_some_and(|job| {
                     cassandra_job_looks_stuck(job.since.elapsed().as_secs(), ceiling)
                 });
+            let progress_text = self
+                .cassandra_inflight
+                .as_ref()
+                .map(|j| cassandra_progress_text(j.kind, &j.env, &j.nodes))
+                .unwrap_or_else(|| "Running".to_string());
             let now = chrono::Utc::now().timestamp();
             let domain_state = cassandra_domain(
                 ec2_manager::accounts::declared_domain_for(
@@ -29070,7 +29078,10 @@ mod gui {
                         if dlg.running {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                ui.label("Running...");
+                                // Flashing yellow, worded for the job: Updating,
+                                // Restarting, Running, ...
+                                let colour = flashing_yellow(ui);
+                                note_label(ui, colour, progress_text.as_str());
                             });
                         }
                         if !dlg.log.is_empty() {
@@ -29505,7 +29516,7 @@ mod gui {
                                                 action = Some(CassandraAction::RestartNow(t.instance_id.clone()));
                                             }
                                             if ui
-                                                .add_enabled(!scheduled, egui::Button::new("Schedule restart..."))
+                                                .add_enabled(!scheduled, egui::Button::new("Schedule restart"))
                                                 .on_hover_text(
                                                     "Pick a time for cron on the node(s) to restart Cassandra.",
                                                 )
@@ -29525,7 +29536,7 @@ mod gui {
                                     .count();
                                 if offer_restart && unrestarted > 1 {
                                     if ui
-                                        .add_enabled(!scheduled, egui::Button::new("Schedule restart for all nodes..."))
+                                        .add_enabled(!scheduled, egui::Button::new("Schedule restart for all nodes"))
                                         .on_hover_text(
                                             "cron on every staged node restarts Cassandra at the same \
                                              local time, so the cluster moves to the new cert together.",
@@ -48178,7 +48189,60 @@ mod gui {
             account_id: account_id.clone(),
             env: env.clone(),
             kind,
+            nodes: cassandra_job_node_names(job),
             since: Instant::now(),
+        }
+    }
+
+    /// The names of the nodes `job` acts on.
+    fn cassandra_job_node_names(job: &CassandraJob) -> Vec<String> {
+        let names = |ts: &[cassandra_flow::Target]| ts.iter().map(|t| t.name.clone()).collect();
+        match job {
+            CassandraJob::DryRun { targets, .. }
+            | CassandraJob::Apply { targets, .. }
+            | CassandraJob::Preflight { targets, .. }
+            | CassandraJob::Schedule { targets, .. }
+            | CassandraJob::CancelSchedule { targets, .. }
+            | CassandraJob::WatchScheduled { targets, .. } => names(targets),
+            CassandraJob::RestartNow { target, .. } => vec![target.name.clone()],
+            CassandraJob::Rollback { restore, .. } => {
+                restore.iter().map(|r| r.target.name.clone()).collect()
+            }
+        }
+    }
+
+    /// The flashing word for what a job is doing. "Updating" is the Update
+    /// cert stage, "Restarting" a Restart now.
+    fn cassandra_activity_word(kind: CassandraJobKind) -> &'static str {
+        match kind {
+            CassandraJobKind::DryRun | CassandraJobKind::Preflight => "Running",
+            CassandraJobKind::Apply => "Updating",
+            CassandraJobKind::RestartNow => "Restarting",
+            CassandraJobKind::Rollback => "Rolling back",
+            CassandraJobKind::Schedule => "Scheduling",
+            CassandraJobKind::CancelSchedule => "Cancelling",
+            CassandraJobKind::WatchScheduled => "Checking",
+        }
+    }
+
+    /// `a, b, c`, or `a, b, c, d, e, f +2 more` past six names.
+    fn cassandra_node_list(names: &[String]) -> String {
+        const SHOWN: usize = 6;
+        if names.len() <= SHOWN {
+            names.join(", ")
+        } else {
+            format!("{} +{} more", names[..SHOWN].join(", "), names.len() - SHOWN)
+        }
+    }
+
+    /// The line beside the spinner while a job runs, e.g.
+    /// `Updating DEV1 - cassandra-001, cassandra-002`. ASCII only.
+    fn cassandra_progress_text(kind: CassandraJobKind, env: &str, nodes: &[String]) -> String {
+        let word = cassandra_activity_word(kind);
+        if nodes.is_empty() {
+            format!("{word} {env}")
+        } else {
+            format!("{word} {env} - {}", cassandra_node_list(nodes))
         }
     }
 
@@ -48391,6 +48455,18 @@ mod gui {
             SchedState::Checking => "restart time passed - checking the nodes",
             SchedState::AwaitingConfirm => "checks finished - confirm in the Scheduled restart window",
             SchedState::Scheduled if now < rec.when => return cassandra_notice_text(env, rec.when),
+            // The scheduled time has been reached: cron is restarting the
+            // nodes right now (it fires on the minute and Cassandra takes a
+            // moment). Say so, with what is restarting and why, until the
+            // checks take over.
+            SchedState::Scheduled if now < rec.when + cassandra_cert::CHECK_GRACE_SECS => {
+                let names: Vec<String> = rec.nodes.iter().map(|n| n.name.clone()).collect();
+                return format!(
+                    "{env}: Restarting Cassandra on {} - Cassandra cert update ({})",
+                    cassandra_node_list(&names),
+                    cassandra_local_time(rec.when)
+                );
+            }
             SchedState::Scheduled => match auth {
                 Some(false) => "restart time passed - checks waiting for credentials",
                 None => "restart time passed - checks waiting (credential status unknown)",
@@ -60336,6 +60412,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 account_id: account.into(),
                 env: env.into(),
                 kind,
+                nodes: Vec::new(),
                 since: Instant::now(),
             }
         }
@@ -61358,7 +61435,8 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 (Some(true), true, "restart time passed - checks failed, retrying"),
             ];
             for (auth, retry, want) in cases {
-                let got = t(&rec, when + 5, auth, retry);
+                // After the restart window: the checks' state.
+                let got = t(&rec, when + cassandra_cert::CHECK_GRACE_SECS + 5, auth, retry);
                 assert!(got.ends_with(want), "{got}");
                 assert!(got.starts_with("DEV1: ") && got.contains(&cassandra_local_time(when)), "{got}");
                 assert!(got.is_ascii(), "{got}");
@@ -61368,6 +61446,68 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             rec.state = SchedState::AwaitingConfirm;
             assert!(t(&rec, when + 900, None, false)
                 .ends_with("checks finished - confirm in the Scheduled restart window"));
+        }
+
+        /// When the scheduled time is reached the notice says Restarting, with
+        /// what is restarting and why, until the checks take over.
+        #[test]
+        fn the_notice_says_restarting_from_the_scheduled_time_with_the_details() {
+            let rec = sched_record(&["i-1", "i-2"]);
+            let when = rec.when;
+            for now in [when, when + 1, when + cassandra_cert::CHECK_GRACE_SECS - 1] {
+                let got = cassandra_notice_text_for("DEV1", &rec, now, Some(true), false);
+                assert!(got.starts_with("DEV1: Restarting Cassandra on "), "{got}");
+                assert!(got.contains(&rec.nodes[0].name) && got.contains(&rec.nodes[1].name), "{got}");
+                assert!(got.contains("Cassandra cert update"), "{got}");
+                assert!(got.contains(&cassandra_local_time(when)), "{got}");
+                assert!(got.is_ascii(), "{got}");
+                // Credentials do not matter to the restart itself.
+                assert_eq!(got, cassandra_notice_text_for("DEV1", &rec, now, Some(false), false));
+            }
+            // Before the time it is still the countdown line; once the grace
+            // has passed the checks' wording takes over.
+            assert_eq!(
+                cassandra_notice_text_for("DEV1", &rec, when - 1, Some(true), false),
+                cassandra_notice_text("DEV1", when)
+            );
+            let after = cassandra_notice_text_for(
+                "DEV1", &rec, when + cassandra_cert::CHECK_GRACE_SECS, Some(true), false,
+            );
+            assert!(!after.contains("Restarting Cassandra on"), "{after}");
+        }
+
+        #[test]
+        fn a_running_job_says_what_it_is_doing_in_one_flashing_word() {
+            use CassandraJobKind::*;
+            let names: Vec<String> = ["cassandra-001", "cassandra-002"].iter().map(|s| s.to_string()).collect();
+            assert_eq!(cassandra_progress_text(Apply, "DEV1", &names), "Updating DEV1 - cassandra-001, cassandra-002");
+            assert_eq!(cassandra_progress_text(RestartNow, "DEV1", &names[..1]), "Restarting DEV1 - cassandra-001");
+            assert_eq!(cassandra_progress_text(DryRun, "DEV1", &[]), "Running DEV1");
+            assert_eq!(cassandra_activity_word(Preflight), "Running");
+            for k in [DryRun, Apply, RestartNow, Preflight, Rollback, Schedule, CancelSchedule, WatchScheduled] {
+                assert!(cassandra_activity_word(k).is_ascii());
+            }
+            let many: Vec<String> = (1..=9).map(|i| format!("n{i}")).collect();
+            assert_eq!(cassandra_node_list(&many), "n1, n2, n3, n4, n5, n6 +3 more");
+        }
+
+        #[test]
+        fn the_job_names_its_nodes_and_the_buttons_have_no_ellipsis() {
+            let job = CassandraJob::RestartNow {
+                account_id: "111".into(),
+                env: "DEV1".into(),
+                target: cassandra_flow::Target { instance_id: "i-1".into(), name: "cassandra-001".into() },
+                before: HashMap::new(),
+            };
+            assert_eq!(cassandra_job_identity(&job, 1).nodes, ["cassandra-001"]);
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            assert!(src.contains("egui::Button::new(\"Schedule restart\")"));
+            assert!(src.contains("egui::Button::new(\"Schedule restart for all nodes\")"));
+            assert!(!src.contains("Schedule restart..."));
+            // The progress line is flashing yellow, not a plain label.
+            let at = src.find("let progress_text = self").expect("progress text");
+            assert!(src[at..].contains("note_label(ui, colour, progress_text.as_str())"));
         }
 
         /// Finding 6: an orphan record names every node that may hold the
