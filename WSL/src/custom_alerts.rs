@@ -45,6 +45,7 @@ pub struct CustomAlert {
     /// Looked for, case-insensitively, in the alert's summary (`message`).
     pub match_text: String,
     /// Minutes after first sighting at which the alert is acknowledged.
+    /// `0` acknowledges it at once.
     pub ack_after_mins: u32,
     pub escalate: bool,
     /// Minutes after the acknowledge before it escalates. Zero when
@@ -82,6 +83,16 @@ pub fn parse_mins(raw: &str) -> Option<u32> {
     t.parse::<u32>().ok().filter(|n| *n >= 1)
 }
 
+/// Minutes before the acknowledge: like `parse_mins` but `0` is allowed and
+/// means "acknowledge as soon as the alert is seen".
+pub fn parse_ack_mins(raw: &str) -> Option<u32> {
+    let t = raw.trim();
+    if t == "0" {
+        return Some(0);
+    }
+    parse_mins(t)
+}
+
 /// Why a form cannot be saved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Problem {
@@ -102,7 +113,7 @@ impl Problem {
             Self::BlankMatchText => {
                 "Enter the text to look for. A blank would match every alert."
             }
-            Self::BadAckMins => "Minutes to acknowledge must be a whole number, 1 or more.",
+            Self::BadAckMins => "Minutes to acknowledge must be a whole number, 0 or more (0 acknowledges at once).",
             Self::BadWaitMins => "Minutes to wait to escalate must be a whole number, 1 or more.",
         }
     }
@@ -210,7 +221,7 @@ impl AlertForm {
         if match_text.is_empty() {
             return Err(Problem::BlankMatchText);
         }
-        let ack_after_mins = parse_mins(&self.ack_raw).ok_or(Problem::BadAckMins)?;
+        let ack_after_mins = parse_ack_mins(&self.ack_raw).ok_or(Problem::BadAckMins)?;
         let escalate_wait_mins = if self.escalate {
             parse_mins(&self.wait_raw).ok_or(Problem::BadWaitMins)?
         } else {
@@ -227,7 +238,7 @@ impl AlertForm {
 
     /// The line under the minute boxes. Empty while a number is unusable.
     pub fn escalates_at_label(&self) -> String {
-        let Some(ack) = parse_mins(&self.ack_raw) else {
+        let Some(ack) = parse_ack_mins(&self.ack_raw) else {
             return String::new();
         };
         if !self.escalate {
@@ -505,6 +516,26 @@ mod tests {
     }
 
     #[test]
+    fn acknowledge_minutes_may_be_zero_but_wait_minutes_may_not() {
+        assert_eq!(parse_ack_mins("0"), Some(0));
+        assert_eq!(parse_ack_mins(" 0 "), Some(0));
+        assert_eq!(parse_ack_mins("00"), None, "only a plain 0");
+        assert_eq!(parse_ack_mins("3"), Some(3));
+        assert_eq!(parse_ack_mins("-1"), None);
+        assert_eq!(parse_mins("0"), None, "the escalate wait still needs 1+");
+    }
+
+    #[test]
+    fn a_zero_minute_acknowledge_is_due_the_moment_it_is_seen() {
+        let mut s = CustomAlertState::default();
+        let defs = vec![def("disk", "disk", 0, true, 5)];
+        s.consider(&alert("1", "disk full"), &defs, false, 1_000);
+        let due = s.due(1_000);
+        assert_eq!(due.len(), 1);
+        assert!(matches!(due[0], Due::Acknowledge { .. }));
+    }
+
+    #[test]
     fn upsert_replaces_in_place_and_keeps_order() {
         let mut list = vec![def("a", "x", 1, false, 0), def("b", "y", 1, false, 0)];
         upsert(&mut list, def("A2", "z", 3, false, 0), Some("a"));
@@ -561,7 +592,7 @@ mod tests {
         f.match_text = "   ".to_string();
         assert_eq!(f.check(&existing), Err(Problem::BlankMatchText));
         f.match_text = "disk".to_string();
-        f.ack_raw = "0".to_string();
+        f.ack_raw = "-1".to_string();
         assert_eq!(f.check(&existing), Err(Problem::BadAckMins));
         f.ack_raw = "2".to_string();
         f.wait_raw = "x".to_string();

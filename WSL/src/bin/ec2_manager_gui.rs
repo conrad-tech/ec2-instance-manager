@@ -22228,7 +22228,9 @@ mod gui {
                                             .desired_width(60.0),
                                     );
                                     ui.label("minutes");
-                                });
+                                })
+                                .response
+                                .on_hover_text("0 acknowledges the alert as soon as it is seen.");
                                 ui.end_row();
 
                                 ui.label("Escalate");
@@ -31080,6 +31082,7 @@ mod gui {
             let mut window_open = true;
             let mut submit = false;
             let mut dismiss = false;
+            let (now_date, now_time) = cassandra_now_example();
             egui::Window::new("Schedule restart")
                 .id(egui::Id::new("cassandra_schedule_restart"))
                 .collapsible(false)
@@ -31097,14 +31100,14 @@ mod gui {
                             ui.label("Date:");
                             ui.add(
                                 egui::TextEdit::singleline(&mut sd.date)
-                                    .hint_text("YYYY-MM-DD")
+                                    .hint_text(now_date.as_str())
                                     .desired_width(120.0),
                             );
                             ui.end_row();
                             ui.label("Time:");
                             ui.add(
                                 egui::TextEdit::singleline(&mut sd.time)
-                                    .hint_text("HH:MM")
+                                    .hint_text(now_time.as_str())
                                     .desired_width(120.0),
                             );
                             ui.end_row();
@@ -31115,6 +31118,7 @@ mod gui {
                     }
                     let names: Vec<String> = sd.targets().into_iter().map(|t| t.name).collect();
                     ui.label(format!("Nodes: {}", names.join(", ")));
+                    ui.weak(format!("It is now {now_date} {now_time} here (24-hour clock)."));
                     ui.weak("cron on each node restarts Cassandra at this local time. Allow 2 minutes to 60 days.");
                     if let Some(e) = &sd.error {
                         note_label(ui, red, e.as_str());
@@ -49967,6 +49971,14 @@ mod gui {
         }
     }
 
+    /// The current local date and time in the formats the Schedule dialog
+    /// takes (`YYYY-MM-DD`, 24-hour `HH:MM`): the greyed hint in each box, so
+    /// the user sees the clock they are being asked to use.
+    fn cassandra_now_example() -> (String, String) {
+        let now = chrono::Local::now();
+        (now.format("%Y-%m-%d").to_string(), now.format("%H:%M").to_string())
+    }
+
     /// The default schedule the dialog opens on: tomorrow, 02:00 local.
     fn cassandra_default_schedule_input() -> (String, String) {
         let tomorrow = chrono::Local::now().date_naive() + chrono::Duration::days(1);
@@ -62327,6 +62339,15 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let got = parse_schedule_input("2026-11-02", "03:30").expect("parses");
             // Round trip through the display helper the dialog already uses.
             assert_eq!(cassandra_local_time(got), "2026-11-02 03:30");
+        }
+
+        #[test]
+        fn the_schedule_hints_show_the_current_time_in_the_format_the_boxes_take() {
+            let (d, t) = cassandra_now_example();
+            assert!(parse_schedule_input(&d, &t).is_ok(), "{d} {t}");
+            let src = include_str!("ec2_manager_gui.rs");
+            assert!(src.contains(".hint_text(now_date.as_str())"));
+            assert!(src.contains(".hint_text(now_time.as_str())"));
         }
 
         #[test]

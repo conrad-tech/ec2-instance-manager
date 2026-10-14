@@ -1618,13 +1618,13 @@ fn parse_personal_script(raw: &str) -> Option<PersonalScript> {
 }
 
 /// `name|ack|escalate|wait|match`. Dropped when it cannot be decoded or
-/// would not pass the dialog's own checks: a line hand-edited to zero
-/// minutes or a blank match must not become a watcher that matches every
+/// would not pass the dialog's own checks: a line hand-edited to a zero escalate
+/// wait or a blank match must not become a watcher that matches every
 /// alert or escalates at once.
 fn parse_custom_alert(raw: &str) -> Option<crate::custom_alerts::CustomAlert> {
     let mut f = raw.splitn(5, '|');
     let name = decode_b64(f.next()?)?;
-    let ack_after_mins = crate::custom_alerts::parse_mins(f.next()?)?;
+    let ack_after_mins = crate::custom_alerts::parse_ack_mins(f.next()?)?;
     let escalate = f.next()?.trim() == "1";
     let wait_raw = f.next()?.trim();
     let match_text = decode_b64(f.next()?)?;
@@ -2181,7 +2181,7 @@ mod tests {
 
     #[test]
     fn an_unusable_custom_alert_line_is_skipped() {
-        // bad base64, zero minutes, a blank name, and a blank match text
+        // bad base64, a zero escalate wait, a blank name, and a blank match text
         let good = {
             let mut c = AppConfig::default();
             c.custom_alerts = vec![crate::custom_alerts::CustomAlert {
@@ -2196,7 +2196,7 @@ mod tests {
         let line = good.lines().find(|l| l.starts_with("custom_alert=")).unwrap();
         let text = format!(
             "custom_alert=not-base64!!|1|0|0|also-bad\n\
-             custom_alert=b2s=|0|0|0|eA==\n\
+             custom_alert=b2s=|1|1|0|eA==\n\
              custom_alert=|1|0|0|eA==\n\
              custom_alert=b2s=|1|0|0|\n\
              {line}\n"
