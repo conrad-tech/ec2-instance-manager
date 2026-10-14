@@ -43825,7 +43825,9 @@ mod gui {
         initial: Vec<ec2_manager::custom_alerts::CustomAlert>,
         mailbox: String,
     ) -> CustomAlertsRuntime {
-        use ec2_manager::custom_alerts::{Considered, CustomAlertState, Due};
+        use ec2_manager::custom_alerts::{
+            reread_verdict, Considered, CustomAlertState, Due, RereadVerdict,
+        };
         use ec2_manager::{alerts, oncall};
 
         // Sized like the other watchers' defaults: a poll twice a minute over
@@ -43871,7 +43873,7 @@ mod gui {
 
                 // A snapshot, so a save in the dialog never holds the lock
                 // across an HTTP call.
-                let snapshot = thread_defs.lock().map(|g| g.clone()).unwrap_or_default();
+                let snapshot = thread_defs.lock().unwrap_or_else(|p| p.into_inner()).clone();
 
                 // Deleting or renaming an alert stops its timers: a phone
                 // must not ring for something the user just removed.
@@ -43920,26 +43922,34 @@ mod gui {
                 // fallen off it, and absence is not evidence it closed.
                 for id in state.watched_alert_ids() {
                     match alerts::fetch_alert(&auth, &id) {
-                        Ok(a) if ec2_manager::reaper::alert_is_closed(&a.status) => {
-                            note(
-                                LogLevel::Info,
-                                format!("custom alerts: {id} closed - nothing more to do"),
-                            );
-                            state.closed(&id);
-                        }
-                        // A person acknowledged it while it was being timed:
-                        // they have it, so it must not escalate over them.
-                        Ok(a) if a.acknowledged => {
-                            note(
-                                LogLevel::Info,
-                                format!(
-                                    "custom alerts: {id} was acknowledged by someone else - \
-                                     no longer timing it"
-                                ),
-                            );
-                            state.closed(&id);
-                        }
-                        Ok(_) => {}
+                        Ok(a) => match reread_verdict(
+                            &a.status,
+                            a.acknowledged,
+                            state.acked_by_us(&id),
+                        ) {
+                            RereadVerdict::Closed => {
+                                note(
+                                    LogLevel::Info,
+                                    format!("custom alerts: {id} closed - nothing more to do"),
+                                );
+                                state.closed(&id);
+                            }
+                            // A person acknowledged it while it was being
+                            // timed: they have it, so it must not escalate
+                            // over them. Our own successful acknowledge is
+                            // not that, or we would cancel our escalation.
+                            RereadVerdict::AckedElsewhere => {
+                                note(
+                                    LogLevel::Info,
+                                    format!(
+                                        "custom alerts: {id} was acknowledged by someone else - \
+                                         no longer timing it"
+                                    ),
+                                );
+                                state.closed(&id);
+                            }
+                            RereadVerdict::KeepTiming => {}
+                        },
                         // Left alone: a transient failure must not cancel an
                         // escalation.
                         Err(e) => note(
@@ -43953,10 +43963,15 @@ mod gui {
                     match due {
                         Due::Acknowledge { alert_id, name } => {
                             match alerts::acknowledge_alert(&auth, &alert_id) {
-                                Ok(()) => note(
-                                    LogLevel::Info,
-                                    format!("custom alerts: acknowledged {alert_id} ('{name}')"),
-                                ),
+                                Ok(()) => {
+                                    state.ack_succeeded(&alert_id);
+                                    note(
+                                        LogLevel::Info,
+                                        format!(
+                                            "custom alerts: acknowledged {alert_id} ('{name}')"
+                                        ),
+                                    )
+                                }
                                 // Not fatal: a failed acknowledge costs a
                                 // duplicate page, dropping the watch would
                                 // cost the escalation.
@@ -43988,7 +44003,7 @@ mod gui {
                             std::thread::spawn(move || {
                                 let (ok, detail) = match send_escalation_email(&mailbox2, &subject)
                                 {
-                                    Ok(address) => (true, format!("sent to {address}")),
+                                    Ok(_) => (true, "sent".to_string()),
                                     Err(reason) => (false, reason),
                                 };
                                 let _ = tx2.send(CustomAlertEvent::Escalated { name, detail, ok });
@@ -61518,6 +61533,22 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert!(on_call < fetch, "on call is decided before the feed is read");
             assert!(body.contains("dry_run_route("), "built-in watchers are consulted");
             assert!(body.contains("forget_removed("), "removed alerts drop their watches");
+        }
+
+        /// The re-read must go through `reread_verdict`: a bare "acknowledged"
+        /// test cancels the watcher's own escalation after its own acknowledge.
+        #[test]
+        fn the_custom_alerts_poll_rereads_through_the_verdict() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let def = format!("fn start_custom_alerts_{}(", "poll");
+            let start = src.find(&def).expect("the poll");
+            let end = src[start..].find("\n    }\n").map(|i| start + i).expect("its end");
+            let body = &src[start..end];
+            assert!(body.contains("reread_verdict("), "the re-read uses the verdict");
+            assert!(body.contains("ack_succeeded("), "a successful acknowledge is recorded");
+            let bare = format!("if a.{}", "acknowledged");
+            assert!(!body.contains(&bare), "no bare acknowledged arm");
+            assert!(!body.contains("sent to {address}"), "the mailbox address is never logged");
         }
 
         #[test]

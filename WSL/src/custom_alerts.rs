@@ -267,6 +267,27 @@ pub enum Due {
     },
 }
 
+/// What a re-read of a watched alert means for its timer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RereadVerdict {
+    Closed,
+    AckedElsewhere,
+    KeepTiming,
+}
+
+/// Closed always wins. Acknowledged counts as a person taking it only when
+/// our own acknowledge did not succeed; otherwise our acknowledge would
+/// cancel our own escalation.
+pub fn reread_verdict(status: &str, acknowledged: bool, acked_by_us: bool) -> RereadVerdict {
+    if crate::reaper::alert_is_closed(status) {
+        RereadVerdict::Closed
+    } else if acknowledged && !acked_by_us {
+        RereadVerdict::AckedElsewhere
+    } else {
+        RereadVerdict::KeepTiming
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Watch {
     name: String,
@@ -274,6 +295,9 @@ struct Watch {
     ack_at_ms: u64,
     escalate_at_ms: Option<u64>,
     acked: bool,
+    /// Our acknowledge was attempted AND succeeded. Separate from `acked`,
+    /// so a re-read cannot mistake our own acknowledge for a person's.
+    ack_ok: bool,
     escalated: bool,
 }
 
@@ -328,6 +352,7 @@ impl CustomAlertState {
                 ack_at_ms,
                 escalate_at_ms,
                 acked: false,
+                ack_ok: false,
                 escalated: false,
             },
         );
@@ -370,6 +395,18 @@ impl CustomAlertState {
             key(a).cmp(&key(b))
         });
         out
+    }
+
+    /// Our acknowledge of `alert_id` went through.
+    pub fn ack_succeeded(&mut self, alert_id: &str) {
+        if let Some(w) = self.watching.get_mut(alert_id) {
+            w.ack_ok = true;
+        }
+    }
+
+    /// Whether our own acknowledge of `alert_id` succeeded.
+    pub fn acked_by_us(&self, alert_id: &str) -> bool {
+        self.watching.get(alert_id).is_some_and(|w| w.ack_ok)
     }
 
     /// `alert_id` has closed: stop timing it.
@@ -710,5 +747,45 @@ mod tests {
         let mut st = CustomAlertState::new();
         st.consider(&alert("A1", "disk"), &defs, false, u64::MAX - 10);
         assert!(st.due(u64::MAX - 5).is_empty(), "saturates rather than wrapping to now");
+    }
+
+    #[test]
+    fn the_reread_verdict_table() {
+        use RereadVerdict::*;
+        assert_eq!(reread_verdict("closed", true, true), Closed, "closed always wins");
+        assert_eq!(reread_verdict("closed", false, false), Closed);
+        assert_eq!(reread_verdict("open", true, false), AckedElsewhere);
+        assert_eq!(reread_verdict("acked", true, true), KeepTiming);
+        assert_eq!(reread_verdict("open", false, false), KeepTiming);
+        assert_eq!(reread_verdict("open", false, true), KeepTiming);
+    }
+
+    #[test]
+    fn our_own_acknowledge_does_not_cancel_our_escalation() {
+        let defs = vec![def("disk", "disk", 1, true, 1)];
+        let (mut st, _) = watched(&defs);
+        assert_eq!(
+            st.due(T0 + MIN_MS),
+            vec![Due::Acknowledge { alert_id: "A1".into(), name: "disk".into() }]
+        );
+        st.ack_succeeded("A1");
+        assert_eq!(
+            reread_verdict("acked", true, st.acked_by_us("A1")),
+            RereadVerdict::KeepTiming
+        );
+        assert_eq!(st.due(T0 + 2 * MIN_MS).len(), 1, "the escalation still fires");
+    }
+
+    #[test]
+    fn a_failed_acknowledge_does_not_hide_a_person_taking_the_alert() {
+        let defs = vec![def("disk", "disk", 1, true, 1)];
+        let (mut st, _) = watched(&defs);
+        assert_eq!(st.due(T0 + MIN_MS).len(), 1);
+        // No ack_succeeded: our acknowledge failed.
+        assert!(!st.acked_by_us("A1"));
+        assert_eq!(
+            reread_verdict("open", true, st.acked_by_us("A1")),
+            RereadVerdict::AckedElsewhere
+        );
     }
 }
