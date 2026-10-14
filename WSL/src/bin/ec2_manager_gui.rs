@@ -4878,6 +4878,514 @@ mod gui {
         }
     }
 
+    /// Everything a manual remediation needs, bundled so the dispatcher and
+    /// the per-watcher runs take one argument instead of a dozen.
+    #[derive(Clone)]
+    struct ManualRemediationEnv {
+        auth: ec2_manager::alerts::AlertsAuth,
+        reaper_cfg: ec2_manager::features::ReaperFeature,
+        pingdom_cfg: ec2_manager::features::PingdomFeature,
+        unhealthy_cfg: ec2_manager::features::UnhealthyHostFeature,
+        instance_age_cfg: ec2_manager::features::InstanceAgeFeature,
+        app_config: ec2_manager::config::AppConfig,
+        mode: Mode,
+        mailbox: Option<String>,
+        in_flight: ReaperInFlight,
+        tx: Sender<ReaperEvent>,
+        status_tx: Sender<AlertActionStatus>,
+        /// Whether this user is on the unhealthy-host watcher's own
+        /// `allowed_users` (and it is enabled). The button sits behind
+        /// `reaper.allowed_users`; a terminate must not be reachable by being
+        /// on that list alone.
+        unhealthy_allowed: bool,
+        /// The same for the instance-age watcher.
+        instance_age_allowed: bool,
+    }
+
+    /// Why a manual Run Remediation must not proceed for `route`, if it must
+    /// not. Pure, so the refusals are pinned by a test rather than by the
+    /// order of arms inside a thread.
+    ///
+    /// Reaper is never refused here: its own start function carries its own
+    /// checks. The two terminating watchers need their own allow-list.
+    fn manual_remediation_refusal(
+        route: DryRunRoute,
+        unhealthy_allowed: bool,
+        instance_age_allowed: bool,
+    ) -> Option<&'static str> {
+        match route {
+            DryRunRoute::Reaper => None,
+            DryRunRoute::UnhealthyHost if unhealthy_allowed => None,
+            DryRunRoute::UnhealthyHost => Some(
+                "this is an unhealthy-host alert, and you are not on \
+                 unhealthy_host.allowed_users (or the watcher is not enabled) — \
+                 nothing was terminated",
+            ),
+            DryRunRoute::InstanceAge if instance_age_allowed => None,
+            DryRunRoute::InstanceAge => Some(
+                "this is an instance-age alert, and you are not on \
+                 instance_age.allowed_users (or the watcher is not enabled) — \
+                 nothing was terminated",
+            ),
+            DryRunRoute::Pingdom => Some(
+                "this is a Pingdom alert: Pingdom has no remediation (it only \
+                 acknowledges and escalates), so there is nothing to run",
+            ),
+            DryRunRoute::Neither => Some(
+                "no watcher's rules claim this alert, so there is no remediation \
+                 to run — Test Alert Match shows which rules were checked",
+            ),
+        }
+    }
+
+    /// **Run Remediation**: work out what kind of alert this is, then run
+    /// that kind's fix.
+    ///
+    /// It used to run the reaper fix for every alert it was given, and
+    /// refused anything reaper's rules did not match — so an unhealthy-host
+    /// alert either did nothing or, worse, was taken for a reaper one by a
+    /// broad rule. Routing is `dry_run_route`, the same precedence Test Alert
+    /// Match uses, so the button and the test cannot disagree about which
+    /// watcher owns an alert.
+    ///
+    /// * reaper — `start_reaper_remediation`, unchanged.
+    /// * unhealthy host — terminate one unhealthy ASG-managed instance now,
+    ///   then wait and escalate if the alert is still open.
+    /// * instance age — one pass of the watcher's decision; terminates only
+    ///   when `decide` says it is safe.
+    /// * Pingdom / unclaimed — nothing to run, and it says so.
+    fn start_manual_remediation(env: ManualRemediationEnv, alert_id: String, override_health: bool) {
+        std::thread::spawn(move || {
+            let tx = env.tx.clone();
+            let full = match ec2_manager::alerts::fetch_alert(&env.auth, &alert_id) {
+                Ok(a) => a,
+                Err(e) => {
+                    let message = format!("could not read alert {alert_id} in full — {e}");
+                    let _ = tx.send(ReaperEvent::SourcedNote {
+                        source: LogSource::AlertTest,
+                        level: LogLevel::Error,
+                        message: format!("remediation: {message}"),
+                    });
+                    let _ = env.status_tx.send(AlertActionStatus::Failed(message));
+                    return;
+                }
+            };
+            let route = dry_run_route(
+                &full,
+                &env.reaper_cfg,
+                &env.pingdom_cfg,
+                &env.unhealthy_cfg,
+                &env.instance_age_cfg,
+            );
+            let _ = tx.send(ReaperEvent::SourcedNote {
+                source: LogSource::AlertTest,
+                level: LogLevel::Warn,
+                message: format!(
+                    "remediation: alert {alert_id} routes to {route:?} \
+                     (override={override_health})"
+                ),
+            });
+            if let Some(why) =
+                manual_remediation_refusal(route, env.unhealthy_allowed, env.instance_age_allowed)
+            {
+                let _ = tx.send(ReaperEvent::SourcedNote {
+                    source: LogSource::AlertTest,
+                    level: LogLevel::Warn,
+                    message: format!("remediation: alert {alert_id}: {why}"),
+                });
+                let _ = env
+                    .status_tx
+                    .send(AlertActionStatus::Failed(format!("alert {alert_id}: {why}")));
+                return;
+            }
+            match route {
+                DryRunRoute::Reaper => start_reaper_remediation(
+                    env.auth.clone(),
+                    env.reaper_cfg.clone(),
+                    env.app_config.clone(),
+                    env.mode.clone(),
+                    alert_id,
+                    override_health,
+                    Arc::clone(&env.in_flight),
+                    tx,
+                    env.status_tx.clone(),
+                ),
+                DryRunRoute::UnhealthyHost => run_unhealthy_host_remediation(&env, full),
+                DryRunRoute::InstanceAge => run_instance_age_remediation(&env, full),
+                // Refused above.
+                DryRunRoute::Pingdom | DryRunRoute::Neither => {}
+            }
+        });
+    }
+
+    /// Wait up to `total` for `alert_id` to close, re-reading it every 30s.
+    /// True when it closed. A failed read is noted and the wait continues —
+    /// it must not be taken for "closed".
+    fn wait_until_alert_closes(
+        auth: &ec2_manager::alerts::AlertsAuth,
+        alert_id: &str,
+        total: std::time::Duration,
+        note: &impl Fn(LogLevel, String),
+    ) -> bool {
+        let deadline = std::time::Instant::now() + total;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            std::thread::sleep((deadline - now).min(std::time::Duration::from_secs(30)));
+            match ec2_manager::alerts::fetch_alert(auth, alert_id) {
+                Ok(a) if ec2_manager::reaper::alert_is_closed(&a.status) => return true,
+                Ok(_) => {}
+                Err(e) => note(
+                    LogLevel::Warn,
+                    format!("could not re-read {alert_id}, still waiting: {e}"),
+                ),
+            }
+        }
+    }
+
+    /// Terminate `id` only if an auto scaling group will replace it. True
+    /// when the terminate landed. Refuses on anything short of a confirmed
+    /// `aws:autoscaling:groupName` tag — an instance terminated by mistake is
+    /// never coming back.
+    fn terminate_asg_instance(
+        ctx: &AwsContext,
+        mode: &Mode,
+        id: &str,
+        note: &impl Fn(LogLevel, String),
+    ) -> bool {
+        match instance_asg_group(&ctx.profile, &ctx.region, id) {
+            Ok(Some(group)) => {
+                note(LogLevel::Info, format!("{id} is managed by ASG {group}"));
+                match terminate_instance(&ctx.profile, &ctx.region, id, mode) {
+                    Ok(()) => {
+                        note(LogLevel::Warn, format!("TERMINATED {id}; {group} will replace it"));
+                        true
+                    }
+                    Err(e) => {
+                        note(LogLevel::Error, format!("terminate of {id} FAILED — {e}. Not retried"));
+                        false
+                    }
+                }
+            }
+            Ok(None) => {
+                note(
+                    LogLevel::Error,
+                    format!(
+                        "refusing to terminate {id} — it carries no aws:autoscaling:groupName \
+                         tag, so nothing would replace it"
+                    ),
+                );
+                false
+            }
+            Err(e) => {
+                note(
+                    LogLevel::Error,
+                    format!("could not confirm {id} is ASG-managed ({e}) — refusing to terminate"),
+                );
+                false
+            }
+        }
+    }
+
+    /// Manual unhealthy-host remediation: the watcher's `plan` and ASG guard
+    /// applied now, without the ack wait, then its own wait-and-escalate.
+    ///
+    /// On call the alert is acknowledged first, as the watcher does; off call
+    /// it is left alone, because acknowledging would silence whoever is
+    /// actually holding the pager. Runs on the caller's thread.
+    fn run_unhealthy_host_remediation(env: &ManualRemediationEnv, alert: ec2_manager::alerts::Alert) {
+        use ec2_manager::{alerts, oncall, reaper, unhealthy_host as uh};
+
+        let cfg = &env.unhealthy_cfg;
+        let alert_id = alert.id.clone();
+        let mut end = RemediationStatusGuard::new(env.status_tx.clone(), &alert_id);
+        end.status = AlertActionStatus::Failed(format!(
+            "alert {alert_id}: stopped before anything was terminated — see the log under \
+             Sources -> Unhealthy Host"
+        ));
+        let note = |level: LogLevel, message: String| {
+            let _ = env.tx.send(ReaperEvent::SourcedNote {
+                source: LogSource::UnhealthyHost,
+                level,
+                message: format!("unhealthy host: manual {message}"),
+            });
+        };
+
+        let Some(_claim) = claim_in_flight(&env.in_flight, &alert_id) else {
+            note(
+                LogLevel::Warn,
+                format!("remediation for {alert_id} is already running — not starting a second one"),
+            );
+            end.status = AlertActionStatus::Failed(format!(
+                "a remediation for alert {alert_id} is already running — not starting a second one"
+            ));
+            return;
+        };
+        note(LogLevel::Warn, format!("remediation requested for alert {alert_id}"));
+
+        let Some(resource) = reaper::alert_target_group(&alert) else {
+            note(LogLevel::Error, format!("{alert_id} names no target group — nothing to act on"));
+            end.status =
+                AlertActionStatus::Failed(format!("alert {alert_id} names no target group"));
+            return;
+        };
+        if reaper::alert_is_closed(&alert.status) {
+            note(
+                LogLevel::Warn,
+                format!("{alert_id} is already closed — remediating anyway, because this was asked for"),
+            );
+        }
+
+        let on_call = match oncall::is_on_call(
+            &env.auth,
+            &cfg.resolved_schedule_id(),
+            &cfg.resolved_atlassian_account_id(),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                note(LogLevel::Warn, format!("on-call lookup failed ({e}) — treating as off call"));
+                false
+            }
+        };
+        if on_call {
+            match alerts::acknowledge_alert(&env.auth, &alert_id) {
+                Ok(()) => note(LogLevel::Info, format!("acknowledged {alert_id}")),
+                Err(e) => note(
+                    LogLevel::Warn,
+                    format!("could not acknowledge {alert_id}: {e} — carrying on"),
+                ),
+            }
+        } else {
+            note(LogLevel::Info, "off call — not acknowledging".to_string());
+        }
+
+        let ctx = match reaper_account_context(&env.mode, &env.app_config, &alert.account) {
+            Ok(c) => c,
+            Err(why) => {
+                note(LogLevel::Error, why.clone());
+                end.status = AlertActionStatus::Failed(format!("alert {alert_id}: {why}"));
+                return;
+            }
+        };
+        let tg_name = reaper::target_group_name(&resource).unwrap_or("");
+        let kind = uh::kind_of(tg_name, cfg);
+
+        let mut spent = 0u32;
+        loop {
+            let members = match target_group_members(&ctx.profile, &ctx.region, &resource) {
+                Ok(m) => m,
+                Err(why) => {
+                    note(LogLevel::Error, format!("{resource} could not be read ({why}) — terminating nothing"));
+                    end.status = AlertActionStatus::Failed(format!(
+                        "alert {alert_id}: {resource} could not be read ({why})"
+                    ));
+                    return;
+                }
+            };
+            note(
+                LogLevel::Info,
+                format!(
+                    "{resource} health: {}",
+                    members
+                        .iter()
+                        .map(|m| format!("{} ({})", m.id, m.health))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+            let plan = uh::plan(&members, kind, spent);
+            note(LogLevel::Warn, plan.reason.clone());
+            let terminated = match &plan.terminate {
+                Some(id) => terminate_asg_instance(&ctx, &env.mode, id, &note),
+                None => false,
+            };
+            if terminated {
+                spent += 1;
+            } else if spent == 0 {
+                // Nothing has changed, so there is nothing to watch for. The
+                // person is here; they get the reason rather than a ten
+                // minute wait and an email.
+                end.status = AlertActionStatus::Failed(format!(
+                    "alert {alert_id}: nothing terminated — {}",
+                    plan.reason
+                ));
+                return;
+            }
+            let wait = wait_after_check(terminated, plan.wait);
+            let window = match wait {
+                uh::Wait::AfterTerminate => cfg.after_terminate(),
+                uh::Wait::VaultRetry => cfg.vault_retry(),
+            };
+            note(
+                LogLevel::Info,
+                format!("waiting {} minute(s) for {alert_id} to close", window.as_secs() / 60),
+            );
+            if wait_until_alert_closes(&env.auth, &alert_id, window, &note) {
+                note(LogLevel::Info, format!("{alert_id} closed — done"));
+                end.status = AlertActionStatus::Ok(format!(
+                    "alert {alert_id}: terminated {spent} unhealthy instance(s) and the alert closed"
+                ));
+                return;
+            }
+            if wait == uh::Wait::VaultRetry {
+                continue;
+            }
+            note(
+                LogLevel::Error,
+                format!("{alert_id} ({resource}) is still open after {spent} terminate(s) — escalating"),
+            );
+            let subject =
+                reaper::escalation_subject(reaper::OutcomeCode::Failure, &alert.created_at);
+            end.status = match env.mailbox.as_deref() {
+                Some(mailbox) => match send_escalation_email(mailbox, &subject) {
+                    Ok(address) => {
+                        note(LogLevel::Info, format!("escalation sent to {address}"));
+                        AlertActionStatus::Failed(format!(
+                            "alert {alert_id}: still open after the terminate — escalated"
+                        ))
+                    }
+                    Err(reason) => {
+                        note(
+                            LogLevel::Error,
+                            format!("escalation NOT sent ({reason}) — nothing will ring"),
+                        );
+                        AlertActionStatus::Failed(format!(
+                            "alert {alert_id}: still open and the escalation failed: {reason}"
+                        ))
+                    }
+                },
+                None => {
+                    note(LogLevel::Error, "no escalation mailbox configured — nothing will ring".to_string());
+                    AlertActionStatus::Failed(format!(
+                        "alert {alert_id}: still open and there is no escalation mailbox"
+                    ))
+                }
+            };
+            return;
+        }
+    }
+
+    /// Manual instance-age remediation: one pass of the watcher's own
+    /// decision. `decide` is the only thing that may name an instance to
+    /// terminate; a `Wait` or `Refuse` is reported and nothing is changed.
+    /// On call the alert is acknowledged, but only once a terminate is
+    /// actually going ahead. Runs on the caller's thread.
+    fn run_instance_age_remediation(env: &ManualRemediationEnv, alert: ec2_manager::alerts::Alert) {
+        use ec2_manager::{alerts, instance_age as ia, oncall};
+
+        let cfg = &env.instance_age_cfg;
+        let alert_id = alert.id.clone();
+        let mut end = RemediationStatusGuard::new(env.status_tx.clone(), &alert_id);
+        end.status = AlertActionStatus::Failed(format!(
+            "alert {alert_id}: stopped before anything was terminated — see the log under \
+             Sources -> Instance Age"
+        ));
+        let note = |level: LogLevel, message: String| {
+            let _ = env.tx.send(ReaperEvent::SourcedNote {
+                source: LogSource::InstanceAge,
+                level,
+                message: format!("instance age: manual {message}"),
+            });
+        };
+        let fail = |end: &mut RemediationStatusGuard, why: String| {
+            note(LogLevel::Error, format!("{alert_id} — {why}"));
+            end.status = AlertActionStatus::Failed(format!("alert {alert_id}: {why}"));
+        };
+
+        let Some(_claim) = claim_in_flight(&env.in_flight, &alert_id) else {
+            fail(&mut end, "a remediation for this alert is already running".to_string());
+            return;
+        };
+        note(LogLevel::Warn, format!("remediation requested for alert {alert_id}"));
+
+        let facts = ia::parse_facts(&alert.description);
+        if facts.instance_id.is_empty() {
+            fail(&mut end, "names no readable instance id — nothing to act on".to_string());
+            return;
+        }
+        let ctx = match instance_age_context(&env.mode, &env.app_config, &facts) {
+            Ok(c) => c,
+            Err(e) => return fail(&mut end, e),
+        };
+        let asg_name = match instance_asg_group(&ctx.profile, &ctx.region, &facts.instance_id) {
+            Ok(Some(n)) => n,
+            Ok(None) => {
+                return fail(
+                    &mut end,
+                    format!(
+                        "{} carries no aws:autoscaling:groupName tag — nothing would replace \
+                         it, so it is never terminated",
+                        facts.instance_id
+                    ),
+                )
+            }
+            Err(e) => return fail(&mut end, format!("could not read {}: {e}", facts.instance_id)),
+        };
+        let group = match read_group(&ctx, &asg_name) {
+            Ok(g) => g,
+            Err(e) => return fail(&mut end, e),
+        };
+        let history = match read_termination_history(&ctx, &asg_name, cfg.recent_terminate_window()) {
+            Ok(h) => h,
+            Err(e) => return fail(&mut end, e),
+        };
+        let view = match read_group_view(&ctx, &group) {
+            Ok(v) => v,
+            Err(e) => return fail(&mut end, e),
+        };
+        let tg_names: Vec<String> = group
+            .target_group_arns
+            .iter()
+            .map(|a| ec2_manager::asg::target_group_name_from_arn(a))
+            .collect();
+        let kind = ia::kind_of(&asg_name, &tg_names, cfg);
+
+        match ia::decide(&facts, &view, kind, &history) {
+            ia::Decision::Refuse { reason } => fail(&mut end, format!("refused: {reason}")),
+            ia::Decision::Wait { reason } => fail(
+                &mut end,
+                format!("not safe to terminate yet: {reason} — nothing changed; run it again later"),
+            ),
+            ia::Decision::Terminate { instance_id, reason } => {
+                note(LogLevel::Warn, format!("{alert_id} ({}) — {reason}", kind.label()));
+                let on_call = match oncall::is_on_call(
+                    &env.auth,
+                    &cfg.resolved_schedule_id(),
+                    &cfg.resolved_atlassian_account_id(),
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        note(LogLevel::Warn, format!("on-call lookup failed ({e}) — treating as off call"));
+                        false
+                    }
+                };
+                if on_call {
+                    match alerts::acknowledge_alert(&env.auth, &alert_id) {
+                        Ok(()) => note(LogLevel::Info, format!("acknowledged {alert_id}")),
+                        Err(e) => note(
+                            LogLevel::Warn,
+                            format!("could not acknowledge {alert_id}: {e} — carrying on"),
+                        ),
+                    }
+                }
+                match terminate_instance(&ctx.profile, &ctx.region, &instance_id, &env.mode) {
+                    Ok(()) => {
+                        note(
+                            LogLevel::Warn,
+                            format!("{alert_id} — terminated {instance_id}; {asg_name} will replace it"),
+                        );
+                        end.status = AlertActionStatus::Ok(format!(
+                            "alert {alert_id}: terminated {instance_id}; {asg_name} will replace it"
+                        ));
+                    }
+                    Err(e) => fail(&mut end, format!("terminate of {instance_id} failed: {e}")),
+                }
+            }
+        }
+    }
+
     /// The right-click menu on a row in the Alerts window.
     ///
     /// The same two actions the Alert ID box offers, aimed at the row under
@@ -18976,13 +19484,21 @@ mod gui {
                 .pivot(egui::Align2::CENTER_CENTER)
                 .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
-                    ui.label("Remediate the instance this alert resolves to?");
+                    ui.label("Run the remediation for this alert's type?");
                     ui.add_space(4.0);
                     ui.monospace(&alert_id);
                     ui.add_space(6.0);
-                    ui.label("On that instance this will run:");
-                    ui.monospace("docker compose down");
-                    ui.monospace("docker compose up -d");
+                    ui.label("The alert is read first and routed by its type:");
+                    ui.label("  Reaper down: docker compose down / up -d on its instance");
+                    ui.label(
+                        "  Unhealthy host: terminates one unhealthy instance in its target \
+                         group (ASG-managed only), then escalates if still open",
+                    );
+                    ui.label(
+                        "  Instance age: terminates the aged instance if the safety checks \
+                         allow it",
+                    );
+                    ui.label("  Pingdom: no remediation - nothing is run");
                     ui.add_space(6.0);
                     // A real consequence a person can be surprised by:
                     // acknowledging silences whoever is actually on call.
@@ -18991,6 +19507,7 @@ mod gui {
                         "Which instance that is has not been resolved yet — \
                          use Test Alert Match first if you want to see it.",
                     );
+                    ui.label("Override applies to the reaper fix only.");
                     ui.add_space(4.0);
                     // The tick changes what this does, so it is restated here
                     // rather than left on a checkbox behind the dialog.
@@ -19023,7 +19540,7 @@ mod gui {
                 self.log_reaper(
                     LogLevel::Warn,
                     format!(
-                        "reaper: Run Remediation confirmed for alert {alert_id} \
+                        "Run Remediation confirmed for alert {alert_id} \
                          (override={override_health})"
                     ),
                 );
@@ -19035,16 +19552,25 @@ mod gui {
                     "remediating alert {alert_id} — progress in the log under On-Call -> \
                      Reaper Down"
                 )));
-                start_reaper_remediation(
-                    self.alerts_auth.clone(),
-                    self.reaper_cfg.clone(),
-                    self.config.clone(),
-                    self.options.mode.clone(),
+                let os_user = ec2_manager::features::current_os_user();
+                start_manual_remediation(
+                    ManualRemediationEnv {
+                        auth: self.alerts_auth.clone(),
+                        reaper_cfg: self.reaper_cfg.clone(),
+                        pingdom_cfg: self.pingdom_cfg.clone(),
+                        unhealthy_cfg: self.unhealthy_host_cfg.clone(),
+                        instance_age_cfg: self.instance_age_cfg.clone(),
+                        app_config: self.config.clone(),
+                        mode: self.options.mode.clone(),
+                        mailbox: ec2_manager::jsm_auth::escalation_mailbox(),
+                        in_flight: Arc::clone(&self.reaper_in_flight),
+                        tx: self.reaper_probe_tx.clone(),
+                        status_tx: self.dry_run_status_tx.clone(),
+                        unhealthy_allowed: self.unhealthy_host_cfg.is_allowed_user(&os_user),
+                        instance_age_allowed: self.instance_age_cfg.is_allowed_user(&os_user),
+                    },
                     alert_id,
                     override_health,
-                    Arc::clone(&self.reaper_in_flight),
-                    self.reaper_probe_tx.clone(),
-                    self.dry_run_status_tx.clone(),
                 );
             }
             if do_confirm || do_cancel || !window_open {
@@ -58979,6 +59505,39 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             }
         }
 
+        /// Run Remediation runs the fix for the alert's own type. The
+        /// terminating watchers need their own allow-list on top of the
+        /// button's, and the types with no fix say so rather than running
+        /// the reaper fix.
+        #[test]
+        fn manual_remediation_is_refused_unless_the_alert_type_has_a_fix_you_may_run() {
+            use DryRunRoute::*;
+            assert_eq!(manual_remediation_refusal(Reaper, false, false), None);
+            assert_eq!(manual_remediation_refusal(UnhealthyHost, true, false), None);
+            assert!(manual_remediation_refusal(UnhealthyHost, false, true).is_some());
+            assert_eq!(manual_remediation_refusal(InstanceAge, false, true), None);
+            assert!(manual_remediation_refusal(InstanceAge, true, false).is_some());
+            assert!(manual_remediation_refusal(Pingdom, true, true).is_some());
+            assert!(manual_remediation_refusal(Neither, true, true).is_some());
+        }
+
+        /// The confirmation must hand off to the router, not straight to the
+        /// reaper fix - that was the bug: every alert got `compose down`.
+        #[test]
+        fn the_run_remediation_confirm_goes_through_the_router() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let body = src
+                .split("fn render_run_remediation_confirm(")
+                .nth(1)
+                .expect("the confirm renderer")
+                .split("\n        fn ")
+                .next()
+                .unwrap();
+            assert!(body.contains("start_manual_remediation("));
+            assert!(!body.contains("start_reaper_remediation("));
+        }
+
         #[test]
         fn a_dry_run_routes_a_pingdom_alert_to_the_pingdom_path() {
             assert_eq!(
@@ -58995,7 +59554,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn a_dry_run_routes_a_reaper_alert_to_the_reaper_path() {
-            let mut a = dry_run_alert("something is wrong");
+            let mut a = dry_run_alert("Cassandra Reaper is wrong");
             a.extra.insert("alertname".to_string(), "reaper-stalled".to_string());
             assert_eq!(
                 dry_run_route(
@@ -59014,7 +59573,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             // Reaper is the one with a box to read, so an alert both claim
             // gets the more thorough run -- and the more thorough run answers
             // the pingdom question too.
-            let mut a = dry_run_alert("[Pingdom] domain xxx yy PROD");
+            let mut a = dry_run_alert("[Pingdom] reaper domain xxx yy PROD");
             a.extra.insert("alertname".to_string(), "reaper-stalled".to_string());
             assert_eq!(
                 dry_run_route(
@@ -59025,6 +59584,24 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &dry_run_instance_age_cfg(),
                 ),
                 DryRunRoute::Reaper
+            );
+        }
+
+        #[test]
+        fn a_reaper_rule_match_without_reaper_in_the_title_does_not_take_the_alert() {
+            // The alertname rule matches, but the title names another app:
+            // that is an unhealthy-host alert, not a reaper one.
+            let mut a = dry_run_alert("[Target Group]: prod-App-UnHealthyHostCount-Critical");
+            a.extra.insert("alertname".to_string(), "reaper-stalled".to_string());
+            assert_eq!(
+                dry_run_route(
+                    &a,
+                    &dry_run_reaper_cfg(),
+                    &pingdom_cfg(),
+                    &unhealthy_host_cfg(),
+                    &dry_run_instance_age_cfg(),
+                ),
+                DryRunRoute::UnhealthyHost
             );
         }
 

@@ -214,11 +214,22 @@ impl AlertMatch {
 /// `match_alert` reports as `None`, and the second of which must never be
 /// silent: it means the remediation is declining the alerts it exists for.
 pub fn identifies(alert: &Alert, cfg: &ReaperFeature) -> bool {
+    // The title must name reaper, whatever else matched. The three rules
+    // below are ORed, so one broad rule (an `UnHealthyHostCount` message, a
+    // shared App tag) claimed other apps' alarms and ran `compose down`
+    // against them. Required here rather than in config so no rule value can
+    // widen it.
+    if !contains_ci(&alert.message, REAPER_TITLE_WORD) {
+        return false;
+    }
     let alertname = alert.extra.get("alertname").map(String::as_str).unwrap_or("");
     contains_ci(alertname, &cfg.alertname_contains)
         || contains_ci(&alert.app, &cfg.app_contains)
         || contains_ci(&alert.message, &cfg.message_contains)
 }
+
+/// The word a reaper alert's title must contain (case-insensitive).
+pub const REAPER_TITLE_WORD: &str = "reaper";
 
 /// The `targetgroup/<name>/<id>` an alert names, wherever it names one.
 ///
@@ -1290,10 +1301,17 @@ mod tests {
         }
     }
 
+    /// `cfg()` with the title rule off, so a test about the alertname / App
+    /// rules is not satisfied by the title that `alert()` must carry anyway.
+    fn cfg_without_title_rule() -> ReaperFeature {
+        ReaperFeature { message_contains: String::new(), ..cfg() }
+    }
+
     fn alert() -> Alert {
         let mut a = Alert {
             id: "alert-1".to_string(),
             status: "open".to_string(),
+            message: "[Reaper] stalled".to_string(),
             account: "123456789012".to_string(),
             environment: "DEV1".to_string(),
             description: "reaper stalled on i-0abc123def4567890".to_string(),
@@ -1313,18 +1331,28 @@ mod tests {
     }
 
     #[test]
+    fn a_title_without_reaper_is_never_identified_whatever_the_rules_match() {
+        let mut a = alert();
+        a.message = "[Target Group]: prod-cassandra-UnHealthyHostCount-Critical".to_string();
+        // The alertname rule still matches, and the title is what vetoes it.
+        assert!(!identifies(&a, &cfg()));
+        a.message = "[Target Group]: prod-cassandra-REAPER-UnHealthyHostCount".to_string();
+        assert!(identifies(&a, &cfg()));
+    }
+
+    #[test]
     fn an_unrelated_alert_matches_nothing() {
         let mut a = alert();
         a.extra.clear();
         a.description = "disk full on i-0abc123def4567890".to_string();
-        assert!(match_alert(&a, &cfg()).is_none());
+        assert!(match_alert(&a, &cfg_without_title_rule()).is_none());
     }
 
     #[test]
     fn a_match_with_no_instance_id_yields_none_not_a_partial_target() {
         let mut a = alert();
         a.description = "reaper stalled somewhere".to_string();
-        assert!(match_alert(&a, &cfg()).is_none());
+        assert!(match_alert(&a, &cfg_without_title_rule()).is_none());
     }
 
     #[test]
@@ -1333,7 +1361,7 @@ mod tests {
         let mut a = alert();
         a.extra.clear();
         a.app = "&{%&{% extraProperties['App'] &}%&}%".to_string();
-        assert!(match_alert(&a, &cfg()).is_none());
+        assert!(match_alert(&a, &cfg_without_title_rule()).is_none());
     }
 
     #[test]
@@ -1357,7 +1385,7 @@ mod tests {
             JUNK_EXTRA_KEY.to_string(),
             "{alertname=reaper-stalled}".to_string(),
         );
-        assert!(match_alert(&a, &cfg()).is_none());
+        assert!(match_alert(&a, &cfg_without_title_rule()).is_none());
     }
 
     #[test]
@@ -1373,7 +1401,7 @@ mod tests {
             JUNK_EXTRA_KEY.to_string(),
             "{alertname=reaper-stalled, InstanceId=i-0abc123def4567890}".to_string(),
         );
-        assert!(match_alert(&a, &cfg()).is_none());
+        assert!(match_alert(&a, &cfg_without_title_rule()).is_none());
     }
 
     #[test]

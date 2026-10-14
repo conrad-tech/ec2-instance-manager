@@ -922,6 +922,39 @@ carries the escalation; every later alert for the same thing is
 
 Two buttons beside Test Alert Match, same `reaper.allowed_users` gate.
 
+**A reaper alert's title must contain "reaper"** (`reaper::REAPER_TITLE_WORD`,
+case-insensitive, checked first in `reaper::identifies`). The three `*_contains`
+rules are ORed, so one broad rule used to claim other apps' alarms (an
+`UnHealthyHostCount` message, a shared App tag) and `compose down` ran against
+them. The title word is a hard AND in code, not a config value, so no rule can
+widen it. Everything that asks "is this reaper's" goes through `identifies`
+(`match_alert`, `unhealthy_host::claims`, `dry_run_route`, the manual route), so
+an alert without it falls through to unhealthy host / instance age / pingdom.
+
+**Run Remediation routes by alert type** (`start_manual_remediation`, using
+`dry_run_route` — the same precedence as Test Alert Match, so the two cannot
+disagree about which watcher owns an alert). It used to run the reaper fix for
+everything and only refused what reaper's rules missed, so an unhealthy-host
+alert was either declined or, with a broad reaper rule, got `compose down`.
+
+- **Reaper** — `start_reaper_remediation`, unchanged (Override applies here only).
+- **Unhealthy host** (`run_unhealthy_host_remediation`) — `uh::plan` and the
+  ASG-tag guard applied now, with no 7-minute ack wait: on call it acknowledges
+  first, off call it does not. Then the watcher's own wait
+  (`after_terminate`, or `vault_retry` and re-plan for Vault) and an `RE-F`
+  escalation if the alert is still open. If nothing is terminated on the first
+  pass it stops and reports why, with no wait and no email.
+- **Instance age** (`run_instance_age_remediation`) — one pass of `ia::decide`.
+  Only `Terminate` acts (acknowledging first when on call); `Wait`/`Refuse`
+  change nothing and say why. No follow-up escalation, as the watcher has none.
+- **Pingdom / unclaimed** — refused with a sentence; nothing runs.
+- **The terminating routes need their own list.** The button sits behind
+  `reaper.allowed_users`; `manual_remediation_refusal` also requires the user to
+  pass `unhealthy_host.is_allowed_user` / `instance_age.is_allowed_user`
+  (enabled + named), so being on the reaper list alone cannot terminate.
+- Unhealthy-host and instance-age lines go to their own log sources; the route
+  decision goes to Alert Test.
+
 **Run Remediation** treats the alert as if it had just arrived, whatever state
 it is in — open, closed, acknowledged or not — and ignores the cooldown and
 whatever this session has already handled, because a person asking for it has
