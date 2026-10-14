@@ -9,6 +9,7 @@ pub mod cassandra_flow;
 pub mod config;
 pub mod connection_tabs;
 pub mod credentials;
+pub mod custom_alerts;
 pub mod defaults_check;
 pub mod diagnostics;
 pub mod elb;

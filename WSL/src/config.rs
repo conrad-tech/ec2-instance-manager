@@ -153,6 +153,8 @@ pub struct AppConfig {
     /// User-authored scripts shown under the built-in entries in the
     /// Scripts menu ("Add Script"). Order is the menu order.
     pub personal_scripts: Vec<PersonalScript>,
+    /// User-defined alert watchers (the Alerts window's Add/Update alert).
+    pub custom_alerts: Vec<crate::custom_alerts::CustomAlert>,
     /// Cached git personal access token, exported as `GIT_PAT` by Prep
     /// Terminal. Stored base64-encoded in config.ini — that is obfuscation,
     /// not encryption: anyone who can read the file can read the token.
@@ -224,6 +226,7 @@ impl Default for AppConfig {
             cassandra_runs: BTreeMap::new(),
             cassandra_schedules: BTreeMap::new(),
             personal_scripts: Vec::new(),
+            custom_alerts: Vec::new(),
             git_pat: None,
             file_browser_paths: BTreeMap::new(),
         }
@@ -1213,6 +1216,11 @@ impl AppConfig {
                         cfg.personal_scripts.push(script);
                     }
                 }
+                "custom_alert" => {
+                    if let Some(alert) = parse_custom_alert(value) {
+                        cfg.custom_alerts.push(alert);
+                    }
+                }
                 "account_env" => {
                     if let Some(env) = parse_account_env(value) {
                         cfg.user_environments.push(env);
@@ -1547,6 +1555,20 @@ impl AppConfig {
             ));
         }
 
+        // `name|ack|escalate|wait|match`, with name and match base64'd for the
+        // reason personal_script's fields are: this file is line-based and
+        // both are free text that may contain '|', '=' or newlines.
+        for alert in &self.custom_alerts {
+            lines.push(format!(
+                "custom_alert={}|{}|{}|{}|{}",
+                encode_b64(&alert.name),
+                alert.ack_after_mins,
+                u8::from(alert.escalate),
+                alert.escalate_wait_mins,
+                encode_b64(&alert.match_text),
+            ));
+        }
+
         for env in &self.user_environments {
             lines.push(format!(
                 "account_env={}|{}|{}",
@@ -1593,6 +1615,34 @@ fn parse_personal_script(raw: &str) -> Option<PersonalScript> {
         return None;
     }
     Some(PersonalScript { name, hotkey, body })
+}
+
+/// `name|ack|escalate|wait|match`. Dropped when it cannot be decoded or
+/// would not pass the dialog's own checks: a line hand-edited to zero
+/// minutes or a blank match must not become a watcher that matches every
+/// alert or escalates at once.
+fn parse_custom_alert(raw: &str) -> Option<crate::custom_alerts::CustomAlert> {
+    let mut f = raw.splitn(5, '|');
+    let name = decode_b64(f.next()?)?;
+    let ack_after_mins = crate::custom_alerts::parse_mins(f.next()?)?;
+    let escalate = f.next()?.trim() == "1";
+    let wait_raw = f.next()?.trim();
+    let match_text = decode_b64(f.next()?)?;
+    if name.trim().is_empty() || match_text.trim().is_empty() {
+        return None;
+    }
+    let escalate_wait_mins = if escalate {
+        crate::custom_alerts::parse_mins(wait_raw)?
+    } else {
+        0
+    };
+    Some(crate::custom_alerts::CustomAlert {
+        name,
+        match_text,
+        ack_after_mins,
+        escalate,
+        escalate_wait_mins,
+    })
 }
 
 /// `<account id>|<ENV>|<vault addr>`.
@@ -2098,6 +2148,62 @@ mod tests {
 
         let parsed = AppConfig::parse(&cfg.to_text());
         assert_eq!(parsed.personal_scripts, cfg.personal_scripts);
+    }
+
+    #[test]
+    fn custom_alerts_round_trip_through_config_text() {
+        use crate::custom_alerts::CustomAlert;
+        let mut cfg = AppConfig::default();
+        cfg.custom_alerts = vec![
+            CustomAlert {
+                name: "Disk | full = yes".to_string(),
+                match_text: "disk space\nlow".to_string(),
+                ack_after_mins: 2,
+                escalate: true,
+                escalate_wait_mins: 5,
+            },
+            CustomAlert {
+                name: "  spaced \u{e9}\u{4e2d}  ".to_string(),
+                match_text: "cpu".to_string(),
+                ack_after_mins: 1,
+                escalate: false,
+                escalate_wait_mins: 0,
+            },
+        ];
+        let parsed = AppConfig::parse(&cfg.to_text());
+        assert_eq!(parsed.custom_alerts, cfg.custom_alerts);
+    }
+
+    #[test]
+    fn a_config_with_no_custom_alerts_parses_to_none() {
+        assert!(AppConfig::parse("").custom_alerts.is_empty());
+    }
+
+    #[test]
+    fn an_unusable_custom_alert_line_is_skipped() {
+        // bad base64, zero minutes, a blank name, and a blank match text
+        let good = {
+            let mut c = AppConfig::default();
+            c.custom_alerts = vec![crate::custom_alerts::CustomAlert {
+                name: "ok".into(),
+                match_text: "x".into(),
+                ack_after_mins: 1,
+                escalate: false,
+                escalate_wait_mins: 0,
+            }];
+            c.to_text()
+        };
+        let line = good.lines().find(|l| l.starts_with("custom_alert=")).unwrap();
+        let text = format!(
+            "custom_alert=not-base64!!|1|0|0|also-bad\n\
+             custom_alert=b2s=|0|0|0|eA==\n\
+             custom_alert=|1|0|0|eA==\n\
+             custom_alert=b2s=|1|0|0|\n\
+             {line}\n"
+        );
+        let parsed = AppConfig::parse(&text);
+        assert_eq!(parsed.custom_alerts.len(), 1, "only the good line survives");
+        assert_eq!(parsed.custom_alerts[0].name, "ok");
     }
 
     #[test]
