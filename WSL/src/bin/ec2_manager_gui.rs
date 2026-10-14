@@ -21661,6 +21661,9 @@ mod gui {
             // Copied out for the same reason: the grid closure cannot read
             // `self`. Same gate as the Alert ID row's buttons.
             let probe_enabled = self.reaper_probe_enabled;
+            // Copied out for the same reason: the closure cannot read `self`.
+            let custom_alerts_enabled = self.custom_alerts_enabled;
+            let mut open_custom_alert_form = false;
             // The newest thing the run has said. A run reports progress and
             // then exactly one outcome, so the last message is the current
             // state and there is never a queue to reconcile.
@@ -21746,6 +21749,21 @@ mod gui {
                             .clicked()
                         {
                             ack_all_ids = Some(ack_ids);
+                        }
+                        // Visible only to the user named on custom_alerts, and
+                        // re-checked here rather than trusting window state.
+                        if custom_alerts_enabled
+                            && ui
+                                .button("Add/Update alert")
+                                .on_hover_text(
+                                    "Define an alert to watch for: match text in an alert's \
+                                     summary, acknowledge it after a delay and optionally \
+                                     escalate if it is still open. Acts only while you are \
+                                     on call.",
+                                )
+                                .clicked()
+                        {
+                            open_custom_alert_form = true;
                         }
                     });
 
@@ -22011,6 +22029,10 @@ mod gui {
             if let Some(ids) = ack_all_ids {
                 self.pending_ack_all = Some(ids);
             }
+            if open_custom_alert_form && self.custom_alerts_enabled {
+                self.custom_alert_note = None;
+                self.custom_alert_form = Some(ec2_manager::custom_alerts::AlertForm::new_blank());
+            }
             // The row menu and the Alert ID box feed the same two paths. The
             // box wins if somehow both fired in one frame, which it cannot,
             // since a context menu swallows the click that opens it.
@@ -22071,6 +22093,247 @@ mod gui {
             }
             // Keep the clock/auto-refresh ticking even when the app is idle.
             ctx.request_repaint_after(Duration::from_millis(500));
+        }
+
+        /// Persist a saved alert and hand the poll thread the new list. A
+        /// config write that fails is said in the dialog: a save that only
+        /// looked saved is the worst outcome here.
+        fn save_custom_alert(
+            &mut self,
+            def: ec2_manager::custom_alerts::CustomAlert,
+            replacing: Option<String>,
+        ) {
+            let name = def.name.clone();
+            apply_custom_alert_save(&mut self.config.custom_alerts, def, replacing);
+            self.sync_custom_alerts(format!("saved '{name}'"));
+        }
+
+        fn delete_custom_alert(&mut self, name: &str) {
+            if apply_custom_alert_delete(&mut self.config.custom_alerts, name) {
+                self.sync_custom_alerts(format!("deleted '{name}'"));
+            }
+        }
+
+        /// Write `config.ini` and replace the poll thread's snapshot source.
+        fn sync_custom_alerts(&mut self, what: String) {
+            if let Some(rt) = &self.custom_alerts {
+                let mut defs = rt.defs.lock().unwrap_or_else(|p| p.into_inner());
+                *defs = self.config.custom_alerts.clone();
+            }
+            match self.config.save() {
+                Ok(()) => {
+                    self.log_custom_alerts(LogLevel::Info, format!("custom alerts: {what}"));
+                    self.custom_alert_note = Some(format!("Alert {what}."));
+                }
+                Err(e) => {
+                    self.log_custom_alerts(
+                        LogLevel::Error,
+                        format!("custom alerts: {what}, but config.ini could not be written: {e}"),
+                    );
+                    self.custom_alert_note = Some(format!(
+                        "Alert {what}, but config.ini could not be written: {e}. \
+                         It will be lost when the app closes."
+                    ));
+                }
+            }
+        }
+
+        /// The Add/Update alert dialog. The gate is re-read every frame, not
+        /// trusted from the state that opened it.
+        fn render_custom_alert_dialog(&mut self, ctx: &egui::Context) {
+            use ec2_manager::custom_alerts::{FormMode, Problem};
+
+            if !self.custom_alerts_enabled {
+                self.custom_alert_form = None;
+                self.custom_alert_note = None;
+                return;
+            }
+            let Some(mut form) = self.custom_alert_form.clone() else {
+                return;
+            };
+            let saved = self.config.custom_alerts.clone();
+            let note = self.custom_alert_note.clone();
+
+            let mut open = true;
+            let mut save: Option<(ec2_manager::custom_alerts::CustomAlert, Option<String>)> = None;
+            let mut delete: Option<String> = None;
+            let mut close = false;
+
+            egui::Window::new("Add/Update alert")
+                .id(egui::Id::new("custom_alert_dialog"))
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(460.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        let mut mode = form.mode;
+                        ui.radio_value(&mut mode, FormMode::New, "New alert");
+                        ui.radio_value(&mut mode, FormMode::Current, "Current alert");
+                        form.set_mode(mode);
+                    });
+                    ui.separator();
+
+                    if form.mode == FormMode::Current {
+                        let label = form
+                            .selected
+                            .clone()
+                            .unwrap_or_else(|| "Select an alert".to_string());
+                        egui::ComboBox::from_id_salt("custom_alert_pick")
+                            .selected_text(label)
+                            .width(300.0)
+                            .show_ui(ui, |ui| {
+                                for def in &saved {
+                                    let picked = form.selected.as_deref() == Some(def.name.as_str());
+                                    if ui.selectable_label(picked, &def.name).clicked() {
+                                        form.load(def);
+                                    }
+                                }
+                            });
+                        if saved.is_empty() {
+                            ui.weak("No alerts saved yet. Choose New alert to add one.");
+                        }
+                        ui.add_space(4.0);
+                    }
+
+                    let editable = form.mode == FormMode::New || form.selected.is_some();
+                    ui.add_enabled_ui(editable, |ui| {
+                        egui::Grid::new("custom_alert_grid")
+                            .num_columns(2)
+                            .spacing([8.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label("Name");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.name)
+                                        .desired_width(300.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("Alert text");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.match_text)
+                                        .hint_text("text the alert summary contains")
+                                        .desired_width(300.0),
+                                )
+                                .on_hover_text(
+                                    "Matched, ignoring case, against the alert's summary. \
+                                     A blank is refused: it would match every alert.",
+                                );
+                                ui.end_row();
+
+                                ui.label("Acknowledge after");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut form.ack_raw)
+                                            .desired_width(60.0),
+                                    );
+                                    ui.label("minutes");
+                                });
+                                ui.end_row();
+
+                                ui.label("Escalate");
+                                ui.checkbox(&mut form.escalate, "if still open");
+                                ui.end_row();
+
+                                ui.label("Wait to escalate");
+                                ui.horizontal(|ui| {
+                                    ui.add_enabled(
+                                        form.escalate,
+                                        egui::TextEdit::singleline(&mut form.wait_raw)
+                                            .desired_width(60.0),
+                                    );
+                                    ui.label("minutes after it is acknowledged");
+                                });
+                                ui.end_row();
+                            });
+                    });
+
+                    let label = form.escalates_at_label();
+                    if !label.is_empty() {
+                        ui.weak(label);
+                    }
+
+                    let checked = form.check(&saved);
+                    if let Err(problem) = &checked {
+                        // Nothing to complain about before a choice is made.
+                        if !(form.mode == FormMode::Current && form.selected.is_none())
+                            && *problem != Problem::NothingSelected
+                        {
+                            note_label(ui, egui::Color32::from_rgb(200, 60, 60), problem.message());
+                        }
+                    }
+
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(checked.is_ok(), egui::Button::new("Save"))
+                            .clicked()
+                        {
+                            if let Ok(def) = checked.clone() {
+                                let replacing = (form.mode == FormMode::Current)
+                                    .then(|| form.selected.clone())
+                                    .flatten();
+                                save = Some((def, replacing));
+                            }
+                        }
+                        if form.mode == FormMode::Current && form.selected.is_some() {
+                            let name = form.selected.clone().unwrap_or_default();
+                            if form.confirm_delete {
+                                note_label(
+                                    ui,
+                                    egui::Color32::from_rgb(200, 60, 60),
+                                    format!("Delete '{name}'?"),
+                                );
+                                if ui.button("Yes, delete").clicked() {
+                                    delete = Some(name);
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    form.confirm_delete = false;
+                                }
+                            } else if ui.button("Delete").clicked() {
+                                form.confirm_delete = true;
+                            }
+                        }
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
+                    });
+                    if let Some(note) = &note {
+                        ui.weak(note);
+                    }
+                });
+
+            // Escape closes it, but only when it is the topmost window: Escape
+            // with another window on top must not reach past it.
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                && ctx
+                    .top_layer_id()
+                    .is_some_and(|l| l.id == egui::Id::new("custom_alert_dialog"))
+            {
+                close = true;
+            }
+
+            if let Some((def, replacing)) = save {
+                // A rename or a new name applies to the form too, so a second
+                // Save edits the same alert rather than adding another.
+                let name = def.name.clone();
+                self.save_custom_alert(def, replacing);
+                form.mode = FormMode::Current;
+                form.selected = Some(name);
+                form.confirm_delete = false;
+            }
+            if let Some(name) = delete {
+                self.delete_custom_alert(&name);
+                form = ec2_manager::custom_alerts::AlertForm::new_blank();
+                form.mode = FormMode::Current;
+            }
+
+            if close || !open {
+                self.custom_alert_form = None;
+                self.custom_alert_note = None;
+            } else {
+                self.custom_alert_form = Some(form);
+            }
         }
 
         /// `(username, PAT, host)` for the git credential store, when the
@@ -40173,6 +40436,7 @@ mod gui {
                 self.close_top_window_on_escape(ctx);
                 self.render_ack_all_confirm(ctx);
                 self.render_run_remediation_confirm(ctx);
+                self.render_custom_alert_dialog(ctx);
                 self.pump_script_runs();
                 self.poll_script_events();
                 self.poll_alerts_events();
@@ -43135,6 +43399,24 @@ mod gui {
             ),
         ));
         (true, lines)
+    }
+
+    /// Add `def`, or replace the saved alert called `replacing` in place.
+    /// Free and pure so the list handling is tested without an app.
+    fn apply_custom_alert_save(
+        list: &mut Vec<ec2_manager::custom_alerts::CustomAlert>,
+        def: ec2_manager::custom_alerts::CustomAlert,
+        replacing: Option<String>,
+    ) {
+        ec2_manager::custom_alerts::upsert(list, def, replacing.as_deref());
+    }
+
+    /// Remove the saved alert called `name`. True when one existed.
+    fn apply_custom_alert_delete(
+        list: &mut Vec<ec2_manager::custom_alerts::CustomAlert>,
+        name: &str,
+    ) -> bool {
+        ec2_manager::custom_alerts::remove(list, name)
     }
 
     /// Whether the custom-alerts watcher may run, and the startup lines saying
@@ -52702,6 +52984,75 @@ mod gui {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn saving_replaces_in_place_and_deleting_removes() {
+            use ec2_manager::custom_alerts::CustomAlert;
+            let def = |n: &str| CustomAlert {
+                name: n.to_string(),
+                match_text: "x".to_string(),
+                ack_after_mins: 1,
+                escalate: false,
+                escalate_wait_mins: 0,
+            };
+            let mut list = vec![def("a"), def("b")];
+            apply_custom_alert_save(&mut list, def("a2"), Some("a".to_string()));
+            assert_eq!(list.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["a2", "b"]);
+            apply_custom_alert_save(&mut list, def("c"), None);
+            assert_eq!(list.len(), 3);
+            assert!(apply_custom_alert_delete(&mut list, "B"));
+            assert_eq!(list.len(), 2);
+            assert!(!apply_custom_alert_delete(&mut list, "nope"));
+        }
+
+        /// The dialog and its button are reachable only for a user the gate
+        /// let through, and the dialog re-checks the gate every frame.
+        #[test]
+        fn the_custom_alert_dialog_and_button_stay_behind_the_gate() {
+            let src = include_str!("ec2_manager_gui.rs");
+
+            let def = format!("fn render_custom_alert_{}(", "dialog");
+            let start = src.find(&def).expect("the dialog");
+            let end = src[start..].find("\n        }\n").map(|i| start + i).expect("its end");
+            let body = &src[start..end];
+            let gate = body.find("if !self.custom_alerts_enabled").expect("the gate re-check");
+            let form = body.find("self.custom_alert_form").expect("the form");
+            assert!(gate < form, "the gate is checked before the form is touched");
+            assert!(
+                body.contains("self.custom_alert_form = None"),
+                "a shut gate drops the dialog state"
+            );
+
+            let alerts_fn = src.find("fn render_alerts_window(").expect("the alerts window");
+            let alerts_end = src[alerts_fn..].find("\n        }\n").map(|i| alerts_fn + i).unwrap();
+            let alerts_body = &src[alerts_fn..alerts_end];
+            let button = alerts_body.find("Add/Update alert").expect("the button");
+            let guard = alerts_body[..button].rfind("custom_alerts_enabled").expect("its guard");
+            assert!(button - guard < 400, "the guard sits directly above the button");
+
+            // Assembled, or this assertion is satisfied by its own source.
+            let call = format!("self.render_custom_alert_{}(ctx);", "dialog");
+            let calls = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//") && l.contains(&call))
+                .count();
+            assert_eq!(calls, 1, "the dialog is drawn from exactly one place, update");
+        }
+
+        /// A bare status-coloured label is a notification that stays thin on
+        /// a light panel; `status_coloured_labels_all_carry_the_light_theme_weight`
+        /// allows exactly two grey ones, so the dialog must use `note_label`.
+        #[test]
+        fn the_custom_alert_dialog_uses_note_label_for_its_messages() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let name = format!("fn render_custom_alert_{}(", "dialog");
+            let start = src.find(&name).expect("the dialog");
+            let end = src[start..].find("\n        }\n").map(|i| start + i).expect("its end");
+            let body = &src[start..end];
+            let bare = format!("ui.{}(", "colored_label");
+            assert!(!body.contains(&bare), "use note_label, not a bare coloured label");
+            assert!(body.contains("note_label("));
+        }
 
         /// The number on the **Alerts** button is a count of open alerts,
         /// and a count of nothing is left off — a `(0)` in brackets reads as
