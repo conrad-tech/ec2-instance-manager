@@ -533,6 +533,11 @@ mod gui {
         /// Its own source so only the people on `cassandra_cert.allowed_users`
         /// read which nodes were restarted and how they came back.
         Cassandra,
+        /// The custom-alerts watcher: the poll thread, every acknowledge and
+        /// escalation, and the startup lines about whether it came up. Its
+        /// own source so only the user named on `custom_alerts.allowed_users`
+        /// reads which alerts were matched and acknowledged.
+        CustomAlerts,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -564,6 +569,7 @@ mod gui {
         jira: bool,
         alerts: bool,
         cassandra: bool,
+        custom_alerts: bool,
     }
 
     impl OnCallFilters {
@@ -578,6 +584,7 @@ mod gui {
                 || self.jira
                 || self.alerts
                 || self.cassandra
+                || self.custom_alerts
         }
 
         fn includes(self, source: LogSource) -> bool {
@@ -593,6 +600,7 @@ mod gui {
                 LogSource::Jira => self.jira,
                 LogSource::Alerts => self.alerts,
                 LogSource::Cassandra => self.cassandra,
+                LogSource::CustomAlerts => self.custom_alerts,
                 LogSource::App => false,
             }
         }
@@ -629,6 +637,9 @@ mod gui {
             }
             if self.cassandra {
                 picked.push("Cassandra");
+            }
+            if self.custom_alerts {
+                picked.push("Custom Alerts");
             }
             if picked.is_empty() {
                 // Renamed from "On-Call" when Jira and Alerts joined it: a
@@ -672,6 +683,7 @@ mod gui {
         jira: bool,
         alerts: bool,
         cassandra: bool,
+        custom_alerts: bool,
     }
 
     impl LogVisibility {
@@ -696,6 +708,9 @@ mod gui {
                 // Named on the list, `"*"` not honoured, `enabled` not
                 // consulted: the same rule as the watchers above.
                 cassandra: features.cassandra_cert.is_listed_user(user),
+                // Named on the list, `"*"` not honoured, `enabled` not
+                // consulted: the same rule as the watchers above.
+                custom_alerts: features.custom_alerts.is_listed_user(user),
             }
         }
 
@@ -712,6 +727,7 @@ mod gui {
                 LogSource::Jira => self.jira,
                 LogSource::Alerts => self.alerts,
                 LogSource::Cassandra => self.cassandra,
+                LogSource::CustomAlerts => self.custom_alerts,
             }
         }
 
@@ -727,6 +743,7 @@ mod gui {
                 || self.jira
                 || self.alerts
                 || self.cassandra
+                || self.custom_alerts
         }
     }
 
@@ -13245,6 +13262,10 @@ mod gui {
 
         fn log_pingdom(&mut self, level: LogLevel, message: impl Into<String>) {
             self.log_from(LogSource::Pingdom, level, message);
+        }
+
+        fn log_custom_alerts(&mut self, level: LogLevel, message: impl Into<String>) {
+            self.log_from(LogSource::CustomAlerts, level, message);
         }
 
         fn log_unhealthy_host(&mut self, level: LogLevel, message: impl Into<String>) {
@@ -39607,6 +39628,17 @@ mod gui {
                             );
                         });
                     }
+                    if vis.custom_alerts {
+                        ui.horizontal(|ui| {
+                            ui.label("Custom Alerts");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.checkbox(&mut self.oncall_filters.custom_alerts, "");
+                                },
+                            );
+                        });
+                    }
                 })
                 .response
                 .on_hover_text(
@@ -43000,6 +43032,61 @@ mod gui {
                 cfg.app_contains,
                 cfg.message_contains,
             ),
+        ));
+        (true, lines)
+    }
+
+    /// Whether the custom-alerts watcher may run, and the startup lines saying
+    /// why. Pure, and returns the lines instead of logging them, so every dark
+    /// state can be asserted without an `Ec2GuiApp`. Each one names itself.
+    ///
+    /// The lines go to `LogSource::CustomAlerts`, which only a listed user can
+    /// read, and never to the shared `gates:` line. The mailbox address never
+    /// appears in a line: the app log gets pasted into tickets.
+    fn custom_alerts_gate_report(
+        cfg: &ec2_manager::features::CustomAlertsFeature,
+        user: &str,
+        auth_complete: bool,
+        mailbox: Option<&str>,
+    ) -> (bool, Vec<(bool, String)>) {
+        let mut lines: Vec<(bool, String)> = Vec::new();
+        if !cfg.enabled {
+            lines.push((
+                false,
+                "custom alerts: off - custom_alerts.enabled is false in this build".to_string(),
+            ));
+            return (false, lines);
+        }
+        if !cfg.is_allowed_user(user) {
+            lines.push((
+                false,
+                format!(
+                    "custom alerts: off - os_user '{user}' is not on custom_alerts.allowed_users \
+                     (note '*' is deliberately not honoured)"
+                ),
+            ));
+            return (false, lines);
+        }
+        if !auth_complete {
+            lines.push((false, "custom alerts: no JSM credentials, staying dark".to_string()));
+            return (false, lines);
+        }
+        if mailbox.map(str::trim).unwrap_or("").is_empty() {
+            lines.push((
+                false,
+                "custom alerts: no escalation mailbox configured, staying dark - set \
+                 ESCALATION_MAILBOX or store the ec2_manager/escalation_mailbox credential. \
+                 Acknowledging without being able to escalate would silence a live page and \
+                 never ring"
+                    .to_string(),
+            ));
+            return (false, lines);
+        }
+        lines.push((
+            false,
+            "custom alerts: armed - acknowledging and escalating the alerts saved in the \
+             Alerts window, on call only"
+                .to_string(),
         ));
         (true, lines)
     }
@@ -57875,7 +57962,7 @@ mod gui {
 
         #[test]
         fn ticking_reaper_down_narrows_the_log_to_that_script() {
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
             assert!(only_reaper.any());
             assert!(only_reaper.includes(LogSource::ReaperDown));
             assert!(!only_reaper.includes(LogSource::App));
@@ -57886,7 +57973,7 @@ mod gui {
             // The popup shuts as soon as it is used, so without this the only
             // evidence that most of the log is being hidden is the log being
             // short — which reads as the app having stopped logging.
-            assert_eq!(OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false }.label(), "Sources: Reaper Down");
+            assert_eq!(OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false, custom_alerts: false }.label(), "Sources: Reaper Down");
         }
 
         #[test]
@@ -57907,7 +57994,7 @@ mod gui {
 
             // And that tag is what the dropdown filters on — asserted through
             // the same predicate the panel uses, not a reimplementation of it.
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
             let kept: Vec<&str> = app
                 .logs
                 .iter()
@@ -57922,7 +58009,7 @@ mod gui {
             // The two filters are independent and both on screen. A DEBUG
             // reaper line with DEBUG unticked stays hidden, the same as any
             // other DEBUG line.
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
             let mut levels = LogFilters::default();
             levels.set_verbosity_low();
             assert!(!levels.includes(LogLevel::Debug));
@@ -60637,7 +60724,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn the_on_call_filter_can_narrow_the_log_to_pingdom() {
-            let only_pingdom = OnCallFilters { reaper_down: false, pingdom: true, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false };
+            let only_pingdom = OnCallFilters { reaper_down: false, pingdom: true, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
             assert!(only_pingdom.includes(LogSource::Pingdom));
             assert!(!only_pingdom.includes(LogSource::ReaperDown));
             assert!(!only_pingdom.includes(LogSource::App));
@@ -60647,7 +60734,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         #[test]
         fn nothing_ticked_still_shows_the_pingdom_lines() {
             // A dropdown nobody opens must not remove anything from view.
-            let none = OnCallFilters { reaper_down: false, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false };
+            let none = OnCallFilters { reaper_down: false, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
             assert!(none.includes(LogSource::Pingdom));
             assert!(none.includes(LogSource::ReaperDown));
             assert!(none.includes(LogSource::App));
@@ -60656,7 +60743,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn both_ticked_shows_both_and_says_so() {
-            let both = OnCallFilters { reaper_down: true, pingdom: true, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false };
+            let both = OnCallFilters { reaper_down: true, pingdom: true, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
             assert!(both.includes(LogSource::Pingdom));
             assert!(both.includes(LogSource::ReaperDown));
             assert!(!both.includes(LogSource::App));
@@ -60965,6 +61052,102 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             // closes cannot outlive it.
             let body = method_body(prod, "fn render_cassandra_dialog");
             assert!(body.contains("if !self.cassandra_cert_enabled"), "{body}");
+        }
+
+        #[test]
+        fn custom_alerts_lines_are_visible_only_to_a_listed_user() {
+            let f: ec2_manager::features::Features = serde_json::from_str(
+                r#"{"custom_alerts":{"enabled":false,"allowed_users":["john"]}}"#,
+            )
+            .unwrap();
+            assert!(LogVisibility::for_user(&f, "john").shows(LogSource::CustomAlerts));
+            assert!(
+                !LogVisibility::for_user(&f, "rick").shows(LogSource::CustomAlerts),
+                "an unlisted user reads none of it"
+            );
+            assert!(!LogVisibility::for_user(&f, "").shows(LogSource::CustomAlerts));
+            assert!(LogVisibility::for_user(&f, "john").any_source());
+            assert!(!LogVisibility::for_user(&f, "rick").any_source());
+        }
+
+        #[test]
+        fn the_custom_alerts_source_filters_and_labels_like_the_others() {
+            let only = OnCallFilters { custom_alerts: true, ..OnCallFilters::default() };
+            assert!(only.includes(LogSource::CustomAlerts));
+            assert!(!only.includes(LogSource::Pingdom));
+            assert!(!only.includes(LogSource::App));
+            assert_eq!(only.label(), "Sources: Custom Alerts");
+            assert!(OnCallFilters::default().includes(LogSource::CustomAlerts));
+        }
+
+        fn custom_cfg(enabled: bool, users: &[&str]) -> ec2_manager::features::CustomAlertsFeature {
+            ec2_manager::features::CustomAlertsFeature {
+                enabled,
+                allowed_users: users.iter().map(|u| u.to_string()).collect(),
+            }
+        }
+
+        #[test]
+        fn the_custom_alerts_gate_names_each_dark_state() {
+            let (armed, lines) =
+                custom_alerts_gate_report(&custom_cfg(false, &["john"]), "john", true, Some("m@x"));
+            assert!(!armed);
+            assert!(lines[0].1.contains("custom_alerts.enabled is false"));
+
+            let (armed, lines) =
+                custom_alerts_gate_report(&custom_cfg(true, &["john"]), "rick", true, Some("m@x"));
+            assert!(!armed);
+            assert!(lines[0].1.contains("'rick' is not on custom_alerts.allowed_users"));
+
+            let (armed, lines) =
+                custom_alerts_gate_report(&custom_cfg(true, &["john"]), "john", false, Some("m@x"));
+            assert!(!armed);
+            assert!(lines[0].1.contains("no JSM credentials"));
+
+            let (armed, lines) =
+                custom_alerts_gate_report(&custom_cfg(true, &["john"]), "john", true, None);
+            assert!(!armed);
+            assert!(lines[0].1.contains("no escalation mailbox"));
+            let (_, blank) =
+                custom_alerts_gate_report(&custom_cfg(true, &["john"]), "john", true, Some("  "));
+            assert!(blank[0].1.contains("no escalation mailbox"));
+        }
+
+        #[test]
+        fn the_custom_alerts_gate_arms_only_when_everything_is_in_place() {
+            let (armed, lines) = custom_alerts_gate_report(
+                &custom_cfg(true, &["john"]),
+                "john",
+                true,
+                Some("mailbox@example.invalid"),
+            );
+            assert!(armed);
+            assert!(lines.iter().any(|(_, l)| l.contains("armed")));
+            assert!(
+                lines.iter().all(|(_, l)| !l.contains("mailbox@example.invalid")),
+                "the address never goes in the log"
+            );
+        }
+
+        #[test]
+        fn the_shared_gates_line_does_not_name_custom_alerts() {
+            // The shared `gates:` line goes to App, which everyone reads, so
+            // it must never mention a gated feature. Both halves are
+            // assembled at runtime, or this scan matches its own source.
+            let gates = format!("gate{}", "s:");
+            let feature = format!("custom_{}", "alerts");
+            let src = include_str!("ec2_manager_gui.rs");
+            for (n, line) in src.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                assert!(
+                    !(line.contains(&gates) && line.contains(&feature)),
+                    "line {}: the shared gates line must not name custom alerts: {}",
+                    n + 1,
+                    line.trim(),
+                );
+            }
         }
 
         /// The Cassandra source follows `cassandra_cert.allowed_users` by
