@@ -110,6 +110,8 @@ pub struct Features {
     /// Start / Stop / Restart from the Inventory right-click menu: who may
     /// see the entries.
     pub instance_power: InstancePowerFeature,
+    /// Add/Update alert dialog and its poll thread: who may use it.
+    pub custom_alerts: CustomAlertsFeature,
     /// Scripts -> Cassandra Cert: who may see it, and its tunables.
     pub cassandra_cert: CassandraCertFeature,
     /// Inventory resource sub-tabs: which target groups have their health
@@ -472,6 +474,36 @@ impl InstancePowerFeature {
     /// True when `user` is named on the allow-list.
     pub fn is_allowed_user(&self, user: &str) -> bool {
         user_in_list(&self.allowed_users, user)
+    }
+}
+
+/// The `custom_alerts` section of `assets/features.json`.
+///
+/// Gates the **Add/Update alert** dialog and the poll thread behind it: the
+/// user-defined watchers that acknowledge a matching on-call alert after a
+/// delay and escalate if it is still open. This acknowledges live pages and
+/// can ring a phone, so both keys are required and `"*"` is **not** honoured,
+/// exactly as for `pingdom` and `reaper`. Ships closed.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct CustomAlertsFeature {
+    /// Master switch. Shipped false.
+    pub enabled: bool,
+    /// OS usernames who may use it (case-insensitive, trimmed). Shipped
+    /// empty. A user not named here sees none of the feature.
+    pub allowed_users: Vec<String>,
+}
+
+impl CustomAlertsFeature {
+    /// True when `user` may use the feature: switched on **and** named.
+    pub fn is_allowed_user(&self, user: &str) -> bool {
+        self.enabled && names_user(&self.allowed_users, user)
+    }
+
+    /// True when `user` is named on the list, whether or not the feature is
+    /// enabled. Decides who reads its log lines; see [`names_user`].
+    pub fn is_listed_user(&self, user: &str) -> bool {
+        names_user(&self.allowed_users, user)
     }
 }
 
@@ -1516,6 +1548,10 @@ impl Default for Features {
             // are required by the gate, so a features.json nobody can parse
             // hands out no power to stop a production instance.
             instance_power: InstancePowerFeature::default(),
+            // Derived Default: off, nobody allowed. Both are required by the
+            // gate, so a features.json nobody can parse hands out no watcher
+            // that acknowledges pages.
+            custom_alerts: CustomAlertsFeature::default(),
             // Hand-written Default: `enabled` false and an empty allow-list,
             // both required by the gate, so an unparseable features.json
             // cannot arm a cluster-wide restart.
@@ -1682,6 +1718,12 @@ impl Features {
     /// says.
     pub fn instance_power_enabled_for(&self, user: &str) -> bool {
         self.instance_power.enabled && self.instance_power.is_allowed_user(user)
+    }
+
+    /// Whether the custom-alerts dialog and poll are offered to `user`: the
+    /// flag AND the name, hidden rather than greyed out.
+    pub fn custom_alerts_enabled_for(&self, user: &str) -> bool {
+        self.custom_alerts.is_allowed_user(user)
     }
 
     /// Whether the Cassandra Cert dialog is offered to `user`: the flag AND
@@ -2041,6 +2083,81 @@ mod tests {
             "assets/features.json must ship instance_power switched off with \
              an empty allowed_users"
         );
+    }
+
+    // ---- custom_alerts ----------------------------------------------
+
+    #[test]
+    fn the_shipped_file_hands_custom_alerts_to_nobody() {
+        let f = load();
+        assert!(
+            !f.custom_alerts_enabled_for("any.user"),
+            "assets/features.json must ship custom_alerts switched off with \
+             an empty allowed_users"
+        );
+        assert!(!f.custom_alerts.enabled);
+        assert!(f.custom_alerts.allowed_users.is_empty());
+    }
+
+    #[test]
+    fn custom_alerts_needs_the_flag_and_the_name() {
+        let armed: Features = serde_json::from_str(
+            r#"{"custom_alerts":{"enabled":true,"allowed_users":["john"]}}"#,
+        )
+        .unwrap();
+        assert!(armed.custom_alerts_enabled_for("john"));
+        assert!(armed.custom_alerts_enabled_for("John"), "case-insensitive");
+        assert!(armed.custom_alerts_enabled_for(" john "), "trimmed");
+        assert!(!armed.custom_alerts_enabled_for("rick"), "another user gets nothing");
+
+        let named_but_off: Features = serde_json::from_str(
+            r#"{"custom_alerts":{"enabled":false,"allowed_users":["john"]}}"#,
+        )
+        .unwrap();
+        assert!(!named_but_off.custom_alerts_enabled_for("john"));
+
+        let on_but_unnamed: Features =
+            serde_json::from_str(r#"{"custom_alerts":{"enabled":true,"allowed_users":[]}}"#)
+                .unwrap();
+        assert!(!on_but_unnamed.custom_alerts_enabled_for("john"));
+    }
+
+    #[test]
+    fn custom_alerts_does_not_honour_a_wildcard() {
+        // This acknowledges live pages and can ring a phone, so a stray "*"
+        // must not arm it for everyone.
+        let everyone: Features = serde_json::from_str(
+            r#"{"custom_alerts":{"enabled":true,"allowed_users":["*"]}}"#,
+        )
+        .unwrap();
+        assert!(!everyone.custom_alerts_enabled_for("anyone"));
+        assert!(!everyone.custom_alerts.is_listed_user("anyone"));
+    }
+
+    #[test]
+    fn custom_alerts_fails_closed() {
+        let armed: Features = serde_json::from_str(
+            r#"{"custom_alerts":{"enabled":true,"allowed_users":["john"]}}"#,
+        )
+        .unwrap();
+        assert!(!armed.custom_alerts_enabled_for(""), "an unknown user is on no list");
+        assert!(!armed.custom_alerts_enabled_for("   "));
+
+        let missing: Features = serde_json::from_str("{}").unwrap();
+        assert!(!missing.custom_alerts_enabled_for("john"));
+        assert!(!Features::default().custom_alerts_enabled_for("john"));
+    }
+
+    #[test]
+    fn a_listed_user_is_listed_even_when_the_feature_is_off() {
+        // Decides who reads the feature's log lines: the person it is for
+        // must still see the "switched off" line.
+        let f: Features = serde_json::from_str(
+            r#"{"custom_alerts":{"enabled":false,"allowed_users":["john"]}}"#,
+        )
+        .unwrap();
+        assert!(f.custom_alerts.is_listed_user("john"));
+        assert!(!f.custom_alerts.is_listed_user("rick"));
     }
 
     #[test]

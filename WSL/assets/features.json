@@ -206,6 +206,11 @@
     "poll_secs": 30,
     "fetch_count": 10
   },
+  "_custom_alerts_comment": "Add/Update alert dialog in the Alerts window, and the poll thread behind it: user-defined watchers that match text in an alert summary, ACKNOWLEDGE it after a delay, and optionally ESCALATE (the RE-F email) if it is still open ack-delay + escalate-wait minutes after it was first seen. Acts only while you hold the on-call pager. BOTH keys are required: set enabled to true AND name the OS username in allowed_users. '*' is deliberately NOT honoured. A user who is not named sees none of it: no button, no dialog, no poll, no log lines. Shipped closed; add your username and rebuild.",
+  "custom_alerts": {
+    "enabled": false,
+    "allowed_users": []
+  },
   "_instance_power_comment": "Start instance / Stop instance / Restart (stop -> start) on the Inventory tab's right-click menu. Restart is a STOP, a poll until the instance actually reports 'stopped', a 20s hold so the shutdown is visible, and then a START — it is NOT ec2 reboot-instances, which keeps the same host and never reports stopped. These write live AWS state, so BOTH keys are required: set enabled to true AND name the OS username in allowed_users ([\"*\"] = everyone, [] = nobody). Shipped closed on both counts, so the menu entries are hidden until an admin opts users in and rebuilds; instance_power= on the startup gates: log line says which way it resolved. Live mode only — a Sim profile refuses. One list covers all three actions.",
   "instance_power": {
     "enabled": false,
