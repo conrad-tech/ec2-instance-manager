@@ -1552,6 +1552,60 @@ no watcher naming them the whole dropdown is gone rather than drawn empty.
   lists, and is the case that had the panel opening on the alert feed's
   traffic.
 
+### Custom alerts: Add/Update alert (Alerts window)
+
+User-defined watchers: match text in an incoming JSM alert, acknowledge after N
+minutes, optionally escalate with the same `RE-F` email. Spec:
+`docs/superpowers/specs/2026-10-14-custom-alerts-design.md` (gitignored, local).
+
+- **Where the code lives:** `src/custom_alerts.rs` (model, validation, pure timer
+  state machine), the GUI's `start_custom_alerts_poll` (the only thread that
+  makes calls) and `render_custom_alert_dialog` (the Add/Update dialog).
+- **Gate:** `custom_alerts.enabled` AND a named user in `allowed_users`
+  (`names_user`; `"*"` is NOT honoured, because this acknowledges and can ring a
+  phone). Shipped off with nobody listed. It also needs the Alerts feature. The
+  gate closes every surface in the spec's table: button, dialog (re-checked every
+  frame), poll thread (never started), saved alerts (ignored), log source,
+  `gates:` line and the Logs source dropdown.
+- **Timeline:** acknowledge at N minutes, escalate at N + wait, both measured from
+  first sighting. Escalation is one `RE-F` email, once.
+- **On call only:** no acknowledge, timer or escalation off call or when the
+  on-call lookup fails. Off-call periods do NOT freeze or re-base timers: watches
+  from an earlier on-call shift keep running and can fire together when you come
+  back on call (Pingdom has the same shape).
+- **Built-ins win:** an alert the Pingdom, unhealthy-host or reaper watchers
+  claim (`dry_run_route`) is skipped. When two custom alerts match, the first
+  saved wins.
+- **Duplicate rule:** keyed on alert id, no environment grouping; each matching
+  alert is its own incident.
+- **Restart re-times:** timers are in memory; a still-open alert is timed again
+  from the restart.
+- **Delete/rename drops timers:** so nothing rings for a removed alert. Other
+  edits apply from the next poll without re-timing.
+- **Already acknowledged is left alone, but not our own acknowledge:** the poll's
+  re-read decides with the pure `custom_alerts::reread_verdict(status,
+  acknowledged, acked_by_us)`. Closed always wins; an alert acknowledged by
+  someone else is dropped; an alert acknowledged by THIS watcher
+  (`ack_succeeded`) keeps timing so its escalation still fires. A failed
+  acknowledge does not count as "by us". This stops the watcher cancelling its
+  own escalation. It relies on `alerts::fetch_alert` filling `Alert.acknowledged`
+  (`alerts.rs` `from_raw`).
+- **The page says almost nothing:** the email carries only `RE-F` and a time; the
+  alert name is local (app log only). The escalation log line says only "sent":
+  the mailbox address never goes in a log line.
+- **Persistence:** `config.ini` `custom_alert=` lines, with name and match text
+  base64'd.
+- **Shared state:** the definitions `Arc<Mutex<Vec<_>>>` is the only shared state
+  between the dialog and the poll thread.
+- **Known and left alone:** `seen` (alert ids already timed) is never pruned;
+  growth is small and it is what stops an alert being re-timed after it closes. A
+  failed acknowledge is never retried.
+- **Deferred, not built:** a periodic heartbeat log line (`watching_count` exists
+  but is unused), and a red (not grey) note for a failed config write in the
+  dialog.
+- **A live test pages.** It sends a real escalation: a real `RE-F` email, then a
+  call and a Telegram message. Do not run one without telling whoever is on call.
+
 ### Jira Tickets (the ticket list and the ticket view)
 
 `src/jira.rs` reads the Jira **issue** API — a different API from the JSM Ops
