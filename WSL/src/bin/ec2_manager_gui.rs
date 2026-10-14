@@ -30195,6 +30195,17 @@ mod gui {
                                 action = Some(CassandraAction::Apply);
                             }
                             note_label(ui, amber, "This stages the new cert only. It will not restart the service.");
+                            // The progress line above sits over the dry-run
+                            // results, so a long one scrolls it out of sight
+                            // by the time this button is clicked: say it here
+                            // too, beside the button that started the job.
+                            if dlg.running {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    let colour = flashing_yellow(ui);
+                                    note_label(ui, colour, progress_text.as_str());
+                                });
+                            }
                         }
 
                         // ---- Rollback panel (spec 5) ----
@@ -63240,6 +63251,13 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             // The progress line is flashing yellow, not a plain label.
             let at = src.find("let progress_text = self").expect("progress text");
             assert!(src[at..].contains("note_label(ui, colour, progress_text.as_str())"));
+            // ...and it is repeated under the Update cert button, which sits
+            // below the dry-run results where the first one is scrolled away.
+            let button = src.find("egui::Button::new(\"Update cert\")").expect("Update cert button");
+            assert!(
+                src[button..].contains("note_label(ui, colour, progress_text.as_str())"),
+                "no progress line after the Update cert button"
+            );
         }
 
         /// Finding 6: an orphan record names every node that may hold the
