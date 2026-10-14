@@ -11105,6 +11105,18 @@ mod gui {
         /// this user, JSM credentials are not configured, or no escalation
         /// mailbox is set — see `pingdom_gate_report`, which names which.
         pingdom: Option<PingdomRuntime>,
+        /// Background custom-alerts watcher. `None` unless the gate in
+        /// `custom_alerts_gate_report` armed it: feature on, this user named,
+        /// JSM credentials, and an escalation mailbox.
+        custom_alerts: Option<CustomAlertsRuntime>,
+        /// Whether this user may see the Add/Update alert button and dialog:
+        /// `custom_alerts.enabled` AND this OS user named. Resolved once at
+        /// startup, never per frame.
+        custom_alerts_enabled: bool,
+        /// The Add/Update alert dialog, when open.
+        custom_alert_form: Option<ec2_manager::custom_alerts::AlertForm>,
+        /// The note under the dialog's buttons (saved / deleted / save failed).
+        custom_alert_note: Option<String>,
         /// Background unhealthy-host watcher. `None` when the feature is off
         /// for this user, JSM credentials are not configured, or no
         /// escalation mailbox is set — `unhealthy_host_gate_report` names which.
@@ -11490,6 +11502,33 @@ mod gui {
                 (rt, lines)
             };
 
+            // Its own gate and its own thread, for the reason pingdom's is
+            // separate from reaper's: the watchers share a feed and nothing
+            // else, and one being disarmed must never disarm another.
+            let custom_alerts_enabled = features
+                .custom_alerts_enabled_for(&ec2_manager::features::current_os_user());
+            let (custom_alerts, custom_alerts_startup_log) = {
+                let user = ec2_manager::features::current_os_user();
+                let mailbox = ec2_manager::jsm_auth::escalation_mailbox();
+                let (armed, lines) = custom_alerts_gate_report(
+                    &features.custom_alerts,
+                    &user,
+                    resolved_alerts_auth.is_complete(),
+                    mailbox.as_deref(),
+                );
+                let rt = if armed {
+                    Some(start_custom_alerts_poll(
+                        resolved_alerts_auth.clone(),
+                        features.clone(),
+                        config.custom_alerts.clone(),
+                        mailbox.unwrap_or_default(),
+                    ))
+                } else {
+                    None
+                };
+                (rt, lines)
+            };
+
             let (unhealthy_host, unhealthy_host_startup_log) = {
                 let user = ec2_manager::features::current_os_user();
                 let mailbox = ec2_manager::jsm_auth::escalation_mailbox();
@@ -11842,6 +11881,10 @@ mod gui {
                 alerts_generation: 0,
                 reaper,
                 pingdom,
+                custom_alerts,
+                custom_alerts_enabled,
+                custom_alert_form: None,
+                custom_alert_note: None,
                 unhealthy_host,
                 unhealthy_host_notice: None,
                 instance_age,
@@ -11962,6 +12005,10 @@ mod gui {
                 // nothing else is there.
                 let level = if is_warn { LogLevel::Warn } else { LogLevel::Info };
                 app.log_pingdom(level, msg);
+            }
+            for (is_warn, msg) in custom_alerts_startup_log {
+                let level = if is_warn { LogLevel::Warn } else { LogLevel::Info };
+                app.log_custom_alerts(level, msg);
             }
             for (is_warn, msg) in unhealthy_host_startup_log {
                 let level = if is_warn { LogLevel::Warn } else { LogLevel::Info };
@@ -19681,6 +19728,40 @@ mod gui {
                                     "pingdom: escalation for {incident} FAILED TO SEND — {detail}. \
                                      The alert is acknowledged and nothing will ring; handle it \
                                      by hand"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Drain whatever the custom-alerts watcher has said since the last
+        /// frame. The acknowledge and the escalation already happened on its
+        /// own thread, so this only records them.
+        fn poll_custom_alerts_events(&mut self) {
+            let Some(rt) = &self.custom_alerts else { return };
+            let events: Vec<CustomAlertEvent> = rt.rx.try_iter().collect();
+            for ev in events {
+                match ev {
+                    CustomAlertEvent::Note { level, message } => {
+                        self.log_custom_alerts(level, message)
+                    }
+                    CustomAlertEvent::Escalated { name, detail, ok } => {
+                        if ok {
+                            self.log_custom_alerts(
+                                LogLevel::Warn,
+                                format!("custom alerts: escalation for '{name}' {detail}"),
+                            );
+                        } else {
+                            // The alert is acknowledged and therefore quiet,
+                            // and nothing is going to ring: say so loudly.
+                            self.log_custom_alerts(
+                                LogLevel::Error,
+                                format!(
+                                    "custom alerts: escalation for '{name}' FAILED TO SEND - \
+                                     {detail}. The alert is acknowledged and nothing will \
+                                     ring; handle it by hand"
                                 ),
                             );
                         }
@@ -40101,11 +40182,13 @@ mod gui {
                 self.poll_ack_all_events();
                 self.poll_reaper_events();
                 self.poll_pingdom_events();
+                self.poll_custom_alerts_events();
                 self.poll_unhealthy_host_events();
                 self.poll_instance_age_events();
                 if self.pingdom.is_some()
                     || self.unhealthy_host.is_some()
                     || self.instance_age.is_some()
+                    || self.custom_alerts.is_some()
                 {
                     // The watcher runs on its own thread and does not need a
                     // frame to acknowledge, time or escalate — but its log is
@@ -42897,6 +42980,24 @@ mod gui {
         _handle: std::thread::JoinHandle<()>,
     }
 
+    /// What the custom-alerts poll thread reports back. Its own type for the
+    /// reason `PingdomEvent` is: a shared enum would be mostly variants one
+    /// producer can never emit.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum CustomAlertEvent {
+        Note { level: LogLevel, message: String },
+        /// An escalation was sent, or could not be.
+        Escalated { name: String, detail: String, ok: bool },
+    }
+
+    struct CustomAlertsRuntime {
+        rx: std::sync::mpsc::Receiver<CustomAlertEvent>,
+        /// The saved alerts. The GUI replaces the contents when the dialog
+        /// saves or deletes; the poll thread takes a snapshot every poll.
+        defs: ec2_manager::custom_alerts::SharedDefs,
+        _handle: std::thread::JoinHandle<()>,
+    }
+
     /// The entire payload of a pingdom escalation: a tier code and the
     /// alert's own timestamp, and nothing else.
     ///
@@ -43425,6 +43526,31 @@ mod gui {
         }
     }
 
+
+    /// Whether the custom-alerts watcher may act this poll. Off call, or
+    /// unable to tell, means nothing at all: no acknowledge, no timer, no
+    /// escalation. Pure, so the rule is pinned by a test.
+    fn custom_alerts_on_call_decision(
+        lookup: std::result::Result<bool, String>,
+    ) -> (bool, String) {
+        match lookup {
+            Ok(true) => (true, "custom alerts: on call - watching the feed".to_string()),
+            Ok(false) => (
+                false,
+                "custom alerts: off call - doing nothing at all: no acknowledge, no timer, \
+                 no escalation"
+                    .to_string(),
+            ),
+            Err(e) => (
+                false,
+                format!(
+                    "custom alerts: on-call lookup failed ({e}) - treating as off call, so \
+                     nothing is acknowledged and nothing escalates"
+                ),
+            ),
+        }
+    }
+
     /// The argument names `send_escalation_email` passes to
     /// `send_escalation.ps1`.
     ///
@@ -43684,6 +43810,198 @@ mod gui {
         });
 
         PingdomRuntime { rx, _handle: handle }
+    }
+
+    /// Poll the alert feed and run the user's saved alerts: acknowledge a
+    /// matching alert after its delay, and escalate if it is still open.
+    ///
+    /// **Off call it does nothing at all**, exactly as pingdom's does. The
+    /// saved alerts are read from `defs` every poll, so a save in the dialog
+    /// applies from the next poll; the timers are owned by this thread alone.
+    /// An alert any built-in watcher claims is never touched.
+    fn start_custom_alerts_poll(
+        auth: ec2_manager::alerts::AlertsAuth,
+        features: ec2_manager::features::Features,
+        initial: Vec<ec2_manager::custom_alerts::CustomAlert>,
+        mailbox: String,
+    ) -> CustomAlertsRuntime {
+        use ec2_manager::custom_alerts::{Considered, CustomAlertState, Due};
+        use ec2_manager::{alerts, oncall};
+
+        // Sized like the other watchers' defaults: a poll twice a minute over
+        // the newest alerts, against minute-granular timers.
+        const POLL: std::time::Duration = std::time::Duration::from_secs(30);
+        const FETCH: u32 = 25;
+
+        let defs: ec2_manager::custom_alerts::SharedDefs =
+            std::sync::Arc::new(std::sync::Mutex::new(initial));
+        let thread_defs = std::sync::Arc::clone(&defs);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut state = CustomAlertState::new();
+            let schedule_id = ec2_manager::jsm_auth::resolve_id(
+                ec2_manager::jsm_auth::SCHEDULE_ID_ENV,
+                ec2_manager::jsm_auth::SCHEDULE_ID_TARGET,
+                "",
+            );
+            let account_id = ec2_manager::jsm_auth::resolve_id(
+                ec2_manager::jsm_auth::ATLASSIAN_ACCOUNT_ID_ENV,
+                ec2_manager::jsm_auth::ATLASSIAN_ACCOUNT_ID_TARGET,
+                "",
+            );
+            let mut last_on_call: Option<bool> = None;
+            let note = |level: LogLevel, message: String| {
+                let _ = tx.send(CustomAlertEvent::Note { level, message });
+            };
+
+            loop {
+                let (on_call, reason) = custom_alerts_on_call_decision(
+                    oncall::is_on_call(&auth, &schedule_id, &account_id)
+                        .map_err(|e| e.to_string()),
+                );
+                if last_on_call != Some(on_call) {
+                    note(if on_call { LogLevel::Info } else { LogLevel::Warn }, reason);
+                    last_on_call = Some(on_call);
+                }
+                if !on_call {
+                    std::thread::sleep(POLL);
+                    continue;
+                }
+
+                // A snapshot, so a save in the dialog never holds the lock
+                // across an HTTP call.
+                let snapshot = thread_defs.lock().map(|g| g.clone()).unwrap_or_default();
+
+                // Deleting or renaming an alert stops its timers: a phone
+                // must not ring for something the user just removed.
+                for id in state.forget_removed(&snapshot) {
+                    note(
+                        LogLevel::Warn,
+                        format!(
+                            "custom alerts: {id} - its saved alert was deleted or renamed, \
+                             no longer timing it"
+                        ),
+                    );
+                }
+
+                match alerts::fetch_latest(&auth, FETCH) {
+                    Ok(list) => {
+                        for alert in &list {
+                            let claimed = !matches!(
+                                dry_run_route(
+                                    alert,
+                                    &features.reaper,
+                                    &features.pingdom,
+                                    &features.unhealthy_host,
+                                    &features.instance_age,
+                                ),
+                                DryRunRoute::Neither
+                            );
+                            let now_ms = monotonic_ms(started);
+                            if let Considered::Watching { name } =
+                                state.consider(alert, &snapshot, claimed, now_ms)
+                            {
+                                note(
+                                    LogLevel::Info,
+                                    format!(
+                                        "custom alerts: {} matched '{name}' - timing it",
+                                        alert.id
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => note(LogLevel::Warn, format!("custom alerts: feed read failed: {e}")),
+                }
+
+                // Has anything being timed closed? Read each by id rather
+                // than trusting the list: an alert older than FETCH has
+                // fallen off it, and absence is not evidence it closed.
+                for id in state.watched_alert_ids() {
+                    match alerts::fetch_alert(&auth, &id) {
+                        Ok(a) if ec2_manager::reaper::alert_is_closed(&a.status) => {
+                            note(
+                                LogLevel::Info,
+                                format!("custom alerts: {id} closed - nothing more to do"),
+                            );
+                            state.closed(&id);
+                        }
+                        // A person acknowledged it while it was being timed:
+                        // they have it, so it must not escalate over them.
+                        Ok(a) if a.acknowledged => {
+                            note(
+                                LogLevel::Info,
+                                format!(
+                                    "custom alerts: {id} was acknowledged by someone else - \
+                                     no longer timing it"
+                                ),
+                            );
+                            state.closed(&id);
+                        }
+                        Ok(_) => {}
+                        // Left alone: a transient failure must not cancel an
+                        // escalation.
+                        Err(e) => note(
+                            LogLevel::Warn,
+                            format!("custom alerts: could not re-read {id}, still timing it: {e}"),
+                        ),
+                    }
+                }
+
+                for due in state.due(monotonic_ms(started)) {
+                    match due {
+                        Due::Acknowledge { alert_id, name } => {
+                            match alerts::acknowledge_alert(&auth, &alert_id) {
+                                Ok(()) => note(
+                                    LogLevel::Info,
+                                    format!("custom alerts: acknowledged {alert_id} ('{name}')"),
+                                ),
+                                // Not fatal: a failed acknowledge costs a
+                                // duplicate page, dropping the watch would
+                                // cost the escalation.
+                                Err(e) => note(
+                                    LogLevel::Warn,
+                                    format!(
+                                        "custom alerts: could not acknowledge {alert_id} \
+                                         ('{name}'): {e} - still timing it"
+                                    ),
+                                ),
+                            }
+                        }
+                        Due::Escalate { alert_id, created_at, name } => {
+                            let subject = ec2_manager::reaper::escalation_subject(
+                                ec2_manager::reaper::OutcomeCode::Failure,
+                                &created_at,
+                            );
+                            note(
+                                LogLevel::Error,
+                                format!(
+                                    "custom alerts: {alert_id} ('{name}') is still open - \
+                                     escalating"
+                                ),
+                            );
+                            // Off the poll thread: this drives Outlook COM and
+                            // takes seconds, and nothing here may wait on it.
+                            let tx2 = tx.clone();
+                            let mailbox2 = mailbox.clone();
+                            std::thread::spawn(move || {
+                                let (ok, detail) = match send_escalation_email(&mailbox2, &subject)
+                                {
+                                    Ok(address) => (true, format!("sent to {address}")),
+                                    Err(reason) => (false, reason),
+                                };
+                                let _ = tx2.send(CustomAlertEvent::Escalated { name, detail, ok });
+                            });
+                        }
+                    }
+                }
+
+                std::thread::sleep(POLL);
+            }
+        });
+
+        CustomAlertsRuntime { rx, defs, _handle: handle }
     }
 
     // ---- unhealthy-host watcher -------------------------------------------
@@ -61127,6 +61445,79 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 lines.iter().all(|(_, l)| !l.contains("mailbox@example.invalid")),
                 "the address never goes in the log"
             );
+        }
+
+        #[test]
+        fn custom_alerts_do_nothing_off_call_or_when_the_lookup_fails() {
+            let (on, line) = custom_alerts_on_call_decision(Ok(true));
+            assert!(on);
+            assert!(line.starts_with("custom alerts:"));
+            let (on, line) = custom_alerts_on_call_decision(Ok(false));
+            assert!(!on);
+            assert!(line.contains("no acknowledge, no timer, no escalation"));
+            let (on, line) = custom_alerts_on_call_decision(Err("boom".to_string()));
+            assert!(!on, "a failed lookup counts as off call");
+            assert!(line.contains("boom"));
+        }
+
+        #[test]
+        fn a_custom_alerts_escalation_carries_nothing_but_a_code_and_a_time() {
+            let subject = ec2_manager::reaper::escalation_subject(
+                ec2_manager::reaper::OutcomeCode::Failure,
+                "2026-10-14T14:03:11Z",
+            );
+            assert!(subject.starts_with(ec2_manager::reaper::OutcomeCode::Failure.as_str()));
+            assert!(subject.contains("2026-10-14T14:03:11Z"));
+            // The saved alert's name and the alert id are for the local log.
+            assert!(!subject.contains("Disk"));
+        }
+
+        /// The poll must only ever start from the one gated site. A second
+        /// call site added later would arm the watcher for a user the gate
+        /// refused, with no compile error and nothing else to notice.
+        #[test]
+        fn the_custom_alerts_poll_starts_only_behind_the_gate() {
+            let src = include_str!("ec2_manager_gui.rs");
+            // Assembled, or this scan matches its own source.
+            let needle = format!("start_custom_alerts_{}(", "poll");
+            let sites: Vec<(usize, &str)> = src
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| !l.trim_start().starts_with("//") && l.contains(&needle))
+                .collect();
+            assert_eq!(
+                sites.len(),
+                2,
+                "expected the definition and one gated call, found {sites:?}"
+            );
+            let call_at = src.find(&format!("Some({needle}")).expect("the call");
+            let before = &src[call_at.saturating_sub(200)..call_at];
+            assert!(
+                before.contains("if armed"),
+                "the call must sit directly behind `if armed`: {before}"
+            );
+            // `App::new` binds the gate's answer on one line; the tests call it
+            // across two, so this finds the production use only.
+            let gate = format!("let (armed, lines) = custom_alerts_{}(", "gate_report");
+            let gate_at = src.find(&gate).expect("the gate");
+            assert!(gate_at < call_at, "the gate decides before the poll starts");
+        }
+
+        /// The poll re-checks the on-call answer before it reads the feed and
+        /// again never acts on an alert a built-in watcher claims.
+        #[test]
+        fn the_custom_alerts_poll_checks_on_call_and_the_built_ins() {
+            let src = include_str!("ec2_manager_gui.rs");
+            // Assembled, so this test's own text is not the first match.
+            let def = format!("fn start_custom_alerts_{}(", "poll");
+            let start = src.find(&def).expect("the poll");
+            let end = src[start..].find("\n    }\n").map(|i| start + i).expect("its end");
+            let body = &src[start..end];
+            let on_call = body.find("custom_alerts_on_call_decision(").expect("on-call gate");
+            let fetch = body.find("alerts::fetch_latest(").expect("the feed read");
+            assert!(on_call < fetch, "on call is decided before the feed is read");
+            assert!(body.contains("dry_run_route("), "built-in watchers are consulted");
+            assert!(body.contains("forget_removed("), "removed alerts drop their watches");
         }
 
         #[test]
