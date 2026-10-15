@@ -31577,6 +31577,7 @@ mod gui {
                         }
                         if undo.is_none() {
                             self.log_cassandra(LogLevel::Info, "cassandra: scheduled restart cancelled");
+                            self.message = format!("{}: scheduled Cassandra restart cancelled", owner.env.to_uppercase());
                         } else {
                             self.log_cassandra(LogLevel::Info, "cassandra: the failed schedule was undone");
                         }
@@ -31585,6 +31586,11 @@ mod gui {
                         self.log_cassandra(
                             LogLevel::Warn,
                             format!("cassandra: could not cancel on: {}", failed.join("; ")),
+                        );
+                        self.message = format!(
+                            "{}: could not cancel the Cassandra restart on: {}. The schedule is kept; press Cancel to retry.",
+                            owner.env.to_uppercase(),
+                            failed.join("; ")
                         );
                     }
                     let not_cancelled = failed.join("; ");
@@ -40657,6 +40663,14 @@ mod gui {
                         })
                         .collect()
                 };
+                // A Cancel (or the undo of a failed Schedule) in flight: the
+                // chip is clicked with the dialog usually closed, so without
+                // this line nothing on screen says it was heard.
+                let cassandra_cancelling: Option<String> = self
+                    .cassandra_inflight
+                    .as_ref()
+                    .filter(|j| j.kind == CassandraJobKind::CancelSchedule)
+                    .map(|j| cassandra_progress_text(j.kind, &j.env.to_uppercase(), &j.nodes));
                 egui::TopBottomPanel::top("top").show(ctx, |ui| {
                     egui::MenuBar::new().ui(ui, |ui| {
                         let edit_menu_resp = ui.menu_button("Edit", |ui| {
@@ -41440,6 +41454,8 @@ mod gui {
                             } else {
                                 CASSANDRA_CHIP_LOCKED
                             };
+                            // A cancel in flight: a second click can only be refused.
+                            let can_change = can_change && cassandra_cancelling.is_none();
                             let can_reschedule = can_change && self.cassandra_cert_enabled;
                             let reschedule_hover = if can_change && !self.cassandra_cert_enabled {
                                 "Rescheduling needs Cassandra Cert access; Cancel still works"
@@ -41537,6 +41553,14 @@ mod gui {
                             for notice in &cassandra_notices {
                                 let colour = flashing_yellow(ui);
                                 note_label(ui, colour, notice.as_str());
+                            }
+                            if let Some(text) = &cassandra_cancelling {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    let colour = flashing_yellow(ui);
+                                    note_label(ui, colour, text.as_str());
+                                });
+                                ctx.request_repaint_after(std::time::Duration::from_millis(500));
                             }
                             if !cassandra_rows.is_empty() {
                                 // Keep the flash animating while any schedule exists.
@@ -63253,6 +63277,25 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             }
             let many: Vec<String> = (1..=9).map(|i| format!("n{i}")).collect();
             assert_eq!(cassandra_node_list(&many), "n1, n2, n3, n4, n5, n6 +3 more");
+        }
+
+        /// Clicking Cancel on the toolbar chip (dialog closed) used to show
+        /// nothing until the job ended, and a second click was refused.
+        #[test]
+        fn a_cancel_in_flight_says_so_on_the_toolbar_and_locks_the_chip() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let at = src.find("let cassandra_cancelling").expect("the cancelling line");
+            let rest = &src[at..];
+            assert!(rest.contains("CassandraJobKind::CancelSchedule"));
+            assert!(rest.contains("note_label(ui, colour, text.as_str())"), "flashing line");
+            assert!(rest.contains("let can_change = can_change && cassandra_cancelling.is_none();"));
+            // ...and the finished cancel is announced on the status line too.
+            assert!(src.contains("scheduled Cassandra restart cancelled"));
+            assert_eq!(
+                cassandra_progress_text(CassandraJobKind::CancelSchedule, "DEV1", &["cassandra-001".into()]),
+                "Cancelling DEV1 - cassandra-001"
+            );
         }
 
         #[test]
