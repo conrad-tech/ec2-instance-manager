@@ -62089,7 +62089,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     (
                         targets[2].clone(),
                         cassandra_flow::NodeStatus::Up {
-                            change: Some(cassandra_cert::CertChange::NotRenewed),
+                            change: Some(cassandra_cert::CertChange::NotRenewed(1000)),
                         },
                     ),
                 ],
@@ -63127,7 +63127,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             for bad in [
                 NodeStatus::RestartFailed("boom".into()),
                 NodeStatus::DidNotStabilise,
-                NodeStatus::Up { change: Some(CertChange::NotRenewed) },
+                NodeStatus::Up { change: Some(CertChange::NotRenewed(1000)) },
                 NodeStatus::Up { change: Some(CertChange::Flagged(vec!["issuer".into()])) },
                 NodeStatus::Unverified("no port".into()),
             ] {

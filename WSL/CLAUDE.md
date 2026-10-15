@@ -4244,7 +4244,7 @@ UNGATED on purpose: a live cron restart must stay visible and cancellable even
 if the user relaunched without Cassandra Cert access; only Reschedule is gated.
 The monitor, checks and confirm window are gate-independent.
 `poll_cassandra_schedules` starts watch-only checks (`CassandraJob::WatchScheduled`)
-at `when + CHECK_GRACE_SECS` (90 s, cron fires on the minute and Cassandra
+at `when + CHECK_GRACE_SECS` (60 s, cron fires on the minute and Cassandra
 takes a moment to go down) once `schedule_phase` says StartChecks. It waits for
 auth (logged once per change) and never fails for it. A failed check returns
 the record to Scheduled with a 60 s backoff (`CASSANDRA_WATCH_RETRY`); records

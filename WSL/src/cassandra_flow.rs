@@ -3,6 +3,7 @@
 //! tested with a fake instead of AWS. The decisions live in `cassandra_cert`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::Engine;
@@ -424,6 +425,20 @@ pub fn read_cert_retrying(
     pacer: &Pacer,
     deadline_secs: u64,
 ) -> Result<Option<CertInfo>, String> {
+    read_cert_retrying_until(exec, t, pacer, deadline_secs, &AtomicBool::new(false))
+}
+
+/// `read_cert_retrying`, abandoned (with whatever it last saw) as soon as
+/// `cancel` is set. The early read during the stability watch needs it: a node
+/// that then fails its watch must not hold the run open for the read's
+/// whole deadline.
+fn read_cert_retrying_until(
+    exec: ExecFn,
+    t: &Target,
+    pacer: &Pacer,
+    deadline_secs: u64,
+    cancel: &AtomicBool,
+) -> Result<Option<CertInfo>, String> {
     let start = (pacer.now)();
     // A hard bound on attempts as well, so a clock that never moves cannot
     // keep this loop alive.
@@ -442,7 +457,7 @@ pub fn read_cert_retrying(
                 cert_from_check(&out).map(|(c, _, _)| c)
             }
         };
-        if matches!(last, Ok(Some(_))) || exec_errors >= 2 {
+        if matches!(last, Ok(Some(_))) || exec_errors >= 2 || cancel.load(Ordering::SeqCst) {
             break;
         }
         if (pacer.now)().saturating_sub(start) >= deadline_secs {
@@ -451,25 +466,6 @@ pub fn read_cert_retrying(
         (pacer.sleep)(POLL);
     }
     last
-}
-
-/// Post-restart verification: the served cert of every node that reached
-/// Stable, retried until readable; `None` for the others, which are judged
-/// by their watch alone.
-fn verify_stable(
-    exec: ExecFn,
-    targets: &[Target],
-    watched: &[Result<WatchState, String>],
-    pacer: &Pacer,
-) -> Vec<Option<Result<Option<CertInfo>, String>>> {
-    let stable: Vec<usize> = (0..targets.len())
-        .filter(|&i| matches!(watched[i], Ok(WatchState::Stable)))
-        .collect();
-    let subset: Vec<Target> = stable.iter().map(|&i| targets[i].clone()).collect();
-    let mut read = per_node(&subset, &|t| read_cert_retrying(exec, t, pacer, VERIFY_DEADLINE_SECS)).into_iter();
-    (0..targets.len())
-        .map(|i| if stable.contains(&i) { read.next() } else { None })
-        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -523,9 +519,24 @@ pub struct ApplyReport {
 const RESTART_CMD: &str = "systemctl restart --no-block cassandra; echo \"__CC_RC__$?\"";
 const ACTIVE_CMD: &str = "systemctl is-active cassandra";
 
+/// What the watch hands back: each node's verdict, and for every node that
+/// reached Stable the cert it serves (`None` for the others, which are judged
+/// by their watch alone).
+type Watched = (
+    Vec<Result<WatchState, String>>,
+    Vec<Option<Result<Option<CertInfo>, String>>>,
+);
+
 /// Restart every target at the same moment, then poll until each is judged.
 /// The first observation of every node happens right after the restarts are
 /// issued, so the ceiling is measured from the restart.
+///
+/// Each node's served cert is read **while its stability window is still
+/// running**, from the moment it has been continuously active for half of
+/// `required` (`required / 2`). `active` arrives well before the native port
+/// listens, so reading only after the window ends added the whole port wait on
+/// top of it; started at half-way the two overlap. The read is only kept for a
+/// node that then reaches Stable, and is cancelled for any other.
 fn restart_and_watch(
     exec: ExecFn,
     targets: &[Target],
@@ -534,7 +545,7 @@ fn restart_and_watch(
     ceiling: u64,
     pacer: &Pacer,
     emit: &(dyn Fn(String) + Sync),
-) -> Vec<Result<WatchState, String>> {
+) -> Watched {
     // One thread per node, released together so the restarts are issued in
     // the same instant rather than one after another.
     let barrier = std::sync::Barrier::new(targets.len().max(1));
@@ -558,35 +569,67 @@ fn restart_and_watch(
         emit(format!("watching {} node(s) (restart was issued by the schedule)", targets.len()));
     }
 
+    let early = required / 2;
     let mut watches: Vec<StabilityWatch> =
         targets.iter().map(|_| StabilityWatch::new(required, ceiling)).collect();
     let mut states: Vec<WatchState> = vec![WatchState::Pending; targets.len()];
-    loop {
-        let now = (pacer.now)();
-        let live: Vec<usize> = (0..targets.len())
-            .filter(|&i| sent[i].is_ok() && states[i] == WatchState::Pending)
-            .collect();
-        if live.is_empty() {
-            break;
+    let cancels: Vec<AtomicBool> = targets.iter().map(|_| AtomicBool::new(false)).collect();
+    let certs = std::thread::scope(|scope| {
+        let mut readers: Vec<Option<std::thread::ScopedJoinHandle<'_, Result<Option<CertInfo>, String>>>> =
+            targets.iter().map(|_| None).collect();
+        loop {
+            let now = (pacer.now)();
+            let live: Vec<usize> = (0..targets.len())
+                .filter(|&i| sent[i].is_ok() && states[i] == WatchState::Pending)
+                .collect();
+            if live.is_empty() {
+                break;
+            }
+            let subset: Vec<Target> = live.iter().map(|&i| targets[i].clone()).collect();
+            let actives: Vec<bool> = per_node(&subset, &|t| {
+                exec(&t.instance_id, ACTIVE_CMD, QUICK_TIMEOUT)
+                    .map(|o| o.trim() == "active")
+                    .unwrap_or(false)
+            });
+            for (k, &i) in live.iter().enumerate() {
+                states[i] = watches[i].observe(now, actives[k]);
+                if states[i] != WatchState::Pending {
+                    emit(format!("{}: {:?}", targets[i].name, states[i]));
+                }
+                let ready = states[i] == WatchState::Stable
+                    || (states[i] == WatchState::Pending
+                        && watches[i].active_for(now).is_some_and(|a| a >= early));
+                if ready && readers[i].is_none() {
+                    emit(format!("{}: active, reading the cert it serves", targets[i].name));
+                    let t = &targets[i];
+                    let cancel = &cancels[i];
+                    readers[i] = Some(scope.spawn(move || {
+                        read_cert_retrying_until(exec, t, pacer, VERIFY_DEADLINE_SECS, cancel)
+                    }));
+                }
+            }
+            if live.iter().all(|&i| states[i] != WatchState::Pending) {
+                break;
+            }
+            (pacer.sleep)(POLL);
         }
-        let subset: Vec<Target> = live.iter().map(|&i| targets[i].clone()).collect();
-        let actives: Vec<bool> = per_node(&subset, &|t| {
-            exec(&t.instance_id, ACTIVE_CMD, QUICK_TIMEOUT)
-                .map(|o| o.trim() == "active")
-                .unwrap_or(false)
-        });
-        for (k, &i) in live.iter().enumerate() {
-            states[i] = watches[i].observe(now, actives[k]);
-            if states[i] != WatchState::Pending {
-                emit(format!("{}: {:?}", targets[i].name, states[i]));
+        // A read for a node that did not make it is of no use: stop it.
+        for (i, c) in cancels.iter().enumerate() {
+            if states[i] != WatchState::Stable {
+                c.store(true, Ordering::SeqCst);
             }
         }
-        if live.iter().all(|&i| states[i] != WatchState::Pending) {
-            break;
-        }
-        (pacer.sleep)(POLL);
-    }
-    sent.into_iter().zip(states).map(|(r, s)| r.map(|_| s)).collect()
+        readers
+            .into_iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let read = h.map(|h| h.join().expect("cert reader panicked"));
+                if states[i] == WatchState::Stable { read } else { None }
+            })
+            .collect::<Vec<_>>()
+    });
+    let watched = sent.into_iter().zip(states).map(|(r, s)| r.map(|_| s)).collect();
+    (watched, certs)
 }
 
 pub struct RestartInput<'a> {
@@ -608,7 +651,8 @@ pub fn restart_nodes(
     pacer: &Pacer,
     emit: &(dyn Fn(String) + Sync),
 ) -> ApplyReport {
-    let watched = restart_and_watch(
+    // The watch also read what each Stable node serves, waiting for its port.
+    let (watched, certs) = restart_and_watch(
         exec,
         input.targets,
         input.issue_restart,
@@ -618,9 +662,6 @@ pub fn restart_nodes(
         emit,
     );
     let restarted = watched.iter().any(|w| w.is_ok());
-
-    // Verify what each Stable node serves now, waiting for its port.
-    let certs = verify_stable(exec, input.targets, &watched, pacer);
     let mut reference: Option<CertInfo> = None;
     let nodes: Vec<(Target, NodeStatus)> = input
         .targets
@@ -832,9 +873,9 @@ pub fn rollback(
     }
 
     // 2. Restart together, watch, verify against the cert rolled back to.
-    let watched = restart_and_watch(exec, &restore_targets, true, input.required_secs, input.ceiling_secs, pacer, emit);
+    let (watched, certs) =
+        restart_and_watch(exec, &restore_targets, true, input.required_secs, input.ceiling_secs, pacer, emit);
     let restarted = watched.iter().any(|w| w.is_ok());
-    let certs = verify_stable(exec, &restore_targets, &watched, pacer);
     let mut nodes: Vec<(Target, RollbackStatus)> = restore_targets
         .iter()
         .cloned()
@@ -877,7 +918,7 @@ pub fn apply_failed_nodes(report: &ApplyReport) -> Vec<Target> {
             | NodeStatus::DidNotStabilise
             | NodeStatus::Unverified(_) => true,
             NodeStatus::Up { change } => {
-                matches!(change, Some(CertChange::NotRenewed) | Some(CertChange::Flagged(_)))
+                matches!(change, Some(CertChange::NotRenewed(_)) | Some(CertChange::Flagged(_)))
             }
             NodeStatus::NotRestarted | NodeStatus::Staged => false,
         })
@@ -936,6 +977,16 @@ impl Severity {
     }
 }
 
+/// An expiry as the date openssl reported it, `YYYY-MM-DD UTC` (`@<epoch>`
+/// if out of range). UTC because the cert states its expiry in GMT; the local
+/// date could differ by a day. ASCII only.
+fn expiry_date_utc(epoch: i64) -> String {
+    match chrono::DateTime::from_timestamp(epoch, 0) {
+        Some(t) => format!("{} UTC", t.format("%Y-%m-%d")),
+        None => format!("@{epoch}"),
+    }
+}
+
 /// One node's apply outcome in words, for the result panel and the log.
 /// ASCII only.
 pub fn describe_apply_status(status: &NodeStatus) -> (Severity, String) {
@@ -959,9 +1010,12 @@ pub fn describe_apply_status(status: &NodeStatus) -> (Severity, String) {
         NodeStatus::Up { change: Some(CertChange::Renewed) } => {
             (Severity::Good, "Renewed: up, serving the new cert".to_string())
         }
-        NodeStatus::Up { change: Some(CertChange::NotRenewed) } => (
+        NodeStatus::Up { change: Some(CertChange::NotRenewed(not_after)) } => (
             Severity::Bad,
-            "Not renewed: up, but the expiry date did not move".to_string(),
+            format!(
+                "Not renewed: up, but the expiry date did not move: still {}",
+                expiry_date_utc(*not_after)
+            ),
         ),
         NodeStatus::Up { change: Some(CertChange::Flagged(diffs)) } => (
             Severity::Bad,
@@ -2419,6 +2473,74 @@ mod flow_tests {
     }
 
     #[test]
+    fn the_cert_is_read_from_half_way_through_the_stability_window() {
+        let (fake, reads) = slow_port_box(0, NEW_AFTER, "02");
+        let clock = Clock::new();
+        let now = || clock.0.load(Ordering::SeqCst);
+        let sleep = |d: Duration| { clock.0.fetch_add(d.as_secs(), Ordering::SeqCst); };
+        let pacer = Pacer { now: &now, sleep: &sleep };
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let started = std::sync::Mutex::new(None);
+        let emit = |line: String| {
+            if line.contains("reading the cert") {
+                *started.lock().unwrap() = Some((clock.0.load(Ordering::SeqCst), reads.load(Ordering::SeqCst)));
+            }
+        };
+        let before = before_map(&["i-1"]);
+        let input = RestartInput {
+            targets: &[t("i-1", "a")],
+            unselected: &[],
+            before: &before,
+            required_secs: 60,
+            ceiling_secs: 300,
+            issue_restart: true,
+        };
+        let rep = restart_nodes(&exec, &input, &pacer, &emit);
+        assert!(matches!(rep.nodes[0].1, NodeStatus::Up { .. }), "{:?}", rep.nodes[0].1);
+        let (at, reads_then) = started.lock().unwrap().expect("the early read was announced");
+        assert_eq!(at, 30, "half of the 60s window");
+        assert_eq!(reads_then, 0, "no cert read before that point");
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "one read answered, so no second after the window");
+    }
+
+    #[test]
+    fn a_node_that_fails_its_watch_after_its_early_read_started_is_still_judged_by_the_watch() {
+        // Active until the clock reads 35s (so the early read starts at 30s),
+        // then down for good. The state follows the clock rather than a poll
+        // count: the early read's own sleeps move the shared fake clock too.
+        let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let c = clock.clone();
+        let fake = Fake::new(move |_id, cmd| {
+            if cmd.contains("is-active") {
+                Ok(if c.load(Ordering::SeqCst) < 35 { "active\n" } else { "failed\n" }.into())
+            } else if cmd.contains("systemctl restart") {
+                Ok("__CC_RC__0\n".into())
+            } else {
+                Ok(NO_CERT_YET.into())
+            }
+        });
+        let now = || clock.load(Ordering::SeqCst);
+        let sleep = |d: Duration| { clock.fetch_add(d.as_secs(), Ordering::SeqCst); };
+        let pacer = Pacer { now: &now, sleep: &sleep };
+        let exec = |i: &str, c: &str, t: Duration| fake.exec(i, c, t);
+        let before = before_map(&["i-1"]);
+        let input = RestartInput {
+            targets: &[t("i-1", "a")],
+            unselected: &[],
+            before: &before,
+            required_secs: 60,
+            ceiling_secs: 100,
+            issue_restart: true,
+        };
+        let rep = restart_nodes(&exec, &input, &pacer, &|_| {});
+        assert_eq!(rep.nodes[0].1, NodeStatus::DidNotStabilise);
+        // No cert is kept for it, whatever its early read found. (Whether the
+        // read was cut short is not asserted: the fake clock lets it finish
+        // instantly, so the cancel can never be seen to win a race.)
+        assert!(!matches!(rep.nodes[0].1, NodeStatus::Up { .. } | NodeStatus::Unverified(_)));
+    }
+
+    #[test]
     fn a_rollback_whose_port_never_answers_is_unverified_not_wrong() {
         let (fake, _) = slow_port_box(usize::MAX, OLD_AFTER, "01");
         let clock = Clock::new();
@@ -2435,7 +2557,9 @@ mod flow_tests {
             "{:?}",
             rep.nodes[0].1
         );
-        assert!(clock.0.load(Ordering::SeqCst) >= 60 + VERIFY_DEADLINE_SECS, "gave up only after the deadline");
+        // The read starts half-way through the 60s window (30s), so its
+        // deadline runs from there, not from the end of the window.
+        assert!(clock.0.load(Ordering::SeqCst) >= 60 / 2 + VERIFY_DEADLINE_SECS, "gave up only after the deadline");
         assert_eq!(rollback_failed_nodes(&rep).len(), 1, "unverified counts as failing");
         let (sev, text) = describe_rollback_status(&rep.nodes[0].1);
         assert!(sev.is_problem() && text.starts_with("unverified"), "{text}");
@@ -2482,7 +2606,7 @@ mod flow_tests {
                 (t("i-4", "d"), NodeStatus::DidNotStabilise),
                 (t("i-5", "e"), NodeStatus::Up { change: None }),
                 (t("i-6", "f"), NodeStatus::Up { change: Some(CertChange::Renewed) }),
-                (t("i-7", "g"), NodeStatus::Up { change: Some(CertChange::NotRenewed) }),
+                (t("i-7", "g"), NodeStatus::Up { change: Some(CertChange::NotRenewed(1000)) }),
                 (t("i-8", "h"), NodeStatus::Up { change: Some(CertChange::Flagged(vec!["s".into()])) }),
                 (t("i-9", "i"), NodeStatus::Unverified("x".into())),
             ],
@@ -2577,9 +2701,10 @@ mod describe_tests {
         assert_eq!(sev, Severity::Good);
         assert!(text.contains("Renewed"), "{text}");
 
-        let (sev, text) = apply(NodeStatus::Up { change: Some(CertChange::NotRenewed) });
+        let (sev, text) = apply(NodeStatus::Up { change: Some(CertChange::NotRenewed(1_798_848_000)) });
         assert_eq!(sev, Severity::Bad);
         assert!(text.contains("the expiry date did not move"), "{text}");
+        assert!(text.contains("2027-01-02"), "the date it is still on: {text}");
 
         let (sev, text) = apply(NodeStatus::Up {
             change: Some(CertChange::Flagged(vec!["subject changed: a -> b".into()])),
@@ -2648,7 +2773,7 @@ mod describe_tests {
             apply(NodeStatus::DidNotStabilise),
             apply(NodeStatus::Up { change: None }),
             apply(NodeStatus::Up { change: Some(CertChange::Renewed) }),
-            apply(NodeStatus::Up { change: Some(CertChange::NotRenewed) }),
+            apply(NodeStatus::Up { change: Some(CertChange::NotRenewed(1000)) }),
             apply(NodeStatus::Unverified("e".into())),
             rollback(RollbackStatus::RestoreFailed("e".into())),
             rollback(RollbackStatus::NotRestarted),

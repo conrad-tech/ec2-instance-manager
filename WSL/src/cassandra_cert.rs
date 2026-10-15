@@ -204,15 +204,17 @@ pub fn is_expired(cert: &CertInfo, now: i64) -> bool {
 pub enum CertChange {
     /// A later expiry, same subject and issuer.
     Renewed,
-    /// The expiry did not move forward.
-    NotRenewed,
+    /// The expiry did not move forward. Carries the expiry the node serves
+    /// (epoch seconds, as openssl reports it in GMT), so the message can say
+    /// which date it is still on.
+    NotRenewed(i64),
     /// The expiry moved but the cert does not look like the one it replaced.
     Flagged(Vec<String>),
 }
 
 pub fn compare_certs(before: &CertInfo, after: &CertInfo) -> CertChange {
     if after.not_after <= before.not_after {
-        return CertChange::NotRenewed;
+        return CertChange::NotRenewed(after.not_after);
     }
     let mut diffs = Vec::new();
     if squash(&before.subject) != squash(&after.subject) {
@@ -851,6 +853,12 @@ impl StabilityWatch {
         }
     }
 
+    /// How long the node has been continuously active as of `now`, `None`
+    /// while it is not.
+    pub fn active_for(&self, now: u64) -> Option<u64> {
+        self.stable_since.map(|since| now.saturating_sub(since))
+    }
+
     pub fn observe(&mut self, now: u64, active: bool) -> WatchState {
         if let Some(done) = self.done {
             return done;
@@ -924,7 +932,7 @@ pub const MIN_LEAD_SECS: i64 = 120;
 pub const MAX_LEAD_SECS: i64 = 60 * 24 * 3600;
 /// cron fires on the minute and Cassandra takes a moment to go down: the
 /// checks start this long after the scheduled time.
-pub const CHECK_GRACE_SECS: i64 = 90;
+pub const CHECK_GRACE_SECS: i64 = 60;
 
 pub fn validate_schedule_time(when: i64, now: i64) -> Result<(), String> {
     if when <= now {
@@ -1292,8 +1300,8 @@ mod tests {
     fn a_renewal_needs_a_later_expiry_and_the_same_shape() {
         let before = cert("/CN=*.a", "/CN=ca", 1000, "01");
         assert_eq!(compare_certs(&before, &cert("/CN=*.a", "/CN=ca", 2000, "02")), CertChange::Renewed);
-        assert_eq!(compare_certs(&before, &cert("/CN=*.a", "/CN=ca", 1000, "01")), CertChange::NotRenewed);
-        assert_eq!(compare_certs(&before, &cert("/CN=*.a", "/CN=ca", 500, "00")), CertChange::NotRenewed);
+        assert_eq!(compare_certs(&before, &cert("/CN=*.a", "/CN=ca", 1000, "01")), CertChange::NotRenewed(1000));
+        assert_eq!(compare_certs(&before, &cert("/CN=*.a", "/CN=ca", 500, "00")), CertChange::NotRenewed(500));
     }
 
     #[test]
