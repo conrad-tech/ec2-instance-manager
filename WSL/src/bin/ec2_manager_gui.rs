@@ -38843,7 +38843,7 @@ mod gui {
 
             // Keyboard shortcuts: Ctrl+F toggles the find bar, Esc closes it,
             // F3 / Shift+F3 cycle matches, Ctrl+/ toggles line comments.
-            let (ctrl_f, esc_pressed, mut do_next, mut do_prev, mut toggle_comment) = ui.input(|i| {
+            let (ctrl_f, esc_pressed, mut do_next, mut do_prev, toggle_comment) = ui.input(|i| {
                 let mut cf = false;
                 let mut esc = false;
                 let mut nx = false;
@@ -47651,6 +47651,82 @@ mod gui {
         egui::Color32::from_rgb(230, 230, 230)
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ServiceHealth {
+        Good,
+        Transitional,
+        Bad,
+    }
+
+    impl ServiceHealth {
+        fn color(self) -> egui::Color32 {
+            match self {
+                ServiceHealth::Good => egui::Color32::from_rgb(80, 220, 100),
+                ServiceHealth::Transitional => egui::Color32::from_rgb(240, 190, 60),
+                ServiceHealth::Bad => egui::Color32::from_rgb(255, 85, 85),
+            }
+        }
+    }
+
+    /// Recognise a `systemctl status` "Active:" line and return the column
+    /// range (start inclusive, end exclusive) of the state, e.g.
+    /// `inactive (dead)` or `active (running)`, with its health. The
+    /// trailing `since ...; 11h ago` is left in the normal colour.
+    /// `row` holds one char per terminal column.
+    ///
+    /// `inactive` must be tested as a whole word, not as a prefix match on
+    /// "active" -- the two share a suffix and the wrong order paints a dead
+    /// service green. Anything that is not clearly working is red.
+    fn service_status_span(row: &[char]) -> Option<(usize, usize, ServiceHealth)> {
+        let mut i = 0;
+        while i < row.len() && row[i] == ' ' {
+            i += 1;
+        }
+        let label: Vec<char> = "Active:".chars().collect();
+        if row.len() < i + label.len() || row[i..i + label.len()] != label[..] {
+            return None;
+        }
+        i += label.len();
+        while i < row.len() && row[i] == ' ' {
+            i += 1;
+        }
+        let start = i;
+        while i < row.len() && !row[i].is_whitespace() {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        let word: String = row[start..i].iter().collect();
+        let mut end = i;
+        let mut detail = String::new();
+        let mut j = i;
+        while j < row.len() && row[j] == ' ' {
+            j += 1;
+        }
+        if j < row.len() && row[j] == '(' {
+            if let Some(close) = row[j..].iter().position(|&c| c == ')') {
+                end = j + close + 1;
+                detail = row[j + 1..j + close].iter().collect();
+            }
+        }
+        let health = match word.as_str() {
+            "active" => match detail.as_str() {
+                "running" | "exited" | "waiting" | "listening" | "mounted" | "plugged" => {
+                    ServiceHealth::Good
+                }
+                "" => ServiceHealth::Good,
+                _ => ServiceHealth::Bad,
+            },
+            "activating" | "reloading" | "deactivating" | "refreshing" => {
+                ServiceHealth::Transitional
+            }
+            "inactive" | "failed" | "dead" | "maintenance" => ServiceHealth::Bad,
+            _ => return None,
+        };
+        Some((start, end, health))
+    }
+
     /// Build a LayoutJob for terminal content.  When `selection` is provided
     /// (start, end, scroll_offset), selected cells get a highlight background
     /// baked directly into the galley so it is pixel-perfect on every display.
@@ -47683,6 +47759,15 @@ mod gui {
         let mut current_text = String::new();
 
         for row in 0..rows {
+            let row_chars: Vec<char> = (0..cols)
+                .map(|c| {
+                    screen
+                        .cell(row, c)
+                        .and_then(|cell| cell.contents().chars().next())
+                        .unwrap_or(' ')
+                })
+                .collect();
+            let status_span = service_status_span(&row_chars);
             for col in 0..cols {
                 let cursor_cell = cursor == Some((row, col));
                 let (cell_text, mut format) = if let Some(cell) = screen.cell(row, col) {
@@ -47713,6 +47798,17 @@ mod gui {
                     };
                     (" ", format)
                 };
+
+                // systemctl state colouring (skipped on the cursor cell so
+                // inverse video keeps working there).
+                if let Some((s, e, health)) = status_span {
+                    if col >= s as u16 && col < e as u16 && !cursor_cell {
+                        format.color = health.color();
+                        if format.underline != egui::Stroke::NONE {
+                            format.underline = egui::Stroke::new(1.0, format.color);
+                        }
+                    }
+                }
 
                 // Apply selection highlight as cell background
                 if let Some((ref start, ref end, scroll_off)) = selection {
@@ -53286,7 +53382,7 @@ mod gui {
             let top = |st: &Vec<String>| {
                 st.last().cloned().unwrap_or_else(|| "<ssm login>".to_string())
             };
-            let mut run = |st: &mut Vec<String>, line: &str| {
+            let run = |st: &mut Vec<String>, line: &str| {
                 apply_submitted_line_to_user_stack(st, line);
             };
 
@@ -59468,6 +59564,64 @@ mod gui {
                 }
             }
             assert!(found_red, "expected red cell to be present");
+        }
+
+        fn status_row(s: &str) -> Vec<char> {
+            s.chars().collect()
+        }
+
+        #[test]
+        fn service_status_span_classifies_systemctl_states() {
+            let cases = [
+                ("     Active: inactive (dead)", "inactive (dead)", ServiceHealth::Bad),
+                ("     Active: failed (Result: exit-code) since Thu", "failed (Result: exit-code)", ServiceHealth::Bad),
+                (
+                    "     Active: active (running) since Thu 2026-10-15 08:00:58 UTC; 11h ago",
+                    "active (running)",
+                    ServiceHealth::Good,
+                ),
+                ("     Active: active (exited) since Thu", "active (exited)", ServiceHealth::Good),
+                ("     Active: activating (start) since Thu", "activating (start)", ServiceHealth::Transitional),
+            ];
+            for (line, expect, health) in cases {
+                let row = status_row(line);
+                let (s, e, h) = service_status_span(&row).expect(line);
+                assert_eq!(row[s..e].iter().collect::<String>(), expect);
+                assert_eq!(h, health, "{line}");
+            }
+        }
+
+        #[test]
+        fn service_status_span_ignores_other_lines() {
+            for line in [
+                "     Loaded: loaded (/etc/systemd/system/x.service; static)",
+                "# systemctl status reaper-cert-renew",
+                "     Active the thing",
+                "Active:",
+            ] {
+                assert!(service_status_span(&status_row(line)).is_none(), "{line}");
+            }
+        }
+
+        #[test]
+        fn terminal_layout_job_colours_the_active_state() {
+            let mut parser = vt100::Parser::new(1, 40, 10);
+            parser.process(b"Active: inactive (dead)");
+            let job = terminal_layout_job(
+                parser.screen(),
+                false,
+                egui::FontId::monospace(12.0),
+                None,
+                None,
+            );
+            let red = ServiceHealth::Bad.color();
+            let coloured: String = job
+                .sections
+                .iter()
+                .filter(|s| s.format.color == red)
+                .map(|s| &job.text[s.byte_range.clone()])
+                .collect();
+            assert_eq!(coloured, "inactive (dead)");
         }
 
         #[test]
