@@ -77,10 +77,17 @@ impl ConnectionTabs {
 
     pub fn close(&mut self, id: u64) -> bool {
         let before = self.tabs.len();
+        let idx = self.tabs.iter().position(|t| t.id == id);
         self.tabs.retain(|t| t.id != id);
 
+        // Like Chrome: closing the selected tab selects the one that slid
+        // into its place (the right-hand neighbour), or the new last tab
+        // when the closed one was last. Closing another tab leaves the
+        // selection alone.
         if self.selected == Some(id) {
-            self.selected = self.tabs.last().map(|t| t.id);
+            self.selected = idx
+                .and_then(|i| self.tabs.get(i).or_else(|| self.tabs.last()))
+                .map(|t| t.id);
         }
 
         before != self.tabs.len()
@@ -175,6 +182,47 @@ mod tests {
         assert!(tabs.close(a));
         assert_eq!(tabs.tabs().len(), 1);
         assert_eq!(tabs.selected(), Some(b));
+    }
+
+    #[test]
+    fn closing_the_selected_tab_selects_its_right_neighbour() {
+        let mk = || {
+            let mut t = ConnectionTabs::new();
+            let ids: Vec<u64> = (0..5)
+                .map(|i| t.open(format!("t{i}"), format!("i-{i}"), "dev".to_string()))
+                .collect();
+            (t, ids)
+        };
+
+        // far left closed -> tab 2 selected, not the far right
+        let (mut t, ids) = mk();
+        t.select(ids[0]);
+        t.close(ids[0]);
+        assert_eq!(t.selected(), Some(ids[1]));
+
+        // middle closed -> the tab that was to its right
+        let (mut t, ids) = mk();
+        t.select(ids[1]);
+        t.close(ids[1]);
+        assert_eq!(t.selected(), Some(ids[2]));
+
+        // last closed -> the new last tab
+        let (mut t, ids) = mk();
+        t.select(ids[4]);
+        t.close(ids[4]);
+        assert_eq!(t.selected(), Some(ids[3]));
+
+        // closing an unselected tab leaves the selection alone
+        let (mut t, ids) = mk();
+        t.select(ids[3]);
+        t.close(ids[0]);
+        assert_eq!(t.selected(), Some(ids[3]));
+
+        // closing the only tab leaves nothing selected
+        let mut t = ConnectionTabs::new();
+        let only = t.open("x".into(), "i-x".into(), "dev".into());
+        t.close(only);
+        assert_eq!(t.selected(), None);
     }
 
     #[test]

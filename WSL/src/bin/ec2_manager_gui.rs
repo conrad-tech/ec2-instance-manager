@@ -47668,6 +47668,164 @@ mod gui {
         }
     }
 
+    /// Seconds for the words after `Up ` in a `docker ps` STATUS cell
+    /// (`2 minutes`, `About a minute`, `Less than a second`, `33 hours`),
+    /// plus how many chars of `text` the duration occupies.
+    fn parse_docker_up_secs(text: &str) -> Option<(u64, usize)> {
+        let mut used = 0usize;
+        let mut words = Vec::new();
+        for w in text.split(' ') {
+            if w.is_empty() {
+                break;
+            }
+            words.push(w);
+        }
+        let mut idx = 0;
+        if words.first() == Some(&"About") {
+            idx = 1;
+        }
+        if words.starts_with(&["Less", "than", "a", "second"]) {
+            return Some((0, "Less than a second".len()));
+        }
+        let n: f64 = match *words.get(idx)? {
+            "a" | "an" => 1.0,
+            w => w.parse().ok()?,
+        };
+        let unit = *words.get(idx + 1)?;
+        let mult = match unit.trim_end_matches('s') {
+            "second" => 1.0,
+            "minute" => 60.0,
+            "hour" => 3600.0,
+            "day" => 86_400.0,
+            "week" => 604_800.0,
+            "month" => 2_629_800.0,
+            "year" => 31_557_600.0,
+            _ => return None,
+        };
+        for w in &words[..idx + 2] {
+            used += w.chars().count() + 1;
+        }
+        Some(((n * mult) as u64, used - 1))
+    }
+
+    /// The STATUS cell of a `docker ps` row. `Up <time>`: under two
+    /// minutes red, under five amber, longer green. `Exited (n)` and
+    /// `Restarting (n)` red, `Paused` amber.
+    fn docker_status_span(row: &[char]) -> Option<(usize, usize, ServiceHealth)> {
+        let text: String = row.iter().collect();
+        let bytes_to_col = |b: usize| text[..b].chars().count();
+        for (b, _) in text.match_indices("  ") {
+            let mut start_b = b;
+            while text[start_b..].starts_with(' ') {
+                start_b += 1;
+            }
+            let rest = &text[start_b..];
+            let start = bytes_to_col(start_b);
+            if let Some(after) = rest.strip_prefix("Up ") {
+                let (secs, len) = parse_docker_up_secs(after)?;
+                let health = if secs < 120 {
+                    ServiceHealth::Bad
+                } else if secs < 300 {
+                    ServiceHealth::Transitional
+                } else {
+                    ServiceHealth::Good
+                };
+                return Some((start, start + 3 + len, health));
+            }
+            for word in ["Exited", "Restarting", "Dead"] {
+                if let Some(tail) = rest.strip_prefix(word) {
+                    let mut len = word.len();
+                    if tail.starts_with(" (") {
+                        if let Some(c) = tail.find(')') {
+                            len += c + 1;
+                        }
+                    }
+                    return Some((start, start + rest[..len].chars().count(), ServiceHealth::Bad));
+                }
+            }
+            if rest.starts_with("Paused") {
+                return Some((start, start + 6, ServiceHealth::Transitional));
+            }
+        }
+        None
+    }
+
+    /// Seconds in a systemd relative time such as `11h ago`, `5min 3s ago`
+    /// or `1 day 2h ago` (the text before ` ago`). `None` if unreadable.
+    fn parse_systemd_age_secs(text: &str) -> Option<u64> {
+        let mut total = 0f64;
+        let mut seen = false;
+        let mut pending: Option<f64> = None;
+        for tok in text.split_whitespace() {
+            let digits: String = tok
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            let unit = &tok[digits.len()..];
+            let (num, unit) = if digits.is_empty() {
+                (pending.take()?, unit)
+            } else {
+                let n: f64 = digits.parse().ok()?;
+                if unit.is_empty() {
+                    pending = Some(n);
+                    continue;
+                }
+                (n, unit)
+            };
+            let mult = match unit {
+                "us" => 0.000_001,
+                "ms" => 0.001,
+                "s" | "sec" | "second" | "seconds" => 1.0,
+                "min" | "minute" | "minutes" => 60.0,
+                "h" | "hr" | "hour" | "hours" => 3600.0,
+                "d" | "day" | "days" => 86_400.0,
+                "w" | "week" | "weeks" => 604_800.0,
+                "month" | "months" => 2_629_800.0,
+                "y" | "year" | "years" => 31_557_600.0,
+                _ => return None,
+            };
+            total += num * mult;
+            seen = true;
+        }
+        if seen && pending.is_none() {
+            Some(total as u64)
+        } else {
+            None
+        }
+    }
+
+    /// For an `Active: active (...) since ...; 11h ago` line, the column
+    /// range of `11h ago` and how long the unit has been up: under a
+    /// minute red, under five amber, longer green. Only for `active`
+    /// itself; a dead unit's "ago" is time since it stopped.
+    fn service_uptime_span(row: &[char]) -> Option<(usize, usize, ServiceHealth)> {
+        let (s, e, _) = service_status_span(row)?;
+        let word_end = row[s..e].iter().position(|&c| c == ' ').map_or(e, |p| s + p);
+        if row[s..word_end].iter().collect::<String>() != "active" {
+            return None;
+        }
+        let mut i = e;
+        while i + 1 < row.len() && !(row[i] == ';' && row[i + 1] == ' ') {
+            i += 1;
+        }
+        if i + 1 >= row.len() {
+            return None;
+        }
+        let start = i + 2;
+        let tail: String = row[start..].iter().collect();
+        let ago = tail.find(" ago")?;
+        let secs = parse_systemd_age_secs(&tail[..ago])?;
+        let end = start + tail[..ago + 4].chars().count();
+        let health = if secs < 60 {
+            ServiceHealth::Bad
+        } else if secs < 300 {
+            ServiceHealth::Transitional
+        } else {
+            ServiceHealth::Good
+        };
+        Some((start, end, health))
+    }
+
     /// Recognise a `systemctl status` "Active:" line and return the column
     /// range (start inclusive, end exclusive) of the state, e.g.
     /// `inactive (dead)` or `active (running)`, with its health. The
@@ -47768,6 +47926,7 @@ mod gui {
                 })
                 .collect();
             let status_span = service_status_span(&row_chars);
+            let uptime_span = service_uptime_span(&row_chars).or_else(|| docker_status_span(&row_chars));
             for col in 0..cols {
                 let cursor_cell = cursor == Some((row, col));
                 let (cell_text, mut format) = if let Some(cell) = screen.cell(row, col) {
@@ -47801,7 +47960,7 @@ mod gui {
 
                 // systemctl state colouring (skipped on the cursor cell so
                 // inverse video keeps working there).
-                if let Some((s, e, health)) = status_span {
+                for (s, e, health) in status_span.into_iter().chain(uptime_span) {
                     if col >= s as u16 && col < e as u16 && !cursor_cell {
                         format.color = health.color();
                         if format.underline != egui::Stroke::NONE {
@@ -59601,6 +59760,55 @@ mod gui {
             ] {
                 assert!(service_status_span(&status_row(line)).is_none(), "{line}");
             }
+        }
+
+        #[test]
+        fn service_uptime_is_coloured_by_age() {
+            let cases = [
+                ("Active: active (running) since Thu 08:00:58 UTC; 34s ago", "34s ago", ServiceHealth::Bad),
+                ("Active: active (running) since Thu 08:00:58 UTC; 59s ago", "59s ago", ServiceHealth::Bad),
+                ("Active: active (running) since Thu 08:00:58 UTC; 1min 0s ago", "1min 0s ago", ServiceHealth::Transitional),
+                ("Active: active (running) since Thu 08:00:58 UTC; 4min 59s ago", "4min 59s ago", ServiceHealth::Transitional),
+                ("Active: active (running) since Thu 08:00:58 UTC; 5min ago", "5min ago", ServiceHealth::Good),
+                ("Active: active (running) since Thu 08:00:58 UTC; 11h ago", "11h ago", ServiceHealth::Good),
+                ("Active: active (running) since Thu 08:00:58 UTC; 1 day 2h ago", "1 day 2h ago", ServiceHealth::Good),
+            ];
+            for (line, expect, health) in cases {
+                let row = status_row(line);
+                let (s, e, h) = service_uptime_span(&row).expect(line);
+                assert_eq!(row[s..e].iter().collect::<String>(), expect);
+                assert_eq!(h, health, "{line}");
+            }
+            for line in [
+                "Active: inactive (dead) since Thu 08:00:58 UTC; 11h ago",
+                "Active: active (running)",
+            ] {
+                assert!(service_uptime_span(&status_row(line)).is_none(), "{line}");
+            }
+        }
+
+        #[test]
+        fn docker_status_is_coloured_by_uptime() {
+            let line = |st: &str| format!("a1b2c3d4e5f6   img:latest   \"cmd\"   2 days ago   {st}   0.0.0.0:80->80/tcp   cassandra");
+            let cases = [
+                ("Up 5 seconds", "Up 5 seconds", ServiceHealth::Bad),
+                ("Up Less than a second", "Up Less than a second", ServiceHealth::Bad),
+                ("Up About a minute", "Up About a minute", ServiceHealth::Bad),
+                ("Up 2 minutes", "Up 2 minutes", ServiceHealth::Transitional),
+                ("Up 4 minutes", "Up 4 minutes", ServiceHealth::Transitional),
+                ("Up 5 minutes", "Up 5 minutes", ServiceHealth::Good),
+                ("Up About an hour (healthy)", "Up About an hour", ServiceHealth::Good),
+                ("Up 33 hours", "Up 33 hours", ServiceHealth::Good),
+                ("Exited (137) 3 minutes ago", "Exited (137)", ServiceHealth::Bad),
+                ("Restarting (1) 5 seconds ago", "Restarting (1)", ServiceHealth::Bad),
+            ];
+            for (st, expect, health) in cases {
+                let row = status_row(&line(st));
+                let (s, e, h) = docker_status_span(&row).expect(st);
+                assert_eq!(row[s..e].iter().collect::<String>(), expect);
+                assert_eq!(h, health, "{st}");
+            }
+            assert!(docker_status_span(&status_row(" 10:00:00 up 3 days, 2 users")).is_none());
         }
 
         #[test]
