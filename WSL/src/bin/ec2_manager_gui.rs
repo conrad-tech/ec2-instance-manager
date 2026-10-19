@@ -512,6 +512,10 @@ mod gui {
         /// every terminate, every escalation, and the startup lines about
         /// whether the feature came up at all.
         InstanceAge,
+        /// The Grafana watcher: the poll thread, every acknowledge, every
+        /// terminate, every escalation, and the startup lines about whether
+        /// the feature came up at all.
+        Grafana,
         /// The Jira Tickets feature: the list, every ticket opened, every
         /// transition, comment and edit. Its own source so a user off
         /// `jira.allowed_users` never reads ticket keys or comment text out
@@ -565,6 +569,7 @@ mod gui {
         pingdom: bool,
         unhealthy_host: bool,
         instance_age: bool,
+        grafana: bool,
         alert_test: bool,
         jira: bool,
         alerts: bool,
@@ -581,6 +586,7 @@ mod gui {
                 || self.alert_test
                 || self.unhealthy_host
                 || self.instance_age
+                || self.grafana
                 || self.jira
                 || self.alerts
                 || self.cassandra
@@ -596,6 +602,7 @@ mod gui {
                 LogSource::Pingdom => self.pingdom,
                 LogSource::UnhealthyHost => self.unhealthy_host,
                 LogSource::InstanceAge => self.instance_age,
+                LogSource::Grafana => self.grafana,
                 LogSource::AlertTest => self.alert_test,
                 LogSource::Jira => self.jira,
                 LogSource::Alerts => self.alerts,
@@ -625,6 +632,9 @@ mod gui {
             }
             if self.instance_age {
                 picked.push("Instance Age");
+            }
+            if self.grafana {
+                picked.push("Grafana");
             }
             if self.alert_test {
                 picked.push("Alert Test");
@@ -679,6 +689,7 @@ mod gui {
         pingdom: bool,
         unhealthy_host: bool,
         instance_age: bool,
+        grafana: bool,
         alert_test: bool,
         jira: bool,
         alerts: bool,
@@ -700,6 +711,9 @@ mod gui {
                 pingdom: features.pingdom.is_listed_user(user),
                 unhealthy_host: features.unhealthy_host.is_listed_user(user),
                 instance_age: features.instance_age.is_listed_user(user),
+                // Named on the list, `"*"` not honoured, `enabled` not
+                // consulted: the same rule as the watchers above.
+                grafana: features.grafana.is_listed_user(user),
                 // The button's gate, not a watcher's: a dry run is something
                 // this person ran, whichever watcher claimed the alert.
                 alert_test: features.reaper.is_listed_user(user),
@@ -723,6 +737,7 @@ mod gui {
                 LogSource::Pingdom => self.pingdom,
                 LogSource::UnhealthyHost => self.unhealthy_host,
                 LogSource::InstanceAge => self.instance_age,
+                LogSource::Grafana => self.grafana,
                 LogSource::AlertTest => self.alert_test,
                 LogSource::Jira => self.jira,
                 LogSource::Alerts => self.alerts,
@@ -739,6 +754,7 @@ mod gui {
                 || self.pingdom
                 || self.unhealthy_host
                 || self.instance_age
+                || self.grafana
                 || self.alert_test
                 || self.jira
                 || self.alerts
@@ -13321,6 +13337,10 @@ mod gui {
 
         fn log_instance_age(&mut self, level: LogLevel, message: impl Into<String>) {
             self.log_from(LogSource::InstanceAge, level, message);
+        }
+
+        fn log_grafana(&mut self, level: LogLevel, message: impl Into<String>) {
+            self.log_from(LogSource::Grafana, level, message);
         }
 
         /// Everything the Jira Tickets feature says about itself. Its own
@@ -39949,6 +39969,17 @@ mod gui {
                             );
                         });
                     }
+                    if vis.grafana {
+                        ui.horizontal(|ui| {
+                            ui.label("Grafana");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.checkbox(&mut self.oncall_filters.grafana, "");
+                                },
+                            );
+                        });
+                    }
                     if vis.alert_test {
                         ui.horizontal(|ui| {
                             ui.label("Alert Test");
@@ -58947,8 +58978,26 @@ mod gui {
         }
 
         #[test]
+        fn the_grafana_source_is_filterable_and_gated_by_its_own_list() {
+            let only = OnCallFilters { grafana: true, ..Default::default() };
+            assert!(only.includes(LogSource::Grafana));
+            assert!(!only.includes(LogSource::InstanceAge));
+            assert_eq!(only.label(), "Sources: Grafana");
+
+            let mut features = ec2_manager::features::Features::default();
+            features.grafana.allowed_users = vec!["bconrad".to_string()];
+            let vis = LogVisibility::for_user(&features, "bconrad");
+            assert!(vis.shows(LogSource::Grafana));
+            assert!(vis.any_source());
+            let stranger = LogVisibility::for_user(&features, "someone-else");
+            assert!(!stranger.shows(LogSource::Grafana));
+            // Listed but not enabled still reads the "switched off" line.
+            assert!(!features.grafana.enabled && vis.shows(LogSource::Grafana));
+        }
+
+        #[test]
         fn ticking_reaper_down_narrows_the_log_to_that_script() {
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
             assert!(only_reaper.any());
             assert!(only_reaper.includes(LogSource::ReaperDown));
             assert!(!only_reaper.includes(LogSource::App));
@@ -58959,7 +59008,7 @@ mod gui {
             // The popup shuts as soon as it is used, so without this the only
             // evidence that most of the log is being hidden is the log being
             // short — which reads as the app having stopped logging.
-            assert_eq!(OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false, custom_alerts: false }.label(), "Sources: Reaper Down");
+            assert_eq!(OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false }.label(), "Sources: Reaper Down");
         }
 
         #[test]
@@ -58980,7 +59029,7 @@ mod gui {
 
             // And that tag is what the dropdown filters on — asserted through
             // the same predicate the panel uses, not a reimplementation of it.
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
             let kept: Vec<&str> = app
                 .logs
                 .iter()
@@ -58995,7 +59044,7 @@ mod gui {
             // The two filters are independent and both on screen. A DEBUG
             // reaper line with DEBUG unticked stays hidden, the same as any
             // other DEBUG line.
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
             let mut levels = LogFilters::default();
             levels.set_verbosity_low();
             assert!(!levels.includes(LogLevel::Debug));
@@ -61817,7 +61866,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn the_on_call_filter_can_narrow_the_log_to_pingdom() {
-            let only_pingdom = OnCallFilters { reaper_down: false, pingdom: true, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
+            let only_pingdom = OnCallFilters { reaper_down: false, pingdom: true, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
             assert!(only_pingdom.includes(LogSource::Pingdom));
             assert!(!only_pingdom.includes(LogSource::ReaperDown));
             assert!(!only_pingdom.includes(LogSource::App));
@@ -61827,7 +61876,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         #[test]
         fn nothing_ticked_still_shows_the_pingdom_lines() {
             // A dropdown nobody opens must not remove anything from view.
-            let none = OnCallFilters { reaper_down: false, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
+            let none = OnCallFilters { reaper_down: false, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
             assert!(none.includes(LogSource::Pingdom));
             assert!(none.includes(LogSource::ReaperDown));
             assert!(none.includes(LogSource::App));
@@ -61836,7 +61885,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn both_ticked_shows_both_and_says_so() {
-            let both = OnCallFilters { reaper_down: true, pingdom: true, alert_test: false, unhealthy_host: false, instance_age: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
+            let both = OnCallFilters { reaper_down: true, pingdom: true, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
             assert!(both.includes(LogSource::Pingdom));
             assert!(both.includes(LogSource::ReaperDown));
             assert!(!both.includes(LogSource::App));
