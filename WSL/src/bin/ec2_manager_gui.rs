@@ -4920,6 +4920,7 @@ mod gui {
         pingdom_cfg: ec2_manager::features::PingdomFeature,
         unhealthy_cfg: ec2_manager::features::UnhealthyHostFeature,
         instance_age_cfg: ec2_manager::features::InstanceAgeFeature,
+        grafana_cfg: ec2_manager::features::GrafanaFeature,
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
         mailbox: Option<String>,
@@ -4933,6 +4934,8 @@ mod gui {
         unhealthy_allowed: bool,
         /// The same for the instance-age watcher.
         instance_age_allowed: bool,
+        /// The same for the Grafana watcher.
+        grafana_allowed: bool,
     }
 
     /// Why a manual Run Remediation must not proceed for `route`, if it must
@@ -4945,6 +4948,7 @@ mod gui {
         route: DryRunRoute,
         unhealthy_allowed: bool,
         instance_age_allowed: bool,
+        grafana_allowed: bool,
     ) -> Option<&'static str> {
         match route {
             DryRunRoute::Reaper => None,
@@ -4959,6 +4963,11 @@ mod gui {
                 "this is an instance-age alert, and you are not on \
                  instance_age.allowed_users (or the watcher is not enabled) — \
                  nothing was terminated",
+            ),
+            DryRunRoute::Grafana if grafana_allowed => None,
+            DryRunRoute::Grafana => Some(
+                "this is a Grafana alert, and you are not on grafana.allowed_users \
+                 (or the watcher is not enabled) — nothing was terminated",
             ),
             DryRunRoute::Pingdom => Some(
                 "this is a Pingdom alert: Pingdom has no remediation (it only \
@@ -5009,6 +5018,7 @@ mod gui {
                 &env.pingdom_cfg,
                 &env.unhealthy_cfg,
                 &env.instance_age_cfg,
+                &env.grafana_cfg,
             );
             let _ = tx.send(ReaperEvent::SourcedNote {
                 source: LogSource::AlertTest,
@@ -5018,9 +5028,12 @@ mod gui {
                      (override={override_health})"
                 ),
             });
-            if let Some(why) =
-                manual_remediation_refusal(route, env.unhealthy_allowed, env.instance_age_allowed)
-            {
+            if let Some(why) = manual_remediation_refusal(
+                route,
+                env.unhealthy_allowed,
+                env.instance_age_allowed,
+                env.grafana_allowed,
+            ) {
                 let _ = tx.send(ReaperEvent::SourcedNote {
                     source: LogSource::AlertTest,
                     level: LogLevel::Warn,
@@ -5045,6 +5058,7 @@ mod gui {
                 ),
                 DryRunRoute::UnhealthyHost => run_unhealthy_host_remediation(&env, full),
                 DryRunRoute::InstanceAge => run_instance_age_remediation(&env, full),
+                DryRunRoute::Grafana => run_grafana_remediation(&env, full),
                 // Refused above.
                 DryRunRoute::Pingdom | DryRunRoute::Neither => {}
             }
@@ -5419,6 +5433,164 @@ mod gui {
         }
     }
 
+    /// Run Remediation for a Grafana alert: acknowledge (on call), terminate,
+    /// wait for the replacement to be fully running, give the alert its settle
+    /// window, and escalate if it is still open. The same rules as the poll,
+    /// run once, here, for one alert a person pointed at.
+    fn run_grafana_remediation(env: &ManualRemediationEnv, alert: ec2_manager::alerts::Alert) {
+        use ec2_manager::{alerts, grafana as gf, instance_age as ia, oncall, reaper};
+
+        let cfg = &env.grafana_cfg;
+        let alert_id = alert.id.clone();
+        let mut end = RemediationStatusGuard::new(env.status_tx.clone(), &alert_id);
+        end.status = AlertActionStatus::Failed(format!(
+            "alert {alert_id}: stopped before anything was terminated — see the log under \
+             Sources -> Grafana"
+        ));
+        let note = |level: LogLevel, message: String| {
+            let _ = env.tx.send(ReaperEvent::SourcedNote {
+                source: LogSource::Grafana,
+                level,
+                message: format!("grafana: manual {message}"),
+            });
+        };
+        let fail = |end: &mut RemediationStatusGuard, why: String| {
+            note(LogLevel::Error, format!("{alert_id} — {why}"));
+            end.status = AlertActionStatus::Failed(format!("alert {alert_id}: {why}"));
+        };
+
+        let Some(_claim) = claim_in_flight(&env.in_flight, &alert_id) else {
+            fail(&mut end, "a remediation for this alert is already running".to_string());
+            return;
+        };
+        note(LogLevel::Warn, format!("remediation requested for alert {alert_id}"));
+
+        let facts = ia::parse_facts(&alert.description);
+        if facts.instance_id.is_empty() {
+            fail(&mut end, "names no readable instance id — nothing to act on".to_string());
+            return;
+        }
+        let ctx = match instance_age_context(&env.mode, &env.app_config, &facts) {
+            Ok(c) => c,
+            Err(e) => return fail(&mut end, e),
+        };
+        let asg_name = match instance_asg_group(&ctx.profile, &ctx.region, &facts.instance_id) {
+            Ok(Some(n)) => n,
+            Ok(None) => {
+                return fail(
+                    &mut end,
+                    format!(
+                        "{} carries no aws:autoscaling:groupName tag — nothing would replace \
+                         it, so it is never terminated",
+                        facts.instance_id
+                    ),
+                )
+            }
+            Err(e) => return fail(&mut end, format!("could not read {}: {e}", facts.instance_id)),
+        };
+
+        let on_call = match oncall::is_on_call(
+            &env.auth,
+            &env.reaper_cfg.resolved_schedule_id(),
+            &env.reaper_cfg.resolved_atlassian_account_id(),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                note(LogLevel::Warn, format!("on-call lookup failed ({e}) — treating as off call"));
+                false
+            }
+        };
+        if on_call {
+            match alerts::acknowledge_alert(&env.auth, &alert_id) {
+                Ok(()) => note(LogLevel::Info, format!("acknowledged {alert_id}")),
+                Err(e) => note(
+                    LogLevel::Warn,
+                    format!("could not acknowledge {alert_id}: {e} — carrying on"),
+                ),
+            }
+        }
+
+        if let Err(e) = terminate_instance(&ctx.profile, &ctx.region, &facts.instance_id, &env.mode) {
+            return fail(&mut end, format!("terminate of {} failed: {e}", facts.instance_id));
+        }
+        note(
+            LogLevel::Warn,
+            format!("{alert_id} — terminated {}; waiting for {asg_name} to replace it", facts.instance_id),
+        );
+
+        let escalate = |why: &str| {
+            note(LogLevel::Error, format!("{alert_id} — {why}"));
+            match env.mailbox.as_deref() {
+                Some(m) if !m.trim().is_empty() => {
+                    match send_escalation_email(m, &grafana_escalation_subject(&alert.created_at)) {
+                        // The address is never logged: the app log gets pasted into tickets.
+                        Ok(_) => note(LogLevel::Warn, "escalation sent".to_string()),
+                        Err(e) => note(LogLevel::Error, format!("escalation FAILED TO SEND — {e}")),
+                    }
+                }
+                _ => note(LogLevel::Error, "no escalation mailbox is configured — nothing was sent".to_string()),
+            }
+        };
+
+        // Wait for the replacement, once per poll interval, up to the ceiling.
+        let ceiling = std::time::Instant::now() + cfg.replacement_ceiling();
+        let new_id = loop {
+            if std::time::Instant::now() >= ceiling {
+                escalate(&format!(
+                    "no replacement was fully running in {asg_name} after {} minute(s)",
+                    cfg.replacement_ceiling().as_secs() / 60
+                ));
+                end.status = AlertActionStatus::Failed(format!(
+                    "alert {alert_id}: terminated {}, but no replacement came up — escalated",
+                    facts.instance_id
+                ));
+                return;
+            }
+            std::thread::sleep(cfg.poll_interval());
+            let Ok(group) = read_group(&ctx, &asg_name) else { continue };
+            let state_of = |id: &str| {
+                fetch_instance_state(&ctx.profile, &ctx.region, id).unwrap_or_default()
+            };
+            if let Some(id) = gf::ready_replacement(&group.instances, &facts.instance_id, &state_of) {
+                break id;
+            }
+        };
+        note(
+            LogLevel::Warn,
+            format!(
+                "{alert_id} — {new_id} is fully running; the alert has {} minute(s) to clear",
+                cfg.settle_window().as_secs() / 60
+            ),
+        );
+
+        std::thread::sleep(cfg.settle_window());
+        // A failed read is retried; it is never read as closed.
+        let still_open = loop {
+            match alerts::fetch_alert(&env.auth, &alert_id) {
+                Ok(a) => break !reaper::alert_is_closed(&a.status),
+                Err(e) => {
+                    note(LogLevel::Warn, format!("could not re-read {alert_id}, retrying: {e}"));
+                    std::thread::sleep(cfg.poll_interval());
+                }
+            }
+        };
+        if still_open {
+            escalate(&format!(
+                "still open {} minute(s) after the replacement in {asg_name} was fully running",
+                cfg.settle_window().as_secs() / 60
+            ));
+            end.status = AlertActionStatus::Failed(format!(
+                "alert {alert_id}: replaced {}, but the alert did not clear — escalated",
+                facts.instance_id
+            ));
+        } else {
+            end.status = AlertActionStatus::Ok(format!(
+                "alert {alert_id}: replaced {} with {new_id}; the alert cleared",
+                facts.instance_id
+            ));
+        }
+    }
+
     /// The right-click menu on a row in the Alerts window.
     ///
     /// The same two actions the Alert ID box offers, aimed at the row under
@@ -5552,6 +5724,7 @@ mod gui {
     enum DryRunRoute {
         Reaper,
         UnhealthyHost,
+        Grafana,
         InstanceAge,
         Pingdom,
         /// No watcher claims it. Nothing is run and nothing is escalated —
@@ -5566,7 +5739,7 @@ mod gui {
     /// **Unhealthy-host outranks instance-age**, the older claim on the same
     /// `UnHealthyHostCount` alarms — `instance_age::claims` already excludes
     /// both reaper and unhealthy-host, so this is four deep: reaper, then
-    /// unhealthy-host, then instance-age, then pingdom.
+    /// unhealthy-host, then Grafana, then instance-age, then pingdom.
     ///
     /// Pure, so the precedence is pinned by a test rather than by the order
     /// of `if`s inside a thread.
@@ -5576,18 +5749,20 @@ mod gui {
         pingdom_cfg: &ec2_manager::features::PingdomFeature,
         unhealthy_cfg: &ec2_manager::features::UnhealthyHostFeature,
         instance_age_cfg: &ec2_manager::features::InstanceAgeFeature,
+        grafana_cfg: &ec2_manager::features::GrafanaFeature,
     ) -> DryRunRoute {
         if ec2_manager::reaper::identifies(alert, reaper_cfg) {
             DryRunRoute::Reaper
         } else if ec2_manager::unhealthy_host::claims(alert, unhealthy_cfg, reaper_cfg) {
             DryRunRoute::UnhealthyHost
+        } else if ec2_manager::grafana::claims(alert, grafana_cfg, reaper_cfg, unhealthy_cfg) {
+            DryRunRoute::Grafana
         } else if ec2_manager::instance_age::claims(
             alert,
             instance_age_cfg,
             reaper_cfg,
             unhealthy_cfg,
-            // Task 5 threads the real config
-            &ec2_manager::features::GrafanaFeature::default(),
+            grafana_cfg,
         ) {
             DryRunRoute::InstanceAge
         } else if ec2_manager::pingdom::identifies(alert, pingdom_cfg) {
@@ -5638,6 +5813,7 @@ mod gui {
         pingdom_cfg: ec2_manager::features::PingdomFeature,
         unhealthy_cfg: ec2_manager::features::UnhealthyHostFeature,
         instance_age_cfg: ec2_manager::features::InstanceAgeFeature,
+        grafana_cfg: ec2_manager::features::GrafanaFeature,
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
         mailbox: Option<String>,
@@ -5710,7 +5886,14 @@ mod gui {
                 ),
             );
 
-            match dry_run_route(&alert, &reaper_cfg, &pingdom_cfg, &unhealthy_cfg, &instance_age_cfg) {
+            match dry_run_route(
+                &alert,
+                &reaper_cfg,
+                &pingdom_cfg,
+                &unhealthy_cfg,
+                &instance_age_cfg,
+                &grafana_cfg,
+            ) {
                 DryRunRoute::Reaper => {
                     note(
                         LogLevel::Info,
@@ -5923,12 +6106,75 @@ mod gui {
                             .to_string(),
                     );
                 }
+                DryRunRoute::Grafana => {
+                    use ec2_manager::instance_age as ia;
+                    note(
+                        LogLevel::Info,
+                        format!("dry run: alert {} matches the Grafana rules", alert.id),
+                    );
+                    let facts = ia::parse_facts(&alert.description);
+                    note(
+                        LogLevel::Info,
+                        format!(
+                            "dry run: the description names instance={:?} environment={:?} \
+                             account={:?} region={:?}",
+                            facts.instance_id, facts.environment, facts.account, facts.region
+                        ),
+                    );
+                    if facts.instance_id.is_empty() {
+                        note(
+                            LogLevel::Warn,
+                            "dry run: the alert names no readable instance id — a real run \
+                             would have nothing to act on"
+                                .to_string(),
+                        );
+                    } else {
+                        let walked = instance_age_context(&mode, &app_config, &facts).and_then(|ctx| {
+                            let asg = instance_asg_group(&ctx.profile, &ctx.region, &facts.instance_id)?
+                                .ok_or_else(|| {
+                                    format!(
+                                        "{} carries no aws:autoscaling:groupName tag",
+                                        facts.instance_id
+                                    )
+                                })?;
+                            let group = read_group(&ctx, &asg)?;
+                            Ok((asg, group))
+                        });
+                        match walked {
+                            Err(why) => note(
+                                LogLevel::Error,
+                                format!("dry run: could not read the group — {why}"),
+                            ),
+                            Ok((asg, group)) => note(
+                                LogLevel::Info,
+                                format!(
+                                    "dry run: {} is in {asg} ({} member(s), desired {}). A real \
+                                     run would acknowledge, terminate it, wait up to {} \
+                                     minute(s) for a fully running replacement, give the alert \
+                                     {} minute(s), then escalate if it is still open",
+                                    facts.instance_id,
+                                    group.instances.len(),
+                                    group.desired_capacity,
+                                    grafana_cfg.replacement_ceiling().as_secs() / 60,
+                                    grafana_cfg.settle_window().as_secs() / 60,
+                                ),
+                            ),
+                        }
+                    }
+                    note(
+                        LogLevel::Info,
+                        "dry run: nothing was acknowledged and nothing was terminated — this \
+                         will escalate next, as though the run had failed"
+                            .to_string(),
+                    );
+                }
                 DryRunRoute::Neither => {
                     fail(format!(
                         "alert {} matches no watcher — not a reaper alert \
                          (alertname~{:?} app~{:?} message~{:?}), not an unhealthy-host alert \
                          (alertname~{:?} app~{:?} message~{:?}) and not a pingdom alert \
-                         (alertname~{:?} app~{:?} message~{:?}). Nothing was escalated.",
+                         (alertname~{:?} app~{:?} message~{:?}) and not a Grafana alert \
+                         (grafana.title_contains {:?}). Nothing was escalated.",
                         alert.id,
                         reaper_cfg.alertname_contains,
                         reaper_cfg.app_contains,
@@ -5939,6 +6185,7 @@ mod gui {
                         pingdom_cfg.alertname_contains,
                         pingdom_cfg.app_contains,
                         pingdom_cfg.message_contains,
+                        grafana_cfg.title_contains,
                     ));
                     return;
                 }
@@ -10965,6 +11212,9 @@ mod gui {
         /// The compiled-in instance-age rules, for the dry run's matcher.
         /// The watcher's own copy is moved into its thread.
         instance_age_cfg: ec2_manager::features::InstanceAgeFeature,
+        /// The compiled-in Grafana rules, for the dry run's matcher and the
+        /// manual remediation. The watcher's own copy is moved into its thread.
+        grafana_cfg: ec2_manager::features::GrafanaFeature,
         /// Where a dry run reports back to the *window* — an alert that
         /// could not be fetched, one no watcher claims, a send that did not
         /// go, and the address a send that did go reached. A channel, not a
@@ -11887,6 +12137,7 @@ mod gui {
                 pingdom_cfg: features.pingdom.clone(),
                 unhealthy_host_cfg: features.unhealthy_host.clone(),
                 instance_age_cfg: features.instance_age.clone(),
+                grafana_cfg: features.grafana.clone(),
                 dry_run_status_tx,
                 dry_run_status_rx,
                 reaper_probe_enabled: features
@@ -19695,6 +19946,7 @@ mod gui {
                         pingdom_cfg: self.pingdom_cfg.clone(),
                         unhealthy_cfg: self.unhealthy_host_cfg.clone(),
                         instance_age_cfg: self.instance_age_cfg.clone(),
+                        grafana_cfg: self.grafana_cfg.clone(),
                         app_config: self.config.clone(),
                         mode: self.options.mode.clone(),
                         mailbox: ec2_manager::jsm_auth::escalation_mailbox(),
@@ -19703,6 +19955,7 @@ mod gui {
                         status_tx: self.dry_run_status_tx.clone(),
                         unhealthy_allowed: self.unhealthy_host_cfg.is_allowed_user(&os_user),
                         instance_age_allowed: self.instance_age_cfg.is_allowed_user(&os_user),
+                        grafana_allowed: self.grafana_cfg.is_allowed_user(&os_user),
                     },
                     alert_id,
                     override_health,
@@ -22159,6 +22412,7 @@ mod gui {
                     self.pingdom_cfg.clone(),
                     self.unhealthy_host_cfg.clone(),
                     self.instance_age_cfg.clone(),
+                    self.grafana_cfg.clone(),
                     self.config.clone(),
                     self.options.mode.clone(),
                     ec2_manager::jsm_auth::escalation_mailbox(),
@@ -44328,6 +44582,7 @@ mod gui {
                                     &features.pingdom,
                                     &features.unhealthy_host,
                                     &features.instance_age,
+                                    &features.grafana,
                                 ),
                                 DryRunRoute::Neither
                             );
@@ -61246,6 +61501,40 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             }
         }
 
+        #[test]
+        fn a_grafana_alert_routes_to_grafana_and_beats_instance_age() {
+            use ec2_manager::features::*;
+            let g = GrafanaFeature {
+                title_contains: vec!["Grafana-Missing-Qualys-Info".to_string()],
+                ..Default::default()
+            };
+            let ia_cfg = InstanceAgeFeature {
+                message_contains: "Missing".to_string(),
+                ..Default::default()
+            };
+            let alert = ec2_manager::alerts::Alert {
+                message: "Grafana-Missing-Qualys-Info".to_string(),
+                ..Default::default()
+            };
+            let route = dry_run_route(
+                &alert,
+                &ReaperFeature::default(),
+                &PingdomFeature::default(),
+                &UnhealthyHostFeature::default(),
+                &ia_cfg,
+                &g,
+            );
+            assert_eq!(route, DryRunRoute::Grafana);
+        }
+
+        #[test]
+        fn a_manual_grafana_remediation_needs_the_grafana_list() {
+            assert!(manual_remediation_refusal(DryRunRoute::Grafana, false, false, true).is_none());
+            let refused = manual_remediation_refusal(DryRunRoute::Grafana, true, true, false)
+                .expect("refused");
+            assert!(refused.contains("grafana.allowed_users"));
+        }
+
         fn dry_run_instance_age_cfg() -> ec2_manager::features::InstanceAgeFeature {
             ec2_manager::features::InstanceAgeFeature {
                 enabled: true,
@@ -61264,13 +61553,13 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         #[test]
         fn manual_remediation_is_refused_unless_the_alert_type_has_a_fix_you_may_run() {
             use DryRunRoute::*;
-            assert_eq!(manual_remediation_refusal(Reaper, false, false), None);
-            assert_eq!(manual_remediation_refusal(UnhealthyHost, true, false), None);
-            assert!(manual_remediation_refusal(UnhealthyHost, false, true).is_some());
-            assert_eq!(manual_remediation_refusal(InstanceAge, false, true), None);
-            assert!(manual_remediation_refusal(InstanceAge, true, false).is_some());
-            assert!(manual_remediation_refusal(Pingdom, true, true).is_some());
-            assert!(manual_remediation_refusal(Neither, true, true).is_some());
+            assert_eq!(manual_remediation_refusal(Reaper, false, false, false), None);
+            assert_eq!(manual_remediation_refusal(UnhealthyHost, true, false, false), None);
+            assert!(manual_remediation_refusal(UnhealthyHost, false, true, false).is_some());
+            assert_eq!(manual_remediation_refusal(InstanceAge, false, true, false), None);
+            assert!(manual_remediation_refusal(InstanceAge, true, false, false).is_some());
+            assert!(manual_remediation_refusal(Pingdom, true, true, false).is_some());
+            assert!(manual_remediation_refusal(Neither, true, true, false).is_some());
         }
 
         /// The confirmation must hand off to the router, not straight to the
@@ -61299,6 +61588,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &pingdom_cfg(),
                     &unhealthy_host_cfg(),
                     &dry_run_instance_age_cfg(),
+                    &ec2_manager::features::GrafanaFeature::default(),
                 ),
                 DryRunRoute::Pingdom
             );
@@ -61315,6 +61605,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &pingdom_cfg(),
                     &unhealthy_host_cfg(),
                     &dry_run_instance_age_cfg(),
+                    &ec2_manager::features::GrafanaFeature::default(),
                 ),
                 DryRunRoute::Reaper
             );
@@ -61334,6 +61625,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &pingdom_cfg(),
                     &unhealthy_host_cfg(),
                     &dry_run_instance_age_cfg(),
+                    &ec2_manager::features::GrafanaFeature::default(),
                 ),
                 DryRunRoute::Reaper
             );
@@ -61352,6 +61644,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &pingdom_cfg(),
                     &unhealthy_host_cfg(),
                     &dry_run_instance_age_cfg(),
+                    &ec2_manager::features::GrafanaFeature::default(),
                 ),
                 DryRunRoute::UnhealthyHost
             );
@@ -61366,6 +61659,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &pingdom_cfg(),
                     &unhealthy_host_cfg(),
                     &dry_run_instance_age_cfg(),
+                    &ec2_manager::features::GrafanaFeature::default(),
                 ),
                 DryRunRoute::UnhealthyHost
             );
@@ -61382,6 +61676,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &pingdom_cfg(),
                     &unhealthy_host_cfg(),
                     &dry_run_instance_age_cfg(),
+                    &ec2_manager::features::GrafanaFeature::default(),
                 ),
                 DryRunRoute::Reaper
             );
@@ -61399,6 +61694,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &pingdom_cfg(),
                     &unhealthy_host_cfg(),
                     &dry_run_instance_age_cfg(),
+                    &ec2_manager::features::GrafanaFeature::default(),
                 ),
                 DryRunRoute::Neither
             );
@@ -61416,6 +61712,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &ec2_manager::features::PingdomFeature::default(),
                     &unhealthy_host_cfg(),
                     &dry_run_instance_age_cfg(),
+                    &ec2_manager::features::GrafanaFeature::default(),
                 ),
                 DryRunRoute::Neither
             );
@@ -61432,6 +61729,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &pingdom_cfg(),
                     &unhealthy_host_cfg(),
                     &dry_run_instance_age_cfg(),
+                    &ec2_manager::features::GrafanaFeature::default(),
                 ),
                 DryRunRoute::InstanceAge
             );
@@ -61451,6 +61749,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &pingdom_cfg(),
                     &unhealthy_host_cfg(),
                     &dry_run_instance_age_cfg(),
+                    &ec2_manager::features::GrafanaFeature::default(),
                 ),
                 DryRunRoute::Reaper
             );
@@ -61464,6 +61763,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &pingdom_cfg(),
                     &unhealthy_host_cfg(),
                     &dry_run_instance_age_cfg(),
+                    &ec2_manager::features::GrafanaFeature::default(),
                 ),
                 DryRunRoute::UnhealthyHost
             );
@@ -61482,6 +61782,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &pingdom_cfg(),
                     &unhealthy_host_cfg(),
                     &ec2_manager::features::InstanceAgeFeature::default(),
+                    &ec2_manager::features::GrafanaFeature::default(),
                 ),
                 DryRunRoute::Neither
             );
