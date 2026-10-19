@@ -19873,10 +19873,9 @@ mod gui {
             }
         }
 
-        /// Drain whatever the instance-age watcher has said since the last
-        /// frame. Same shape as `poll_unhealthy_host_events`: the terminate
-        /// and the escalation both already happened on the watcher's own
-        /// thread, so this only records them.
+        /// Drain whatever the Grafana watcher has said since the last frame.
+        /// The terminate and the escalation already happened on its own
+        /// thread; this only records them.
         fn poll_grafana_events(&mut self) {
             let Some(rt) = &self.grafana else { return };
             let events: Vec<GrafanaEvent> = rt.rx.try_iter().collect();
@@ -19904,6 +19903,10 @@ mod gui {
             }
         }
 
+        /// Drain whatever the instance-age watcher has said since the last
+        /// frame. Same shape as `poll_unhealthy_host_events`: the terminate
+        /// and the escalation both already happened on the watcher's own
+        /// thread, so this only records them.
         fn poll_instance_age_events(&mut self) {
             let Some(rt) = &self.instance_age else { return };
             let events: Vec<InstanceAgeEvent> = rt.rx.try_iter().collect();
@@ -45490,7 +45493,7 @@ mod gui {
                 let _ = why;
                 std::thread::spawn(move || {
                     let (ok, detail) = match send_escalation_email(&mailbox2, &subject) {
-                        Ok(address) => (true, format!("sent to {address}")),
+                        Ok(_) => (true, "sent".to_string()),
                         Err(reason) => (false, reason),
                     };
                     let _ = tx2.send(GrafanaEvent::Escalated { alert_id: id, detail, ok });
@@ -69671,6 +69674,30 @@ fed_expire = 4000000000
                 &UnhealthyHostFeature::default(),
                 &g
             ));
+        }
+
+        #[test]
+        fn the_grafana_escalation_log_never_carries_the_mailbox_address() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let start = src.find("fn start_grafana_poll").expect("the poll thread");
+            let end = start
+                + src[start..]
+                    .find("GrafanaRuntime { rx, _handle: handle }")
+                    .expect("the end of the poll");
+            let body = &src[start..end];
+            assert!(
+                !body.contains("sent to {"),
+                "the escalation detail must not carry the mailbox address"
+            );
+            let start = src.find("fn poll_grafana_events").expect("the event drain");
+            let end = start
+                + src[start..]
+                    .find("\n        fn ")
+                    .expect("the function after the drain");
+            let drain = &src[start..end];
+            assert!(drain.contains("{detail}"));
+            assert!(!drain.contains("address"), "the drain logs only the detail");
         }
     }
 }
