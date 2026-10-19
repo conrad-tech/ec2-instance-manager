@@ -152,9 +152,9 @@ pub fn names_an_app(facts: &AlertFacts, cfg: &crate::features::InstanceAgeFeatur
 }
 
 /// Is this alert ours to act on? **Reaper wins, and so does the unhealthy-host
-/// watcher.**
+/// watcher, and the Grafana watcher.**
 ///
-/// Those two already have a fix and a terminate of their own for the alarms
+/// Those three already have a fix and a terminate of their own for the alarms
 /// they claim, and one alarm being handled twice is the failure this exists to
 /// prevent — whether or not either happens to be armed on this machine, for
 /// the reason `unhealthy_host::claims` ignores reaper's `enabled` flag.
@@ -166,10 +166,12 @@ pub fn claims(
     cfg: &crate::features::InstanceAgeFeature,
     reaper_cfg: &crate::features::ReaperFeature,
     unhealthy_cfg: &crate::features::UnhealthyHostFeature,
+    grafana_cfg: &crate::features::GrafanaFeature,
 ) -> bool {
     identifies(alert, cfg)
         && !reaper::identifies(alert, reaper_cfg)
         && !crate::unhealthy_host::identifies(alert, unhealthy_cfg)
+        && !crate::grafana::identifies(alert, grafana_cfg)
 }
 
 /// What shape of group the alert is about.
@@ -990,14 +992,14 @@ Runbook: https://example.invalid/runbook
             .extra
             .insert("alertname".to_string(), "reaper-down".to_string());
         assert!(identifies(&reaper_alert, &cfg()));
-        assert!(!claims(&reaper_alert, &cfg(), &reaper_cfg(), &uh_cfg()));
+        assert!(!claims(&reaper_alert, &cfg(), &reaper_cfg(), &uh_cfg(), &crate::features::GrafanaFeature::default()));
 
         let uh_alert = alert("prod-cassandra-UnHealthyHostCount-InstanceAge");
         assert!(identifies(&uh_alert, &cfg()));
-        assert!(!claims(&uh_alert, &cfg(), &reaper_cfg(), &uh_cfg()));
+        assert!(!claims(&uh_alert, &cfg(), &reaper_cfg(), &uh_cfg(), &crate::features::GrafanaFeature::default()));
 
         let ours = alert("prod-cassandra-InstanceAge-Warning");
-        assert!(claims(&ours, &cfg(), &reaper_cfg(), &uh_cfg()));
+        assert!(claims(&ours, &cfg(), &reaper_cfg(), &uh_cfg(), &crate::features::GrafanaFeature::default()));
     }
 
     #[test]

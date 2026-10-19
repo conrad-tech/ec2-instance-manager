@@ -5581,7 +5581,14 @@ mod gui {
             DryRunRoute::Reaper
         } else if ec2_manager::unhealthy_host::claims(alert, unhealthy_cfg, reaper_cfg) {
             DryRunRoute::UnhealthyHost
-        } else if ec2_manager::instance_age::claims(alert, instance_age_cfg, reaper_cfg, unhealthy_cfg) {
+        } else if ec2_manager::instance_age::claims(
+            alert,
+            instance_age_cfg,
+            reaper_cfg,
+            unhealthy_cfg,
+            // Task 5 threads the real config
+            &ec2_manager::features::GrafanaFeature::default(),
+        ) {
             DryRunRoute::InstanceAge
         } else if ec2_manager::pingdom::identifies(alert, pingdom_cfg) {
             DryRunRoute::Pingdom
@@ -11140,6 +11147,9 @@ mod gui {
         /// The instance-age watcher, when it is armed. `None` when any of its
         /// five gates is shut — `instance_age_gate_report` names which.
         instance_age: Option<InstanceAgeRuntime>,
+        /// The Grafana watcher; `None` while any gate is shut --
+        /// `grafana_gate_report` names which.
+        grafana: Option<GrafanaRuntime>,
         /// Finished remediations waiting on a notifier: the outcome code
         /// (`RE-F`/`RE-N`/`RE-K`/`RE-C`) and the alert's `createdAt`.
         /// Nothing reads this yet — wiring it to a send path is a separate,
@@ -11588,6 +11598,33 @@ mod gui {
                         features.instance_age.clone(),
                         features.reaper.clone(),
                         features.unhealthy_host.clone(),
+                        features.grafana.clone(),
+                        config.clone(),
+                        options.mode.clone(),
+                        mailbox.unwrap_or_default(),
+                    ))
+                } else {
+                    None
+                };
+                (rt, lines)
+            };
+
+            let (grafana, grafana_startup_log) = {
+                let user = ec2_manager::features::current_os_user();
+                let mailbox = ec2_manager::jsm_auth::escalation_mailbox();
+                let (armed, lines) = grafana_gate_report(
+                    &options.mode,
+                    &features.grafana,
+                    &user,
+                    resolved_alerts_auth.is_complete(),
+                    mailbox.as_deref(),
+                );
+                let rt = if armed {
+                    Some(start_grafana_poll(
+                        resolved_alerts_auth.clone(),
+                        features.grafana.clone(),
+                        features.reaper.clone(),
+                        features.unhealthy_host.clone(),
                         config.clone(),
                         options.mode.clone(),
                         mailbox.unwrap_or_default(),
@@ -11904,6 +11941,7 @@ mod gui {
                 unhealthy_host,
                 unhealthy_host_notice: None,
                 instance_age,
+                grafana,
                 instance_age_notice: None,
                 pending_notify: Vec::new(),
                 fed_auth_enabled: features
@@ -12030,6 +12068,10 @@ mod gui {
                 let level = if is_warn { LogLevel::Warn } else { LogLevel::Info };
                 app.log_unhealthy_host(level, msg);
             }
+            for (is_warn, msg) in grafana_startup_log {
+                let level = if is_warn { LogLevel::Warn } else { LogLevel::Info };
+                app.log_grafana(level, msg);
+            }
             for (is_warn, msg) in instance_age_startup_log {
                 // Same reasoning, its own tag: "the watcher never came up" is
                 // the first thing to look for under Sources -> Instance Age
@@ -12092,6 +12134,11 @@ mod gui {
                 features.instance_age_enabled_for(&os_user)
             );
             app.log_instance_age(LogLevel::Info, ia_gate);
+            let grafana_gate = format!(
+                "gates: grafana={}",
+                features.grafana_enabled_for(&os_user)
+            );
+            app.log_grafana(LogLevel::Info, grafana_gate);
             let alerts_gate = format!("gates: alerts={}", app.alerts_enabled);
             app.log_alerts(LogLevel::Info, alerts_gate);
             let jira_gate = format!("gates: jira={}", app.jira_enabled);
@@ -19830,6 +19877,33 @@ mod gui {
         /// frame. Same shape as `poll_unhealthy_host_events`: the terminate
         /// and the escalation both already happened on the watcher's own
         /// thread, so this only records them.
+        fn poll_grafana_events(&mut self) {
+            let Some(rt) = &self.grafana else { return };
+            let events: Vec<GrafanaEvent> = rt.rx.try_iter().collect();
+            for ev in events {
+                match ev {
+                    GrafanaEvent::Note { level, message } => self.log_grafana(level, message),
+                    GrafanaEvent::Escalated { alert_id, detail, ok } => {
+                        if ok {
+                            self.log_grafana(
+                                LogLevel::Warn,
+                                format!("grafana: escalation for {alert_id} {detail}"),
+                            );
+                        } else {
+                            self.log_grafana(
+                                LogLevel::Error,
+                                format!(
+                                    "grafana: escalation for {alert_id} FAILED TO SEND — \
+                                     {detail}. The alert is acknowledged and nothing will \
+                                     ring; handle it by hand"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         fn poll_instance_age_events(&mut self) {
             let Some(rt) = &self.instance_age else { return };
             let events: Vec<InstanceAgeEvent> = rt.rx.try_iter().collect();
@@ -40501,9 +40575,11 @@ mod gui {
                 self.poll_custom_alerts_events();
                 self.poll_unhealthy_host_events();
                 self.poll_instance_age_events();
+                self.poll_grafana_events();
                 if self.pingdom.is_some()
                     || self.unhealthy_host.is_some()
                     || self.instance_age.is_some()
+                    || self.grafana.is_some()
                     || self.custom_alerts.is_some()
                 {
                     // The watcher runs on its own thread and does not need a
@@ -44866,6 +44942,7 @@ mod gui {
         cfg: ec2_manager::features::InstanceAgeFeature,
         reaper_cfg: ec2_manager::features::ReaperFeature,
         unhealthy_cfg: ec2_manager::features::UnhealthyHostFeature,
+        grafana_cfg: ec2_manager::features::GrafanaFeature,
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
         mailbox: String,
@@ -45139,7 +45216,7 @@ mod gui {
                         Ok(list) => {
                             let mut claimed = 0usize;
                             for listed in &list {
-                                if !ia::claims(listed, &cfg, &reaper_cfg, &unhealthy_cfg) {
+                                if !ia::claims(listed, &cfg, &reaper_cfg, &unhealthy_cfg, &grafana_cfg) {
                                     continue;
                                 }
                                 if reaper::alert_is_closed(&listed.status)
@@ -45258,6 +45335,449 @@ mod gui {
     /// would let an NTP step or a DST change reopen a cooldown window.
     fn monotonic_ms(start: std::time::Instant) -> u64 {
         start.elapsed().as_millis() as u64
+    }
+
+    /// What the Grafana poll thread tells the UI.
+    enum GrafanaEvent {
+        Note { level: LogLevel, message: String },
+        Escalated { alert_id: String, detail: String, ok: bool },
+    }
+
+    struct GrafanaRuntime {
+        rx: std::sync::mpsc::Receiver<GrafanaEvent>,
+        _handle: std::thread::JoinHandle<()>,
+    }
+
+    /// The entire payload of a Grafana escalation: reaper's `RE-F` code and
+    /// the alert's own timestamp. The instance, group and account never leave.
+    fn grafana_escalation_subject(created_at: &str) -> String {
+        ec2_manager::reaper::escalation_subject(
+            ec2_manager::reaper::OutcomeCode::Failure,
+            created_at,
+        )
+    }
+
+    /// Whether a NEW incident may start this poll. Off call, or unable to
+    /// tell, starts nothing. An incident already running is not affected: it
+    /// was acknowledged by this machine and must be finished by it.
+    fn grafana_on_call_decision(lookup: std::result::Result<bool, String>) -> (bool, String) {
+        match lookup {
+            Ok(true) => (true, "grafana: on call — watching the feed".to_string()),
+            Ok(false) => (
+                false,
+                "grafana: off call — no new incident starts; anything already running finishes"
+                    .to_string(),
+            ),
+            Err(e) => (
+                false,
+                format!(
+                    "grafana: on-call lookup failed ({e}) — treating as off call, so no new \
+                     incident starts"
+                ),
+            ),
+        }
+    }
+
+    /// Why the Grafana watcher is or is not running, one line per fact. The
+    /// mailbox address is never put in a line: the app log gets pasted into
+    /// tickets.
+    fn grafana_gate_report(
+        mode: &Mode,
+        cfg: &ec2_manager::features::GrafanaFeature,
+        user: &str,
+        auth_complete: bool,
+        mailbox: Option<&str>,
+    ) -> (bool, Vec<(bool, String)>) {
+        let off = |why: String| (false, vec![(false, format!("grafana: off — {why}"))]);
+        if *mode != Mode::Live {
+            return off(format!(
+                "the app is in {} mode, not live. Every AWS read here needs Live",
+                mode.as_str()
+            ));
+        }
+        if !cfg.enabled {
+            return off("grafana.enabled is false in this build".to_string());
+        }
+        if !cfg.is_allowed_user(user) {
+            return off(format!(
+                "os_user '{user}' is not on grafana.allowed_users (note '*' is deliberately \
+                 not honoured here)"
+            ));
+        }
+        if !cfg.names_any_title() {
+            return off(
+                "grafana.title_contains is empty, so the matcher claims nothing; name the \
+                 alert titles this watcher may act on"
+                    .to_string(),
+            );
+        }
+        if !auth_complete {
+            return off("no JSM credentials resolved, so the alert feed cannot be read".to_string());
+        }
+        if mailbox.map(str::trim).unwrap_or("").is_empty() {
+            return off(
+                "no escalation mailbox is configured. It stays dark rather than running \
+                 acknowledge-only: silencing a live page and then never being able to ring is \
+                 worse than doing nothing"
+                    .to_string(),
+            );
+        }
+        let mut lines = Vec::new();
+        if cfg.has_multiple_users() {
+            lines.push((
+                true,
+                "grafana.allowed_users names more than one user; both machines will \
+                 acknowledge and both will terminate"
+                    .to_string(),
+            ));
+        }
+        lines.push((
+            false,
+            format!(
+                "grafana: armed, ON CALL ONLY — polling every {}s over the {} newest alert(s); \
+                 acknowledge, terminate the instance, wait for the replacement to be fully \
+                 running, then escalate once if the alert is still open {} minute(s) later \
+                 (or if no replacement is ready within {} minute(s)); titles ~{:?}",
+                cfg.poll_interval().as_secs(),
+                cfg.alerts_per_poll(),
+                cfg.settle_window().as_secs() / 60,
+                cfg.replacement_ceiling().as_secs() / 60,
+                cfg.title_contains
+            ),
+        ));
+        (true, lines)
+    }
+
+    /// The Grafana watcher's poll thread.
+    ///
+    /// **The order inside one poll is the design**: first the incidents
+    /// already running (watch the replacement, escalate a ceiling, check an
+    /// ended settle window), and only then new alerts off the feed. A new
+    /// alert for an ASG that already has an incident is a duplicate and is
+    /// acknowledged and ignored, so the replacement's own Missing-* alerts
+    /// can never terminate it.
+    fn start_grafana_poll(
+        auth: ec2_manager::alerts::AlertsAuth,
+        cfg: ec2_manager::features::GrafanaFeature,
+        reaper_cfg: ec2_manager::features::ReaperFeature,
+        unhealthy_cfg: ec2_manager::features::UnhealthyHostFeature,
+        app_config: ec2_manager::config::AppConfig,
+        mode: Mode,
+        mailbox: String,
+    ) -> GrafanaRuntime {
+        use ec2_manager::{alerts, grafana as gf, instance_age as ia, oncall, reaper};
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut state = gf::GrafanaState::new(gf::Timing::from_feature(&cfg));
+            let schedule_id = reaper_cfg.resolved_schedule_id();
+            let atlassian_id = reaper_cfg.resolved_atlassian_account_id();
+            let mut last_on_call: Option<bool> = None;
+
+            let note = |level: LogLevel, message: String| {
+                let _ = tx.send(GrafanaEvent::Note { level, message });
+            };
+
+            // Spawned, never run on this thread: `send_escalation_email`
+            // drives Outlook COM and takes seconds, and a hung mail client
+            // must not stall the watcher. A failed send is never retried.
+            let escalate = |alert_id: &str, created_at: &str, why: &str| {
+                let subject = grafana_escalation_subject(created_at);
+                let tx2 = tx.clone();
+                let mailbox2 = mailbox.clone();
+                let id = alert_id.to_string();
+                let _ = why;
+                std::thread::spawn(move || {
+                    let (ok, detail) = match send_escalation_email(&mailbox2, &subject) {
+                        Ok(address) => (true, format!("sent to {address}")),
+                        Err(reason) => (false, reason),
+                    };
+                    let _ = tx2.send(GrafanaEvent::Escalated { alert_id: id, detail, ok });
+                });
+            };
+
+            loop {
+                let now_ms = monotonic_ms(started);
+
+                let (on_call, reason) = grafana_on_call_decision(
+                    oncall::is_on_call(&auth, &schedule_id, &atlassian_id)
+                        .map_err(|e| e.to_string()),
+                );
+                if last_on_call != Some(on_call) {
+                    note(if on_call { LogLevel::Info } else { LogLevel::Warn }, reason);
+                    last_on_call = Some(on_call);
+                }
+
+                // 1. Incidents already running. These finish whether or not
+                //    we are still on call.
+                for step in state.due(now_ms) {
+                    match step {
+                        gf::Step::WatchReplacement(due) => {
+                            let ctx = match instance_age_context(&mode, &app_config, &due.facts) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    note(
+                                        LogLevel::Warn,
+                                        format!(
+                                            "grafana: {} — cannot watch {}: {e}; retrying",
+                                            due.alert_id, due.asg
+                                        ),
+                                    );
+                                    continue;
+                                }
+                            };
+                            let group = match read_group(&ctx, &due.asg) {
+                                Ok(g) => g,
+                                Err(e) => {
+                                    note(
+                                        LogLevel::Warn,
+                                        format!(
+                                            "grafana: {} — could not read {}: {e}; retrying",
+                                            due.alert_id, due.asg
+                                        ),
+                                    );
+                                    continue;
+                                }
+                            };
+                            let state_of = |id: &str| {
+                                fetch_instance_state(&ctx.profile, &ctx.region, id)
+                                    .unwrap_or_default()
+                            };
+                            if let Some(new_id) = gf::ready_replacement(
+                                &group.instances,
+                                &due.old_instance_id,
+                                &state_of,
+                            ) {
+                                note(
+                                    LogLevel::Warn,
+                                    format!(
+                                        "grafana: {} — {new_id} is fully running in {}; the \
+                                         alert has {} minute(s) to clear",
+                                        due.alert_id,
+                                        due.asg,
+                                        cfg.settle_window().as_secs() / 60
+                                    ),
+                                );
+                                state.replacement_ready(&due.asg, now_ms);
+                            }
+                        }
+                        gf::Step::CeilingReached(due) => {
+                            let why = format!(
+                                "no replacement for {} was fully running in {} after {} \
+                                 minute(s)",
+                                due.old_instance_id,
+                                due.asg,
+                                cfg.replacement_ceiling().as_secs() / 60
+                            );
+                            note(LogLevel::Error, format!("grafana: {} — {why}", due.alert_id));
+                            escalate(&due.alert_id, &due.created_at, &why);
+                            state.finish(&due.asg);
+                        }
+                        gf::Step::SettleEnded(due) => {
+                            // Re-read by id: an alert older than fetch_count
+                            // has fallen off the list, and its absence there
+                            // is not evidence it closed.
+                            match alerts::fetch_alert(&auth, &due.alert_id) {
+                                Ok(a) if reaper::alert_is_closed(&a.status) => {
+                                    note(
+                                        LogLevel::Info,
+                                        format!(
+                                            "grafana: {} closed on its own after the \
+                                             replacement came up — nothing to escalate",
+                                            due.alert_id
+                                        ),
+                                    );
+                                    state.finish(&due.asg);
+                                }
+                                Ok(_) => {
+                                    let why = format!(
+                                        "still open {} minute(s) after the replacement in {} \
+                                         was fully running",
+                                        cfg.settle_window().as_secs() / 60,
+                                        due.asg
+                                    );
+                                    note(
+                                        LogLevel::Error,
+                                        format!("grafana: {} — {why}", due.alert_id),
+                                    );
+                                    escalate(&due.alert_id, &due.created_at, &why);
+                                    state.finish(&due.asg);
+                                }
+                                // Neither frees the slot nor escalates: the
+                                // step comes back next poll.
+                                Err(e) => note(
+                                    LogLevel::Warn,
+                                    format!(
+                                        "grafana: could not re-read {}, still timing it: {e}",
+                                        due.alert_id
+                                    ),
+                                ),
+                            }
+                        }
+                    }
+                }
+
+                // 2. New alerts, on call only.
+                if on_call {
+                    match alerts::fetch_latest(&auth, cfg.alerts_per_poll()) {
+                        Ok(list) => {
+                            let mut claimed = 0usize;
+                            for listed in &list {
+                                if !gf::claims(listed, &cfg, &reaper_cfg, &unhealthy_cfg) {
+                                    continue;
+                                }
+                                if reaper::alert_is_closed(&listed.status)
+                                    || state.is_seen(&listed.id)
+                                {
+                                    continue;
+                                }
+                                // The list omits `description`, where the
+                                // instance id lives.
+                                let alert = match alerts::fetch_alert(&auth, &listed.id) {
+                                    Ok(a) => a,
+                                    Err(e) => {
+                                        note(
+                                            LogLevel::Warn,
+                                            format!(
+                                                "grafana: could not read {} in full: {e} — \
+                                                 will retry next poll",
+                                                listed.id
+                                            ),
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let facts = ia::parse_facts(&alert.description);
+                                if facts.instance_id.is_empty() {
+                                    note(
+                                        LogLevel::Warn,
+                                        format!(
+                                            "grafana: {} matches the title rules but names no \
+                                             readable instance id — nothing to act on",
+                                            alert.id
+                                        ),
+                                    );
+                                    state.mark_seen(&alert.id);
+                                    continue;
+                                }
+                                claimed += 1;
+                                state.mark_seen(&alert.id);
+                                // Acknowledge FIRST: every branch below
+                                // terminates, joins an incident or escalates.
+                                if let Err(e) = alerts::acknowledge_alert(&auth, &alert.id) {
+                                    note(
+                                        LogLevel::Warn,
+                                        format!(
+                                            "grafana: could not acknowledge {}: {e} — carrying on",
+                                            alert.id
+                                        ),
+                                    );
+                                }
+                                let ctx = match instance_age_context(&mode, &app_config, &facts) {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        note(LogLevel::Error, format!("grafana: {} — {e}", alert.id));
+                                        escalate(&alert.id, &alert.created_at, &e);
+                                        continue;
+                                    }
+                                };
+                                let asg_name = match instance_asg_group(
+                                    &ctx.profile,
+                                    &ctx.region,
+                                    &facts.instance_id,
+                                ) {
+                                    Ok(Some(n)) => n,
+                                    Ok(None) => {
+                                        let why = format!(
+                                            "{} carries no aws:autoscaling:groupName tag — \
+                                             nothing would replace it, so it is never \
+                                             terminated by this feature",
+                                            facts.instance_id
+                                        );
+                                        note(LogLevel::Error, format!("grafana: {} — {why}", alert.id));
+                                        escalate(&alert.id, &alert.created_at, &why);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        let why =
+                                            format!("could not read {}: {e}", facts.instance_id);
+                                        note(LogLevel::Error, format!("grafana: {} — {why}", alert.id));
+                                        escalate(&alert.id, &alert.created_at, &why);
+                                        continue;
+                                    }
+                                };
+                                match state.begin(&alert.id, &alert.created_at, &facts, &asg_name) {
+                                    gf::Begin::Duplicate { owner } => note(
+                                        LogLevel::Info,
+                                        format!(
+                                            "grafana: {} acknowledged — {owner} already owns \
+                                             {asg_name}, nothing else done",
+                                            alert.id
+                                        ),
+                                    ),
+                                    gf::Begin::Owner => {
+                                        note(
+                                            LogLevel::Warn,
+                                            format!(
+                                                "grafana: {} — terminating {} in {asg_name}",
+                                                alert.id, facts.instance_id
+                                            ),
+                                        );
+                                        match terminate_instance(
+                                            &ctx.profile,
+                                            &ctx.region,
+                                            &facts.instance_id,
+                                            &mode,
+                                        ) {
+                                            Ok(()) => {
+                                                note(
+                                                    LogLevel::Warn,
+                                                    format!(
+                                                        "grafana: {} — terminated {}; waiting \
+                                                         for {asg_name} to replace it",
+                                                        alert.id, facts.instance_id
+                                                    ),
+                                                );
+                                                state.terminated(&asg_name, now_ms);
+                                            }
+                                            Err(e) => {
+                                                let why = format!(
+                                                    "terminate of {} failed: {e}",
+                                                    facts.instance_id
+                                                );
+                                                note(
+                                                    LogLevel::Error,
+                                                    format!("grafana: {} — {why}", alert.id),
+                                                );
+                                                escalate(&alert.id, &alert.created_at, &why);
+                                                state.finish(&asg_name);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            note(
+                                LogLevel::Debug,
+                                format!(
+                                    "grafana: polled {} alert(s), {claimed} claimed, {} \
+                                     incident(s) running",
+                                    list.len(),
+                                    state.active_count()
+                                ),
+                            );
+                        }
+                        Err(e) => note(
+                            LogLevel::Warn,
+                            format!("grafana: could not read the alert feed: {e}"),
+                        ),
+                    }
+                }
+
+                std::thread::sleep(cfg.poll_interval());
+            }
+        });
+        GrafanaRuntime { rx, _handle: handle }
     }
 
     /// Seam over the two alert-API calls the remediation sequence makes
@@ -69075,6 +69595,82 @@ fed_expire = 4000000000
             }];
             let frozen = frozen_colors(&rows, &HashMap::new(), &BTreeMap::new(), &HashSet::new());
             assert!(frozen.is_empty());
+        }
+
+        #[test]
+        fn grafana_on_call_decision_fails_closed() {
+            assert!(grafana_on_call_decision(Ok(true)).0);
+            assert!(!grafana_on_call_decision(Ok(false)).0);
+            let (on, msg) = grafana_on_call_decision(Err("boom".to_string()));
+            assert!(!on, "a failed lookup counts as off call");
+            assert!(msg.contains("boom"));
+        }
+
+        #[test]
+        fn the_grafana_gate_names_each_dark_state() {
+            use ec2_manager::features::GrafanaFeature;
+            let live = Mode::Live;
+            let mut cfg = GrafanaFeature::default();
+            let (armed, lines) = grafana_gate_report(&live, &cfg, "me", true, Some("a@b"));
+            assert!(!armed && lines[0].1.contains("grafana.enabled is false"));
+
+            cfg.enabled = true;
+            let (armed, lines) = grafana_gate_report(&live, &cfg, "me", true, Some("a@b"));
+            assert!(!armed && lines[0].1.contains("not on grafana.allowed_users"));
+
+            cfg.allowed_users = vec!["me".to_string()];
+            let (armed, lines) = grafana_gate_report(&live, &cfg, "me", true, Some("a@b"));
+            assert!(!armed && lines[0].1.contains("title_contains is empty"));
+
+            cfg.title_contains = vec!["Grafana-Missing-Qualys-Info".to_string()];
+            let (armed, lines) = grafana_gate_report(&live, &cfg, "me", false, Some("a@b"));
+            assert!(!armed && lines[0].1.contains("no JSM credentials"));
+            let (armed, lines) = grafana_gate_report(&live, &cfg, "me", true, None);
+            assert!(!armed && lines[0].1.contains("no escalation mailbox"));
+            let (armed, _) = grafana_gate_report(&Mode::Sim, &cfg, "me", true, Some("a@b"));
+            assert!(!armed, "Sim never arms a live terminate");
+
+            let (armed, lines) = grafana_gate_report(&live, &cfg, "me", true, Some("a@b"));
+            assert!(armed);
+            let joined: String = lines.iter().map(|(_, m)| m.as_str()).collect();
+            assert!(joined.contains("12 minute") && joined.contains("25 minute"), "{joined}");
+            assert!(!joined.contains("a@b"), "the mailbox address never appears in a log line");
+        }
+
+        #[test]
+        fn grafana_escalates_with_nothing_but_a_code_and_a_time() {
+            let s = grafana_escalation_subject("2026-10-19T10:00:00Z");
+            assert_eq!(
+                s,
+                ec2_manager::reaper::escalation_subject(
+                    ec2_manager::reaper::OutcomeCode::Failure,
+                    "2026-10-19T10:00:00Z"
+                )
+            );
+        }
+
+        #[test]
+        fn grafana_outranks_instance_age_for_an_alert_both_would_match() {
+            use ec2_manager::features::*;
+            let g = GrafanaFeature {
+                title_contains: vec!["Missing-Qualys".to_string()],
+                ..Default::default()
+            };
+            let ia_cfg = InstanceAgeFeature {
+                message_contains: "Missing-Qualys".to_string(),
+                ..Default::default()
+            };
+            let alert = ec2_manager::alerts::Alert {
+                message: "Grafana-Missing-Qualys-Info".to_string(),
+                ..Default::default()
+            };
+            assert!(!ec2_manager::instance_age::claims(
+                &alert,
+                &ia_cfg,
+                &ReaperFeature::default(),
+                &UnhealthyHostFeature::default(),
+                &g
+            ));
         }
     }
 }
