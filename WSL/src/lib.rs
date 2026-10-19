@@ -20,6 +20,7 @@ pub mod filter;
 pub mod forwards;
 pub mod forwards_check;
 pub mod gui_cli;
+pub mod grafana;
 pub mod inventory;
 pub mod instance_age;
 pub mod jira;
