@@ -107,6 +107,7 @@ pub struct Features {
     /// instance so the ASG replaces it, escalate. Who may run it, and every
     /// tunable.
     pub instance_age: InstanceAgeFeature,
+    pub grafana: GrafanaFeature,
     /// Start / Stop / Restart from the Inventory right-click menu: who may
     /// see the entries.
     pub instance_power: InstancePowerFeature,
@@ -1208,6 +1209,96 @@ impl InstanceAgeFeature {
     }
 }
 
+/// The `grafana` section of `assets/features.json`.
+///
+/// Gates the Grafana watcher: acknowledge a `Grafana-Missing-*-Info` alert,
+/// terminate the instance it names (the Grafana ASG is always min 1 / max 1,
+/// so there is no health gate), wait for the replacement to be fully running,
+/// then escalate once if the alert is still open `settle_mins` later.
+///
+/// Ships disabled with an empty allow-list, and needs both, so a stray `["*"]`
+/// cannot arm live terminates for a site.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct GrafanaFeature {
+    /// Master switch. Off in the shipped file.
+    pub enabled: bool,
+    /// OS usernames permitted to run it. `"*"` is deliberately **not**
+    /// honoured: this acknowledges a live page, terminates an instance and
+    /// rings a phone with nobody watching.
+    pub allowed_users: Vec<String>,
+    /// Case-insensitive substrings of the alert **title** (`message`). Any
+    /// one matching claims the alert. **A blank entry matches nothing**: an
+    /// empty string is a substring of everything, and one stray `""` would
+    /// silently restore "terminate on every alert on the feed".
+    pub title_contains: Vec<String>,
+    /// Minutes, counted from the moment the replacement is fully running,
+    /// after which a still-open alert escalates.
+    pub settle_mins: u64,
+    /// Minutes, counted from the terminate, after which a replacement that
+    /// never became ready escalates anyway. Without it a failed launch would
+    /// never start the settle timer and nothing would ever page.
+    pub replacement_ceiling_mins: u64,
+    /// Feed poll interval.
+    pub poll_secs: u64,
+    /// Alerts pulled per poll.
+    pub fetch_count: u32,
+}
+
+impl GrafanaFeature {
+    /// True when `user` is on `allowed_users`, whether or not the feature is
+    /// enabled. Decides whether they see this watcher's log lines.
+    pub fn is_listed_user(&self, user: &str) -> bool {
+        names_user(&self.allowed_users, user)
+    }
+
+    /// True when `user` may run the watcher. `"*"` does not match.
+    pub fn is_allowed_user(&self, user: &str) -> bool {
+        self.enabled && names_user(&self.allowed_users, user)
+    }
+
+    /// True when `title_contains` names at least one non-blank title.
+    pub fn names_any_title(&self) -> bool {
+        self.title_contains.iter().any(|t| !t.trim().is_empty())
+    }
+
+    /// True when the list names more than one user. Two machines watching one
+    /// feed would both acknowledge and both terminate.
+    pub fn has_multiple_users(&self) -> bool {
+        self.allowed_users
+            .iter()
+            .filter(|a| !a.trim().is_empty())
+            .count()
+            > 1
+    }
+
+    fn mins_or(value: u64, default: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(60 * if value == 0 { default } else { value })
+    }
+
+    /// How long a still-open alert is given once the replacement is running.
+    pub fn settle_window(&self) -> std::time::Duration {
+        Self::mins_or(self.settle_mins, 12)
+    }
+
+    /// How long a replacement is given to become ready before escalating.
+    pub fn replacement_ceiling(&self) -> std::time::Duration {
+        Self::mins_or(self.replacement_ceiling_mins, 25)
+    }
+
+    pub fn poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(if self.poll_secs == 0 { 30 } else { self.poll_secs })
+    }
+
+    pub fn alerts_per_poll(&self) -> u32 {
+        if self.fetch_count == 0 {
+            10
+        } else {
+            self.fetch_count
+        }
+    }
+}
+
 impl ReaperFeature {
     /// True when `user` is on `allowed_users`, whether or not the feature is
     /// enabled. Decides whether they see this watcher's log lines; see
@@ -1544,6 +1635,7 @@ impl Default for Features {
             // Derived Default, and the same three reasons: off, nobody
             // allowed, no application named.
             instance_age: InstanceAgeFeature::default(),
+            grafana: GrafanaFeature::default(),
             // Derived Default: `enabled` false and an empty allow-list. Both
             // are required by the gate, so a features.json nobody can parse
             // hands out no power to stop a production instance.
@@ -1705,6 +1797,12 @@ impl Features {
     /// other.
     pub fn instance_age_enabled_for(&self, user: &str) -> bool {
         self.instance_age.is_allowed_user(user)
+    }
+
+    /// True when the Grafana watcher may run for `user`. Independent of the
+    /// other watchers' gates.
+    pub fn grafana_enabled_for(&self, user: &str) -> bool {
+        self.grafana.is_allowed_user(user)
     }
 
     /// True when the Inventory tab's **Start / Stop / Restart** entries
@@ -3363,5 +3461,103 @@ mod os_identity_tests {
         // Even a wildcard, which `user_in_list` otherwise honours: an
         // unidentified caller is not "everyone".
         assert!(!user_in_list(&["*".to_string()], ""));
+    }
+}
+
+#[cfg(test)]
+mod grafana_feature_tests {
+    use super::*;
+
+    #[test]
+    fn the_grafana_gate_needs_enabled_and_the_list_and_never_honours_a_wildcard() {
+        let mut cfg = GrafanaFeature {
+            allowed_users: vec!["bconrad".to_string()],
+            ..Default::default()
+        };
+        assert!(cfg.is_listed_user("bconrad"));
+        assert!(!cfg.is_allowed_user("bconrad"), "listed but not enabled");
+        cfg.enabled = true;
+        assert!(cfg.is_allowed_user("BCONRAD"), "case-insensitive");
+        assert!(!cfg.is_allowed_user("someone-else"));
+        assert!(!cfg.is_allowed_user(""), "an unknown user is on no list");
+
+        let wild = GrafanaFeature {
+            enabled: true,
+            allowed_users: vec!["*".to_string()],
+            ..Default::default()
+        };
+        assert!(!wild.is_allowed_user("bconrad"), "'*' is not honoured");
+        assert!(!wild.is_listed_user("bconrad"), "'*' does not open the log either");
+    }
+
+    #[test]
+    fn a_blank_title_entry_does_not_count_as_naming_a_title() {
+        assert!(!GrafanaFeature::default().names_any_title());
+        let blank = GrafanaFeature {
+            title_contains: vec!["".to_string(), "  ".to_string()],
+            ..Default::default()
+        };
+        assert!(!blank.names_any_title());
+        let named = GrafanaFeature {
+            title_contains: vec!["".to_string(), "Grafana-Missing-Qualys-Info".to_string()],
+            ..Default::default()
+        };
+        assert!(named.names_any_title());
+    }
+
+    #[test]
+    fn every_grafana_window_falls_back_to_its_default_rather_than_zero() {
+        let cfg = GrafanaFeature::default();
+        assert_eq!(cfg.settle_window().as_secs(), 12 * 60);
+        assert_eq!(cfg.replacement_ceiling().as_secs(), 25 * 60);
+        assert_eq!(cfg.poll_interval().as_secs(), 30);
+        assert_eq!(cfg.alerts_per_poll(), 10);
+
+        let set = GrafanaFeature {
+            settle_mins: 7,
+            replacement_ceiling_mins: 40,
+            poll_secs: 5,
+            fetch_count: 3,
+            ..Default::default()
+        };
+        assert_eq!(set.settle_window().as_secs(), 7 * 60);
+        assert_eq!(set.replacement_ceiling().as_secs(), 40 * 60);
+        assert_eq!(set.poll_interval().as_secs(), 5);
+        assert_eq!(set.alerts_per_poll(), 3);
+    }
+
+    #[test]
+    fn two_names_on_the_grafana_list_are_reported_as_such() {
+        let one = GrafanaFeature {
+            allowed_users: vec!["a".into(), "".into()],
+            ..Default::default()
+        };
+        assert!(!one.has_multiple_users());
+        let two = GrafanaFeature {
+            allowed_users: vec!["a".into(), "b".into()],
+            ..Default::default()
+        };
+        assert!(two.has_multiple_users());
+    }
+
+    #[test]
+    fn the_shipped_grafana_section_is_closed_and_carries_the_five_titles() {
+        let features: Features =
+            serde_json::from_str(include_str!("../assets/features.json")).expect("parses");
+        assert!(!features.grafana.enabled, "ships disabled");
+        assert!(features.grafana.allowed_users.is_empty(), "ships with nobody listed");
+        assert!(!features.grafana_enabled_for("bconrad"));
+        assert_eq!(features.grafana.settle_mins, 12);
+        assert_eq!(features.grafana.replacement_ceiling_mins, 25);
+        let titles = &features.grafana.title_contains;
+        for want in [
+            "Grafana-Missing-Filebeat-Info",
+            "Grafana-Missing-Qualys-Info",
+            "Grafana-Missing-Node-Exporter-Info",
+            "Grafana-Missing-SplunkForwarder-Info",
+            "Grafana-Missing-Crowdstrike-Info",
+        ] {
+            assert!(titles.iter().any(|t| t == want), "missing {want}");
+        }
     }
 }

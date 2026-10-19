@@ -206,6 +206,39 @@
     "poll_secs": 30,
     "fetch_count": 10
   },
+
+  "_grafana_comment": [
+    "Grafana watcher. Acknowledges a Grafana 'Missing-*-Info' alert, terminates",
+    "the instance named in its description (the Grafana auto scaling group is",
+    "always min 1 / max 1, so there is no health gate), waits for the",
+    "replacement to be fully running, then escalates once if the alert is still",
+    "open settle_mins later. Ships closed: set enabled and add your OS username",
+    "to allowed_users ('*' is NOT honoured).",
+    "",
+    "title_contains: case-insensitive substrings of the alert TITLE. Any one",
+    "claims the alert. A blank entry matches nothing. Add a new Missing-*-Info",
+    "alert by adding its name here.",
+    "settle_mins: minutes after the replacement is running before a still-open",
+    "alert escalates (default 12). replacement_ceiling_mins: minutes after the",
+    "terminate before a replacement that never came up escalates anyway",
+    "(default 25)."
+  ],
+  "grafana": {
+    "enabled": false,
+    "allowed_users": [],
+    "title_contains": [
+      "Grafana-Missing-Filebeat-Info",
+      "Grafana-Missing-Qualys-Info",
+      "Grafana-Missing-Node-Exporter-Info",
+      "Grafana-Missing-SplunkForwarder-Info",
+      "Grafana-Missing-Crowdstrike-Info"
+    ],
+    "settle_mins": 12,
+    "replacement_ceiling_mins": 25,
+    "poll_secs": 30,
+    "fetch_count": 10
+  },
+
   "_custom_alerts_comment": "Add/Update alert dialog in the Alerts window, and the poll thread behind it: user-defined watchers that match text in an alert summary, ACKNOWLEDGE it after a delay, and optionally ESCALATE (the RE-F email) if it is still open ack-delay + escalate-wait minutes after it was first seen. Acts only while you hold the on-call pager. BOTH keys are required: set enabled to true AND name the OS username in allowed_users. '*' is deliberately NOT honoured. A user who is not named sees none of it: no button, no dialog, no poll, no log lines. Shipped closed; add your username and rebuild.",
   "custom_alerts": {
     "enabled": false,
