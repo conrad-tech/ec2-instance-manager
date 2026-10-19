@@ -16,15 +16,16 @@
 //!    once if it has not.
 //!
 //! Five alerts usually fire for one outage. They are keyed on the ASG: the
-//! first owns the incident and every later one is acknowledged and otherwise
-//! ignored, including those the replacement itself raises while it boots.
+//! first owns the incident and every later one is acknowledged, recorded, and
+//! re-read with the owner at the settle end — including those the replacement
+//! itself raises while it boots, which must never terminate it.
 
 use crate::alerts::Alert;
 use crate::asg::AsgInstance;
 use crate::features::{GrafanaFeature, ReaperFeature, UnhealthyHostFeature};
 use crate::instance_age::AlertFacts;
 use crate::{reaper, unhealthy_host};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// `true` when `hay` contains `needle`, case-insensitively. **A blank needle
 /// matches nothing** — the same rule, copied rather than shared, as
@@ -89,6 +90,62 @@ pub fn ready_replacement(
         .map(|m| m.instance_id.clone())
 }
 
+/// The Grafana group is always min 1 / max 1 / desired 1. Anything else is
+/// not the group this watcher exists for, so it is never terminated by it.
+///
+/// The title rules match agents (Filebeat, Qualys, Node-Exporter…) that run
+/// on every host, so "five Missing-* alerts for one box" is what any host
+/// that stops reporting looks like. Without this, a hung Cassandra or Vault
+/// node would be terminated with no health gate. **It is a shape rule, not a
+/// name rule**: some other 1/1/1 group would still pass.
+pub fn group_shape_ok(min: i64, max: i64, desired: i64) -> Result<(), String> {
+    if (min, max, desired) == (1, 1, 1) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the auto scaling group is min {min} / max {max} / desired {desired}, not the \
+             1/1/1 Grafana group"
+        ))
+    }
+}
+
+/// How many consecutive polls the settle-end re-read may fail before the
+/// incident is escalated as unconfirmed rather than timed forever.
+pub const MAX_REREAD_FAILURES: u32 = 5;
+
+/// What the re-reads at the end of the settle window say about the owner and
+/// its duplicates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SettleVerdict {
+    /// Every alert was read, and every one is closed.
+    AllClosed,
+    /// `open` of the `of` alerts read back still open. Escalate now, whatever
+    /// else failed to read: still-open evidence beats a failed read of a
+    /// sibling.
+    StillOpen { open: usize, of: usize },
+}
+
+/// Decide the settle end from each alert's re-read: `Ok(true)` closed,
+/// `Ok(false)` still open, `Err` could not be read.
+///
+/// `Err` means "nothing known open, and at least one alert unread" — **never
+/// read as closed**. The text names only the failed reads.
+pub fn settle_verdict(reads: &[(String, Result<bool, String>)]) -> Result<SettleVerdict, String> {
+    let open = reads.iter().filter(|(_, r)| matches!(r, Ok(false))).count();
+    if open > 0 {
+        return Ok(SettleVerdict::StillOpen { open, of: reads.len() });
+    }
+    let failed: Vec<String> = reads
+        .iter()
+        .filter_map(|(id, r)| r.as_ref().err().map(|e| format!("{id}: {e}")))
+        .collect();
+    if failed.is_empty() {
+        Ok(SettleVerdict::AllClosed)
+    } else {
+        Err(failed.join("; "))
+    }
+}
+
 /// The two windows, in milliseconds, so the state machine never reads the
 /// feature struct and every test can name its own numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +184,11 @@ pub struct Due {
     pub facts: AlertFacts,
     /// The instance that was terminated, so the replacement is never it.
     pub old_instance_id: String,
+    /// Every duplicate alert acknowledged for this incident, sorted and
+    /// deduped. Re-read at the settle end with the owner: the owner can close
+    /// because the old box is gone while the replacement's own alert is still
+    /// open, and that one must still page.
+    pub duplicates: Vec<String>,
 }
 
 /// What the caller should do about an incident this poll.
@@ -138,19 +200,25 @@ pub enum Step {
     /// The replacement never became ready: escalate, then
     /// [`GrafanaState::finish`].
     CeilingReached(Due),
-    /// Re-read the alert. Closed: log and [`GrafanaState::finish`]. Still
-    /// open: escalate, then finish. A failed read: do nothing; this step is
-    /// handed back next poll.
+    /// Re-read the owner **and every duplicate** and hand the results to
+    /// [`settle_verdict`]. All closed: log and [`GrafanaState::finish`]. Any
+    /// open: escalate, then finish. A failed read with nothing known open:
+    /// [`GrafanaState::reread_failed`]; this step is handed back next poll
+    /// until that gives up.
     SettleEnded(Due),
 }
 
 #[derive(Clone, Debug)]
 enum Phase {
-    /// Begun, terminate not yet issued (or just failed and about to be
-    /// finished). Nothing is due.
+    /// Begun, terminate not yet issued. Nothing is due.
     Starting,
     Replacing { deadline_ms: u64 },
     Settling { deadline_ms: u64 },
+    /// Refused or failed, already escalated once. Holds the slot so the rest
+    /// of the outage's alerts are duplicates rather than five more attempts
+    /// and five more pages. Nothing is ever due; freed by
+    /// [`GrafanaState::expire_failed`].
+    Failed { until_ms: u64 },
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +227,8 @@ struct Incident {
     created_at: String,
     facts: AlertFacts,
     phase: Phase,
+    duplicates: BTreeSet<String>,
+    reread_failures: u32,
 }
 
 /// What this process has decided, and what it is still waiting on.
@@ -215,6 +285,8 @@ impl GrafanaState {
                 created_at: created_at.to_string(),
                 facts: facts.clone(),
                 phase: Phase::Starting,
+                duplicates: BTreeSet::new(),
+                reread_failures: 0,
             },
         );
         Begin::Owner
@@ -257,6 +329,7 @@ impl GrafanaState {
                 asg: asg.clone(),
                 facts: i.facts.clone(),
                 old_instance_id: i.facts.instance_id.clone(),
+                duplicates: i.duplicates.iter().cloned().collect(),
             };
             match i.phase {
                 Phase::Starting => {}
@@ -268,9 +341,55 @@ impl GrafanaState {
                     out.push(Step::SettleEnded(due()))
                 }
                 Phase::Settling { .. } => {}
+                Phase::Failed { .. } => {}
             }
         }
         out
+    }
+
+    /// A refusal or a failed terminate, already escalated: hold the slot for
+    /// `ceiling_ms` so later alerts for the same outage are duplicates. A
+    /// no-op when there is no incident.
+    pub fn failed(&mut self, asg: &str, now_ms: u64) {
+        if let Some(i) = self.incidents.get_mut(asg) {
+            i.phase = Phase::Failed { until_ms: now_ms.saturating_add(self.timing.ceiling_ms) };
+        }
+    }
+
+    /// Free every Failed lockout whose time is up. Never touches a live one.
+    pub fn expire_failed(&mut self, now_ms: u64) {
+        self.incidents
+            .retain(|_, i| !matches!(i.phase, Phase::Failed { until_ms } if now_ms >= until_ms));
+    }
+
+    /// Record a duplicate the caller acknowledged, so the settle end re-reads
+    /// it. Never changes the phase or a deadline; a no-op with no incident,
+    /// and the owner is never its own duplicate.
+    pub fn add_duplicate(&mut self, asg: &str, alert_id: &str) {
+        if let Some(i) = self.incidents.get_mut(asg) {
+            if i.alert_id != alert_id {
+                i.duplicates.insert(alert_id.to_string());
+            }
+        }
+    }
+
+    /// A settle-end re-read failed this poll. `true` once it has failed
+    /// [`MAX_REREAD_FAILURES`] polls running: escalate and finish.
+    pub fn reread_failed(&mut self, asg: &str) -> bool {
+        match self.incidents.get_mut(asg) {
+            Some(i) => {
+                i.reread_failures = i.reread_failures.saturating_add(1);
+                i.reread_failures >= MAX_REREAD_FAILURES
+            }
+            None => false,
+        }
+    }
+
+    /// Every re-read succeeded: the failure count starts again.
+    pub fn reread_ok(&mut self, asg: &str) {
+        if let Some(i) = self.incidents.get_mut(asg) {
+            i.reread_failures = 0;
+        }
     }
 
     /// The incident is over: closed, escalated, refused or failed. Frees the
@@ -573,6 +692,284 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, vec!["a-asg".to_string(), "b-asg".to_string()]);
+    }
+
+    // ---- the 1/1/1 group shape (C1) ------------------------------------
+
+    #[test]
+    fn only_a_one_one_one_group_is_the_grafana_group() {
+        assert_eq!(group_shape_ok(1, 1, 1), Ok(()));
+        for (min, max, desired) in [(1, 1, 0), (0, 1, 1), (1, 2, 1), (2, 2, 2), (0, 0, 0)] {
+            let why = group_shape_ok(min, max, desired).expect_err("not 1/1/1");
+            assert!(
+                why.contains(&format!("min {min} / max {max} / desired {desired}")),
+                "{why}"
+            );
+            assert!(why.contains("not the 1/1/1 Grafana group"), "{why}");
+        }
+    }
+
+    // ---- the Failed lockout (I3) ---------------------------------------
+
+    fn ceiling() -> u64 {
+        timing().ceiling_ms
+    }
+
+    #[test]
+    fn a_failed_incident_holds_the_slot_so_five_alerts_cost_one_attempt() {
+        let mut s = GrafanaState::new(timing());
+        assert_eq!(s.begin("a1", "t", &facts("i-old"), "g"), Begin::Owner);
+        s.failed("g", 1_000);
+        for id in ["a2", "a3", "a4", "a5"] {
+            assert_eq!(
+                s.begin(id, "t", &facts("i-old"), "g"),
+                Begin::Duplicate { owner: "a1".to_string() },
+                "{id} must not become a second owner"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_ever_due_for_a_failed_incident() {
+        let mut s = GrafanaState::new(timing());
+        s.begin("a1", "t", &facts("i-old"), "g");
+        s.terminated("g", 0);
+        s.failed("g", 0);
+        for now in [0, 1, ceiling() - 1, ceiling(), ceiling() * 10, u64::MAX] {
+            assert!(s.due(now).is_empty(), "at {now}");
+        }
+        // Also from Settling.
+        let mut s = GrafanaState::new(timing());
+        s.begin("a1", "t", &facts("i-old"), "g");
+        s.terminated("g", 0);
+        s.replacement_ready("g", 0);
+        s.failed("g", 0);
+        assert!(s.due(u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn a_failed_lockout_expires_after_the_ceiling() {
+        let mut s = GrafanaState::new(timing());
+        s.begin("a1", "t", &facts("i-old"), "g");
+        s.failed("g", 1_000);
+        s.expire_failed(1_000 + ceiling() - 1);
+        assert_eq!(s.owner_of("g"), Some("a1"), "kept before until_ms");
+        s.expire_failed(1_000 + ceiling());
+        assert_eq!(s.owner_of("g"), None, "freed at until_ms");
+        assert_eq!(s.begin("a9", "t", &facts("i-old"), "g"), Begin::Owner);
+    }
+
+    #[test]
+    fn expire_failed_never_touches_a_live_incident() {
+        let mut s = GrafanaState::new(timing());
+        s.begin("a1", "t", &facts("i-1"), "live");
+        s.terminated("live", 0);
+        s.begin("a2", "t", &facts("i-2"), "starting");
+        s.expire_failed(u64::MAX);
+        assert_eq!(s.active_count(), 2);
+    }
+
+    #[test]
+    fn failed_on_a_missing_incident_is_a_no_op() {
+        let mut s = GrafanaState::new(timing());
+        s.failed("nothing", 0);
+        assert_eq!(s.active_count(), 0);
+        assert_eq!(s.begin("a1", "t", &facts("i-1"), "nothing"), Begin::Owner);
+    }
+
+    #[test]
+    fn finish_still_removes_a_failed_incident_at_once() {
+        let mut s = GrafanaState::new(timing());
+        s.begin("a1", "t", &facts("i-old"), "g");
+        s.failed("g", 0);
+        s.finish("g");
+        assert_eq!(s.begin("a2", "t", &facts("i-old"), "g"), Begin::Owner);
+    }
+
+    #[test]
+    fn a_pre_asg_refusal_is_keyed_on_the_instance() {
+        // Before the ASG is known the caller keys the lockout on the instance.
+        let key = format!("instance {}", "i-0abc");
+        let mut s = GrafanaState::new(timing());
+        assert_eq!(s.begin("a1", "t", &facts("i-0abc"), &key), Begin::Owner);
+        s.failed(&key, 0);
+        assert_eq!(
+            s.begin("a2", "t", &facts("i-0abc"), &key),
+            Begin::Duplicate { owner: "a1".to_string() }
+        );
+        assert!(s.due(u64::MAX).is_empty());
+        s.expire_failed(ceiling());
+        assert_eq!(s.begin("a3", "t", &facts("i-0abc"), &key), Begin::Owner);
+    }
+
+    // ---- duplicates re-checked at settle end (I2) ----------------------
+
+    fn settled(s: &mut GrafanaState, asg: &str) {
+        s.begin("a1", "t1", &facts("i-old"), asg);
+        s.terminated(asg, 0);
+        s.replacement_ready(asg, 0);
+    }
+
+    #[test]
+    fn duplicates_are_handed_back_at_settle_end() {
+        let mut s = GrafanaState::new(timing());
+        settled(&mut s, "g");
+        s.add_duplicate("g", "d-new");
+        match s.due(timing().settle_ms).as_slice() {
+            [Step::SettleEnded(d)] => {
+                assert_eq!(d.alert_id, "a1");
+                assert_eq!(d.duplicates, vec!["d-new".to_string()]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_incident_with_no_duplicates_hands_back_an_empty_list() {
+        let mut s = GrafanaState::new(timing());
+        settled(&mut s, "g");
+        match s.due(timing().settle_ms).as_slice() {
+            [Step::SettleEnded(d)] => assert!(d.duplicates.is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn adding_a_duplicate_never_moves_a_deadline() {
+        // Replacing: the ceiling boundary is unchanged.
+        let mut s = GrafanaState::new(timing());
+        s.begin("a1", "t1", &facts("i-old"), "g");
+        s.terminated("g", 1_000);
+        let ceil = 1_000 + ceiling();
+        assert!(matches!(s.due(ceil - 1).as_slice(), [Step::WatchReplacement(_)]));
+        assert!(matches!(s.due(ceil).as_slice(), [Step::CeilingReached(_)]));
+        s.add_duplicate("g", "d1");
+        s.add_duplicate("g", "d2");
+        assert!(matches!(s.due(ceil - 1).as_slice(), [Step::WatchReplacement(_)]));
+        assert!(matches!(s.due(ceil).as_slice(), [Step::CeilingReached(_)]));
+        // Settling: the settle boundary is unchanged.
+        let mut s = GrafanaState::new(timing());
+        s.begin("a1", "t1", &facts("i-old"), "g");
+        s.terminated("g", 0);
+        s.replacement_ready("g", 5_000);
+        let end = 5_000 + timing().settle_ms;
+        assert!(s.due(end - 1).is_empty());
+        s.add_duplicate("g", "d1");
+        assert!(s.due(end - 1).is_empty());
+        assert!(matches!(s.due(end).as_slice(), [Step::SettleEnded(_)]));
+        // Starting: still nothing due.
+        let mut s = GrafanaState::new(timing());
+        s.begin("a1", "t1", &facts("i-old"), "g");
+        s.add_duplicate("g", "d1");
+        assert!(s.due(u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn duplicate_ids_are_deduped_and_sorted() {
+        let mut s = GrafanaState::new(timing());
+        settled(&mut s, "g");
+        for id in ["d3", "d1", "d3", "d2", "d1"] {
+            s.add_duplicate("g", id);
+        }
+        match s.due(timing().settle_ms).as_slice() {
+            [Step::SettleEnded(d)] => assert_eq!(d.duplicates, vec!["d1", "d2", "d3"]),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn adding_a_duplicate_to_a_missing_asg_is_a_no_op() {
+        let mut s = GrafanaState::new(timing());
+        s.add_duplicate("nobody", "d1");
+        assert_eq!(s.active_count(), 0);
+        assert_eq!(s.owner_of("nobody"), None);
+    }
+
+    #[test]
+    fn the_owner_is_never_listed_as_its_own_duplicate() {
+        let mut s = GrafanaState::new(timing());
+        settled(&mut s, "g");
+        s.add_duplicate("g", "a1");
+        match s.due(timing().settle_ms).as_slice() {
+            [Step::SettleEnded(d)] => assert!(d.duplicates.is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // ---- the settle verdict (I2) ---------------------------------------
+
+    fn read(id: &str, r: Result<bool, &str>) -> (String, Result<bool, String>) {
+        (id.to_string(), r.map_err(|e| e.to_string()))
+    }
+
+    #[test]
+    fn every_alert_closed_is_nothing_to_escalate() {
+        let reads = [read("a1", Ok(true)), read("d1", Ok(true))];
+        assert_eq!(settle_verdict(&reads), Ok(SettleVerdict::AllClosed));
+    }
+
+    #[test]
+    fn any_open_alert_escalates_even_if_the_owner_closed() {
+        let reads = [read("a1", Ok(true)), read("d1", Ok(false)), read("d2", Ok(false))];
+        assert_eq!(settle_verdict(&reads), Ok(SettleVerdict::StillOpen { open: 2, of: 3 }));
+        assert_eq!(
+            settle_verdict(&[read("a1", Ok(false))]),
+            Ok(SettleVerdict::StillOpen { open: 1, of: 1 })
+        );
+    }
+
+    #[test]
+    fn still_open_evidence_beats_a_failed_read_of_a_sibling() {
+        let reads = [read("a1", Err("timeout")), read("d1", Ok(false))];
+        assert_eq!(settle_verdict(&reads), Ok(SettleVerdict::StillOpen { open: 1, of: 2 }));
+    }
+
+    #[test]
+    fn a_failed_read_with_nothing_known_open_is_never_closed() {
+        let reads = [read("a1", Ok(true)), read("d1", Err("HTTP 401"))];
+        let why = settle_verdict(&reads).expect_err("unread is not closed");
+        assert!(why.contains("d1") && why.contains("HTTP 401"), "{why}");
+        assert!(!why.contains("a1"), "only the failed reads are named: {why}");
+    }
+
+    // ---- the bounded settle re-read (M-a) ------------------------------
+
+    #[test]
+    fn the_settle_reread_gives_up_on_the_fifth_consecutive_failure() {
+        assert_eq!(MAX_REREAD_FAILURES, 5);
+        let mut s = GrafanaState::new(timing());
+        settled(&mut s, "g");
+        for n in 1..MAX_REREAD_FAILURES {
+            assert!(!s.reread_failed("g"), "failure {n} keeps timing");
+        }
+        assert!(s.reread_failed("g"), "the fifth gives up");
+    }
+
+    #[test]
+    fn a_successful_read_resets_the_failure_count() {
+        let mut s = GrafanaState::new(timing());
+        settled(&mut s, "g");
+        for _ in 1..MAX_REREAD_FAILURES {
+            assert!(!s.reread_failed("g"));
+        }
+        s.reread_ok("g");
+        for _ in 1..MAX_REREAD_FAILURES {
+            assert!(!s.reread_failed("g"), "counting again from zero");
+        }
+        assert!(s.reread_failed("g"));
+    }
+
+    #[test]
+    fn the_failure_count_is_per_incident() {
+        let mut s = GrafanaState::new(timing());
+        settled(&mut s, "g1");
+        settled(&mut s, "g2");
+        for _ in 1..MAX_REREAD_FAILURES {
+            assert!(!s.reread_failed("g1"));
+        }
+        assert!(!s.reread_failed("g2"), "g2 has its own count");
+        assert!(s.reread_failed("g1"));
+        assert!(!s.reread_failed("missing"), "no incident, nothing to give up on");
     }
 
     #[test]

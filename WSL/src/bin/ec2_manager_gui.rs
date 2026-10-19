@@ -5489,6 +5489,32 @@ mod gui {
             Err(e) => return fail(&mut end, format!("could not read {}: {e}", facts.instance_id)),
         };
 
+        let escalate = |why: &str| {
+            note(LogLevel::Error, format!("{alert_id} — {why}"));
+            match env.mailbox.as_deref() {
+                Some(m) if !m.trim().is_empty() => {
+                    match send_escalation_email(m, &grafana_escalation_subject(&alert.created_at)) {
+                        // The address is never logged: the app log gets pasted into tickets.
+                        Ok(_) => note(LogLevel::Warn, "escalation sent".to_string()),
+                        Err(e) => note(LogLevel::Error, format!("escalation FAILED TO SEND — {e}")),
+                    }
+                }
+                _ => note(LogLevel::Error, "no escalation mailbox is configured — nothing was sent".to_string()),
+            }
+        };
+
+        // C1: the Grafana group is always 1/1/1. Anything else is somebody
+        // else's box — refused before anything is acknowledged or terminated,
+        // and paged, as the poll does.
+        if let Err(why) = read_group(&ctx, &asg_name)
+            .and_then(|g| gf::group_shape_ok(g.min_size, g.max_size, g.desired_capacity))
+        {
+            let why = format!("{asg_name}: {why} — {} is not terminated", facts.instance_id);
+            fail(&mut end, why.clone());
+            escalate(&why);
+            return;
+        }
+
         let on_call = match oncall::is_on_call(
             &env.auth,
             &env.reaper_cfg.resolved_schedule_id(),
@@ -5517,20 +5543,6 @@ mod gui {
             LogLevel::Warn,
             format!("{alert_id} — terminated {}; waiting for {asg_name} to replace it", facts.instance_id),
         );
-
-        let escalate = |why: &str| {
-            note(LogLevel::Error, format!("{alert_id} — {why}"));
-            match env.mailbox.as_deref() {
-                Some(m) if !m.trim().is_empty() => {
-                    match send_escalation_email(m, &grafana_escalation_subject(&alert.created_at)) {
-                        // The address is never logged: the app log gets pasted into tickets.
-                        Ok(_) => note(LogLevel::Warn, "escalation sent".to_string()),
-                        Err(e) => note(LogLevel::Error, format!("escalation FAILED TO SEND — {e}")),
-                    }
-                }
-                _ => note(LogLevel::Error, "no escalation mailbox is configured — nothing was sent".to_string()),
-            }
-        };
 
         // Wait for the replacement, once per poll interval, up to the ceiling.
         let ceiling = std::time::Instant::now() + cfg.replacement_ceiling();
@@ -5564,12 +5576,30 @@ mod gui {
         );
 
         std::thread::sleep(cfg.settle_window());
-        // A failed read is retried; it is never read as closed.
+        // A failed read is retried; it is never read as closed. It is
+        // bounded: after MAX_REREAD_FAILURES in a row the alert is escalated
+        // as unconfirmed rather than this thread waiting forever. Only this
+        // alert is re-read — the manual path has no duplicate tracking.
+        let mut failures = 0u32;
         let still_open = loop {
             match alerts::fetch_alert(&env.auth, &alert_id) {
                 Ok(a) => break !reaper::alert_is_closed(&a.status),
                 Err(e) => {
+                    failures += 1;
                     note(LogLevel::Warn, format!("could not re-read {alert_id}, retrying: {e}"));
+                    if failures >= gf::MAX_REREAD_FAILURES {
+                        escalate(&format!(
+                            "could not re-read {alert_id} after {} attempts — escalating as still \
+                             open (unconfirmed)",
+                            gf::MAX_REREAD_FAILURES
+                        ));
+                        end.status = AlertActionStatus::Failed(format!(
+                            "alert {alert_id}: replaced {} with {new_id}, but the alert could not \
+                             be re-read — escalated",
+                            facts.instance_id
+                        ));
+                        return;
+                    }
                     std::thread::sleep(cfg.poll_interval());
                 }
             }
@@ -45768,6 +45798,11 @@ mod gui {
                     last_on_call = Some(on_call);
                 }
 
+                // A refused or failed incident holds its slot for the
+                // replacement ceiling, so the rest of that outage's alerts are
+                // duplicates rather than five attempts and five pages.
+                state.expire_failed(now_ms);
+
                 // 1. Incidents already running. These finish whether or not
                 //    we are still on call.
                 for step in state.due(now_ms) {
@@ -45834,25 +45869,43 @@ mod gui {
                             state.finish(&due.asg);
                         }
                         gf::Step::SettleEnded(due) => {
-                            // Re-read by id: an alert older than fetch_count
-                            // has fallen off the list, and its absence there
-                            // is not evidence it closed.
-                            match alerts::fetch_alert(&auth, &due.alert_id) {
-                                Ok(a) if reaper::alert_is_closed(&a.status) => {
+                            // Re-read by id, the owner AND every duplicate:
+                            // an alert older than fetch_count has fallen off
+                            // the list, and its absence there is not evidence
+                            // it closed. The owner can close because the old
+                            // box is gone while the replacement's own alert
+                            // stays open — and that one must still page.
+                            let reads: Vec<(String, std::result::Result<bool, String>)> =
+                                std::iter::once(&due.alert_id)
+                                    .chain(due.duplicates.iter())
+                                    .map(|id| {
+                                        let r = alerts::fetch_alert(&auth, id)
+                                            .map(|a| reaper::alert_is_closed(&a.status))
+                                            .map_err(|e| e.to_string());
+                                        (id.clone(), r)
+                                    })
+                                    .collect();
+                            if reads.iter().all(|(_, r)| r.is_ok()) {
+                                state.reread_ok(&due.asg);
+                            }
+                            let verdict = gf::settle_verdict(&reads);
+                            match &verdict {
+                                Ok(gf::SettleVerdict::AllClosed) => {
                                     note(
                                         LogLevel::Info,
                                         format!(
-                                            "grafana: {} closed on its own after the \
-                                             replacement came up — nothing to escalate",
-                                            due.alert_id
+                                            "grafana: {} and its {} duplicate(s) closed after \
+                                             the replacement came up — nothing to escalate",
+                                            due.alert_id,
+                                            due.duplicates.len()
                                         ),
                                     );
                                     state.finish(&due.asg);
                                 }
-                                Ok(_) => {
+                                Ok(gf::SettleVerdict::StillOpen { open, of }) => {
                                     let why = format!(
-                                        "still open {} minute(s) after the replacement in {} \
-                                         was fully running",
+                                        "{open} of {of} alert(s) still open {} minute(s) after \
+                                         the replacement in {} was fully running",
                                         cfg.settle_window().as_secs() / 60,
                                         due.asg
                                     );
@@ -45868,10 +45921,24 @@ mod gui {
                                 Err(e) => note(
                                     LogLevel::Warn,
                                     format!(
-                                        "grafana: could not re-read {}, still timing it: {e}",
+                                        "grafana: could not re-read the alert(s) for {}, \
+                                         still timing it: {e}",
                                         due.alert_id
                                     ),
                                 ),
+                            }
+                            // The give-up, separate from the retry note above:
+                            // only after MAX_REREAD_FAILURES polls running.
+                            if verdict.is_err() && state.reread_failed(&due.asg) {
+                                let why = format!(
+                                    "could not re-read the alert(s) for {} after {} attempts — \
+                                     escalating as still open (unconfirmed)",
+                                    due.asg,
+                                    gf::MAX_REREAD_FAILURES
+                                );
+                                note(LogLevel::Error, format!("grafana: {} — {why}", due.alert_id));
+                                escalate(&due.alert_id, &due.created_at, &why);
+                                state.finish(&due.asg);
                             }
                         }
                     }
@@ -45907,6 +45974,23 @@ mod gui {
                                         continue;
                                     }
                                 };
+                                // Already acknowledged — by a person working it, or
+                                // by an earlier run of this app before a restart.
+                                // Either way it is somebody's: acting on it could
+                                // terminate a replacement or a box being fixed by
+                                // hand.
+                                if alert.acknowledged {
+                                    note(
+                                        LogLevel::Info,
+                                        format!(
+                                            "grafana: {} is already acknowledged — leaving it \
+                                             to whoever took it",
+                                            alert.id
+                                        ),
+                                    );
+                                    state.mark_seen(&alert.id);
+                                    continue;
+                                }
                                 let facts = ia::parse_facts(&alert.description);
                                 if facts.instance_id.is_empty() {
                                     note(
@@ -45933,49 +46017,93 @@ mod gui {
                                         ),
                                     );
                                 }
-                                let ctx = match instance_age_context(&mode, &app_config, &facts) {
-                                    Ok(c) => c,
-                                    Err(e) => {
-                                        note(LogLevel::Error, format!("grafana: {} — {e}", alert.id));
-                                        escalate(&alert.id, &alert.created_at, &e);
-                                        continue;
-                                    }
-                                };
-                                let asg_name = match instance_asg_group(
-                                    &ctx.profile,
-                                    &ctx.region,
-                                    &facts.instance_id,
-                                ) {
-                                    Ok(Some(n)) => n,
-                                    Ok(None) => {
-                                        let why = format!(
+                                // Everything before the ASG is known. A refusal
+                                // here is keyed on the instance, so the other
+                                // alerts for the same box do not page again.
+                                let located = match instance_age_context(&mode, &app_config, &facts) {
+                                    Err(e) => Err(e),
+                                    Ok(ctx) => match instance_asg_group(
+                                        &ctx.profile,
+                                        &ctx.region,
+                                        &facts.instance_id,
+                                    ) {
+                                        Ok(Some(n)) => Ok((ctx, n)),
+                                        Ok(None) => Err(format!(
                                             "{} carries no aws:autoscaling:groupName tag — \
                                              nothing would replace it, so it is never \
                                              terminated by this feature",
                                             facts.instance_id
-                                        );
-                                        note(LogLevel::Error, format!("grafana: {} — {why}", alert.id));
-                                        escalate(&alert.id, &alert.created_at, &why);
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        let why =
-                                            format!("could not read {}: {e}", facts.instance_id);
-                                        note(LogLevel::Error, format!("grafana: {} — {why}", alert.id));
-                                        escalate(&alert.id, &alert.created_at, &why);
+                                        )),
+                                        Err(e) => {
+                                            Err(format!("could not read {}: {e}", facts.instance_id))
+                                        }
+                                    },
+                                };
+                                let (ctx, asg_name) = match located {
+                                    Ok(v) => v,
+                                    Err(why) => {
+                                        let key = format!("instance {}", facts.instance_id);
+                                        match state.begin(&alert.id, &alert.created_at, &facts, &key) {
+                                            gf::Begin::Owner => {
+                                                note(
+                                                    LogLevel::Error,
+                                                    format!("grafana: {} — {why}", alert.id),
+                                                );
+                                                escalate(&alert.id, &alert.created_at, &why);
+                                                state.failed(&key, now_ms);
+                                            }
+                                            gf::Begin::Duplicate { owner } => note(
+                                                LogLevel::Info,
+                                                format!(
+                                                    "grafana: {} acknowledged — already handled \
+                                                     with {owner} ({why}); not escalated again",
+                                                    alert.id
+                                                ),
+                                            ),
+                                        }
                                         continue;
                                     }
                                 };
                                 match state.begin(&alert.id, &alert.created_at, &facts, &asg_name) {
-                                    gf::Begin::Duplicate { owner } => note(
-                                        LogLevel::Info,
-                                        format!(
-                                            "grafana: {} acknowledged — {owner} already owns \
-                                             {asg_name}, nothing else done",
-                                            alert.id
-                                        ),
-                                    ),
+                                    gf::Begin::Duplicate { owner } => {
+                                        note(
+                                            LogLevel::Info,
+                                            format!(
+                                                "grafana: {} acknowledged — {owner} already owns \
+                                                 {asg_name}; it is re-read at the settle end",
+                                                alert.id
+                                            ),
+                                        );
+                                        // Acknowledged or not (we tried): the
+                                        // settle end must look at it, or an open
+                                        // replacement alert goes silent.
+                                        state.add_duplicate(&asg_name, &alert.id);
+                                    }
                                     gf::Begin::Owner => {
+                                        // C1: the Grafana group is always 1/1/1.
+                                        // The title rules match agents on every
+                                        // host, so anything else is somebody
+                                        // else's box and is never terminated.
+                                        let shape = read_group(&ctx, &asg_name).and_then(|g| {
+                                            gf::group_shape_ok(
+                                                g.min_size,
+                                                g.max_size,
+                                                g.desired_capacity,
+                                            )
+                                        });
+                                        if let Err(why) = shape {
+                                            let why = format!(
+                                                "{asg_name}: {why} — {} is not terminated",
+                                                facts.instance_id
+                                            );
+                                            note(
+                                                LogLevel::Error,
+                                                format!("grafana: {} — {why}", alert.id),
+                                            );
+                                            escalate(&alert.id, &alert.created_at, &why);
+                                            state.failed(&asg_name, now_ms);
+                                            continue;
+                                        }
                                         note(
                                             LogLevel::Warn,
                                             format!(
@@ -46010,7 +46138,10 @@ mod gui {
                                                     format!("grafana: {} — {why}", alert.id),
                                                 );
                                                 escalate(&alert.id, &alert.created_at, &why);
-                                                state.finish(&asg_name);
+                                                // Held, never freed: the rest of
+                                                // this outage's alerts must not
+                                                // retry the terminate and page again.
+                                                state.failed(&asg_name, now_ms);
                                             }
                                         }
                                     }
@@ -54120,6 +54251,98 @@ mod gui {
                 !slice.contains("state.finish") && !slice.contains("escalate("),
                 "a failed re-read must neither free the slot nor escalate"
             );
+            // The only way out of a failed re-read is the bounded give-up,
+            // a separate `if` after the retry note.
+            let after = &tail[close..];
+            let give_up = after
+                .find("if verdict.is_err() && state.reread_failed(&due.asg) {")
+                .expect("the bounded give-up");
+            assert!(after[give_up..].contains("escalate("), "the give-up escalates");
+        }
+
+        /// The poll thread's body, above the test module.
+        fn grafana_poll_body() -> &'static str {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let start = src.find("fn start_grafana_poll").expect("the poll thread");
+            let body = &src[start..];
+            let end = body.find("GrafanaRuntime { rx, _handle: handle }").expect("its end");
+            &body[..end]
+        }
+
+        /// `run_grafana_remediation`, above the test module.
+        fn grafana_manual_body() -> &'static str {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let start = src.find("fn run_grafana_remediation").expect("the manual path");
+            let body = &src[start..];
+            let end = body.find("\n    fn ").expect("the function after it");
+            &body[..end]
+        }
+
+        #[test]
+        fn the_grafana_group_shape_is_checked_before_any_terminate() {
+            // C1: the 1/1/1 check sits ahead of the only terminate, on both
+            // the poll and the manual path.
+            for (name, body) in [("poll", grafana_poll_body()), ("manual", grafana_manual_body())] {
+                let shape = body.find("gf::group_shape_ok(").unwrap_or_else(|| panic!("{name}: no shape check"));
+                let term = body.find("terminate_instance(").unwrap_or_else(|| panic!("{name}: no terminate"));
+                assert!(shape < term, "{name}: the shape check must come before the terminate");
+                let read = body[..shape].rfind("read_group(").unwrap_or_else(|| panic!("{name}: no group read"));
+                assert!(read < shape);
+            }
+            // The manual path checks the shape before acknowledging, too.
+            let m = grafana_manual_body();
+            assert!(m.find("gf::group_shape_ok(").unwrap() < m.find("acknowledge_alert(").unwrap());
+        }
+
+        #[test]
+        fn the_grafana_poll_leaves_an_acknowledged_alert_alone() {
+            // I1: someone (or an earlier run of us) already took it.
+            let body = grafana_poll_body();
+            let new_alerts = body.find("// 2. New alerts").expect("the new-alert section");
+            let sec = &body[new_alerts..];
+            let skip = sec.find("if alert.acknowledged {").expect("the acknowledged skip");
+            let parse = sec.find("ia::parse_facts(").expect("the parse");
+            let ack = sec.find("alerts::acknowledge_alert(").expect("the ack");
+            assert!(skip < parse && skip < ack, "skip before parsing or acknowledging");
+            let arm = &sec[skip..parse];
+            assert!(arm.contains("state.mark_seen(&alert.id)") && arm.contains("continue;"));
+        }
+
+        #[test]
+        fn a_failed_grafana_attempt_locks_the_slot_rather_than_freeing_it() {
+            // I3: nothing in the new-alert section frees a slot; refusals and
+            // failed terminates lock it out, and lockouts expire each poll.
+            let body = grafana_poll_body();
+            let new_alerts = body.find("// 2. New alerts").expect("the new-alert section");
+            let sec = &body[new_alerts..];
+            assert!(!sec.contains("state.finish("), "no slot is freed on a new alert");
+            assert!(sec.matches("state.failed(").count() >= 3, "every refusal locks out");
+            assert!(sec.contains("format!(\"instance {}\", facts.instance_id)"));
+            let expire = body.find("state.expire_failed(now_ms)").expect("the expiry");
+            let due = body.find("state.due(now_ms)").expect("the due loop");
+            assert!(expire < due);
+        }
+
+        #[test]
+        fn grafana_duplicates_are_recorded_and_reread_at_settle_end() {
+            // I2.
+            let body = grafana_poll_body();
+            let dup = body.find("gf::Begin::Duplicate { owner } =>").expect("the duplicate arm");
+            let owner = body[dup..].find("gf::Begin::Owner =>").expect("the owner arm");
+            assert!(body[dup..dup + owner].contains("state.add_duplicate(&asg_name, &alert.id)"));
+            let settle = body.find("gf::Step::SettleEnded(due)").expect("the settle arm");
+            let arm = &body[settle..];
+            assert!(arm.contains("due.duplicates"), "the duplicates are re-read");
+            assert!(arm.contains("gf::settle_verdict("));
+            assert!(arm.contains("state.reread_failed(&due.asg)"), "the re-read is bounded");
+        }
+
+        #[test]
+        fn the_manual_grafana_reread_is_bounded() {
+            let body = grafana_manual_body();
+            assert!(body.contains("gf::MAX_REREAD_FAILURES"));
         }
 
         #[test]
