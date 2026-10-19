@@ -62,9 +62,12 @@ baseline immediately before that work was 1522 tests / 24 warnings, on the
 same tree. (Before phase 1 of the resource browser this line had been stale
 for months, reading 356 tests / 21 warnings.)
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 1562 tests pass, 0 fail (939 lib + 3 CLI + 620 GUI),
-  remeasured 2026-09-29 after the stale-tunnel replacement
-- `cargo clippy --features gui` — no errors; 24 pre-existing style warnings.
+- `cargo test --features gui` — 1992 tests pass, 0 fail (1217 lib + 3 CLI + 772 GUI),
+  remeasured 2026-10-19 after the Grafana watcher
+- `cargo clippy --features gui` — no errors; 24 pre-existing style warnings
+  (remeasured 2026-10-19 at 30 `^warning` lines by the same method: 21 GUI + 7
+  lib distinct lints plus two summary lines; the Grafana work adds none — it
+  added one `too_many_arguments` on `start_instance_age_poll`, now allowed).
   **That is a count of `^warning` lines, which is how the pre-branch baseline
   was measured and why the two are comparable — it is 22 distinct lints (6 lib
   + 16 GUI) plus the two per-crate "generated N warnings" summary lines.** The
@@ -1551,6 +1554,76 @@ no watcher naming them the whole dropdown is gone rather than drawn empty.
   a user with neither gets no checkbox. Jira-only is the shipped state of both
   lists, and is the case that had the panel opening on the alert feed's
   traffic.
+
+### Grafana: acknowledge, terminate, wait for the replacement, escalate
+
+`src/grafana.rs` is the fourth watcher on the same JSM feed, for the Grafana
+`Missing-*-Info` alerts (Filebeat, Qualys, Node-Exporter, SplunkForwarder,
+Crowdstrike). **On call only.** Order: acknowledge, terminate the instance the
+alert's description names, wait for the group's replacement to be fully
+running, give the alert `settle_mins` (12) from that moment to clear, and
+escalate once (`RE-F`) if it has not. The state machine is pure; the GUI thread
+(`start_grafana_poll`) makes every call.
+
+- **`title_contains` is the only rule, and a blank entry names nothing.** Same
+  trap as every other list here: an empty string is a substring of everything,
+  so `contains_ci` refuses a blank needle. An empty list keeps the watcher dark.
+  Adding a new `Missing-*-Info` alert is adding its name to the list.
+- **Duplicates are keyed on the ASG, not the alert.** Five alerts usually fire
+  for one outage, and the replacement instance raises its own Missing-* alerts
+  while it boots. Those are duplicates of the incident, so they are
+  acknowledged and ignored: the replacement's alerts can never terminate the
+  replacement. The first alert owns the incident; a duplicate never refreshes
+  its deadlines.
+- **The 12-minute timer starts at "fully running", not at the terminate.** Ready
+  means a group member that is `InService` and `Healthy` in the ASG **and**
+  `running` in EC2 (the old instance never counts as its own replacement).
+  Serving in the ASG alone is not enough: the agents these alerts are about
+  need the box up before they can report.
+- **The 25-minute ceiling exists for a replacement that never comes up.**
+  `replacement_ceiling_mins` after the terminate, with no ready replacement,
+  the watcher escalates anyway. Without it a group that fails to launch would
+  wait forever for a timer that never starts. Once the replacement is ready
+  the ceiling no longer applies.
+- **A failed re-read is retried, never read as closed.** At the end of the
+  settle window the alert is re-read by id; if that read fails the step comes
+  back next poll and the incident is left alone: it neither frees the ASG nor
+  escalates. `the_grafana_poll_never_treats_a_failed_reread_as_closed` scans
+  the Err arm.
+- **No health gate, because the group is always 1/1/1.** Min 1, max 1, desired 1:
+  there is no healthy peer to protect and no capacity to lose that the ASG will
+  not replace. The ASG-tag guard (`instance_asg_group`) still applies: an
+  instance with no `aws:autoscaling:groupName` is never terminated.
+  `terminate_instance` is still the single call site of `terminate-instances`.
+- **Grafana outranks instance-age.** An alert both could claim goes to Grafana:
+  `instance_age::claims` takes `grafana_cfg` and declines it. Reaper and
+  unhealthy-host still win over Grafana (`grafana::claims`). Precedence for
+  Test Alert Match / Run Remediation: reaper > unhealthy host > Grafana >
+  instance-age > pingdom. `start_instance_age_poll` carries
+  `#[allow(clippy::too_many_arguments)]` for the extra parameter.
+- **Gates:** `grafana.enabled` plus a named user in `allowed_users` (`"*"` is
+  NOT honoured), a non-empty `title_contains`, Live mode, JSM credentials and
+  the escalation mailbox. `grafana_gate_report` names each dark state at
+  startup, to the Grafana log source (visible only to users listed by name in
+  `grafana.allowed_users`). Ships closed.
+- **Test Alert Match never acknowledges and never terminates.** The Grafana arm
+  of `start_alert_dry_run` reads the description, resolves the instance and ASG,
+  reports what a real run would do, then escalates like every other route
+  (`nothing_in_the_grafana_test_path_acknowledges_or_terminates`). **Run
+  Remediation** runs the real sequence behind its confirmation and needs the
+  user on `grafana.allowed_users`.
+- **Poll resolution is `poll_secs` (30), not 5s.** The replacement watch runs
+  once per poll, not every 5 seconds as the original spec said. Readiness is
+  noticed up to 30s late, which is small against a 12-minute window.
+- **Known and left alone:**
+  - The shared Test Alert Match escalation tail (used by every route) still
+    prints the mailbox address in its log lines. Pre-existing; the Grafana
+    watcher's own poll-thread escalation log does not
+    (`the_grafana_escalation_log_never_carries_the_mailbox_address`).
+  - The manual Run Remediation re-read loop after the settle window is
+    unbounded: one read per 30s until the alert reads closed or the run ends.
+  - There is no toolbar notice for Grafana (instance-age has one); the log
+    carries the same information.
 
 ### Custom alerts: Add/Update alert (Alerts window)
 

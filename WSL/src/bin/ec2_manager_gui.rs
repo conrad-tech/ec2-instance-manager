@@ -45195,6 +45195,7 @@ mod gui {
     /// alerts off the feed. New alerts get whatever groups are left, so an
     /// incident already being timed is never displaced by a fresh one on the
     /// same group.
+    #[allow(clippy::too_many_arguments)]
     fn start_instance_age_poll(
         auth: ec2_manager::alerts::AlertsAuth,
         cfg: ec2_manager::features::InstanceAgeFeature,
@@ -54095,6 +54096,46 @@ mod gui {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn the_grafana_poll_never_treats_a_failed_reread_as_closed() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let start = src.find("fn start_grafana_poll").expect("the poll thread");
+            let body = &src[start..];
+            let end = body.find("GrafanaRuntime { rx, _handle: handle }").expect("its end");
+            let body = &body[..end];
+            let settle = body.find("gf::Step::SettleEnded").expect("the settle arm");
+            let arm = &body[settle..];
+            // Bounded to the Err arm's own `note(` call, so later correct
+            // `state.finish` calls elsewhere cannot cause a false failure.
+            let err = arm.find("Err(e) => note(").expect("the error arm");
+            let tail = &arm[err..];
+            let marker = tail.find("still timing it").expect("the log text");
+            let rest = &tail[marker..];
+            let close = rest.find("),").map(|i| marker + i + 2).expect("end of the call");
+            let slice = &tail[..close];
+            assert!(slice.contains("could not re-read"), "the slice must be the error arm");
+            assert!(
+                !slice.contains("state.finish") && !slice.contains("escalate("),
+                "a failed re-read must neither free the slot nor escalate"
+            );
+        }
+
+        #[test]
+        fn nothing_in_the_grafana_test_path_acknowledges_or_terminates() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let from = src.find("fn start_alert_dry_run").expect("the dry-run fn");
+            let rest = &src[from..];
+            let start = rest.find("DryRunRoute::Grafana => {").expect("the dry-run arm");
+            let arm = &rest[start..];
+            let end = arm.find("DryRunRoute::Neither => {").expect("the next arm");
+            let arm = &arm[..end];
+            assert!(arm.contains("dry run:"), "the slice must be the dry-run arm");
+            assert!(!arm.contains("acknowledge_alert"), "Test Alert Match never acknowledges");
+            assert!(!arm.contains("terminate_instance"), "Test Alert Match never terminates");
+        }
 
         #[test]
         fn saving_replaces_in_place_and_deleting_removes() {
