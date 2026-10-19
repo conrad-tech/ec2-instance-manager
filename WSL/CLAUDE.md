@@ -62,20 +62,21 @@ baseline immediately before that work was 1522 tests / 24 warnings, on the
 same tree. (Before phase 1 of the resource browser this line had been stale
 for months, reading 356 tests / 21 warnings.)
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 1992 tests pass, 0 fail (1217 lib + 3 CLI + 772 GUI),
-  remeasured 2026-10-19 after the Grafana watcher
-- `cargo clippy --features gui` — no errors; 24 pre-existing style warnings
-  (remeasured 2026-10-19 at 30 `^warning` lines by the same method: 21 GUI + 7
-  lib distinct lints plus two summary lines; the Grafana work adds none — it
-  added one `too_many_arguments` on `start_instance_age_poll`, now allowed).
-  **That is a count of `^warning` lines, which is how the pre-branch baseline
-  was measured and why the two are comparable — it is 22 distinct lints (6 lib
-  + 16 GUI) plus the two per-crate "generated N warnings" summary lines.** The
-  22 are: lib — derivable_impls on Mode, too_many_arguments on
-  sim::make_instance, three manual_is_multiple_of, one manual div_ceil; GUI —
-  two more too_many_arguments, **two** manual case-insensitive ASCII
+- `cargo test --features gui` — 2018 tests pass, 0 fail (1238 lib + 3 CLI + 777 GUI),
+  remeasured 2026-10-19 after the Grafana watcher's final-review fixes
+- `cargo clippy --features gui` — no errors; **30 `^warning` lines**, measured
+  2026-10-19, identical to the pre-Grafana tree at `4e4b95b`. The Grafana work
+  adds no lint: the one it introduced (`too_many_arguments` on
+  `start_instance_age_poll`) is covered by `#[allow(clippy::too_many_arguments)]`.
+  **That is a count of `^warning` lines** — 28 warnings (7 lib + 21 GUI) plus the
+  two per-crate "generated N warnings" summary lines — across 13 distinct lints.
+  Lib (7): derivable_impls on Mode, too_many_arguments on sim::make_instance,
+  three manual_is_multiple_of, one manual_div_ceil, one type_complexity
+  (cassandra_flow). GUI (21): four too_many_arguments, five collapsible_if, four
+  let_and_return, two manual_strip, two manual case-insensitive ASCII
   comparisons, manual `Range::contains`, a clamp-like pattern, a simplifiable
-  `map_or`, four let_and_return, four collapsible_if, one unneeded `return`
+  `map_or`, one unneeded `return`. (The older "24 / 22 distinct lints" figure
+  was measured on an earlier tree and no longer applies.)
 - The Windows release cross-compile
   (`ALLOW_NO_FORWARDS=1 CARGO_TARGET_DIR=/tmp/ec2m cargo build --release
   --target x86_64-pc-windows-gnu --features gui`) — reverified 2026-09-18,
@@ -1571,10 +1572,34 @@ escalate once (`RE-F`) if it has not. The state machine is pure; the GUI thread
   Adding a new `Missing-*-Info` alert is adding its name to the list.
 - **Duplicates are keyed on the ASG, not the alert.** Five alerts usually fire
   for one outage, and the replacement instance raises its own Missing-* alerts
-  while it boots. Those are duplicates of the incident, so they are
-  acknowledged and ignored: the replacement's alerts can never terminate the
-  replacement. The first alert owns the incident; a duplicate never refreshes
-  its deadlines.
+  while it boots. Those are duplicates of the incident: acknowledged, never
+  acted on (the replacement's alerts can never terminate the replacement), and
+  **recorded on the incident** (`add_duplicate`). The first alert owns the
+  incident; a duplicate never refreshes its deadlines.
+- **The settle end re-reads the owner AND every duplicate, and escalates if ANY
+  is still open** (`grafana::settle_verdict`). The owner names the terminated
+  box, and Grafana tends to resolve an alert whose series disappeared — so the
+  owner can close because `i-old` is gone while the replacement's own
+  `Missing-Filebeat` stays open. Re-reading only the owner silenced exactly
+  that page. Still-open evidence beats a failed read of a sibling: one open
+  alert escalates at once even if another could not be read.
+- **An already-acknowledged alert is left alone** (`if alert.acknowledged`,
+  checked on the full read before anything is parsed or acknowledged). Someone
+  — a person working it by hand, or this app before a restart — already took
+  it, and acting on it could terminate a replacement. **Known limit:** state is
+  in memory, so after an app restart mid-incident the replacement's brand-new,
+  still-unacknowledged alerts can become an owner and terminate the
+  replacement; skipping acknowledged alerts covers every alert from before the
+  restart, not ones raised after it.
+- **A refusal or a failed terminate holds the slot** (`Phase::Failed`,
+  `GrafanaState::failed`) for `replacement_ceiling_mins` (25), and is freed by
+  `expire_failed` at the top of every poll. Freeing it at once (the old
+  `finish`) let each of the five alerts for one outage become a new owner,
+  retry the terminate and page again — a persistent `AccessDenied` was five
+  terminate attempts and five pages. Refusals **before the ASG is known** (no
+  account context, no ASG tag, an instance read error) take a slot keyed
+  `instance <id>`, so they too page once per box. Later alerts in a lockout are
+  acknowledged and ignored, with no escalation.
 - **The 12-minute timer starts at "fully running", not at the terminate.** Ready
   means a group member that is `InService` and `Healthy` in the ASG **and**
   `running` in EC2 (the old instance never counts as its own replacement).
@@ -1585,16 +1610,33 @@ escalate once (`RE-F`) if it has not. The state machine is pure; the GUI thread
   the watcher escalates anyway. Without it a group that fails to launch would
   wait forever for a timer that never starts. Once the replacement is ready
   the ceiling no longer applies.
-- **A failed re-read is retried, never read as closed.** At the end of the
-  settle window the alert is re-read by id; if that read fails the step comes
-  back next poll and the incident is left alone: it neither frees the ASG nor
-  escalates. `the_grafana_poll_never_treats_a_failed_reread_as_closed` scans
-  the Err arm.
-- **No health gate, because the group is always 1/1/1.** Min 1, max 1, desired 1:
-  there is no healthy peer to protect and no capacity to lose that the ASG will
-  not replace. The ASG-tag guard (`instance_asg_group`) still applies: an
-  instance with no `aws:autoscaling:groupName` is never terminated.
-  `terminate_instance` is still the single call site of `terminate-instances`.
+- **A failed re-read is retried, never read as closed — but not forever.** At
+  the end of the settle window the alerts are re-read by id; if a read fails
+  (and nothing is known open) the step comes back next poll and the incident
+  neither frees the ASG nor escalates. After `MAX_REREAD_FAILURES` (5)
+  consecutive failed polls (`reread_failed`; `reread_ok` resets) it escalates as
+  "still open (unconfirmed)" and finishes: a JSM outage or an expired token must
+  not mean no page at all, and the escalation goes through Outlook, not JSM.
+  `the_grafana_poll_never_treats_a_failed_reread_as_closed` scans the Err arm
+  and pins that the give-up is a separate `if` after it. The manual Run
+  Remediation re-read is bounded the same way (it re-reads only its own alert;
+  it keeps no duplicate state).
+- **No health gate, because the group is always 1/1/1 — and that is checked.**
+  Min 1, max 1, desired 1: there is no healthy peer to protect and no capacity
+  to lose that the ASG will not replace. The premise is now a check, not an
+  assumption: before any terminate the group is read and
+  `grafana::group_shape_ok` refuses anything that is not exactly 1/1/1, with an
+  escalation (and, on the poll, a Failed lockout). The title rules match agents
+  that run on **every** host, so five `Missing-*` alerts is what any host that
+  stops reporting looks like — without this a hung 3-node Cassandra member or
+  the active Vault node would be terminated with no health gate. On the poll it
+  runs for the owner only (duplicates cost no extra calls); on Run Remediation
+  it runs before anything is acknowledged. **It is a shape rule, not a name
+  rule**: a non-Grafana 1/1/1 group would still be terminated. The ASG-tag
+  guard (`instance_asg_group`) still applies as well, and `terminate_instance`
+  is still the single call site of `terminate-instances`.
+  `the_grafana_group_shape_is_checked_before_any_terminate` pins the order on
+  both paths.
 - **Grafana outranks instance-age.** An alert both could claim goes to Grafana:
   `instance_age::claims` takes `grafana_cfg` and declines it. Reaper and
   unhealthy-host still win over Grafana (`grafana::claims`). Precedence for
@@ -1620,8 +1662,12 @@ escalate once (`RE-F`) if it has not. The state machine is pure; the GUI thread
     prints the mailbox address in its log lines. Pre-existing; the Grafana
     watcher's own poll-thread escalation log does not
     (`the_grafana_escalation_log_never_carries_the_mailbox_address`).
-  - The manual Run Remediation re-read loop after the settle window is
-    unbounded: one read per 30s until the alert reads closed or the run ends.
+  - Manual Run Remediation and the poll share no ownership: a person running
+    it on a duplicate raised by the replacement can terminate the
+    replacement, and the two paths escalate independently.
+  - The poll acknowledges before it knows the group's shape, so a refused
+    non-Grafana host's alert is silenced in JSM; the escalation email is what
+    rings instead.
   - There is no toolbar notice for Grafana (instance-age has one); the log
     carries the same information.
 
