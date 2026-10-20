@@ -1826,6 +1826,27 @@ mod gui {
         error: Option<String>,
     }
 
+    /// How long the second Vault box gets once the first has finished.
+    const VAULT_HEALTH_GRACE: Duration = Duration::from_secs(60);
+    /// The most a Vault Health Check run waits for anything, so a tab stuck
+    /// at a password prompt cannot hold the report back for ever.
+    const VAULT_HEALTH_CAP: Duration = Duration::from_secs(300);
+
+    /// An in-flight Vault Health Check: two tabs, one per Vault box.
+    struct VaultHealthRun {
+        /// The connection tab per box; `None` when its session never opened.
+        tabs: [Option<u64>; 2],
+        /// Report headings, e.g. `Vault 1 (vault-a  i-0abc)`.
+        labels: [String; 2],
+        /// Box finished (marker seen, session failed, or tab gone).
+        done: [bool; 2],
+        /// Tab was present in `pty_sessions` at least once, so a later
+        /// absence means it was closed rather than not yet open.
+        seen: [bool; 2],
+        started: Instant,
+        first_done_at: Option<Instant>,
+    }
+
     /// Modal state for "Scripts -> Cassandra Cert".
     ///
     /// `poll_cassandra_events` fills the job fields; `render_cassandra_dialog`
@@ -11031,6 +11052,8 @@ mod gui {
         vault_iam_enabled: bool,
         /// Active "Scripts → Vault Health Check" dialog, if any.
         vault_health_dialog: Option<VaultHealthDialog>,
+        /// In-flight Vault Health Check, awaiting both boxes.
+        vault_health_run: Option<VaultHealthRun>,
         /// Build-time gate: whether the Vault Health Check entry is shown to
         /// the current OS user (features.json `vault_health.allowed_users`).
         vault_health_enabled: bool,
@@ -12112,6 +12135,7 @@ mod gui {
                 vault_iam_dialog: None,
                 vault_iam_run: None,
                 vault_health_dialog: None,
+                vault_health_run: None,
                 vault_health_enabled: features
                     .vault_health_enabled_for(&ec2_manager::features::current_os_user()),
                 vault_iam_enabled: features
@@ -24352,17 +24376,148 @@ mod gui {
             self.vault_health_dialog = Some(dlg);
         }
 
-        /// Open both sessions and queue the health check on each. (Wired up in
-        /// the next step; until then it only says so.)
+        /// Open a session on each Vault box and queue the health check on
+        /// both. Either box failing to open is not fatal: it is reported as a
+        /// box with no result when the report is built.
         fn enqueue_vault_health_run(
             &mut self,
-            _env: &str,
-            _vault1: (&str, &str),
-            _vault2: (&str, &str),
+            env: &str,
+            vault1: (&str, &str),
+            vault2: (&str, &str),
         ) {
+            if self.vault_health_run.is_some() || !self.pending_script_runs.is_empty() {
+                self.set_script_status(
+                    "Another Scripts run is still in progress.".to_string(),
+                    ScriptState::Failed,
+                );
+                return;
+            }
+            let heading = |n: u8, (id, label): (&str, &str)| {
+                let shown = label.split_whitespace().collect::<Vec<_>>().join(" ");
+                format!("Vault {n} ({})", if shown.is_empty() { id } else { &shown })
+            };
+            let labels = [heading(1, vault1), heading(2, vault2)];
+            let mut tabs: [Option<u64>; 2] = [None, None];
+            for (i, (id, _)) in [vault1, vault2].into_iter().enumerate() {
+                match self.ensure_bastion_session(id, env) {
+                    Some((tab_id, wait_for_login)) => {
+                        let mut steps = vec!["sudo su".to_string(), PREP_STEP_SENTINEL.to_string()];
+                        steps.extend(ec2_manager::vault_health::steps());
+                        self.pending_script_runs.push(PendingScriptRun {
+                            tab_id,
+                            steps,
+                            wait_for_login,
+                            spawned: false,
+                            label: format!("vault_health {id}"),
+                            queued_at: Instant::now(),
+                        });
+                        tabs[i] = Some(tab_id);
+                    }
+                    None => self.log_error(format!(
+                        "vault_health: could not open a session to {id}"
+                    )),
+                }
+            }
+            if tabs.iter().all(Option::is_none) {
+                let msg = "Vault Health Check: could not open a session to either box."
+                    .to_string();
+                self.log_error(msg.clone());
+                self.set_script_status(msg, ScriptState::Failed);
+                return;
+            }
+            self.vault_health_run = Some(VaultHealthRun {
+                tabs,
+                labels,
+                done: [tabs[0].is_none(), tabs[1].is_none()],
+                seen: [false, false],
+                started: Instant::now(),
+                first_done_at: None,
+            });
+            self.script_status_tabs = tabs.iter().flatten().copied().collect();
+            self.main_tab = MainTab::Connections;
             self.set_script_status(
-                "Vault Health Check is not wired up yet.".to_string(),
-                ScriptState::Failed,
+                "Checking Vault on both boxes…".to_string(),
+                ScriptState::Running,
+            );
+        }
+
+        /// A queued script run on `tab_id` finished its steps.
+        fn mark_vault_health_tab_done(&mut self, tab_id: u64) {
+            if let Some(run) = self.vault_health_run.as_mut() {
+                if let Some(i) = run.tabs.iter().position(|t| *t == Some(tab_id)) {
+                    run.done[i] = true;
+                    run.first_done_at.get_or_insert_with(Instant::now);
+                }
+            }
+        }
+
+        /// The tab's whole text, scrollback included.
+        fn vault_health_screen_text(&mut self, tab_id: u64) -> Option<String> {
+            let session = self.pty_sessions.get_mut(&tab_id)?;
+            Some(full_screen_text(&mut session.parser))
+        }
+
+        /// Called every frame: notice closed tabs, and show the report once
+        /// both boxes have finished (or the deadline has passed).
+        fn poll_vault_health_run(&mut self, ctx: &egui::Context) {
+            let Some(run) = self.vault_health_run.as_ref() else {
+                return;
+            };
+            // A tab that was open and is gone was closed under the run.
+            let mut gone: Vec<usize> = Vec::new();
+            let mut now_seen: Vec<usize> = Vec::new();
+            for (i, tab) in run.tabs.iter().enumerate() {
+                if let Some(id) = tab {
+                    if self.pty_sessions.contains_key(id) {
+                        now_seen.push(i);
+                    } else if run.seen[i] && !run.done[i] {
+                        gone.push(i);
+                    }
+                }
+            }
+            if let Some(run) = self.vault_health_run.as_mut() {
+                for i in now_seen {
+                    run.seen[i] = true;
+                }
+                for i in gone {
+                    run.done[i] = true;
+                    run.first_done_at.get_or_insert_with(Instant::now);
+                }
+            }
+            let run = self.vault_health_run.as_ref().expect("checked above");
+            if !vault_health_due(
+                run.done,
+                run.started.elapsed(),
+                run.first_done_at.map(|t| t.elapsed()),
+            ) {
+                ctx.request_repaint_after(Duration::from_secs(1));
+                return;
+            }
+            let run = self.vault_health_run.take().expect("checked above");
+            let texts = [
+                run.tabs[0].and_then(|t| self.vault_health_screen_text(t)),
+                run.tabs[1].and_then(|t| self.vault_health_screen_text(t)),
+            ];
+            let report = ec2_manager::vault_health::build_report(
+                [run.labels[0].as_str(), run.labels[1].as_str()],
+                [texts[0].as_deref(), texts[1].as_deref()],
+            );
+            let healthy = report.verdict.healthy;
+            if healthy {
+                self.log_info(report.summary.clone());
+            } else {
+                self.log_error(report.summary.clone());
+            }
+            self.show_script_result(
+                if healthy {
+                    "Vault Health Check — Healthy"
+                } else {
+                    "Vault Health Check — Unhealthy"
+                },
+                report.summary,
+                healthy,
+                None,
+                Some(report.details),
             );
         }
 
@@ -25791,6 +25946,22 @@ mod gui {
                 return;
             }
 
+            // One Vault box failing to open or dying is a finding for the
+            // report, not a reason to tear down the other box's check.
+            let vault_box = self
+                .vault_health_run
+                .as_ref()
+                .and_then(|r| r.tabs.iter().position(|t| *t == Some(tab_id)));
+            if let Some(i) = vault_box {
+                self.log_error(format!("vault_health: {message}"));
+                self.pending_script_runs.retain(|r| r.tab_id != tab_id);
+                if let Some(r) = self.vault_health_run.as_mut() {
+                    r.done[i] = true;
+                    r.first_done_at.get_or_insert_with(Instant::now);
+                }
+                return;
+            }
+
             let details = self
                 .pty_sessions
                 .get(&tab_id)
@@ -26094,6 +26265,7 @@ mod gui {
                     .get(&tab_id)
                     .map(|s| s.parser.screen().contents());
                 self.finish_vault_iam_run(tab_id, output.as_deref());
+                self.mark_vault_health_tab_done(tab_id);
                 if let Some(run) = self.create_user_run.as_mut() {
                     if tab_id == run.primary_tab {
                         run.primary_done = true;
@@ -28048,6 +28220,7 @@ mod gui {
                 let run_in_flight = !self.pending_script_runs.is_empty()
                     || self.create_user_run.is_some()
                     || self.vault_iam_run.is_some()
+                    || self.vault_health_run.is_some()
                     || self.pending_delete.is_some();
                 let never_prompted = self
                     .pty_sessions
@@ -41087,6 +41260,7 @@ mod gui {
                 self.render_ticket_check(ctx);
                 self.render_vault_iam_dialog(ctx);
                 self.render_vault_health_dialog(ctx);
+                self.poll_vault_health_run(ctx);
                 self.poll_cassandra_events();
                 self.poll_cassandra_schedules();
                 self.render_cassandra_dialog(ctx);
@@ -49555,6 +49729,52 @@ mod gui {
         Some(((bottom_abs - top_abs_row) as u16, actual_sb))
     }
 
+    /// Every line a terminal holds, scrollback included, oldest first.
+    ///
+    /// `screen().contents()` is only the visible rows, which is enough for a
+    /// short verdict marker and not for ~40 lines of health output in a short
+    /// window. The user's scroll position is put back afterwards.
+    fn full_screen_text(parser: &mut vt100::Parser) -> String {
+        let original = parser.screen().scrollback();
+        parser.screen_mut().set_scrollback(usize::MAX);
+        let max = parser.screen().scrollback();
+        let (rows, cols) = parser.screen().size();
+        let rows = (rows as usize).max(1);
+        let mut lines: Vec<String> = Vec::new();
+        let mut offset = max;
+        loop {
+            parser.screen_mut().set_scrollback(offset);
+            let page: Vec<String> = parser.screen().rows(0, cols).collect();
+            // Line index (0 = oldest) of this page's first row; what the
+            // previous page already covered is skipped.
+            let top = max - offset;
+            let skip = lines.len().saturating_sub(top);
+            lines.extend(page.into_iter().skip(skip));
+            if offset == 0 {
+                break;
+            }
+            offset = offset.saturating_sub(rows);
+        }
+        parser.screen_mut().set_scrollback(original);
+        while lines.last().is_some_and(|l| l.trim().is_empty()) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
+    /// Whether the Vault Health Check report should be shown now: both boxes
+    /// finished, or the second one has had `VAULT_HEALTH_GRACE` since the
+    /// first finished, or the overall `VAULT_HEALTH_CAP` has passed.
+    fn vault_health_due(
+        done: [bool; 2],
+        since_start: Duration,
+        since_first_done: Option<Duration>,
+    ) -> bool {
+        done.iter().all(|d| *d)
+            || since_first_done.is_some_and(|d| d >= VAULT_HEALTH_GRACE)
+            || since_start >= VAULT_HEALTH_CAP
+    }
+
     fn extract_selection_text(
         parser: &mut vt100::Parser,
         start: AbsPos,
@@ -57219,6 +57439,69 @@ mod gui {
             assert!(body.contains("self.vault_health_enabled"), "the dialog re-checks its gate");
             assert!(!body.to_ascii_lowercase().contains("primary"));
             assert!(!body.to_ascii_lowercase().contains("secondary"));
+        }
+
+        #[test]
+        fn full_screen_text_includes_scrollback_in_order() {
+            let mut parser = vt100::Parser::new(5, 20, 100);
+            for i in 0..12 {
+                parser.process(format!("line{i:02}\r\n").as_bytes());
+            }
+            let text = full_screen_text(&mut parser);
+            let found: Vec<&str> = text.lines().filter(|l| l.starts_with("line")).collect();
+            let want: Vec<String> = (0..12).map(|i| format!("line{i:02}")).collect();
+            assert_eq!(found, want.iter().map(String::as_str).collect::<Vec<_>>());
+        }
+
+        #[test]
+        fn full_screen_text_works_with_no_scrollback_and_restores_the_scroll_position() {
+            let mut small = vt100::Parser::new(10, 20, 100);
+            small.process(b"alpha\r\nbeta");
+            let text = full_screen_text(&mut small);
+            assert!(text.contains("alpha") && text.contains("beta"));
+
+            let mut scrolled = vt100::Parser::new(5, 20, 100);
+            for i in 0..30 {
+                scrolled.process(format!("row{i:02}\r\n").as_bytes());
+            }
+            scrolled.screen_mut().set_scrollback(7);
+            let _ = full_screen_text(&mut scrolled);
+            assert_eq!(scrolled.screen().scrollback(), 7);
+        }
+
+        #[test]
+        fn the_vault_health_popup_is_due_when_both_finish_or_a_deadline_passes() {
+            let s = Duration::from_secs;
+            // Nobody done, nobody timed out.
+            assert!(!vault_health_due([false, false], s(10), None));
+            // Both done.
+            assert!(vault_health_due([true, true], s(10), Some(s(1))));
+            // One done: the other gets the grace period, then the popup shows.
+            assert!(!vault_health_due([true, false], s(40), Some(s(30))));
+            assert!(vault_health_due([true, false], s(100), Some(VAULT_HEALTH_GRACE)));
+            // Nobody ever finishes: the overall cap ends it.
+            assert!(vault_health_due([false, false], VAULT_HEALTH_CAP, None));
+        }
+
+        #[test]
+        fn vault_health_reads_the_full_buffer_not_the_visible_screen() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let start = src.find("fn vault_health_screen_text").expect("the reader");
+            let body = &src[start..start + 700];
+            assert!(body.contains("full_screen_text"));
+            assert!(!body.contains(".contents()"));
+        }
+
+        #[test]
+        fn a_dead_vault_health_session_does_not_tear_down_the_other_box() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let start = src.find("fn abort_script_run").expect("abort_script_run");
+            let body = &src[start..start + 4000];
+            let vh = body.find("vault_health_run").expect("handles vault health");
+            let clear = body.find("pending_script_runs.clear()").expect("the teardown");
+            assert!(vh < clear, "the vault health branch must come before the teardown");
         }
 
         /// A filter matching nothing falls back to the "bastion" substring

@@ -225,6 +225,57 @@ pub fn judge(a: &BoxReport, b: &BoxReport, label_a: &str, label_b: &str) -> Verd
     Verdict { healthy: problems.is_empty(), problems }
 }
 
+/// Everything the result popup needs.
+#[derive(Debug, Clone)]
+pub struct Report {
+    pub verdict: Verdict,
+    /// The popup's message: the verdict in words.
+    pub summary: String,
+    /// The popup's details pane: the verdict, then each box's full output.
+    pub details: String,
+}
+
+/// Judge the two tabs' text and render the report. `None` is a tab that never
+/// opened or was closed; it is reported as a box with no result, never
+/// skipped.
+pub fn build_report(labels: [&str; 2], texts: [Option<&str>; 2]) -> Report {
+    let reports = [
+        parse_box(texts[0].unwrap_or_default()),
+        parse_box(texts[1].unwrap_or_default()),
+    ];
+    let verdict = judge(&reports[0], &reports[1], labels[0], labels[1]);
+
+    let summary = if verdict.healthy {
+        let (leader, follower) = if reports[0].role() == Role::Leader {
+            (labels[0], labels[1])
+        } else {
+            (labels[1], labels[0])
+        };
+        format!(
+            "Vault is healthy: {leader} is the leader and {follower} is the follower, \
+             both on version {}, with the vault container up on both.",
+            reports[0].version.as_deref().unwrap_or("?")
+        )
+    } else {
+        let mut s = String::from("Vault is NOT healthy:");
+        for p in &verdict.problems {
+            s.push_str("\n - ");
+            s.push_str(p);
+        }
+        s
+    };
+
+    let mut details = summary.clone();
+    for (label, text) in labels.iter().zip(texts.iter()) {
+        details.push_str(&format!("\n\n===== {label} =====\n"));
+        match text.map(str::trim_end).filter(|t| !t.trim().is_empty()) {
+            Some(t) => details.push_str(t),
+            None => details.push_str("(no output)"),
+        }
+    }
+    Report { verdict, summary, details }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,5 +452,45 @@ mod tests {
         assert!(!all.replace(">/dev/null 2>&1", "").contains('>'));
         assert_eq!(steps()[1], "docker ps");
         assert_eq!(steps()[0], HEALTH_COMMAND);
+    }
+
+    #[test]
+    fn report_for_a_healthy_pair() {
+        let (l, f) = (leader(), follower());
+        let r = build_report(["Vault 1 (vault-a)", "Vault 2 (vault-b)"], [Some(&l), Some(&f)]);
+        assert!(r.verdict.healthy, "{:?}", r.verdict.problems);
+        assert!(r.summary.contains("healthy"));
+        assert!(r.summary.contains("Vault 1 (vault-a) is the leader"), "{}", r.summary);
+        assert!(r.summary.contains("Vault 2 (vault-b) is the follower"), "{}", r.summary);
+        assert!(r.summary.contains("1.13.3"));
+    }
+
+    #[test]
+    fn report_details_carry_both_raw_outputs_labelled() {
+        let (l, f) = (leader(), follower());
+        let r = build_report(["Vault 1", "Vault 2"], [Some(&l), Some(&f)]);
+        let at_1 = r.details.find("Vault 1").expect("first label");
+        let at_2 = r.details.rfind("Vault 2").expect("second label");
+        assert!(at_1 < at_2);
+        assert!(r.details.contains("\"is_self\": true"));
+        assert!(r.details.contains("\"is_self\": false"));
+        assert!(r.details.contains("OVERALL: HEALTHY"));
+    }
+
+    #[test]
+    fn a_missing_tab_is_reported_not_skipped() {
+        let l = leader();
+        let r = build_report(["Vault 1", "Vault 2"], [Some(&l), None]);
+        assert!(!r.verdict.healthy);
+        assert!(r.summary.contains("Vault 2"), "{}", r.summary);
+        assert!(r.details.contains("(no output)"), "{}", r.details);
+    }
+
+    #[test]
+    fn an_unhealthy_summary_lists_every_problem() {
+        let (a, b) = (leader(), leader());
+        let r = build_report(["Vault 1", "Vault 2"], [Some(&a), Some(&b)]);
+        assert!(!r.verdict.healthy);
+        assert!(r.summary.contains("both boxes claim to be the leader"), "{}", r.summary);
     }
 }
