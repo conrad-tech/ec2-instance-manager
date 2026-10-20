@@ -1809,6 +1809,23 @@ mod gui {
         focus_top: bool,
     }
 
+    /// Modal state for "Scripts -> Vault Health Check". There is no primary
+    /// or secondary: either Vault box can be the leader, so the two are just
+    /// Vault 1 and Vault 2.
+    #[derive(Default)]
+    struct VaultHealthDialog {
+        /// Account (config profile_id) the two Vault boxes belong to.
+        env_profile_id: String,
+        /// `MMODAL_ENV` selected within that account; empty when untagged.
+        env_name: String,
+        vault1_id: String,
+        vault1_label: String,
+        vault2_id: String,
+        vault2_label: String,
+        /// Inline validation error, shown in red.
+        error: Option<String>,
+    }
+
     /// Modal state for "Scripts -> Cassandra Cert".
     ///
     /// `poll_cassandra_events` fills the job fields; `render_cassandra_dialog`
@@ -11012,6 +11029,11 @@ mod gui {
         /// Build-time gate: whether the Vault IAM Access entry is shown to the
         /// current OS user (features.json `vault_iam.allowed_users`).
         vault_iam_enabled: bool,
+        /// Active "Scripts → Vault Health Check" dialog, if any.
+        vault_health_dialog: Option<VaultHealthDialog>,
+        /// Build-time gate: whether the Vault Health Check entry is shown to
+        /// the current OS user (features.json `vault_health.allowed_users`).
+        vault_health_enabled: bool,
         /// Active "Scripts → Bastion User Sync" dialog, if any.
         user_sync_dialog: Option<UserSyncDialog>,
         /// Whether the Bastion User Sync entry is shown to the current OS
@@ -12089,6 +12111,9 @@ mod gui {
                 delete_saved_pem: None,
                 vault_iam_dialog: None,
                 vault_iam_run: None,
+                vault_health_dialog: None,
+                vault_health_enabled: features
+                    .vault_health_enabled_for(&ec2_manager::features::current_os_user()),
                 vault_iam_enabled: features
                     .vault_iam_enabled_for(&ec2_manager::features::current_os_user()),
                 vault_iam_delete_enabled: features.vault_iam_delete_enabled_for(
@@ -24103,6 +24128,242 @@ mod gui {
                 error: None,
                 focus_top: true,
             });
+        }
+
+        /// Open "Scripts → Vault Health Check" on the default environment.
+        fn open_vault_health_dialog(&mut self) {
+            let (env, env_name) = self.default_script_environment();
+            let mut dlg = VaultHealthDialog {
+                env_profile_id: env,
+                env_name,
+                ..Default::default()
+            };
+            self.preselect_lone_vault_boxes(&mut dlg);
+            self.vault_health_dialog = Some(dlg);
+        }
+
+        /// The environment's Vault boxes, from the cached inventory.
+        fn env_vault_instances(&self, profile_id: &str, env: &str) -> Vec<(String, String)> {
+            self.profile_inventory_cache
+                .get(profile_id)
+                .map(|(inv, _)| vault_instances(&inv.instances, env))
+                .unwrap_or_default()
+        }
+
+        /// Fill an empty Vault 1 / Vault 2 when the dropdown offers exactly one
+        /// box (Vault 2's list excludes Vault 1). Only ever fills empty fields.
+        fn preselect_lone_vault_boxes(&self, dlg: &mut VaultHealthDialog) {
+            let boxes = self.env_vault_instances(&dlg.env_profile_id, &dlg.env_name);
+            if let Some((id, name)) = sole_bastion_candidate(&boxes, "", &dlg.vault1_id) {
+                dlg.vault1_label = format!("{name}  {id}");
+                dlg.vault1_id = id;
+            }
+            let rest: Vec<(String, String)> =
+                boxes.into_iter().filter(|(id, _)| *id != dlg.vault1_id).collect();
+            if let Some((id, name)) = sole_bastion_candidate(&rest, "", &dlg.vault2_id) {
+                dlg.vault2_label = format!("{name}  {id}");
+                dlg.vault2_id = id;
+            }
+        }
+
+        /// Render the "Scripts → Vault Health Check" modal.
+        fn render_vault_health_dialog(&mut self, ctx: &egui::Context) {
+            let Some(mut dlg) = self.vault_health_dialog.take() else {
+                return;
+            };
+            // Re-checked every frame: the entry is hidden off the allow-list,
+            // and so is anything that would reach this dialog another way.
+            if !self.vault_health_enabled {
+                return;
+            }
+            let environments: Vec<ScriptEnv> = self.script_environments();
+            vault_iam_clear_unoffered_selection(
+                &environments,
+                &mut dlg.env_profile_id,
+                &mut dlg.env_name,
+            );
+            let boxes = self.env_vault_instances(&dlg.env_profile_id, &dlg.env_name);
+            let vault2_boxes: Vec<(String, String)> = boxes
+                .iter()
+                .filter(|(id, _)| *id != dlg.vault1_id)
+                .cloned()
+                .collect();
+            let env_auth: Vec<AuthStatus> = environments
+                .iter()
+                .map(|e| self.script_env_auth(&e.account_id))
+                .collect();
+            let auth_warning = self.script_env_auth_warning(&dlg.env_profile_id);
+
+            let mut window_open = true;
+            let mut do_run = false;
+            let mut do_cancel = false;
+            let mut env_changed = false;
+
+            egui::Window::new("Scripts — Vault Health Check")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
+                .show(ctx, |ui| {
+                    egui::Grid::new("vault_health_grid")
+                        .num_columns(2)
+                        .spacing([10.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Environment:");
+                            let env_label = environments
+                                .iter()
+                                .position(|e| {
+                                    e.account_id == dlg.env_profile_id && e.env == dlg.env_name
+                                })
+                                .map(|i| {
+                                    script_env_label_with_auth(&environments[i], env_auth[i])
+                                })
+                                .unwrap_or_else(|| "Select…".to_string());
+                            let prev = (dlg.env_profile_id.clone(), dlg.env_name.clone());
+                            egui::ComboBox::from_id_salt("vault_health_env")
+                                .selected_text(env_label)
+                                .width(360.0)
+                                .show_ui(ui, |ui| {
+                                    for (row, auth) in environments.iter().zip(env_auth.iter()) {
+                                        let selected = row.account_id == dlg.env_profile_id
+                                            && row.env == dlg.env_name;
+                                        if ui
+                                            .selectable_label(
+                                                selected,
+                                                script_env_label_with_auth(row, *auth),
+                                            )
+                                            .clicked()
+                                        {
+                                            dlg.env_profile_id = row.account_id.clone();
+                                            dlg.env_name = row.env.clone();
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            if (dlg.env_profile_id.clone(), dlg.env_name.clone()) != prev {
+                                env_changed = true;
+                            }
+                            ui.end_row();
+                        });
+
+                    ui.add_space(6.0);
+                    Self::bastion_combo_ui(
+                        ui,
+                        "vault_health_1",
+                        "Vault 1:",
+                        "",
+                        &mut dlg.vault1_id,
+                        &mut dlg.vault1_label,
+                        &boxes,
+                    );
+                    ui.add_space(6.0);
+                    Self::bastion_combo_ui(
+                        ui,
+                        "vault_health_2",
+                        "Vault 2:",
+                        "",
+                        &mut dlg.vault2_id,
+                        &mut dlg.vault2_label,
+                        &vault2_boxes,
+                    );
+
+                    if boxes.is_empty() && !dlg.env_profile_id.is_empty() {
+                        ui.add_space(6.0);
+                        note_label(
+                            ui,
+                            egui::Color32::from_rgb(220, 150, 60),
+                            "No running instance in this environment is tagged \
+                             ApplicationName=vault.",
+                        );
+                    }
+
+                    ui.add_space(4.0);
+                    ui.label(
+                        "Opens a tab on each box, runs the Vault health check and docker ps \
+                         as root, then reports whether there is one leader and one follower.",
+                    );
+
+                    if let Some(warn) = &auth_warning {
+                        ui.add_space(6.0);
+                        note_label(ui, egui::Color32::from_rgb(220, 80, 80), warn);
+                    }
+                    if let Some(err) = &dlg.error {
+                        ui.add_space(6.0);
+                        note_label(ui, egui::Color32::from_rgb(220, 80, 80), err);
+                    }
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        let ready = !dlg.vault1_id.is_empty()
+                            && !dlg.vault2_id.is_empty()
+                            && dlg.vault1_id != dlg.vault2_id
+                            && auth_warning.is_none();
+                        if ui
+                            .add_enabled(ready, egui::Button::new("Run"))
+                            .on_disabled_hover_text(
+                                auth_warning.clone().unwrap_or_else(|| {
+                                    "Choose two different Vault boxes.".to_string()
+                                }),
+                            )
+                            .clicked()
+                        {
+                            do_run = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+
+            if do_cancel || !window_open {
+                self.vault_health_dialog = None;
+                return;
+            }
+
+            if env_changed {
+                // The old picks belong to the old environment.
+                dlg.vault1_id.clear();
+                dlg.vault1_label.clear();
+                dlg.vault2_id.clear();
+                dlg.vault2_label.clear();
+                dlg.error = None;
+                self.preselect_lone_vault_boxes(&mut dlg);
+            }
+
+            if do_run {
+                if dlg.env_profile_id.is_empty() {
+                    dlg.error = Some("Choose an environment.".to_string());
+                } else if dlg.vault1_id.is_empty() || dlg.vault2_id.is_empty() {
+                    dlg.error = Some("Choose both Vault 1 and Vault 2.".to_string());
+                } else if dlg.vault1_id == dlg.vault2_id {
+                    dlg.error = Some("Vault 1 and Vault 2 must be different boxes.".to_string());
+                } else {
+                    self.enqueue_vault_health_run(
+                        &dlg.env_profile_id,
+                        (&dlg.vault1_id, &dlg.vault1_label),
+                        (&dlg.vault2_id, &dlg.vault2_label),
+                    );
+                    self.vault_health_dialog = None;
+                    return;
+                }
+            }
+
+            self.vault_health_dialog = Some(dlg);
+        }
+
+        /// Open both sessions and queue the health check on each. (Wired up in
+        /// the next step; until then it only says so.)
+        fn enqueue_vault_health_run(
+            &mut self,
+            _env: &str,
+            _vault1: (&str, &str),
+            _vault2: (&str, &str),
+        ) {
+            self.set_script_status(
+                "Vault Health Check is not wired up yet.".to_string(),
+                ScriptState::Failed,
+            );
         }
 
         /// Render the "Scripts → Vault IAM Access" modal.
@@ -40825,6 +41086,7 @@ mod gui {
                 self.render_pem_env_prompt(ctx);
                 self.render_ticket_check(ctx);
                 self.render_vault_iam_dialog(ctx);
+                self.render_vault_health_dialog(ctx);
                 self.poll_cassandra_events();
                 self.poll_cassandra_schedules();
                 self.render_cassandra_dialog(ctx);
@@ -41387,6 +41649,7 @@ mod gui {
                             + usize::from(self.allow_delete_user)
                             + usize::from(self.user_sync_enabled)
                             + usize::from(self.vault_iam_enabled)
+                            + usize::from(self.vault_health_enabled)
                             + usize::from(self.vault_iam_delete_enabled)
                             + usize::from(self.cassandra_cert_enabled)
                             + self.default_scripts.len()
@@ -41399,6 +41662,7 @@ mod gui {
                         let mut add_script = false;
                         let mut edit_pat = false;
                         let mut open_vault_iam: Option<bool> = None;
+                        let mut open_vault_health = false;
                         let mut open_cassandra = false;
                         let mut open_user_sync = false;
                         egui::ComboBox::from_id_salt("scripts_menu")
@@ -41492,6 +41756,21 @@ mod gui {
                                         .clicked()
                                 {
                                     open_vault_iam = Some(true);
+                                    ui.close();
+                                }
+                                if self.vault_health_enabled
+                                    && ui
+                                        .selectable_label(false, "Vault Health Check")
+                                        .on_hover_text(
+                                            "Check a pair of Vault boxes: opens a tab on \
+                                             each, runs the Vault health check and docker \
+                                             ps as root (read-only), then reports whether \
+                                             there is one leader and one follower on the \
+                                             same version with the vault container up.",
+                                        )
+                                        .clicked()
+                                {
+                                    open_vault_health = true;
                                     ui.close();
                                 }
                                 // Hidden, not greyed out, off the two-key gate
@@ -41631,6 +41910,9 @@ mod gui {
                         }
                         if let Some(delete) = open_vault_iam {
                             self.open_vault_iam_dialog(delete);
+                        }
+                        if open_vault_health {
+                            self.open_vault_health_dialog();
                         }
                         if open_cassandra {
                             self.open_cassandra_dialog();
@@ -48192,6 +48474,33 @@ mod gui {
                 .collect();
         }
         filtered
+    }
+
+    /// The running Vault boxes in an environment, as `(id, name)` pairs sorted
+    /// by name: instances tagged `ApplicationName=vault` (key exact, value
+    /// case-insensitive) whose environment matches. An empty `env_name`
+    /// applies no environment filter, as for the bastion dropdowns.
+    fn vault_instances(instances: &[Instance], env_name: &str) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = instances
+            .iter()
+            .filter(|i| i.state.eq_ignore_ascii_case("running"))
+            .filter(|i| {
+                i.tags
+                    .get("ApplicationName")
+                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("vault"))
+            })
+            .filter(|i| {
+                ec2_manager::script_env::env_matches(instance_env(i).as_deref(), env_name)
+            })
+            .map(|i| (i.instance_id.clone(), i.name.clone().unwrap_or_default()))
+            .collect();
+        out.sort_by(|(a_id, a_name), (b_id, b_name)| {
+            a_name
+                .to_ascii_lowercase()
+                .cmp(&b_name.to_ascii_lowercase())
+                .then_with(|| a_id.cmp(b_id))
+        });
+        out
     }
 
     /// The one candidate to preselect, when the dropdown offers exactly one.
@@ -56830,6 +57139,86 @@ mod gui {
                 sole_secondary_bastion(&instances, "bastion", "i-0a", "i-0b"),
                 None
             );
+        }
+
+        fn vault_box(id: &str, name: &str, env: Option<&str>, tags: &[(&str, &str)]) -> Instance {
+            let mut i = Instance::new(id.to_string(), "running".to_string());
+            i.name = Some(name.to_string());
+            i.env = env.map(str::to_string);
+            for (k, v) in tags {
+                i.tags.insert(k.to_string(), v.to_string());
+            }
+            i
+        }
+
+        #[test]
+        fn only_tagged_vault_instances_in_the_environment() {
+            let all = vec![
+                vault_box("i-v1", "vault-b", Some("DEV1"), &[("ApplicationName", "vault")]),
+                vault_box("i-v2", "vault-a", Some("DEV1"), &[("ApplicationName", "vault")]),
+                vault_box("i-web", "web", Some("DEV1"), &[("ApplicationName", "web")]),
+                vault_box("i-other", "vault-prod", Some("PROD"), &[("ApplicationName", "vault")]),
+            ];
+            let out = vault_instances(&all, "DEV1");
+            // Alphabetical by name, so the dropdown order is stable.
+            assert_eq!(
+                out,
+                vec![
+                    ("i-v2".to_string(), "vault-a".to_string()),
+                    ("i-v1".to_string(), "vault-b".to_string()),
+                ]
+            );
+        }
+
+        #[test]
+        fn vault_tag_value_is_case_insensitive_but_the_key_is_exact() {
+            let all = vec![
+                vault_box("i-1", "a", None, &[("ApplicationName", "VAULT")]),
+                vault_box("i-2", "b", None, &[("applicationname", "vault")]),
+                vault_box("i-3", "c", None, &[("ApplicationName", "vault-agent")]),
+            ];
+            let ids: Vec<String> = vault_instances(&all, "").into_iter().map(|(id, _)| id).collect();
+            assert_eq!(ids, vec!["i-1".to_string()]);
+        }
+
+        #[test]
+        fn untagged_stopped_or_other_environment_instances_are_excluded() {
+            let mut stopped = vault_box("i-s", "s", Some("DEV1"), &[("ApplicationName", "vault")]);
+            stopped.state = "stopped".to_string();
+            let all = vec![
+                stopped,
+                vault_box("i-n", "n", Some("DEV1"), &[]),
+                vault_box("i-x", "x", Some("QA"), &[("ApplicationName", "vault")]),
+            ];
+            assert!(vault_instances(&all, "DEV1").is_empty());
+        }
+
+        #[test]
+        fn an_empty_environment_name_applies_no_environment_filter() {
+            let all = vec![
+                vault_box("i-a", "a", Some("DEV1"), &[("ApplicationName", "vault")]),
+                vault_box("i-b", "b", None, &[("ApplicationName", "vault")]),
+            ];
+            assert_eq!(vault_instances(&all, "").len(), 2);
+        }
+
+        /// The menu entry and the dialog both sit behind the allow-list, and
+        /// the dialog never speaks of a primary or secondary: with Vault the
+        /// roles move.
+        #[test]
+        fn the_vault_health_check_stays_behind_its_gate() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let at = src.find("\"Vault Health Check\"").expect("the menu entry");
+            assert!(
+                src[at.saturating_sub(300)..at].contains("self.vault_health_enabled"),
+                "the menu entry must be inside the vault_health_enabled check"
+            );
+            let start = src.find("fn render_vault_health_dialog").expect("the dialog");
+            let body = &src[start..start + 3000];
+            assert!(body.contains("self.vault_health_enabled"), "the dialog re-checks its gate");
+            assert!(!body.to_ascii_lowercase().contains("primary"));
+            assert!(!body.to_ascii_lowercase().contains("secondary"));
         }
 
         /// A filter matching nothing falls back to the "bastion" substring
