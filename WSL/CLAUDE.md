@@ -62,8 +62,9 @@ baseline immediately before that work was 1522 tests / 24 warnings, on the
 same tree. (Before phase 1 of the resource browser this line had been stale
 for months, reading 356 tests / 21 warnings.)
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 2018 tests pass, 0 fail (1238 lib + 3 CLI + 777 GUI),
-  remeasured 2026-10-19 after the Grafana watcher's final-review fixes
+- `cargo test --features gui` — 2050 tests pass, 0 fail (1260 lib + 3 CLI + 787 GUI),
+  remeasured 2026-10-20 after the Vault Health Check (clippy still 30 lines,
+  Windows release cross-compile exit 0 with zero warnings)
 - `cargo clippy --features gui` — no errors; **30 `^warning` lines**, measured
   2026-10-19, identical to the pre-Grafana tree at `4e4b95b`. The Grafana work
   adds no lint: the one it introduced (`too_many_arguments` on
@@ -4212,6 +4213,49 @@ must not imply being able to delete. The delete always removes the policy too,
 so pointing it at a policy shared by another role takes that role's policy with
 it. Deleting something already absent is fine — the verdict checks end state,
 not the delete's exit code.
+
+### Vault Health Check (Scripts menu)
+
+`src/vault_health.rs` (pure: commands, parsing, verdict, report) plus the
+dialog and run wiring in the GUI. Gated by `vault_health.allowed_users` in
+features.json (`["*"]` shipped = everyone, by the maintainer's decision, as for
+`vault_iam`; `Default` is empty so a malformed file fails closed). Spec:
+`docs/superpowers/specs/2026-10-20-vault-health-check-design.md` (gitignored).
+
+- **Environment + Vault 1 / Vault 2, no primary/secondary.** Either box can be
+  the leader, so the dropdowns are just two picks. Both list only *running*
+  instances in the selected environment tagged `ApplicationName=vault` (key
+  exact, value case-insensitive) — `vault_instances`. Vault 2's list excludes
+  Vault 1. A lone candidate is preselected into an empty field only.
+- **Visible tabs, like Bastion New User.** One SSM tab per box, concurrently:
+  `sudo su`, `PREP_STEP_SENTINEL`, the health one-liner, `docker ps`, then a
+  done marker. Read-only (pinned by `the_steps_are_read_only`). `sudo su` is
+  needed because `docker ps` needs root.
+- **The marker is assembled at runtime** (`m=DONE; echo "__VAULT_HEALTH_${m}__"`)
+  and every result is matched as an **exact line**: the shell echoes each
+  command line, and the one-liner's own text contains `OVERALL: HEALTHY`, so a
+  substring match reads the echo as a result (`command_echo_is_not_a_result`).
+- **The whole buffer is read, scrollback included** (`full_screen_text`).
+  `screen().contents()` is only the visible rows, and ~40 lines of health
+  output does not fit a short window. The user's scroll position is restored.
+- **Healthy means all of:** exactly one leader and one follower (each judged
+  from its **own** `is_self` / `standby`, never from which dropdown it was
+  picked in), both `OVERALL: HEALTHY`, identical `version` (exact string), the
+  `vault` container Up in `docker ps` (name matched exactly — `vault-agent` is
+  not it). Anything unread is a problem, never success.
+- **The popup does not wait for ever.** It shows when both tabs finish, or
+  `VAULT_HEALTH_GRACE` (60s) after the first one did, or at
+  `VAULT_HEALTH_CAP` (5 min) overall (`vault_health_due`). A box that never
+  opened, died, or was closed is reported "no result", not skipped.
+- **`abort_script_run` leaves the other box alone.** A dead Vault session marks
+  its own slot done and returns before the whole-run teardown, which would
+  otherwise drop the other box's queued steps and replace the report with a
+  "Session Failed" popup.
+- Like every other Scripts run there is only one in flight; starting a health
+  check while another is running is refused with a status line.
+- **Not yet verified against live Vault boxes** — the parsing is tested on
+  fixtures shaped from real screenshots, and the dialog/run wiring on source
+  scans, not on a real SSM session.
 
 ### Cassandra Cert (Scripts menu)
 
