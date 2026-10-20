@@ -45,6 +45,7 @@ pub mod tunnel;
 pub mod unhealthy_host;
 pub mod user_sync;
 pub mod util;
+pub mod vault_health;
 pub mod vault_iam;
 pub mod wincred;
 pub mod workflow;
