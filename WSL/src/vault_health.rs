@@ -155,18 +155,49 @@ fn json_str(v: &Option<Value>, key: &str) -> Option<String> {
 
 /// Whether `docker ps` output shows a container named exactly `vault` that is
 /// Up. `None` when there is no table at all (the command never ran).
-fn vault_container_up(screen: &str) -> Option<bool> {
+///
+/// The table is read as a stream of tokens, not line by line: a terminal that
+/// is narrower than the ~138-column table (or a Windows pty that hard-breaks
+/// at its own width) splits rows at arbitrary points. Rows are told apart by
+/// their 12-hex container id, and a row is the vault one when its last token
+/// is exactly `vault`.
+pub fn vault_container_up(screen: &str) -> Option<bool> {
     let lines: Vec<&str> = screen.lines().collect();
-    let header = lines
-        .iter()
-        .rposition(|l| l.contains("CONTAINER ID") && l.contains("NAMES"))?;
+    let header = lines.iter().rposition(|l| l.contains("CONTAINER ID"))?;
+    let mut body: Vec<&str> = Vec::new();
     for row in lines.iter().skip(header + 1) {
         let row = row.trim();
-        if row.is_empty() || row.starts_with('#') || row.starts_with("__VAULT_HEALTH_") {
+        // Blank lines are skipped, not a stop: a hard break inside a run of
+        // column padding leaves one. The prompt / marker is what ends it.
+        if row.is_empty() {
+            continue;
+        }
+        if row.starts_with('#')
+            || row.starts_with("__VAULT_HEALTH_")
+            || row.starts_with("root@")
+            || row.contains(" SSM /")
+        {
             break;
         }
-        let name = row.split_whitespace().last();
-        if name == Some("vault") && row.contains(" Up ") {
+        body.push(row);
+    }
+    // Joined with a space, and with nothing: a break that fell mid-word needs
+    // the second, one that fell on a (trimmed) space needs the first.
+    for sep in [" ", ""] {
+        let joined = body.join(sep);
+        let mut row: Vec<&str> = Vec::new();
+        let mut rows: Vec<Vec<&str>> = Vec::new();
+        for tok in joined.split_whitespace() {
+            if tok.len() == 12 && tok.bytes().all(|b| b.is_ascii_hexdigit()) {
+                rows.push(std::mem::take(&mut row));
+            }
+            row.push(tok);
+        }
+        rows.push(row);
+        if rows
+            .iter()
+            .any(|r| r.last() == Some(&"vault") && r.contains(&"Up"))
+        {
             return Some(true);
         }
     }

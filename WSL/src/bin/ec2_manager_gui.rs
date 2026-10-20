@@ -1850,6 +1850,25 @@ mod gui {
         nonce: String,
     }
 
+    /// What to put in Vault 1 and Vault 2 (None = leave as is). Boxes arrive sorted
+    /// by name; an empty Vault 1 takes the first, an empty Vault 2 the first one
+    /// Vault 1 does not hold, so the two dropdowns always cover two different
+    /// boxes. A field that already holds a pick is never replaced.
+    fn auto_pick_vault_boxes(
+        boxes: &[(String, String)],
+        vault1_id: &str,
+        vault2_id: &str,
+    ) -> (Option<(String, String)>, Option<(String, String)>) {
+        let v1 = if vault1_id.is_empty() { boxes.first().cloned() } else { None };
+        let held1 = v1.as_ref().map(|(id, _)| id.as_str()).unwrap_or(vault1_id);
+        let v2 = if vault2_id.is_empty() {
+            boxes.iter().find(|(id, _)| id != held1).cloned()
+        } else {
+            None
+        };
+        (v1, v2)
+    }
+
     /// Clear Vault 1 / Vault 2 picks the dropdowns no longer offer (the box
     /// stopped, the environment changed, an inventory refresh), and a Vault 2
     /// that has become the same box as Vault 1.
@@ -24198,17 +24217,17 @@ mod gui {
                 .unwrap_or_default()
         }
 
-        /// Fill an empty Vault 1 / Vault 2 when the dropdown offers exactly one
-        /// box (Vault 2's list excludes Vault 1). Only ever fills empty fields.
+        /// Fill an empty Vault 1, then an empty Vault 2, from the boxes the
+        /// environment offers: each takes the first box the other has not.
+        /// Only ever fills empty fields, so a deliberate pick is left alone.
         fn preselect_lone_vault_boxes(&self, dlg: &mut VaultHealthDialog) {
             let boxes = self.env_vault_instances(&dlg.env_profile_id, &dlg.env_name);
-            if let Some((id, name)) = sole_bastion_candidate(&boxes, "", &dlg.vault1_id) {
+            let (v1, v2) = auto_pick_vault_boxes(&boxes, &dlg.vault1_id, &dlg.vault2_id);
+            if let Some((id, name)) = v1 {
                 dlg.vault1_label = format!("{name}  {id}");
                 dlg.vault1_id = id;
             }
-            let rest: Vec<(String, String)> =
-                boxes.into_iter().filter(|(id, _)| *id != dlg.vault1_id).collect();
-            if let Some((id, name)) = sole_bastion_candidate(&rest, "", &dlg.vault2_id) {
+            if let Some((id, name)) = v2 {
                 dlg.vault2_label = format!("{name}  {id}");
                 dlg.vault2_id = id;
             }
@@ -57558,6 +57577,66 @@ mod gui {
                 text.lines().any(|l| l.contains("Up 15 hours") && l.trim_end().ends_with("vault")),
                 "{text}"
             );
+        }
+
+        /// The parser trims trailing blanks from every row, so a wrap that falls
+        /// on a space lost it: `Up` + `33 hours` joined as `Up33 hours` and the
+        /// healthy container read as not Up.
+        #[test]
+        fn full_screen_text_keeps_the_space_a_wrap_falls_on() {
+            let mut parser = vt100::Parser::new(24, 20, 2500);
+            // 20 columns: the first row ends in the space after "Up".
+            parser.process(b"c4fb581a84a7 vault  Up 33 hours  vault\r\n");
+            let text = full_screen_text(&mut parser);
+            assert!(text.contains("vault  Up 33 hours"), "{text:?}");
+            assert!(text.lines().any(|l| l.contains(" Up ") && l.trim_end().ends_with("vault")), "{text}");
+        }
+
+        #[test]
+        fn the_real_docker_ps_row_reads_as_up_at_every_width() {
+            let header = "CONTAINER ID   IMAGE                                                          COMMAND                  CREATED        STATUS         PORTS     NAMES";
+            let row = "6de5e73f2538   docker-proxy-hub.udapp-appsec.us.amz.3mhis.net/vault:1.13.3   \"docker-entrypoint.s\u{2026}\"   33 hours ago   Up 33 hours              vault";
+            for cols in [40u16, 60, 80, 100, 120, 138, 160, 200] {
+                let mut parser = vt100::Parser::new(24, cols, 2500);
+                parser.process(format!("# docker ps\r\n{header}\r\n{row}\r\n\r\nroot@ip SSM /home\r\n# ").as_bytes());
+                let text = full_screen_text(&mut parser);
+                assert_eq!(ec2_manager::vault_health::vault_container_up(&text), Some(true), "cols={cols}\n{text}");
+            }
+        }
+
+        /// A pty that hard-breaks rows at its own width (no wrap flag) must not
+        /// make a running vault container read as down, wherever it breaks.
+        #[test]
+        fn a_hard_broken_docker_ps_row_still_reads_as_up() {
+            let header = "CONTAINER ID   IMAGE                                                          COMMAND                  CREATED        STATUS         PORTS     NAMES";
+            let row = "6de5e73f2538   docker-proxy-hub.udapp-appsec.us.amz.3mhis.net/vault:1.13.3   \"docker-entrypoint.s\u{2026}\"   33 hours ago   Up 33 hours              vault";
+            for w in 30usize..=140 {
+                let brk = |s: &str| -> String {
+                    let cs: Vec<char> = s.chars().collect();
+                    cs.chunks(w).map(|c| c.iter().collect::<String>().trim_end().to_string()).collect::<Vec<_>>().join("\n")
+                };
+                let text = format!("# docker ps\n{}\n{}\n\nroot@ip SSM /home\n# ", brk(header), brk(row));
+                assert_eq!(ec2_manager::vault_health::vault_container_up(&text), Some(true), "w={w}\n{text}");
+            }
+        }
+
+        #[test]
+        fn the_two_vault_dropdowns_fill_with_two_different_boxes() {
+            let boxes = vec![("i-a".to_string(), "a".to_string()), ("i-b".to_string(), "b".to_string())];
+            let (v1, v2) = auto_pick_vault_boxes(&boxes, "", "");
+            assert_eq!(v1.unwrap().0, "i-a");
+            assert_eq!(v2.unwrap().0, "i-b");
+            // A deliberate Vault 1 pick is kept; Vault 2 takes the other box.
+            let (v1, v2) = auto_pick_vault_boxes(&boxes, "i-b", "");
+            assert!(v1.is_none());
+            assert_eq!(v2.unwrap().0, "i-a");
+            // Vault 2 already chosen: nothing to do.
+            assert_eq!(auto_pick_vault_boxes(&boxes, "i-a", "i-b"), (None, None));
+            // One box only: Vault 2 stays empty rather than repeating Vault 1.
+            let one = vec![boxes[0].clone()];
+            let (v1, v2) = auto_pick_vault_boxes(&one, "", "");
+            assert_eq!(v1.unwrap().0, "i-a");
+            assert!(v2.is_none());
         }
 
         #[test]
