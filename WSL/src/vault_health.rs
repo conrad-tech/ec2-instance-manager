@@ -24,25 +24,60 @@ pub const HEALTH_COMMAND: &str = concat!(
     r#"then echo "OVERALL: HEALTHY"; else echo "OVERALL: UNHEALTHY"; fi"#,
 );
 
-const DONE_MARKER: &str = "__VAULT_HEALTH_DONE__";
+/// Keep only what is safe to put in a shell command and in a marker line.
+fn clean(nonce: &str) -> String {
+    nonce.chars().filter(char::is_ascii_alphanumeric).collect()
+}
 
-/// The step that prints the done marker. Assembled by the shell at run time:
-/// the shell echoes every command line before running it, so a literal
-/// marker in the command would be matched off the echo and a tab would read
-/// as finished before anything ran. Same trick as `vault_iam::verdict_step`.
-fn done_step() -> String {
-    "m=DONE; echo \"__VAULT_HEALTH_${m}__\"".to_string()
+fn marker_line(kind: &str, nonce: &str) -> String {
+    format!("__VAULT_HEALTH_{kind}_{}__", clean(nonce))
+}
+
+/// A step that prints a marker line. The marker is assembled by the shell at
+/// run time: the shell echoes every command line before running it, so a
+/// literal marker in the command would be matched off the echo and a tab
+/// would read as started or finished before anything ran. Same trick as
+/// `vault_iam::verdict_step`.
+fn marker_step(kind: &str, nonce: &str) -> String {
+    format!("n={}; echo \"__VAULT_HEALTH_{kind}_${{n}}__\"", clean(nonce))
 }
 
 /// The steps sent to each box after `sudo su` and the terminal prep.
-pub fn steps() -> Vec<String> {
-    vec![HEALTH_COMMAND.to_string(), "docker ps".to_string(), done_step()]
+///
+/// `nonce` is unique to the run. The tab is reused between runs and holds
+/// the previous run's output, so a run's results are only read from after
+/// *its own* start marker: otherwise a re-run whose steps never executed
+/// (the tab sits in `less`, or `sudo` is asking for a password) would read
+/// the previous run's healthy output back.
+pub fn steps(nonce: &str) -> Vec<String> {
+    vec![
+        marker_step("START", nonce),
+        HEALTH_COMMAND.to_string(),
+        "docker ps".to_string(),
+        marker_step("DONE", nonce),
+    ]
 }
 
-/// True once the done marker has been printed as output (a line that is
-/// exactly the marker — the echoed command line never is).
-pub fn is_done(screen: &str) -> bool {
-    screen.lines().any(|l| l.trim() == DONE_MARKER)
+/// True once this run's done marker has been printed as output (a line that
+/// is exactly the marker — the echoed command line never is).
+pub fn is_done(screen: &str, nonce: &str) -> bool {
+    let done = marker_line("DONE", nonce);
+    screen.lines().any(|l| l.trim() == done)
+}
+
+/// The part of the tab after the last line that is exactly this run's start
+/// marker; `None` when the run never started.
+fn this_run<'a>(screen: &'a str, nonce: &str) -> Option<&'a str> {
+    let start = marker_line("START", nonce);
+    let mut offset = 0;
+    let mut found = None;
+    for line in screen.split_inclusive('\n') {
+        offset += line.len();
+        if line.trim() == start {
+            found = Some(offset);
+        }
+    }
+    found.map(|at| &screen[at..])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,8 +173,11 @@ fn vault_container_up(screen: &str) -> Option<bool> {
     Some(false)
 }
 
-/// Read one box's tab text.
-pub fn parse_box(screen: &str) -> BoxReport {
+/// Read one box's tab text, from this run's start marker onwards.
+pub fn parse_box(screen: &str, nonce: &str) -> BoxReport {
+    let Some(screen) = this_run(screen, nonce) else {
+        return BoxReport::default();
+    };
     let health = section_json(screen, "HEALTH");
     let leader = section_json(screen, "LEADER");
     let seal = section_json(screen, "SEAL STATUS");
@@ -160,7 +198,7 @@ pub fn parse_box(screen: &str) -> BoxReport {
         version: json_str(&health, "version").or_else(|| json_str(&seal, "version")),
         overall_healthy,
         container_up: vault_container_up(screen),
-        done: is_done(screen),
+        done: is_done(screen, nonce),
     }
 }
 
@@ -238,10 +276,10 @@ pub struct Report {
 /// Judge the two tabs' text and render the report. `None` is a tab that never
 /// opened or was closed; it is reported as a box with no result, never
 /// skipped.
-pub fn build_report(labels: [&str; 2], texts: [Option<&str>; 2]) -> Report {
+pub fn build_report(labels: [&str; 2], texts: [Option<&str>; 2], nonce: &str) -> Report {
     let reports = [
-        parse_box(texts[0].unwrap_or_default()),
-        parse_box(texts[1].unwrap_or_default()),
+        parse_box(texts[0].unwrap_or_default(), nonce),
+        parse_box(texts[1].unwrap_or_default(), nonce),
     ];
     let verdict = judge(&reports[0], &reports[1], labels[0], labels[1]);
 
@@ -280,6 +318,8 @@ pub fn build_report(labels: [&str; 2], texts: [Option<&str>; 2]) -> Report {
 mod tests {
     use super::*;
 
+    const NONCE: &str = "c0ffee01";
+
     const PS_UP: &str = "CONTAINER ID   IMAGE                                                COMMAND                  CREATED        STATUS         PORTS     NAMES\nc4fb581a84a7   docker-proxy-hub.example.net/vault:1.13.3   \"docker-entrypoint.s…\"   15 hours ago   Up 15 hours              vault";
     const PS_DOWN: &str = "CONTAINER ID   IMAGE                                                COMMAND                  CREATED        STATUS                     PORTS     NAMES\nc4fb581a84a7   docker-proxy-hub.example.net/vault:1.13.3   \"docker-entrypoint.s…\"   15 hours ago   Exited (1) 2 minutes ago             vault";
 
@@ -288,6 +328,7 @@ mod tests {
     fn tab(standby: bool, is_self: bool, version: &str, sealed: bool, overall: &str, ps: &str, done: bool) -> String {
         let mut s = String::new();
         s.push_str("# sudo su\n# ");
+        s.push_str(&format!("# n={NONCE}; echo \"__VAULT_HEALTH_START_${{n}}__\"\n__VAULT_HEALTH_START_{NONCE}__\n# "));
         s.push_str(HEALTH_COMMAND);
         s.push('\n');
         s.push_str(&format!(
@@ -304,7 +345,7 @@ mod tests {
         s.push_str(ps);
         s.push_str("\n# m=DONE; echo \"__VAULT_HEALTH_${m}__\"\n");
         if done {
-            s.push_str("__VAULT_HEALTH_DONE__\n");
+            s.push_str(&format!("__VAULT_HEALTH_DONE_{NONCE}__\n"));
         }
         s
     }
@@ -316,7 +357,7 @@ mod tests {
         tab(true, false, "1.13.3", false, "OVERALL: HEALTHY", PS_UP, true)
     }
     fn judged(a: &str, b: &str) -> Verdict {
-        judge(&parse_box(a), &parse_box(b), "Vault 1", "Vault 2")
+        judge(&parse_box(a, NONCE), &parse_box(b, NONCE), "Vault 1", "Vault 2")
     }
 
     #[test]
@@ -330,8 +371,8 @@ mod tests {
 
     #[test]
     fn roles_come_from_the_boxs_own_answer() {
-        assert_eq!(parse_box(&leader()).role(), Role::Leader);
-        assert_eq!(parse_box(&follower()).role(), Role::Follower);
+        assert_eq!(parse_box(&leader(), NONCE).role(), Role::Leader);
+        assert_eq!(parse_box(&follower(), NONCE).role(), Role::Follower);
     }
 
     #[test]
@@ -339,11 +380,11 @@ mod tests {
         // Only the echoed command lines: they contain OVERALL: HEALTHY and
         // the marker text, and neither may count.
         let echo = format!("# sudo su\n# {HEALTH_COMMAND}\n# docker ps\n# m=DONE; echo \"__VAULT_HEALTH_${{m}}__\"\n");
-        assert!(!is_done(&echo));
-        let b = parse_box(&echo);
+        assert!(!is_done(&echo, NONCE));
+        let b = parse_box(&echo, NONCE);
         assert_eq!(b.overall_healthy, None);
         assert!(!b.done);
-        let v = judge(&b, &parse_box(&follower()), "Vault 1", "Vault 2");
+        let v = judge(&b, &parse_box(&follower(), NONCE), "Vault 1", "Vault 2");
         assert!(!v.healthy);
         assert!(v.problems.iter().any(|p| p.contains("Vault 1") && p.contains("no result")), "{:?}", v.problems);
     }
@@ -393,15 +434,15 @@ mod tests {
     #[test]
     fn container_missing_or_exited() {
         let down = tab(false, true, "1.13.3", false, "OVERALL: HEALTHY", PS_DOWN, true);
-        assert_eq!(parse_box(&down).container_up, Some(false));
+        assert_eq!(parse_box(&down, NONCE).container_up, Some(false));
         let v = judged(&down, &follower());
         assert!(!v.healthy);
         assert!(v.problems.iter().any(|p| p.contains("Vault 1") && p.contains("container")), "{:?}", v.problems);
 
         let empty = tab(false, true, "1.13.3", false, "OVERALL: HEALTHY", "CONTAINER ID   IMAGE   COMMAND   CREATED   STATUS   PORTS   NAMES", true);
-        assert_eq!(parse_box(&empty).container_up, Some(false));
+        assert_eq!(parse_box(&empty, NONCE).container_up, Some(false));
         let no_table = tab(false, true, "1.13.3", false, "OVERALL: HEALTHY", "", true);
-        assert_eq!(parse_box(&no_table).container_up, None);
+        assert_eq!(parse_box(&no_table, NONCE).container_up, None);
         assert!(!judged(&no_table, &follower()).healthy);
     }
 
@@ -409,7 +450,7 @@ mod tests {
     fn a_container_merely_containing_vault_in_its_name_is_not_vault() {
         let other = "CONTAINER ID   IMAGE   COMMAND   CREATED   STATUS   PORTS   NAMES\nabc   img:1   \"x\"   1 hour ago   Up 1 hour       vault-agent";
         let t = tab(false, true, "1.13.3", false, "OVERALL: HEALTHY", other, true);
-        assert_eq!(parse_box(&t).container_up, Some(false));
+        assert_eq!(parse_box(&t, NONCE).container_up, Some(false));
     }
 
     #[test]
@@ -425,24 +466,26 @@ mod tests {
     #[test]
     fn garbled_json_does_not_panic() {
         let junk = "HEALTH\n{\n  \"sealed\": tru\n}\n---\nLEADER\n{\nOVERALL: HEALTHY\n__VAULT_HEALTH_DONE__\n";
-        let b = parse_box(junk);
+        let b = parse_box(junk, NONCE);
         assert_eq!(b.sealed, None);
         let _ = judge(&b, &b, "Vault 1", "Vault 2");
-        let _ = parse_box("");
-        let _ = parse_box("HEALTH\n{");
+        let _ = parse_box("", NONCE);
+        let _ = parse_box("HEALTH\n{", NONCE);
     }
 
     #[test]
     fn the_steps_never_contain_the_literal_marker() {
-        for s in steps() {
-            assert!(!s.contains("__VAULT_HEALTH_DONE__"), "{s}");
+        for s in steps(NONCE) {
+            assert!(!s.contains("__VAULT_HEALTH_DONE_") || s.contains("${n}"), "{s}");
+            assert!(!s.contains(&format!("__VAULT_HEALTH_DONE_{NONCE}__")), "{s}");
+            assert!(!s.contains(&format!("__VAULT_HEALTH_START_{NONCE}__")), "{s}");
         }
-        assert!(steps().last().unwrap().contains("__VAULT_HEALTH_${"));
+        assert!(steps(NONCE).last().unwrap().contains("__VAULT_HEALTH_DONE_${"));
     }
 
     #[test]
     fn the_steps_are_read_only() {
-        let all = steps().join("\n");
+        let all = steps(NONCE).join("\n");
         for bad in [
             "restart", "unseal", "step-down", "docker rm", "docker stop", "docker kill",
             "-X POST", "-X PUT", "-X DELETE", "rm ", "tee",
@@ -450,14 +493,14 @@ mod tests {
             assert!(!all.contains(bad), "step mentions {bad}");
         }
         assert!(!all.replace(">/dev/null 2>&1", "").contains('>'));
-        assert_eq!(steps()[1], "docker ps");
-        assert_eq!(steps()[0], HEALTH_COMMAND);
+        assert_eq!(steps(NONCE)[2], "docker ps");
+        assert_eq!(steps(NONCE)[1], HEALTH_COMMAND);
     }
 
     #[test]
     fn report_for_a_healthy_pair() {
         let (l, f) = (leader(), follower());
-        let r = build_report(["Vault 1 (vault-a)", "Vault 2 (vault-b)"], [Some(&l), Some(&f)]);
+        let r = build_report(["Vault 1 (vault-a)", "Vault 2 (vault-b)"], [Some(&l), Some(&f)], NONCE);
         assert!(r.verdict.healthy, "{:?}", r.verdict.problems);
         assert!(r.summary.contains("healthy"));
         assert!(r.summary.contains("Vault 1 (vault-a) is the leader"), "{}", r.summary);
@@ -468,7 +511,7 @@ mod tests {
     #[test]
     fn report_details_carry_both_raw_outputs_labelled() {
         let (l, f) = (leader(), follower());
-        let r = build_report(["Vault 1", "Vault 2"], [Some(&l), Some(&f)]);
+        let r = build_report(["Vault 1", "Vault 2"], [Some(&l), Some(&f)], NONCE);
         let at_1 = r.details.find("Vault 1").expect("first label");
         let at_2 = r.details.rfind("Vault 2").expect("second label");
         assert!(at_1 < at_2);
@@ -480,7 +523,7 @@ mod tests {
     #[test]
     fn a_missing_tab_is_reported_not_skipped() {
         let l = leader();
-        let r = build_report(["Vault 1", "Vault 2"], [Some(&l), None]);
+        let r = build_report(["Vault 1", "Vault 2"], [Some(&l), None], NONCE);
         assert!(!r.verdict.healthy);
         assert!(r.summary.contains("Vault 2"), "{}", r.summary);
         assert!(r.details.contains("(no output)"), "{}", r.details);
@@ -489,8 +532,36 @@ mod tests {
     #[test]
     fn an_unhealthy_summary_lists_every_problem() {
         let (a, b) = (leader(), leader());
-        let r = build_report(["Vault 1", "Vault 2"], [Some(&a), Some(&b)]);
+        let r = build_report(["Vault 1", "Vault 2"], [Some(&a), Some(&b)], NONCE);
         assert!(!r.verdict.healthy);
         assert!(r.summary.contains("both boxes claim to be the leader"), "{}", r.summary);
+    }
+
+    #[test]
+    fn an_earlier_run_on_a_reused_tab_is_never_read() {
+        // Run 1 was healthy. Run 2's steps were typed into `less`, so all it
+        // left on the tab is its own start marker (a different nonce) and
+        // nothing else. The old results must not count for it.
+        let old = leader();
+        let second = "# n=beef0002; echo \"__VAULT_HEALTH_START_${n}__\"\n__VAULT_HEALTH_START_beef0002__\n";
+        let screen = format!("{old}{second}");
+        let b = parse_box(&screen, "beef0002");
+        assert_eq!(b, BoxReport::default());
+        assert!(!judge(&b, &parse_box(&follower(), NONCE), "Vault 1", "Vault 2").healthy);
+        // And the old run's own nonce still reads it.
+        assert!(parse_box(&screen, NONCE).done);
+    }
+
+    #[test]
+    fn a_box_that_never_printed_the_start_marker_is_unread() {
+        let screen = leader().replace(&format!("__VAULT_HEALTH_START_{NONCE}__\n"), "");
+        assert_eq!(parse_box(&screen, NONCE), BoxReport::default());
+    }
+
+    #[test]
+    fn the_done_marker_must_carry_this_runs_nonce() {
+        let screen = leader().replace(NONCE, "0ther");
+        // Start marker and done marker both carry another nonce.
+        assert!(!is_done(&screen, NONCE));
     }
 }

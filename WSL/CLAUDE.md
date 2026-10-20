@@ -62,7 +62,7 @@ baseline immediately before that work was 1522 tests / 24 warnings, on the
 same tree. (Before phase 1 of the resource browser this line had been stale
 for months, reading 356 tests / 21 warnings.)
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 2050 tests pass, 0 fail (1260 lib + 3 CLI + 787 GUI),
+- `cargo test --features gui` — 2057 tests pass, 0 fail (1263 lib + 3 CLI + 791 GUI),
   remeasured 2026-10-20 after the Vault Health Check (clippy still 30 lines,
   Windows release cross-compile exit 0 with zero warnings)
 - `cargo clippy --features gui` — no errors; **30 `^warning` lines**, measured
@@ -4238,21 +4238,39 @@ features.json (`["*"]` shipped = everyone, by the maintainer's decision, as for
 - **The whole buffer is read, scrollback included** (`full_screen_text`).
   `screen().contents()` is only the visible rows, and ~40 lines of health
   output does not fit a short window. The user's scroll position is restored.
+  **Wrapped rows are joined back into one line**: `rows()` returns each visual
+  row separately, so on a window narrower than the ~138-column `docker ps`
+  table the header and the `vault` row were split and a healthy pair read as
+  having no vault container. (A resize mid-output can still split a line that
+  was on screen at that instant — rare, accepted.)
+- **Every run has a nonce** (`vault_health::steps(nonce)`). The tab is reused
+  (`ensure_bastion_session`) and keeps the previous run's output, so results
+  are read only from after *this run's* runtime-assembled start marker, and
+  the done marker carries the same nonce. Without it a re-run whose steps
+  never executed (the tab sits in `less`, `sudo` wants a password) read the
+  last run's healthy output back — a false "healthy".
 - **Healthy means all of:** exactly one leader and one follower (each judged
   from its **own** `is_self` / `standby`, never from which dropdown it was
   picked in), both `OVERALL: HEALTHY`, identical `version` (exact string), the
   `vault` container Up in `docker ps` (name matched exactly — `vault-agent` is
   not it). Anything unread is a problem, never success.
 - **The popup does not wait for ever.** It shows when both tabs finish, or
-  `VAULT_HEALTH_GRACE` (60s) after the first one did, or at
+  `VAULT_HEALTH_GRACE` (120s — a fresh session can spend 45s waiting for its
+  login prompt) after the first one did, or from the start when one box never
+  opened, or at
   `VAULT_HEALTH_CAP` (5 min) overall (`vault_health_due`). A box that never
   opened, died, or was closed is reported "no result", not skipped.
 - **`abort_script_run` leaves the other box alone.** A dead Vault session marks
   its own slot done and returns before the whole-run teardown, which would
   otherwise drop the other box's queued steps and replace the report with a
   "Session Failed" popup.
-- Like every other Scripts run there is only one in flight; starting a health
-  check while another is running is refused with a status line.
+- Only one Scripts run is in flight: starting a health check while a create,
+  Vault IAM, delete or another health run is going is refused with a status
+  line, and the whole-run teardown in `abort_script_run` clears
+  `vault_health_run`. **The reverse is not enforced** — the other runs do not
+  check for a health run before starting.
+- The dialog clears Vault 1 / Vault 2 picks the dropdowns stop offering, every
+  frame (`clear_unoffered_vault_picks`).
 - **Not yet verified against live Vault boxes** — the parsing is tested on
   fixtures shaped from real screenshots, and the dialog/run wiring on source
   scans, not on a real SSM session.

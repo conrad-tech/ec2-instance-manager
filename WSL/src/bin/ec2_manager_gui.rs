@@ -1827,7 +1827,7 @@ mod gui {
     }
 
     /// How long the second Vault box gets once the first has finished.
-    const VAULT_HEALTH_GRACE: Duration = Duration::from_secs(60);
+    const VAULT_HEALTH_GRACE: Duration = Duration::from_secs(120);
     /// The most a Vault Health Check run waits for anything, so a tab stuck
     /// at a password prompt cannot hold the report back for ever.
     const VAULT_HEALTH_CAP: Duration = Duration::from_secs(300);
@@ -1845,6 +1845,30 @@ mod gui {
         seen: [bool; 2],
         started: Instant,
         first_done_at: Option<Instant>,
+        /// Unique to this run; the tab is reused and still holds the last
+        /// run's output, so results are only read after this run's marker.
+        nonce: String,
+    }
+
+    /// Clear Vault 1 / Vault 2 picks the dropdowns no longer offer (the box
+    /// stopped, the environment changed, an inventory refresh), and a Vault 2
+    /// that has become the same box as Vault 1.
+    fn clear_unoffered_vault_picks(
+        boxes: &[(String, String)],
+        vault1_id: &mut String,
+        vault1_label: &mut String,
+        vault2_id: &mut String,
+        vault2_label: &mut String,
+    ) {
+        if !vault1_id.is_empty() && !boxes.iter().any(|(id, _)| id == vault1_id) {
+            vault1_id.clear();
+            vault1_label.clear();
+        }
+        let offered = boxes.iter().any(|(id, _)| id == vault2_id);
+        if !vault2_id.is_empty() && (!offered || vault2_id == vault1_id) {
+            vault2_id.clear();
+            vault2_label.clear();
+        }
     }
 
     /// Modal state for "Scripts -> Cassandra Cert".
@@ -24207,6 +24231,14 @@ mod gui {
                 &mut dlg.env_name,
             );
             let boxes = self.env_vault_instances(&dlg.env_profile_id, &dlg.env_name);
+            clear_unoffered_vault_picks(
+                &boxes,
+                &mut dlg.vault1_id,
+                &mut dlg.vault1_label,
+                &mut dlg.vault2_id,
+                &mut dlg.vault2_label,
+            );
+            self.preselect_lone_vault_boxes(&mut dlg);
             let vault2_boxes: Vec<(String, String)> = boxes
                 .iter()
                 .filter(|(id, _)| *id != dlg.vault1_id)
@@ -24385,7 +24417,12 @@ mod gui {
             vault1: (&str, &str),
             vault2: (&str, &str),
         ) {
-            if self.vault_health_run.is_some() || !self.pending_script_runs.is_empty() {
+            if self.vault_health_run.is_some()
+                || self.create_user_run.is_some()
+                || self.vault_iam_run.is_some()
+                || self.pending_delete.is_some()
+                || !self.pending_script_runs.is_empty()
+            {
                 self.set_script_status(
                     "Another Scripts run is still in progress.".to_string(),
                     ScriptState::Failed,
@@ -24394,15 +24431,23 @@ mod gui {
             }
             let heading = |n: u8, (id, label): (&str, &str)| {
                 let shown = label.split_whitespace().collect::<Vec<_>>().join(" ");
+                let shown = shown.strip_prefix("(no name) ").unwrap_or(&shown).to_string();
                 format!("Vault {n} ({})", if shown.is_empty() { id } else { &shown })
             };
             let labels = [heading(1, vault1), heading(2, vault2)];
+            let nonce = format!(
+                "{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or_default()
+            );
             let mut tabs: [Option<u64>; 2] = [None, None];
             for (i, (id, _)) in [vault1, vault2].into_iter().enumerate() {
                 match self.ensure_bastion_session(id, env) {
                     Some((tab_id, wait_for_login)) => {
                         let mut steps = vec!["sudo su".to_string(), PREP_STEP_SENTINEL.to_string()];
-                        steps.extend(ec2_manager::vault_health::steps());
+                        steps.extend(ec2_manager::vault_health::steps(&nonce));
                         self.pending_script_runs.push(PendingScriptRun {
                             tab_id,
                             steps,
@@ -24431,7 +24476,10 @@ mod gui {
                 done: [tabs[0].is_none(), tabs[1].is_none()],
                 seen: [false, false],
                 started: Instant::now(),
-                first_done_at: None,
+                // A box that never opened counts as finished from the start,
+                // so the other box gets the same grace a box that died does.
+                first_done_at: tabs.iter().any(Option::is_none).then(Instant::now),
+                nonce,
             });
             self.script_status_tabs = tabs.iter().flatten().copied().collect();
             self.main_tab = MainTab::Connections;
@@ -24501,12 +24549,15 @@ mod gui {
             let report = ec2_manager::vault_health::build_report(
                 [run.labels[0].as_str(), run.labels[1].as_str()],
                 [texts[0].as_deref(), texts[1].as_deref()],
+                &run.nonce,
             );
             let healthy = report.verdict.healthy;
+            // One line: the Logs tab is line-oriented.
+            let one_line = report.summary.replace('\n', "");
             if healthy {
-                self.log_info(report.summary.clone());
+                self.log_info(one_line);
             } else {
-                self.log_error(report.summary.clone());
+                self.log_error(one_line);
             }
             self.show_script_result(
                 if healthy {
@@ -25971,6 +26022,7 @@ mod gui {
             self.pending_script_runs.clear();
             self.create_user_run = None;
             self.vault_iam_run = None;
+            self.vault_health_run = None;
             self.pending_delete = None;
 
             self.log_error(message.clone());
@@ -49740,11 +49792,17 @@ mod gui {
         let max = parser.screen().scrollback();
         let (rows, cols) = parser.screen().size();
         let rows = (rows as usize).max(1);
-        let mut lines: Vec<String> = Vec::new();
+        // (text, wraps into the next row) per visual row, oldest first.
+        let mut lines: Vec<(String, bool)> = Vec::new();
         let mut offset = max;
         loop {
             parser.screen_mut().set_scrollback(offset);
-            let page: Vec<String> = parser.screen().rows(0, cols).collect();
+            let page: Vec<(String, bool)> = parser
+                .screen()
+                .rows(0, cols)
+                .enumerate()
+                .map(|(r, text)| (text, parser.screen().row_wrapped(r as u16)))
+                .collect();
             // Line index (0 = oldest) of this page's first row; what the
             // previous page already covered is skipped.
             let top = max - offset;
@@ -49756,10 +49814,22 @@ mod gui {
             offset = offset.saturating_sub(rows);
         }
         parser.screen_mut().set_scrollback(original);
-        while lines.last().is_some_and(|l| l.trim().is_empty()) {
-            lines.pop();
+        // A row that wraps into the next one is one line of output: join them,
+        // as `Screen::contents` does. Left split, a narrow window breaks a
+        // `docker ps` row in two and the check reads a healthy box as down.
+        let mut joined: Vec<String> = Vec::new();
+        let mut continues = false;
+        for (text, wraps) in lines {
+            match joined.last_mut() {
+                Some(last) if continues => last.push_str(&text),
+                _ => joined.push(text),
+            }
+            continues = wraps;
         }
-        lines.join("\n")
+        while joined.last().is_some_and(|l| l.trim().is_empty()) {
+            joined.pop();
+        }
+        joined.join("\n")
     }
 
     /// Whether the Vault Health Check report should be shown now: both boxes
@@ -57467,6 +57537,79 @@ mod gui {
             scrolled.screen_mut().set_scrollback(7);
             let _ = full_screen_text(&mut scrolled);
             assert_eq!(scrolled.screen().scrollback(), 7);
+        }
+
+        /// A narrow terminal wraps the `docker ps` table. `rows()` hands back
+        /// each visual row separately, which split `CONTAINER ID ... NAMES`
+        /// across two lines and read a healthy pair as having no vault
+        /// container. Wrapped rows are joined back into the line they were.
+        #[test]
+        fn full_screen_text_joins_wrapped_rows() {
+            let header = format!("CONTAINER ID   IMAGE{}STATUS         PORTS     NAMES", " ".repeat(90));
+            let row = format!("c4fb581a84a7   img:1.13.3{}Up 15 hours              vault", " ".repeat(80));
+            let mut parser = vt100::Parser::new(24, 60, 2500);
+            parser.process(format!("{header}\r\n{row}\r\n").as_bytes());
+            let text = full_screen_text(&mut parser);
+            assert!(
+                text.lines().any(|l| l.contains("CONTAINER ID") && l.contains("NAMES")),
+                "{text}"
+            );
+            assert!(
+                text.lines().any(|l| l.contains("Up 15 hours") && l.trim_end().ends_with("vault")),
+                "{text}"
+            );
+        }
+
+        #[test]
+        fn stale_vault_picks_are_cleared_when_the_dropdown_stops_offering_them() {
+            let boxes = vec![("i-a".to_string(), "a".to_string()), ("i-b".to_string(), "b".to_string())];
+            let (mut v1, mut l1) = ("i-a".to_string(), "a  i-a".to_string());
+            let (mut v2, mut l2) = ("i-b".to_string(), "b  i-b".to_string());
+            clear_unoffered_vault_picks(&boxes, &mut v1, &mut l1, &mut v2, &mut l2);
+            assert_eq!((v1.as_str(), v2.as_str()), ("i-a", "i-b"));
+            // i-b stops being offered (stopped, or the environment changed).
+            let only_a = vec![boxes[0].clone()];
+            clear_unoffered_vault_picks(&only_a, &mut v1, &mut l1, &mut v2, &mut l2);
+            assert_eq!(v1, "i-a");
+            assert!(v2.is_empty() && l2.is_empty());
+            // Vault 2 may never hold the same box as Vault 1.
+            v2 = "i-a".to_string();
+            l2 = "a  i-a".to_string();
+            clear_unoffered_vault_picks(&only_a, &mut v1, &mut l1, &mut v2, &mut l2);
+            assert!(v2.is_empty() && l2.is_empty());
+            // Nothing offered at all clears both.
+            clear_unoffered_vault_picks(&[], &mut v1, &mut l1, &mut v2, &mut l2);
+            assert!(v1.is_empty() && l1.is_empty());
+        }
+
+        #[test]
+        fn a_vault_health_run_will_not_start_over_another_run_and_a_teardown_clears_it() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let start = src.find("fn enqueue_vault_health_run").expect("enqueue");
+            let body = &src[start..start + 5500];
+            for guard in ["vault_health_run.is_some()", "create_user_run", "vault_iam_run", "pending_delete", "pending_script_runs"] {
+                assert!(body.contains(guard), "the start guard must check {guard}");
+            }
+            // A box that never opened starts the grace clock, like a box that died.
+            assert!(body.contains("first_done_at"), "first_done_at must be set when a tab never opened");
+            let abort = src.find("fn abort_script_run").expect("abort_script_run");
+            let abort_body = &src[abort..abort + 5000];
+            let clear = abort_body.find("pending_script_runs.clear()").expect("the teardown");
+            assert!(abort_body[clear..].contains("vault_health_run = None"));
+        }
+
+        #[test]
+        fn every_vault_health_run_gets_its_own_nonce() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let start = src.find("fn enqueue_vault_health_run").expect("enqueue");
+            let body = &src[start..start + 4500];
+            assert!(body.contains("vault_health::steps(&nonce)"));
+            assert!(body.contains("nonce"));
+            let poll = src.find("fn poll_vault_health_run").expect("poll");
+            assert!(src[poll..poll + 4500].contains("build_report("));
+            assert!(src[poll..poll + 4500].contains("&run.nonce"));
         }
 
         #[test]
