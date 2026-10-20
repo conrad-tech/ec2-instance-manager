@@ -4271,6 +4271,24 @@ features.json (`["*"]` shipped = everyone, by the maintainer's decision, as for
   check for a health run before starting.
 - The dialog clears Vault 1 / Vault 2 picks the dropdowns stop offering, every
   frame (`clear_unoffered_vault_picks`).
+- **Target group check.** A worker thread (`start_vault_target_group_lookup`)
+  lists the account's target groups and finds the one with **both boxes
+  registered, by instance id** — not by name (`find_vault_target_group`;
+  groups named `vault` are asked first and at most `MAX_TARGET_GROUP_CHECKS`
+  (60) are read, since the API is one group per call). Rules
+  (`judge_target_group`): the leader must be `healthy` there and the follower
+  must **not** be; with no clean leader + follower pair the minimum is one
+  healthy and one not. A group that cannot be found or read is a **problem**,
+  never a pass. The popup waits for the lookup (the 5-minute cap still ends
+  it). `build_report` skips the check; the GUI calls
+  `build_report_with_target_group`.
+- **Docker uptime.** The healthy message shows each box's container uptime
+  (`vault_uptime`, parsed from docker's `Up 33 hours` words). A container Up
+  `FRESH_UPTIME_SECS` (120) or less turns the popup red ("Healthy (just
+  started)") without making the pair unhealthy.
+- **The `docker ps` table is read as a token stream** (`vault_up_row`), rows
+  split on the 12-hex container id, so hard line breaks anywhere cannot hide
+  the `vault` row.
 - **Not yet verified against live Vault boxes** — the parsing is tested on
   fixtures shaped from real screenshots, and the dialog/run wiring on source
   scans, not on a real SSM session.

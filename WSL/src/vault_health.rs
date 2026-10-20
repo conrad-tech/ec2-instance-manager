@@ -354,6 +354,109 @@ pub fn judge(a: &BoxReport, b: &BoxReport, label_a: &str, label_b: &str) -> Verd
     Verdict { healthy: problems.is_empty(), problems }
 }
 
+/// What the load balancer says about the two boxes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetGroupResult {
+    /// The target group holding both boxes, and each box's state in it
+    /// (`healthy`, `unhealthy`, `draining`... as the API words it), in the
+    /// same order as the two Vault boxes.
+    Found { name: String, states: [String; 2] },
+    /// Why it could not be checked.
+    Failed(String),
+}
+
+/// Most target groups asked about while looking for the Vault one: the API
+/// answers one group per call, so an account full of them must not mean a
+/// call for each.
+pub const MAX_TARGET_GROUP_CHECKS: usize = 60;
+
+/// Find the target group that has both boxes registered and read their state.
+/// Matched by instance id, not by name; groups with `vault` in the name are
+/// asked first only to keep the number of calls down. `health` reads one
+/// group's targets.
+pub fn find_vault_target_group(
+    ids: [&str; 2],
+    mut groups: Vec<crate::elb::TargetGroup>,
+    mut health: impl FnMut(&crate::elb::TargetGroup) -> Result<Vec<crate::elb::Target>, String>,
+) -> TargetGroupResult {
+    groups.retain(|g| g.target_type == "instance");
+    groups.sort_by_key(|g| !g.name.to_ascii_lowercase().contains("vault"));
+    let mut first_error: Option<String> = None;
+    let mut checked = 0;
+    for g in groups.iter().take(MAX_TARGET_GROUP_CHECKS) {
+        checked += 1;
+        match health(g) {
+            Ok(targets) => {
+                let state_of = |id: &str| {
+                    targets.iter().find(|t| t.id == id).map(|t| t.state.clone())
+                };
+                if let (Some(a), Some(b)) = (state_of(ids[0]), state_of(ids[1])) {
+                    return TargetGroupResult::Found { name: g.name.clone(), states: [a, b] };
+                }
+            }
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    let mut msg = format!(
+        "no target group has both {} and {} registered (looked at {checked} group(s))",
+        ids[0], ids[1]
+    );
+    if let Some(e) = first_error {
+        msg.push_str(&format!("; the first error was: {e}"));
+    }
+    TargetGroupResult::Failed(msg)
+}
+
+/// The target-group rules: the leader is healthy there and the follower is
+/// not. When the roles are not a clean leader + follower the minimum still
+/// holds: one box healthy and one not. Returns the problems and a one-line
+/// description for the report.
+pub fn judge_target_group(
+    tg: &TargetGroupResult,
+    roles: [Role; 2],
+    labels: [&str; 2],
+) -> (Vec<String>, String) {
+    let (name, states) = match tg {
+        TargetGroupResult::Failed(e) => {
+            return (
+                vec![format!("target group could not be checked: {e}")],
+                format!("Target group: not checked ({e})."),
+            );
+        }
+        TargetGroupResult::Found { name, states } => (name, states),
+    };
+    let mut problems = Vec::new();
+    let healthy = |i: usize| states[i] == "healthy";
+    let clean = matches!(roles, [Role::Leader, Role::Follower] | [Role::Follower, Role::Leader]);
+    if clean {
+        for i in 0..2 {
+            match roles[i] {
+                Role::Leader if !healthy(i) => problems.push(format!(
+                    "{}: it is the leader but is {} in target group {name} (the leader should be healthy)",
+                    labels[i], states[i]
+                )),
+                Role::Follower if healthy(i) => problems.push(format!(
+                    "{}: it is the follower but is healthy in target group {name} (the follower should not be)",
+                    labels[i]
+                )),
+                _ => {}
+            }
+        }
+    } else if healthy(0) == healthy(1) {
+        problems.push(format!(
+            "target group {name} should have one healthy and one unhealthy box, but {} is {} and {} is {}",
+            labels[0], states[0], labels[1], states[1]
+        ));
+    }
+    let line = format!(
+        "Target group {name}: {} {}, {} {}.",
+        labels[0], states[0], labels[1], states[1]
+    );
+    (problems, line)
+}
+
 /// Everything the result popup needs.
 #[derive(Debug, Clone)]
 pub struct Report {
@@ -371,11 +474,29 @@ pub struct Report {
 /// opened or was closed; it is reported as a box with no result, never
 /// skipped.
 pub fn build_report(labels: [&str; 2], texts: [Option<&str>; 2], nonce: &str) -> Report {
+    build_report_with_target_group(labels, texts, nonce, None)
+}
+
+/// As `build_report`, plus the load balancer's view when one was read (`None`
+/// skips the check, for callers with no AWS access).
+pub fn build_report_with_target_group(
+    labels: [&str; 2],
+    texts: [Option<&str>; 2],
+    nonce: &str,
+    tg: Option<&TargetGroupResult>,
+) -> Report {
     let reports = [
         parse_box(texts[0].unwrap_or_default(), nonce),
         parse_box(texts[1].unwrap_or_default(), nonce),
     ];
-    let verdict = judge(&reports[0], &reports[1], labels[0], labels[1]);
+    let mut verdict = judge(&reports[0], &reports[1], labels[0], labels[1]);
+    let tg_line = tg.map(|tg| {
+        let (problems, line) =
+            judge_target_group(tg, [reports[0].role(), reports[1].role()], labels);
+        verdict.problems.extend(problems);
+        verdict.healthy = verdict.problems.is_empty();
+        line
+    });
 
     let fresh = reports
         .iter()
@@ -399,6 +520,10 @@ pub fn build_report(labels: [&str; 2], texts: [Option<&str>; 2], nonce: &str) ->
         if !ups.is_empty() {
             s.push_str(&format!("\nDocker uptime: {}.", ups.join(", ")));
         }
+        if let Some(line) = &tg_line {
+            s.push('\n');
+            s.push_str(line);
+        }
         if fresh {
             s.push_str("\nA vault container started two minutes ago or less.");
         }
@@ -406,8 +531,20 @@ pub fn build_report(labels: [&str; 2], texts: [Option<&str>; 2], nonce: &str) ->
     } else {
         let mut s = String::from("Vault is NOT healthy:");
         for p in &verdict.problems {
-            s.push_str("\n - ");
-            s.push_str(p);
+            if let Some(line) = &tg_line {
+            s.push('\n');
+            s.push_str(line);
+        }
+        s.push_str("\n - ");
+            if let Some(line) = &tg_line {
+            s.push('\n');
+            s.push_str(line);
+        }
+        s.push_str(p);
+        }
+        if let Some(line) = &tg_line {
+            s.push('\n');
+            s.push_str(line);
         }
         s
     };
@@ -716,5 +853,98 @@ mod tests {
         assert!(build_report(["a", "b"], [Some(&l), Some(&two)], NONCE).fresh);
         let three = f.replace("Up 15 hours", "Up 3 minutes");
         assert!(!build_report(["a", "b"], [Some(&l), Some(&three)], NONCE).fresh);
+    }
+
+    fn tg(name: &str, ty: &str) -> crate::elb::TargetGroup {
+        crate::elb::TargetGroup { name: name.to_string(), arn: format!("arn:{name}"), target_type: ty.to_string(), ..Default::default() }
+    }
+    fn tgt(id: &str, state: &str) -> crate::elb::Target {
+        crate::elb::Target { id: id.to_string(), state: state.to_string(), ..Default::default() }
+    }
+
+    #[test]
+    fn the_target_group_is_found_by_instance_id_not_by_name() {
+        let groups = vec![tg("web", "instance"), tg("odd-name", "instance"), tg("lam", "lambda")];
+        let r = find_vault_target_group(["i-a", "i-b"], groups, |g| match g.name.as_str() {
+            "web" => Ok(vec![tgt("i-x", "healthy")]),
+            "odd-name" => Ok(vec![tgt("i-a", "healthy"), tgt("i-b", "unhealthy")]),
+            other => panic!("asked about {other}"),
+        });
+        assert_eq!(r, TargetGroupResult::Found { name: "odd-name".into(), states: ["healthy".into(), "unhealthy".into()] });
+    }
+
+    #[test]
+    fn vault_named_groups_are_asked_first_and_a_miss_is_a_failure_with_the_reason() {
+        let mut asked = Vec::new();
+        let r = find_vault_target_group(["i-a", "i-b"], vec![tg("web", "instance"), tg("prod-Vault-tg", "instance")], |g| {
+            asked.push(g.name.clone());
+            Err("AccessDenied".to_string())
+        });
+        assert_eq!(asked[0], "prod-Vault-tg");
+        match r {
+            TargetGroupResult::Failed(m) => assert!(m.contains("i-a") && m.contains("AccessDenied"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_group_with_only_one_of_the_boxes_is_not_the_vault_group() {
+        let r = find_vault_target_group(["i-a", "i-b"], vec![tg("g", "instance")], |_| Ok(vec![tgt("i-a", "healthy")]));
+        assert!(matches!(r, TargetGroupResult::Failed(_)));
+    }
+
+    fn found(a: &str, b: &str) -> TargetGroupResult {
+        TargetGroupResult::Found { name: "vault-tg".into(), states: [a.into(), b.into()] }
+    }
+
+    #[test]
+    fn the_leader_must_be_healthy_and_the_follower_not() {
+        let l = ["Vault 1", "Vault 2"];
+        let (p, _) = judge_target_group(&found("healthy", "unhealthy"), [Role::Leader, Role::Follower], l);
+        assert!(p.is_empty(), "{p:?}");
+        // Roles swapped: still fine when the states follow the roles.
+        let (p, _) = judge_target_group(&found("unhealthy", "healthy"), [Role::Follower, Role::Leader], l);
+        assert!(p.is_empty(), "{p:?}");
+        // Both healthy: the follower should not be.
+        let (p, _) = judge_target_group(&found("healthy", "healthy"), [Role::Leader, Role::Follower], l);
+        assert_eq!(p.len(), 1);
+        assert!(p[0].contains("Vault 2") && p[0].contains("follower"), "{p:?}");
+        // Leader unhealthy: wrong.
+        let (p, _) = judge_target_group(&found("unhealthy", "unhealthy"), [Role::Leader, Role::Follower], l);
+        assert!(p.iter().any(|x| x.contains("Vault 1") && x.contains("leader")), "{p:?}");
+        // The LB pointing at the follower instead of the leader: both wrong.
+        let (p, _) = judge_target_group(&found("unhealthy", "healthy"), [Role::Leader, Role::Follower], l);
+        assert_eq!(p.len(), 2, "{p:?}");
+    }
+
+    #[test]
+    fn without_a_clean_leader_pair_one_healthy_one_not_is_the_minimum() {
+        let l = ["Vault 1", "Vault 2"];
+        let (p, _) = judge_target_group(&found("healthy", "unhealthy"), [Role::Unknown, Role::Unknown], l);
+        assert!(p.is_empty(), "{p:?}");
+        let (p, _) = judge_target_group(&found("healthy", "healthy"), [Role::Unknown, Role::Unknown], l);
+        assert_eq!(p.len(), 1);
+        let (p, _) = judge_target_group(&found("unhealthy", "draining"), [Role::Leader, Role::Leader], l);
+        assert_eq!(p.len(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_target_group_is_a_problem_not_a_pass() {
+        let (p, _) = judge_target_group(&TargetGroupResult::Failed("denied".into()), [Role::Leader, Role::Follower], ["a", "b"]);
+        assert!(p[0].contains("denied"));
+    }
+
+    #[test]
+    fn the_report_fails_a_healthy_pair_whose_target_group_is_wrong_and_names_it() {
+        let (l, f) = (leader(), follower());
+        let ok = build_report_with_target_group(["Vault 1", "Vault 2"], [Some(&l), Some(&f)], NONCE, Some(&found("healthy", "unhealthy")));
+        assert!(ok.verdict.healthy, "{:?}", ok.verdict.problems);
+        assert!(ok.summary.contains("Target group vault-tg"), "{}", ok.summary);
+        let bad = build_report_with_target_group(["Vault 1", "Vault 2"], [Some(&l), Some(&f)], NONCE, Some(&found("healthy", "healthy")));
+        assert!(!bad.verdict.healthy);
+        assert!(bad.summary.contains("the follower should not be"), "{}", bad.summary);
+        assert!(bad.summary.contains("Target group vault-tg"), "{}", bad.summary);
+        // Not asked (no AWS access): the Vault checks decide alone.
+        assert!(build_report(["Vault 1", "Vault 2"], [Some(&l), Some(&f)], NONCE).verdict.healthy);
     }
 }

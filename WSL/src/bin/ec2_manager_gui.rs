@@ -1848,6 +1848,9 @@ mod gui {
         /// Unique to this run; the tab is reused and still holds the last
         /// run's output, so results are only read after this run's marker.
         nonce: String,
+        /// The load balancer's view of the two boxes, filled by a worker
+        /// thread (AWS calls must not run on the UI thread). `None` = pending.
+        target_group: std::sync::Arc<std::sync::Mutex<Option<ec2_manager::vault_health::TargetGroupResult>>>,
     }
 
     /// What to put in Vault 1 and Vault 2 (None = leave as is). Boxes arrive sorted
@@ -24489,6 +24492,8 @@ mod gui {
                 self.set_script_status(msg, ScriptState::Failed);
                 return;
             }
+            let target_group = std::sync::Arc::new(std::sync::Mutex::new(None));
+            self.start_vault_target_group_lookup(vault1.0, vault2.0, target_group.clone());
             self.vault_health_run = Some(VaultHealthRun {
                 tabs,
                 labels,
@@ -24499,6 +24504,7 @@ mod gui {
                 // so the other box gets the same grace a box that died does.
                 first_done_at: tabs.iter().any(Option::is_none).then(Instant::now),
                 nonce,
+                target_group,
             });
             self.script_status_tabs = tabs.iter().flatten().copied().collect();
             self.main_tab = MainTab::Connections;
@@ -24506,6 +24512,55 @@ mod gui {
                 "Checking Vault on both boxes…".to_string(),
                 ScriptState::Running,
             );
+        }
+
+        /// Read the Vault target group's view of the two boxes on a worker
+        /// thread and drop the answer in `slot`. Read-only: two describes.
+        fn start_vault_target_group_lookup(
+            &self,
+            id1: &str,
+            id2: &str,
+            slot: std::sync::Arc<std::sync::Mutex<Option<ec2_manager::vault_health::TargetGroupResult>>>,
+        ) {
+            use ec2_manager::vault_health::TargetGroupResult;
+            let put = |slot: &std::sync::Mutex<Option<TargetGroupResult>>, r: TargetGroupResult| {
+                if let Ok(mut g) = slot.lock() {
+                    *g = Some(r);
+                }
+            };
+            let Some(ctx) = self.context_for_instance(id1) else {
+                put(&slot, TargetGroupResult::Failed("no AWS account found for the box".to_string()));
+                return;
+            };
+            if ctx.mode != Mode::Live {
+                put(&slot, TargetGroupResult::Failed("not in Live mode".to_string()));
+                return;
+            }
+            if ctx.auth_status != AuthStatus::Ok {
+                put(&slot, TargetGroupResult::Failed(format!(
+                    "account is not authorised (auth_status={})",
+                    ctx.auth_status
+                )));
+                return;
+            }
+            let (profile, region) = (ctx.profile.clone(), ctx.region.clone());
+            let account = ctx.account_id.clone().unwrap_or_default();
+            let ids = [id1.to_string(), id2.to_string()];
+            let repaint = self.egui_ctx.clone();
+            std::thread::spawn(move || {
+                let result = match elb::fetch_target_groups(&profile, &region, &account) {
+                    Err(e) => TargetGroupResult::Failed(format!("could not list target groups: {}", e.message())),
+                    Ok(groups) => ec2_manager::vault_health::find_vault_target_group(
+                        [ids[0].as_str(), ids[1].as_str()],
+                        groups,
+                        |g| elb::fetch_target_health(&profile, &region, &g.arn).map_err(|e| e.message()),
+                    ),
+                };
+                put(&slot, result);
+                if let Some(c) = &repaint {
+                    c.request_repaint();
+                }
+            });
         }
 
         /// A queued script run on `tab_id` finished its steps.
@@ -24560,15 +24615,33 @@ mod gui {
                 ctx.request_repaint_after(Duration::from_secs(1));
                 return;
             }
+            // The target-group lookup is a separate AWS call; wait for it
+            // (the overall cap still ends the wait).
+            let tg_ready = run.target_group.lock().map(|g| g.is_some()).unwrap_or(true);
+            if !tg_ready && run.started.elapsed() < VAULT_HEALTH_CAP {
+                ctx.request_repaint_after(Duration::from_secs(1));
+                return;
+            }
             let run = self.vault_health_run.take().expect("checked above");
+            let tg_result = run
+                .target_group
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .unwrap_or_else(|| {
+                    ec2_manager::vault_health::TargetGroupResult::Failed(
+                        "timed out waiting for the AWS lookup".to_string(),
+                    )
+                });
             let texts = [
                 run.tabs[0].and_then(|t| self.vault_health_screen_text(t)),
                 run.tabs[1].and_then(|t| self.vault_health_screen_text(t)),
             ];
-            let report = ec2_manager::vault_health::build_report(
+            let report = ec2_manager::vault_health::build_report_with_target_group(
                 [run.labels[0].as_str(), run.labels[1].as_str()],
                 [texts[0].as_deref(), texts[1].as_deref()],
                 &run.nonce,
+                Some(&tg_result),
             );
             let healthy = report.verdict.healthy;
             // One line: the Logs tab is line-oriented.
@@ -57692,8 +57765,8 @@ mod gui {
             assert!(body.contains("vault_health::steps(&nonce)"));
             assert!(body.contains("nonce"));
             let poll = src.find("fn poll_vault_health_run").expect("poll");
-            assert!(src[poll..poll + 4500].contains("build_report("));
-            assert!(src[poll..poll + 4500].contains("&run.nonce"));
+            assert!(src[poll..poll + 6500].contains("build_report_with_target_group("));
+            assert!(src[poll..poll + 6500].contains("&run.nonce"));
         }
 
         #[test]
