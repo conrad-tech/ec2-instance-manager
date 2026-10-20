@@ -22,6 +22,12 @@
     ],
     "delete_allowed_users": []
   },
+  "_vault_health_comment": "\"Vault Health Check\" entry in the Scripts menu. Pick an environment and two Vault instances (tagged ApplicationName=vault); it opens a visible SSM tab on each, runs 'sudo su', a read-only Vault health check and 'docker ps', then shows a report with a healthy/unhealthy verdict for the pair (one leader + one follower, same version, vault container Up). allowed_users lists the OS usernames that see the entry: [\"*\"] = everyone (the shipped default), [] = nobody, or name specific users.",
+  "vault_health": {
+    "allowed_users": [
+      "*"
+    ]
+  },
   "_user_sync_comment": "\"Bastion User Sync\" entry in the Scripts menu. Both bastions mount the same EFS at /efs/home, and NFS authorises by NUMBER rather than by name, so an account is only usable on both boxes when its uid AND gid are identical on both. Drift arrives when someone creates an account on one bastion and not the other: that box then hands the next new user a number the other box has already spent, and the create fails on the secondary with 'UID nnnn is not unique', leaving a half-made account. NOTE that Bastion New User already does this check automatically -- every create reads both bastions first, creates anything missing from either, and allocates a uid/gid free on both -- so this dialog is for auditing, and for repairing drift without creating anyone. It scans a chosen environment's primary and secondary, reports every account with a home under /efs/home, and creates the ones missing from either side using the SAME uid/gid, but only where both numbers are free on the target. It never renumbers an account whose uid differs between the boxes (that needs usermod plus a recursive chown of a live home on a shared filesystem) and never takes over a number held by someone else (that needs useradd --non-unique, which makes two people one identity on EFS); both are reported for a human to settle. allowed_users lists the OS usernames that see the entry: [\"*\"] = everyone, [] = nobody (the shipped default), or name specific users. It writes accounts on both bastions, so it ships closed -- add usernames and rebuild to hand it out..",
   "user_sync": {
     "allowed_users": []

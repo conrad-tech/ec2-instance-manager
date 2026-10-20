@@ -86,6 +86,8 @@ pub struct Features {
     pub personal_scripts: PersonalScriptsFeature,
     /// "Vault IAM Access" entry in the Scripts menu: who may see it.
     pub vault_iam: VaultIamFeature,
+    /// "Vault Health Check" entry in the Scripts menu: who may see it.
+    pub vault_health: VaultHealthFeature,
     /// "Bastion User Sync" entry in the Scripts menu: who may see it.
     pub user_sync: UserSyncFeature,
     /// "Send test escalation" action: who may see it.
@@ -423,6 +425,26 @@ impl VaultIamFeature {
     /// create list is not enough — delete has its own list.
     pub fn is_delete_allowed_user(&self, user: &str) -> bool {
         user_in_list(&self.delete_allowed_users, user)
+    }
+}
+
+/// The `vault_health` section of `assets/features.json`.
+///
+/// Gates the **Vault Health Check** entry in the Scripts menu, which opens
+/// root shells on two Vault boxes and runs read-only checks. `["*"]` means
+/// everyone (the maintainer's decision, as for `vault_iam`); the `Default`
+/// is empty so a malformed features.json hides the entry.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct VaultHealthFeature {
+    /// OS usernames allowed to see the entry (case-insensitive).
+    pub allowed_users: Vec<String>,
+}
+
+impl VaultHealthFeature {
+    /// True when `user` may see the Vault Health Check entry.
+    pub fn is_allowed_user(&self, user: &str) -> bool {
+        user_in_list(&self.allowed_users, user)
     }
 }
 
@@ -1613,6 +1635,7 @@ impl Default for Features {
             jira: JiraFeature::default(),
             personal_scripts: PersonalScriptsFeature::default(),
             vault_iam: VaultIamFeature::default(),
+            vault_health: VaultHealthFeature::default(),
             // Derived Default: an empty allow-list, which is the fail-closed
             // state this feature must land in.
             user_sync: UserSyncFeature::default(),
@@ -1719,6 +1742,12 @@ impl Features {
     /// Fails closed: a malformed features.json yields an empty allow-list.
     pub fn vault_iam_enabled_for(&self, user: &str) -> bool {
         self.vault_iam.is_allowed_user(user)
+    }
+
+    /// True when the **Vault Health Check** entry should be shown to `user`.
+    /// Fails closed: a malformed features.json yields an empty allow-list.
+    pub fn vault_health_enabled_for(&self, user: &str) -> bool {
+        self.vault_health.is_allowed_user(user)
     }
 
     /// True when the destructive **Vault IAM Delete** entry should be shown to
@@ -2093,6 +2122,43 @@ mod tests {
             r#"{{"vault_iam":{{"allowed_users":{allowed}}}}}"#
         ))
         .expect("should parse")
+    }
+
+    fn vault_health_features(allowed: &str) -> Features {
+        serde_json::from_str(&format!(
+            r#"{{"vault_health":{{"allowed_users":{allowed}}}}}"#
+        ))
+        .expect("should parse")
+    }
+
+    #[test]
+    fn vault_health_wildcard_shows_to_everyone() {
+        assert!(vault_health_features(r#"["*"]"#).vault_health_enabled_for("anyone"));
+    }
+
+    #[test]
+    fn vault_health_follows_a_named_allow_list() {
+        let f = vault_health_features(r#"["bconrad"]"#);
+        assert!(f.vault_health_enabled_for("bconrad"));
+        assert!(f.vault_health_enabled_for(" BConrad "));
+        assert!(!f.vault_health_enabled_for("someone.else"));
+    }
+
+    #[test]
+    fn vault_health_defaults_to_nobody() {
+        let absent: Features = serde_json::from_str("{}").expect("should parse");
+        assert!(!absent.vault_health_enabled_for("bconrad"));
+        assert!(!Features::default().vault_health_enabled_for("bconrad"));
+        assert!(!vault_health_features("[]").vault_health_enabled_for("bconrad"));
+        // An unknown user (empty name) is on no list, wildcard included.
+        assert!(!vault_health_features(r#"["*"]"#).vault_health_enabled_for(""));
+    }
+
+    #[test]
+    fn the_shipped_features_file_declares_vault_health() {
+        let f: Features =
+            serde_json::from_str(include_str!("../assets/features.json")).expect("parses");
+        assert!(f.vault_health_enabled_for("anyone"));
     }
 
     #[test]
