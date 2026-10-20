@@ -98,6 +98,8 @@ pub struct BoxReport {
     pub version: Option<String>,
     pub overall_healthy: Option<bool>,
     pub container_up: Option<bool>,
+    /// How long the vault container has been Up: seconds, and docker's words.
+    pub uptime: Option<(u64, String)>,
     pub done: bool,
 }
 
@@ -162,6 +164,63 @@ fn json_str(v: &Option<Value>, key: &str) -> Option<String> {
 /// their 12-hex container id, and a row is the vault one when its last token
 /// is exactly `vault`.
 pub fn vault_container_up(screen: &str) -> Option<bool> {
+    vault_up_row(screen).map(|row| row.is_some())
+}
+
+/// A container younger than this is shown red in the report: it has just
+/// (re)started, whatever else is true.
+pub const FRESH_UPTIME_SECS: u64 = 120;
+
+/// How long the vault container has been Up, in seconds, and as docker words
+/// it (`33 hours`). `None` when there is no Up vault row or it can't be read.
+pub fn vault_uptime(screen: &str) -> Option<(u64, String)> {
+    let row = vault_up_row(screen)??;
+    let i = row.iter().position(|t| t == "Up")?;
+    let words: Vec<&str> = row[i + 1..]
+        .iter()
+        .map(String::as_str)
+        .take_while(|t| !t.starts_with('('))
+        .collect();
+    let secs = parse_docker_uptime(&words)?;
+    // Status is followed by PORTS / NAMES; keep only the duration words.
+    let text: Vec<&str> = match words.iter().position(|w| {
+        matches!(*w, "second" | "seconds" | "minute" | "minutes" | "hour" | "hours" | "day" | "days"
+            | "week" | "weeks" | "month" | "months" | "year" | "years")
+    }) {
+        Some(u) => words[..=u].to_vec(),
+        None => words.iter().take(4).copied().collect(),
+    };
+    Some((secs, text.join(" ")))
+}
+
+/// `Less than a second`, `5 seconds`, `About a minute`, `33 hours`, `3 days`...
+/// The words after `Up`; trailing columns (ports, name) are ignored.
+fn parse_docker_uptime(words: &[&str]) -> Option<u64> {
+    let unit = |w: &str| -> Option<u64> {
+        Some(match w {
+            "second" | "seconds" => 1,
+            "minute" | "minutes" => 60,
+            "hour" | "hours" => 3600,
+            "day" | "days" => 86_400,
+            "week" | "weeks" => 604_800,
+            "month" | "months" => 2_592_000,
+            "year" | "years" => 31_536_000,
+            _ => return None,
+        })
+    };
+    let w: Vec<String> = words.iter().map(|w| w.to_ascii_lowercase()).collect();
+    let w: Vec<&str> = w.iter().map(String::as_str).collect();
+    match w.as_slice() {
+        ["less", "than", ..] => Some(0),
+        ["about", "a" | "an", u, ..] => unit(u),
+        [n, u, ..] => Some(n.parse::<u64>().ok()? * unit(u)?),
+        _ => None,
+    }
+}
+
+/// `None` = no table; `Some(None)` = table but no Up vault row; `Some(Some(tokens))`
+/// = the Up vault row, split into words.
+fn vault_up_row(screen: &str) -> Option<Option<Vec<String>>> {
     let lines: Vec<&str> = screen.lines().collect();
     let header = lines.iter().rposition(|l| l.contains("CONTAINER ID"))?;
     let mut body: Vec<&str> = Vec::new();
@@ -194,14 +253,14 @@ pub fn vault_container_up(screen: &str) -> Option<bool> {
             row.push(tok);
         }
         rows.push(row);
-        if rows
+        if let Some(r) = rows
             .iter()
-            .any(|r| r.last() == Some(&"vault") && r.contains(&"Up"))
+            .find(|r| r.last() == Some(&"vault") && r.contains(&"Up"))
         {
-            return Some(true);
+            return Some(Some(r.iter().map(|t| t.to_string()).collect()));
         }
     }
-    Some(false)
+    Some(None)
 }
 
 /// Read one box's tab text, from this run's start marker onwards.
@@ -229,6 +288,7 @@ pub fn parse_box(screen: &str, nonce: &str) -> BoxReport {
         version: json_str(&health, "version").or_else(|| json_str(&seal, "version")),
         overall_healthy,
         container_up: vault_container_up(screen),
+        uptime: vault_uptime(screen),
         done: is_done(screen, nonce),
     }
 }
@@ -302,6 +362,9 @@ pub struct Report {
     pub summary: String,
     /// The popup's details pane: the verdict, then each box's full output.
     pub details: String,
+    /// A vault container has been Up for two minutes or less: the popup
+    /// shows its message red even when the pair is healthy.
+    pub fresh: bool,
 }
 
 /// Judge the two tabs' text and render the report. `None` is a tab that never
@@ -314,17 +377,32 @@ pub fn build_report(labels: [&str; 2], texts: [Option<&str>; 2], nonce: &str) ->
     ];
     let verdict = judge(&reports[0], &reports[1], labels[0], labels[1]);
 
+    let fresh = reports
+        .iter()
+        .any(|r| r.uptime.as_ref().is_some_and(|(secs, _)| *secs <= FRESH_UPTIME_SECS));
     let summary = if verdict.healthy {
         let (leader, follower) = if reports[0].role() == Role::Leader {
             (labels[0], labels[1])
         } else {
             (labels[1], labels[0])
         };
-        format!(
+        let mut s = format!(
             "Vault is healthy: {leader} is the leader and {follower} is the follower, \
              both on version {}, with the vault container up on both.",
             reports[0].version.as_deref().unwrap_or("?")
-        )
+        );
+        let ups: Vec<String> = labels
+            .iter()
+            .zip(reports.iter())
+            .filter_map(|(l, r)| r.uptime.as_ref().map(|(_, t)| format!("{l} {t}")))
+            .collect();
+        if !ups.is_empty() {
+            s.push_str(&format!("\nDocker uptime: {}.", ups.join(", ")));
+        }
+        if fresh {
+            s.push_str("\nA vault container started two minutes ago or less.");
+        }
+        s
     } else {
         let mut s = String::from("Vault is NOT healthy:");
         for p in &verdict.problems {
@@ -342,7 +420,7 @@ pub fn build_report(labels: [&str; 2], texts: [Option<&str>; 2], nonce: &str) ->
             None => details.push_str("(no output)"),
         }
     }
-    Report { verdict, summary, details }
+    Report { verdict, summary, details, fresh }
 }
 
 #[cfg(test)]
@@ -594,5 +672,49 @@ mod tests {
         let screen = leader().replace(NONCE, "0ther");
         // Start marker and done marker both carry another nonce.
         assert!(!is_done(&screen, NONCE));
+    }
+
+    #[test]
+    fn docker_uptime_words_become_seconds() {
+        let p = |s: &str| parse_docker_uptime(&s.split_whitespace().collect::<Vec<_>>());
+        assert_eq!(p("Less than a second"), Some(0));
+        assert_eq!(p("5 seconds"), Some(5));
+        assert_eq!(p("About a minute"), Some(60));
+        assert_eq!(p("2 minutes"), Some(120));
+        assert_eq!(p("About an hour"), Some(3600));
+        assert_eq!(p("33 hours"), Some(33 * 3600));
+        assert_eq!(p("3 days"), Some(3 * 86_400));
+        assert_eq!(p("what"), None);
+    }
+
+    fn table(status: &str) -> String {
+        format!("# docker ps\nCONTAINER ID   IMAGE   COMMAND   CREATED   STATUS   PORTS   NAMES\n6de5e73f2538   img:1.13.3   \"x\"   5 days ago   Up {status}              vault\n\nroot@ip SSM /home\n")
+    }
+
+    #[test]
+    fn uptime_is_read_from_the_vault_row() {
+        assert_eq!(vault_uptime(&table("33 hours")), Some((33 * 3600, "33 hours".to_string())));
+        assert_eq!(vault_uptime(&table("About a minute (healthy)")).map(|u| u.0), Some(60));
+        assert_eq!(vault_uptime("no table"), None);
+    }
+
+    #[test]
+    fn a_healthy_report_shows_each_boxs_uptime_and_flags_a_fresh_start() {
+        let (l, f) = (leader(), follower());
+        let r = build_report(["Vault 1", "Vault 2"], [Some(&l), Some(&f)], NONCE);
+        assert!(r.summary.contains("Docker uptime: Vault 1 "), "{}", r.summary);
+        assert!(r.summary.contains(", Vault 2 "), "{}", r.summary);
+        assert!(!r.fresh, "{}", r.summary);
+        // Same pair, but Vault 2's container came up 90 seconds ago.
+        let young = f.replace("Up 15 hours", "Up About a minute");
+        assert_ne!(young, f, "fixture should carry 'Up 15 hours'");
+        let r = build_report(["Vault 1", "Vault 2"], [Some(&l), Some(&young)], NONCE);
+        assert!(r.verdict.healthy);
+        assert!(r.fresh, "{}", r.summary);
+        // Exactly two minutes counts as fresh; a little over does not.
+        let two = f.replace("Up 15 hours", "Up 2 minutes");
+        assert!(build_report(["a", "b"], [Some(&l), Some(&two)], NONCE).fresh);
+        let three = f.replace("Up 15 hours", "Up 3 minutes");
+        assert!(!build_report(["a", "b"], [Some(&l), Some(&three)], NONCE).fresh);
     }
 }

@@ -24578,14 +24578,19 @@ mod gui {
             } else {
                 self.log_error(one_line);
             }
+            // Healthy but a container started two minutes ago or less: the
+            // message is red (the popup colours by `success`).
+            let fresh = healthy && report.fresh;
             self.show_script_result(
-                if healthy {
+                if fresh {
+                    "Vault Health Check — Healthy (just started)"
+                } else if healthy {
                     "Vault Health Check — Healthy"
                 } else {
                     "Vault Health Check — Unhealthy"
                 },
                 report.summary,
-                healthy,
+                healthy && !fresh,
                 None,
                 Some(report.details),
             );
