@@ -1,6 +1,6 @@
 //! Temporary pause switches for the unattended on-call watchers.
 //!
-//! Edit > Manage Fixes lists every watcher that is actually running and lets
+//! Edit > Manage Fixes lists every watcher the user is armed for and lets
 //! a person stop one for a while, to resolve an incident by hand without the
 //! app acknowledging, terminating or escalating underneath them.
 //!
@@ -44,7 +44,6 @@ pub const PAUSED_RECHECK: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct State {
-    running: BTreeSet<Fix>,
     paused: BTreeSet<Fix>,
 }
 
@@ -55,17 +54,6 @@ fn state() -> &'static Mutex<State> {
 
 fn lock() -> std::sync::MutexGuard<'static, State> {
     state().lock().unwrap_or_else(|p| p.into_inner())
-}
-
-/// Called when a watcher's thread starts, so the menu lists only fixes that
-/// exist in this session.
-pub fn register(fix: Fix) {
-    lock().running.insert(fix);
-}
-
-/// Watchers that were started, in a stable order.
-pub fn registered() -> Vec<Fix> {
-    lock().running.iter().copied().collect()
 }
 
 pub fn is_paused(fix: Fix) -> bool {
@@ -81,12 +69,9 @@ pub fn set_paused(fix: Fix, paused: bool) {
     }
 }
 
-/// Top-of-loop guard (also registers the watcher): when paused, sleeps `PAUSED_RECHECK` and returns true,
+/// Top-of-loop guard : when paused, sleeps `PAUSED_RECHECK` and returns true,
 /// and the caller `continue`s.
 pub fn hold(fix: Fix) -> bool {
-    // Registering here means a watcher is listed exactly when its loop is
-    // really running, with no separate call to forget.
-    register(fix);
     if is_paused(fix) {
         std::thread::sleep(PAUSED_RECHECK);
         true
@@ -104,10 +89,6 @@ mod tests {
     #[test]
     fn fixes_run_by_default_and_pause_independently() {
         assert!(!is_paused(Fix::Reaper));
-        register(Fix::Reaper);
-        register(Fix::Pingdom);
-        register(Fix::Reaper);
-        assert_eq!(registered(), vec![Fix::Reaper, Fix::Pingdom]);
         set_paused(Fix::Reaper, true);
         assert!(is_paused(Fix::Reaper));
         assert!(!is_paused(Fix::Pingdom));

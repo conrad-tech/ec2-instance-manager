@@ -94,8 +94,9 @@ pub struct AppConfig {
     pub default_remote_browser_path: Option<String>,
     /// Starting path for the remote file browser on a bastion (an instance
     /// matching the features.json primary/secondary bastion filter).
-    /// `{{user}}` expands to the local OS username. Falls back to
-    /// `DEFAULT_BASTION_BROWSER_PATH` if unset.
+    /// `{{user}}` expands to the SSH login saved for the environment. Unset
+    /// means the VS Code rule: `/efs/home/<login>`, or `/home/ec2-user`
+    /// for the built-in login (also the result when no login is saved).
     pub default_bastion_browser_path: Option<String>,
     /// Starting directory used by the native Upload/Download file dialogs.
     /// Falls back to the OS default (typically last-used) if unset.
@@ -1622,10 +1623,6 @@ fn decode_b64(raw: &str) -> Option<String> {
 
 /// `<b64 name>|<hotkey>|<b64 body>`. A script with an unreadable name or
 /// body is dropped rather than surfaced half-decoded.
-/// Remote file-browser start on a bastion when none is configured. Created
-/// users live on the shared EFS mount; `{{user}}` is the local OS username.
-pub const DEFAULT_BASTION_BROWSER_PATH: &str = "/efs/home/{{user}}";
-
 /// Whether an instance is a bastion, by the features.json primary/secondary
 /// filters (case-insensitive substring of name or id). A blank filter
 /// matches nothing here.

@@ -18514,7 +18514,7 @@ mod gui {
                 .pivot(egui::Align2::CENTER_CENTER)
                 .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
-                    ui.label("Bastion default path ({{user}} = your OS username):");
+                    ui.label("Bastion default path ({{user}} = SSH login for the environment):");
                     let mut bastion = self
                         .config
                         .default_bastion_browser_path
@@ -18522,7 +18522,7 @@ mod gui {
                         .unwrap_or_default();
                     let resp_b = ui.add(
                         egui::TextEdit::singleline(&mut bastion)
-                            .hint_text(ec2_manager::config::DEFAULT_BASTION_BROWSER_PATH)
+                            .hint_text("(SSH login: /efs/home/<user>, ec2-user: /home/ec2-user)")
                             .desired_width(320.0),
                     );
                     if resp_b.changed() {
@@ -27241,6 +27241,7 @@ mod gui {
                         .map(|p| p.profile_id.clone())
                         .unwrap_or_else(|| context.profile.clone())
                 });
+            let tab_profile_for_browser = tab_profile.clone();
             let tab_id = self.connections.open(title.clone(), instance_id.clone(), tab_profile);
             self.rebuild_account_colors();
             let default_path = if context.mode == Mode::Sim {
@@ -27250,13 +27251,13 @@ mod gui {
             } else {
                 // Prefer the path the user last navigated to on this instance;
                 // fall back to the configured default, then /home/ec2-user.
-                let name = self
+                let found = self
                     .profile_inventory_cache
                     .values()
                     .flat_map(|(inv, _)| inv.instances.iter())
-                    .find(|i| i.instance_id == instance_id)
-                    .and_then(|i| i.name.clone())
-                    .unwrap_or_default();
+                    .find(|i| i.instance_id == instance_id);
+                let name = found.and_then(|i| i.name.clone()).unwrap_or_default();
+                let env = found.and_then(instance_env).unwrap_or_default();
                 let is_bastion = ec2_manager::config::is_bastion_instance(
                     &instance_id,
                     &name,
@@ -27264,17 +27265,14 @@ mod gui {
                     &self.secondary_bastion_filter,
                 );
                 let fallback = if is_bastion {
-                    let tpl = self
-                        .config
-                        .default_bastion_browser_path
-                        .clone()
-                        .unwrap_or_else(|| {
-                            ec2_manager::config::DEFAULT_BASTION_BROWSER_PATH.to_string()
-                        });
-                    expand_script_placeholders(
-                        &tpl,
-                        &ec2_manager::features::current_os_user(),
-                    )
+                    // The login saved for this environment (what Open in
+                    // VS Code uses); "ec2-user" when none is saved, which
+                    // lands on /home/ec2-user.
+                    let login = self.config.resolve_ssh_user(&tab_profile_for_browser, &env);
+                    match self.config.default_bastion_browser_path.as_deref() {
+                        Some(tpl) => expand_script_placeholders(tpl, &login),
+                        None => default_remote_dir(&login),
+                    }
                 } else {
                     self.config
                         .default_remote_browser_path
@@ -41835,7 +41833,22 @@ mod gui {
                                     }
                                 }
                             });
-                            let fixes = ec2_manager::fix_pause::registered();
+                            // Read off the armed runtimes every frame: each is `Some` only
+                            // when that fix's own gate passed at startup (enabled, this
+                            // user named, credentials, mailbox), so a fix the user is not
+                            // armed for is never listed -- not even its name.
+                            use ec2_manager::fix_pause::Fix;
+                            let fixes: Vec<Fix> = [
+                                (self.reaper.is_some(), Fix::Reaper),
+                                (self.pingdom.is_some(), Fix::Pingdom),
+                                (self.unhealthy_host.is_some(), Fix::UnhealthyHost),
+                                (self.instance_age.is_some(), Fix::InstanceAge),
+                                (self.grafana.is_some(), Fix::Grafana),
+                                (self.custom_alerts.is_some(), Fix::CustomAlerts),
+                            ]
+                            .into_iter()
+                            .filter_map(|(armed, fix)| armed.then_some(fix))
+                            .collect();
                             if !fixes.is_empty() {
                                 ui.menu_button("Manage Fixes", |ui| {
                                     ui.weak("Untick to pause until you re-tick or restart.");
