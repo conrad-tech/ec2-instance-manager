@@ -18514,7 +18514,32 @@ mod gui {
                 .pivot(egui::Align2::CENTER_CENTER)
                 .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
-                    ui.label("Remote SSM browser default path:");
+                    ui.label("Bastion default path ({{user}} = your OS username):");
+                    let mut bastion = self
+                        .config
+                        .default_bastion_browser_path
+                        .clone()
+                        .unwrap_or_default();
+                    let resp_b = ui.add(
+                        egui::TextEdit::singleline(&mut bastion)
+                            .hint_text(ec2_manager::config::DEFAULT_BASTION_BROWSER_PATH)
+                            .desired_width(320.0),
+                    );
+                    if resp_b.changed() {
+                        self.config.default_bastion_browser_path =
+                            if bastion.trim().is_empty() {
+                                None
+                            } else {
+                                Some(bastion.trim().to_string())
+                            };
+                    }
+                    if resp_b.lost_focus() {
+                        let _ = self.config.save();
+                    }
+                    ui.weak("Used for instances matching the primary/secondary bastion filter.");
+
+                    ui.add_space(8.0);
+                    ui.label("Remote SSM browser default path (all other instances):");
                     let mut remote = self
                         .config
                         .default_remote_browser_path
@@ -18578,6 +18603,7 @@ mod gui {
                     ui.horizontal(|ui| {
                         if ui.button("Reset to Defaults").clicked() {
                             self.config.default_remote_browser_path = None;
+                            self.config.default_bastion_browser_path = None;
                             self.config.default_local_dialog_path = None;
                             let _ = self.config.save();
                         }
@@ -27224,10 +27250,40 @@ mod gui {
             } else {
                 // Prefer the path the user last navigated to on this instance;
                 // fall back to the configured default, then /home/ec2-user.
+                let name = self
+                    .profile_inventory_cache
+                    .values()
+                    .flat_map(|(inv, _)| inv.instances.iter())
+                    .find(|i| i.instance_id == instance_id)
+                    .and_then(|i| i.name.clone())
+                    .unwrap_or_default();
+                let is_bastion = ec2_manager::config::is_bastion_instance(
+                    &instance_id,
+                    &name,
+                    &self.primary_bastion_filter,
+                    &self.secondary_bastion_filter,
+                );
+                let fallback = if is_bastion {
+                    let tpl = self
+                        .config
+                        .default_bastion_browser_path
+                        .clone()
+                        .unwrap_or_else(|| {
+                            ec2_manager::config::DEFAULT_BASTION_BROWSER_PATH.to_string()
+                        });
+                    expand_script_placeholders(
+                        &tpl,
+                        &ec2_manager::features::current_os_user(),
+                    )
+                } else {
+                    self.config
+                        .default_remote_browser_path
+                        .clone()
+                        .unwrap_or_else(|| "/home/ec2-user".to_string())
+                };
                 self.config
                     .file_browser_path(&instance_id)
-                    .or_else(|| self.config.default_remote_browser_path.clone())
-                    .unwrap_or_else(|| "/home/ec2-user".to_string())
+                    .unwrap_or(fallback)
             };
             let mut fb_state = FileBrowserState {
                 current_path: default_path.clone(),
@@ -39987,15 +40043,15 @@ mod gui {
                 .get(find_current)
                 .map(|m| (m.byte_start, m.byte_end));
 
-            // Compute the scroll offset that brings the current match into view.
-            let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-            let mut scroll_offset: Option<f32> = None;
+            // The line to bring into view. The scroll itself is requested from
+            // inside the scroll area using the galley's real row positions:
+            // multiplying a line index by a style height drifts (the galley
+            // pixel-rounds its rows), ~15 lines off by line 1100.
+            let mut scroll_to_line: Option<usize> = None;
             if do_scroll {
                 if let Some(m) = matches.get(find_current) {
                     let upto = m.byte_start.min(editor_content.len());
-                    let line_idx = editor_content[..upto].matches('\n').count();
-                    let target = (line_idx as f32) * row_height - row_height * 3.0;
-                    scroll_offset = Some(target.max(0.0));
+                    scroll_to_line = Some(editor_content[..upto].matches('\n').count());
                 }
             }
 
@@ -40032,10 +40088,7 @@ mod gui {
             }
 
             // Code editor with line numbers
-            let mut scroll = egui::ScrollArea::both().id_salt(("editor_scroll", tab_id));
-            if let Some(off) = scroll_offset {
-                scroll = scroll.vertical_scroll_offset(off);
-            }
+            let scroll = egui::ScrollArea::both().id_salt(("editor_scroll", tab_id));
             scroll.show(ui, |ui| {
                     ui.horizontal_top(|ui| {
                         let line_count = editor_content.lines().count().max(1);
@@ -40080,13 +40133,24 @@ mod gui {
                             job.wrap.max_width = f32::INFINITY;
                             ui.fonts_mut(|f| f.layout_job(job))
                         };
-                        let response = ui.add(
-                            egui::TextEdit::multiline(&mut editor_content)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY)
-                                .code_editor()
-                                .layouter(&mut layouter),
-                        );
+                        let output = egui::TextEdit::multiline(&mut editor_content)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY)
+                            .code_editor()
+                            .layouter(&mut layouter)
+                            .show(ui);
+                        let response = output.response;
+                        if let Some(line) = scroll_to_line {
+                            if let Some(row) = output.galley.rows.get(line) {
+                                let row_h = row.height();
+                                let top = output.galley_pos.y + row.pos.y - row_h * 3.0;
+                                let rect = egui::Rect::from_min_size(
+                                    egui::pos2(output.galley_pos.x, top),
+                                    egui::vec2(1.0, row_h * 4.0),
+                                );
+                                ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+                            }
+                        }
 
                         // Handle toggle comment (Ctrl+/)
                         if toggle_comment {
@@ -41771,6 +41835,23 @@ mod gui {
                                     }
                                 }
                             });
+                            let fixes = ec2_manager::fix_pause::registered();
+                            if !fixes.is_empty() {
+                                ui.menu_button("Manage Fixes", |ui| {
+                                    ui.weak("Untick to pause until you re-tick or restart.");
+                                    for fix in fixes {
+                                        let mut running = !ec2_manager::fix_pause::is_paused(fix);
+                                        if ui.checkbox(&mut running, fix.label()).changed() {
+                                            ec2_manager::fix_pause::set_paused(fix, !running);
+                                            self.log_warn(format!(
+                                                "manage fixes: {} {}",
+                                                fix.label(),
+                                                if running { "resumed" } else { "PAUSED" }
+                                            ));
+                                        }
+                                    }
+                                });
+                            }
                             if ui.button("File Browser Defaults...").clicked() {
                                 self.show_file_browser_defaults = true;
                                 ui.close();
@@ -44929,6 +45010,7 @@ mod gui {
             };
 
             loop {
+                if ec2_manager::fix_pause::hold(ec2_manager::fix_pause::Fix::Pingdom) { continue; }
                 let now_ms = monotonic_ms(started);
 
                 // On call first, before the feed is even read: off call
@@ -45178,6 +45260,7 @@ mod gui {
             };
 
             loop {
+                if ec2_manager::fix_pause::hold(ec2_manager::fix_pause::Fix::CustomAlerts) { continue; }
                 let (on_call, reason) = custom_alerts_on_call_decision(
                     oncall::is_on_call(&auth, &schedule_id, &account_id)
                         .map_err(|e| e.to_string()),
@@ -45437,6 +45520,7 @@ mod gui {
             };
 
             loop {
+                if ec2_manager::fix_pause::hold(ec2_manager::fix_pause::Fix::UnhealthyHost) { continue; }
                 let now_ms = monotonic_ms(started);
 
                 let (on_call, reason) = unhealthy_host_on_call_decision(
@@ -46039,6 +46123,7 @@ mod gui {
             };
 
             loop {
+                if ec2_manager::fix_pause::hold(ec2_manager::fix_pause::Fix::InstanceAge) { continue; }
                 let now_ms = monotonic_ms(started);
                 state.begin_poll();
 
@@ -46392,6 +46477,7 @@ mod gui {
             };
 
             loop {
+                if ec2_manager::fix_pause::hold(ec2_manager::fix_pause::Fix::Grafana) { continue; }
                 let now_ms = monotonic_ms(started);
 
                 let (on_call, reason) = grafana_on_call_decision(
@@ -47430,6 +47516,7 @@ mod gui {
             let mut reported: HashMap<String, String> = HashMap::new();
 
             loop {
+                if ec2_manager::fix_pause::hold(ec2_manager::fix_pause::Fix::Reaper) { continue; }
                 let now_ms = monotonic_ms(started);
                 match alerts::fetch_latest(&auth, cfg.alerts_per_poll()) {
                     Ok(list) => {

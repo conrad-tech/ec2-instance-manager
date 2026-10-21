@@ -92,6 +92,11 @@ pub struct AppConfig {
     /// Starting path used when opening the remote SSM file browser in a
     /// new connection tab. Falls back to "/home/ec2-user" if unset.
     pub default_remote_browser_path: Option<String>,
+    /// Starting path for the remote file browser on a bastion (an instance
+    /// matching the features.json primary/secondary bastion filter).
+    /// `{{user}}` expands to the local OS username. Falls back to
+    /// `DEFAULT_BASTION_BROWSER_PATH` if unset.
+    pub default_bastion_browser_path: Option<String>,
     /// Starting directory used by the native Upload/Download file dialogs.
     /// Falls back to the OS default (typically last-used) if unset.
     pub default_local_dialog_path: Option<String>,
@@ -210,6 +215,7 @@ impl Default for AppConfig {
             window_h: None,
             window_maximized: None,
             default_remote_browser_path: None,
+            default_bastion_browser_path: None,
             default_local_dialog_path: None,
             ssh_pem_library: Vec::new(),
             jira_seen: BTreeMap::new(),
@@ -1288,6 +1294,13 @@ impl AppConfig {
                         Some(value.to_string())
                     };
                 }
+                "default_bastion_browser_path" => {
+                    cfg.default_bastion_browser_path = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
                 "default_local_dialog_path" => {
                     cfg.default_local_dialog_path = if value.is_empty() {
                         None
@@ -1358,6 +1371,9 @@ impl AppConfig {
 
         if let Some(ref p) = self.default_remote_browser_path {
             lines.push(format!("default_remote_browser_path={p}"));
+        }
+        if let Some(ref p) = self.default_bastion_browser_path {
+            lines.push(format!("default_bastion_browser_path={p}"));
         }
         if let Some(ref p) = self.default_local_dialog_path {
             lines.push(format!("default_local_dialog_path={p}"));
@@ -1606,6 +1622,22 @@ fn decode_b64(raw: &str) -> Option<String> {
 
 /// `<b64 name>|<hotkey>|<b64 body>`. A script with an unreadable name or
 /// body is dropped rather than surfaced half-decoded.
+/// Remote file-browser start on a bastion when none is configured. Created
+/// users live on the shared EFS mount; `{{user}}` is the local OS username.
+pub const DEFAULT_BASTION_BROWSER_PATH: &str = "/efs/home/{{user}}";
+
+/// Whether an instance is a bastion, by the features.json primary/secondary
+/// filters (case-insensitive substring of name or id). A blank filter
+/// matches nothing here.
+pub fn is_bastion_instance(id: &str, name: &str, primary: &str, secondary: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    [primary, secondary].iter().any(|f| {
+        let f = f.trim().to_ascii_lowercase();
+        !f.is_empty() && (id.contains(&f) || name.contains(&f))
+    })
+}
+
 fn parse_personal_script(raw: &str) -> Option<PersonalScript> {
     let mut fields = raw.splitn(3, '|');
     let name = decode_b64(fields.next()?)?;
@@ -2312,6 +2344,29 @@ mod tests {
         let round_tripped = legacy.to_text();
         assert!(!round_tripped.contains("fed_password_blob"));
         assert!(!round_tripped.contains("fed_username"));
+    }
+
+    #[test]
+    fn bastion_browser_path_round_trips() {
+        let mut cfg = AppConfig::default();
+        cfg.default_bastion_browser_path = Some("/efs/home/{{user}}".to_string());
+        let text = cfg.to_text();
+        assert!(text.contains("default_bastion_browser_path=/efs/home/{{user}}"));
+        assert_eq!(
+            AppConfig::parse(&text).default_bastion_browser_path.as_deref(),
+            Some("/efs/home/{{user}}")
+        );
+
+    }
+
+    #[test]
+    fn bastion_detection_uses_the_configured_filters() {
+        assert!(is_bastion_instance("i-1", "prod-Bastion-a", "bastion", ""));
+        assert!(is_bastion_instance("i-1", "jump-b", "", "JUMP"));
+        assert!(!is_bastion_instance("i-1", "web-1", "bastion", "bastion"));
+        // A blank filter claims nothing (unlike the dropdowns, where blank
+        // shows all): otherwise every instance would count as a bastion.
+        assert!(!is_bastion_instance("i-1", "web-1", "", "  "));
     }
 
     #[test]

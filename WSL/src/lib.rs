@@ -16,6 +16,7 @@ pub mod elb;
 pub mod error;
 pub mod fed_auth;
 pub mod features;
+pub mod fix_pause;
 pub mod filter;
 pub mod forwards;
 pub mod forwards_check;
