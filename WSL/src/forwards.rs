@@ -111,6 +111,30 @@ impl ForwardsConfig {
             .unwrap_or(&[])
     }
 
+    /// This configuration with `extra` forwards added to `env` — the ones a
+    /// user added from the Port Forwards window. A host `forwards.json`
+    /// already declares for that environment wins, so an added line can never
+    /// redirect a shared one.
+    pub fn with_extra(&self, env: &str, extra: &[ForwardEntry]) -> ForwardsConfig {
+        let mut merged = self.clone();
+        if extra.is_empty() {
+            return merged;
+        }
+        let key = merged
+            .environments
+            .keys()
+            .find(|k| k.trim().eq_ignore_ascii_case(env.trim()))
+            .cloned()
+            .unwrap_or_else(|| env.trim().to_string());
+        let list = merged.environments.entry(key).or_default();
+        for e in extra {
+            if !list.iter().any(|x| x.host.trim().eq_ignore_ascii_case(e.host.trim())) {
+                list.push(e.clone());
+            }
+        }
+        merged
+    }
+
     /// Port for a DNS name: an explicit port wins, then the first matching
     /// rule, then `default_port`.
     pub fn port_for(&self, host: &str, explicit: Option<u16>) -> u16 {
@@ -1079,5 +1103,84 @@ mod tests {
             cfg.port_rules.iter().any(|r| r.match_ == "postgres"),
             "bundled forwards.json should ship the port rules"
         );
+    }
+}
+
+
+/// Check a forward typed into the Add forward dialog and turn it into an
+/// entry. Refuses locally, as it is typed, so a bad value never reaches the
+/// ssh command line: the host goes into a `LocalForward` directive and the
+/// ip into a bind address.
+pub fn validate_user_forward(host: &str, ip: &str, port: &str) -> Result<ForwardEntry, String> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err("Enter the host name to forward to.".to_string());
+    }
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        return Err(
+            "The host may contain only letters, digits, '.', '-' and '_' \
+             (no spaces, and no :port - use the Port box)."
+                .to_string(),
+        );
+    }
+    let ip = ip.trim();
+    if ip.parse::<std::net::Ipv4Addr>().is_err() {
+        return Err("Enter the local loopback address to bind, e.g. 127.200.20.4.".to_string());
+    }
+    let port = port.trim();
+    let port = if port.is_empty() {
+        None
+    } else {
+        match port.parse::<u16>() {
+            Ok(p) if p >= 1 => Some(p),
+            _ => return Err("The port must be a number from 1 to 65535, or blank.".to_string()),
+        }
+    };
+    Ok(ForwardEntry {
+        ip: ip.to_string(),
+        host: host.to_string(),
+        port,
+    })
+}
+
+#[cfg(test)]
+mod user_forward_tests {
+    use super::*;
+
+    #[test]
+    fn a_typed_forward_is_checked_before_it_can_reach_ssh() {
+        assert!(validate_user_forward("svc.example.net", "127.200.1.1", "").is_ok());
+        assert_eq!(
+            validate_user_forward(" svc.example.net ", "127.200.1.1", "8443").unwrap().port,
+            Some(8443)
+        );
+        assert!(validate_user_forward("", "127.200.1.1", "").is_err());
+        assert!(validate_user_forward("a b", "127.200.1.1", "").is_err());
+        assert!(validate_user_forward("a:443", "127.200.1.1", "").is_err());
+        assert!(validate_user_forward("a;rm", "127.200.1.1", "").is_err());
+        assert!(validate_user_forward("a.net", "not-an-ip", "").is_err());
+        assert!(validate_user_forward("a.net", "127.0.0.1", "0").is_err());
+        assert!(validate_user_forward("a.net", "127.0.0.1", "70000").is_err());
+    }
+
+    #[test]
+    fn an_added_forward_joins_the_environment_but_never_overrides_a_declared_host() {
+        let cfg = ForwardsConfig::parse(
+            r#"{"environments":{"DEV1":[{"ip":"127.200.1.1","host":"a.net"}]}}"#,
+        );
+        let extra = [
+            ForwardEntry { ip: "127.200.1.9".into(), host: "A.net".into(), port: None },
+            ForwardEntry { ip: "127.200.1.2".into(), host: "b.net".into(), port: Some(8080) },
+        ];
+        let merged = cfg.with_extra("dev1", &extra);
+        let list = merged.entries_for("DEV1");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].ip, "127.200.1.1");
+        assert_eq!(list[1].host, "b.net");
+        // A brand-new environment name gets its own entry.
+        assert_eq!(cfg.with_extra("QA", &extra).entries_for("QA").len(), 2);
     }
 }

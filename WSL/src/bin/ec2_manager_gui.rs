@@ -1502,6 +1502,18 @@ mod gui {
     /// Present on every row, not only failing ones: the case it exists for is
     /// a setup that used to work and stopped — a terminated bastion, a
     /// deleted login, a rotated key.
+    struct AddForwardDialog {
+        account_id: String,
+        env: String,
+        label: String,
+        host: String,
+        ip: String,
+        port: String,
+        /// Why the last Add was refused, shown under the boxes.
+        error: Option<String>,
+    }
+
+    /// The `PortForwardLoginDialog` struct follows.
     struct PortForwardLoginDialog {
         /// `vscode_key(account_id, env)` — the row this belongs to.
         key: String,
@@ -5723,8 +5735,11 @@ mod gui {
     fn alert_row_menu(
         ui: &mut egui::Ui,
         alert: &ec2_manager::alerts::Alert,
+        show_probe: bool,
+        can_ack: bool,
         dry_run: &mut Option<String>,
         remediate: &mut Option<String>,
+        acknowledge: &mut Option<String>,
     ) {
         ui.label(
             egui::RichText::new(if alert.tiny_id.is_empty() {
@@ -5734,6 +5749,33 @@ mod gui {
             })
             .strong(),
         );
+        ui.separator();
+        // Open to everyone who can see the window: acknowledging has no
+        // on-call gate when a person does it (the gate belongs to the
+        // unattended watchers). Disabled, with the reason, once there is
+        // nothing left to acknowledge.
+        let closed = ec2_manager::reaper::alert_is_closed(&alert.status);
+        let hover = if closed {
+            "This alert is already closed."
+        } else if alert.acknowledged {
+            "This alert is already acknowledged."
+        } else {
+            "Acknowledge this alert."
+        };
+        if ui
+            .add_enabled(
+                can_ack && !alert.acknowledged && !closed && !alert.id.trim().is_empty(),
+                egui::Button::new("Acknowledge"),
+            )
+            .on_hover_text(hover)
+            .clicked()
+        {
+            *acknowledge = Some(alert.id.clone());
+            ui.close();
+        }
+        if !show_probe {
+            return;
+        }
         ui.separator();
         if ui
             .button("Test Alert Match")
@@ -10888,6 +10930,9 @@ mod gui {
         save_filter_name: String,
         /// Environments hidden from the color legend (toggled on the connections page)
         hidden_envs: std::collections::HashSet<String>,
+        /// An environment the user just ticked in Exclude Env that has port
+        /// forwards declared, waiting on the confirmation dialog.
+        pending_exclude_env: Option<String>,
         selected_saved_filter: String,
         selected_instance_id: String,
         /// Whatever the Details tab is showing — an instance or a target group.
@@ -11186,6 +11231,8 @@ mod gui {
         show_port_forwards: bool,
         /// Open "Login…" dialog for one Port Forwards row, if any.
         port_forward_login: Option<PortForwardLoginDialog>,
+        /// The "Add forward" form, open from an environment's forwards list.
+        add_forward_dialog: Option<AddForwardDialog>,
         /// Throttle for `poll_port_tunnels`.
         last_tunnel_poll_at: Instant,
         /// Tunnel status line, rendered like the Scripts one (yellow while
@@ -12071,6 +12118,7 @@ mod gui {
                 multi_account_ids: std::collections::HashSet::new(),
                 save_filter_name: String::new(),
                 hidden_envs: initial_hidden_envs,
+                pending_exclude_env: None,
                 selected_saved_filter: String::new(),
                 selected_instance_id: String::new(),
                 detail_tabs: Vec::new(),
@@ -12213,6 +12261,7 @@ mod gui {
                 probe_rx,
                 tunnel_bastion_pref: HashMap::new(),
                 port_forward_login: None,
+                add_forward_dialog: None,
                 tunnel_errors: HashMap::new(),
                 tunnel_failures: HashMap::new(),
                 show_port_forwards: false,
@@ -14540,25 +14589,45 @@ mod gui {
 
         /// One row of the Port Forwards window: an environment that has
         /// forwards declared, and what is known about reaching it.
+        /// forwards.json plus the forwards this user added for one
+        /// environment. Every place that resolves forwards goes through
+        /// here, so an added forward cannot show in one view and be missing
+        /// from the tunnel or the VS Code block.
+        fn forwards_config_for(
+            &self,
+            profile_id: &str,
+            env: &str,
+        ) -> ec2_manager::forwards::ForwardsConfig {
+            self.forwards_config
+                .with_extra(env, self.config.user_forwards_for(profile_id, env))
+        }
+
         fn port_forward_rows(&mut self) -> Vec<PortForwardRow> {
             let hosts_path = self.config.hosts_file_path();
             let hosts = ec2_manager::forwards::load_hosts(&hosts_path);
-            let environments = self.script_environments();
+            // Exclude Env does not apply here: every environment forwards.json
+            // declares is listed, so one excluded before its forwards existed
+            // is still there to be set up.
+            let environments = self.script_environments_with(true);
             let mut rows: Vec<PortForwardRow> = Vec::new();
 
-            for env_name in self
-                .forwards_config
-                .environments
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
             {
-                // An environment in forwards.json may exist in more than one
-                // account; each is its own tunnel, since each has its own
+                // `environments` is declared AND discovered (instance tags),
+                // so an environment nobody listed in accounts.json still gets
+                // a row once it has forwards — from forwards.json or added by
+                // the user. The same environment name may exist in more than
+                // one account; each is its own tunnel, since each has its own
                 // bastion and its own login.
                 let matches: Vec<ScriptEnv> = environments
                     .iter()
-                    .filter(|e| e.env.trim().eq_ignore_ascii_case(env_name.trim()))
+                    .filter(|e| !e.env.trim().is_empty())
+                    .filter(|e| {
+                        !self.forwards_config.entries_for(&e.env).is_empty()
+                            || !self
+                                .config
+                                .user_forwards_for(&e.account_id, &e.env)
+                                .is_empty()
+                    })
                     .cloned()
                     .collect();
                 for row in matches {
@@ -14568,7 +14637,7 @@ mod gui {
                     );
                     let forwards = ec2_manager::forwards::without_collisions(
                         &ec2_manager::forwards::resolve_forwards(
-                            &self.forwards_config,
+                            &self.forwards_config_for(&row.account_id, &row.env),
                             &hosts,
                             &row.env,
                         ),
@@ -15687,16 +15756,61 @@ mod gui {
             let mut dismiss: Option<(PortForwardRow, String)> = None;
             let mut clear_all = false;
             let mut open_login: Option<PortForwardRow> = None;
+            let mut open_add_forward: Option<PortForwardRow> = None;
+            // Every environment the app knows, declared or discovered, for
+            // the picker that gives one its first forward.
+            let mut open_add_new: Option<(String, String, String)> = None;
+            let all_envs: Vec<ScriptEnv> = self
+                .script_environments_with(true)
+                .into_iter()
+                .filter(|e| !e.env.trim().is_empty())
+                .collect();
+            let mut remove_forward: Option<(PortForwardRow, String)> = None;
+            let user_hosts: HashMap<String, Vec<String>> = rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.key.clone(),
+                        self.config
+                            .user_forwards_for(&r.account_id, &r.env)
+                            .iter()
+                            .map(|e| e.host.to_ascii_lowercase())
+                            .collect(),
+                    )
+                })
+                .collect();
 
             egui::Window::new("Port Forwards")
                 .open(&mut open)
                 .resizable(true)
                 .default_width(560.0)
                 .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("pf_add_to_env")
+                            .selected_text("Add forward to environment…")
+                            .show_ui(ui, |ui| {
+                                for e in &all_envs {
+                                    let shown = format!("{} ({})", e.label, e.account_label);
+                                    if ui.selectable_label(false, shown).clicked() {
+                                        open_add_new = Some((
+                                            e.account_id.clone(),
+                                            e.env.clone(),
+                                            e.label.clone(),
+                                        ));
+                                        ui.close();
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Every environment the app knows, including ones found \
+                                 from instance tags that forwards.json does not name.",
+                            );
+                    });
                     if rows.is_empty() {
                         ui.label(
-                            "No environments have forwards declared. Add them to \
-                             forwards.json and rebuild.",
+                            "No environments have forwards yet. Add one above, or \
+                             declare them in forwards.json and rebuild.",
                         );
                         return;
                     }
@@ -15979,16 +16093,44 @@ mod gui {
                         .id_salt(format!("pf_{}", row.key))
                         .show(ui, |ui| {
                             for fwd in &row.forwards {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{}:{} -> {}:{}",
-                                        fwd.ip,
-                                        fwd.local_port,
-                                        fwd.host,
-                                        fwd.remote_port
-                                    ))
-                                    .small(),
-                                );
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{}:{} -> {}:{}",
+                                            fwd.ip,
+                                            fwd.local_port,
+                                            fwd.host,
+                                            fwd.remote_port
+                                        ))
+                                        .small(),
+                                    );
+                                    let added = user_hosts
+                                        .get(&row.key)
+                                        .is_some_and(|h| {
+                                            h.contains(&fwd.host.to_ascii_lowercase())
+                                        });
+                                    if added {
+                                        ui.label(egui::RichText::new("(added by you)").small().weak());
+                                        if ui
+                                            .small_button("Remove")
+                                            .on_hover_text("Remove this forward you added.")
+                                            .clicked()
+                                        {
+                                            remove_forward =
+                                                Some((row.clone(), fwd.host.clone()));
+                                        }
+                                    }
+                                });
+                            }
+                            if ui
+                                .small_button("Add forward")
+                                .on_hover_text(
+                                    "Add a forward to this environment, stored on this \
+                                     machine in addition to forwards.json.",
+                                )
+                                .clicked()
+                            {
+                                open_add_forward = Some(row.clone());
                             }
                         });
 
@@ -16068,6 +16210,34 @@ mod gui {
             if let Some(row) = open_login {
                 self.open_port_forward_login(&row);
             }
+            if let Some(row) = open_add_forward {
+                self.add_forward_dialog = Some(AddForwardDialog {
+                    account_id: row.account_id.clone(),
+                    env: row.env.clone(),
+                    label: row.label.clone(),
+                    host: String::new(),
+                    ip: String::new(),
+                    port: String::new(),
+                    error: None,
+                });
+            }
+            if let Some((account_id, env, label)) = open_add_new {
+                self.add_forward_dialog = Some(AddForwardDialog {
+                    account_id,
+                    env,
+                    label,
+                    host: String::new(),
+                    ip: String::new(),
+                    port: String::new(),
+                    error: None,
+                });
+            }
+            if let Some((row, host)) = remove_forward {
+                if self.config.remove_user_forward(&row.account_id, &row.env, &host) {
+                    let _ = self.config.save();
+                    self.log_info(format!("tunnel {}: removed added forward {host}", row.label));
+                }
+            }
             if let Some((row, enabled)) = toggle {
                 self.config
                     .set_tunnel_enabled(&row.account_id, &row.env, enabled);
@@ -16122,6 +16292,18 @@ mod gui {
         /// saved. Available on every row, whatever its status — the case this
         /// exists for is a setup that used to work and stopped.
         fn open_port_forward_login(&mut self, row: &PortForwardRow) {
+            // An account nobody has loaded yet (newly granted, never
+            // selected) has no inventory, so the dropdowns would be empty
+            // with nothing saying why. Ask for it; the dialog re-reads the
+            // cache every frame, so the list fills in when the reply lands.
+            if !self.profile_inventory_cache.contains_key(&row.account_id) {
+                self.log_info(format!(
+                    "tunnel {}: no inventory loaded for this account yet — refreshing it \
+                     so the bastion lists can fill",
+                    row.label
+                ));
+                self.refresh_profile(&row.account_id, true);
+            }
             let available = self.env_instances(&row.account_id, &row.env);
             // Strictly this environment's saved values. Prefilling from the
             // account-wide entry would show a sibling environment's boxes and
@@ -16233,6 +16415,18 @@ mod gui {
                 &dlg.user,
                 &dlg.pem,
             );
+            // Finishing setup is the answer to "do you want this environment?"
+            // — stop excluding it, or it would vanish from the inventory
+            // filters the moment it is working.
+            let env_lower = dlg.env.trim().to_ascii_lowercase();
+            if self.hidden_envs.remove(&env_lower) {
+                self.config.excluded_envs = self.hidden_envs.iter().cloned().collect();
+                self.config.excluded_envs.sort();
+                self.log_info(format!(
+                    "tunnel {}: setup saved, so {} is no longer excluded",
+                    dlg.label, dlg.env
+                ));
+            }
             let _ = self.config.save();
             self.tunnel_errors.remove(&dlg.key);
             self.config.clear_tunnel_dismissal(&dlg.account_id, &dlg.env);
@@ -16457,6 +16651,112 @@ mod gui {
         }
 
         /// Render the per-environment Login dialog.
+        /// The Add forward form. Validates as it is submitted
+        /// (`validate_user_forward`) and refuses a host already forwarded in
+        /// the environment or a bind another environment already holds, since
+        /// a clashing bind kills the whole tunnel under
+        /// `ExitOnForwardFailure`.
+        fn render_add_forward_dialog(&mut self, ctx: &egui::Context) {
+            let Some(mut dlg) = self.add_forward_dialog.take() else {
+                return;
+            };
+            let mut window_open = true;
+            let mut do_add = false;
+            let mut do_cancel = false;
+            egui::Window::new(format!("{} - add forward", dlg.label))
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
+                .show(ctx, |ui| {
+                    egui::Grid::new("add_forward_grid").num_columns(2).show(ui, |ui| {
+                        ui.label("Host:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dlg.host)
+                                .hint_text("service.example.net")
+                                .desired_width(260.0),
+                        );
+                        ui.end_row();
+                        ui.label("Local IP:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dlg.ip)
+                                .hint_text("127.200.20.4")
+                                .desired_width(260.0),
+                        );
+                        ui.end_row();
+                        ui.label("Port:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dlg.port)
+                                .hint_text("blank = pick from the host name")
+                                .desired_width(260.0),
+                        );
+                        ui.end_row();
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "The host is resolved on the bastion. The local IP is where \
+                             it is bound here; if your hosts file already maps the host, \
+                             that address is used instead.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    if let Some(err) = &dlg.error {
+                        note_label(ui, egui::Color32::from_rgb(220, 60, 60), err.as_str());
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Add").clicked() {
+                            do_add = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+            let mut keep_open = window_open && !do_cancel;
+            if do_add {
+                match self.try_add_user_forward(&dlg) {
+                    Ok(()) => keep_open = false,
+                    Err(e) => dlg.error = Some(e),
+                }
+            }
+            if keep_open {
+                self.add_forward_dialog = Some(dlg);
+            }
+        }
+
+        fn try_add_user_forward(&mut self, dlg: &AddForwardDialog) -> std::result::Result<(), String> {
+            let entry = ec2_manager::forwards::validate_user_forward(&dlg.host, &dlg.ip, &dlg.port)?;
+            let rows = self.port_forward_rows();
+            let this_key = ec2_manager::config::AppConfig::vscode_key(&dlg.account_id, &dlg.env);
+            if rows
+                .iter()
+                .filter(|r| r.key == this_key)
+                .flat_map(|r| r.forwards.iter())
+                .any(|f| f.host.eq_ignore_ascii_case(&entry.host))
+            {
+                return Err(format!("{} is already forwarded in this environment.", entry.host));
+            }
+            let port = self.forwards_config.port_for(&entry.host, entry.port);
+            if let Some(other) = rows.iter().find(|r| {
+                r.key != this_key
+                    && r.forwards.iter().any(|f| f.ip == entry.ip && f.local_port == port)
+            }) {
+                return Err(format!(
+                    "{}:{} is already bound by {}. Use a different local IP.",
+                    entry.ip, port, other.label
+                ));
+            }
+            self.config.add_user_forward(&dlg.account_id, &dlg.env, entry.clone());
+            let _ = self.config.save();
+            self.log_info(format!(
+                "tunnel {}: added forward {}:{} -> {}",
+                dlg.label, entry.ip, port, entry.host
+            ));
+            Ok(())
+        }
+
         fn render_port_forward_login_dialog(&mut self, ctx: &egui::Context) {
             let Some(mut dlg) = self.port_forward_login.take() else {
                 return;
@@ -16468,6 +16768,9 @@ mod gui {
             let mut do_test = false;
             let mut do_close = false;
             let available = self.env_instances(&dlg.account_id, &dlg.env);
+            let inventory_loaded = self.profile_inventory_cache.contains_key(&dlg.account_id);
+            let no_bastions = bastion_candidates(&available, &dlg.primary_query).is_empty();
+            let mut do_reload_inventory = false;
             let library = self.config.sorted_pem_library();
             let stale_note = |ui: &mut egui::Ui, which: &str| {
                 note_label(ui, 
@@ -16487,6 +16790,35 @@ mod gui {
                 .pivot(egui::Align2::CENTER_CENTER)
                 .default_pos(ctx.content_rect().center())
                 .show(ctx, |ui| {
+                    if no_bastions {
+                        let why = if !inventory_loaded {
+                            "No inventory has loaded for this account yet, so there are no \
+                             bastions to pick. It is being fetched; if this stays empty, \
+                             check that the account's credentials are valid."
+                                .to_string()
+                        } else if available.is_empty() {
+                            format!(
+                                "The account's inventory has no running instances tagged \
+                                 for environment '{}'.",
+                                dlg.env
+                            )
+                        } else {
+                            format!(
+                                "None of this environment's {} running instance(s) has \
+                                 '{}' in its name or id.",
+                                available.len(),
+                                dlg.primary_query.trim()
+                            )
+                        };
+                        note_label(
+                            ui,
+                            egui::Color32::from_rgb(220, 150, 60),
+                            egui::RichText::new(why).small(),
+                        );
+                        if ui.small_button("Reload inventory").clicked() {
+                            do_reload_inventory = true;
+                        }
+                    }
                     // `bastion_combo_ui` is an associated function (no
                     // `self`), unlike the module-level helpers below it.
                     Self::bastion_combo_ui(
@@ -16625,6 +16957,9 @@ mod gui {
                     });
                 });
 
+            if do_reload_inventory {
+                self.refresh_profile(&dlg.account_id, true);
+            }
             if do_test {
                 // Testing unsaved edits tests nothing, and a pass that was
                 // not persisted is worse than no test at all.
@@ -16696,7 +17031,7 @@ mod gui {
                 self.log_warn(warning);
             }
             let resolved_forwards = ec2_manager::forwards::resolve_forwards(
-                &self.forwards_config,
+                &self.forwards_config_for(&profile_id, &env),
                 &hosts,
                 &env,
             );
@@ -17189,7 +17524,7 @@ mod gui {
             if let Some(path) = rehosted {
                 let hosts = ec2_manager::forwards::load_hosts(&path);
                 let resolved = ec2_manager::forwards::resolve_forwards(
-                    &self.forwards_config,
+                    &self.forwards_config_for(&dlg.profile_id, &dlg.env),
                     &hosts,
                     &dlg.env,
                 );
@@ -18657,7 +18992,19 @@ mod gui {
         /// available; it returns immediately once an account is cached, so
         /// calling this per frame while the dialog is open is cheap.
         fn script_environments(&mut self) -> Vec<ScriptEnv> {
-            let hidden: Vec<String> = self.hidden_envs.iter().cloned().collect();
+            self.script_environments_with(false)
+        }
+
+        /// `script_environments`, optionally ignoring Exclude Env. Port
+        /// Forwards asks for the unfiltered list: an environment with
+        /// forwards declared must stay reachable there so it can be set up,
+        /// even if it was excluded before anyone declared them.
+        fn script_environments_with(&mut self, include_excluded: bool) -> Vec<ScriptEnv> {
+            let hidden: Vec<String> = if include_excluded {
+                Vec::new()
+            } else {
+                self.hidden_envs.iter().cloned().collect()
+            };
             let profiles: Vec<(String, String, String)> = self
                 .config
                 .profiles
@@ -19931,6 +20278,59 @@ mod gui {
                         self.start_alerts_fetch();
                     }
                 }
+            }
+        }
+
+        /// Whether forwards.json declares any port forwards for `env`
+        /// (case-insensitive, like every other environment match).
+        fn env_has_forwards(&self, env: &str) -> bool {
+            !self.forwards_config.entries_for(env).is_empty()
+        }
+
+        /// Confirmation for excluding an environment that has port forwards.
+        fn render_exclude_env_confirm(&mut self, ctx: &egui::Context) {
+            let Some(env) = self.pending_exclude_env.clone() else {
+                return;
+            };
+            let mut window_open = true;
+            let mut do_confirm = false;
+            let mut do_cancel = false;
+            egui::Window::new("Exclude environment with port forwards?")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut window_open)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
+                .show(ctx, |ui| {
+                    note_label(
+                        ui,
+                        egui::Color32::from_rgb(220, 60, 60),
+                        format!("{env} has port forwards declared in forwards.json."),
+                    );
+                    ui.label(
+                        "Excluding it hides it from the inventory and the Scripts \
+                         dialogs. It will still be listed in Port Forwards so its \
+                         tunnel can be managed, and finishing its Setup there \
+                         un-excludes it again.",
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Exclude anyway").clicked() {
+                            do_confirm = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            do_cancel = true;
+                        }
+                    });
+                });
+            if do_confirm {
+                self.hidden_envs.insert(env.to_ascii_lowercase());
+                self.config.excluded_envs = self.hidden_envs.iter().cloned().collect();
+                self.config.excluded_envs.sort();
+                let _ = self.config.save();
+                self.log_info(format!("excluded environment {env} (it has port forwards)"));
+            }
+            if do_confirm || do_cancel || !window_open {
+                self.pending_exclude_env = None;
             }
         }
 
@@ -22156,6 +22556,7 @@ mod gui {
             // `self`, then applied below alongside the buttons' results.
             let mut menu_dry_run: Option<String> = None;
             let mut menu_remediate: Option<String> = None;
+            let mut menu_acknowledge: Option<String> = None;
             // Carried out of the window closure like the rest: opening the
             // detail window needs `&mut self`.
             let mut open_alert: Option<(String, String)> = None;
@@ -22448,15 +22849,15 @@ mod gui {
                                         // whichever column the user happened to
                                         // aim at.
                                         let mut menu = |r: egui::Response| {
-                                            if !probe_enabled {
-                                                return;
-                                            }
                                             r.context_menu(|ui| {
                                                 alert_row_menu(
                                                     ui,
                                                     a,
+                                                    probe_enabled,
+                                                    !ack_all_running,
                                                     &mut menu_dry_run,
                                                     &mut menu_remediate,
+                                                    &mut menu_acknowledge,
                                                 );
                                             });
                                         };
@@ -22495,6 +22896,14 @@ mod gui {
                                         }));
                                         if a.acknowledged {
                                             menu(ui.label("ack"));
+                                        } else if ec2_manager::reaper::alert_is_closed(&a.status) {
+                                            // Closed before anyone took it: there is
+                                            // nothing left to acknowledge, so amber
+                                            // would be a call to action that is gone.
+                                            menu(note_label(ui,
+                                                egui::Color32::GRAY,
+                                                "unack",
+                                            ));
                                         } else {
                                             menu(note_label(ui,
                                                 egui::Color32::from_rgb(220, 160, 60),
@@ -22529,6 +22938,10 @@ mod gui {
             }
             if let Some(ids) = ack_all_ids {
                 self.pending_ack_all = Some(ids);
+            }
+            if let Some(id) = menu_acknowledge {
+                self.log_alerts(LogLevel::Info, format!("alerts: acknowledging {id} from the row menu"));
+                self.start_ack_all(vec![id]);
             }
             if open_custom_alert_form && self.custom_alerts_enabled {
                 self.custom_alert_note = None;
@@ -41461,6 +41874,7 @@ mod gui {
                 self.render_pem_dialog(ctx);
                 self.render_port_forwards_window(ctx);
                 self.render_port_forward_login_dialog(ctx);
+                self.render_add_forward_dialog(ctx);
                 self.render_hosts_prompt(ctx);
                 self.render_settings_pem_dialog(ctx);
                 self.render_manage_accounts_dialog(ctx);
@@ -41495,6 +41909,7 @@ mod gui {
                 // nothing else wanted.
                 self.close_top_window_on_escape(ctx);
                 self.render_ack_all_confirm(ctx);
+                self.render_exclude_env_confirm(ctx);
                 self.render_run_remediation_confirm(ctx);
                 self.render_custom_alert_dialog(ctx);
                 self.pump_script_runs();
@@ -41833,26 +42248,44 @@ mod gui {
                                     }
                                 }
                             });
-                            // Read off the armed runtimes every frame: each is `Some` only
-                            // when that fix's own gate passed at startup (enabled, this
-                            // user named, credentials, mailbox), so a fix the user is not
-                            // armed for is never listed -- not even its name.
+                            // Listed = this user is named on the fix's allow-list
+                            // (`log_visibility`, the same rule that decides who reads
+                            // its log lines). Armed = its watcher actually started
+                            // (the runtime is `Some` only when every gate passed). A fix
+                            // the user is not listed for is never shown, not even its
+                            // name; a listed one that is dark is shown greyed so the
+                            // list is complete and the Logs tab says why it is off.
                             use ec2_manager::fix_pause::Fix;
-                            let fixes: Vec<Fix> = [
-                                (self.reaper.is_some(), Fix::Reaper),
-                                (self.pingdom.is_some(), Fix::Pingdom),
-                                (self.unhealthy_host.is_some(), Fix::UnhealthyHost),
-                                (self.instance_age.is_some(), Fix::InstanceAge),
-                                (self.grafana.is_some(), Fix::Grafana),
-                                (self.custom_alerts.is_some(), Fix::CustomAlerts),
+                            let vis = self.log_visibility;
+                            let fixes: Vec<(Fix, bool)> = [
+                                (vis.reaper_down, self.reaper.is_some(), Fix::Reaper),
+                                (vis.pingdom, self.pingdom.is_some(), Fix::Pingdom),
+                                (vis.unhealthy_host, self.unhealthy_host.is_some(), Fix::UnhealthyHost),
+                                (vis.instance_age, self.instance_age.is_some(), Fix::InstanceAge),
+                                (vis.grafana, self.grafana.is_some(), Fix::Grafana),
+                                (vis.custom_alerts, self.custom_alerts.is_some(), Fix::CustomAlerts),
                             ]
                             .into_iter()
-                            .filter_map(|(armed, fix)| armed.then_some(fix))
+                            .filter_map(|(listed, armed, fix)| listed.then_some((fix, armed)))
                             .collect();
                             if !fixes.is_empty() {
                                 ui.menu_button("Manage Fixes", |ui| {
                                     ui.weak("Untick to pause until you re-tick or restart.");
-                                    for fix in fixes {
+                                    for (fix, armed) in fixes {
+                                        if !armed {
+                                            ui.add_enabled(
+                                                false,
+                                                egui::Label::new(format!(
+                                                    "{} (not running on this machine)",
+                                                    fix.label()
+                                                )),
+                                            )
+                                            .on_disabled_hover_text(
+                                                "Switched off or missing credentials / mailbox. \
+                                                 The startup line in the Logs tab says which.",
+                                            );
+                                            continue;
+                                        }
                                         let mut running = !ec2_manager::fix_pause::is_paused(fix);
                                         if ui.checkbox(&mut running, fix.label()).changed() {
                                             ec2_manager::fix_pause::set_paused(fix, !running);
@@ -42047,7 +42480,13 @@ mod gui {
                                             );
                                             ui.painter().circle_filled(rect.center(), 4.0, *color);
                                             if ui.checkbox(&mut excluded, env).changed() {
-                                                if excluded {
+                                                if excluded
+                                                    && self.env_has_forwards(&env_lower)
+                                                {
+                                                    // Ask first; the dialog does the
+                                                    // insert on confirmation.
+                                                    self.pending_exclude_env = Some(env.clone());
+                                                } else if excluded {
                                                     self.hidden_envs.insert(env_lower);
                                                 } else {
                                                     self.hidden_envs.remove(&env_lower);

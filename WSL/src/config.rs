@@ -135,6 +135,10 @@ pub struct AppConfig {
     /// being silently absent because it was missing from a list saved
     /// months ago.
     pub disabled_forwards: BTreeMap<String, Vec<String>>,
+    /// Forwards the user added from the Port Forwards window, keyed like
+    /// `disabled_forwards`. Layered over `forwards.json` at runtime, which
+    /// stays the shared baseline.
+    pub user_forwards: BTreeMap<String, Vec<crate::forwards::ForwardEntry>>,
     /// Environments where the background port-forward tunnel was switched
     /// off, keyed like the other VS Code settings. Stores the *off* set
     /// because the option ships on.
@@ -227,6 +231,7 @@ impl Default for AppConfig {
             vscode_pem_suppressed: BTreeMap::new(),
             forwards_hosts_file: None,
             disabled_forwards: BTreeMap::new(),
+            user_forwards: BTreeMap::new(),
             tunnel_off: BTreeMap::new(),
             tunnel_dismissed: BTreeMap::new(),
             bastion_selections: BTreeMap::new(),
@@ -591,6 +596,45 @@ impl AppConfig {
             .get(&Self::vscode_key(profile_id, env))
             .map(|names| names.iter().any(|n| n.eq_ignore_ascii_case(host.trim())))
             .unwrap_or(false)
+    }
+
+    /// Forwards the user added for this environment.
+    pub fn user_forwards_for(&self, profile_id: &str, env: &str) -> &[crate::forwards::ForwardEntry] {
+        self.user_forwards
+            .get(&Self::vscode_key(profile_id, env))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Add a forward for an environment. A host already added there is
+    /// replaced rather than duplicated.
+    pub fn add_user_forward(
+        &mut self,
+        profile_id: &str,
+        env: &str,
+        entry: crate::forwards::ForwardEntry,
+    ) {
+        let list = self
+            .user_forwards
+            .entry(Self::vscode_key(profile_id, env))
+            .or_default();
+        list.retain(|e| !e.host.eq_ignore_ascii_case(&entry.host));
+        list.push(entry);
+    }
+
+    /// Remove a forward the user added. Returns whether one was there.
+    pub fn remove_user_forward(&mut self, profile_id: &str, env: &str, host: &str) -> bool {
+        let key = Self::vscode_key(profile_id, env);
+        let Some(list) = self.user_forwards.get_mut(&key) else {
+            return false;
+        };
+        let before = list.len();
+        list.retain(|e| !e.host.eq_ignore_ascii_case(host.trim()));
+        let removed = list.len() != before;
+        if list.is_empty() {
+            self.user_forwards.remove(&key);
+        }
+        removed
     }
 
     /// Tick or untick a forward for an environment.
@@ -1108,6 +1152,25 @@ impl AppConfig {
                 continue;
             }
 
+            if let Some(rest) = key.strip_prefix("user_forward.") {
+                // host|ip|port — validated on entry, so none can hold a `|`.
+                let mut parts = value.split('|');
+                let host = parts.next().unwrap_or("").trim();
+                let ip = parts.next().unwrap_or("").trim();
+                let port = parts.next().and_then(|p| p.trim().parse::<u16>().ok());
+                if !rest.is_empty() && !host.is_empty() && !ip.is_empty() {
+                    cfg.user_forwards
+                        .entry(rest.to_string())
+                        .or_default()
+                        .push(crate::forwards::ForwardEntry {
+                            ip: ip.to_string(),
+                            host: host.to_string(),
+                            port,
+                        });
+                }
+                continue;
+            }
+
             if let Some(rest) = key.strip_prefix("forwards_disabled.") {
                 if !rest.is_empty() {
                     let names: Vec<String> = value
@@ -1427,6 +1490,16 @@ impl AppConfig {
         for (key, names) in &self.disabled_forwards {
             if !names.is_empty() {
                 lines.push(format!("forwards_disabled.{key}={}", names.join(",")));
+            }
+        }
+        for (key, entries) in &self.user_forwards {
+            for e in entries {
+                lines.push(format!(
+                    "user_forward.{key}={}|{}|{}",
+                    e.host,
+                    e.ip,
+                    e.port.map(|p| p.to_string()).unwrap_or_default()
+                ));
             }
         }
         for (profile, suppressed) in &self.vscode_pem_suppressed {
@@ -2145,6 +2218,29 @@ mod tests {
         cfg.set_forward_disabled("acct", "DEV1", "solr.example.net", false);
         assert!(!cfg.forward_disabled("acct", "DEV1", "solr.example.net"));
         assert!(cfg.disabled_forwards.is_empty());
+    }
+
+    #[test]
+    fn user_forwards_are_per_environment_and_round_trip() {
+        let mut cfg = AppConfig::default();
+        cfg.add_user_forward(
+            "acct",
+            "dev1",
+            crate::forwards::ForwardEntry {
+                ip: "127.200.1.2".into(),
+                host: "svc.example.net".into(),
+                port: Some(8443),
+            },
+        );
+        assert_eq!(cfg.user_forwards_for("acct", "DEV1").len(), 1);
+        assert!(cfg.user_forwards_for("acct", "DEV2").is_empty());
+        let text = cfg.to_text();
+        let back = AppConfig::parse(&text);
+        let got = back.user_forwards_for("acct", "DEV1");
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].host.as_str(), got[0].port), ("svc.example.net", Some(8443)));
+        assert!(cfg.remove_user_forward("acct", "DEV1", "SVC.example.net"));
+        assert!(cfg.user_forwards.is_empty());
     }
 
     #[test]
