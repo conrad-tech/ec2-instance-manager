@@ -46435,6 +46435,7 @@ mod gui {
             // is waiting.
             let run_one = |state: &mut ia::InstanceAgeState,
                            alert_id: &str,
+                           alert_name: &str,
                            created_at: &str,
                            facts: &ia::AlertFacts,
                            now_ms: u64|
@@ -46538,6 +46539,13 @@ mod gui {
                     ia::Decision::Refuse { reason } => {
                         note(LogLevel::Error, format!("instance age: {alert_id} — {reason}"));
                         escalate(alert_id, created_at, &reason);
+                        // Sent AFTER `escalate`, which posts its own generic
+                        // notice: the channel is ordered and the UI keeps the
+                        // last one, so a protected instance shows the specific
+                        // line rather than "Instance age: <id> — <reason>".
+                        if let Some(text) = ia::protected_notice(alert_name, facts, &view) {
+                            let _ = tx.send(InstanceAgeEvent::Notice { text });
+                        }
                         true
                     }
                     ia::Decision::Wait { reason } => {
@@ -46619,10 +46627,11 @@ mod gui {
                             );
                             state.finish(&due.alert_id);
                         }
-                        Ok(_) => {
+                        Ok(a) => {
                             if run_one(
                                 &mut state,
                                 &due.alert_id,
+                                &a.message,
                                 &due.created_at,
                                 &due.facts,
                                 now_ms,
@@ -46732,6 +46741,7 @@ mod gui {
                                         run_one(
                                             &mut state,
                                             &alert.id,
+                                            &alert.message,
                                             &alert.created_at,
                                             &facts,
                                             now_ms,

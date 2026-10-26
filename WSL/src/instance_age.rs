@@ -377,6 +377,32 @@ fn member_is_good(
     m.is_serving()
 }
 
+/// The toolbar line for an alert whose instance has scale-in protection on,
+/// or `None` when it does not (or is not in the group at all).
+///
+/// `decide` already refuses such an alert, in rule 3; this is the same test
+/// asked on its own so the caller can put the *reason* on the main page
+/// instead of the generic escalation line.
+pub fn protected_notice(
+    alert_name: &str,
+    facts: &AlertFacts,
+    view: &GroupView,
+) -> Option<String> {
+    let aged = view
+        .members
+        .iter()
+        .find(|m| m.instance_id == facts.instance_id)?;
+    if !aged.protected_from_scale_in {
+        return None;
+    }
+    let name = alert_name.trim();
+    let name = if name.is_empty() { "Instance age alert" } else { name };
+    Some(format!(
+        "{name}, scale in protection enabled on {}",
+        facts.instance_id
+    ))
+}
+
 /// Decide what to do about one instance-age alert.
 ///
 /// Six rules, first to fire wins. **The order is the design** — it decides
@@ -1240,6 +1266,24 @@ Runbook: https://example.invalid/runbook
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_protected_instance_gets_a_toolbar_line_naming_the_alert_and_the_id() {
+        let mut aged = healthy(AGED);
+        aged.protected_from_scale_in = true;
+        let v = view(vec![aged, healthy(PEER)], None);
+        let text = protected_notice("Instance too old", &aged_facts(), &v).expect("a notice");
+        assert_eq!(
+            text,
+            format!("Instance too old, scale in protection enabled on {AGED}")
+        );
+    }
+
+    #[test]
+    fn an_unprotected_instance_gets_no_protection_notice() {
+        let v = view(vec![healthy(AGED), healthy(PEER)], None);
+        assert!(protected_notice("x", &aged_facts(), &v).is_none());
     }
 
     #[test]
