@@ -5416,7 +5416,7 @@ mod gui {
     /// On call the alert is acknowledged, but only once a terminate is
     /// actually going ahead. Runs on the caller's thread.
     fn run_instance_age_remediation(env: &ManualRemediationEnv, alert: ec2_manager::alerts::Alert) {
-        use ec2_manager::{alerts, instance_age as ia, oncall};
+        use ec2_manager::{alerts, instance_age as ia};
 
         let cfg = &env.instance_age_cfg;
         let alert_id = alert.id.clone();
@@ -5486,25 +5486,14 @@ mod gui {
         let kind = ia::kind_of(&asg_name, &tg_names, cfg);
 
         match ia::decide(&facts, &view, kind, &history) {
-            ia::Decision::Refuse { reason } => fail(&mut end, format!("refused: {reason}")),
-            ia::Decision::Wait { reason } => fail(
-                &mut end,
-                format!("not safe to terminate yet: {reason} — nothing changed; run it again later"),
-            ),
-            ia::Decision::Terminate { instance_id, reason } => {
-                note(LogLevel::Warn, format!("{alert_id} ({}) — {reason}", kind.label()));
-                let on_call = match oncall::is_on_call(
-                    &env.auth,
-                    &cfg.resolved_schedule_id(),
-                    &cfg.resolved_atlassian_account_id(),
-                ) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        note(LogLevel::Warn, format!("on-call lookup failed ({e}) — treating as off call"));
-                        false
-                    }
-                };
-                if on_call {
+            ia::Decision::Refuse { reason } => {
+                // Scale-in protection is handled as the live watcher handles
+                // it: acknowledge (on call), toolbar + alert-window notice, no
+                // escalation email.
+                if let Some(text) = ia::protected_notice(&alert.message, &facts, &view) {
+                    note(LogLevel::Warn, format!("{alert_id} — {reason}; not escalating"));
+                    // No on-call gate: a person pressed the button, so they
+                    // have taken the alert.
                     match alerts::acknowledge_alert(&env.auth, &alert_id) {
                         Ok(()) => note(LogLevel::Info, format!("acknowledged {alert_id}")),
                         Err(e) => note(
@@ -5512,6 +5501,33 @@ mod gui {
                             format!("could not acknowledge {alert_id}: {e} — carrying on"),
                         ),
                     }
+                    let _ = env.tx.send(ReaperEvent::InstanceAgeProtected {
+                        alert_id: alert_id.clone(),
+                        text,
+                    });
+                    end.status = AlertActionStatus::Ok(format!(
+                        "alert {alert_id}: scale-in protection enabled on {} — not terminated, \
+                         no escalation",
+                        facts.instance_id
+                    ));
+                    return;
+                }
+                fail(&mut end, format!("refused: {reason}"))
+            }
+            ia::Decision::Wait { reason } => fail(
+                &mut end,
+                format!("not safe to terminate yet: {reason} — nothing changed; run it again later"),
+            ),
+            ia::Decision::Terminate { instance_id, reason } => {
+                note(LogLevel::Warn, format!("{alert_id} ({}) — {reason}", kind.label()));
+                // No on-call gate: a person pressed the button, so they have
+                // taken the alert.
+                match alerts::acknowledge_alert(&env.auth, &alert_id) {
+                    Ok(()) => note(LogLevel::Info, format!("acknowledged {alert_id}")),
+                    Err(e) => note(
+                        LogLevel::Warn,
+                        format!("could not acknowledge {alert_id}: {e} — carrying on"),
+                    ),
                 }
                 match terminate_instance(&ctx.profile, &ctx.region, &instance_id, &env.mode) {
                     Ok(()) => {
@@ -20531,6 +20547,15 @@ mod gui {
 
         /// Drain reaper poll-thread events into the log (and, for a real
         /// outcome, the notifier seam).
+        /// Put a scale-in-protection notice on the toolbar and on that alert's
+        /// window. Shared by the live poll and a manual Run Remediation.
+        fn record_protected_alert(&mut self, alert_id: String, text: String) {
+            if !self.instance_age_protected_lines.contains(&text) {
+                self.instance_age_protected_lines.push(text.clone());
+            }
+            self.protected_alerts.insert(alert_id, text);
+        }
+
         fn poll_reaper_events(&mut self) {
             // Copy events out first: `self.log_*` needs `&mut self`, which
             // would conflict with the immutable borrow of `rt` (itself
@@ -20551,6 +20576,9 @@ mod gui {
                 match ev {
                     ReaperEvent::SourcedNote { source, level, message } => {
                         self.log_from(*source, *level, message.clone())
+                    }
+                    ReaperEvent::InstanceAgeProtected { alert_id, text } => {
+                        self.record_protected_alert(alert_id.clone(), text.clone());
                     }
                     ReaperEvent::Skipped { reason } => {
                         self.log_reaper(LogLevel::Debug, format!("reaper: skipped — {reason}"))
@@ -20735,10 +20763,7 @@ mod gui {
                         self.instance_age_notice = Some(text);
                     }
                     InstanceAgeEvent::Protected { alert_id, text } => {
-                        if !self.instance_age_protected_lines.contains(&text) {
-                            self.instance_age_protected_lines.push(text.clone());
-                        }
-                        self.protected_alerts.insert(alert_id, text);
+                        self.record_protected_alert(alert_id, text);
                     }
                     InstanceAgeEvent::Escalated { alert_id, detail, ok } => {
                         if ok {
@@ -44617,6 +44642,9 @@ mod gui {
             level: LogLevel,
             message: String,
         },
+        /// An instance-age alert refused for scale-in protection, raised by a
+        /// manual Run Remediation. Same notices as the live poll's.
+        InstanceAgeProtected { alert_id: String, text: String },
         /// Matched, but not acted on.
         Skipped { reason: String },
         /// A line of narration from a remediation in flight — the ack, the
