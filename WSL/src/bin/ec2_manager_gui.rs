@@ -11247,6 +11247,14 @@ mod gui {
         /// escalation a human needs to see without opening the Logs tab.
         /// Drawn red beside the insurance one, and dismissed the same way.
         instance_age_notice: Option<String>,
+        /// One toolbar line per alert whose instance has scale-in protection.
+        /// Unlike `instance_age_notice` a later one does not replace an earlier
+        /// one, and only the toolbar's clear button removes them.
+        instance_age_protected_lines: Vec<String>,
+        /// Alert id -> the same text, for the alert window. **Never cleared by
+        /// the toolbar's button**: the window's line is meant to be always
+        /// there for as long as the app runs.
+        protected_alerts: std::collections::HashMap<String, String>,
         /// When every enabled environment last became healthy, or `None`
         /// while any is not. Drives the self-expiring success banner, and
         /// resetting it on failure is what makes a recovery show again.
@@ -12368,6 +12376,8 @@ mod gui {
                 instance_age,
                 grafana,
                 instance_age_notice: None,
+                instance_age_protected_lines: Vec::new(),
+                protected_alerts: std::collections::HashMap::new(),
                 pending_notify: Vec::new(),
                 fed_auth_enabled: features
                     .fed_auth_enabled_for(&ec2_manager::features::current_os_user()),
@@ -15427,6 +15437,7 @@ mod gui {
                 || failed(&self.tunnel_status)
                 || self.unhealthy_host_notice.is_some()
                 || self.instance_age_notice.is_some()
+                || !self.instance_age_protected_lines.is_empty()
                 || !self.message.is_empty()
         }
 
@@ -15445,6 +15456,7 @@ mod gui {
             self.script_status_highlight = None;
             self.unhealthy_host_notice = None;
             self.instance_age_notice = None;
+            self.instance_age_protected_lines.clear();
 
             if let Some((_, ScriptState::Failed)) = self.tunnel_status {
                 let rows = self.port_forward_rows();
@@ -20722,6 +20734,12 @@ mod gui {
                     InstanceAgeEvent::Notice { text } => {
                         self.instance_age_notice = Some(text);
                     }
+                    InstanceAgeEvent::Protected { alert_id, text } => {
+                        if !self.instance_age_protected_lines.contains(&text) {
+                            self.instance_age_protected_lines.push(text.clone());
+                        }
+                        self.protected_alerts.insert(alert_id, text);
+                    }
                     InstanceAgeEvent::Escalated { alert_id, detail, ok } => {
                         if ok {
                             self.log_instance_age(
@@ -22296,6 +22314,7 @@ mod gui {
                         w.note.clone(),
                     )
                 };
+                let protected_line = self.protected_alerts.get(&id).cloned();
                 let title = match &alert {
                     Some(a) if !a.message.is_empty() => format!(
                         "#{}  ·  {}",
@@ -22321,6 +22340,17 @@ mod gui {
                             .id_salt(("alert_body", id.as_str()))
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
+                                // First, and before the loading / error early
+                                // returns below, so it is there in every state
+                                // of the window. Not dismissible.
+                                if let Some(text) = &protected_line {
+                                    note_label(
+                                        ui,
+                                        egui::Color32::from_rgb(220, 90, 90),
+                                        egui::RichText::new(text).strong(),
+                                    );
+                                    ui.separator();
+                                }
                                 if loading && alert.is_none() {
                                     ui.horizontal(|ui| {
                                         ui.spinner();
@@ -22544,6 +22574,10 @@ mod gui {
                 let win = self.alerts_window.as_ref().expect("checked above");
                 (win.window_min, win.auto_refresh, self.ack_all_running)
             };
+            // Alert ids whose instance has scale-in protection, copied out for
+            // the same reason: the closure cannot also read `self`.
+            let protected_ids: std::collections::HashSet<String> =
+                self.protected_alerts.keys().cloned().collect();
             let mut copy_text: Option<String> = None;
             let mut ack_all_ids: Option<Vec<String>> = None;
             // Carried out of the window closure for the same reason the two
@@ -22920,9 +22954,27 @@ mod gui {
                                         } else {
                                             &a.environment
                                         }));
-                                        menu(
-                                            ui.label(&a.message).on_hover_text(&a.message),
-                                        );
+                                        if protected_ids.contains(&a.id) {
+                                            // The message, then the reason it
+                                            // was left alone, in yellow at the
+                                            // end of the same cell.
+                                            ui.horizontal(|ui| {
+                                                menu(
+                                                    ui.label(&a.message)
+                                                        .on_hover_text(&a.message),
+                                                );
+                                                menu(note_label(
+                                                    ui,
+                                                    egui::Color32::from_rgb(230, 200, 40),
+                                                    egui::RichText::new("Protection Enabled")
+                                                        .strong(),
+                                                ));
+                                            });
+                                        } else {
+                                            menu(
+                                                ui.label(&a.message).on_hover_text(&a.message),
+                                            );
+                                        }
                                         ui.end_row();
                                     }
                                 });
@@ -43025,6 +43077,7 @@ mod gui {
                     || self.script_status_highlight.is_some()
                     || self.unhealthy_host_notice.is_some()
                     || self.instance_age_notice.is_some()
+                    || !self.instance_age_protected_lines.is_empty()
                     || !cassandra_rows.is_empty()
                     || !self.message.is_empty();
                 if has_status {
@@ -43071,6 +43124,10 @@ mod gui {
                                 ui.label(notification_text(ui, c, text));
                             }
                             if let Some(text) = self.instance_age_notice.clone() {
+                                let c = status_color(&ScriptState::Failed, ui);
+                                ui.label(notification_text(ui, c, text));
+                            }
+                            for text in self.instance_age_protected_lines.clone() {
                                 let c = status_color(&ScriptState::Failed, ui);
                                 ui.label(notification_text(ui, c, text));
                             }
@@ -46316,6 +46373,9 @@ mod gui {
         Escalated { alert_id: String, detail: String, ok: bool },
         /// Something a human needs to see without opening the Logs tab.
         Notice { text: String },
+        /// An alert refused because its instance has scale-in protection.
+        /// Kept per alert id, for the toolbar and for that alert's window.
+        Protected { alert_id: String, text: String },
     }
 
     struct InstanceAgeRuntime {
@@ -46537,15 +46597,23 @@ mod gui {
 
                 match ia::decide(facts, &view, kind, &history) {
                     ia::Decision::Refuse { reason } => {
+                        // Scale-in protection is somebody's deliberate choice,
+                        // not a fault: toolbar notice and log only, no
+                        // escalation email. The alert is already acknowledged
+                        // by this point, so nothing rings.
+                        if let Some(text) = ia::protected_notice(alert_name, facts, &view) {
+                            note(
+                                LogLevel::Warn,
+                                format!("instance age: {alert_id} — {reason}; not escalating"),
+                            );
+                            let _ = tx.send(InstanceAgeEvent::Protected {
+                                alert_id: alert_id.to_string(),
+                                text,
+                            });
+                            return true;
+                        }
                         note(LogLevel::Error, format!("instance age: {alert_id} — {reason}"));
                         escalate(alert_id, created_at, &reason);
-                        // Sent AFTER `escalate`, which posts its own generic
-                        // notice: the channel is ordered and the UI keeps the
-                        // last one, so a protected instance shows the specific
-                        // line rather than "Instance age: <id> — <reason>".
-                        if let Some(text) = ia::protected_notice(alert_name, facts, &view) {
-                            let _ = tx.send(InstanceAgeEvent::Notice { text });
-                        }
                         true
                     }
                     ia::Decision::Wait { reason } => {
