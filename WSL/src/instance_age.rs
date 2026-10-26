@@ -34,8 +34,34 @@ pub struct AlertFacts {
     /// real instance id or empty. It ends up on argv for a terminate.
     pub instance_id: String,
     pub environment: String,
+    /// The account's **name** — the text before the bracket in
+    /// `Account: Foo (123456789012)`, or the whole value when there is no
+    /// bracket and it is not a bare number.
     pub account: String,
+    /// The 12-digit account **number**, from the bracket (or a bare number
+    /// value). Empty when the alert carries none. This is what the account
+    /// gate keys on; the name is only checked against it.
+    pub account_id: String,
     pub region: String,
+}
+
+/// Split an `Account:` value into its name and 12-digit number.
+///
+/// The feed writes `Name (123456789012)`. A bare 12-digit value is a number
+/// with no name. Anything else is a name with no number.
+fn split_account(value: &str) -> (String, String) {
+    let v = value.trim();
+    let is_id = |t: &str| t.len() == 12 && t.bytes().all(|b| b.is_ascii_digit());
+    if is_id(v) {
+        return (String::new(), v.to_string());
+    }
+    if let (Some(open), true) = (v.rfind('('), v.ends_with(')')) {
+        let inner = v[open + 1..v.len() - 1].trim();
+        if is_id(inner) {
+            return (v[..open].trim().to_string(), inner.to_string());
+        }
+    }
+    (v.to_string(), String::new())
 }
 
 /// Characters that mean the feed served a value it never rendered.
@@ -92,6 +118,8 @@ pub fn parse_facts(description: &str) -> AlertFacts {
         }
     }
 
+    let (account_name, account_id) = split_account(&account.unwrap_or_default());
+
     AlertFacts {
         application: application.unwrap_or_default(),
         // Whitelisted rather than escaped, the stance reaper takes with every
@@ -100,7 +128,8 @@ pub fn parse_facts(description: &str) -> AlertFacts {
             .and_then(|v| reaper::find_instance_id(&v))
             .unwrap_or_default(),
         environment: environment.unwrap_or_default(),
-        account: account.unwrap_or_default(),
+        account: account_name,
+        account_id,
         region: region.unwrap_or_default(),
     }
 }
@@ -759,31 +788,193 @@ pub fn resolve_account_id(
     name: &str,
     profiles: &[crate::models::ProfileConfig],
 ) -> std::result::Result<String, String> {
-    let n = name.trim();
-    if n.is_empty() {
-        return Err("the alert names no account, so there is no profile to work with".to_string());
+    resolve_account_id_with_env(name, "", profiles, &|_| Vec::new())
+}
+
+/// [`resolve_account_id`] for an alert, which also names its `Environment:`.
+///
+/// The `Account:` value is tried first, exactly as before. **Only when it
+/// matches no account label** — or matches several — is the environment
+/// consulted: the account whose entry in `accounts.json` declares that
+/// environment. Alerts have been seen carrying an account name that is not any
+/// label while the environment is exactly the one `accounts.json` declares.
+///
+/// The same rule holds for the fallback: **zero matches or two-plus is an
+/// error, never a guess.**
+pub fn resolve_account_id_for_alert(
+    name: &str,
+    environment: &str,
+    profiles: &[crate::models::ProfileConfig],
+) -> std::result::Result<String, String> {
+    resolve_account_id_with_env(name, environment, profiles, &|account_id| {
+        crate::accounts::environments_for(account_id, &[])
+            .into_iter()
+            .map(|e| e.name)
+            .collect()
+    })
+}
+
+/// Resolve the alert's account **and verify it** — the gate in front of every
+/// AWS call the instance-age and Grafana watchers make.
+///
+/// * The alert's own account **number** (`Account: Name (123456789012)`) is
+///   authoritative when present, and must be an account in `accounts.json`.
+///   A name the alert gives that `accounts.json` labels with a *different*
+///   number is refused, not reconciled.
+/// * With no number, the name and then the environment resolve it as
+///   [`resolve_account_id_for_alert`] does.
+/// * **The environment must be one `accounts.json` declares for that
+///   account.** A blank environment on an account that declares some is
+///   refused too. An account that declares none has nothing to check against
+///   and passes.
+///
+/// Every refusal names what the alert said and what `accounts.json` holds.
+pub fn resolve_alert_account(
+    facts: &AlertFacts,
+    profiles: &[crate::models::ProfileConfig],
+) -> std::result::Result<String, String> {
+    resolve_alert_account_with(facts, profiles, &|account_id| {
+        crate::accounts::environments_for(account_id, &[])
+            .into_iter()
+            .map(|e| e.name)
+            .collect()
+    })
+}
+
+fn resolve_alert_account_with(
+    facts: &AlertFacts,
+    profiles: &[crate::models::ProfileConfig],
+    envs_of: &dyn Fn(&str) -> Vec<String>,
+) -> std::result::Result<String, String> {
+    let id = if facts.account_id.is_empty() {
+        resolve_account_id_with_env(&facts.account, &facts.environment, profiles, envs_of)?
+    } else {
+        let id = facts.account_id.as_str();
+        if !profiles.iter().any(|p| p.account_id == id) {
+            return Err(format!(
+                "the alert's account number {id} is not an account in accounts.json — refusing \
+                 to use credentials for it"
+            ));
+        }
+        let name = facts.account.trim();
+        if !name.is_empty() {
+            let labelled: Vec<&crate::models::ProfileConfig> = profiles
+                .iter()
+                .filter(|p| p.display_name.trim().eq_ignore_ascii_case(name))
+                .collect();
+            if !labelled.is_empty() && !labelled.iter().any(|p| p.account_id == id) {
+                return Err(format!(
+                    "the alert says account {name:?} is number {id}, but accounts.json labels \
+                     {name:?} as {} — the alert and accounts.json disagree",
+                    labelled
+                        .iter()
+                        .map(|p| p.account_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        id.to_string()
+    };
+
+    let declared = envs_of(&id);
+    if !declared.is_empty() {
+        let env = facts.environment.trim();
+        if env.is_empty() {
+            return Err(format!(
+                "the alert names no environment, but account {id} declares {} — cannot confirm \
+                 which one it is",
+                declared.join(", ")
+            ));
+        }
+        if !declared.iter().any(|e| e.trim().eq_ignore_ascii_case(env)) {
+            return Err(format!(
+                "the alert's environment {env:?} is not one account {id} declares in \
+                 accounts.json ({}) — wrong account or wrong environment",
+                declared.join(", ")
+            ));
+        }
     }
+    Ok(id)
+}
+
+/// The resolver itself, with the declared-environments lookup passed in so it
+/// is tested without the bundled `accounts.json`.
+fn resolve_account_id_with_env(
+    name: &str,
+    environment: &str,
+    profiles: &[crate::models::ProfileConfig],
+    envs_of: &dyn Fn(&str) -> Vec<String>,
+) -> std::result::Result<String, String> {
+    let n = name.trim();
+    let env = environment.trim();
     if n.len() == 12 && n.bytes().all(|b| b.is_ascii_digit()) {
         return Ok(n.to_string());
     }
-    let hits: Vec<&crate::models::ProfileConfig> = profiles
-        .iter()
-        .filter(|p| p.display_name.trim().eq_ignore_ascii_case(n))
-        .collect();
-    match hits.len() {
-        1 => Ok(hits[0].account_id.clone()),
-        0 => Err(format!(
-            "no account in accounts.json is labelled {n:?} — the alert's account cannot be \
-             resolved to credentials"
-        )),
+
+    let by_label: Vec<&crate::models::ProfileConfig> = if n.is_empty() {
+        Vec::new()
+    } else {
+        profiles
+            .iter()
+            .filter(|p| p.display_name.trim().eq_ignore_ascii_case(n))
+            .collect()
+    };
+    if by_label.len() == 1 {
+        return Ok(by_label[0].account_id.clone());
+    }
+
+    // The label did not settle it. Which accounts declare this environment —
+    // among the label's hits if it had several, otherwise among all of them.
+    let declares = |p: &&crate::models::ProfileConfig| {
+        envs_of(&p.account_id)
+            .iter()
+            .any(|e| e.trim().eq_ignore_ascii_case(env))
+    };
+    let by_env: Vec<&crate::models::ProfileConfig> = if env.is_empty() {
+        Vec::new()
+    } else if by_label.is_empty() {
+        profiles.iter().filter(declares).collect()
+    } else {
+        by_label.iter().copied().filter(declares).collect()
+    };
+    if by_env.len() == 1 {
+        return Ok(by_env[0].account_id.clone());
+    }
+
+    if n.is_empty() && env.is_empty() {
+        return Err("the alert names no account or environment, so there is no profile to work \
+                    with"
+            .to_string());
+    }
+    let ids = |v: &[&crate::models::ProfileConfig]| {
+        v.iter().map(|p| p.account_id.as_str()).collect::<Vec<_>>().join(", ")
+    };
+    if by_env.len() > 1 {
+        return Err(format!(
+            "{} accounts in accounts.json declare the environment {env:?} ({}) — refusing to \
+             guess which one the alert means",
+            by_env.len(),
+            ids(&by_env)
+        ));
+    }
+    match by_label.len() {
+        0 => Err(if env.is_empty() {
+            format!(
+                "no account in accounts.json is labelled {n:?} — the alert's account cannot be \
+                 resolved to credentials"
+            )
+        } else {
+            format!(
+                "no account in accounts.json is labelled {n:?}, and none declares the \
+                 environment {env:?} — the alert's account cannot be resolved to credentials"
+            )
+        }),
         _ => Err(format!(
             "{} accounts in accounts.json are labelled {n:?} ({}) — refusing to guess which one \
              the alert means",
-            hits.len(),
-            hits.iter()
-                .map(|p| p.account_id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            by_label.len(),
+            ids(&by_label)
         )),
     }
 }
@@ -1218,6 +1409,7 @@ Runbook: https://example.invalid/runbook
             instance_id: AGED.to_string(),
             environment: "prod".to_string(),
             account: "acme-prod".to_string(),
+            account_id: String::new(),
             region: "us-east-1".to_string(),
         }
     }
@@ -1725,5 +1917,141 @@ Runbook: https://example.invalid/runbook
             "eleven digits is not an account id"
         );
         assert!(resolve_account_id("12345678901a", &profiles).is_err());
+    }
+
+    #[test]
+    fn an_unknown_account_name_falls_back_to_the_environment_the_alert_names() {
+        let profiles = vec![profile("Dev", "111111111111"), profile("Prod", "222222222222")];
+        let envs = |id: &str| match id {
+            "111111111111" => vec!["DEV1".to_string(), "DEV2".to_string()],
+            "222222222222" => vec!["PROD".to_string()],
+            _ => vec![],
+        };
+        // The label matches nothing, the environment names exactly one account.
+        assert_eq!(
+            resolve_account_id_with_env("xyz", "prod", &profiles, &envs).unwrap(),
+            "222222222222"
+        );
+        assert_eq!(
+            resolve_account_id_with_env("", " DEV2 ", &profiles, &envs).unwrap(),
+            "111111111111",
+            "a blank account name still resolves by environment"
+        );
+        // A label that matches is not overridden by the environment.
+        assert_eq!(
+            resolve_account_id_with_env("Dev", "PROD", &profiles, &envs).unwrap(),
+            "111111111111"
+        );
+    }
+
+    #[test]
+    fn the_environment_fallback_never_guesses() {
+        let profiles = vec![profile("Dev", "111111111111"), profile("Prod", "222222222222")];
+        let shared = |_: &str| vec!["PROD".to_string()];
+        let two = resolve_account_id_with_env("xyz", "PROD", &profiles, &shared).unwrap_err();
+        assert!(two.contains("111111111111") && two.contains("222222222222"), "{two}");
+
+        let none = resolve_account_id_with_env("xyz", "STG9", &profiles, &|_| vec![]).unwrap_err();
+        assert!(none.contains("xyz") && none.contains("STG9"), "{none}");
+
+        assert!(resolve_account_id_with_env("", "", &profiles, &shared).is_err());
+    }
+
+    #[test]
+    fn the_environment_breaks_a_tie_between_two_accounts_with_one_label() {
+        let profiles = vec![profile("acme", "111111111111"), profile("ACME", "222222222222")];
+        let envs = |id: &str| {
+            if id == "222222222222" { vec!["PROD".to_string()] } else { vec!["DEV1".to_string()] }
+        };
+        assert_eq!(
+            resolve_account_id_with_env("acme", "PROD", &profiles, &envs).unwrap(),
+            "222222222222"
+        );
+    }
+
+    #[test]
+    fn the_account_line_splits_into_a_name_and_a_number() {
+        let f = parse_facts("Account: Foo1 (123456789012)\nEnvironment: DEV3\n");
+        assert_eq!(f.account, "Foo1");
+        assert_eq!(f.account_id, "123456789012");
+        let bare = parse_facts("Account: 123456789012\n");
+        assert_eq!((bare.account.as_str(), bare.account_id.as_str()), ("", "123456789012"));
+        let name_only = parse_facts("Account: acme-prod\n");
+        assert_eq!((name_only.account.as_str(), name_only.account_id.as_str()), ("acme-prod", ""));
+        let short = parse_facts("Account: Foo (12345)\n");
+        assert_eq!(short.account_id, "", "five digits is not an account number");
+    }
+
+    fn gate_facts(name: &str, id: &str, env: &str) -> AlertFacts {
+        AlertFacts {
+            account: name.to_string(),
+            account_id: id.to_string(),
+            environment: env.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_account_gate_passes_a_known_number_and_a_declared_environment() {
+        let profiles = vec![profile("Dev", "111111111111"), profile("Prod", "222222222222")];
+        let envs = |id: &str| match id {
+            "111111111111" => vec!["DEV1".to_string(), "DEV3".to_string()],
+            _ => vec!["PROD".to_string()],
+        };
+        // The alert's name is not our label; the number decides.
+        assert_eq!(
+            resolve_alert_account_with(&gate_facts("Foo1", "111111111111", "dev3"), &profiles, &envs)
+                .unwrap(),
+            "111111111111"
+        );
+    }
+
+    #[test]
+    fn the_account_gate_refuses_what_does_not_line_up() {
+        let profiles = vec![profile("Dev", "111111111111"), profile("Prod", "222222222222")];
+        let envs = |id: &str| match id {
+            "111111111111" => vec!["DEV1".to_string()],
+            _ => vec!["PROD".to_string()],
+        };
+        let unknown = resolve_alert_account_with(&gate_facts("x", "999999999999", "DEV1"), &profiles, &envs)
+            .unwrap_err();
+        assert!(unknown.contains("999999999999"), "{unknown}");
+
+        let wrong_env = resolve_alert_account_with(&gate_facts("Dev", "111111111111", "PROD"), &profiles, &envs)
+            .unwrap_err();
+        assert!(wrong_env.contains("PROD") && wrong_env.contains("DEV1"), "{wrong_env}");
+
+        let blank_env = resolve_alert_account_with(&gate_facts("Dev", "111111111111", ""), &profiles, &envs)
+            .unwrap_err();
+        assert!(blank_env.contains("no environment"), "{blank_env}");
+
+        // Name and number disagree with accounts.json.
+        let clash = resolve_alert_account_with(&gate_facts("Prod", "111111111111", "DEV1"), &profiles, &envs)
+            .unwrap_err();
+        assert!(clash.contains("disagree"), "{clash}");
+    }
+
+    #[test]
+    fn an_account_that_declares_no_environments_has_nothing_to_check_against() {
+        let profiles = vec![profile("Sandbox", "333333333333")];
+        assert_eq!(
+            resolve_alert_account_with(&gate_facts("", "333333333333", "whatever"), &profiles, &|_| vec![])
+                .unwrap(),
+            "333333333333"
+        );
+    }
+
+    #[test]
+    fn with_no_number_the_name_and_environment_resolve_and_are_then_checked() {
+        let profiles = vec![profile("Dev", "111111111111"), profile("Prod", "222222222222")];
+        let envs = |id: &str| match id {
+            "111111111111" => vec!["DEV1".to_string()],
+            _ => vec!["PROD".to_string()],
+        };
+        assert_eq!(
+            resolve_alert_account_with(&gate_facts("xyz", "", "PROD"), &profiles, &envs).unwrap(),
+            "222222222222"
+        );
+        assert!(resolve_alert_account_with(&gate_facts("Dev", "", "PROD"), &profiles, &envs).is_err());
     }
 }

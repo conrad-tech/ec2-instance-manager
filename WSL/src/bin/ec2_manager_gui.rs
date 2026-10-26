@@ -4468,7 +4468,9 @@ mod gui {
         facts: &ec2_manager::instance_age::AlertFacts,
     ) -> std::result::Result<AwsContext, String> {
         let profiles = ec2_manager::accounts::load_accounts();
-        let account_id = ec2_manager::instance_age::resolve_account_id(&facts.account, &profiles)?;
+        // The account gate: the alert's own number and environment must agree
+        // with accounts.json before any credentials are used.
+        let account_id = ec2_manager::instance_age::resolve_alert_account(facts, &profiles)?;
         let mut ctx = reaper_account_context(mode, app_config, &account_id)?;
         // The alert names its region, and an account spanning two would
         // otherwise be read in whichever one it is configured with.
