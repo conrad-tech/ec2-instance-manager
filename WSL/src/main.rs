@@ -188,6 +188,7 @@ fn run() -> Result<()> {
                 states: options.states.clone(),
                 only_ssm_managed: options.only_ssm,
                 pinned_ids: Vec::new(),
+                account_ids: Vec::new(),
             },
         );
         config.save()?;
@@ -835,6 +836,7 @@ fn run_interactive_shell(
                     states: states.clone(),
                     only_ssm_managed: only_ssm,
                     pinned_ids: Vec::new(),
+                    account_ids: Vec::new(),
                 },
             );
             config.save()?;

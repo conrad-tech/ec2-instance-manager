@@ -181,6 +181,10 @@ pub struct SavedFilter {
     /// Shown *in addition to* whatever the terms/states match — never as a
     /// restriction on them.
     pub pinned_ids: Vec<String>,
+    /// Profile ids of the Multi-account Lookup this filter was saved with
+    /// (the checked accounts plus the primary), empty when it was saved from a
+    /// single-account lookup. Choosing the filter re-checks them.
+    pub account_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

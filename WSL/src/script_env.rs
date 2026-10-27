@@ -103,6 +103,40 @@ pub fn env_matches(tag: Option<&str>, env: &str) -> bool {
 /// excluded contributes no rows at all — it does **not** fall back to the
 /// unfiltered whole-account row, which would quietly re-expose every bastion
 /// the user just hid.
+/// The environment names an account's instances name, decided **per
+/// account**: when any instance carries a non-empty value under one of the
+/// `primary` keys (`MMODAL_ENV` and its spellings), only those values count;
+/// only when none does is the `fallback` list (`Env` / `Environment`) read.
+///
+/// Per account rather than per instance, so one stray `Environment=shared` on
+/// a box in an `MMODAL_ENV`-tagged account does not add an environment of its
+/// own. Values come back trimmed and in instance order, duplicates and all —
+/// [`build`] dedupes case-insensitively.
+pub fn discovered_envs<'a>(
+    tag_sets: impl Iterator<Item = &'a std::collections::BTreeMap<String, String>> + Clone,
+    primary: &[String],
+    fallback: &[String],
+) -> Vec<String> {
+    let read = |keys: &[String]| -> Vec<String> {
+        tag_sets
+            .clone()
+            .filter_map(|tags| {
+                keys.iter()
+                    .filter_map(|k| tags.get(k))
+                    .map(|v| v.trim())
+                    .find(|v| !v.is_empty())
+                    .map(str::to_string)
+            })
+            .collect()
+    };
+    let from_primary = read(primary);
+    if from_primary.is_empty() {
+        read(fallback)
+    } else {
+        from_primary
+    }
+}
+
 pub fn build(
     account_id: &str,
     account_label: &str,
@@ -158,6 +192,46 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tags(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn keys(k: &[&str]) -> Vec<String> {
+        k.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn mmodal_env_anywhere_in_the_account_hides_the_fallback_tags() {
+        let sets = [
+            tags(&[("MMODAL_ENV", "dev1")]),
+            tags(&[("Environment", "shared")]),
+            tags(&[("MMODAL_ENV", "  "), ("Env", "prod")]),
+        ];
+        let got = discovered_envs(
+            sets.iter(),
+            &keys(&["MMODAL_ENV", "mmodal_env"]),
+            &keys(&["Env", "Environment"]),
+        );
+        assert_eq!(got, vec!["dev1".to_string()]);
+    }
+
+    #[test]
+    fn with_no_usable_mmodal_env_the_fallback_tags_are_read() {
+        let sets = [
+            tags(&[("MMODAL_ENV", "")]),
+            tags(&[("Environment", "shared")]),
+            tags(&[("Env", "prod")]),
+            tags(&[("Unrelated", "x")]),
+        ];
+        let got = discovered_envs(
+            sets.iter(),
+            &keys(&["MMODAL_ENV", "mmodal_env"]),
+            &keys(&["Env", "Environment"]),
+        );
+        assert_eq!(got, vec!["shared".to_string(), "prod".to_string()]);
+        assert!(discovered_envs([].iter(), &keys(&["MMODAL_ENV"]), &keys(&["Env"])).is_empty());
+    }
 
     fn declared(names: &[&str]) -> Vec<AccountEnvironment> {
         names

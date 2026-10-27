@@ -10522,6 +10522,60 @@ mod gui {
     }
 
     /// Whether a saved filter's own rules (ignoring pins) would show `instance`.
+    /// What a saved filter stores for the Multi-account Lookup: the checked
+    /// accounts plus the primary, sorted. Empty when nothing is checked, so a
+    /// single-account filter stays single-account.
+    ///
+    /// The primary is included because it is not in the dropdown: a filter
+    /// saved from `dev1` with `dev2`/`prod1` checked is a lookup over all
+    /// three, and choosing it from `prod1` should still reach `dev1`.
+    fn saved_account_ids(checked: &HashSet<String>, primary: &str) -> Vec<String> {
+        if checked.is_empty() {
+            return Vec::new();
+        }
+        let mut ids: Vec<String> = checked.iter().cloned().collect();
+        if !primary.is_empty() && !ids.iter().any(|i| i == primary) {
+            ids.push(primary.to_string());
+        }
+        ids.sort();
+        ids
+    }
+
+    /// The accounts to tick when a saved filter is chosen: the saved ones the
+    /// dropdown actually offers (signed in, and not the current primary, which
+    /// is always searched). Also returns how many saved accounts were left out.
+    fn accounts_to_check(
+        saved: &[String],
+        primary: &str,
+        offered: &[String],
+    ) -> (HashSet<String>, usize) {
+        let mut ids = HashSet::new();
+        let mut skipped = 0;
+        for id in saved {
+            if id == primary {
+                continue;
+            }
+            if offered.iter().any(|o| o == id) {
+                ids.insert(id.clone());
+            } else {
+                skipped += 1;
+            }
+        }
+        (ids, skipped)
+    }
+
+    /// Display names of the checked accounts, in the dropdown's order.
+    fn checked_account_names(
+        offered: &[(String, String)],
+        checked: &HashSet<String>,
+    ) -> Vec<String> {
+        offered
+            .iter()
+            .filter(|(pid, _)| checked.contains(pid))
+            .map(|(_, display)| display.clone())
+            .collect()
+    }
+
     fn saved_filter_rules_match(saved: &SavedFilter, instance: &Instance) -> bool {
         let filters = Filters {
             includes: saved.include_terms.clone(),
@@ -13939,6 +13993,7 @@ mod gui {
                 &self.profile_inventory_cache,
                 &self.inventory,
                 self.selected_profile.as_deref(),
+                &self.config,
             );
             // Diagnostic: why might the environment color legend be empty?
             let env_keys = self
@@ -15838,7 +15893,9 @@ mod gui {
                                         .unwrap_or(0);
                                     let shown = format!(
                                         "{} ({}) ({})",
-                                        e.label, e.account_label, count
+                                        script_env_label(e),
+                                        e.account_label,
+                                        count
                                     );
                                     if ui.selectable_label(false, shown).clicked() {
                                         open_add_new = Some((
@@ -19079,17 +19136,30 @@ mod gui {
             let mut rows = Vec::new();
             for (profile_id, account_id, display_name) in profiles {
                 self.prime_cache_from_disk(&profile_id);
-                let discovered: Vec<String> = self
-                    .profile_inventory_cache
-                    .get(&profile_id)
-                    .map(|(inv, _)| {
-                        inv.instances.iter().filter_map(instance_env).collect()
-                    })
-                    .unwrap_or_default();
+                // Per account: MMODAL_ENV anywhere in it wins, and only an
+                // account with none falls back to Env / Environment.
+                let (primary_keys, fallback_keys) =
+                    self.config.env_tag_tiers_for(&profile_id);
                 let declared = ec2_manager::accounts::environments_for(
                     &account_id,
                     &self.config.user_environments,
                 );
+                // An account that declares its environments is covered by
+                // that list; nothing is discovered from its tags on top.
+                let discovered: Vec<String> = if !declared.is_empty() {
+                    Vec::new()
+                } else {
+                    self.profile_inventory_cache
+                        .get(&profile_id)
+                        .map(|(inv, _)| {
+                            ec2_manager::script_env::discovered_envs(
+                                inv.instances.iter().map(|i| &i.tags),
+                                &primary_keys,
+                                &fallback_keys,
+                            )
+                        })
+                        .unwrap_or_default()
+                };
                 rows.extend(ec2_manager::script_env::build(
                     &profile_id,
                     &display_name,
@@ -30707,6 +30777,10 @@ mod gui {
                     states,
                     only_ssm_managed: self.only_ssm,
                     pinned_ids,
+                    account_ids: saved_account_ids(
+                        &self.multi_account_ids,
+                        self.selected_profile.as_deref().unwrap_or(""),
+                    ),
                 },
             );
             self.config.save()?;
@@ -30738,6 +30812,28 @@ mod gui {
             self.search_rules = rules_from_search_terms(&saved.include_terms, &saved.exclude_terms);
             self.selected_state_filter = state_filter_from_saved_states(&saved.states);
             self.only_ssm = saved.only_ssm_managed;
+
+            // Re-check the Multi-account Lookup the filter was saved with. A
+            // filter saved from a single account carries none and leaves the
+            // current selection alone.
+            let mut skipped = 0;
+            if !saved.account_ids.is_empty() {
+                let primary = self.selected_profile.clone().unwrap_or_default();
+                let offered: Vec<String> = self
+                    .config
+                    .profiles
+                    .iter()
+                    .filter(|p| {
+                        self.profile_auth_infos
+                            .iter()
+                            .any(|a| a.profile_id == p.profile_id && a.auth_status == AuthStatus::Ok)
+                    })
+                    .map(|p| p.profile_id.clone())
+                    .collect();
+                let (ids, missed) = accounts_to_check(&saved.account_ids, &primary, &offered);
+                self.multi_account_ids = ids;
+                skipped = missed;
+            }
             self.apply_filters();
 
             // Instances added by hand via "Add to filter" show up alongside the
@@ -30747,7 +30843,13 @@ mod gui {
                 merge_pinned_instances(&mut self.filtered, &pool, &saved.pinned_ids);
             }
 
-            self.message = format!("Applied saved filter: {name}");
+            self.message = if skipped > 0 {
+                format!(
+                    "Applied saved filter: {name} ({skipped} saved account(s) not signed in, skipped)"
+                )
+            } else {
+                format!("Applied saved filter: {name}")
+            };
             self.log_info(self.message.clone());
             Ok(())
         }
@@ -34047,6 +34149,14 @@ mod gui {
                         // themselves, so a `Key: value` tag rule reaches them.
                         let search_rules = self.search_rules.clone();
 
+                        // Default order: starred instances lead. A chosen
+                        // column (below) is applied on top of this.
+                        {
+                            let cfg = &self.config;
+                            float_favorites_first(&mut self.filtered, |i| {
+                                cfg.is_favorite(&account_scope, &region_scope, &i.instance_id)
+                            });
+                        }
                         // Sort filtered instances if a sort column is selected.
                         if let Some(sort_col) = self.sort_column {
                             let acct = account_scope.clone();
@@ -34264,7 +34374,7 @@ mod gui {
                             row_double_clicked |= resp_itype.double_clicked();
                             row_hovered |= resp_itype.hovered();
 
-                            let env_val = instance_env(instance).unwrap_or_default();
+                            let env_val = env_display(&instance_env(instance).unwrap_or_default());
                             let resp_env = ui.allocate_ui_with_layout(
                                 egui::vec2(cw(SortColumn::Env), 18.0),
                                 egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
@@ -35111,6 +35221,9 @@ mod gui {
                     .cmp(&b.name.to_ascii_lowercase())
                     .then_with(|| a.account_id.cmp(&b.account_id))
             });
+            // Starred rows lead by default; an explicit sort below overrides.
+            let default_favs = self.resource_favorite_ids(ResourceKind::LoadBalancer);
+            float_favorites_first(&mut rows, |lb| default_favs.contains(&lb.arn));
             if let Some(sort) = self.resource_sort(ResourceKind::LoadBalancer) {
                 let favs = self.resource_favorite_ids(ResourceKind::LoadBalancer);
                 sort_resource_rows(
@@ -35842,6 +35955,9 @@ mod gui {
                     // pair swap places between visits.
                     .then_with(|| a.id.cmp(&b.id))
             });
+            // Starred rows lead by default; an explicit sort below overrides.
+            let default_favs = self.resource_favorite_ids(ResourceKind::HostedZone);
+            float_favorites_first(&mut rows, |z| default_favs.contains(&z.id));
             if let Some(sort) = self.resource_sort(ResourceKind::HostedZone) {
                 let favs = self.resource_favorite_ids(ResourceKind::HostedZone);
                 sort_resource_rows(
@@ -36436,6 +36552,9 @@ mod gui {
                     .cmp(&b.name.to_ascii_lowercase())
                     .then_with(|| a.account_id.cmp(&b.account_id))
             });
+            // Starred rows lead by default; an explicit sort below overrides.
+            let default_favs = self.resource_favorite_ids(ResourceKind::Bucket);
+            float_favorites_first(&mut rows, |b| default_favs.contains(&b.name));
             if let Some(sort) = self.resource_sort(ResourceKind::Bucket) {
                 let favs = self.resource_favorite_ids(ResourceKind::Bucket);
                 sort_resource_rows(
@@ -36863,6 +36982,9 @@ mod gui {
                     .cmp(&b.name.to_ascii_lowercase())
                     .then_with(|| a.account_id.cmp(&b.account_id))
             });
+            // Starred rows lead by default; an explicit sort below overrides.
+            let default_favs = self.resource_favorite_ids(ResourceKind::Asg);
+            float_favorites_first(&mut rows, |g| default_favs.contains(&g.arn));
             if let Some(sort) = self.resource_sort(ResourceKind::Asg) {
                 let favs = self.resource_favorite_ids(ResourceKind::Asg);
                 sort_resource_rows(
@@ -37691,6 +37813,9 @@ mod gui {
                     .cmp(&b.name.to_ascii_lowercase())
                     .then_with(|| a.account_id.cmp(&b.account_id))
             });
+            // Starred rows lead by default; an explicit sort below overrides.
+            let default_favs = self.resource_favorite_ids(ResourceKind::TargetGroup);
+            float_favorites_first(&mut rows, |tg| default_favs.contains(&tg.arn));
             if let Some(sort) = self.resource_sort(ResourceKind::TargetGroup) {
                 // The only comparator needing more than the row itself: a
                 // group's Healthy/Total lives in `tg_health`, filled lazily by
@@ -38533,7 +38658,7 @@ mod gui {
                                 egui::Sense::hover(),
                             );
                             ui.painter().circle_filled(rect.center(), 5.0, *color);
-                            ui.label(env);
+                            ui.label(env_display(env));
                         }
                     });
                     ui.separator();
@@ -41131,7 +41256,7 @@ mod gui {
                     text.push_str(&format!("Private IP: {}\n", instance.private_ip.as_deref().unwrap_or("-")));
                     text.push_str(&format!("Private DNS: {}\n", instance.private_dns.as_deref().unwrap_or("-")));
                     text.push_str(&format!("AZ: {}\n", instance.az.as_deref().unwrap_or("-")));
-                    text.push_str(&format!("Environment: {}\n", instance_env(&instance).unwrap_or_else(|| "-".to_string())));
+                    text.push_str(&format!("Environment: {}\n", instance_env(&instance).map(|e| env_display(&e)).unwrap_or_else(|| "-".to_string())));
                     text.push_str(&format!("IAM Role: {}\n", st.iam_role.as_deref().unwrap_or("-")));
                     text.push_str(&format!("ASG: {}\n", instance.asg.as_deref().unwrap_or("-")));
                     text.push_str(&format!("SSM Managed: {}\n", if instance.ssm_managed { "Yes" } else { "No" }));
@@ -41202,7 +41327,7 @@ mod gui {
                         row(ui, "Private IP", instance.private_ip.as_deref().unwrap_or("-"));
                         row(ui, "Private DNS", instance.private_dns.as_deref().unwrap_or("-"));
                         row(ui, "Availability Zone", instance.az.as_deref().unwrap_or("-"));
-                        row(ui, "Environment", &instance_env(&instance).unwrap_or_else(|| "-".to_string()));
+                        row(ui, "Environment", &instance_env(&instance).map(|e| env_display(&e)).unwrap_or_else(|| "-".to_string()));
                         row(ui, "IAM Role", st.iam_role.as_deref().unwrap_or(
                             if st.volumes_loading { "loading..." } else { "-" }
                         ));
@@ -42618,7 +42743,10 @@ mod gui {
                                                 egui::Sense::hover(),
                                             );
                                             ui.painter().circle_filled(rect.center(), 4.0, *color);
-                                            if ui.checkbox(&mut excluded, env).changed() {
+                                            if ui
+                                                .checkbox(&mut excluded, env_display(env))
+                                                .changed()
+                                            {
                                                 if excluded
                                                     && self.env_has_forwards(&env_lower)
                                                 {
@@ -43856,7 +43984,7 @@ mod gui {
                     if !other_profiles.is_empty() {
                         let checked_count = self.multi_account_ids.len();
                         let multi_label = if checked_count > 0 {
-                            format!("Multi-account ({checked_count})")
+                            format!("Multi-account Lookup ({checked_count})")
                         } else {
                             "Multi-account Lookup".to_string()
                         };
@@ -43878,6 +44006,27 @@ mod gui {
                             });
                         if changed {
                             self.apply_filters();
+                        }
+                        // Name each checked account, left to right, so what
+                        // the lookup covers is visible without opening the
+                        // dropdown.
+                        let checked_names = checked_account_names(
+                            &other_profiles
+                                .iter()
+                                .map(|(pid, display, _)| (pid.clone(), display.clone()))
+                                .collect::<Vec<_>>(),
+                            &self.multi_account_ids,
+                        );
+                        if !checked_names.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                for name in &checked_names {
+                                    ui.label(
+                                        egui::RichText::new(name)
+                                            .color(egui::Color32::from_rgb(230, 190, 40))
+                                            .strong(),
+                                    );
+                                }
+                            });
                         }
                     }
 
@@ -49794,6 +49943,18 @@ mod gui {
     /// of which arrived long after the first three. That is why
     /// `nothing_reads_the_env_tag_key_directly_any_more` pins it rather than
     /// trusting a convention.
+    /// How an environment name is shown anywhere in the UI: upper case, as the
+    /// Scripts dialogs already do, so one environment reads the same in every
+    /// dropdown, legend and column. Display only — matching stays
+    /// case-insensitive on the real value.
+    ///
+    /// The value itself comes from `instance_env`, i.e. the `MMODAL_ENV` tag,
+    /// falling back (an empty or absent one is skipped) to the account's own
+    /// key and then the generic `Env` / `Environment` tags.
+    fn env_display(name: &str) -> String {
+        name.to_uppercase()
+    }
+
     fn instance_env(instance: &Instance) -> Option<String> {
         instance
             .env
@@ -49844,6 +50005,7 @@ mod gui {
         inventories: &HashMap<String, (Inventory, AwsContext)>,
         current_inventory: &Inventory,
         current_profile: Option<&str>,
+        config: &ec2_manager::config::AppConfig,
     ) -> HashMap<String, egui::Color32> {
         let mut map = HashMap::new();
 
@@ -49890,10 +50052,34 @@ mod gui {
                 Vec::new()
             };
 
-            let mut envs: Vec<String> = instances.iter()
-                .filter_map(|i| instance_env(i))
+            // Same per-account rule the Scripts and Port Forwards lists use,
+            // so Exclude Env and the legend name the same environments.
+            // An account that declares its environments is covered by that
+            // list and nothing is discovered from its tags on top.
+            let account_id = profiles
+                .iter()
+                .find(|p| &p.profile_id == profile_id)
+                .map(|p| p.account_id.as_str())
+                .filter(|a| !a.is_empty())
+                .unwrap_or(profile_id.as_str());
+            let declared = ec2_manager::accounts::environments_for(
+                account_id,
+                &config.user_environments,
+            );
+            let mut envs: Vec<String> = if !declared.is_empty() {
+                declared.iter().map(|e| e.name.trim().to_ascii_lowercase()).collect()
+            } else {
+                let (primary_keys, fallback_keys) = config.env_tag_tiers_for(profile_id);
+                ec2_manager::script_env::discovered_envs(
+                    instances.iter().map(|i| &i.tags),
+                    &primary_keys,
+                    &fallback_keys,
+                )
+                .into_iter()
                 .map(|e| e.to_ascii_lowercase())
-                .collect();
+                .collect()
+            };
+            envs.retain(|e| !e.is_empty());
             envs.sort();
             envs.dedup();
 
@@ -54078,6 +54264,16 @@ mod gui {
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => std::cmp::Ordering::Equal,
         }
+    }
+
+    /// Move favorites ahead of everything else, keeping each group's order.
+    ///
+    /// This is the DEFAULT order of every table, applied before any chosen
+    /// column: a search for `bastion` with two of five starred lists those two
+    /// first. `sort_by` is stable, so a column the user then picks is applied
+    /// on top and decides where favorites land, exactly as before.
+    fn float_favorites_first<T>(rows: &mut [T], favorite: impl Fn(&T) -> bool) {
+        rows.sort_by(|a, b| favorite(b).cmp(&favorite(a)));
     }
 
     /// Apply one column's ordering to rows already in their default order.
@@ -61453,6 +61649,7 @@ mod gui {
                 states: Vec::new(),
                 only_ssm_managed: false,
                 pinned_ids: pinned.iter().map(|s| s.to_string()).collect(),
+                account_ids: Vec::new(),
             }
         }
 
@@ -61553,6 +61750,36 @@ mod gui {
                 detail_health_message(&FetchError::Denied),
                 FetchError::Denied.message()
             );
+        }
+
+        #[test]
+        fn a_saved_filter_remembers_and_restores_the_multi_account_lookup() {
+            let checked: HashSet<String> = ["dev2", "prod1"].iter().map(|s| s.to_string()).collect();
+            let saved = saved_account_ids(&checked, "dev1");
+            assert_eq!(saved, ["dev1", "dev2", "prod1"]);
+            assert!(saved_account_ids(&HashSet::new(), "dev1").is_empty());
+
+            let offered: Vec<String> = ["dev1", "dev2", "prod1"].iter().map(|s| s.to_string()).collect();
+            // From prod1 as primary: dev1 and dev2 are ticked, prod1 is implicit.
+            let (ids, skipped) = accounts_to_check(&saved, "prod1", &offered);
+            assert_eq!(skipped, 0);
+            let mut got: Vec<_> = ids.into_iter().collect();
+            got.sort();
+            assert_eq!(got, ["dev1", "dev2"]);
+            // A saved account that is not signed in is skipped, and counted.
+            let (ids, skipped) = accounts_to_check(&saved, "dev1", &["dev2".to_string()]);
+            assert_eq!((ids.len(), skipped), (1, 1));
+        }
+
+        #[test]
+        fn checked_accounts_are_named_in_dropdown_order() {
+            let offered = vec![
+                ("a".to_string(), "dev1".to_string()),
+                ("b".to_string(), "dev2".to_string()),
+                ("c".to_string(), "prod1".to_string()),
+            ];
+            let checked: HashSet<String> = ["c", "a"].iter().map(|s| s.to_string()).collect();
+            assert_eq!(checked_account_names(&offered, &checked), ["dev1", "prod1"]);
         }
 
         #[test]
@@ -68686,6 +68913,28 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             out
         }
 
+
+        /// Starred rows lead by default, each group keeping its own order, and a
+        /// chosen column still decides where favorites land.
+        #[test]
+        fn favorites_lead_by_default_and_an_explicit_sort_overrides() {
+            let mut rows = vec!["a", "b", "c", "d", "e"];
+            float_favorites_first(&mut rows, |r| *r == "c" || *r == "e");
+            assert_eq!(rows, ["c", "e", "a", "b", "d"]);
+
+            // Sorting by the chosen column on top moves favorites with it.
+            let sort = ResourceSort {
+                column: 1,
+                direction: SortDirection::Descending,
+            };
+            sort_resource_rows(
+                &mut rows,
+                sort,
+                |r| *r == "c" || *r == "e",
+                |a, b, _| a.cmp(b),
+            );
+            assert_eq!(rows, ["e", "d", "c", "b", "a"]);
+        }
 
         /// **A short label in a wide column must still fill its cell.**
         ///

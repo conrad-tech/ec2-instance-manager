@@ -340,6 +340,33 @@ impl AppConfig {
     ///
     /// Deduped, so a configured key already in the chain is not probed twice;
     /// blanks dropped, since a blank key would match a blank tag name.
+    /// The environment tag keys split into the two tiers the dropdowns use:
+    /// `(primary, fallback)`. Primary is the account's own key, `MMODAL_ENV`
+    /// and its lower-case spelling; fallback is the global `Env` /
+    /// `Environment` list, minus anything already primary. See
+    /// `script_env::discovered_envs` for how an account chooses between them.
+    pub fn env_tag_tiers_for(&self, account_id: &str) -> (Vec<String>, Vec<String>) {
+        let mut primary: Vec<String> = Vec::new();
+        let mut push = |list: &mut Vec<String>, k: &str| {
+            let k = k.trim();
+            if !k.is_empty() && !list.iter().any(|e| e == k) {
+                list.push(k.to_string());
+            }
+        };
+        if let Some(own) = self.profile_env_tags.get(account_id) {
+            push(&mut primary, own);
+        }
+        push(&mut primary, "MMODAL_ENV");
+        push(&mut primary, "mmodal_env");
+        let mut fallback: Vec<String> = Vec::new();
+        for k in &self.tag_mapping.env_keys {
+            if !primary.iter().any(|p| p == k.trim()) {
+                push(&mut fallback, k);
+            }
+        }
+        (primary, fallback)
+    }
+
     pub fn env_tag_keys_for(&self, account_id: &str) -> Vec<String> {
         let mut keys: Vec<String> = Vec::new();
         let mut push = |k: &str| {
@@ -1615,13 +1642,14 @@ impl AppConfig {
         for (scope, filters) in &self.saved_filters {
             for saved in filters {
                 lines.push(format!(
-                    "saved_filter.{scope}={}|{}|{}|{}|{}|{}",
+                    "saved_filter.{scope}={}|{}|{}|{}|{}|{}|{}",
                     saved.name,
                     saved.include_terms.join(","),
                     saved.exclude_terms.join(","),
                     saved.states.join(","),
                     if saved.only_ssm_managed { "1" } else { "0" },
-                    saved.pinned_ids.join(",")
+                    saved.pinned_ids.join(","),
+                    saved.account_ids.join(",")
                 ));
             }
         }
@@ -1813,6 +1841,7 @@ fn parse_saved_filter(raw: &str) -> Option<SavedFilter> {
             states: split_csv(fields[3]),
             only_ssm_managed: matches!(fields[4].trim(), "1" | "true" | "TRUE"),
             pinned_ids: split_csv(fields[5]),
+            account_ids: fields.get(6).map(|f| split_csv(f)).unwrap_or_default(),
         });
     }
     if fields.len() >= 5 {
@@ -1823,6 +1852,7 @@ fn parse_saved_filter(raw: &str) -> Option<SavedFilter> {
             states: split_csv(fields[3]),
             only_ssm_managed: matches!(fields[4].trim(), "1" | "true" | "TRUE"),
             pinned_ids: Vec::new(),
+            account_ids: Vec::new(),
         });
     }
 
@@ -1842,6 +1872,7 @@ fn parse_saved_filter(raw: &str) -> Option<SavedFilter> {
         states: split_csv(fields[2]),
         only_ssm_managed: matches!(fields[3].trim(), "1" | "true" | "TRUE"),
         pinned_ids: Vec::new(),
+        account_ids: Vec::new(),
     })
 }
 
@@ -2633,6 +2664,7 @@ mod tests {
                 states: vec!["running".to_string()],
                 only_ssm_managed: true,
                 pinned_ids: Vec::new(),
+                account_ids: Vec::new(),
             },
         );
 
@@ -2662,6 +2694,7 @@ mod tests {
                 states: vec![],
                 only_ssm_managed: false,
                 pinned_ids: Vec::new(),
+                account_ids: Vec::new(),
             },
         );
         cfg.upsert_port_forward_preset(PortForwardPreset {
