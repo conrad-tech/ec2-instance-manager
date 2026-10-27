@@ -1107,6 +1107,33 @@ mod tests {
 }
 
 
+/// The next loopback address nobody is using, in the `127.200.x.y` range the
+/// declared forwards already live in: one past the highest address in use
+/// there, or `127.200.1.1` when none is. Handing every added forward its own
+/// address is what makes a bind clash impossible, so the user is never asked
+/// to choose one. Addresses outside `127.200.*.*` are ignored for the
+/// ordering but still never returned. `None` only if the range is full.
+pub fn next_free_loopback(used: &[String]) -> Option<String> {
+    let parse = |ip: &str| ip.trim().parse::<std::net::Ipv4Addr>().ok();
+    let taken: std::collections::HashSet<u32> =
+        used.iter().filter_map(|u| parse(u)).map(u32::from).collect();
+    let base = u32::from(std::net::Ipv4Addr::new(127, 200, 0, 0));
+    let top = u32::from(std::net::Ipv4Addr::new(127, 200, 255, 255));
+    let highest = taken.iter().copied().filter(|n| (base..=top).contains(n)).max();
+    let usable = |n: u32| {
+        let last = n & 0xff;
+        last != 0 && last != 255 && !taken.contains(&n)
+    };
+    // Third octet 1 upward: 127.200.0.x is left alone.
+    let floor = base + 256;
+    let start = highest.map(|h| (h + 1).max(floor)).unwrap_or(floor + 1);
+    // Past the highest first; wrap to the bottom only if the top is full.
+    (start..=top)
+        .chain(floor..start)
+        .find(|n| usable(*n))
+        .map(|n| std::net::Ipv4Addr::from(n).to_string())
+}
+
 /// Check a forward typed into the Add forward dialog and turn it into an
 /// entry. Refuses locally, as it is typed, so a bad value never reaches the
 /// ssh command line: the host goes into a `LocalForward` directive and the
@@ -1164,6 +1191,20 @@ mod user_forward_tests {
         assert!(validate_user_forward("a.net", "not-an-ip", "").is_err());
         assert!(validate_user_forward("a.net", "127.0.0.1", "0").is_err());
         assert!(validate_user_forward("a.net", "127.0.0.1", "70000").is_err());
+    }
+
+    #[test]
+    fn the_next_free_loopback_is_one_past_the_highest_in_use() {
+        assert_eq!(next_free_loopback(&[]).as_deref(), Some("127.200.1.1"));
+        let used = vec!["127.200.20.4".to_string(), "127.200.20.7".to_string(), "10.0.0.1".to_string()];
+        assert_eq!(next_free_loopback(&used).as_deref(), Some("127.200.20.8"));
+        // Rolls over the .255 / .0 octets rather than handing out a
+        // network or broadcast-looking address.
+        let used = vec!["127.200.3.254".to_string()];
+        assert_eq!(next_free_loopback(&used).as_deref(), Some("127.200.4.1"));
+        // Never an address that is taken.
+        let used = vec!["127.200.255.254".to_string(), "127.200.1.1".to_string()];
+        assert_eq!(next_free_loopback(&used).as_deref(), Some("127.200.1.2"));
     }
 
     #[test]

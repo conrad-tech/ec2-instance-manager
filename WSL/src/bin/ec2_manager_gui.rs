@@ -1507,7 +1507,6 @@ mod gui {
         env: String,
         label: String,
         host: String,
-        ip: String,
         port: String,
         /// Why the last Add was refused, shown under the boxes.
         error: Option<String>,
@@ -11440,6 +11439,9 @@ mod gui {
         /// captured then rather than read at confirm time, so toggling the
         /// box while the dialog is open cannot change what was agreed to.
         pending_run_remediation: Option<(String, bool)>,
+        /// Log name for the pending remediation, known only when it was aimed
+        /// from a row (the row carries the title the route is read from).
+        pending_run_remediation_log: Option<&'static str>,
         /// Run Remediation's Override tick: skip the "is it already healthy"
         /// check and remediate regardless.
         reaper_override: bool,
@@ -12353,6 +12355,7 @@ mod gui {
                 reaper_probe_rx,
                 reaper_in_flight,
                 pending_run_remediation: None,
+                pending_run_remediation_log: None,
                 reaper_override: false,
                 alert_action_status: None,
                 alert_action_ok_since: None,
@@ -15821,10 +15824,22 @@ mod gui {
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         egui::ComboBox::from_id_salt("pf_add_to_env")
-                            .selected_text("Add forward to environment…")
+                            .selected_text("Add forward to environment")
                             .show_ui(ui, |ui| {
                                 for e in &all_envs {
-                                    let shown = format!("{} ({})", e.label, e.account_label);
+                                    // Same number as the row's own "forwards (N)".
+                                    let count = rows
+                                        .iter()
+                                        .find(|r| {
+                                            r.account_id == e.account_id
+                                                && r.env.eq_ignore_ascii_case(&e.env)
+                                        })
+                                        .map(|r| r.forwards.len())
+                                        .unwrap_or(0);
+                                    let shown = format!(
+                                        "{} ({}) ({})",
+                                        e.label, e.account_label, count
+                                    );
                                     if ui.selectable_label(false, shown).clicked() {
                                         open_add_new = Some((
                                             e.account_id.clone(),
@@ -16250,7 +16265,6 @@ mod gui {
                     env: row.env.clone(),
                     label: row.label.clone(),
                     host: String::new(),
-                    ip: String::new(),
                     port: String::new(),
                     error: None,
                 });
@@ -16261,7 +16275,6 @@ mod gui {
                     env,
                     label,
                     host: String::new(),
-                    ip: String::new(),
                     port: String::new(),
                     error: None,
                 });
@@ -16712,13 +16725,6 @@ mod gui {
                                 .desired_width(260.0),
                         );
                         ui.end_row();
-                        ui.label("Local IP:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut dlg.ip)
-                                .hint_text("127.200.20.4")
-                                .desired_width(260.0),
-                        );
-                        ui.end_row();
                         ui.label("Port:");
                         ui.add(
                             egui::TextEdit::singleline(&mut dlg.port)
@@ -16729,8 +16735,8 @@ mod gui {
                     });
                     ui.label(
                         egui::RichText::new(
-                            "The host is resolved on the bastion. The local IP is where \
-                             it is bound here; if your hosts file already maps the host, \
+                            "The host is resolved on the bastion. A free local address \
+                             is picked for you; if your hosts file already maps the host, \
                              that address is used instead.",
                         )
                         .small()
@@ -16761,8 +16767,27 @@ mod gui {
         }
 
         fn try_add_user_forward(&mut self, dlg: &AddForwardDialog) -> std::result::Result<(), String> {
-            let entry = ec2_manager::forwards::validate_user_forward(&dlg.host, &dlg.ip, &dlg.port)?;
             let rows = self.port_forward_rows();
+            // Every address anything already binds or names, so the one
+            // picked cannot clash with a tunnel, a declared forward, an
+            // added one or a hosts-file line.
+            let hosts = ec2_manager::forwards::load_hosts(&self.config.hosts_file_path());
+            let mut used: Vec<String> = rows
+                .iter()
+                .flat_map(|r| r.forwards.iter().map(|f| f.ip.clone()))
+                .collect();
+            used.extend(
+                self.forwards_config
+                    .environments
+                    .values()
+                    .flatten()
+                    .map(|e| e.ip.clone()),
+            );
+            used.extend(self.config.user_forwards.values().flatten().map(|e| e.ip.clone()));
+            used.extend(hosts.iter().map(|h| h.ip.clone()));
+            let ip = ec2_manager::forwards::next_free_loopback(&used)
+                .ok_or_else(|| "No free local address is left in 127.200.0.0/16.".to_string())?;
+            let entry = ec2_manager::forwards::validate_user_forward(&dlg.host, &ip, &dlg.port)?;
             let this_key = ec2_manager::config::AppConfig::vscode_key(&dlg.account_id, &dlg.env);
             if rows
                 .iter()
@@ -20519,9 +20544,12 @@ mod gui {
                 // A remediation can take the whole stage-2 window, so without
                 // this the button looks like it did nothing for 15 minutes.
                 self.alert_action_ok_since = None;
+                let log_name = self
+                    .pending_run_remediation_log
+                    .take()
+                    .unwrap_or("the Logs tab's Sources dropdown for this alert's type");
                 self.alert_action_status = Some(AlertActionStatus::Running(format!(
-                    "remediating alert {alert_id} — progress in the Logs tab under the \
-                     Sources dropdown for this alert's type"
+                    "remediating alert {alert_id} — progress in the log under {log_name}"
                 )));
                 let os_user = ec2_manager::features::current_os_user();
                 start_manual_remediation(
@@ -23034,11 +23062,38 @@ mod gui {
             // The row menu and the Alert ID box feed the same two paths. The
             // box wins if somehow both fired in one frame, which it cannot,
             // since a context menu swallows the click that opens it.
+            let confirm_remediation_from_box = confirm_remediation_id.clone();
             let confirm_remediation_id = confirm_remediation_id
                 .or_else(|| menu_remediate.map(|id| (id, self.reaper_override)));
             let dry_run_alert_id = dry_run_alert_id.or(menu_dry_run);
 
             if let Some(pending) = confirm_remediation_id {
+                // Only a row-menu click names the log: the row's own title
+                // is what routes it. A typed id has not been read yet.
+                let from_row = confirm_remediation_from_box.is_none();
+                self.pending_run_remediation_log = if from_row {
+                    self.alerts_window
+                        .as_ref()
+                        .and_then(|w| w.rows.iter().find(|a| a.id == pending.0))
+                        .and_then(|a| {
+                            match dry_run_route(
+                                a,
+                                &self.reaper_cfg,
+                                &self.pingdom_cfg,
+                                &self.unhealthy_host_cfg,
+                                &self.instance_age_cfg,
+                                &self.grafana_cfg,
+                            ) {
+                                DryRunRoute::Reaper => Some("On-Call -> Reaper Down"),
+                                DryRunRoute::UnhealthyHost => Some("Sources -> Unhealthy Host"),
+                                DryRunRoute::Grafana => Some("Sources -> Grafana"),
+                                DryRunRoute::InstanceAge => Some("Sources -> Instance Age"),
+                                DryRunRoute::Pingdom | DryRunRoute::Neither => None,
+                            }
+                        })
+                } else {
+                    None
+                };
                 self.pending_run_remediation = Some(pending);
             }
             if let Some(id) = dry_run_alert_id {
