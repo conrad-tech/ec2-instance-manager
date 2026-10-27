@@ -4996,8 +4996,8 @@ mod gui {
             Self {
                 tx,
                 status: AlertActionStatus::Failed(format!(
-                    "alert {alert_id}: stopped before a fix ran — see the log under \
-                     On-Call -> Reaper Down"
+                    "alert {alert_id}: stopped before a fix ran — see the Logs tab under the \
+                     Sources dropdown"
                 )),
             }
         }
@@ -5507,7 +5507,7 @@ mod gui {
                         alert_id: alert_id.clone(),
                         text,
                     });
-                    end.status = AlertActionStatus::Ok(format!(
+                    end.status = AlertActionStatus::Warning(format!(
                         "alert {alert_id}: scale-in protection enabled on {} — not terminated, \
                          no escalation",
                         facts.instance_id
@@ -5854,6 +5854,9 @@ mod gui {
         Ok(String),
         /// It did not. Carries the reason, never a bare failure.
         Failed(String),
+        /// Nothing was changed on purpose and a person should look — drawn
+        /// flashing yellow. Scale-in protection is the one use today.
+        Warning(String),
     }
 
     /// How long a successful dry-run / escalation line stays under the Alert
@@ -5878,6 +5881,7 @@ mod gui {
                 Self::Running(_) => egui::Color32::from_rgb(255, 205, 0),
                 Self::Ok(_) => egui::Color32::from_rgb(90, 190, 110),
                 Self::Failed(_) => egui::Color32::from_rgb(220, 80, 80),
+                Self::Warning(_) => egui::Color32::from_rgb(255, 205, 0),
             }
         }
 
@@ -5888,7 +5892,7 @@ mod gui {
                 // fonts egui bundles and drew an empty box beside every
                 // successful dry run.
                 Self::Ok(m) => format!("\u{2714} {m}"),
-                Self::Failed(m) => format!("\u{26a0} {m}"),
+                Self::Failed(m) | Self::Warning(m) => format!("\u{26a0} {m}"),
             }
         }
     }
@@ -20516,8 +20520,8 @@ mod gui {
                 // this the button looks like it did nothing for 15 minutes.
                 self.alert_action_ok_since = None;
                 self.alert_action_status = Some(AlertActionStatus::Running(format!(
-                    "remediating alert {alert_id} — progress in the log under On-Call -> \
-                     Reaper Down"
+                    "remediating alert {alert_id} — progress in the Logs tab under the \
+                     Sources dropdown for this alert's type"
                 )));
                 let os_user = ec2_manager::features::current_os_user();
                 start_manual_remediation(
@@ -22371,11 +22375,7 @@ mod gui {
                                 // returns below, so it is there in every state
                                 // of the window. Not dismissible.
                                 if let Some(text) = &protected_line {
-                                    note_label(
-                                        ui,
-                                        egui::Color32::from_rgb(220, 90, 90),
-                                        egui::RichText::new(text).strong(),
-                                    );
+                                    note_label(ui, flashing_yellow(ui), egui::RichText::new(text).strong());
                                     ui.separator();
                                 }
                                 if loading && alert.is_none() {
@@ -22849,8 +22849,13 @@ mod gui {
                             // status-coloured line here -- a direct
                             // `colored_label` stays thin on a light panel, and
                             // there is a test that says so.
+                            let color = if matches!(st, AlertActionStatus::Warning(_)) {
+                                flashing_yellow(ui)
+                            } else {
+                                st.color()
+                            };
                             ui.horizontal_wrapped(|ui| {
-                                note_label(ui, st.color(), st.text());
+                                note_label(ui, color, st.text());
                             });
                         }
                     }
@@ -43155,7 +43160,7 @@ mod gui {
                                 ui.label(notification_text(ui, c, text));
                             }
                             for text in self.instance_age_protected_lines.clone() {
-                                let c = status_color(&ScriptState::Failed, ui);
+                                let c = flashing_yellow(ui);
                                 ui.label(notification_text(ui, c, text));
                             }
                             if let Some(hl) = self.script_status_highlight.clone() {
