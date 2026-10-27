@@ -30813,27 +30813,25 @@ mod gui {
             self.selected_state_filter = state_filter_from_saved_states(&saved.states);
             self.only_ssm = saved.only_ssm_managed;
 
-            // Re-check the Multi-account Lookup the filter was saved with. A
-            // filter saved from a single account carries none and leaves the
-            // current selection alone.
-            let mut skipped = 0;
-            if !saved.account_ids.is_empty() {
-                let primary = self.selected_profile.clone().unwrap_or_default();
-                let offered: Vec<String> = self
-                    .config
-                    .profiles
-                    .iter()
-                    .filter(|p| {
-                        self.profile_auth_infos
-                            .iter()
-                            .any(|a| a.profile_id == p.profile_id && a.auth_status == AuthStatus::Ok)
-                    })
-                    .map(|p| p.profile_id.clone())
-                    .collect();
-                let (ids, missed) = accounts_to_check(&saved.account_ids, &primary, &offered);
-                self.multi_account_ids = ids;
-                skipped = missed;
-            }
+            // Switch the Multi-account Lookup to exactly what the filter was
+            // saved with. A filter with no accounts (saved from a single
+            // account, or before filters remembered them) CLEARS the checks:
+            // leaving them alone is what let the biggest lookup stick across
+            // every filter chosen after it.
+            let primary = self.selected_profile.clone().unwrap_or_default();
+            let offered: Vec<String> = self
+                .config
+                .profiles
+                .iter()
+                .filter(|p| {
+                    self.profile_auth_infos
+                        .iter()
+                        .any(|a| a.profile_id == p.profile_id && a.auth_status == AuthStatus::Ok)
+                })
+                .map(|p| p.profile_id.clone())
+                .collect();
+            let (ids, skipped) = accounts_to_check(&saved.account_ids, &primary, &offered);
+            self.multi_account_ids = ids;
             self.apply_filters();
 
             // Instances added by hand via "Add to filter" show up alongside the
@@ -43989,21 +43987,31 @@ mod gui {
                             "Multi-account Lookup".to_string()
                         };
                         let mut changed = false;
-                        egui::ComboBox::from_id_salt("multi_account_lookup")
-                            .selected_text(multi_label)
-                            .show_ui(ui, |ui| {
-                                for (pid, display, _) in &other_profiles {
-                                    let mut checked = self.multi_account_ids.contains(pid);
-                                    if ui.checkbox(&mut checked, display).changed() {
-                                        if checked {
-                                            self.multi_account_ids.insert(pid.clone());
-                                        } else {
-                                            self.multi_account_ids.remove(pid);
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("multi_account_lookup")
+                                .selected_text(multi_label)
+                                .show_ui(ui, |ui| {
+                                    for (pid, display, _) in &other_profiles {
+                                        let mut checked = self.multi_account_ids.contains(pid);
+                                        if ui.checkbox(&mut checked, display).changed() {
+                                            if checked {
+                                                self.multi_account_ids.insert(pid.clone());
+                                            } else {
+                                                self.multi_account_ids.remove(pid);
+                                            }
+                                            changed = true;
                                         }
-                                        changed = true;
                                     }
-                                }
-                            });
+                                });
+                            if ui
+                                .add_enabled(checked_count > 0, egui::Button::new("Clear"))
+                                .on_hover_text("Uncheck every account in the lookup")
+                                .clicked()
+                            {
+                                self.multi_account_ids.clear();
+                                changed = true;
+                            }
+                        });
                         if changed {
                             self.apply_filters();
                         }
