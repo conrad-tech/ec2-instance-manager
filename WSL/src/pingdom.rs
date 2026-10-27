@@ -87,9 +87,17 @@ impl EnvSource {
 /// says `last word of the summary` when it happens, which is the signal to
 /// add a marker.
 ///
+/// **The environment always sits right before the word `has`** — these
+/// summaries read `[Pingdom] <host> <app> <env> has an alert` — so the summary
+/// is cut at its last whole-word `has` before either rule runs. Without that
+/// the marker rule would take `prod has an alert` as the environment, and the
+/// last-word rule would take `alert`. A summary with no `has` is read whole,
+/// as before.
+///
 /// `None` for a summary with nothing usable: one word, nothing after the
 /// marker, or a value carrying template junk.
 pub fn environment_from_title(message: &str, markers: &[String]) -> (Option<String>, EnvSource) {
+    let message = before_has(message);
     for marker in markers {
         let m = marker.trim();
         if m.is_empty() {
@@ -117,6 +125,28 @@ pub fn environment_from_title(message: &str, markers: &[String]) -> (Option<Stri
         return (None, EnvSource::Unreadable);
     }
     (Some(last.to_string()), EnvSource::LastWord)
+}
+
+/// The summary up to its last whole-word `has` (case-insensitive), or all of
+/// it when there is none. `has` inside a longer word (`hash`, `whas`) is not
+/// the word.
+fn before_has(message: &str) -> &str {
+    let lower = message.to_ascii_lowercase();
+    let mut cut = None;
+    for (at, _) in lower.match_indices("has") {
+        let before_ok = message[..at]
+            .chars()
+            .next_back()
+            .map_or(true, |c| c.is_whitespace());
+        let after_ok = message[at + 3..]
+            .chars()
+            .next()
+            .map_or(true, |c| c.is_whitespace());
+        if before_ok && after_ok {
+            cut = Some(at);
+        }
+    }
+    cut.map_or(message, |at| message[..at].trim_end())
 }
 
 /// Byte offset of the first case-insensitive occurrence of `needle`.
@@ -374,6 +404,26 @@ mod tests {
             environment_from_title("[Pingdom] example.com MyApp PROD", &markers(&["MyApp"]));
         assert_eq!(env, Some("PROD".to_string()));
         assert_eq!(how, EnvSource::AfterMarker("MyApp".to_string()));
+    }
+
+    #[test]
+    fn the_environment_is_the_text_right_before_has() {
+        let title = "[Pingdom] example.com Catalyst UAA PROD has an alert";
+        let (env, how) = environment_from_title(title, &markers(&["UAA"]));
+        assert_eq!(env, Some("PROD".to_string()));
+        assert_eq!(how, EnvSource::AfterMarker("UAA".to_string()));
+        // No marker: still the word before `has`, not `alert`.
+        let (env, how) = environment_from_title(title, &[]);
+        assert_eq!(env, Some("PROD".to_string()));
+        assert_eq!(how, EnvSource::LastWord);
+    }
+
+    #[test]
+    fn has_must_be_a_whole_word() {
+        let (env, _) = environment_from_title("[Pingdom] hash.example.com PROD", &[]);
+        assert_eq!(env, Some("PROD".to_string()));
+        let (env, _) = environment_from_title("[Pingdom] app prod one HAS an alert", &markers(&["app"]));
+        assert_eq!(env, Some("prod one".to_string()));
     }
 
     #[test]
