@@ -44142,6 +44142,10 @@ mod gui {
                         let account = self.account_scope();
                         let region = self.region_scope();
                         let fav_ids = self.config.favorites_for_scope(&account, &region);
+                        // Favorites are per account: drop any multi-account
+                        // lookup left over from the previous filter so this
+                        // shows the current account's only.
+                        self.multi_account_ids.clear();
                         self.search_rules = vec![SearchRuleInput::default()];
                         self.selected_state_filter = STATE_FILTER_NONE.to_string();
                         self.only_ssm = false;
