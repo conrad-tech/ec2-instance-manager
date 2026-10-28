@@ -11,7 +11,8 @@
 # shell echoing the command line can never print a line a parser would accept.
 set -u
 
-b=BEGIN; echo "__DG_${b}__"
+b=BEGIN
+echo "__DG_${b}__"
 s=SEC
 echo "__DG_${s}__ DFH"
 df -h
@@ -19,4 +20,5 @@ echo "__DG_${s}__ BYTES"
 df -B1 --output=target,size
 echo "__DG_${s}__ LSBLK"
 lsblk -b -P -o NAME,TYPE,SERIAL,FSTYPE,MOUNTPOINT,PKNAME,SIZE
-e=END; echo "__DG_${e}__"
+e=END
+echo "__DG_${e}__"

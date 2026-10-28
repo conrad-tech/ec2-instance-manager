@@ -691,16 +691,44 @@ mod tests {
 
     #[test]
     fn the_probe_script_changes_nothing_on_the_box() {
-        for line in exec_lines(PROBE_SCRIPT) {
-            assert!(!line.contains('>'), "redirection: {line}");
-            for tok in line.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
-                for bad in ["growpart", "xfs_growfs", "resize2fs", "mkfs", "mount", "umount", "rm", "tee", "dd", "sudo", "reboot"] {
-                    assert_ne!(tok, bad, "mutating verb in: {line}");
-                }
-            }
-        }
+        let bad = probe_violations(PROBE_SCRIPT);
+        assert!(bad.is_empty(), "probe lines outside the allow-list: {bad:?}");
         // Markers are assembled at runtime, never literal.
-        assert!(!exec_lines(PROBE_SCRIPT).iter().any(|l| l.contains("__DG_SEC__") || l.contains("__DG_END__")));
+        let all = exec_lines(PROBE_SCRIPT);
+        for m in ["__DG_BEGIN__", "__DG_SEC__", "__DG_END__"] {
+            assert!(!all.iter().any(|l| l.contains(m)), "literal marker {m}");
+        }
+    }
+
+    /// Executable lines that are not on the allow-list: each must start with
+    /// `set`, `echo`, `df`, `lsblk` or be a plain `NAME=value` assignment,
+    /// and none may redirect, chain, pipe, background or substitute.
+    fn probe_violations(script: &str) -> Vec<String> {
+        let assign = |l: &str| {
+            l.split_once('=').is_some_and(|(k, v)| {
+                !k.is_empty()
+                    && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && !k.starts_with(|c: char| c.is_ascii_digit())
+                    && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+        };
+        exec_lines(script)
+            .into_iter()
+            .filter(|l| {
+                let first = l.split_whitespace().next().unwrap_or("");
+                let allowed = matches!(first, "set" | "echo" | "df" | "lsblk") || assign(l);
+                let chained = ['>', '<', ';', '&', '|', '`'].iter().any(|c| l.contains(*c)) || l.contains("$(");
+                !allowed || chained
+            })
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn the_probe_allow_list_rejects_mutating_lines() {
+        let bad = probe_violations("set -u\necho ok\npartprobe /dev/nvme1n1\necho x > /tmp/f\ndf -h\nx=1; reboot\n");
+        assert_eq!(bad, vec!["partprobe /dev/nvme1n1", "echo x > /tmp/f", "x=1; reboot"]);
+        assert!(probe_violations("set -u\nb=BEGIN\necho \"__x_${b}__\"\ndf -h\nlsblk -b -P\n").is_empty());
     }
 
     #[test]
