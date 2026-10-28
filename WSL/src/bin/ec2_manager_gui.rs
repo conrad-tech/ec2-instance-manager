@@ -1388,6 +1388,14 @@ mod gui {
         }
     }
 
+    /// A finished VS Code server pre-install, reported back to the UI thread.
+    struct VscodeWarmEvent {
+        /// Environment label, as the Port Forwards window shows it.
+        label: String,
+        bastion: String,
+        outcome: std::result::Result<ec2_manager::vscode_warm::WarmOutcome, String>,
+    }
+
     /// One environment in the Port Forwards window.
     #[derive(Clone)]
     struct PortForwardRow {
@@ -1557,6 +1565,9 @@ mod gui {
         ssh_user: String,
         /// Remote directory VS Code should open.
         remote_path: String,
+        /// Whether the instance is one of the bastions, which decides the
+        /// default folder: only there does a login's EFS home exist.
+        is_bastion: bool,
         /// Currently selected pem path (the field the user edits/picks).
         pem_path: String,
         /// "Don't ask again" — unchecked by default.
@@ -3793,6 +3804,17 @@ mod gui {
             format!("/home/{user}")
         } else {
             format!("/efs/home/{user}")
+        }
+    }
+
+    /// Where VS Code opens by default on a given box. Only a bastion carries
+    /// the shared EFS homes, so only there does a login's own home exist;
+    /// every other instance opens `/home/ec2-user`.
+    fn default_open_dir(user: &str, is_bastion: bool) -> String {
+        if is_bastion {
+            default_remote_dir(user)
+        } else {
+            format!("/home/{LOCAL_HOME_USER}")
         }
     }
 
@@ -11348,6 +11370,16 @@ mod gui {
         tunnel_probes: HashMap<String, ProbeState>,
         probe_tx: Sender<ProbeOutcome>,
         probe_rx: Receiver<ProbeOutcome>,
+        /// The local VS Code's commit, read once in the background. It names
+        /// the server a remote box needs, so nothing is pre-installed until
+        /// it is known.
+        vscode_commit: Arc<Mutex<Option<String>>>,
+        /// `<environment>|<login>|<commit>` of every pre-install started this
+        /// session. In memory only: the box answers "already there" in one
+        /// call, so nothing has to be remembered across runs.
+        vscode_warm_started: HashSet<String>,
+        vscode_warm_tx: Sender<VscodeWarmEvent>,
+        vscode_warm_rx: Receiver<VscodeWarmEvent>,
         /// Which of an environment's bastions the next attempt should start
         /// with, as an index into `PortForwardRow::bastions`. Advanced by
         /// `note_tunnel_failover`; in memory only, since which box a tunnel
@@ -11888,6 +11920,7 @@ mod gui {
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (ack_all_tx, ack_all_rx) = mpsc::channel();
             let (probe_tx, probe_rx) = mpsc::channel();
+            let (vscode_warm_tx, vscode_warm_rx) = mpsc::channel();
             let (email_tx, email_rx) = mpsc::channel();
             let (user_sync_tx, user_sync_rx) = mpsc::channel();
             let (create_pre_tx, create_pre_rx) = mpsc::channel();
@@ -12399,6 +12432,10 @@ mod gui {
                 tunnel_probes: HashMap::new(),
                 probe_tx,
                 probe_rx,
+                vscode_commit: Arc::new(Mutex::new(None)),
+                vscode_warm_started: HashSet::new(),
+                vscode_warm_tx,
+                vscode_warm_rx,
                 tunnel_bastion_pref: HashMap::new(),
                 port_forward_login: None,
                 add_forward_dialog: None,
@@ -12582,10 +12619,19 @@ mod gui {
             // "Open in VS Code" button never blocks on a subprocess spawn.
             {
                 let flag = Arc::clone(&app.vscode_cli_ok);
+                let commit = Arc::clone(&app.vscode_commit);
                 std::thread::spawn(move || {
                     let ok = ec2_manager::ssh_config::vscode_cli_available();
                     if let Ok(mut g) = flag.lock() {
                         *g = Some(ok);
+                    }
+                    // Which server a box would need, for the pre-install.
+                    if ok {
+                        let found = ec2_manager::ssh_config::vscode_version_output()
+                            .and_then(|o| ec2_manager::vscode_warm::parse_commit(&o));
+                        if let Ok(mut g) = commit.lock() {
+                            *g = found;
+                        }
                     }
                 });
             }
@@ -15281,6 +15327,106 @@ mod gui {
         }
 
         /// Drain finished probes and say what they found.
+        /// Pre-install the VS Code server for this user on every forwarded
+        /// bastion, so the first Open in VS Code skips the download.
+        ///
+        /// Runs from the tunnel poll, so it also waits for credentials the
+        /// way the tunnel does. One worker per environment walks its
+        /// bastions in turn: on the shared EFS a second bastion then finds
+        /// the first one's install, and two boxes never download into the
+        /// same directory at once. Each (environment, login, commit) is tried
+        /// once per session, so a failing download is not retried every poll.
+        fn start_vscode_warm(&mut self, rows: &[PortForwardRow]) {
+            if self.options.mode != Mode::Live {
+                return;
+            }
+            let Some(commit) = self.vscode_commit.lock().ok().and_then(|g| g.clone())
+            else {
+                return;
+            };
+            for row in rows {
+                if row.bastions.is_empty()
+                    || !self.config.tunnel_enabled(&row.account_id, &row.env)
+                    || self.script_env_auth(&row.account_id) != AuthStatus::Ok
+                {
+                    continue;
+                }
+                let user = self.config.env_ssh_user(&row.account_id, &row.env);
+                let Some(command) = ec2_manager::vscode_warm::command(&commit, &user)
+                else {
+                    continue;
+                };
+                let targets: Vec<(String, String, String)> = row
+                    .bastions
+                    .iter()
+                    .filter_map(|b| {
+                        self.bastion_connection_details(&row.account_id, b)
+                            .map(|(_, profile, region)| (b.clone(), profile, region))
+                    })
+                    .collect();
+                if targets.is_empty() {
+                    continue;
+                }
+                let key = format!("{}|{user}|{commit}", row.key);
+                if !self.vscode_warm_started.insert(key) {
+                    continue;
+                }
+                self.log_info(format!(
+                    "VS Code server: checking {} bastion(s) for {} as {user}",
+                    targets.len(),
+                    row.label
+                ));
+                let (tx, label) = (self.vscode_warm_tx.clone(), row.label.clone());
+                std::thread::spawn(move || {
+                    for (bastion, profile, region) in targets {
+                        // The download alone ran ~6 minutes on a slow box.
+                        let outcome =
+                            ssm_send_command(&profile, &region, &bastion, &command)
+                                .and_then(|id| {
+                                    ssm_wait_for_command(
+                                        &profile,
+                                        &region,
+                                        &bastion,
+                                        &id,
+                                        Duration::from_secs(20 * 60),
+                                    )
+                                })
+                                .map(|out| ec2_manager::vscode_warm::parse_outcome(&out));
+                        let _ = tx.send(VscodeWarmEvent {
+                            label: label.clone(),
+                            bastion,
+                            outcome,
+                        });
+                    }
+                });
+            }
+        }
+
+        fn poll_vscode_warm(&mut self) {
+            use ec2_manager::vscode_warm::WarmOutcome;
+            while let Ok(ev) = self.vscode_warm_rx.try_recv() {
+                let who = format!("{} ({})", ev.label, ev.bastion);
+                match ev.outcome {
+                    Ok(WarmOutcome::Installed) => {
+                        self.log_info(format!("VS Code server: installed on {who}"))
+                    }
+                    Ok(WarmOutcome::Present) => {
+                        self.log_debug(format!("VS Code server: already on {who}"))
+                    }
+                    Ok(WarmOutcome::Failed(why)) => self.log_warn(format!(
+                        "VS Code server: could not install on {who} — {why}"
+                    )),
+                    Ok(WarmOutcome::Unknown) => self.log_warn(format!(
+                        "VS Code server: no answer from {who}; the install was \
+                         not confirmed"
+                    )),
+                    Err(err) => self.log_warn(format!(
+                        "VS Code server: could not reach {who} — {err}"
+                    )),
+                }
+            }
+        }
+
         fn poll_probe_results(&mut self) {
             while let Ok(outcome) = self.probe_rx.try_recv() {
                 let label = self
@@ -15471,6 +15617,7 @@ mod gui {
             self.last_tunnel_poll_at = Instant::now();
 
             let rows = self.port_forward_rows();
+            self.start_vscode_warm(&rows);
             for row in rows {
                 if !self.config.tunnel_enabled(&row.account_id, &row.env) {
                     continue;
@@ -17186,6 +17333,12 @@ mod gui {
             let env = instance_env(instance).unwrap_or_default();
             let ssh_user = self.config.resolve_ssh_user(&profile_id, &env);
             let instance_name = instance.name.clone().unwrap_or_default();
+            let is_bastion = ec2_manager::config::is_bastion_instance(
+                &instance.instance_id,
+                &instance_name,
+                &self.primary_bastion_filter,
+                &self.secondary_bastion_filter,
+            );
             let suppressed = self.config.vscode_prompt_suppressed(&profile_id, &env);
             let resolved_pem =
                 self.config
@@ -17216,7 +17369,7 @@ mod gui {
             // Fast path: user opted out of the prompt and a pem is known.
             if suppressed {
                 if let Some(pem) = resolved_pem.clone() {
-                    let remote = default_remote_dir(&ssh_user);
+                    let remote = default_open_dir(&ssh_user, is_bastion);
                     // With the background tunnel on it owns the forwards, so
                     // the block carries none: VS Code connecting to the same
                     // alias would otherwise fight it for every port and one
@@ -17292,7 +17445,8 @@ mod gui {
                 env: env.clone(),
                 aws_profile: context.profile.clone(),
                 region: context.region.clone(),
-                remote_path: default_remote_dir(&user_prefill),
+                remote_path: default_open_dir(&user_prefill, is_bastion),
+                is_bastion,
                 ssh_user: user_prefill,
                 pem_path: pem_prefill,
                 dont_ask_again: false,
@@ -17493,9 +17647,11 @@ mod gui {
                         // VS Code reports permission denied. A hand-typed
                         // path stops matching and is left alone from then on.
                         if resp.changed()
-                            && dlg.remote_path == default_remote_dir(&prev_user)
+                            && dlg.remote_path
+                                == default_open_dir(&prev_user, dlg.is_bastion)
                         {
-                            dlg.remote_path = default_remote_dir(&dlg.ssh_user);
+                            dlg.remote_path =
+                                default_open_dir(&dlg.ssh_user, dlg.is_bastion);
                         }
                     });
                     ui.horizontal(|ui| {
@@ -42154,6 +42310,7 @@ mod gui {
                 self.poll_ssh_config();
                 self.poll_port_tunnels();
                 self.poll_probe_results();
+                self.poll_vscode_warm();
                 self.poll_stale_connection_tabs();
                 if self.poll_connection_events() {
                     // More output queued than we processed this frame;
@@ -59192,6 +59349,16 @@ mod gui {
             assert_eq!(default_remote_dir("ec2-user"), "/home/ec2-user");
             assert_eq!(default_remote_dir("jdoe"), "/efs/home/jdoe");
             assert_eq!(default_remote_dir("  jdoe "), "/efs/home/jdoe");
+        }
+
+        /// Only a bastion has the shared EFS homes; every other instance
+        /// opens /home/ec2-user whatever the login.
+        #[test]
+        fn non_bastions_open_the_ec2_user_home() {
+            assert_eq!(default_open_dir("jdoe", true), "/efs/home/jdoe");
+            assert_eq!(default_open_dir("ec2-user", true), "/home/ec2-user");
+            assert_eq!(default_open_dir("jdoe", false), "/home/ec2-user");
+            assert_eq!(default_open_dir("ec2-user", false), "/home/ec2-user");
         }
 
         /// The Open-folder field follows the SSH user only while it is

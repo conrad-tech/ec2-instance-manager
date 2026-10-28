@@ -50,6 +50,7 @@ pub mod user_sync;
 pub mod util;
 pub mod vault_health;
 pub mod vault_iam;
+pub mod vscode_warm;
 pub mod wincred;
 pub mod workflow;
 pub mod wsl;

@@ -659,6 +659,33 @@ pub fn vscode_cli_available() -> bool {
     false
 }
 
+/// Raw output of `code --version` (version, commit, architecture), or `None`
+/// when it cannot be run. The commit is what names the server VS Code
+/// installs on a remote box, so it is the key for pre-installing one.
+pub fn vscode_version_output() -> Option<String> {
+    let mut command = if cfg!(windows) {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/c", "code", "--version"]);
+        c
+    } else {
+        let mut c = std::process::Command::new("code");
+        c.arg("--version");
+        c
+    };
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = command.output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
