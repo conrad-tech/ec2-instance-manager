@@ -5238,38 +5238,55 @@ mod gui {
     /// config, so the default is named here rather than read.
     const DISK_GROW_SSM_TIMEOUT: Duration = Duration::from_secs(90);
 
-    /// Pure: `describe-volumes` JSON into the instance's volumes. A volume
-    /// with no id is dropped; an unreadable reply is an error, never an
-    /// empty list.
-    fn parse_disk_grow_volumes(raw: &str) -> std::result::Result<Vec<ec2_manager::disk_grow::Volume>, String> {
+    /// Pure: `describe-volumes` JSON into the instance's volumes. Strict: a
+    /// volume with no usable Size, or without a clean `attached` attachment
+    /// to this instance, fails the whole parse (naming it); nothing is
+    /// dropped or defaulted, since either could mis-aim the resize.
+    fn parse_disk_grow_volumes(raw: &str, instance_id: &str) -> std::result::Result<Vec<ec2_manager::disk_grow::Volume>, String> {
         let v: serde_json::Value =
             serde_json::from_str(raw).map_err(|e| format!("unreadable describe-volumes reply: {e}"))?;
         let list = v
             .get("Volumes")
             .and_then(|x| x.as_array())
             .ok_or_else(|| "describe-volumes reply has no Volumes list".to_string())?;
-        Ok(list
-            .iter()
-            .filter_map(|vol| {
-                let id = vol.get("VolumeId")?.as_str()?.to_string();
-                Some(ec2_manager::disk_grow::Volume {
-                    id,
-                    size_gib: vol.get("Size").and_then(|s| s.as_u64()).unwrap_or(0),
-                    volume_type: vol
-                        .get("VolumeType")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    device: vol
-                        .get("Attachments")
-                        .and_then(|a| a.get(0))
-                        .and_then(|a| a.get("Device"))
-                        .and_then(|d| d.as_str())
-                        .unwrap_or("")
-                        .to_string(),
+        let mut out = Vec::with_capacity(list.len());
+        for vol in list {
+            let id = vol
+                .get("VolumeId")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| "describe-volumes entry has no VolumeId".to_string())?
+                .to_string();
+            let size_gib = vol
+                .get("Size")
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| format!("volume {id} has no usable Size"))?;
+            let ours = vol
+                .get("Attachments")
+                .and_then(|a| a.as_array())
+                .and_then(|a| {
+                    a.iter()
+                        .find(|x| x.get("InstanceId").and_then(|i| i.as_str()) == Some(instance_id))
                 })
-            })
-            .collect())
+                .ok_or_else(|| format!("volume {id} has no attachment to {instance_id}"))?;
+            let state = ours.get("State").and_then(|x| x.as_str()).unwrap_or("");
+            if state != "attached" {
+                return Err(format!(
+                    "volume {id} is {} on {instance_id}, not attached",
+                    if state.is_empty() { "in an unknown state" } else { state }
+                ));
+            }
+            out.push(ec2_manager::disk_grow::Volume {
+                id,
+                size_gib,
+                volume_type: vol
+                    .get("VolumeType")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                device: ours.get("Device").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            });
+        }
+        Ok(out)
     }
 
     /// Pure: the `Size` (GiB) of the first volume in a `describe-volumes` reply.
@@ -5331,7 +5348,7 @@ mod gui {
                 &format!("Name=attachment.instance-id,Values={instance_id}"),
             ],
         )?;
-        let volumes = parse_disk_grow_volumes(&raw)?;
+        let volumes = parse_disk_grow_volumes(&raw, instance_id)?;
         let inst = aws_json(
             &ctx.profile,
             &ctx.region,
@@ -64764,20 +64781,56 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         fn the_volume_list_parser_reads_a_describe_volumes_reply() {
             let raw = r#"{"Volumes":[
               {"VolumeId":"vol-0aaa1111bbbb2222c","Size":30,"VolumeType":"gp3",
-               "Attachments":[{"Device":"/dev/xvda","State":"attached"}]},
-              {"VolumeId":"vol-0ddd3333eeee4444f","Size":200,"VolumeType":"io1","Attachments":[]},
-              {"Size":5}]}"#;
-            let v = parse_disk_grow_volumes(raw).unwrap();
-            assert_eq!(v.len(), 2, "a volume with no id is dropped");
+               "Attachments":[{"InstanceId":"i-0123456789abcdef0","Device":"/dev/xvda","State":"attached"}]},
+              {"VolumeId":"vol-0ddd3333eeee4444f","Size":200,"VolumeType":"io1",
+               "Attachments":[{"InstanceId":"i-0123456789abcdef0","Device":"/dev/sdf","State":"attached"}]}]}"#;
+            let v = parse_disk_grow_volumes(raw, "i-0123456789abcdef0").unwrap();
+            assert_eq!(v.len(), 2);
             assert_eq!(v[0].id, "vol-0aaa1111bbbb2222c");
             assert_eq!(v[0].size_gib, 30);
             assert_eq!(v[0].volume_type, "gp3");
             assert_eq!(v[0].device, "/dev/xvda");
             assert_eq!(v[1].size_gib, 200);
-            assert_eq!(v[1].device, "");
-            assert!(parse_disk_grow_volumes("not json").is_err());
-            assert!(parse_disk_grow_volumes("{}").is_err());
-            assert!(parse_disk_grow_volumes(r#"{"Volumes":[]}"#).unwrap().is_empty());
+            assert_eq!(v[1].device, "/dev/sdf");
+            assert!(parse_disk_grow_volumes("not json", "i-0123456789abcdef0").is_err());
+            assert!(parse_disk_grow_volumes("{}", "i-0123456789abcdef0").is_err());
+            assert!(parse_disk_grow_volumes(r#"{"Volumes":[]}"#, "i-0123456789abcdef0").unwrap().is_empty());
+        }
+
+        #[test]
+        fn a_volume_with_no_usable_size_fails_the_whole_parse() {
+            for size in ["", r#","Size":"big""#, r#","Size":null"#] {
+                let raw = format!(
+                    r#"{{"Volumes":[{{"VolumeId":"vol-0aaa1111bbbb2222c","VolumeType":"gp3"{size},
+                    "Attachments":[{{"InstanceId":"i-0123456789abcdef0","Device":"/dev/xvda","State":"attached"}}]}}]}}"#
+                );
+                let e = parse_disk_grow_volumes(&raw, "i-0123456789abcdef0").unwrap_err();
+                assert!(e.contains("vol-0aaa1111bbbb2222c"), "{e}");
+            }
+        }
+
+        #[test]
+        fn the_device_comes_from_this_instances_attachment_on_a_multi_attach_volume() {
+            let raw = r#"{"Volumes":[{"VolumeId":"vol-0aaa1111bbbb2222c","Size":100,"VolumeType":"io2",
+              "Attachments":[
+               {"InstanceId":"i-0fffffffffffffff0","Device":"/dev/xvda","State":"attached"},
+               {"InstanceId":"i-0123456789abcdef0","Device":"/dev/sdg","State":"attached"}]}]}"#;
+            let v = parse_disk_grow_volumes(raw, "i-0123456789abcdef0").unwrap();
+            assert_eq!(v[0].device, "/dev/sdg");
+        }
+
+        #[test]
+        fn a_volume_not_cleanly_attached_to_this_instance_is_an_error() {
+            let raw = r#"{"Volumes":[{"VolumeId":"vol-0aaa1111bbbb2222c","Size":100,"VolumeType":"gp3",
+              "Attachments":[{"InstanceId":"i-0123456789abcdef0","Device":"/dev/sdf","State":"detaching"}]}]}"#;
+            let e = parse_disk_grow_volumes(raw, "i-0123456789abcdef0").unwrap_err();
+            assert!(e.contains("detaching") && e.contains("vol-0aaa1111bbbb2222c"), "{e}");
+            let other = r#"{"Volumes":[{"VolumeId":"vol-0aaa1111bbbb2222c","Size":100,"VolumeType":"gp3",
+              "Attachments":[{"InstanceId":"i-0fffffffffffffff0","Device":"/dev/sdf","State":"attached"}]}]}"#;
+            let e = parse_disk_grow_volumes(other, "i-0123456789abcdef0").unwrap_err();
+            assert!(e.contains("vol-0aaa1111bbbb2222c"), "{e}");
+            let none = r#"{"Volumes":[{"VolumeId":"vol-0aaa1111bbbb2222c","Size":100,"VolumeType":"gp3","Attachments":[]}]}"#;
+            assert!(parse_disk_grow_volumes(none, "i-0123456789abcdef0").is_err());
         }
 
         #[test]
