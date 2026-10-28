@@ -110,6 +110,8 @@ pub struct Features {
     /// tunable.
     pub instance_age: InstanceAgeFeature,
     pub grafana: GrafanaFeature,
+    /// Disk-utilization watcher: acknowledge, grow the volume, wait.
+    pub disk_grow: DiskGrowFeature,
     /// Start / Stop / Restart from the Inventory right-click menu: who may
     /// see the entries.
     pub instance_power: InstancePowerFeature,
@@ -1328,6 +1330,104 @@ impl GrafanaFeature {
     }
 }
 
+/// The `disk_grow` section of `assets/features.json`.
+///
+/// Gates the disk-utilization watcher: on call only, it acknowledges a disk
+/// alert, grows the volume, and waits for the space to become usable.
+///
+/// Ships disabled with an empty allow-list, and needs both, so a stray `["*"]`
+/// cannot arm live volume changes for a site.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct DiskGrowFeature {
+    /// Master switch. Off in the shipped file.
+    pub enabled: bool,
+    /// OS usernames permitted to run it. `"*"` is deliberately **not**
+    /// honoured: this acknowledges a live page and changes live volumes.
+    pub allowed_users: Vec<String>,
+    /// Environments (`MMODAL_ENV`, case-insensitive) the watcher leaves
+    /// alone. A blank entry excludes nothing. While any exclusion is
+    /// configured, an alert whose environment cannot be read (blank, or an
+    /// unrendered `{{…}}`/`%…%` template; see
+    /// `disk_grow::environment_unreadable`) is left alone too: it might be
+    /// an excluded one. It is logged once and keeps ringing for a human.
+    pub excluded_environments: Vec<String>,
+    /// Feed poll interval.
+    pub poll_secs: u64,
+    /// Alerts pulled per poll.
+    pub fetch_count: u32,
+    /// Minutes to wait for the grown space to become usable.
+    pub usable_wait_mins: u64,
+    /// Minutes after which the optimizing watch stops with a warning (no
+    /// escalation: the grow itself succeeded).
+    pub optimize_ceiling_mins: u64,
+}
+
+impl DiskGrowFeature {
+    /// True when `user` is on `allowed_users`, whether or not the feature is
+    /// enabled. Decides whether they see this watcher's log lines.
+    pub fn is_listed_user(&self, user: &str) -> bool {
+        names_user(&self.allowed_users, user)
+    }
+
+    /// True when `user` may run the watcher. `"*"` does not match.
+    pub fn is_allowed_user(&self, user: &str) -> bool {
+        self.enabled && names_user(&self.allowed_users, user)
+    }
+
+    /// True when the list names more than one user. Two machines watching one
+    /// feed would both acknowledge and both grow.
+    pub fn has_multiple_users(&self) -> bool {
+        self.allowed_users
+            .iter()
+            .filter(|a| !a.trim().is_empty())
+            .count()
+            > 1
+    }
+
+    /// True when `environment` is excluded. Case-insensitive, trimmed; a
+    /// blank entry (or a blank environment) excludes nothing.
+    pub fn excludes(&self, environment: &str) -> bool {
+        let env = environment.trim();
+        !env.is_empty()
+            && self
+                .excluded_environments
+                .iter()
+                .any(|e| !e.trim().is_empty() && e.trim().eq_ignore_ascii_case(env))
+    }
+
+    /// True when at least one non-blank environment is excluded.
+    pub fn names_any_exclusion(&self) -> bool {
+        self.excluded_environments.iter().any(|e| !e.trim().is_empty())
+    }
+
+    fn mins_or(value: u64, default: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(60 * if value == 0 { default } else { value })
+    }
+
+    pub fn poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(if self.poll_secs == 0 { 30 } else { self.poll_secs })
+    }
+
+    pub fn alerts_per_poll(&self) -> u32 {
+        if self.fetch_count == 0 {
+            10
+        } else {
+            self.fetch_count
+        }
+    }
+
+    /// How long the grown space is given to become usable (default 15 min).
+    pub fn usable_wait(&self) -> std::time::Duration {
+        Self::mins_or(self.usable_wait_mins, 15)
+    }
+
+    /// After this the optimizing watch stops with a warning (default 12 h).
+    pub fn optimize_ceiling(&self) -> std::time::Duration {
+        Self::mins_or(self.optimize_ceiling_mins, 12 * 60)
+    }
+}
+
 impl ReaperFeature {
     /// True when `user` is on `allowed_users`, whether or not the feature is
     /// enabled. Decides whether they see this watcher's log lines; see
@@ -1666,6 +1766,7 @@ impl Default for Features {
             // allowed, no application named.
             instance_age: InstanceAgeFeature::default(),
             grafana: GrafanaFeature::default(),
+            disk_grow: DiskGrowFeature::default(),
             // Derived Default: `enabled` false and an empty allow-list. Both
             // are required by the gate, so a features.json nobody can parse
             // hands out no power to stop a production instance.
@@ -1839,6 +1940,11 @@ impl Features {
     /// other watchers' gates.
     pub fn grafana_enabled_for(&self, user: &str) -> bool {
         self.grafana.is_allowed_user(user)
+    }
+
+    /// True when the disk-utilization watcher may run for `user`.
+    pub fn disk_grow_enabled_for(&self, user: &str) -> bool {
+        self.disk_grow.is_allowed_user(user)
     }
 
     /// True when the Inventory tab's **Start / Stop / Restart** entries
@@ -3634,5 +3740,107 @@ mod grafana_feature_tests {
         ] {
             assert!(titles.iter().any(|t| t == want), "missing {want}");
         }
+    }
+}
+
+#[cfg(test)]
+mod disk_grow_feature_tests {
+    use super::*;
+
+    #[test]
+    fn the_disk_grow_gate_needs_enabled_and_the_list_and_never_honours_a_wildcard() {
+        let wild = DiskGrowFeature {
+            enabled: true,
+            allowed_users: vec!["*".to_string()],
+            ..Default::default()
+        };
+        assert!(!wild.is_allowed_user("bconrad"), "'*' is not honoured");
+        assert!(!wild.is_listed_user("bconrad"));
+
+        let off = DiskGrowFeature {
+            enabled: false,
+            allowed_users: vec!["bconrad".to_string()],
+            ..Default::default()
+        };
+        assert!(off.is_listed_user("bconrad"));
+        assert!(!off.is_allowed_user("bconrad"), "listed but not enabled");
+
+        let on = DiskGrowFeature {
+            enabled: true,
+            allowed_users: vec!["bconrad".to_string()],
+            ..Default::default()
+        };
+        assert!(on.is_allowed_user("BCONRAD"));
+        assert!(!on.is_allowed_user(""), "an unknown user is on no list");
+        let f = Features {
+            disk_grow: on,
+            ..Default::default()
+        };
+        assert!(f.disk_grow_enabled_for("bconrad"));
+        assert!(!f.disk_grow_enabled_for("other"));
+    }
+
+    #[test]
+    fn exclusions_match_case_insensitively_and_a_blank_entry_excludes_nothing() {
+        let cfg = DiskGrowFeature {
+            excluded_environments: vec![" dev1 ".into(), "".into()],
+            ..Default::default()
+        };
+        assert!(cfg.excludes("DEV1"));
+        assert!(cfg.excludes("dev1"));
+        assert!(!cfg.excludes("PROD"));
+        assert!(!cfg.excludes(""));
+        assert!(cfg.names_any_exclusion());
+        let blank = DiskGrowFeature {
+            excluded_environments: vec!["".into(), " ".into()],
+            ..Default::default()
+        };
+        assert!(!blank.names_any_exclusion());
+        assert!(!blank.excludes(""));
+    }
+
+    #[test]
+    fn every_disk_grow_window_falls_back_to_its_default_rather_than_zero() {
+        let cfg = DiskGrowFeature::default();
+        assert_eq!(cfg.poll_interval().as_secs(), 30);
+        assert_eq!(cfg.alerts_per_poll(), 10);
+        assert_eq!(cfg.usable_wait().as_secs(), 15 * 60);
+        assert_eq!(cfg.optimize_ceiling().as_secs(), 12 * 3600);
+        let set = DiskGrowFeature {
+            poll_secs: 5,
+            fetch_count: 3,
+            usable_wait_mins: 2,
+            optimize_ceiling_mins: 90,
+            ..Default::default()
+        };
+        assert_eq!(set.poll_interval().as_secs(), 5);
+        assert_eq!(set.alerts_per_poll(), 3);
+        assert_eq!(set.usable_wait().as_secs(), 120);
+        assert_eq!(set.optimize_ceiling().as_secs(), 90 * 60);
+    }
+
+    #[test]
+    fn two_names_on_the_disk_grow_list_are_reported_as_such() {
+        let one = DiskGrowFeature {
+            allowed_users: vec!["a".into(), "".into()],
+            ..Default::default()
+        };
+        assert!(!one.has_multiple_users());
+        let two = DiskGrowFeature {
+            allowed_users: vec!["a".into(), "b".into()],
+            ..Default::default()
+        };
+        assert!(two.has_multiple_users());
+    }
+
+    #[test]
+    fn the_shipped_disk_grow_section_is_closed() {
+        let features: Features =
+            serde_json::from_str(include_str!("../assets/features.json")).expect("parses");
+        assert!(!features.disk_grow.enabled);
+        assert!(features.disk_grow.allowed_users.is_empty());
+        assert!(features.disk_grow.excluded_environments.is_empty());
+        assert!(!features.disk_grow_enabled_for("bconrad"));
+        assert_eq!(features.disk_grow.optimize_ceiling_mins, 720);
     }
 }

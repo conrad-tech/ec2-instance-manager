@@ -61,23 +61,27 @@ toolbar badge counts, the editable due date and Open in Jira — the measured
 baseline immediately before that work was 1522 tests / 24 warnings, on the
 same tree. (Before phase 1 of the resource browser this line had been stale
 for months, reading 356 tests / 21 warnings.)
-- `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 2057 tests pass, 0 fail (1263 lib + 3 CLI + 791 GUI),
-  remeasured 2026-10-20 after the Vault Health Check (clippy still 30 lines,
-  Windows release cross-compile exit 0 with zero warnings)
-- `cargo clippy --features gui` — no errors; **30 `^warning` lines**, measured
-  2026-10-19, identical to the pre-Grafana tree at `4e4b95b`. The Grafana work
-  adds no lint: the one it introduced (`too_many_arguments` on
-  `start_instance_age_poll`) is covered by `#[allow(clippy::too_many_arguments)]`.
-  **That is a count of `^warning` lines** — 28 warnings (7 lib + 21 GUI) plus the
-  two per-crate "generated N warnings" summary lines — across 13 distinct lints.
-  Lib (7): derivable_impls on Mode, too_many_arguments on sim::make_instance,
-  three manual_is_multiple_of, one manual_div_ceil, one type_complexity
-  (cassandra_flow). GUI (21): four too_many_arguments, five collapsible_if, four
+- `cargo build --features gui` — one pre-existing warning (`config.rs:350` unused `mut`)
+- `cargo test --features gui` — 2231 tests pass, 0 fail (1389 lib + 3 CLI + 839 GUI),
+  remeasured 2026-10-28 on `disk-utilization-watcher` after the disk-utilization
+  watcher's final review fixes (Windows release cross-compile exit 0; its only
+  warning is the lib's `unused mut` at `config.rs:350`, not from this work).
+- `cargo clippy --features gui` — no errors. **36 `^warning` lines** on that
+  tree (11 lib + 23 GUI warnings plus the two per-crate "generated N warnings"
+  summary lines), none in `disk_grow.rs` or in any line the branch added; the
+  other lints sit in files the branch did not touch. The earlier **30**
+  (28 warnings: 7 lib + 21 GUI, plus the two summaries, across 13 distinct
+  lints) was measured 2026-10-19 on the pre-Grafana tree at `4e4b95b` and
+  belongs to that older base, not to this branch; the difference came in
+  with the base, not with the watcher. Lints counted then — lib:
+  derivable_impls on Mode, too_many_arguments on sim::make_instance, three
+  manual_is_multiple_of, one manual_div_ceil, one type_complexity
+  (cassandra_flow); GUI: four too_many_arguments, five collapsible_if, four
   let_and_return, two manual_strip, two manual case-insensitive ASCII
   comparisons, manual `Range::contains`, a clamp-like pattern, a simplifiable
-  `map_or`, one unneeded `return`. (The older "24 / 22 distinct lints" figure
-  was measured on an earlier tree and no longer applies.)
+  `map_or`, one unneeded `return`. The Grafana work's one lint
+  (`too_many_arguments` on `start_instance_age_poll`) is covered by
+  `#[allow(clippy::too_many_arguments)]`.
 - The Windows release cross-compile
   (`ALLOW_NO_FORWARDS=1 CARGO_TARGET_DIR=/tmp/ec2m cargo build --release
   --target x86_64-pc-windows-gnu --features gui`) — reverified 2026-09-18,
@@ -1432,10 +1436,14 @@ run.** Run Remediation and Override are unchanged.
   alert is not known until it has been fetched, so a tooltip promising
   `compose down` is simply wrong on a pingdom alert — it said exactly that
   until a user hovered one. It now names what each watcher does.
-- **Run Remediation is reaper-only**, and its tooltip says so in the first
-  line. The row menu offers it on every alert because the menu is drawn
-  before anything is fetched; on a pingdom alert there is no fix to run and
-  the log says so.
+- **Run Remediation routes by alert type, and its hover is watcher-neutral**
+  (`RUN_REMEDIATION_HOVER`, shared by the button and the row menu): it names
+  what each route does, disk utilization included, as the Test Alert Match
+  hover does. It used to open with "Reaper alerts only ... compose down",
+  which was wrong for every other route. The confirmation dialog lists the
+  disk-utilization route too. The row menu offers it on every alert because
+  the menu is drawn before anything is fetched; on a pingdom alert there is
+  no fix to run and the log says so.
 - **A failure the person needs to see goes to the window, not just the log**
   (`alert_submit_error`, a red line under the Alert ID box): an alert id that
   could not be fetched, one no watcher claims, or a send that did not go. The
@@ -1693,6 +1701,218 @@ escalate once (`RE-F`) if it has not. The state machine is pure; the GUI thread
   - There is no toolbar notice for Grafana (instance-age has one); the log
     carries the same information.
 
+### Disk utilization: acknowledge, grow the data volume, comment
+
+`src/disk_grow.rs` is the fifth watcher on the same JSM feed, for
+`[EC2]: <env>-Cassandra-100-DiskUtilization-Warning` / `-Critical`. **On call
+only.** Order: acknowledge, read the box over SSM, grow the **larger** EBS
+volume (`modify-volume`), wait until the new size is usable, grow the XFS
+filesystem, post the `df -h` before/after on the alert, and say nothing more
+when it worked. The state machine and decisions are pure (`disk_grow.rs`); the
+GUI thread (`start_disk_grow_poll`) makes every call. Spec:
+`docs/superpowers/specs/2026-10-28-disk-utilization-watcher-design.md`.
+
+- **A title must carry BOTH `[EC2]` and `DiskUtilization`**
+  (`disk_grow::TITLE_MARKERS`, case-insensitive, hard AND in code like reaper's
+  title word). **Kafka disk alerts are deliberately not claimed**: a different
+  alert family with a different fix. The two markers alone do **not** keep
+  them out — `[EC2]: dev1-Kafka-100-DiskUtilization-Warning` carries both — so
+  `identifies` also requires the title NOT to contain `kafka`
+  (`disk_grow::EXCLUDED_TITLE_WORD`, case-insensitive, a hard-coded AND like
+  reaper's title word, not a config value).
+  `an_ec2_kafka_disk_alert_is_never_identified`. `claims` yields to reaper, unhealthy host and
+  Grafana, so it never takes what they take.
+- **Two-key gate, `"*"` not honoured**: `disk_grow.enabled` AND a named user in
+  `allowed_users` (`disk_grow_enabled_for`). This acknowledges a live page and
+  changes live volumes, so a stray wildcard must not arm it. Ships closed. Live
+  mode only; JSM credentials and the escalation mailbox are required, and each
+  dark state names itself at startup to the Disk Utilization log source.
+- **On call only, and a failed lookup counts as off call.** No acknowledge, no
+  timer, no resize. It is checked at **first sighting**: a *running* incident
+  carries on regardless of the rota, because stopping between `modify-volume`
+  and the filesystem grow leaves a grown volume under a small filesystem.
+- **Excluded environments are ignored entirely** — not acknowledged, not
+  commented, not escalated. Matching is case-insensitive on `MMODAL_ENV`; a
+  blank entry names nothing.
+  - **An unreadable environment is not "not excluded".** While *any* exclusion
+    is configured, an alert whose environment is blank or carries `{ } % < >`
+    (`disk_grow::environment_unreadable`) does **nothing at all**: no
+    acknowledge, no resize, no escalation, one Warn, marked seen. It keeps
+    ringing for a human. Reading "blank" as "not excluded" acknowledged and
+    resized an excluded environment whose tag had not rendered — the feed does
+    serve unrendered templates. The cost, accepted: such alerts are never
+    auto-handled while an exclusion list exists. With no exclusions configured
+    behaviour is unchanged.
+    `an_unreadable_environment_is_left_alone_while_anything_is_excluded` pins
+    the guard before every acknowledge/escalate/grow.
+- **The data volume is the larger one** (`choose_volume`), refusing — and
+  escalating — when only one volume is attached, the two largest are the same
+  size, or the larger one is the root volume. Each is a case where "larger" no
+  longer means "data", and guessing grows the wrong disk. The volume list is
+  strict: a missing `Size`, or an attachment that is not this instance's and
+  `attached`, fails the whole read rather than defaulting to 0 GiB or taking a
+  multi-attach volume's other attachment.
+- **On the box the device is found by volume serial, not name.** An NVMe
+  device's serial is the volume id without the dash; `/dev/sdf` never matches
+  `nvme1n1`. `/data` is the *expected* mount but **not a gate**: the larger
+  volume is the data volume by definition, so a different mount proceeds and is
+  logged locally only (never in the comment). XFS only; LVM, RAID, a partition
+  layout the script cannot handle, an unmounted device or another filesystem
+  **escalate**. The mount reaches the script as a whitelisted parameter, and
+  both scripts are scan-tested (`PROBE_SCRIPT` read-only by allow-list;
+  `FS_SCRIPT` only grows).
+- **Sizes: +1 TB (1024 GiB), then +10% rounded up** (`growth_options`).
+  - **+10% is tried only after an explicit AWS refusal**
+    (`classify_modify_error` -> `Refused`). Options over the volume type's
+    maximum are dropped, so at the ceiling only +10% (or nothing, then
+    escalate) applies.
+  - **AWS allows one modification per volume per 6 hours.** A rate-limit
+    reply is `RateLimited`: it **escalates without trying 10%** (the next size
+    would be refused for the same reason), and a failed instance **holds its
+    slot for `FAILED_HOLD_MS` (6h)** so the other alerts for it neither retry
+    nor re-page inside that window.
+  - **An ambiguous failure (timeout, unparsed reply) is never retried.** The
+    size is re-read (`disk_grow_resize`'s `read_size`): larger than before
+    means it landed; anything else, or a failed read, escalates.
+    `IncorrectModificationState` is classified Ambiguous, so it escalates rather
+    than falling through to +10%.
+    `a_modify_error_that_is_ambiguous_is_never_retried_with_another_size`.
+  - **`modify-volume` has exactly ONE call site** (`modify_volume`, reached only
+    from the `NextMove::Full` arm of `disk_grow_grow_once`; refuses outside Live
+    and on a bad id itself). A scan test pins the count and that an
+    already-acknowledged alert never reaches it. A local refusal reuses
+    `ModifyError::Refused`, so the log line says "refused", never "AWS refused".
+    An SSM error from a probe or the fs script means "unknown, re-probe" and
+    can **never** trigger another `modify-volume`.
+- **It is a multi-poll state machine, not a blocking thread.** Modify ->
+  wait until the volume is usable (`optimizing`) -> filesystem grow -> comment
+  -> keep the toolbar line while optimizing (`transition`, `Phase`). The
+  filesystem does not wait for `completed`; optimizing can take hours.
+  - **Flashing yellow `<instance> growing`** (`disk_grow_growing`), not
+    clearable (`has_clearable_status` excludes it, scan-tested), removed by
+    `GrowEnded` on **every** terminal arm.
+  - **The 12h `optimize_ceiling_mins` stops the flashing and does NOT
+    escalate** — the grow itself succeeded. The poll enforces it itself,
+    *before* reading the modification state, so an Unknown or unreadable state
+    cannot flash for ever. An unreadable state in `Modifying` past
+    `usable_wait_mins` escalates instead.
+  - An unreadable state read logs and retries; it is never read as complete.
+- **The filesystem grow's `OK` verdict is not trusted.** `growpart` reporting
+  `NOCHANGE` and `xfs_growfs` exiting 0 on an unchanged filesystem both read as
+  OK. `disk_grow_fs_with` therefore: requires the device to be ahead of the
+  filesystem *before* growing (else `Unknown`, the size has not reached the box;
+  retried, escalating after `DISK_GROW_MAX_FS_UNKNOWN` = 10 polls); **re-probes**
+  after; and requires the filesystem larger than recorded **and** the device no
+  longer ahead. Anything else is `Failed`. `fs_plan` also finishes a grow whose
+  *answer was lost* (SSM error after the script ran): device not ahead but the
+  filesystem larger than `Incident.fs_bytes_before` is treated as grown, and no
+  second grow runs.
+- **The alert comment is ONLY the two `df -h <mount>` blocks, before and
+  after** (`alert_comment`), at the user's instruction: no volume id, no EBS
+  sizes, no mount remarks. Both blocks come through `df_h_for_mount` (header +
+  the one row), never raw script output, so the "after" cannot carry anything
+  else; the "after" comes from a **fresh probe**, not the grow script's output.
+  `the_disk_grow_comment_is_built_only_from_alert_comment` pins one `add_note`
+  call fed only by `alert_comment`. A failed post is `Failed` and escalates.
+- **An alert that is already acknowledged is recovery-only and is never
+  resized** (`disk_grow_next_move`). Someone — a person, or this app before a
+  restart — took it. The one thing worth doing is finishing a grow this app
+  started: `recovery` tracks the incident **only** when the volume is
+  `Modifying`/`Unknown`, or `Optimizing`/`Completed` while the box still shows
+  less than the volume's size (`device_bytes < size`). Anything else is
+  `Nothing`: the filesystem already fills the device, and tracking it would
+  wait for a grow that happened and page falsely. "Never modified" is `Nothing`
+  too, or every alert a person acknowledged by hand would page. A failed state
+  read escalates. This arm has no `modify-volume`
+  (`a_restart_mid_resize_tracks_the_grow_and_never_resizes`).
+- **A filesystem-only path (device already ahead) still starts an incident**
+  in `Optimizing`, so later alerts for the instance are duplicates; otherwise
+  the next unacknowledged alert would become an owner and resize again.
+- **Duplicates are keyed on the instance**; the first alert owns the incident.
+  Later ones are acknowledged and otherwise ignored, never refreshing the
+  owner's deadlines.
+- **No success escalation.** Success ends silently and the alert closes on its
+  own. **Escalation reuses `RE-F`** (`OutcomeCode::Failure.as_str()`), subject =
+  code and time only; instance, account, environment and sizes stay local.
+  `the_disk_grow_escalation_subject_carries_only_the_code_and_the_time`. An
+  alert with no usable instance id, or no configured profile, escalates and does
+  nothing else (no acknowledge — JSM keeps ringing as well). A failed
+  escalation is never retried, as everywhere.
+- **The alert-note endpoint was ASSUMED, not verified.**
+  `alerts::add_note` posts `{ops_base}/alerts/{id}/notes` with `{"note": …}`,
+  taken from the Opsgenie-compatible API. It could not be checked offline.
+  **Verify on first live use** that the note actually lands; a wrong endpoint
+  fails the comment step, which escalates.
+- **Test Alert Match is read-only for this route** (`start_alert_dry_run`):
+  reads the volumes and the box, reports the volume and mount it *would* grow,
+  and never acknowledges, resizes or posts a note. It escalates like the other
+  routes (that is what Test Alert Match is for). Precedence: reaper > unhealthy
+  host > Grafana > disk utilization > instance-age > pingdom > custom.
+- **Run Remediation** (also on the row menu) needs the user on
+  `disk_grow.allowed_users` and **refuses, with a sentence and nothing run**,
+  an excluded or unreadable environment, and a volume whose modification is
+  `Modifying`/`Optimizing` — all *before* acknowledging. It waits for the grow
+  to finish on its own thread and puts up **no toolbar line**.
+- **Visibility.** The Disk Utilization log source is visible only to users
+  **listed by name** in `disk_grow.allowed_users` (`"*"` does not open it), and
+  it has a **Manage Fixes** row, `Disk Utilization (EC2)`. The shared `gates:`
+  line does not name it.
+- **The poll reads the modification state before any resize**
+  (`disk_grow::resize_gate`, in the `NextMove::Full` arm). A modification in
+  flight (`Modifying`, `Optimizing` or an unrecognised state) is tracked as a
+  recovery incident through `recovery`, never resized again; an unreadable
+  state escalates; only completed, failed or "never modified" resize. This
+  closes the manual-run/poll race, an off-call manual run followed by a shift
+  start and a restart after a failed owner acknowledge. A volume AWS has
+  never modified may answer `describe-volumes-modifications` with
+  `InvalidVolumeModification.NotFound` rather than an empty list;
+  `volume_modification_state` maps that to "never modified" (resize), or the
+  first grow of any volume would escalate. **Unverified against a real
+  volume.** When a modification is in flight and the box already shows the
+  full size, the poll (which has already acknowledged) escalates rather than
+  staying silent, so a volume still optimizing past the 12h ceiling can page.
+  `the_poll_reads_the_modification_state_before_any_resize`.
+- **The poll claims the shared in-flight set** (`ReaperInFlight`, the one Run
+  Remediation's `claim_in_flight` uses) for each new alert before its chain;
+  an alert a person is remediating is skipped **without** being marked seen,
+  so the next poll looks again. Manual and poll runs on one alert cannot
+  overlap. `the_poll_claims_the_shared_in_flight_set_before_the_chain`.
+- **`acked` counts as acknowledged** (`disk_grow::alert_acknowledged`), as
+  well as the `acknowledged` flag: JSM's third status, which some replies
+  carry without the flag.
+- **On an already-acknowledged alert a failed modification is not ours.** The
+  volume's latest-ever modification can be months old: `recovery` reads
+  `Failed` as nothing to do, with one Warn — no page, no 6h hold. A failed
+  state *read* still escalates.
+- **Consequences worth knowing:**
+  - **A failed incident holds its instance for 6h** (`FAILED_HOLD_MS`), so
+    later alerts for that box are acknowledged by this app and otherwise
+    ignored for that window — nobody else is paged by them; the one
+    escalation is the page.
+  - **Seen-state is in memory.** After a restart an incident that already
+    escalated can escalate again — the filesystem-only path failing again, or
+    recovery hitting an unreadable state, are the ways.
+  - **The filesystem-only path fails at once on an `Unknown`** (no clear
+    answer from SSM), while a running incident retries
+    `DISK_GROW_MAX_FS_UNKNOWN` (10) polls first.
+- **Known and left alone:**
+  - **Errors on an already-acknowledged alert still escalate**, unlike Grafana,
+    which leaves acknowledged alerts alone. If a person was working it, this
+    pages about their incident.
+  - **The manual wait loop mirrors the poll's running-incident step**; a shared
+    step function would remove the drift risk.
+  - **`IncorrectModificationState` from `modify-volume` escalates**
+    (Ambiguous) rather than trying +10%; the state read before the resize
+    makes it rare.
+  - **The dry run still escalates for an excluded or unreadable environment**,
+    and its plan line says "a real run would acknowledge/resize" even where the
+    manual refusal would fire.
+  - **The fs script's `NOCHANGE` detection reads only the first line** of its
+    output; the post-grow re-probe is what actually decides.
+  - **First live use**: arm one environment only, run Test Alert Match on a
+    real alert, then Run Remediation on a low-risk box before leaving it to the
+    poll, and confirm the alert note posts.
+
 ### Custom alerts: Add/Update alert (Alerts window)
 
 User-defined watchers: match text in an incoming JSM alert, acknowledge after N
@@ -1714,8 +1934,12 @@ minutes, optionally escalate with the same `RE-F` email. Spec:
   on-call lookup fails. Off-call periods do NOT freeze or re-base timers: watches
   from an earlier on-call shift keep running and can fire together when you come
   back on call (Pingdom has the same shape).
-- **Built-ins win:** an alert the Pingdom, unhealthy-host or reaper watchers
-  claim (`dry_run_route`) is skipped. When two custom alerts match, the first
+- **Built-ins win:** an alert the Pingdom, unhealthy-host, reaper, Grafana or
+  instance-age watchers claim (`dry_run_route`) is skipped. **Disk utilization
+  counts only while it is armed for this user** (`disk_grow_enabled_for`,
+  `custom_alerts_should_skip`): it claims every `[EC2] DiskUtilization` title
+  with no config at all, so on the shipped closed build it would otherwise
+  swallow those alerts from custom alerts with nothing acting on them. When two custom alerts match, the first
   saved wins.
 - **Duplicate rule:** keyed on alert id, no environment grouping; each matching
   alert is its own incident.

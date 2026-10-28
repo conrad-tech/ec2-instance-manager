@@ -246,6 +246,16 @@
     "poll_secs": 30,
     "fetch_count": 10
   },
+  "_disk_grow_comment": "Disk-utilization watcher on the JSM alert feed: acknowledges a disk alert, grows the volume, then waits for the space to become usable. ON CALL ONLY: nothing happens off call. BOTH keys are required: set enabled to true AND name the OS username in allowed_users; '*' is deliberately NOT honoured, because this acknowledges a live page and changes live volumes. excluded_environments lists MMODAL_ENV values (case-insensitive, e.g. [\"DEV1\"]) the watcher leaves alone entirely: an alert from an excluded environment is neither acknowledged nor grown. A blank entry excludes nothing. usable_wait_mins (default 15) is how long grown space is given to become usable; optimize_ceiling_mins (default 720) is when the optimizing watch stops with a warning, without escalating, because the grow itself succeeded. poll_secs (30) and fetch_count (10) pace the feed. Shipped closed.",
+  "disk_grow": {
+    "enabled": false,
+    "allowed_users": [],
+    "excluded_environments": [],
+    "poll_secs": 30,
+    "fetch_count": 10,
+    "usable_wait_mins": 15,
+    "optimize_ceiling_mins": 720
+  },
 
   "_custom_alerts_comment": "Add/Update alert dialog in the Alerts window, and the poll thread behind it: user-defined watchers that match text in an alert summary, ACKNOWLEDGE it after a delay, and optionally ESCALATE (the RE-F email) if it is still open ack-delay + escalate-wait minutes after it was first seen. Acts only while you hold the on-call pager. BOTH keys are required: set enabled to true AND name the OS username in allowed_users. '*' is deliberately NOT honoured. A user who is not named sees none of it: no button, no dialog, no poll, no log lines. Shipped closed; add your username and rebuild.",
   "custom_alerts": {

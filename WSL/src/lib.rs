@@ -12,6 +12,7 @@ pub mod credentials;
 pub mod custom_alerts;
 pub mod defaults_check;
 pub mod diagnostics;
+pub mod disk_grow;
 pub mod elb;
 pub mod error;
 pub mod fed_auth;

@@ -542,6 +542,12 @@ mod gui {
         /// own source so only the user named on `custom_alerts.allowed_users`
         /// reads which alerts were matched and acknowledged.
         CustomAlerts,
+        /// The disk-utilization watcher: the poll thread, every acknowledge,
+        /// every volume grow and filesystem grow, every escalation, and the
+        /// startup lines about whether the feature came up at all. Its own
+        /// source so only the people named on `disk_grow.allowed_users` read
+        /// which boxes were grown.
+        DiskGrow,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -575,6 +581,7 @@ mod gui {
         alerts: bool,
         cassandra: bool,
         custom_alerts: bool,
+        disk_grow: bool,
     }
 
     impl OnCallFilters {
@@ -591,6 +598,7 @@ mod gui {
                 || self.alerts
                 || self.cassandra
                 || self.custom_alerts
+                || self.disk_grow
         }
 
         fn includes(self, source: LogSource) -> bool {
@@ -608,6 +616,7 @@ mod gui {
                 LogSource::Alerts => self.alerts,
                 LogSource::Cassandra => self.cassandra,
                 LogSource::CustomAlerts => self.custom_alerts,
+                LogSource::DiskGrow => self.disk_grow,
                 LogSource::App => false,
             }
         }
@@ -650,6 +659,9 @@ mod gui {
             }
             if self.custom_alerts {
                 picked.push("Custom Alerts");
+            }
+            if self.disk_grow {
+                picked.push("Disk Utilization");
             }
             if picked.is_empty() {
                 // Renamed from "On-Call" when Jira and Alerts joined it: a
@@ -695,6 +707,7 @@ mod gui {
         alerts: bool,
         cassandra: bool,
         custom_alerts: bool,
+        disk_grow: bool,
     }
 
     impl LogVisibility {
@@ -725,6 +738,9 @@ mod gui {
                 // Named on the list, `"*"` not honoured, `enabled` not
                 // consulted: the same rule as the watchers above.
                 custom_alerts: features.custom_alerts.is_listed_user(user),
+                // Named on the list, `"*"` not honoured, `enabled` not
+                // consulted: the same rule as the watchers above.
+                disk_grow: features.disk_grow.is_listed_user(user),
             }
         }
 
@@ -743,6 +759,7 @@ mod gui {
                 LogSource::Alerts => self.alerts,
                 LogSource::Cassandra => self.cassandra,
                 LogSource::CustomAlerts => self.custom_alerts,
+                LogSource::DiskGrow => self.disk_grow,
             }
         }
 
@@ -760,6 +777,7 @@ mod gui {
                 || self.alerts
                 || self.cassandra
                 || self.custom_alerts
+                || self.disk_grow
         }
     }
 
@@ -5002,6 +5020,7 @@ mod gui {
         unhealthy_cfg: ec2_manager::features::UnhealthyHostFeature,
         instance_age_cfg: ec2_manager::features::InstanceAgeFeature,
         grafana_cfg: ec2_manager::features::GrafanaFeature,
+        disk_grow_cfg: ec2_manager::features::DiskGrowFeature,
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
         mailbox: Option<String>,
@@ -5017,6 +5036,8 @@ mod gui {
         instance_age_allowed: bool,
         /// The same for the Grafana watcher.
         grafana_allowed: bool,
+        /// The same for the disk-utilization watcher.
+        disk_grow_allowed: bool,
     }
 
     /// Why a manual Run Remediation must not proceed for `route`, if it must
@@ -5030,6 +5051,7 @@ mod gui {
         unhealthy_allowed: bool,
         instance_age_allowed: bool,
         grafana_allowed: bool,
+        disk_grow_allowed: bool,
     ) -> Option<&'static str> {
         match route {
             DryRunRoute::Reaper => None,
@@ -5049,6 +5071,12 @@ mod gui {
             DryRunRoute::Grafana => Some(
                 "this is a Grafana alert, and you are not on grafana.allowed_users \
                  (or the watcher is not enabled) — nothing was terminated",
+            ),
+            DryRunRoute::DiskGrow if disk_grow_allowed => None,
+            DryRunRoute::DiskGrow => Some(
+                "this is a disk-utilization alert, and you are not on \
+                 disk_grow.allowed_users (or the watcher is not enabled) — no volume \
+                 was grown",
             ),
             DryRunRoute::Pingdom => Some(
                 "this is a Pingdom alert: Pingdom has no remediation (it only \
@@ -5114,6 +5142,7 @@ mod gui {
                 env.unhealthy_allowed,
                 env.instance_age_allowed,
                 env.grafana_allowed,
+                env.disk_grow_allowed,
             ) {
                 let _ = tx.send(ReaperEvent::SourcedNote {
                     source: LogSource::AlertTest,
@@ -5140,6 +5169,7 @@ mod gui {
                 DryRunRoute::UnhealthyHost => run_unhealthy_host_remediation(&env, full),
                 DryRunRoute::InstanceAge => run_instance_age_remediation(&env, full),
                 DryRunRoute::Grafana => run_grafana_remediation(&env, full),
+                DryRunRoute::DiskGrow => run_disk_grow_remediation(&env, full),
                 // Refused above.
                 DryRunRoute::Pingdom | DryRunRoute::Neither => {}
             }
@@ -5253,6 +5283,246 @@ mod gui {
                 AsgRefresh::Refused
             }
         }
+    }
+
+    /// How long a disk-grow script may run on the box. Matches the shipped
+    /// `send_command_timeout` default (90s); these helpers take no features
+    /// config, so the default is named here rather than read.
+    const DISK_GROW_SSM_TIMEOUT: Duration = Duration::from_secs(90);
+
+    /// Pure: `describe-volumes` JSON into the instance's volumes. Strict: a
+    /// volume with no usable Size, or without a clean `attached` attachment
+    /// to this instance, fails the whole parse (naming it); nothing is
+    /// dropped or defaulted, since either could mis-aim the resize.
+    fn parse_disk_grow_volumes(raw: &str, instance_id: &str) -> std::result::Result<Vec<ec2_manager::disk_grow::Volume>, String> {
+        let v: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| format!("unreadable describe-volumes reply: {e}"))?;
+        let list = v
+            .get("Volumes")
+            .and_then(|x| x.as_array())
+            .ok_or_else(|| "describe-volumes reply has no Volumes list".to_string())?;
+        let mut out = Vec::with_capacity(list.len());
+        for vol in list {
+            let id = vol
+                .get("VolumeId")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| "describe-volumes entry has no VolumeId".to_string())?
+                .to_string();
+            let size_gib = vol
+                .get("Size")
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| format!("volume {id} has no usable Size"))?;
+            let ours = vol
+                .get("Attachments")
+                .and_then(|a| a.as_array())
+                .and_then(|a| {
+                    a.iter()
+                        .find(|x| x.get("InstanceId").and_then(|i| i.as_str()) == Some(instance_id))
+                })
+                .ok_or_else(|| format!("volume {id} has no attachment to {instance_id}"))?;
+            let state = ours.get("State").and_then(|x| x.as_str()).unwrap_or("");
+            if state != "attached" {
+                return Err(format!(
+                    "volume {id} is {} on {instance_id}, not attached",
+                    if state.is_empty() { "in an unknown state" } else { state }
+                ));
+            }
+            out.push(ec2_manager::disk_grow::Volume {
+                id,
+                size_gib,
+                volume_type: vol
+                    .get("VolumeType")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                device: ours.get("Device").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Pure: the `Size` (GiB) of the first volume in a `describe-volumes` reply.
+    fn parse_volume_size_gib(raw: &str) -> std::result::Result<u64, String> {
+        let v: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| format!("unreadable describe-volumes reply: {e}"))?;
+        v.get("Volumes")
+            .and_then(|x| x.get(0))
+            .and_then(|x| x.get("Size"))
+            .and_then(|s| s.as_u64())
+            .ok_or_else(|| "describe-volumes reply carries no volume size".to_string())
+    }
+
+    /// Pure: the instance's `RootDeviceName` from a `describe-instances` reply.
+    fn parse_root_device_name(raw: &str) -> std::result::Result<String, String> {
+        let v: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| format!("unreadable describe-instances reply: {e}"))?;
+        v.get("Reservations")
+            .and_then(|r| r.get(0))
+            .and_then(|r| r.get("Instances"))
+            .and_then(|i| i.get(0))
+            .and_then(|i| i.get("RootDeviceName"))
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| "describe-instances reply carries no RootDeviceName".to_string())
+    }
+
+    /// An instance id as `aws` would accept it, checked before it reaches argv.
+    fn is_safe_instance_id(id: &str) -> bool {
+        id.strip_prefix("i-").is_some_and(|rest| {
+            (8..=17).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    }
+
+    /// `^vol-[0-9a-f]{8,17}$`.
+    fn is_safe_volume_id(id: &str) -> bool {
+        id.strip_prefix("vol-").is_some_and(|rest| {
+            (8..=17).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    }
+
+    /// The instance's attached volumes plus its root device name.
+    fn disk_grow_volumes(
+        ctx: &AwsContext,
+        instance_id: &str,
+    ) -> std::result::Result<(Vec<ec2_manager::disk_grow::Volume>, String), String> {
+        if !is_safe_instance_id(instance_id) {
+            return Err(format!("refusing {instance_id:?}: not an instance id"));
+        }
+        let raw = aws_json(
+            &ctx.profile,
+            &ctx.region,
+            &[
+                "ec2",
+                "describe-volumes",
+                "--filters",
+                &format!("Name=attachment.instance-id,Values={instance_id}"),
+            ],
+        )?;
+        let volumes = parse_disk_grow_volumes(&raw, instance_id)?;
+        let inst = aws_json(
+            &ctx.profile,
+            &ctx.region,
+            &["ec2", "describe-instances", "--instance-ids", instance_id],
+        )?;
+        Ok((volumes, parse_root_device_name(&inst)?))
+    }
+
+    /// `ec2 modify-volume` is the one resize call, and it must reach `aws`
+    /// from here only. Live mode and the volume id are checked here, not
+    /// trusted from the caller. The error carries the classified kind (spawn
+    /// failure or empty stderr is `Ambiguous`) and the trimmed stderr.
+    fn modify_volume(
+        ctx: &AwsContext,
+        volume_id: &str,
+        new_gib: u64,
+        mode: &Mode,
+    ) -> std::result::Result<(), (ec2_manager::disk_grow::ModifyError, String)> {
+        use ec2_manager::disk_grow::ModifyError;
+        if *mode != Mode::Live {
+            return Err((ModifyError::Refused, "refusing to modify a volume: not in Live mode".to_string()));
+        }
+        if !is_safe_volume_id(volume_id) {
+            return Err((ModifyError::Refused, format!("refusing {volume_id:?}: not a volume id")));
+        }
+        let output = aws_command()
+            .args([
+                "ec2",
+                "modify-volume",
+                "--profile",
+                &ctx.profile,
+                "--region",
+                &ctx.region,
+                "--volume-id",
+                volume_id,
+                "--size",
+                &new_gib.to_string(),
+                "--output",
+                "json",
+            ])
+            .output()
+            .map_err(|e| (ModifyError::Ambiguous, format!("modify-volume failed to run: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr: String = stderr.trim().chars().take(300).collect();
+            return Err((ec2_manager::disk_grow::classify_modify_error(&stderr), stderr));
+        }
+        Ok(())
+    }
+
+    /// The volume's modification state, for the wait after a resize.
+    fn volume_modification_state(
+        ctx: &AwsContext,
+        volume_id: &str,
+    ) -> std::result::Result<ec2_manager::disk_grow::ModState, String> {
+        if !is_safe_volume_id(volume_id) {
+            return Err(format!("refusing {volume_id:?}: not a volume id"));
+        }
+        // A volume that has never been modified may answer with an error
+        // rather than an empty list; that is "no modification", not unreadable.
+        let raw = match aws_json(
+            &ctx.profile,
+            &ctx.region,
+            &["ec2", "describe-volumes-modifications", "--volume-ids", volume_id],
+        ) {
+            Ok(raw) => raw,
+            Err(e) if e.contains("InvalidVolumeModification.NotFound") => {
+                return Err(ec2_manager::disk_grow::NO_MODIFICATION.to_string())
+            }
+            Err(e) => return Err(e),
+        };
+        ec2_manager::disk_grow::parse_mod_state(&raw)
+    }
+
+    /// The volume's current size in GiB, re-read after an ambiguous failure.
+    fn volume_size_gib(ctx: &AwsContext, volume_id: &str) -> std::result::Result<u64, String> {
+        if !is_safe_volume_id(volume_id) {
+            return Err(format!("refusing {volume_id:?}: not a volume id"));
+        }
+        let raw = aws_json(
+            &ctx.profile,
+            &ctx.region,
+            &["ec2", "describe-volumes", "--volume-ids", volume_id],
+        )?;
+        parse_volume_size_gib(&raw)
+    }
+
+    /// Read-only probe of the box over SSM.
+    fn disk_grow_probe(
+        ctx: &AwsContext,
+        instance_id: &str,
+    ) -> std::result::Result<ec2_manager::disk_grow::Probe, String> {
+        if !is_safe_instance_id(instance_id) {
+            return Err(format!("refusing {instance_id:?}: not an instance id"));
+        }
+        let out = exec_remote_command(
+            &None,
+            ctx,
+            instance_id,
+            &b64_script_command(ec2_manager::disk_grow::PROBE_SCRIPT),
+            DISK_GROW_SSM_TIMEOUT,
+        )?;
+        ec2_manager::disk_grow::parse_probe(&out)
+    }
+
+    /// Grow the filesystem on the box. The `RE_DG_*` assignments are part of
+    /// the body before it is base64'd, so they reach the script.
+    fn disk_grow_run_fs(
+        ctx: &AwsContext,
+        instance_id: &str,
+        dev: &ec2_manager::disk_grow::DataDevice,
+    ) -> std::result::Result<ec2_manager::disk_grow::FsGrow, String> {
+        if !is_safe_instance_id(instance_id) {
+            return Err(format!("refusing {instance_id:?}: not an instance id"));
+        }
+        let body = ec2_manager::disk_grow::fs_grow_command(dev)?;
+        let out = exec_remote_command(
+            &None,
+            ctx,
+            instance_id,
+            &b64_script_command(&body),
+            DISK_GROW_SSM_TIMEOUT,
+        )?;
+        Ok(ec2_manager::disk_grow::parse_fs_grow(&out))
     }
 
     /// `autoscaling start-instance-refresh` is the one refresh call, and it
@@ -5807,6 +6077,270 @@ mod gui {
         }
     }
 
+    /// Why a manual disk grow must not run for an alert in `environment`, if
+    /// it must not. The poll's two environment rules, in the poll's order:
+    /// while anything is excluded an environment that cannot be read is left
+    /// alone (it might be an excluded one), and an excluded one is left alone.
+    fn disk_grow_manual_env_refusal(
+        cfg: &ec2_manager::features::DiskGrowFeature,
+        environment: &str,
+    ) -> Option<String> {
+        let env = environment.trim();
+        if cfg.names_any_exclusion() && ec2_manager::disk_grow::environment_unreadable(env) {
+            return Some(format!(
+                "its environment cannot be read ({env:?}) and environments are excluded here, \
+                 so it might be an excluded one — nothing was acknowledged or grown"
+            ));
+        }
+        if cfg.excludes(env) {
+            return Some(format!(
+                "environment {env} is excluded (disk_grow.excluded_environments) — nothing was \
+                 acknowledged or grown"
+            ));
+        }
+        None
+    }
+
+    /// Why a manual disk grow must not touch a volume in this modification
+    /// state, if it must not. A manual run shares no state with the poll, so
+    /// a volume already modifying or optimizing may be an incident the poll
+    /// is in the middle of; a second resize or filesystem grow would race
+    /// it. A state that is unknown or cannot be read cannot rule that out,
+    /// so it refuses too. Never modified, completed or failed: proceed.
+    fn disk_grow_manual_state_refusal(
+        state: &std::result::Result<ec2_manager::disk_grow::ModState, String>,
+    ) -> Option<String> {
+        use ec2_manager::disk_grow::{ModState, NO_MODIFICATION};
+        match state {
+            Ok(ModState::Completed) | Ok(ModState::Failed) => None,
+            Err(e) if e == NO_MODIFICATION => None,
+            Ok(ModState::Modifying) | Ok(ModState::Optimizing) => Some(format!(
+                "the volume is already being modified ({}) — a manual run shares no state with \
+                 the watcher's poll and could race an incident it is already handling; nothing \
+                 was acknowledged or grown",
+                match state {
+                    Ok(ModState::Modifying) => "modifying",
+                    _ => "optimizing",
+                }
+            )),
+            Ok(ModState::Unknown(s)) => Some(format!(
+                "the volume's modification state is {s:?}, which cannot rule out a grow already \
+                 in flight — nothing was acknowledged or grown"
+            )),
+            Err(e) => Some(format!(
+                "the volume's modification state could not be read ({e}), so a grow already in \
+                 flight cannot be ruled out — nothing was acknowledged or grown"
+            )),
+        }
+    }
+
+    /// Run Remediation for a disk-utilization alert: the poll's owner chain
+    /// (`disk_grow_grow_once`, shared so the two cannot drift), run once,
+    /// here, for one alert a person pointed at. Acknowledges first only when
+    /// on call, like the other manual routes. Blocks until the filesystem is
+    /// grown and the alert commented; it does not wait for the volume to
+    /// finish optimizing and puts no line on the toolbar.
+    fn run_disk_grow_remediation(env: &ManualRemediationEnv, alert: ec2_manager::alerts::Alert) {
+        use ec2_manager::{alerts, disk_grow as dg, instance_age as ia, oncall};
+
+        let cfg = &env.disk_grow_cfg;
+        let alert_id = alert.id.clone();
+        let mut end = RemediationStatusGuard::new(env.status_tx.clone(), &alert_id);
+        end.status = AlertActionStatus::Failed(format!(
+            "alert {alert_id}: stopped before the volume was grown — see the log under \
+             Sources -> Disk Utilization"
+        ));
+        let note = |level: LogLevel, message: String| {
+            let _ = env.tx.send(ReaperEvent::SourcedNote {
+                source: LogSource::DiskGrow,
+                level,
+                message: format!("disk grow: manual {message}"),
+            });
+        };
+        let fail = |end: &mut RemediationStatusGuard, why: String| {
+            note(LogLevel::Error, format!("{alert_id} — {why}"));
+            end.status = AlertActionStatus::Failed(format!("alert {alert_id}: {why}"));
+        };
+        let escalate = |why: &str| {
+            note(LogLevel::Error, format!("{alert_id} — {why}; escalating once"));
+            match env.mailbox.as_deref() {
+                Some(m) if !m.trim().is_empty() => {
+                    match send_escalation_email(m, &disk_grow_escalation_subject(&alert.created_at)) {
+                        // The address is never logged: the app log gets pasted into tickets.
+                        Ok(_) => note(LogLevel::Warn, "escalation sent".to_string()),
+                        Err(e) => note(LogLevel::Error, format!("escalation FAILED TO SEND — {e}")),
+                    }
+                }
+                _ => note(LogLevel::Error, "no escalation mailbox is configured — nothing was sent".to_string()),
+            }
+        };
+
+        let Some(_claim) = claim_in_flight(&env.in_flight, &alert_id) else {
+            fail(&mut end, "a remediation for this alert is already running".to_string());
+            return;
+        };
+        note(LogLevel::Warn, format!("remediation requested for alert {alert_id}"));
+
+        let facts = ia::parse_facts(&alert.description);
+        if let Some(why) = disk_grow_manual_env_refusal(cfg, &facts.environment) {
+            return fail(&mut end, why);
+        }
+        if facts.instance_id.is_empty() {
+            return fail(&mut end, "names no readable instance id — nothing to act on".to_string());
+        }
+        let ctx = match instance_age_context(&env.mode, &env.app_config, &facts) {
+            Ok(c) => c,
+            Err(e) => return fail(&mut end, e),
+        };
+        // The refusal the poll does not need: read the data volume's state
+        // before anything is acknowledged, and leave an in-flight one alone.
+        let volume = match disk_grow_volumes(&ctx, &facts.instance_id)
+            .and_then(|(vols, root)| dg::choose_volume(&vols, &root))
+        {
+            Ok(v) => v,
+            Err(e) => return fail(&mut end, format!("choosing the data volume: {e}")),
+        };
+        if let Some(why) = disk_grow_manual_state_refusal(&volume_modification_state(&ctx, &volume.id)) {
+            return fail(&mut end, format!("{}: {why}", volume.id));
+        }
+
+        let on_call = match oncall::is_on_call(
+            &env.auth,
+            &env.reaper_cfg.resolved_schedule_id(),
+            &env.reaper_cfg.resolved_atlassian_account_id(),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                note(LogLevel::Warn, format!("on-call lookup failed ({e}) — treating as off call"));
+                false
+            }
+        };
+        if on_call && !dg::alert_acknowledged(&alert) {
+            match alerts::acknowledge_alert(&env.auth, &alert_id) {
+                Ok(()) => note(LogLevel::Info, format!("acknowledged {alert_id}")),
+                Err(e) => note(
+                    LogLevel::Warn,
+                    format!("could not acknowledge {alert_id}: {e} — carrying on"),
+                ),
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let now_ms = || started.elapsed().as_millis() as u64;
+        let inc = match disk_grow_grow_once(&env.auth, &ctx, &env.mode, &alert, &facts, now_ms(), &note) {
+            GrowOnce::Started(inc) => *inc,
+            GrowOnce::Nothing(why) => {
+                note(LogLevel::Info, why.clone());
+                end.status = AlertActionStatus::Ok(format!("alert {alert_id}: nothing to do — {why}"));
+                return;
+            }
+            GrowOnce::Failed(why) => {
+                fail(&mut end, why.clone());
+                escalate(&why);
+                return;
+            }
+        };
+        let done = |end: &mut RemediationStatusGuard| {
+            note(
+                LogLevel::Warn,
+                format!(
+                    "{alert_id} — filesystem at {} on {} grown and the alert commented; not \
+                     waiting for {} to finish optimizing (no toolbar line for a manual run)",
+                    inc.mount, inc.instance, inc.volume_id
+                ),
+            );
+            end.status = AlertActionStatus::Ok(format!(
+                "alert {alert_id}: {} grown and the alert commented",
+                inc.volume_id
+            ));
+        };
+        if inc.fs_grown {
+            return done(&mut end);
+        }
+
+        // Resized (or recovering a resize): wait, once per poll interval, for
+        // the new size to be usable, then grow the filesystem once.
+        let usable_wait_ms = cfg.usable_wait().as_millis() as u64;
+        let optimize_ceiling_ms = cfg.optimize_ceiling().as_millis() as u64;
+        let mut unknown = 0u32;
+        loop {
+            std::thread::sleep(cfg.poll_interval());
+            let elapsed_ms = now_ms().saturating_sub(inc.started_ms);
+            let mod_state = match volume_modification_state(&ctx, &inc.volume_id) {
+                Ok(s) => s,
+                Err(e) => {
+                    note(
+                        LogLevel::Warn,
+                        format!("could not read the modification state of {}, retrying: {e}", inc.volume_id),
+                    );
+                    if elapsed_ms >= usable_wait_ms {
+                        let why = format!(
+                            "the modification state of {} could not be read within {} minute(s) \
+                             of the resize",
+                            inc.volume_id,
+                            usable_wait_ms / 60_000
+                        );
+                        fail(&mut end, why.clone());
+                        escalate(&why);
+                        return;
+                    }
+                    continue;
+                }
+            };
+            match dg::transition(
+                dg::Phase::Modifying,
+                &mod_state,
+                false,
+                elapsed_ms,
+                usable_wait_ms,
+                optimize_ceiling_ms,
+            ) {
+                dg::Transition::Wait => {}
+                dg::Transition::GrowFilesystem => {
+                    let target = FsTarget {
+                        volume_id: &inc.volume_id,
+                        mount: &inc.mount,
+                        df_before: &inc.df_before,
+                        fs_recorded: inc.fs_bytes_before,
+                    };
+                    match disk_grow_fs_and_comment(&env.auth, &ctx, &inc.instance, &target, &alert_id) {
+                        DiskGrowFs::Done => return done(&mut end),
+                        DiskGrowFs::Unknown(e) => {
+                            unknown += 1;
+                            if disk_grow_unknown_exhausted(unknown) {
+                                let why = format!(
+                                    "the filesystem grow gave no clear answer {unknown} times \
+                                     running: {e}"
+                                );
+                                fail(&mut end, why.clone());
+                                escalate(&why);
+                                return;
+                            }
+                            note(
+                                LogLevel::Warn,
+                                format!(
+                                    "filesystem grow: {e}; retrying ({unknown}/{DISK_GROW_MAX_FS_UNKNOWN})"
+                                ),
+                            );
+                        }
+                        DiskGrowFs::Failed(why) => {
+                            fail(&mut end, why.clone());
+                            escalate(&why);
+                            return;
+                        }
+                    }
+                }
+                // Not reachable with fs_grown false, but never read as done.
+                dg::Transition::Complete | dg::Transition::StopFlashing(_) => {}
+                dg::Transition::Escalate(why) => {
+                    fail(&mut end, why.clone());
+                    escalate(&why);
+                    return;
+                }
+            }
+        }
+    }
+
     /// The right-click menu on a row in the Alerts window.
     ///
     /// The same two actions the Alert ID box offers, aimed at the row under
@@ -5882,6 +6416,9 @@ mod gui {
                  For an instance-age alert: reads the instance, its auto scaling group, \
                  its recent scaling activity and its target health, and reports what would \
                  be terminated; terminates nothing.\n\n\
+                 For a disk-utilization alert: reads the instance's volumes and the box, \
+                 and reports the data volume, its mount and the planned sizes; modifies \
+                 nothing and grows nothing.\n\n\
                  Then it escalates as though the fix had failed. Nothing is \
                  acknowledged and nothing is changed. Every step is in the log under \
                  On-Call -> Alert Test.",
@@ -5893,16 +6430,7 @@ mod gui {
         }
         if ui
             .button("Run Remediation")
-            .on_hover_text(
-                "Reaper alerts only.\n\n\
-                 Remediate this alert now, as if it had just come in: acknowledge \
-                 (only if you are on call), compose down, \
-                 compose up -d, then watch for the alert to close.\n\n\
-                 A pingdom alert has no fix to run — use Test Alert Match for those.\n\n\
-                 Works on an open, closed, acknowledged or unacknowledged alert, and \
-                 ignores the cooldown and whatever this session has already handled.\n\n\
-                 Asks for confirmation first.",
-            )
+            .on_hover_text(format!("{RUN_REMEDIATION_HOVER}\n\nAsks for confirmation first."))
             .clicked()
         {
             *remediate = Some(alert.id.clone());
@@ -5969,12 +6497,46 @@ mod gui {
         }
     }
 
+    /// The Run Remediation hover, shared by the button and the row menu.
+    /// Watcher-neutral: which watcher claims the alert is not known until it
+    /// has been fetched, so it names what each route does.
+    const RUN_REMEDIATION_HOVER: &str = "Remediate this alert now, as if it had just come in. \
+         The alert is read first and routed by its type; if you are on call it is \
+         acknowledged first.\n\n\
+         Reaper down: docker compose down / up -d on its instance, then watch for the \
+         alert to close.\n\
+         Unhealthy host: terminates (or refreshes) one unhealthy ASG instance in its target \
+         group, then escalates if still open.\n\
+         Grafana: terminates the instance the alert names and waits for its replacement.\n\
+         Disk utilization (EC2): grows the larger EBS volume (+1 TB, else +10%) and its XFS \
+         filesystem, then comments on the alert.\n\
+         Instance age: terminates the aged instance if the safety checks allow it.\n\
+         Pingdom: no fix to run - use Test Alert Match.\n\n\
+         Each route needs you on that watcher's allowed_users. Works on an open, closed, \
+         acknowledged or unacknowledged alert, and ignores the cooldown and whatever this \
+         session has already handled.";
+
+    /// Whether the custom-alerts poll should leave an alert to a built-in
+    /// watcher. Disk grow claims every `[EC2] DiskUtilization` title with no
+    /// config at all, so it only counts while it is armed for this user;
+    /// otherwise a closed build would swallow those alerts from custom
+    /// alerts with nothing acting on them.
+    fn custom_alerts_should_skip(route: DryRunRoute, disk_grow_active: bool) -> bool {
+        match route {
+            DryRunRoute::Neither => false,
+            DryRunRoute::DiskGrow => disk_grow_active,
+            _ => true,
+        }
+    }
+
     /// Which watcher a dry run should exercise for this alert.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum DryRunRoute {
         Reaper,
         UnhealthyHost,
         Grafana,
+        /// An EC2 `DiskUtilization` alert: grow the data volume.
+        DiskGrow,
         InstanceAge,
         Pingdom,
         /// No watcher claims it. Nothing is run and nothing is escalated —
@@ -5988,8 +6550,12 @@ mod gui {
     /// thorough run — which answers the pingdom question along the way.
     /// **Unhealthy-host outranks instance-age**, the older claim on the same
     /// `UnHealthyHostCount` alarms — `instance_age::claims` already excludes
-    /// both reaper and unhealthy-host, so this is four deep: reaper, then
-    /// unhealthy-host, then Grafana, then instance-age, then pingdom.
+    /// both reaper and unhealthy-host, so this is five deep: reaper, then
+    /// unhealthy-host, then Grafana, then disk grow, then instance-age, then
+    /// pingdom. Disk grow reads only the title (`[EC2]` + `DiskUtilization`),
+    /// so it takes no config of its own; the shipped instance-age rules do
+    /// not match such a title (pinned by a test), so placing it above them
+    /// needs no change to `instance_age::claims`.
     ///
     /// Pure, so the precedence is pinned by a test rather than by the order
     /// of `if`s inside a thread.
@@ -6007,6 +6573,8 @@ mod gui {
             DryRunRoute::UnhealthyHost
         } else if ec2_manager::grafana::claims(alert, grafana_cfg, reaper_cfg, unhealthy_cfg) {
             DryRunRoute::Grafana
+        } else if ec2_manager::disk_grow::claims(alert, reaper_cfg, unhealthy_cfg, grafana_cfg) {
+            DryRunRoute::DiskGrow
         } else if ec2_manager::instance_age::claims(
             alert,
             instance_age_cfg,
@@ -6064,6 +6632,7 @@ mod gui {
         unhealthy_cfg: ec2_manager::features::UnhealthyHostFeature,
         instance_age_cfg: ec2_manager::features::InstanceAgeFeature,
         grafana_cfg: ec2_manager::features::GrafanaFeature,
+        disk_grow_cfg: ec2_manager::features::DiskGrowFeature,
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
         mailbox: Option<String>,
@@ -6418,13 +6987,235 @@ mod gui {
                             .to_string(),
                     );
                 }
+                DryRunRoute::DiskGrow => {
+                    use ec2_manager::{disk_grow as dg, instance_age as ia};
+                    note(
+                        LogLevel::Info,
+                        format!("dry run: alert {} matches the disk-utilization rules", alert.id),
+                    );
+                    let facts = ia::parse_facts(&alert.description);
+                    note(
+                        LogLevel::Info,
+                        format!(
+                            "dry run: the description names instance={:?} environment={:?} \
+                             account={:?} region={:?}",
+                            facts.instance_id, facts.environment, facts.account, facts.region
+                        ),
+                    );
+                    // Every step is a read. The block ends early wherever a
+                    // real run would stop, and the escalation below still goes.
+                    'walk: {
+                        if disk_grow_cfg.names_any_exclusion()
+                            && dg::environment_unreadable(&facts.environment)
+                        {
+                            note(
+                                LogLevel::Warn,
+                                format!(
+                                    "dry run: the environment cannot be read ({:?}) and \
+                                     environments are excluded ({:?}) — a real run would do \
+                                     nothing: no acknowledge, no grow",
+                                    facts.environment.trim(),
+                                    disk_grow_cfg.excluded_environments
+                                ),
+                            );
+                            break 'walk;
+                        }
+                        if disk_grow_cfg.excludes(&facts.environment) {
+                            note(
+                                LogLevel::Info,
+                                format!(
+                                    "dry run: environment {} is excluded — a real run would do \
+                                     nothing",
+                                    facts.environment.trim()
+                                ),
+                            );
+                            break 'walk;
+                        }
+                        if facts.instance_id.is_empty() {
+                            note(
+                                LogLevel::Warn,
+                                "dry run: the alert names no readable instance id — a real run \
+                                 would escalate without acting"
+                                    .to_string(),
+                            );
+                            break 'walk;
+                        }
+                        let ctx = match instance_age_context(&mode, &app_config, &facts) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                note(
+                                    LogLevel::Error,
+                                    format!("dry run: could not resolve the account — {e}"),
+                                );
+                                break 'walk;
+                            }
+                        };
+                        let (volumes, root) = match disk_grow_volumes(&ctx, &facts.instance_id) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                note(
+                                    LogLevel::Error,
+                                    format!("dry run: could not list the volumes — {e}"),
+                                );
+                                break 'walk;
+                            }
+                        };
+                        let listing: Vec<String> = volumes
+                            .iter()
+                            .map(|v| format!("{} {} GiB {} at {}", v.id, v.size_gib, v.volume_type, v.device))
+                            .collect();
+                        note(
+                            LogLevel::Info,
+                            format!("dry run: volumes {listing:?}, root device {root}"),
+                        );
+                        let volume = match dg::choose_volume(&volumes, &root) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                note(
+                                    LogLevel::Warn,
+                                    format!(
+                                        "dry run: no data volume chosen — {e}; a real run would \
+                                         escalate"
+                                    ),
+                                );
+                                break 'walk;
+                            }
+                        };
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: data volume {} ({} GiB {})",
+                                volume.id, volume.size_gib, volume.volume_type
+                            ),
+                        );
+                        let mod_state = volume_modification_state(&ctx, &volume.id);
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: modification state of {}: {}",
+                                volume.id,
+                                match &mod_state {
+                                    Ok(s) => format!("{s:?}"),
+                                    Err(e) => e.clone(),
+                                }
+                            ),
+                        );
+                        if let Some(why) = disk_grow_manual_state_refusal(&mod_state) {
+                            note(
+                                LogLevel::Warn,
+                                format!("dry run: Run Remediation would refuse — {why}"),
+                            );
+                        }
+                        let probe = match disk_grow_probe(&ctx, &facts.instance_id) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                note(
+                                    LogLevel::Error,
+                                    format!(
+                                        "dry run: could not read the box over SSM — {e}; a real \
+                                         run would escalate"
+                                    ),
+                                );
+                                break 'walk;
+                            }
+                        };
+                        let dev = match dg::resolve_data_device(&probe, &volume.id) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                note(
+                                    LogLevel::Error,
+                                    format!(
+                                        "dry run: could not find {} on the box — {e}; a real run \
+                                         would escalate",
+                                        volume.id
+                                    ),
+                                );
+                                break 'walk;
+                            }
+                        };
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: {} is {} mounted at {}{}",
+                                volume.id,
+                                dev.disk,
+                                dev.mount,
+                                if dev.mount == "/data" {
+                                    " (/data)"
+                                } else {
+                                    " (not /data; a real run grows it anyway)"
+                                }
+                            ),
+                        );
+                        if let Some(row) = dg::df_h_for_mount(&probe.df_h, &dev.mount) {
+                            note(LogLevel::Info, format!("dry run: df -h now: {row}"));
+                        }
+                        let device_ahead = match dg::fs_bytes_for_mount(&probe, &dev.mount) {
+                            Some(fs) => {
+                                let ahead = dg::device_ahead_of_fs(dev.device_bytes, fs);
+                                note(
+                                    LogLevel::Info,
+                                    format!(
+                                        "dry run: device {} bytes, filesystem {fs} bytes — \
+                                         device_ahead_of_fs={ahead}",
+                                        dev.device_bytes
+                                    ),
+                                );
+                                ahead
+                            }
+                            None => {
+                                note(
+                                    LogLevel::Warn,
+                                    format!(
+                                        "dry run: the box reports no filesystem size for {} — a \
+                                         real run would escalate",
+                                        dev.mount
+                                    ),
+                                );
+                                break 'walk;
+                            }
+                        };
+                        let options: Vec<String> = dg::growth_options(&volume)
+                            .iter()
+                            .map(|g| format!("{} GiB ({:?})", g.new_gib, g.kind))
+                            .collect();
+                        note(
+                            LogLevel::Info,
+                            format!("dry run: planned growth options, in order: {options:?}"),
+                        );
+                        let plan = match disk_grow_next_move(ec2_manager::disk_grow::alert_acknowledged(&alert), device_ahead) {
+                            NextMove::Full => {
+                                "acknowledge (on call), resize to the first option AWS accepts, \
+                                 wait for the new size, grow the filesystem and comment the \
+                                 alert"
+                            }
+                            NextMove::FilesystemOnly => {
+                                "acknowledge (on call) and grow the filesystem only — the device \
+                                 is already larger than it — then comment the alert"
+                            }
+                            NextMove::Nothing => {
+                                "nothing new: the alert is already acknowledged and the device \
+                                 is not ahead (an acknowledged alert is never resized)"
+                            }
+                        };
+                        note(LogLevel::Info, format!("dry run: a real run would {plan}"));
+                    }
+                    note(
+                        LogLevel::Info,
+                        "dry run: nothing was acknowledged, no volume was modified, the \
+                         filesystem was not grown and the alert was not commented — this will \
+                         escalate next, as though the run had failed"
+                            .to_string(),
+                    );
+                }
                 DryRunRoute::Neither => {
                     fail(format!(
                         "alert {} matches no watcher — not a reaper alert \
                          (alertname~{:?} app~{:?} message~{:?}), not an unhealthy-host alert \
                          (alertname~{:?} app~{:?} message~{:?}) and not a pingdom alert \
                          (alertname~{:?} app~{:?} message~{:?}) and not a Grafana alert \
-                         (grafana.title_contains {:?}). Nothing was escalated.",
+                         (grafana.title_contains {:?}) and not a disk-utilization alert (its \
+                         title needs both [EC2] and DiskUtilization). Nothing was escalated.",
                         alert.id,
                         reaper_cfg.alertname_contains,
                         reaper_cfg.app_contains,
@@ -11404,6 +12195,10 @@ mod gui {
         /// (owning alert id, short text): one flashing line per running
         /// instance refresh. Not clearable; it ends with the incident.
         unhealthy_host_refreshing: Vec<(String, String)>,
+        /// (instance, short text): one flashing line per volume the
+        /// disk-grow watcher is growing. Not clearable; it ends only with
+        /// `DiskGrowEvent::GrowEnded`.
+        disk_grow_growing: Vec<(String, String)>,
         /// The instance-age watcher's own toolbar line: the one refusal or
         /// escalation a human needs to see without opening the Logs tab.
         /// Drawn red beside the insurance one, and dismissed the same way.
@@ -11552,6 +12347,9 @@ mod gui {
         /// The compiled-in Grafana rules, for the dry run's matcher and the
         /// manual remediation. The watcher's own copy is moved into its thread.
         grafana_cfg: ec2_manager::features::GrafanaFeature,
+        /// The compiled-in disk-utilization rules, for the dry run and the
+        /// manual remediation. The watcher's own copy is moved into its thread.
+        disk_grow_cfg: ec2_manager::features::DiskGrowFeature,
         /// Where a dry run reports back to the *window* — an alert that
         /// could not be fetched, one no watcher claims, a send that did not
         /// go, and the address a send that did go reached. A channel, not a
@@ -11740,6 +12538,9 @@ mod gui {
         /// The Grafana watcher; `None` while any gate is shut --
         /// `grafana_gate_report` names which.
         grafana: Option<GrafanaRuntime>,
+        /// The disk-utilization watcher; `None` while any gate is shut --
+        /// `disk_grow_gate_report` names which.
+        disk_grow: Option<DiskGrowRuntime>,
         /// Finished remediations waiting on a notifier: the outcome code
         /// (`RE-F`/`RE-N`/`RE-K`/`RE-C`) and the alert's `createdAt`.
         /// Nothing reads this yet — wiring it to a send path is a separate,
@@ -12226,6 +13027,37 @@ mod gui {
                 (rt, lines)
             };
 
+            // Its own gate and its own thread, like every other watcher on
+            // the feed: one being disarmed must never disarm another.
+            let (disk_grow, disk_grow_startup_log) = {
+                let user = ec2_manager::features::current_os_user();
+                let mailbox = ec2_manager::jsm_auth::escalation_mailbox();
+                let mailbox_ok = !mailbox.as_deref().map(str::trim).unwrap_or("").is_empty();
+                let (armed, lines) = disk_grow_gate_report(
+                    &user,
+                    &features.disk_grow,
+                    &options.mode,
+                    resolved_alerts_auth.is_complete(),
+                    mailbox_ok,
+                );
+                let rt = if armed {
+                    Some(start_disk_grow_poll(
+                        resolved_alerts_auth.clone(),
+                        features.disk_grow.clone(),
+                        features.reaper.clone(),
+                        features.unhealthy_host.clone(),
+                        features.grafana.clone(),
+                        config.clone(),
+                        options.mode.clone(),
+                        mailbox.unwrap_or_default(),
+                        Arc::clone(&reaper_in_flight),
+                    ))
+                } else {
+                    None
+                };
+                (rt, lines)
+            };
+
             let mut app = Self {
                 wsl_setup_state,
                 wsl_setup_status: None,
@@ -12489,6 +13321,7 @@ mod gui {
                 unhealthy_host_cfg: features.unhealthy_host.clone(),
                 instance_age_cfg: features.instance_age.clone(),
                 grafana_cfg: features.grafana.clone(),
+                disk_grow_cfg: features.disk_grow.clone(),
                 dry_run_status_tx,
                 dry_run_status_rx,
                 reaper_probe_enabled: features
@@ -12544,8 +13377,10 @@ mod gui {
                 unhealthy_host,
                 unhealthy_host_notice: None,
                 unhealthy_host_refreshing: Vec::new(),
+                disk_grow_growing: Vec::new(),
                 instance_age,
                 grafana,
+                disk_grow,
                 instance_age_notice: None,
                 instance_age_protected_lines: Vec::new(),
                 protected_alerts: std::collections::HashMap::new(),
@@ -12687,6 +13522,12 @@ mod gui {
                 let level = if is_warn { LogLevel::Warn } else { LogLevel::Info };
                 app.log_grafana(level, msg);
             }
+            for (is_warn, msg) in disk_grow_startup_log {
+                // Its own tag: "the watcher never came up" is the first thing
+                // to look for under Sources -> Disk Utilization.
+                let level = if is_warn { LogLevel::Warn } else { LogLevel::Info };
+                app.log_disk_grow(level, msg);
+            }
             for (is_warn, msg) in instance_age_startup_log {
                 // Same reasoning, its own tag: "the watcher never came up" is
                 // the first thing to look for under Sources -> Instance Age
@@ -12754,6 +13595,11 @@ mod gui {
                 features.grafana_enabled_for(&os_user)
             );
             app.log_grafana(LogLevel::Info, grafana_gate);
+            let disk_grow_gate = format!(
+                "gates: disk_grow={}",
+                features.disk_grow_enabled_for(&os_user)
+            );
+            app.log_disk_grow(LogLevel::Info, disk_grow_gate);
             let alerts_gate = format!("gates: alerts={}", app.alerts_enabled);
             app.log_alerts(LogLevel::Info, alerts_gate);
             let jira_gate = format!("gates: jira={}", app.jira_enabled);
@@ -14003,6 +14849,10 @@ mod gui {
 
         fn log_grafana(&mut self, level: LogLevel, message: impl Into<String>) {
             self.log_from(LogSource::Grafana, level, message);
+        }
+
+        fn log_disk_grow(&mut self, level: LogLevel, message: impl Into<String>) {
+            self.log_from(LogSource::DiskGrow, level, message);
         }
 
         /// Everything the Jira Tickets feature says about itself. Its own
@@ -20772,6 +21622,9 @@ mod gui {
                          group (ASG-managed only), then escalates if still open",
                     );
                     ui.label(
+                        "  Disk utilization (EC2): grows the larger EBS volume (+1 TB, else +10%) and its XFS filesystem on the instance.",
+                    );
+                    ui.label(
                         "  Instance age: terminates the aged instance if the safety checks \
                          allow it",
                     );
@@ -20841,6 +21694,7 @@ mod gui {
                         unhealthy_cfg: self.unhealthy_host_cfg.clone(),
                         instance_age_cfg: self.instance_age_cfg.clone(),
                         grafana_cfg: self.grafana_cfg.clone(),
+                        disk_grow_cfg: self.disk_grow_cfg.clone(),
                         app_config: self.config.clone(),
                         mode: self.options.mode.clone(),
                         mailbox: ec2_manager::jsm_auth::escalation_mailbox(),
@@ -20850,6 +21704,7 @@ mod gui {
                         unhealthy_allowed: self.unhealthy_host_cfg.is_allowed_user(&os_user),
                         instance_age_allowed: self.instance_age_cfg.is_allowed_user(&os_user),
                         grafana_allowed: self.grafana_cfg.is_allowed_user(&os_user),
+                        disk_grow_allowed: self.disk_grow_cfg.is_allowed_user(&os_user),
                     },
                     alert_id,
                     override_health,
@@ -21061,6 +21916,44 @@ mod gui {
                                     "grafana: escalation for {alert_id} FAILED TO SEND — \
                                      {detail}. The alert is acknowledged and nothing will \
                                      ring; handle it by hand"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Drain whatever the disk-grow watcher has said since the last
+        /// frame. The grow and the escalation already happened on its own
+        /// thread; this only records them and keeps the toolbar lines in step.
+        fn poll_disk_grow_events(&mut self) {
+            let Some(rt) = &self.disk_grow else { return };
+            let events: Vec<DiskGrowEvent> = rt.rx.try_iter().collect();
+            for ev in events {
+                match ev {
+                    DiskGrowEvent::Note { level, message } => self.log_disk_grow(level, message),
+                    DiskGrowEvent::GrowStarted { key, text } => {
+                        self.disk_grow_growing.retain(|(k, _)| *k != key);
+                        self.disk_grow_growing.push((key, text));
+                    }
+                    DiskGrowEvent::GrowEnded { key } => {
+                        self.disk_grow_growing.retain(|(k, _)| *k != key);
+                    }
+                    DiskGrowEvent::Escalated { alert_id, detail, ok } => {
+                        if ok {
+                            self.log_disk_grow(
+                                LogLevel::Warn,
+                                format!("disk grow: escalation for {alert_id} {detail}"),
+                            );
+                        } else {
+                            self.log_disk_grow(
+                                LogLevel::Error,
+                                format!(
+                                    "disk grow: escalation for {alert_id} FAILED TO SEND — \
+                                     {detail}. Nothing was sent and nothing will ring; check \
+                                     the alert in JSM (it may or may not have been \
+                                     acknowledged) and handle it by hand"
                                 ),
                             );
                         }
@@ -23081,6 +23974,9 @@ mod gui {
                  For an instance-age alert: reads the instance, its auto scaling group, \
                  its recent scaling activity and its target health, and reports what would \
                  be terminated; terminates nothing.\n\n\
+                 For a disk-utilization alert: reads the instance's volumes and the box, \
+                 and reports the data volume, its mount and the planned sizes; modifies \
+                 nothing and grows nothing.\n\n\
                  Then it escalates as though the fix had failed. Nothing is \
                  acknowledged and nothing is changed. Every step is in the log under \
                  On-Call -> Alert Test.",
@@ -23099,15 +23995,7 @@ mod gui {
                                     !id.is_empty(),
                                     egui::Button::new("Run Remediation"),
                                 )
-                                .on_hover_text(
-                                    "Reaper alerts only.\n\n\
-                 Remediate this alert now, as if it had just come in: acknowledge \
-                 (only if you are on call), compose down, \
-                 compose up -d, then watch for the alert to close.\n\n\
-                 A pingdom alert has no fix to run — use Test Alert Match for those.\n\n\
-                 Works on an open, closed, acknowledged or unacknowledged alert, and \
-                 ignores the cooldown and whatever this session has already handled.",
-                                )
+                                .on_hover_text(RUN_REMEDIATION_HOVER)
                                 .clicked()
                             {
                                 confirm_remediation_id =
@@ -23375,6 +24263,7 @@ mod gui {
                                 DryRunRoute::Reaper => Some("On-Call -> Reaper Down"),
                                 DryRunRoute::UnhealthyHost => Some("Sources -> Unhealthy Host"),
                                 DryRunRoute::Grafana => Some("Sources -> Grafana"),
+                                DryRunRoute::DiskGrow => Some("Sources -> Disk Utilization"),
                                 DryRunRoute::InstanceAge => Some("Sources -> Instance Age"),
                                 DryRunRoute::Pingdom | DryRunRoute::Neither => None,
                             }
@@ -23404,6 +24293,7 @@ mod gui {
                     self.unhealthy_host_cfg.clone(),
                     self.instance_age_cfg.clone(),
                     self.grafana_cfg.clone(),
+                    self.disk_grow_cfg.clone(),
                     self.config.clone(),
                     self.options.mode.clone(),
                     ec2_manager::jsm_auth::escalation_mailbox(),
@@ -41968,6 +42858,17 @@ mod gui {
                             );
                         });
                     }
+                    if vis.disk_grow {
+                        ui.horizontal(|ui| {
+                            ui.label("Disk Utilization");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.checkbox(&mut self.oncall_filters.disk_grow, "");
+                                },
+                            );
+                        });
+                    }
                     if vis.alert_test {
                         ui.horizontal(|ui| {
                             ui.label("Alert Test");
@@ -42495,10 +43396,12 @@ mod gui {
                 self.poll_unhealthy_host_events();
                 self.poll_instance_age_events();
                 self.poll_grafana_events();
+                self.poll_disk_grow_events();
                 if self.pingdom.is_some()
                     || self.unhealthy_host.is_some()
                     || self.instance_age.is_some()
                     || self.grafana.is_some()
+                    || self.disk_grow.is_some()
                     || self.custom_alerts.is_some()
                 {
                     // The watcher runs on its own thread and does not need a
@@ -42834,6 +43737,7 @@ mod gui {
                                 (vis.instance_age, self.instance_age.is_some(), Fix::InstanceAge),
                                 (vis.grafana, self.grafana.is_some(), Fix::Grafana),
                                 (vis.custom_alerts, self.custom_alerts.is_some(), Fix::CustomAlerts),
+                                (vis.disk_grow, self.disk_grow.is_some(), Fix::DiskGrow),
                             ]
                             .into_iter()
                             .filter_map(|(listed, armed, fix)| listed.then_some((fix, armed)))
@@ -43598,6 +44502,7 @@ mod gui {
                     || self.script_status_highlight.is_some()
                     || self.unhealthy_host_notice.is_some()
                     || !self.unhealthy_host_refreshing.is_empty()
+                    || !self.disk_grow_growing.is_empty()
                     || self.instance_age_notice.is_some()
                     || !self.instance_age_protected_lines.is_empty()
                     || !cassandra_rows.is_empty()
@@ -43646,6 +44551,16 @@ mod gui {
                                 ui.label(notification_text(ui, c, text));
                             }
                             for (_, text) in self.unhealthy_host_refreshing.clone() {
+                                let c = flashing_yellow(ui);
+                                note_label(ui, c, text);
+                            }
+                            // One flashing line per volume being grown. Not
+                            // clearable (no x, and `has_clearable_status`
+                            // leaves it out): it ends with the incident.
+                            if !self.disk_grow_growing.is_empty() {
+                                ctx.request_repaint_after(Duration::from_millis(100));
+                            }
+                            for (_, text) in self.disk_grow_growing.clone() {
                                 let c = flashing_yellow(ui);
                                 note_label(ui, c, text);
                             }
@@ -46309,6 +47224,10 @@ mod gui {
         // the newest alerts, against minute-granular timers.
         const POLL: std::time::Duration = std::time::Duration::from_secs(30);
         const FETCH: u32 = 25;
+        // Disk grow takes its alerts from custom alerts only while it is
+        // armed for this user (see `custom_alerts_should_skip`).
+        let disk_grow_active =
+            features.disk_grow_enabled_for(&ec2_manager::features::current_os_user());
 
         let defs: ec2_manager::custom_alerts::SharedDefs =
             std::sync::Arc::new(std::sync::Mutex::new(initial));
@@ -46366,7 +47285,7 @@ mod gui {
                 match alerts::fetch_latest(&auth, FETCH) {
                     Ok(list) => {
                         for alert in &list {
-                            let claimed = !matches!(
+                            let claimed = custom_alerts_should_skip(
                                 dry_run_route(
                                     alert,
                                     &features.reaper,
@@ -46375,7 +47294,7 @@ mod gui {
                                     &features.instance_age,
                                     &features.grafana,
                                 ),
-                                DryRunRoute::Neither
+                                disk_grow_active,
                             );
                             let now_ms = monotonic_ms(started);
                             if let Considered::Watching { name } =
@@ -47940,6 +48859,1019 @@ mod gui {
             }
         });
         GrafanaRuntime { rx, _handle: handle }
+    }
+
+    /// What the disk-grow poll thread tells the UI.
+    enum DiskGrowEvent {
+        Note { level: LogLevel, message: String },
+        /// A volume grow began on `key` (the instance id); `text` is the
+        /// flashing toolbar line.
+        GrowStarted { key: String, text: String },
+        /// The incident on `key` is over, whichever way: drop its line.
+        GrowEnded { key: String },
+        Escalated { alert_id: String, detail: String, ok: bool },
+    }
+
+    struct DiskGrowRuntime {
+        rx: std::sync::mpsc::Receiver<DiskGrowEvent>,
+        _handle: std::thread::JoinHandle<()>,
+    }
+
+    /// The entire payload of a disk-grow escalation: reaper's `RE-F` code and
+    /// the alert's own timestamp. The instance, volume, environment and
+    /// account never leave.
+    fn disk_grow_escalation_subject(created_at: &str) -> String {
+        ec2_manager::reaper::escalation_subject(
+            ec2_manager::reaper::OutcomeCode::Failure,
+            created_at,
+        )
+    }
+
+    /// What the owner path does to a box, decided from the alert and the box
+    /// alone.
+    ///
+    /// * not yet acknowledged: the full sequence (grow the volume, then the
+    ///   filesystem) unless the device is already ahead of the filesystem,
+    ///   in which case only the filesystem grow is left to do;
+    /// * already acknowledged: recovery only (somebody, or this app before a
+    ///   restart, already took it). Finish a filesystem grow the device is
+    ///   waiting on, and never resize a volume.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum NextMove {
+        Full,
+        FilesystemOnly,
+        Nothing,
+    }
+
+    fn disk_grow_next_move(acknowledged: bool, device_ahead: bool) -> NextMove {
+        match (acknowledged, device_ahead) {
+            (_, true) => NextMove::FilesystemOnly,
+            (false, false) => NextMove::Full,
+            (true, false) => NextMove::Nothing,
+        }
+    }
+
+    /// Consecutive polls a running incident's filesystem grow may come back
+    /// with no clear answer (SSM unreachable, the device not yet showing the
+    /// new size) before it is escalated. Never a reason to resize again.
+    const DISK_GROW_MAX_FS_UNKNOWN: u32 = 10;
+
+    /// Walk the growth options against `modify`, the one resize call.
+    ///
+    /// * accepted: that size;
+    /// * refused: the next option. A refusal may be local (not Live, a bad
+    ///   id) rather than AWS's, so the log carries the message verbatim and
+    ///   never says who refused;
+    /// * rate limited: stop and escalate. AWS allows one modification per
+    ///   volume per six hours, so the next size would be refused too;
+    /// * ambiguous (a timeout, an unparsed reply): NEVER another size. The
+    ///   first may have landed, and a second request would grow the volume
+    ///   twice. `read_size` decides: larger than `old_gib` is accepted,
+    ///   anything else (or no answer) escalates.
+    ///
+    /// No options at all (the volume is at its type's maximum) escalates.
+    fn disk_grow_resize(
+        options: &[ec2_manager::disk_grow::Growth],
+        old_gib: u64,
+        mut modify: impl FnMut(u64) -> std::result::Result<(), (ec2_manager::disk_grow::ModifyError, String)>,
+        mut read_size: impl FnMut() -> std::result::Result<u64, String>,
+        note: &dyn Fn(LogLevel, String),
+    ) -> std::result::Result<ec2_manager::disk_grow::Growth, String> {
+        use ec2_manager::disk_grow::{Growth, ModifyError};
+        if options.is_empty() {
+            return Err(format!(
+                "no larger size fits under the volume type's maximum ({old_gib} GiB now)"
+            ));
+        }
+        let mut refusals: Vec<String> = Vec::new();
+        for g in options {
+            match modify(g.new_gib) {
+                Ok(()) => return Ok(*g),
+                Err((ModifyError::Refused, msg)) => {
+                    note(
+                        LogLevel::Warn,
+                        format!("disk grow: modify-volume to {} GiB refused: {msg}", g.new_gib),
+                    );
+                    refusals.push(format!("{} GiB: {msg}", g.new_gib));
+                }
+                Err((ModifyError::RateLimited, msg)) => {
+                    return Err(format!(
+                        "modify-volume to {} GiB is rate limited (one modification per volume \
+                         per six hours), not retried: {msg}",
+                        g.new_gib
+                    ));
+                }
+                Err((ModifyError::Ambiguous, msg)) => {
+                    return match read_size() {
+                        Ok(now) if now > old_gib => {
+                            note(
+                                LogLevel::Warn,
+                                format!(
+                                    "disk grow: modify-volume to {} GiB gave no clear answer \
+                                     ({msg}) but the volume now reads {now} GiB — treating it \
+                                     as accepted",
+                                    g.new_gib
+                                ),
+                            );
+                            Ok(Growth { new_gib: now, kind: g.kind })
+                        }
+                        Ok(now) => Err(format!(
+                            "modify-volume to {} GiB gave no clear answer ({msg}) and the volume \
+                             still reads {now} GiB — not retried with another size",
+                            g.new_gib
+                        )),
+                        Err(e) => Err(format!(
+                            "modify-volume to {} GiB gave no clear answer ({msg}) and the size \
+                             could not be re-read ({e}) — not retried with another size",
+                            g.new_gib
+                        )),
+                    };
+                }
+            }
+        }
+        Err(format!("every size was refused: {}", refusals.join("; ")))
+    }
+
+    /// How a filesystem grow ended.
+    enum DiskGrowFs {
+        /// Grown, confirmed by a fresh probe, and the alert carries the
+        /// before/after comment.
+        Done,
+        /// No clear answer (SSM did not report back, the device does not show
+        /// the new size yet): try again next poll. Never a reason to resize.
+        Unknown(String),
+        /// A definite failure: escalate.
+        Failed(String),
+    }
+
+    /// Grow the XFS filesystem on `volume_id` at `mount`, prove it grew, and
+    /// comment on the owner alert with the `df -h` row before and after.
+    ///
+    /// The script's OK is not proof: `growpart` NOCHANGE and an
+    /// `xfs_growfs` that changed nothing both report it. So the box is read
+    /// first (`fs_plan`: the device must be ahead of the filesystem, or the
+    /// filesystem must already be larger than `fs_recorded`, the size before
+    /// the incident -- a grow that landed and whose answer was lost) and,
+    /// after a grow, again: the filesystem must be larger than recorded and
+    /// caught up with the device. The "after" row comes from that fresh probe
+    /// via `df_h_for_mount`, never from the script's output, and the comment
+    /// is the two rows and nothing else. The comment is part of the job: a
+    /// note that cannot be added is a failure.
+    fn disk_grow_fs_and_comment(
+        auth: &ec2_manager::alerts::AlertsAuth,
+        ctx: &AwsContext,
+        instance: &str,
+        inc: &FsTarget<'_>,
+        owner_alert: &str,
+    ) -> DiskGrowFs {
+        use ec2_manager::alerts;
+        disk_grow_fs_with(
+            || disk_grow_probe(ctx, instance),
+            |dev| disk_grow_run_fs(ctx, instance, dev),
+            |comment| alerts::add_note(auth, owner_alert, comment).map_err(|e| e.to_string()),
+            inc.volume_id,
+            inc.mount,
+            inc.df_before,
+            inc.fs_recorded,
+        )
+    }
+
+    /// Which filesystem, and what it looked like before the incident.
+    struct FsTarget<'a> {
+        volume_id: &'a str,
+        mount: &'a str,
+        df_before: &'a str,
+        fs_recorded: u64,
+    }
+
+    /// `disk_grow_fs_and_comment` over its three calls, so the decisions are
+    /// tested with scripted probes. `post` adds the note to the owner alert.
+    fn disk_grow_fs_with(
+        mut probe: impl FnMut() -> std::result::Result<ec2_manager::disk_grow::Probe, String>,
+        mut run_fs: impl FnMut(
+            &ec2_manager::disk_grow::DataDevice,
+        ) -> std::result::Result<ec2_manager::disk_grow::FsGrow, String>,
+        mut post: impl FnMut(&str) -> std::result::Result<(), String>,
+        volume_id: &str,
+        mount: &str,
+        df_before: &str,
+        fs_recorded: u64,
+    ) -> DiskGrowFs {
+        use ec2_manager::disk_grow as dg;
+        let before = match probe() {
+            Ok(p) => p,
+            Err(e) => return DiskGrowFs::Unknown(format!("reading the box before the grow: {e}")),
+        };
+        let dev = match dg::resolve_data_device(&before, volume_id) {
+            Ok(d) => d,
+            Err(e) => return DiskGrowFs::Failed(format!("finding {volume_id} on the box: {e}")),
+        };
+        if dev.mount != mount {
+            return DiskGrowFs::Failed(format!(
+                "{volume_id} is now mounted at {} rather than {mount}",
+                dev.mount
+            ));
+        }
+        let Some(fs_before) = dg::fs_bytes_for_mount(&before, mount) else {
+            return DiskGrowFs::Failed(format!("the box reports no filesystem size for {mount}"));
+        };
+        let after = match dg::fs_plan(dev.device_bytes, fs_before, fs_recorded) {
+            dg::FsPlan::NotYet => {
+                return DiskGrowFs::Unknown(format!(
+                    "the device under {mount} does not show the new size yet"
+                ))
+            }
+            // A grow already landed (its answer was lost): this probe is the
+            // fresh "after"; nothing is grown twice.
+            dg::FsPlan::AlreadyGrown => before,
+            dg::FsPlan::Grow => {
+                match run_fs(&dev) {
+                    Err(e) => {
+                        return DiskGrowFs::Unknown(format!(
+                            "the filesystem grow did not report back: {e}"
+                        ))
+                    }
+                    Ok(dg::FsGrow::Failed(why)) => {
+                        return DiskGrowFs::Failed(format!("the filesystem grow failed: {why}"))
+                    }
+                    // Not proof on its own; the fresh probe below decides.
+                    Ok(dg::FsGrow::Grown { .. }) => {}
+                }
+                match probe() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return DiskGrowFs::Unknown(format!("reading the box after the grow: {e}"))
+                    }
+                }
+            }
+        };
+        let after_dev = match dg::resolve_data_device(&after, volume_id) {
+            Ok(d) => d,
+            Err(e) => {
+                return DiskGrowFs::Failed(format!("finding {volume_id} after the grow: {e}"))
+            }
+        };
+        let Some(fs_after) = dg::fs_bytes_for_mount(&after, mount) else {
+            return DiskGrowFs::Failed(format!("the box reports no filesystem size for {mount}"));
+        };
+        if fs_after <= fs_recorded || dg::device_ahead_of_fs(after_dev.device_bytes, fs_after) {
+            return DiskGrowFs::Failed(format!(
+                "the grow reported OK but the filesystem at {mount} did not grow to fill the \
+                 device ({fs_recorded} -> {fs_after} bytes, device {} bytes)",
+                after_dev.device_bytes
+            ));
+        }
+        let df_after = match dg::df_h_for_mount(&after.df_h, mount) {
+            Some(d) => d,
+            None => return DiskGrowFs::Failed(format!("no df -h row for {mount} after the grow")),
+        };
+        let comment = dg::alert_comment(df_before, &df_after);
+        if let Err(e) = post(&comment) {
+            return DiskGrowFs::Failed(format!(
+                "the filesystem grew but the alert comment could not be added: {e}"
+            ));
+        }
+        DiskGrowFs::Done
+    }
+
+    /// The poll's bound on consecutive no-clear-answer filesystem grows.
+    fn disk_grow_unknown_exhausted(count: u32) -> bool {
+        count >= DISK_GROW_MAX_FS_UNKNOWN
+    }
+
+    /// How one owner-path run of the grow chain ended.
+    enum GrowOnce {
+        /// An incident to time: a resize was accepted (phase Modifying), or
+        /// the filesystem was grown onto a device already ahead of it (phase
+        /// Optimizing, `fs_grown`). Either way the caller sends `GrowStarted`
+        /// and `state.start`s it at once.
+        Started(Box<ec2_manager::disk_grow::Incident>),
+        /// Recovery on an already-acknowledged alert found nothing to do.
+        Nothing(String),
+        /// A step failed; the text names it. Escalate once.
+        Failed(String),
+    }
+
+    /// The owner path's whole chain, for the poll and for Run Remediation:
+    /// probe -> volumes -> choose the data volume -> find it on the box ->
+    /// the "before" `df -h` row -> either the filesystem grow alone (the
+    /// device is already ahead of its filesystem) or the resize.
+    ///
+    /// It never acknowledges (the caller does, first) and an
+    /// already-acknowledged alert never reaches the resize: that is
+    /// `disk_grow_next_move`'s table.
+    fn disk_grow_grow_once(
+        auth: &ec2_manager::alerts::AlertsAuth,
+        ctx: &AwsContext,
+        mode: &Mode,
+        alert: &ec2_manager::alerts::Alert,
+        facts: &ec2_manager::instance_age::AlertFacts,
+        now_ms: u64,
+        note: &dyn Fn(LogLevel, String),
+    ) -> GrowOnce {
+        use ec2_manager::disk_grow as dg;
+        let instance = facts.instance_id.as_str();
+        let tag = format!("disk grow: {} ({instance})", alert.id);
+        let fail = |step: &str, e: String| GrowOnce::Failed(format!("{step}: {e}"));
+
+        let probe = match disk_grow_probe(ctx, instance) {
+            Ok(p) => p,
+            Err(e) => return fail("reading the box over SSM", e),
+        };
+        let (volumes, root) = match disk_grow_volumes(ctx, instance) {
+            Ok(v) => v,
+            Err(e) => return fail("listing the instance's volumes", e),
+        };
+        let volume = match dg::choose_volume(&volumes, &root) {
+            Ok(v) => v,
+            Err(e) => return fail("choosing the data volume", e),
+        };
+        let dev = match dg::resolve_data_device(&probe, &volume.id) {
+            Ok(d) => d,
+            Err(e) => return fail("finding the data volume on the box", e),
+        };
+        let df_before = match dg::df_h_for_mount(&probe.df_h, &dev.mount) {
+            Some(d) => d,
+            None => return fail("reading df -h", format!("no row for {}", dev.mount)),
+        };
+        let Some(fs_bytes) = dg::fs_bytes_for_mount(&probe, &dev.mount) else {
+            return fail("reading the filesystem size", format!("none reported for {}", dev.mount));
+        };
+        let device_ahead = dg::device_ahead_of_fs(dev.device_bytes, fs_bytes);
+        if dev.mount != "/data" {
+            // Logged locally only; never part of the alert comment.
+            note(
+                LogLevel::Info,
+                format!("{tag} — the data volume is mounted at {}, not /data; growing it anyway", dev.mount),
+            );
+        }
+        note(
+            LogLevel::Info,
+            format!(
+                "{tag} — data volume {} ({} GiB {}) is {} at {}",
+                volume.id, volume.size_gib, volume.volume_type, dev.disk, dev.mount
+            ),
+        );
+        let incident = |phase: dg::Phase, fs_grown: bool| {
+            GrowOnce::Started(Box::new(dg::Incident {
+                instance: instance.to_string(),
+                owner_alert: alert.id.clone(),
+                created_at: alert.created_at.clone(),
+                volume_id: volume.id.clone(),
+                df_before: df_before.clone(),
+                mount: dev.mount.clone(),
+                started_ms: now_ms,
+                phase,
+                fs_grown,
+                fs_bytes_before: fs_bytes,
+                facts: facts.clone(),
+            }))
+        };
+        match disk_grow_next_move(dg::alert_acknowledged(alert), device_ahead) {
+            // Already acknowledged and nothing to grow on the box yet. If a
+            // modification is under way (this app resized, then restarted),
+            // track it so the filesystem is grown once it is usable. Never
+            // a resize here.
+            NextMove::Nothing => {
+                let state = volume_modification_state(ctx, &volume.id);
+                if state == Ok(dg::ModState::Failed) {
+                    // Possibly months old and not ours: said once, nothing done.
+                    note(
+                        LogLevel::Warn,
+                        format!(
+                            "{tag} — already acknowledged; {}'s last modification failed. Not \
+                             one this run started, so nothing is done and nothing pages",
+                            volume.id
+                        ),
+                    );
+                }
+                match dg::recovery(&state, dev.device_bytes, volume.size_gib) {
+                    dg::Recovery::Track => {
+                        note(
+                            LogLevel::Warn,
+                            format!(
+                                "{tag} — already acknowledged and {} is mid-modification; \
+                                 recovering: the filesystem is grown once the new size is usable \
+                                 (no resize)",
+                                volume.id
+                            ),
+                        );
+                        incident(dg::Phase::Modifying, false)
+                    }
+                    dg::Recovery::Nothing(why) => GrowOnce::Nothing(format!(
+                        "{tag} — already acknowledged and {why}; nothing to do (an acknowledged \
+                         alert is never resized)"
+                    )),
+                    dg::Recovery::Failed(why) => fail("checking for a grow to recover", why),
+                }
+            }
+            NextMove::FilesystemOnly => {
+                note(
+                    LogLevel::Warn,
+                    format!(
+                        "{tag} — the device is already larger than its filesystem; skipping the \
+                         resize and growing the filesystem only"
+                    ),
+                );
+                let target = FsTarget {
+                    volume_id: &volume.id,
+                    mount: &dev.mount,
+                    df_before: &df_before,
+                    fs_recorded: fs_bytes,
+                };
+                match disk_grow_fs_and_comment(auth, ctx, instance, &target, &alert.id) {
+                    DiskGrowFs::Done => {
+                        note(
+                            LogLevel::Info,
+                            format!("{tag} — filesystem at {} grown and the alert commented", dev.mount),
+                        );
+                        incident(dg::Phase::Optimizing, true)
+                    }
+                    DiskGrowFs::Unknown(e) => fail("growing the filesystem (no clear answer)", e),
+                    DiskGrowFs::Failed(e) => fail("growing the filesystem", e),
+                }
+            }
+            NextMove::Full => {
+                // Read the volume's modification state before any resize. A
+                // modification already in flight (a manual run, a grow from
+                // before a restart, or one still optimizing past the 12h
+                // ceiling) is recovered, never resized again: a second
+                // modify-volume would race it and be refused, which pages.
+                let state = volume_modification_state(ctx, &volume.id);
+                match dg::resize_gate(&state) {
+                    dg::ResizeGate::Unreadable(e) => {
+                        return fail("reading the volume's modification state", e)
+                    }
+                    dg::ResizeGate::InFlight => {
+                        return match dg::recovery(&state, dev.device_bytes, volume.size_gib) {
+                            dg::Recovery::Track => {
+                                note(
+                                    LogLevel::Warn,
+                                    format!(
+                                        "{tag} — {} is already being modified; tracking it \
+                                         (no resize): the filesystem is grown once the new size \
+                                         is usable",
+                                        volume.id
+                                    ),
+                                );
+                                incident(dg::Phase::Modifying, false)
+                            }
+                            // The poll has already acknowledged the alert, so
+                            // doing nothing here would be silent: escalate.
+                            dg::Recovery::Nothing(why) => fail(
+                                "a modification is in flight and there is nothing to track",
+                                format!("{} is already being modified and {why}", volume.id),
+                            ),
+                            dg::Recovery::Failed(why) => {
+                                fail("checking the modification in flight", why)
+                            }
+                        };
+                    }
+                    dg::ResizeGate::Resize => {}
+                }
+                let options = dg::growth_options(&volume);
+                match disk_grow_resize(
+                    &options,
+                    volume.size_gib,
+                    |gib| modify_volume(ctx, &volume.id, gib, mode),
+                    || volume_size_gib(ctx, &volume.id),
+                    note,
+                ) {
+                    Ok(g) => {
+                        note(
+                            LogLevel::Warn,
+                            format!(
+                                "{tag} — {} resized {} -> {} GiB; waiting for the new size to \
+                                 become usable",
+                                volume.id, volume.size_gib, g.new_gib
+                            ),
+                        );
+                        incident(dg::Phase::Modifying, false)
+                    }
+                    Err(e) => fail("resizing the volume", e),
+                }
+            }
+        }
+    }
+
+    /// Whether a NEW incident may start this poll. Off call, or unable to
+    /// tell, starts nothing. An incident already running is not affected: it
+    /// was acknowledged by this machine and must be finished by it.
+    fn disk_grow_on_call_decision(lookup: std::result::Result<bool, String>) -> (bool, String) {
+        match lookup {
+            Ok(true) => (true, "disk grow: on call — watching the feed".to_string()),
+            Ok(false) => (
+                false,
+                "disk grow: off call — no new incident starts; anything already running finishes"
+                    .to_string(),
+            ),
+            Err(e) => (
+                false,
+                format!(
+                    "disk grow: on-call lookup failed ({e}) — treating as off call, so no new \
+                     incident starts"
+                ),
+            ),
+        }
+    }
+
+    /// Why the disk-grow watcher is or is not running, one line per fact.
+    /// The mailbox address is never put in a line (only whether there is
+    /// one): the app log gets pasted into tickets.
+    fn disk_grow_gate_report(
+        user: &str,
+        cfg: &ec2_manager::features::DiskGrowFeature,
+        mode: &Mode,
+        auth_ok: bool,
+        mailbox_ok: bool,
+    ) -> (bool, Vec<(bool, String)>) {
+        let off = |why: String| (false, vec![(false, format!("disk grow: off — {why}"))]);
+        if !cfg.enabled {
+            return off("disk_grow.enabled is false in this build".to_string());
+        }
+        if !cfg.is_allowed_user(user) {
+            return off(format!(
+                "os_user '{user}' is not on disk_grow.allowed_users (note '*' is deliberately \
+                 not honoured here)"
+            ));
+        }
+        if *mode != Mode::Live {
+            return off(format!(
+                "the app is in {} mode, not Live. Every AWS read and write here needs Live",
+                mode.as_str()
+            ));
+        }
+        if !auth_ok {
+            return off("no JSM credentials resolved, so the alert feed cannot be read".to_string());
+        }
+        if !mailbox_ok {
+            return off(
+                "no escalation mailbox is configured. It stays dark rather than running \
+                 acknowledge-only: silencing a live page and then never being able to ring is \
+                 worse than doing nothing"
+                    .to_string(),
+            );
+        }
+        let mut lines = Vec::new();
+        if cfg.has_multiple_users() {
+            lines.push((
+                true,
+                "disk_grow.allowed_users names more than one user; both machines will \
+                 acknowledge and both will grow the same volume"
+                    .to_string(),
+            ));
+        }
+        let excluded: Vec<&str> = cfg
+            .excluded_environments
+            .iter()
+            .map(|e| e.trim())
+            .filter(|e| !e.is_empty())
+            .collect();
+        let excluded = if excluded.is_empty() {
+            "no environment is excluded".to_string()
+        } else {
+            format!("excluded environment(s): {}", excluded.join(", "))
+        };
+        lines.push((
+            false,
+            format!(
+                "disk grow: armed, ON CALL ONLY — polling every {}s over the {} newest alert(s); \
+                 acknowledge, grow the volume, grow the filesystem, comment on the alert, and \
+                 escalate once on any failure (space given {} minute(s) to become usable, the \
+                 optimizing watch stops after {} minute(s)); {excluded}",
+                cfg.poll_interval().as_secs(),
+                cfg.alerts_per_poll(),
+                cfg.usable_wait().as_secs() / 60,
+                cfg.optimize_ceiling().as_secs() / 60,
+            ),
+        ));
+        (true, lines)
+    }
+
+    /// The disk-grow watcher's poll thread.
+    ///
+    /// **The order inside one poll is the design**: the pause switch, then
+    /// the failed-slot expiry and the on-call lookup, then the incidents
+    /// already running (they finish whether or not we are still on call),
+    /// and only then new alerts off the feed (on call only).
+    #[allow(clippy::too_many_arguments)]
+    fn start_disk_grow_poll(
+        auth: ec2_manager::alerts::AlertsAuth,
+        cfg: ec2_manager::features::DiskGrowFeature,
+        reaper_cfg: ec2_manager::features::ReaperFeature,
+        unhealthy_cfg: ec2_manager::features::UnhealthyHostFeature,
+        grafana_cfg: ec2_manager::features::GrafanaFeature,
+        app_config: ec2_manager::config::AppConfig,
+        mode: Mode,
+        mailbox: String,
+        in_flight: ReaperInFlight,
+    ) -> DiskGrowRuntime {
+        use ec2_manager::{alerts, disk_grow as dg, instance_age as ia, oncall, reaper};
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut state = dg::DiskGrowState::new();
+            let schedule_id = reaper_cfg.resolved_schedule_id();
+            let atlassian_id = reaper_cfg.resolved_atlassian_account_id();
+            let mut last_on_call: Option<bool> = None;
+            // Consecutive "no clear answer" filesystem grows, per instance.
+            let mut fs_unknown: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
+
+            let note = |level: LogLevel, message: String| {
+                let _ = tx.send(DiskGrowEvent::Note { level, message });
+            };
+
+            // Spawned, never run on this thread: `send_escalation_email`
+            // drives Outlook COM and takes seconds, and a hung mail client
+            // must not stall the watcher. A failed send is never retried, and
+            // the detail logged is "sent" or the failure -- never the address.
+            let escalate = |alert_id: &str, created_at: &str, why: &str| {
+                // The reason stays local; the email carries only the code
+                // and the time, and the mailbox never goes in a log line.
+                note(LogLevel::Error, format!("disk grow: {alert_id} — {why}; escalating once"));
+                let subject = disk_grow_escalation_subject(created_at);
+                let tx2 = tx.clone();
+                let mailbox2 = mailbox.clone();
+                let id = alert_id.to_string();
+                std::thread::spawn(move || {
+                    let (ok, detail) = match send_escalation_email(&mailbox2, &subject) {
+                        Ok(_) => (true, "sent".to_string()),
+                        Err(reason) => (false, reason),
+                    };
+                    let _ = tx2.send(DiskGrowEvent::Escalated { alert_id: id, detail, ok });
+                });
+            };
+
+            loop {
+                if ec2_manager::fix_pause::hold(ec2_manager::fix_pause::Fix::DiskGrow) {
+                    continue;
+                }
+                let now_ms = monotonic_ms(started);
+
+                // A failed incident holds its slot for a while, so the rest
+                // of that outage's alerts are duplicates rather than a fresh
+                // attempt and a fresh page each.
+                state.expire_failed(now_ms);
+
+                let (on_call, reason) = disk_grow_on_call_decision(
+                    oncall::is_on_call(&auth, &schedule_id, &atlassian_id)
+                        .map_err(|e| e.to_string()),
+                );
+                if last_on_call != Some(on_call) {
+                    note(if on_call { LogLevel::Info } else { LogLevel::Warn }, reason);
+                    last_on_call = Some(on_call);
+                }
+
+                let usable_wait_ms = cfg.usable_wait().as_millis() as u64;
+                let optimize_ceiling_ms = cfg.optimize_ceiling().as_millis() as u64;
+                fs_unknown.retain(|k, _| state.owner_of(k).is_some());
+
+                // 1. Incidents already running. These finish whether or not
+                //    we are still on call: stopping between the resize and the
+                //    filesystem grow would leave the volume grown and the
+                //    filesystem not.
+                for inc in state.incidents() {
+                    let elapsed_ms = now_ms.saturating_sub(inc.started_ms);
+                    let tag = format!("disk grow: {} ({})", inc.owner_alert, inc.instance);
+                    // The optimizing watch's own ceiling, checked before the
+                    // state is read, so an Unknown, regressed or unreadable
+                    // state cannot keep the line flashing for ever. The
+                    // filesystem is already grown in this phase.
+                    if inc.phase == dg::Phase::Optimizing && elapsed_ms >= optimize_ceiling_ms {
+                        note(
+                            LogLevel::Warn,
+                            format!(
+                                "{tag} — {} not reported completed after {} minute(s); the \
+                                 filesystem is already grown, so the watch stops here",
+                                inc.volume_id,
+                                optimize_ceiling_ms / 60_000
+                            ),
+                        );
+                        let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
+                        fs_unknown.remove(&inc.instance);
+                        state.finish(&inc.instance);
+                        continue;
+                    }
+                    let read = instance_age_context(&mode, &app_config, &inc.facts).and_then(|ctx| {
+                        volume_modification_state(&ctx, &inc.volume_id).map(|s| (ctx, s))
+                    });
+                    let (ctx, mod_state) = match read {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // Never read as complete. Retried next poll; only
+                            // before the filesystem is grown does the usable
+                            // wait still apply, so a state that stays
+                            // unreadable pages rather than waiting for ever.
+                            note(
+                                LogLevel::Warn,
+                                format!(
+                                    "{tag} — could not read modification state of {}, \
+                                     retrying: {e}",
+                                    inc.volume_id
+                                ),
+                            );
+                            if inc.phase == dg::Phase::Modifying && elapsed_ms >= usable_wait_ms {
+                                let why = format!(
+                                    "the modification state of {} could not be read within {} \
+                                     minute(s) of the resize",
+                                    inc.volume_id,
+                                    usable_wait_ms / 60_000
+                                );
+                                escalate(&inc.owner_alert, &inc.created_at, &why);
+                                let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
+                                fs_unknown.remove(&inc.instance);
+                                state.failed(&inc.instance, now_ms);
+                            }
+                            continue;
+                        }
+                    };
+                    match dg::transition(
+                        inc.phase,
+                        &mod_state,
+                        inc.fs_grown,
+                        elapsed_ms,
+                        usable_wait_ms,
+                        optimize_ceiling_ms,
+                    ) {
+                        dg::Transition::Wait => {}
+                        dg::Transition::GrowFilesystem => {
+                            let target = FsTarget {
+                                volume_id: &inc.volume_id,
+                                mount: &inc.mount,
+                                df_before: &inc.df_before,
+                                fs_recorded: inc.fs_bytes_before,
+                            };
+                            match disk_grow_fs_and_comment(
+                                &auth,
+                                &ctx,
+                                &inc.instance,
+                                &target,
+                                &inc.owner_alert,
+                            ) {
+                                DiskGrowFs::Done => {
+                                    note(
+                                        LogLevel::Info,
+                                        format!(
+                                            "{tag} — filesystem at {} grown and the alert \
+                                             commented; watching {} until it completes",
+                                            inc.mount, inc.volume_id
+                                        ),
+                                    );
+                                    state.fs_grown(&inc.instance);
+                                    state.set_phase(&inc.instance, dg::Phase::Optimizing);
+                                    fs_unknown.remove(&inc.instance);
+                                }
+                                // No clear answer: retry next poll. Never
+                                // another resize; bounded, then escalated.
+                                DiskGrowFs::Unknown(e) => {
+                                    let n = fs_unknown.entry(inc.instance.clone()).or_insert(0);
+                                    *n += 1;
+                                    if disk_grow_unknown_exhausted(*n) {
+                                        let why = format!(
+                                            "the filesystem grow gave no clear answer {} polls \
+                                             running: {e}",
+                                            *n
+                                        );
+                                        escalate(&inc.owner_alert, &inc.created_at, &why);
+                                        let _ = tx.send(DiskGrowEvent::GrowEnded {
+                                            key: inc.instance.clone(),
+                                        });
+                                        fs_unknown.remove(&inc.instance);
+                                        state.failed(&inc.instance, now_ms);
+                                    } else {
+                                        note(
+                                            LogLevel::Warn,
+                                            format!(
+                                                "{tag} — filesystem grow: {e}; retrying next poll \
+                                                 ({}/{DISK_GROW_MAX_FS_UNKNOWN})",
+                                                *n
+                                            ),
+                                        );
+                                    }
+                                }
+                                DiskGrowFs::Failed(why) => {
+                                    escalate(&inc.owner_alert, &inc.created_at, &why);
+                                    let _ = tx.send(DiskGrowEvent::GrowEnded {
+                                        key: inc.instance.clone(),
+                                    });
+                                    fs_unknown.remove(&inc.instance);
+                                    state.failed(&inc.instance, now_ms);
+                                }
+                            }
+                        }
+                        dg::Transition::Complete => {
+                            note(
+                                LogLevel::Info,
+                                format!("{tag} — {} completed; the incident is over", inc.volume_id),
+                            );
+                            let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
+                            fs_unknown.remove(&inc.instance);
+                            state.finish(&inc.instance);
+                        }
+                        dg::Transition::Escalate(why) => {
+                            escalate(&inc.owner_alert, &inc.created_at, &why);
+                            let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
+                            fs_unknown.remove(&inc.instance);
+                            state.failed(&inc.instance, now_ms);
+                        }
+                        dg::Transition::StopFlashing(why) => {
+                            note(LogLevel::Warn, format!("{tag} — {why}"));
+                            let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
+                            fs_unknown.remove(&inc.instance);
+                            state.finish(&inc.instance);
+                        }
+                    }
+                }
+
+                // 2. New alerts, on call only.
+                if on_call {
+                    match alerts::fetch_latest(&auth, cfg.alerts_per_poll()) {
+                        Ok(list) => {
+                            let mut claimed = 0usize;
+                            for listed in &list {
+                                if !dg::claims(listed, &reaper_cfg, &unhealthy_cfg, &grafana_cfg) {
+                                    continue;
+                                }
+                                if reaper::alert_is_closed(&listed.status)
+                                    || state.is_seen(&listed.id)
+                                {
+                                    continue;
+                                }
+                                // The shared in-flight set Run Remediation
+                                // claims: an alert a person is remediating is
+                                // skipped WITHOUT being marked seen, so the
+                                // next poll looks again. Otherwise the poll
+                                // holds it itself for the whole chain
+                                // (released on Drop at the end of this pass).
+                                let Some(_claim) = claim_in_flight(&in_flight, &listed.id) else {
+                                    note(
+                                        LogLevel::Info,
+                                        format!(
+                                            "disk grow: {} is being remediated by hand — left \
+                                             to that run this poll",
+                                            listed.id
+                                        ),
+                                    );
+                                    continue;
+                                };
+                                // The list omits `description`, where the
+                                // instance, account and environment live. A
+                                // failed read is not marked seen, so the next
+                                // poll tries again.
+                                let alert = match alerts::fetch_alert(&auth, &listed.id) {
+                                    Ok(a) => a,
+                                    Err(e) => {
+                                        note(
+                                            LogLevel::Warn,
+                                            format!(
+                                                "disk grow: could not read {} in full: {e} — \
+                                                 will retry next poll",
+                                                listed.id
+                                            ),
+                                        );
+                                        continue;
+                                    }
+                                };
+                                state.mark_seen(&alert.id);
+                                if reaper::alert_is_closed(&alert.status) {
+                                    continue;
+                                }
+                                claimed += 1;
+                                let facts = ia::parse_facts(&alert.description);
+                                // An environment nothing can be decided from
+                                // might be an excluded one: while anything is
+                                // excluded, leave it alone entirely. Already
+                                // marked seen, so this is said once.
+                                if cfg.names_any_exclusion() && dg::environment_unreadable(&facts.environment) {
+                                    note(
+                                        LogLevel::Warn,
+                                        format!(
+                                            "disk grow: {} — its environment cannot be read \
+                                             ({:?}) and environments are excluded here, so it \
+                                             is left alone for a person: not acknowledged, \
+                                             not grown",
+                                            alert.id,
+                                            facts.environment.trim()
+                                        ),
+                                    );
+                                    continue;
+                                }
+                                // Excluded: nothing at all -- no acknowledge,
+                                // no comment, no escalation.
+                                if cfg.excludes(&facts.environment) {
+                                    note(
+                                        LogLevel::Info,
+                                        format!(
+                                            "disk grow: {} is in excluded environment {} — left \
+                                             alone",
+                                            alert.id,
+                                            facts.environment.trim()
+                                        ),
+                                    );
+                                    continue;
+                                }
+                                // Local, so decided before acknowledging (and
+                                // nothing is acknowledged). The alert is
+                                // already marked seen, so it pages once.
+                                let located = if facts.instance_id.is_empty() {
+                                    Err("the alert names no readable instance id".to_string())
+                                } else {
+                                    instance_age_context(&mode, &app_config, &facts)
+                                };
+                                let ctx = match located {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        let why = format!("cannot act on it: {e}");
+                                        escalate(&alert.id, &alert.created_at, &why);
+                                        continue;
+                                    }
+                                };
+                                let instance = facts.instance_id.clone();
+                                let begun = state.begin(&instance, &alert.id, now_ms);
+                                if begun != dg::Begin::Owner {
+                                    let why = match &begun {
+                                        dg::Begin::Duplicate { owner } => {
+                                            format!("{owner} already owns {instance}")
+                                        }
+                                        _ => format!("{instance} is held after a failed attempt"),
+                                    };
+                                    if !dg::alert_acknowledged(&alert) {
+                                        if let Err(e) = alerts::acknowledge_alert(&auth, &alert.id) {
+                                            note(
+                                                LogLevel::Warn,
+                                                format!(
+                                                    "disk grow: could not acknowledge {}: {e}",
+                                                    alert.id
+                                                ),
+                                            );
+                                        }
+                                    }
+                                    note(
+                                        LogLevel::Info,
+                                        format!(
+                                            "disk grow: {} acknowledged and ignored — {why}",
+                                            alert.id
+                                        ),
+                                    );
+                                    continue;
+                                }
+                                // Owner. Acknowledge FIRST, unless somebody
+                                // (or this app before a restart) already
+                                // did: then it is recovery only.
+                                if !dg::alert_acknowledged(&alert) {
+                                    if let Err(e) = alerts::acknowledge_alert(&auth, &alert.id) {
+                                        note(
+                                            LogLevel::Error,
+                                            format!(
+                                                "disk grow: could not acknowledge {}: {e} — \
+                                                 carrying on",
+                                                alert.id
+                                            ),
+                                        );
+                                    }
+                                }
+                                match disk_grow_grow_once(
+                                    &auth, &ctx, &mode, &alert, &facts, now_ms, &note,
+                                ) {
+                                    // Started on this thread straight after
+                                    // `begin`: `begin` does not reserve.
+                                    GrowOnce::Started(incident) => {
+                                        let _ = tx.send(DiskGrowEvent::GrowStarted {
+                                            key: instance.clone(),
+                                            text: format!("{instance} growing"),
+                                        });
+                                        state.start(*incident);
+                                    }
+                                    GrowOnce::Nothing(why) => note(LogLevel::Info, why),
+                                    GrowOnce::Failed(why) => {
+                                        escalate(&alert.id, &alert.created_at, &why);
+                                        state.failed(&instance, now_ms);
+                                    }
+                                }
+                            }
+                            note(
+                                LogLevel::Debug,
+                                format!(
+                                    "disk grow: polled {} alert(s), {claimed} claimed, {} \
+                                     incident(s) running",
+                                    list.len(),
+                                    state.incidents().len()
+                                ),
+                            );
+                        }
+                        Err(e) => note(
+                            LogLevel::Warn,
+                            format!("disk grow: could not read the alert feed: {e}"),
+                        ),
+                    }
+                }
+
+                std::thread::sleep(cfg.poll_interval());
+            }
+        });
+        DiskGrowRuntime { rx, _handle: handle }
     }
 
     /// Seam over the two alert-API calls the remediation sequence makes
@@ -62267,7 +64199,7 @@ mod gui {
 
         #[test]
         fn ticking_reaper_down_narrows_the_log_to_that_script() {
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false, disk_grow: false };
             assert!(only_reaper.any());
             assert!(only_reaper.includes(LogSource::ReaperDown));
             assert!(!only_reaper.includes(LogSource::App));
@@ -62278,7 +64210,7 @@ mod gui {
             // The popup shuts as soon as it is used, so without this the only
             // evidence that most of the log is being hidden is the log being
             // short — which reads as the app having stopped logging.
-            assert_eq!(OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false }.label(), "Sources: Reaper Down");
+            assert_eq!(OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false, disk_grow: false }.label(), "Sources: Reaper Down");
         }
 
         #[test]
@@ -62299,7 +64231,7 @@ mod gui {
 
             // And that tag is what the dropdown filters on — asserted through
             // the same predicate the panel uses, not a reimplementation of it.
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false, disk_grow: false };
             let kept: Vec<&str> = app
                 .logs
                 .iter()
@@ -62314,7 +64246,7 @@ mod gui {
             // The two filters are independent and both on screen. A DEBUG
             // reaper line with DEBUG unticked stays hidden, the same as any
             // other DEBUG line.
-            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
+            let only_reaper = OnCallFilters { reaper_down: true, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false, disk_grow: false };
             let mut levels = LogFilters::default();
             levels.set_verbosity_low();
             assert!(!levels.includes(LogLevel::Debug));
@@ -64021,10 +65953,190 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn a_manual_grafana_remediation_needs_the_grafana_list() {
-            assert!(manual_remediation_refusal(DryRunRoute::Grafana, false, false, true).is_none());
-            let refused = manual_remediation_refusal(DryRunRoute::Grafana, true, true, false)
+            assert!(manual_remediation_refusal(DryRunRoute::Grafana, false, false, true, false).is_none());
+            let refused = manual_remediation_refusal(DryRunRoute::Grafana, true, true, false, false)
                 .expect("refused");
             assert!(refused.contains("grafana.allowed_users"));
+        }
+
+        const DISK_TITLE: &str = "[EC2]: dev1-Cassandra-100-DiskUtilization-Warning";
+
+        fn populated_disk_grow_cfg() -> ec2_manager::features::DiskGrowFeature {
+            ec2_manager::features::DiskGrowFeature {
+                enabled: true,
+                allowed_users: listed(&["bconrad"]),
+                excluded_environments: listed(&["PROD"]),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn a_disk_utilization_alert_routes_to_disk_grow() {
+            use ec2_manager::features::*;
+            // The disk-grow claim reads only the title; the populated config
+            // is what a real site would hold, and must not change the route.
+            let route = dry_run_route(
+                &dry_run_alert(DISK_TITLE),
+                &ReaperFeature::default(),
+                &PingdomFeature::default(),
+                &UnhealthyHostFeature::default(),
+                &InstanceAgeFeature::default(),
+                &GrafanaFeature::default(),
+            );
+            assert_eq!(route, DryRunRoute::DiskGrow);
+            // The shipped instance-age rules sit below it and do not steal it.
+            let shipped = ec2_manager::features::load();
+            assert_eq!(
+                dry_run_route(
+                    &dry_run_alert(DISK_TITLE),
+                    &ReaperFeature::default(),
+                    &PingdomFeature::default(),
+                    &UnhealthyHostFeature::default(),
+                    &shipped.instance_age,
+                    &GrafanaFeature::default(),
+                ),
+                DryRunRoute::DiskGrow
+            );
+        }
+
+        #[test]
+        fn reaper_and_grafana_still_outrank_disk_grow() {
+            use ec2_manager::features::*;
+            // A title both claim: reaper wins (its title word plus a rule).
+            let reaper = ReaperFeature {
+                message_contains: "DiskUtilization".to_string(),
+                ..Default::default()
+            };
+            let reaper_title = "[EC2]: dev1-cassandra-reaper-DiskUtilization-Warning";
+            assert_eq!(
+                dry_run_route(
+                    &dry_run_alert(reaper_title),
+                    &reaper,
+                    &PingdomFeature::default(),
+                    &UnhealthyHostFeature::default(),
+                    &InstanceAgeFeature::default(),
+                    &GrafanaFeature::default(),
+                ),
+                DryRunRoute::Reaper
+            );
+            let grafana = GrafanaFeature {
+                title_contains: vec!["DiskUtilization".to_string()],
+                ..Default::default()
+            };
+            assert_eq!(
+                dry_run_route(
+                    &dry_run_alert(DISK_TITLE),
+                    &ReaperFeature::default(),
+                    &PingdomFeature::default(),
+                    &UnhealthyHostFeature::default(),
+                    &InstanceAgeFeature::default(),
+                    &grafana,
+                ),
+                DryRunRoute::Grafana
+            );
+        }
+
+        #[test]
+        fn instance_age_does_not_claim_a_disk_utilization_title() {
+            let shipped = ec2_manager::features::load();
+            assert!(!ec2_manager::instance_age::identifies(
+                &dry_run_alert(DISK_TITLE),
+                &shipped.instance_age
+            ));
+        }
+
+        #[test]
+        fn manual_remediation_refuses_disk_grow_for_a_user_off_the_list() {
+            assert!(
+                manual_remediation_refusal(DryRunRoute::DiskGrow, true, true, true, true).is_none()
+            );
+            let refused = manual_remediation_refusal(DryRunRoute::DiskGrow, true, true, true, false)
+                .expect("refused");
+            assert!(refused.contains("disk_grow.allowed_users"), "{refused}");
+            // And the other routes do not consult the disk-grow list.
+            assert!(
+                manual_remediation_refusal(DryRunRoute::Grafana, true, true, true, false).is_none()
+            );
+        }
+
+        #[test]
+        fn nothing_in_the_disk_grow_test_path_acknowledges_modifies_or_grows() {
+            let src = disk_grow_prod_src();
+            let from = src.find("fn start_alert_dry_run").expect("the dry-run fn");
+            let rest = &src[from..];
+            let start = rest.find("DryRunRoute::DiskGrow => {").expect("the dry-run arm");
+            let arm = &rest[start..];
+            let end = arm.find("DryRunRoute::Neither => {").expect("the next arm");
+            let arm = &arm[..end];
+            assert!(arm.contains("dry run:"), "the slice must be the dry-run arm");
+            for banned in [
+                "acknowledge_alert",
+                "modify_volume(",
+                "disk_grow_run_fs(",
+                "add_note(",
+                "disk_grow_grow_once(",
+                "disk_grow_fs_and_comment(",
+            ] {
+                assert!(!arm.contains(banned), "Test Alert Match must not call {banned}");
+            }
+            // It does read the box and report the plan.
+            assert!(arm.contains("disk_grow_probe("));
+            assert!(arm.contains("growth_options("));
+            assert!(arm.contains("device_ahead_of_fs("));
+        }
+
+        #[test]
+        fn disk_grow_remediation_refuses_an_excluded_environment() {
+            let cfg = populated_disk_grow_cfg();
+            let why = disk_grow_manual_env_refusal(&cfg, "prod").expect("refused");
+            assert!(why.contains("excluded"), "{why}");
+            assert!(why.contains("prod"), "{why}");
+            assert_eq!(disk_grow_manual_env_refusal(&cfg, "DEV1"), None);
+            // Nothing excluded: any environment, even blank, proceeds.
+            let open = ec2_manager::features::DiskGrowFeature::default();
+            assert_eq!(disk_grow_manual_env_refusal(&open, "PROD"), None);
+            assert_eq!(disk_grow_manual_env_refusal(&open, ""), None);
+        }
+
+        #[test]
+        fn disk_grow_remediation_refuses_an_unreadable_environment_while_anything_is_excluded() {
+            let cfg = populated_disk_grow_cfg();
+            for env in ["", "  ", "{{env}}", "&{%x%}%"] {
+                let why = disk_grow_manual_env_refusal(&cfg, env)
+                    .unwrap_or_else(|| panic!("{env:?} must be refused"));
+                assert!(why.contains("cannot be read"), "{why}");
+            }
+        }
+
+        #[test]
+        fn disk_grow_remediation_refuses_a_volume_mid_modification() {
+            use ec2_manager::disk_grow::{ModState, NO_MODIFICATION};
+            for s in [ModState::Modifying, ModState::Optimizing] {
+                let why = disk_grow_manual_state_refusal(&Ok(s.clone())).expect("refused");
+                assert!(why.contains("already being modified"), "{why}");
+                assert!(why.contains("poll"), "the reason names the race: {why}");
+            }
+            // Unknown and an unreadable state are refused too: nothing here
+            // can say no modification is in flight.
+            assert!(disk_grow_manual_state_refusal(&Ok(ModState::Unknown("x".into()))).is_some());
+            assert!(disk_grow_manual_state_refusal(&Err("boom".to_string())).is_some());
+            // Settled, or never modified: proceed.
+            assert_eq!(disk_grow_manual_state_refusal(&Ok(ModState::Completed)), None);
+            assert_eq!(disk_grow_manual_state_refusal(&Ok(ModState::Failed)), None);
+            assert_eq!(disk_grow_manual_state_refusal(&Err(NO_MODIFICATION.to_string())), None);
+        }
+
+        #[test]
+        fn the_manual_disk_grow_runs_the_shared_chain_and_refuses_first() {
+            let body = disk_grow_fn_body(disk_grow_prod_src(), "fn run_disk_grow_remediation(");
+            let claim = body.find("claim_in_flight(").expect("in-flight claim");
+            let env = body.find("disk_grow_manual_env_refusal(").expect("env refusal");
+            let state = body.find("disk_grow_manual_state_refusal(").expect("state refusal");
+            let ack = body.find("acknowledge_alert(").expect("ack");
+            let chain = body.find("disk_grow_grow_once(").expect("the shared chain");
+            assert!(claim < env && env < state && state < ack && ack < chain, "{body}");
+            assert!(!body.contains("modify_volume("), "the resize lives in the shared chain only");
+            assert!(body.contains("if on_call"), "acknowledges only on call");
         }
 
         fn dry_run_instance_age_cfg() -> ec2_manager::features::InstanceAgeFeature {
@@ -64045,13 +66157,13 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         #[test]
         fn manual_remediation_is_refused_unless_the_alert_type_has_a_fix_you_may_run() {
             use DryRunRoute::*;
-            assert_eq!(manual_remediation_refusal(Reaper, false, false, false), None);
-            assert_eq!(manual_remediation_refusal(UnhealthyHost, true, false, false), None);
-            assert!(manual_remediation_refusal(UnhealthyHost, false, true, false).is_some());
-            assert_eq!(manual_remediation_refusal(InstanceAge, false, true, false), None);
-            assert!(manual_remediation_refusal(InstanceAge, true, false, false).is_some());
-            assert!(manual_remediation_refusal(Pingdom, true, true, false).is_some());
-            assert!(manual_remediation_refusal(Neither, true, true, false).is_some());
+            assert_eq!(manual_remediation_refusal(Reaper, false, false, false, false), None);
+            assert_eq!(manual_remediation_refusal(UnhealthyHost, true, false, false, false), None);
+            assert!(manual_remediation_refusal(UnhealthyHost, false, true, false, false).is_some());
+            assert_eq!(manual_remediation_refusal(InstanceAge, false, true, false, false), None);
+            assert!(manual_remediation_refusal(InstanceAge, true, false, false, false).is_some());
+            assert!(manual_remediation_refusal(Pingdom, true, true, false, false).is_some());
+            assert!(manual_remediation_refusal(Neither, true, true, false, false).is_some());
         }
 
         /// The confirmation must hand off to the router, not straight to the
@@ -64661,6 +66773,111 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert_eq!(hits.len(), 1, "{needle} must appear once, found at lines {hits:?}");
         }
 
+        #[test]
+        fn modify_volume_has_exactly_one_call_site() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let needle = format!("\"modify-{}\"", "volume");
+            let hits: Vec<usize> = src
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| !l.trim_start().starts_with("//") && l.contains(&needle))
+                .map(|(n, _)| n + 1)
+                .collect();
+            assert_eq!(hits.len(), 1, "{needle} must appear once, found at lines {hits:?}");
+        }
+
+        fn disk_grow_test_ctx() -> AwsContext {
+            AwsContext {
+                mode: Mode::Live,
+                profile: "nonexistent-test-profile".to_string(),
+                account_id: None,
+                arn: None,
+                user_id: None,
+                region: "us-east-1".to_string(),
+                auth_status: AuthStatus::Ok,
+            }
+        }
+
+        #[test]
+        fn modify_volume_refuses_outside_live_mode_and_a_bad_volume_id() {
+            let ctx = disk_grow_test_ctx();
+            let (kind, msg) = modify_volume(&ctx, "vol-0123456789abcdef0", 100, &Mode::Sim).unwrap_err();
+            assert_eq!(kind, ec2_manager::disk_grow::ModifyError::Refused);
+            assert!(msg.contains("Live"), "{msg}");
+            for bad in ["vol-x;rm", "vol-", "vol-0123456789abcdef012", "i-0123456789abcdef0", ""] {
+                let (kind, msg) = modify_volume(&ctx, bad, 100, &Mode::Live).unwrap_err();
+                assert_eq!(kind, ec2_manager::disk_grow::ModifyError::Refused, "{bad}");
+                assert!(msg.contains("not a volume id"), "{msg}");
+            }
+        }
+
+        #[test]
+        fn the_volume_list_parser_reads_a_describe_volumes_reply() {
+            let raw = r#"{"Volumes":[
+              {"VolumeId":"vol-0aaa1111bbbb2222c","Size":30,"VolumeType":"gp3",
+               "Attachments":[{"InstanceId":"i-0123456789abcdef0","Device":"/dev/xvda","State":"attached"}]},
+              {"VolumeId":"vol-0ddd3333eeee4444f","Size":200,"VolumeType":"io1",
+               "Attachments":[{"InstanceId":"i-0123456789abcdef0","Device":"/dev/sdf","State":"attached"}]}]}"#;
+            let v = parse_disk_grow_volumes(raw, "i-0123456789abcdef0").unwrap();
+            assert_eq!(v.len(), 2);
+            assert_eq!(v[0].id, "vol-0aaa1111bbbb2222c");
+            assert_eq!(v[0].size_gib, 30);
+            assert_eq!(v[0].volume_type, "gp3");
+            assert_eq!(v[0].device, "/dev/xvda");
+            assert_eq!(v[1].size_gib, 200);
+            assert_eq!(v[1].device, "/dev/sdf");
+            assert!(parse_disk_grow_volumes("not json", "i-0123456789abcdef0").is_err());
+            assert!(parse_disk_grow_volumes("{}", "i-0123456789abcdef0").is_err());
+            assert!(parse_disk_grow_volumes(r#"{"Volumes":[]}"#, "i-0123456789abcdef0").unwrap().is_empty());
+        }
+
+        #[test]
+        fn a_volume_with_no_usable_size_fails_the_whole_parse() {
+            for size in ["", r#","Size":"big""#, r#","Size":null"#] {
+                let raw = format!(
+                    r#"{{"Volumes":[{{"VolumeId":"vol-0aaa1111bbbb2222c","VolumeType":"gp3"{size},
+                    "Attachments":[{{"InstanceId":"i-0123456789abcdef0","Device":"/dev/xvda","State":"attached"}}]}}]}}"#
+                );
+                let e = parse_disk_grow_volumes(&raw, "i-0123456789abcdef0").unwrap_err();
+                assert!(e.contains("vol-0aaa1111bbbb2222c"), "{e}");
+            }
+        }
+
+        #[test]
+        fn the_device_comes_from_this_instances_attachment_on_a_multi_attach_volume() {
+            let raw = r#"{"Volumes":[{"VolumeId":"vol-0aaa1111bbbb2222c","Size":100,"VolumeType":"io2",
+              "Attachments":[
+               {"InstanceId":"i-0fffffffffffffff0","Device":"/dev/xvda","State":"attached"},
+               {"InstanceId":"i-0123456789abcdef0","Device":"/dev/sdg","State":"attached"}]}]}"#;
+            let v = parse_disk_grow_volumes(raw, "i-0123456789abcdef0").unwrap();
+            assert_eq!(v[0].device, "/dev/sdg");
+        }
+
+        #[test]
+        fn a_volume_not_cleanly_attached_to_this_instance_is_an_error() {
+            let raw = r#"{"Volumes":[{"VolumeId":"vol-0aaa1111bbbb2222c","Size":100,"VolumeType":"gp3",
+              "Attachments":[{"InstanceId":"i-0123456789abcdef0","Device":"/dev/sdf","State":"detaching"}]}]}"#;
+            let e = parse_disk_grow_volumes(raw, "i-0123456789abcdef0").unwrap_err();
+            assert!(e.contains("detaching") && e.contains("vol-0aaa1111bbbb2222c"), "{e}");
+            let other = r#"{"Volumes":[{"VolumeId":"vol-0aaa1111bbbb2222c","Size":100,"VolumeType":"gp3",
+              "Attachments":[{"InstanceId":"i-0fffffffffffffff0","Device":"/dev/sdf","State":"attached"}]}]}"#;
+            let e = parse_disk_grow_volumes(other, "i-0123456789abcdef0").unwrap_err();
+            assert!(e.contains("vol-0aaa1111bbbb2222c"), "{e}");
+            let none = r#"{"Volumes":[{"VolumeId":"vol-0aaa1111bbbb2222c","Size":100,"VolumeType":"gp3","Attachments":[]}]}"#;
+            assert!(parse_disk_grow_volumes(none, "i-0123456789abcdef0").is_err());
+        }
+
+        #[test]
+        fn the_size_and_root_device_parsers_read_their_replies() {
+            assert_eq!(parse_volume_size_gib(r#"{"Volumes":[{"Size":250}]}"#), Ok(250));
+            assert!(parse_volume_size_gib(r#"{"Volumes":[]}"#).is_err());
+            assert!(parse_volume_size_gib("garbage").is_err());
+            let inst = r#"{"Reservations":[{"Instances":[{"RootDeviceName":"/dev/xvda"}]}]}"#;
+            assert_eq!(parse_root_device_name(inst), Ok("/dev/xvda".to_string()));
+            assert!(parse_root_device_name(r#"{"Reservations":[]}"#).is_err());
+        }
+
         /// `start-instance-refresh` reaches `aws` from exactly one function,
         /// which re-checks Live mode and the ASG name itself.
         #[test]
@@ -65200,7 +67417,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn the_on_call_filter_can_narrow_the_log_to_pingdom() {
-            let only_pingdom = OnCallFilters { reaper_down: false, pingdom: true, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
+            let only_pingdom = OnCallFilters { reaper_down: false, pingdom: true, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false, disk_grow: false };
             assert!(only_pingdom.includes(LogSource::Pingdom));
             assert!(!only_pingdom.includes(LogSource::ReaperDown));
             assert!(!only_pingdom.includes(LogSource::App));
@@ -65210,7 +67427,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         #[test]
         fn nothing_ticked_still_shows_the_pingdom_lines() {
             // A dropdown nobody opens must not remove anything from view.
-            let none = OnCallFilters { reaper_down: false, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
+            let none = OnCallFilters { reaper_down: false, pingdom: false, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false, disk_grow: false };
             assert!(none.includes(LogSource::Pingdom));
             assert!(none.includes(LogSource::ReaperDown));
             assert!(none.includes(LogSource::App));
@@ -65219,7 +67436,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn both_ticked_shows_both_and_says_so() {
-            let both = OnCallFilters { reaper_down: true, pingdom: true, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false };
+            let both = OnCallFilters { reaper_down: true, pingdom: true, alert_test: false, unhealthy_host: false, instance_age: false, grafana: false, jira: false, alerts: false, cassandra: false, custom_alerts: false, disk_grow: false };
             assert!(both.includes(LogSource::Pingdom));
             assert!(both.includes(LogSource::ReaperDown));
             assert!(!both.includes(LogSource::App));
@@ -65480,6 +67697,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 "instance_age=",
                 "jira=",
                 "cassandra",
+                "disk_grow",
             ] {
                 assert!(
                     !line.contains(banned),
@@ -65495,6 +67713,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 ("log_alerts", "gates: alerts="),
                 ("log_jira", "gates: jira="),
                 ("log_cassandra", "gates: cassandra_cert="),
+                ("log_disk_grow", "gates: disk_grow="),
             ] {
                 assert!(body.contains(text), "{text:?} must still be reported");
                 assert!(body.contains(helper), "{helper} must exist to carry it");
@@ -72531,6 +74750,583 @@ fed_expire = 4000000000
             let drain = &src[start..end];
             assert!(drain.contains("{detail}"));
             assert!(!drain.contains("address"), "the drain logs only the detail");
+        }
+
+        #[test]
+        fn the_disk_grow_gate_report_names_each_dark_state() {
+            use ec2_manager::features::DiskGrowFeature;
+            let live = Mode::Live;
+            let mut cfg = DiskGrowFeature::default();
+            let (armed, lines) = disk_grow_gate_report("me", &cfg, &live, true, true);
+            assert!(!armed && lines[0].1.contains("enabled is false"), "{lines:?}");
+
+            cfg.enabled = true;
+            cfg.allowed_users = vec!["*".to_string()];
+            let (armed, lines) = disk_grow_gate_report("me", &cfg, &live, true, true);
+            assert!(!armed && lines[0].1.contains("not on disk_grow.allowed_users"), "{lines:?}");
+            assert!(lines[0].1.contains("'*'"), "the wildcard note is part of the line");
+
+            cfg.allowed_users = vec!["me".to_string()];
+            let (armed, lines) = disk_grow_gate_report("me", &cfg, &Mode::Sim, true, true);
+            assert!(!armed && lines[0].1.contains("Live"), "{lines:?}");
+
+            let (armed, lines) = disk_grow_gate_report("me", &cfg, &live, false, true);
+            assert!(!armed && lines[0].1.contains("credentials"), "{lines:?}");
+
+            let (armed, lines) = disk_grow_gate_report("me", &cfg, &live, true, false);
+            assert!(!armed && lines[0].1.contains("mailbox"), "{lines:?}");
+
+            // Armed: ON CALL ONLY, and every excluded environment by name.
+            cfg.excluded_environments = vec!["PROD".to_string(), " ".to_string(), "uat2".to_string()];
+            let (armed, lines) = disk_grow_gate_report("me", &cfg, &live, true, true);
+            assert!(armed);
+            let on_call = lines
+                .iter()
+                .find(|(_, m)| m.contains("ON CALL ONLY"))
+                .expect("an ON CALL ONLY line");
+            assert!(on_call.1.contains("PROD") && on_call.1.contains("uat2"), "{}", on_call.1);
+            assert!(!lines.iter().any(|(warn, _)| *warn), "one user, no warning");
+
+            // Two names on the list: the two-machines warning, still armed.
+            cfg.allowed_users = vec!["me".to_string(), "you".to_string()];
+            let (armed, lines) = disk_grow_gate_report("me", &cfg, &live, true, true);
+            assert!(armed);
+            assert!(lines.iter().any(|(warn, m)| *warn && m.contains("both machines")), "{lines:?}");
+
+            // Nothing excluded is said in words, not as an empty list.
+            cfg.allowed_users = vec!["me".to_string()];
+            cfg.excluded_environments.clear();
+            let (_, lines) = disk_grow_gate_report("me", &cfg, &live, true, true);
+            let joined: String = lines.iter().map(|(_, m)| m.as_str()).collect();
+            assert!(joined.contains("no environment is excluded"), "{joined}");
+        }
+
+        #[test]
+        fn disk_grow_on_call_decision_fails_closed() {
+            assert!(disk_grow_on_call_decision(Ok(true)).0);
+            assert!(!disk_grow_on_call_decision(Ok(false)).0);
+            let (on, msg) = disk_grow_on_call_decision(Err("boom".to_string()));
+            assert!(!on, "a failed lookup counts as off call");
+            assert!(msg.contains("boom") && msg.contains("disk grow"), "{msg}");
+        }
+
+        #[test]
+        fn the_disk_grow_escalation_subject_carries_only_the_code_and_the_time() {
+            let ts = "2026-10-28T10:00:00Z";
+            let s = disk_grow_escalation_subject(ts);
+            assert_eq!(
+                s,
+                ec2_manager::reaper::escalation_subject(
+                    ec2_manager::reaper::OutcomeCode::Failure,
+                    ts
+                )
+            );
+            for leak in ["i-", "disk", "vol-", "Disk"] {
+                assert!(!s.contains(leak), "{s:?} must not carry {leak:?}");
+            }
+            // The Pi-side daemon tiers on this literal code.
+            assert!(s.starts_with("RE-F"), "{s:?}");
+            assert_eq!(s, "RE-F 2026-10-28T10:00:00Z");
+        }
+
+        /// The production half of the file, and one top-level function's body
+        /// in it: `method_body` (which stops at the next 8-space `fn`) cut at
+        /// the 4-space `}` that closes it, so a scan never reads into the
+        /// function after it.
+        fn disk_grow_prod_src() -> &'static str {
+            let whole = include_str!("ec2_manager_gui.rs");
+            &whole[..whole.find("    mod tests {").expect("the test module")]
+        }
+
+        fn disk_grow_fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+            let body = method_body(src, signature);
+            match body.find("\n    }\n") {
+                Some(end) => &body[..end],
+                None => body,
+            }
+        }
+
+        /// The `{ ... }` block that opens at the first `{` at or after `at`.
+        fn disk_grow_block_after(body: &str, at: usize) -> &str {
+            let open = at + body[at..].find('{').expect("a block");
+            let close = find_matching_close(body, open);
+            &body[open..=close]
+        }
+
+        #[test]
+        fn the_disk_grow_poll_acknowledges_only_on_the_owner_and_duplicate_paths() {
+            let src = disk_grow_prod_src();
+            let body = disk_grow_fn_body(src, "fn start_disk_grow_poll(");
+            let acks: Vec<usize> =
+                body.match_indices("acknowledge_alert(").map(|(i, _)| i).collect();
+            assert_eq!(acks.len(), 2, "exactly the duplicate and the owner acknowledge");
+            let begin = body.find("state.begin(").expect("the duplicate decision");
+            assert!(acks.iter().all(|&a| a > begin), "nothing is acknowledged before begin");
+            let dup = body.find("begun != dg::Begin::Owner").expect("the duplicate/held branch");
+            let dup_block = disk_grow_block_after(body, dup);
+            assert_eq!(dup_block.matches("acknowledge_alert(").count(), 1, "{dup_block}");
+            assert!(dup_block.contains("!dg::alert_acknowledged(&alert)"), "{dup_block}");
+            assert!(dup_block.contains("continue"), "{dup_block}");
+            // The owner's acknowledge is after the duplicate branch and also
+            // skips an alert somebody already took.
+            let owner_ack = acks[1];
+            assert!(owner_ack > dup + dup_block.len());
+            assert!(body[dup + dup_block.len()..owner_ack].contains("!dg::alert_acknowledged(&alert)"));
+
+            // An excluded environment: one log line, nothing else.
+            let ex = body.find("if cfg.excludes(&facts.environment)").expect("the exclusion");
+            assert!(ex < begin, "the exclusion is decided before anything else");
+            let ex_block = disk_grow_block_after(body, ex);
+            for banned in ["acknowledge_alert(", "add_note(", "escalate(", "state.failed(", "grow_once("] {
+                assert!(!ex_block.contains(banned), "{banned} in {ex_block}");
+            }
+            assert!(ex_block.contains("continue"), "{ex_block}");
+            // The grow chain itself never acknowledges.
+            let once = disk_grow_fn_body(src, "fn disk_grow_grow_once(");
+            assert!(!once.contains("acknowledge_alert("), "{once}");
+        }
+
+        #[test]
+        fn the_disk_grow_poll_never_treats_an_unreadable_modification_state_as_complete() {
+            let src = disk_grow_prod_src();
+            let body = disk_grow_fn_body(src, "fn start_disk_grow_poll(");
+            let read = body.find("volume_modification_state(").expect("the state read");
+            let err = read + body[read..].find("Err(e) =>").expect("its Err arm");
+            let arm = disk_grow_block_after(body, err);
+            assert!(arm.contains("continue"), "retried next poll: {arm}");
+            for banned in ["finish(", "Complete", "fs_grown(", "set_phase("] {
+                assert!(!arm.contains(banned), "{banned} in {arm}");
+            }
+            // The optimizing ceiling is enforced ahead of the read, so an
+            // unreadable (or Unknown) state cannot keep the line flashing.
+            let ceiling = body
+                .find("inc.phase == dg::Phase::Optimizing && elapsed_ms >= optimize_ceiling_ms")
+                .expect("the poll's own optimizing ceiling");
+            assert!(ceiling < read);
+            let stop = disk_grow_block_after(body, ceiling);
+            assert!(stop.contains("GrowEnded") && stop.contains("state.finish("), "{stop}");
+        }
+
+        #[test]
+        fn the_disk_grow_comment_is_built_only_from_alert_comment() {
+            let src = disk_grow_prod_src();
+            let notes: Vec<&str> = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//") && l.contains("add_note("))
+                .collect();
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            assert!(
+                notes[0].contains("|comment| alerts::add_note(auth, owner_alert, comment)"),
+                "{notes:?}"
+            );
+            let wrapper = disk_grow_fn_body(src, "fn disk_grow_fs_and_comment(");
+            assert!(wrapper.contains("add_note("), "the wrapper's post is the note");
+            let fs = disk_grow_fn_body(src, "fn disk_grow_fs_with(");
+            assert!(fs.contains("let comment = dg::alert_comment(df_before, &df_after);"), "{fs}");
+            assert_eq!(fs.matches("post(").count(), 1, "{fs}");
+            assert!(fs.contains("post(&comment)"), "{fs}");
+            assert!(fs.contains("dg::df_h_for_mount(&after.df_h, mount)"), "{fs}");
+            assert!(!fs.contains("Grown { df_after"), "the script's own output is never the comment");
+            let calls = src.matches("dg::alert_comment(").count();
+            assert_eq!(calls, 1, "alert_comment is built in one place");
+            let once = disk_grow_fn_body(src, "fn disk_grow_grow_once(");
+            assert!(once.contains("dg::df_h_for_mount(&probe.df_h, &dev.mount)"), "{once}");
+        }
+
+        #[test]
+        fn an_already_acknowledged_alert_never_reaches_modify_volume() {
+            let src = disk_grow_prod_src();
+            let once = disk_grow_fn_body(src, "fn disk_grow_grow_once(");
+            assert_eq!(once.matches("modify_volume(").count(), 1, "{once}");
+            assert!(once.contains("disk_grow_next_move(dg::alert_acknowledged(alert), device_ahead)"));
+            let full = once.find("NextMove::Full =>").expect("the Full arm");
+            let arm = disk_grow_block_after(once, full);
+            assert!(arm.contains("modify_volume("), "{arm}");
+            // And the call sites of the resize helper: only the grow chain.
+            let calls = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//") && l.contains("modify_volume("))
+                .count();
+            assert_eq!(calls, 2, "the definition and the grow chain's one call");
+            assert_eq!(disk_grow_next_move(true, false), NextMove::Nothing);
+            assert_ne!(disk_grow_next_move(true, true), NextMove::Full);
+        }
+
+        #[test]
+        fn a_modify_error_that_is_ambiguous_is_never_retried_with_another_size() {
+            use ec2_manager::disk_grow::{Growth, GrowthKind, ModifyError};
+            use std::cell::RefCell;
+            let opts = [
+                Growth { new_gib: 2024, kind: GrowthKind::OneTb },
+                Growth { new_gib: 1100, kind: GrowthKind::TenPercent },
+            ];
+            let quiet = |_: LogLevel, _: String| {};
+            let run = |results: Vec<std::result::Result<(), (ModifyError, String)>>,
+                       size: std::result::Result<u64, String>| {
+                let asked = RefCell::new(Vec::new());
+                let results = RefCell::new(results);
+                let reads = RefCell::new(0);
+                let out = disk_grow_resize(
+                    &opts,
+                    1000,
+                    |gib| {
+                        asked.borrow_mut().push(gib);
+                        results.borrow_mut().remove(0)
+                    },
+                    || {
+                        *reads.borrow_mut() += 1;
+                        size.clone()
+                    },
+                    &quiet,
+                );
+                (out, asked.into_inner(), reads.into_inner())
+            };
+            // Ambiguous, unchanged: escalate, never the +10%.
+            let (out, asked, reads) =
+                run(vec![Err((ModifyError::Ambiguous, "timeout".into()))], Ok(1000));
+            assert!(out.is_err() && asked == vec![2024] && reads == 1, "{out:?} {asked:?}");
+            // Ambiguous, but the size grew: it went through.
+            let (out, asked, _) =
+                run(vec![Err((ModifyError::Ambiguous, "timeout".into()))], Ok(2024));
+            assert_eq!(out.unwrap().new_gib, 2024);
+            assert_eq!(asked, vec![2024]);
+            // Ambiguous and the size cannot be read: escalate.
+            let (out, asked, _) =
+                run(vec![Err((ModifyError::Ambiguous, "x".into()))], Err("denied".into()));
+            assert!(out.is_err() && asked == vec![2024]);
+            // Refused: the +10% is tried.
+            let (out, asked, reads) = run(
+                vec![Err((ModifyError::Refused, "InvalidParameterValue".into())), Ok(())],
+                Ok(0),
+            );
+            assert_eq!(out.unwrap().new_gib, 1100);
+            assert_eq!((asked, reads), (vec![2024, 1100], 0));
+            // Rate limited: stop at once.
+            let (out, asked, _) =
+                run(vec![Err((ModifyError::RateLimited, "6 hours".into()))], Ok(0));
+            assert!(out.is_err() && asked == vec![2024]);
+            // Both refused: escalate, naming both refusals.
+            let (out, asked, _) = run(
+                vec![
+                    Err((ModifyError::Refused, "first no".into())),
+                    Err((ModifyError::Refused, "second no".into())),
+                ],
+                Ok(0),
+            );
+            let e = out.unwrap_err();
+            assert!(e.contains("first no") && e.contains("second no"), "{e}");
+            assert_eq!(asked, vec![2024, 1100]);
+            // Nothing fits: no call at all.
+            let none = disk_grow_resize(&[], 65000, |_| panic!("no call"), || panic!("no read"), &quiet);
+            assert!(none.is_err());
+        }
+
+        /// A probe of one data disk `vol-0abc12345678` at `/data`.
+        fn disk_grow_fake_probe(device_gib: u64, fs_gib: u64) -> ec2_manager::disk_grow::Probe {
+            use ec2_manager::disk_grow::{BlockDev, Probe};
+            let gib = 1024 * 1024 * 1024u64;
+            Probe {
+                df_h: format!(
+                    "Filesystem      Size  Used Avail Use% Mounted on\n\
+                     /dev/nvme1n1    {fs_gib}G  1G  1G   1% /data"
+                ),
+                fs_bytes: vec![("/data".to_string(), fs_gib * gib)],
+                blocks: vec![BlockDev {
+                    name: "nvme1n1".into(),
+                    dev_type: "disk".into(),
+                    serial: "vol0abc12345678".into(),
+                    fstype: "xfs".into(),
+                    mountpoint: "/data".into(),
+                    pkname: String::new(),
+                    size_bytes: device_gib * gib,
+                }],
+            }
+        }
+
+        /// Drive `disk_grow_fs_with` over scripted probes and a scripted grow.
+        fn disk_grow_fs_run(
+            probes: Vec<std::result::Result<ec2_manager::disk_grow::Probe, String>>,
+            grow: std::result::Result<ec2_manager::disk_grow::FsGrow, String>,
+            fs_recorded_gib: u64,
+        ) -> (DiskGrowFs, usize, Vec<String>) {
+            use std::cell::RefCell;
+            let probes = RefCell::new(probes);
+            let grows = RefCell::new(0usize);
+            let posted = RefCell::new(Vec::new());
+            let out = disk_grow_fs_with(
+                || probes.borrow_mut().remove(0),
+                |_| {
+                    *grows.borrow_mut() += 1;
+                    grow.clone()
+                },
+                |c| {
+                    posted.borrow_mut().push(c.to_string());
+                    Ok(())
+                },
+                "vol-0abc12345678",
+                "/data",
+                "BEFORE-ROW",
+                fs_recorded_gib * 1024 * 1024 * 1024,
+            );
+            (out, grows.into_inner(), posted.into_inner())
+        }
+
+        #[test]
+        fn a_filesystem_grow_whose_answer_was_lost_is_finished_not_escalated() {
+            use ec2_manager::disk_grow::FsGrow;
+            let grown = || Ok(FsGrow::Grown { df_after: "script output".into() });
+            // First attempt: the grow lands, the after-probe is lost.
+            let (out, grows, posted) = disk_grow_fs_run(
+                vec![Ok(disk_grow_fake_probe(2000, 1000)), Err("ssm timeout".into())],
+                grown(),
+                1000,
+            );
+            assert!(matches!(out, DiskGrowFs::Unknown(_)) && grows == 1 && posted.is_empty());
+            // The retry: the device is no longer ahead, but the filesystem is
+            // larger than recorded. Grown: commented from the fresh probe,
+            // with no second grow.
+            let (out, grows, posted) =
+                disk_grow_fs_run(vec![Ok(disk_grow_fake_probe(2000, 2000))], grown(), 1000);
+            assert!(matches!(out, DiskGrowFs::Done), "lost answer must finish");
+            assert_eq!(grows, 0);
+            assert_eq!(posted.len(), 1);
+            assert!(posted[0].contains("BEFORE-ROW") && posted[0].contains("2000G"), "{posted:?}");
+            assert!(!posted[0].contains("script output"), "{posted:?}");
+            // An ordinary grow: device ahead, grown, confirmed, commented.
+            let (out, grows, posted) = disk_grow_fs_run(
+                vec![Ok(disk_grow_fake_probe(2000, 1000)), Ok(disk_grow_fake_probe(2000, 2000))],
+                grown(),
+                1000,
+            );
+            assert!(matches!(out, DiskGrowFs::Done) && grows == 1 && posted.len() == 1);
+        }
+
+        #[test]
+        fn a_device_not_ahead_and_a_filesystem_not_larger_still_waits_then_escalates() {
+            use ec2_manager::disk_grow::FsGrow;
+            let grown = || Ok(FsGrow::Grown { df_after: String::new() });
+            let (out, grows, posted) =
+                disk_grow_fs_run(vec![Ok(disk_grow_fake_probe(1000, 1000))], grown(), 1000);
+            assert!(matches!(out, DiskGrowFs::Unknown(_)) && grows == 0 && posted.is_empty());
+            // Unknown is bounded by the poll: escalated at the limit.
+            assert!(!disk_grow_unknown_exhausted(DISK_GROW_MAX_FS_UNKNOWN - 1));
+            assert!(disk_grow_unknown_exhausted(DISK_GROW_MAX_FS_UNKNOWN));
+            // An OK verdict with no growth is a failure, never a comment.
+            let (out, _, posted) = disk_grow_fs_run(
+                vec![Ok(disk_grow_fake_probe(2000, 1000)), Ok(disk_grow_fake_probe(2000, 1000))],
+                grown(),
+                1000,
+            );
+            assert!(matches!(out, DiskGrowFs::Failed(_)) && posted.is_empty());
+            let poll = disk_grow_fn_body(disk_grow_prod_src(), "fn start_disk_grow_poll(");
+            assert!(poll.contains("disk_grow_unknown_exhausted(*n)"), "the poll uses the bound");
+        }
+
+        #[test]
+        fn a_never_modified_volume_and_an_in_flight_one_with_nothing_to_track_are_handled() {
+            let src = disk_grow_prod_src();
+            let state = disk_grow_fn_body(src, "fn volume_modification_state(");
+            assert!(state.contains("InvalidVolumeModification.NotFound"), "{state}");
+            assert!(state.contains("NO_MODIFICATION"), "{state}");
+            let once = disk_grow_fn_body(src, "fn disk_grow_grow_once(");
+            let at = once.find("dg::ResizeGate::InFlight").expect("the in-flight arm");
+            let arm = &once[at..];
+            let nothing = arm.find("dg::Recovery::Nothing(why) =>").expect("the Nothing arm");
+            assert!(arm[nothing..].trim_start_matches("dg::Recovery::Nothing(why) =>").trim_start().starts_with("fail("), "silent after the acknowledge");
+        }
+
+        #[test]
+        fn a_restart_mid_resize_tracks_the_grow_and_never_resizes() {
+            let once = disk_grow_fn_body(disk_grow_prod_src(), "fn disk_grow_grow_once(");
+            let nothing = once.find("NextMove::Nothing =>").expect("the recovery arm");
+            let block = disk_grow_block_after(once, nothing);
+            let end = once[nothing..].find(block).expect("the arm's block") + block.len();
+            let arm = &once[nothing..nothing + end];
+            assert!(arm.contains("let state = volume_modification_state(ctx, &volume.id);"), "{arm}");
+            assert!(arm.contains("dg::recovery(&state, dev.device_bytes, volume.size_gib)"), "{arm}");
+            assert_eq!(arm.matches("volume_modification_state(").count(), 1, "read once: {arm}");
+            // Only Track starts an incident; Nothing (the box already shows
+            // the full size) creates none.
+            assert_eq!(arm.matches("incident(").count(), 1, "{arm}");
+            assert!(arm.contains("dg::Recovery::Nothing(why) => GrowOnce::Nothing("), "{arm}");
+            assert!(arm.contains("dg::Recovery::Track"), "{arm}");
+            assert!(arm.contains("incident(dg::Phase::Modifying, false)"), "{arm}");
+            assert!(!arm.contains("modify_volume(") && !arm.contains("disk_grow_resize("), "{arm}");
+        }
+
+        #[test]
+        fn an_unreadable_environment_is_left_alone_while_anything_is_excluded() {
+            let body = disk_grow_fn_body(disk_grow_prod_src(), "fn start_disk_grow_poll(");
+            let facts = body.find("let facts = ia::parse_facts(").expect("the facts");
+            let guard = body
+                .find("if cfg.names_any_exclusion() && dg::environment_unreadable(&facts.environment)")
+                .expect("the unreadable-environment branch");
+            assert!(guard > facts);
+            let rest = &body[facts..];
+            for call in ["acknowledge_alert(", "escalate(", "disk_grow_grow_once(", "state.begin("] {
+                let at = facts + rest.find(call).unwrap_or_else(|| panic!("{call}"));
+                assert!(guard < at, "{call} must come after the guard");
+            }
+            let block = disk_grow_block_after(body, guard);
+            for banned in ["acknowledge_alert(", "escalate(", "add_note(", "state.failed(", "grow_once("] {
+                assert!(!block.contains(banned), "{banned} in {block}");
+            }
+            assert!(block.contains("LogLevel::Warn") && block.contains("continue"), "{block}");
+            // Marked seen before the guard, so it is logged once, not per poll.
+            let seen = body[..facts].rfind("state.mark_seen(&alert.id)").expect("marked seen");
+            assert!(seen < guard);
+        }
+
+        #[test]
+        fn custom_alerts_yield_to_disk_grow_only_while_it_is_armed() {
+            use DryRunRoute::*;
+            assert!(!custom_alerts_should_skip(DiskGrow, false), "a closed build must not swallow it");
+            assert!(custom_alerts_should_skip(DiskGrow, true));
+            assert!(!custom_alerts_should_skip(Neither, true));
+            assert!(!custom_alerts_should_skip(Neither, false));
+            for r in [Reaper, UnhealthyHost, Grafana, InstanceAge, Pingdom] {
+                assert!(custom_alerts_should_skip(r, false) && custom_alerts_should_skip(r, true));
+            }
+            // Assembled: a literal would count as a call site in another scan.
+            let sig = format!("fn start_custom_alerts_{}(", "poll");
+            let poll = disk_grow_fn_body(disk_grow_prod_src(), &sig);
+            assert!(poll.contains("custom_alerts_should_skip("), "{poll}");
+            assert!(poll.contains("disk_grow_enabled_for("), "{poll}");
+        }
+
+        #[test]
+        fn the_poll_reads_the_modification_state_before_any_resize() {
+            let once = disk_grow_fn_body(disk_grow_prod_src(), "fn disk_grow_grow_once(");
+            let full = once.find("NextMove::Full =>").expect("the Full arm");
+            let arm = disk_grow_block_after(once, full);
+            let read = arm.find("volume_modification_state(ctx, &volume.id)").expect("the state read");
+            let resize = arm.find("disk_grow_resize(").expect("the resize");
+            assert!(read < resize, "{arm}");
+            // A modification in flight is recovered, never resized again.
+            assert!(arm.contains("dg::recovery("), "{arm}");
+            assert!(arm.contains("dg::resize_gate(&state)"), "{arm}");
+            let gate = arm.find("dg::resize_gate(&state)").unwrap();
+            assert!(gate < resize, "{arm}");
+        }
+
+        #[test]
+        fn the_poll_claims_the_shared_in_flight_set_before_the_chain() {
+            let body = disk_grow_fn_body(disk_grow_prod_src(), "fn start_disk_grow_poll(");
+            let claim = body
+                .find("claim_in_flight(&in_flight, &listed.id)")
+                .expect("the poll claims the alert");
+            let seen = body.find("state.mark_seen(&alert.id)").expect("mark_seen");
+            let chain = body.find("disk_grow_grow_once(").expect("the chain");
+            assert!(claim < seen && claim < chain);
+            // Skipped without being marked seen, so the next poll looks again.
+            let skip = disk_grow_block_after(body, claim);
+            assert!(skip.contains("continue") && !skip.contains("mark_seen"), "{skip}");
+            let src = disk_grow_prod_src();
+            assert!(src.contains("Arc::clone(&reaper_in_flight),\n                    ))"), "passed in");
+        }
+
+        #[test]
+        fn new_alerts_are_only_read_on_call() {
+            let body = disk_grow_fn_body(disk_grow_prod_src(), "fn start_disk_grow_poll(");
+            assert_eq!(body.matches("alerts::fetch_latest(").count(), 1);
+            let on_call = body.find("\n                if on_call {\n").expect("the on-call gate");
+            let block = disk_grow_block_after(body, on_call);
+            assert!(block.contains("alerts::fetch_latest("), "{block}");
+        }
+
+        #[test]
+        fn every_end_of_a_running_incident_drops_its_line_and_its_retry_count() {
+            let body = disk_grow_fn_body(disk_grow_prod_src(), "fn start_disk_grow_poll(");
+            let start = body.find("for inc in state.incidents()").expect("the running loop");
+            let end = body.find("// 2. New alerts").expect("the new-alert step");
+            let lp = &body[start..end];
+            let mut ends: Vec<usize> = lp
+                .match_indices("state.finish(")
+                .chain(lp.match_indices("state.failed("))
+                .map(|(i, _)| i)
+                .collect();
+            ends.sort();
+            assert!(ends.len() >= 6, "{ends:?}");
+            let mut from = 0;
+            for e in ends {
+                let seg = &lp[from..e];
+                assert!(seg.contains("GrowEnded"), "an end without GrowEnded: {seg}");
+                assert!(seg.contains("fs_unknown.remove(&inc.instance)"), "{seg}");
+                from = e + 1;
+            }
+            // Moving to Optimizing also ends the filesystem retries.
+            let done = lp.find("DiskGrowFs::Done =>").expect("the Done arm");
+            let arm = disk_grow_block_after(lp, done);
+            assert!(arm.contains("fs_unknown.remove(&inc.instance)"), "{arm}");
+        }
+
+        #[test]
+        fn a_failed_disk_grow_send_does_not_claim_the_alert_is_acknowledged() {
+            let drain = method_body(disk_grow_prod_src(), "fn poll_disk_grow_events(");
+            assert!(!drain.contains("The alert is acknowledged and nothing will"), "{drain}");
+            assert!(drain.contains("Nothing was sent and nothing will ring"), "{drain}");
+            assert!(drain.contains("the alert in JSM"), "{drain}");
+            let poll = disk_grow_fn_body(disk_grow_prod_src(), "fn start_disk_grow_poll(");
+            assert!(!poll.contains("format!(\"instance {}\", alert.id)"), "unused slot key");
+        }
+
+        #[test]
+        fn run_remediation_names_the_disk_route_and_is_watcher_neutral() {
+            let src = disk_grow_prod_src();
+            let confirm = method_body(src, "fn render_run_remediation_confirm(");
+            assert!(confirm.contains(
+                "Disk utilization (EC2): grows the larger EBS volume (+1 TB, else +10%) and its XFS filesystem on the instance."
+            ));
+            assert!(!src.contains("Reaper alerts only."), "the hover is not reaper-only");
+            assert_eq!(src.matches("RUN_REMEDIATION_HOVER").count(), 3, "defined once, used twice");
+            for route in ["Reaper down", "Unhealthy host", "Grafana", "Disk utilization", "Instance age", "Pingdom"] {
+                assert!(RUN_REMEDIATION_HOVER.contains(route), "{route}");
+            }
+        }
+
+        #[test]
+        fn the_disk_grow_line_is_not_clearable() {
+            let clearable = method_body(disk_grow_prod_src(), "fn has_clearable_status(");
+            assert!(!clearable.contains("disk_grow"), "{clearable}");
+        }
+
+        #[test]
+        fn disk_grow_next_move_table() {
+            assert_eq!(disk_grow_next_move(false, false), NextMove::Full);
+            assert_eq!(disk_grow_next_move(false, true), NextMove::FilesystemOnly);
+            assert_eq!(disk_grow_next_move(true, true), NextMove::FilesystemOnly);
+            assert_eq!(disk_grow_next_move(true, false), NextMove::Nothing);
+        }
+
+        #[test]
+        fn the_disk_grow_poll_checks_the_pause_switch_first() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let body = method_body(src, "fn start_disk_grow_poll(");
+            let hold = body
+                .find("fix_pause::hold(ec2_manager::fix_pause::Fix::DiskGrow)")
+                .expect("the poll checks its own pause switch");
+            let lookup = body.find("oncall::is_on_call(").expect("the on-call lookup");
+            assert!(hold < lookup, "the pause switch is checked before anything else");
+            let looped = body.find("loop {").expect("the poll loop");
+            assert!(looped < hold, "and it is checked inside the loop, every poll");
+        }
+
+        #[test]
+        fn the_disk_grow_source_is_filterable_and_gated_by_its_own_list() {
+            let only = OnCallFilters { disk_grow: true, ..Default::default() };
+            assert!(only.includes(LogSource::DiskGrow));
+            assert!(!only.includes(LogSource::Grafana));
+            assert_eq!(only.label(), "Sources: Disk Utilization");
+            let mut features = ec2_manager::features::Features::default();
+            features.disk_grow.allowed_users = vec!["bconrad".to_string()];
+            let vis = LogVisibility::for_user(&features, "bconrad");
+            assert!(vis.shows(LogSource::DiskGrow) && vis.any_source());
+            let stranger = LogVisibility::for_user(&features, "someone-else");
+            assert!(!stranger.shows(LogSource::DiskGrow));
+            features.disk_grow.allowed_users = vec!["*".to_string()];
+            let wild = LogVisibility::for_user(&features, "bconrad");
+            assert!(!wild.shows(LogSource::DiskGrow), "'*' is not honoured");
         }
     }
 }
