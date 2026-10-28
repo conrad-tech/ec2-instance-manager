@@ -476,6 +476,9 @@ pub struct Incident {
     pub started_ms: u64,
     pub phase: Phase,
     pub fs_grown: bool,
+    /// What the alert said about the box (account, region, instance), kept
+    /// so every later poll resolves the same AWS context the owner did.
+    pub facts: crate::instance_age::AlertFacts,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -937,6 +940,7 @@ mod tests {
             started_ms: 0,
             phase: Phase::Modifying,
             fs_grown: false,
+            facts: Default::default(),
         }
     }
 
