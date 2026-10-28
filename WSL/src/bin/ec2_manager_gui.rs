@@ -5233,6 +5233,233 @@ mod gui {
         }
     }
 
+    /// How long a disk-grow script may run on the box. Matches the shipped
+    /// `send_command_timeout` default (90s); these helpers take no features
+    /// config, so the default is named here rather than read.
+    const DISK_GROW_SSM_TIMEOUT: Duration = Duration::from_secs(90);
+
+    /// Pure: `describe-volumes` JSON into the instance's volumes. A volume
+    /// with no id is dropped; an unreadable reply is an error, never an
+    /// empty list.
+    fn parse_disk_grow_volumes(raw: &str) -> std::result::Result<Vec<ec2_manager::disk_grow::Volume>, String> {
+        let v: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| format!("unreadable describe-volumes reply: {e}"))?;
+        let list = v
+            .get("Volumes")
+            .and_then(|x| x.as_array())
+            .ok_or_else(|| "describe-volumes reply has no Volumes list".to_string())?;
+        Ok(list
+            .iter()
+            .filter_map(|vol| {
+                let id = vol.get("VolumeId")?.as_str()?.to_string();
+                Some(ec2_manager::disk_grow::Volume {
+                    id,
+                    size_gib: vol.get("Size").and_then(|s| s.as_u64()).unwrap_or(0),
+                    volume_type: vol
+                        .get("VolumeType")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    device: vol
+                        .get("Attachments")
+                        .and_then(|a| a.get(0))
+                        .and_then(|a| a.get("Device"))
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                })
+            })
+            .collect())
+    }
+
+    /// Pure: the `Size` (GiB) of the first volume in a `describe-volumes` reply.
+    fn parse_volume_size_gib(raw: &str) -> std::result::Result<u64, String> {
+        let v: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| format!("unreadable describe-volumes reply: {e}"))?;
+        v.get("Volumes")
+            .and_then(|x| x.get(0))
+            .and_then(|x| x.get("Size"))
+            .and_then(|s| s.as_u64())
+            .ok_or_else(|| "describe-volumes reply carries no volume size".to_string())
+    }
+
+    /// Pure: the instance's `RootDeviceName` from a `describe-instances` reply.
+    fn parse_root_device_name(raw: &str) -> std::result::Result<String, String> {
+        let v: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| format!("unreadable describe-instances reply: {e}"))?;
+        v.get("Reservations")
+            .and_then(|r| r.get(0))
+            .and_then(|r| r.get("Instances"))
+            .and_then(|i| i.get(0))
+            .and_then(|i| i.get("RootDeviceName"))
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| "describe-instances reply carries no RootDeviceName".to_string())
+    }
+
+    /// An instance id as `aws` would accept it, checked before it reaches argv.
+    fn is_safe_instance_id(id: &str) -> bool {
+        id.strip_prefix("i-").is_some_and(|rest| {
+            (8..=17).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    }
+
+    /// `^vol-[0-9a-f]{8,17}$`.
+    fn is_safe_volume_id(id: &str) -> bool {
+        id.strip_prefix("vol-").is_some_and(|rest| {
+            (8..=17).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    }
+
+    /// The instance's attached volumes plus its root device name.
+    // used by the disk-grow poll (Task 7)
+    #[allow(dead_code)]
+    fn disk_grow_volumes(
+        ctx: &AwsContext,
+        instance_id: &str,
+    ) -> std::result::Result<(Vec<ec2_manager::disk_grow::Volume>, String), String> {
+        if !is_safe_instance_id(instance_id) {
+            return Err(format!("refusing {instance_id:?}: not an instance id"));
+        }
+        let raw = aws_json(
+            &ctx.profile,
+            &ctx.region,
+            &[
+                "ec2",
+                "describe-volumes",
+                "--filters",
+                &format!("Name=attachment.instance-id,Values={instance_id}"),
+            ],
+        )?;
+        let volumes = parse_disk_grow_volumes(&raw)?;
+        let inst = aws_json(
+            &ctx.profile,
+            &ctx.region,
+            &["ec2", "describe-instances", "--instance-ids", instance_id],
+        )?;
+        Ok((volumes, parse_root_device_name(&inst)?))
+    }
+
+    /// `ec2 modify-volume` is the one resize call, and it must reach `aws`
+    /// from here only. Live mode and the volume id are checked here, not
+    /// trusted from the caller. The error carries the classified kind (spawn
+    /// failure or empty stderr is `Ambiguous`) and the trimmed stderr.
+    // used by the disk-grow poll (Task 7)
+    #[allow(dead_code)]
+    fn modify_volume(
+        ctx: &AwsContext,
+        volume_id: &str,
+        new_gib: u64,
+        mode: &Mode,
+    ) -> std::result::Result<(), (ec2_manager::disk_grow::ModifyError, String)> {
+        use ec2_manager::disk_grow::ModifyError;
+        if *mode != Mode::Live {
+            return Err((ModifyError::Refused, "refusing to modify a volume: not in Live mode".to_string()));
+        }
+        if !is_safe_volume_id(volume_id) {
+            return Err((ModifyError::Refused, format!("refusing {volume_id:?}: not a volume id")));
+        }
+        let output = aws_command()
+            .args([
+                "ec2",
+                "modify-volume",
+                "--profile",
+                &ctx.profile,
+                "--region",
+                &ctx.region,
+                "--volume-id",
+                volume_id,
+                "--size",
+                &new_gib.to_string(),
+                "--output",
+                "json",
+            ])
+            .output()
+            .map_err(|e| (ModifyError::Ambiguous, format!("modify-volume failed to run: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr: String = stderr.trim().chars().take(300).collect();
+            return Err((ec2_manager::disk_grow::classify_modify_error(&stderr), stderr));
+        }
+        Ok(())
+    }
+
+    /// The volume's modification state, for the wait after a resize.
+    // used by the disk-grow poll (Task 7)
+    #[allow(dead_code)]
+    fn volume_modification_state(
+        ctx: &AwsContext,
+        volume_id: &str,
+    ) -> std::result::Result<ec2_manager::disk_grow::ModState, String> {
+        if !is_safe_volume_id(volume_id) {
+            return Err(format!("refusing {volume_id:?}: not a volume id"));
+        }
+        let raw = aws_json(
+            &ctx.profile,
+            &ctx.region,
+            &["ec2", "describe-volumes-modifications", "--volume-ids", volume_id],
+        )?;
+        ec2_manager::disk_grow::parse_mod_state(&raw)
+    }
+
+    /// The volume's current size in GiB, re-read after an ambiguous failure.
+    // used by the disk-grow poll (Task 7)
+    #[allow(dead_code)]
+    fn volume_size_gib(ctx: &AwsContext, volume_id: &str) -> std::result::Result<u64, String> {
+        if !is_safe_volume_id(volume_id) {
+            return Err(format!("refusing {volume_id:?}: not a volume id"));
+        }
+        let raw = aws_json(
+            &ctx.profile,
+            &ctx.region,
+            &["ec2", "describe-volumes", "--volume-ids", volume_id],
+        )?;
+        parse_volume_size_gib(&raw)
+    }
+
+    /// Read-only probe of the box over SSM.
+    // used by the disk-grow poll (Task 7)
+    #[allow(dead_code)]
+    fn disk_grow_probe(
+        ctx: &AwsContext,
+        instance_id: &str,
+    ) -> std::result::Result<ec2_manager::disk_grow::Probe, String> {
+        if !is_safe_instance_id(instance_id) {
+            return Err(format!("refusing {instance_id:?}: not an instance id"));
+        }
+        let out = exec_remote_command(
+            &None,
+            ctx,
+            instance_id,
+            &b64_script_command(ec2_manager::disk_grow::PROBE_SCRIPT),
+            DISK_GROW_SSM_TIMEOUT,
+        )?;
+        ec2_manager::disk_grow::parse_probe(&out)
+    }
+
+    /// Grow the filesystem on the box. The `RE_DG_*` assignments are part of
+    /// the body before it is base64'd, so they reach the script.
+    // used by the disk-grow poll (Task 7)
+    #[allow(dead_code)]
+    fn disk_grow_run_fs(
+        ctx: &AwsContext,
+        instance_id: &str,
+        dev: &ec2_manager::disk_grow::DataDevice,
+    ) -> std::result::Result<ec2_manager::disk_grow::FsGrow, String> {
+        if !is_safe_instance_id(instance_id) {
+            return Err(format!("refusing {instance_id:?}: not an instance id"));
+        }
+        let body = ec2_manager::disk_grow::fs_grow_command(dev)?;
+        let out = exec_remote_command(
+            &None,
+            ctx,
+            instance_id,
+            &b64_script_command(&body),
+            DISK_GROW_SSM_TIMEOUT,
+        )?;
+        Ok(ec2_manager::disk_grow::parse_fs_grow(&out))
+    }
+
     /// `autoscaling start-instance-refresh` is the one refresh call, and it
     /// must reach `aws` from here only. Live mode only, checked here rather
     /// than trusted from the caller.
@@ -64492,6 +64719,75 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             // count as a hit of its own — self-matching regardless of what
             // the rest of the file does.
             assert_eq!(hits.len(), 1, "{needle} must appear once, found at lines {hits:?}");
+        }
+
+        #[test]
+        fn modify_volume_has_exactly_one_call_site() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let needle = format!("\"modify-{}\"", "volume");
+            let hits: Vec<usize> = src
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| !l.trim_start().starts_with("//") && l.contains(&needle))
+                .map(|(n, _)| n + 1)
+                .collect();
+            assert_eq!(hits.len(), 1, "{needle} must appear once, found at lines {hits:?}");
+        }
+
+        fn disk_grow_test_ctx() -> AwsContext {
+            AwsContext {
+                mode: Mode::Live,
+                profile: "nonexistent-test-profile".to_string(),
+                account_id: None,
+                arn: None,
+                user_id: None,
+                region: "us-east-1".to_string(),
+                auth_status: AuthStatus::Ok,
+            }
+        }
+
+        #[test]
+        fn modify_volume_refuses_outside_live_mode_and_a_bad_volume_id() {
+            let ctx = disk_grow_test_ctx();
+            let (kind, msg) = modify_volume(&ctx, "vol-0123456789abcdef0", 100, &Mode::Sim).unwrap_err();
+            assert_eq!(kind, ec2_manager::disk_grow::ModifyError::Refused);
+            assert!(msg.contains("Live"), "{msg}");
+            for bad in ["vol-x;rm", "vol-", "vol-0123456789abcdef012", "i-0123456789abcdef0", ""] {
+                let (kind, msg) = modify_volume(&ctx, bad, 100, &Mode::Live).unwrap_err();
+                assert_eq!(kind, ec2_manager::disk_grow::ModifyError::Refused, "{bad}");
+                assert!(msg.contains("not a volume id"), "{msg}");
+            }
+        }
+
+        #[test]
+        fn the_volume_list_parser_reads_a_describe_volumes_reply() {
+            let raw = r#"{"Volumes":[
+              {"VolumeId":"vol-0aaa1111bbbb2222c","Size":30,"VolumeType":"gp3",
+               "Attachments":[{"Device":"/dev/xvda","State":"attached"}]},
+              {"VolumeId":"vol-0ddd3333eeee4444f","Size":200,"VolumeType":"io1","Attachments":[]},
+              {"Size":5}]}"#;
+            let v = parse_disk_grow_volumes(raw).unwrap();
+            assert_eq!(v.len(), 2, "a volume with no id is dropped");
+            assert_eq!(v[0].id, "vol-0aaa1111bbbb2222c");
+            assert_eq!(v[0].size_gib, 30);
+            assert_eq!(v[0].volume_type, "gp3");
+            assert_eq!(v[0].device, "/dev/xvda");
+            assert_eq!(v[1].size_gib, 200);
+            assert_eq!(v[1].device, "");
+            assert!(parse_disk_grow_volumes("not json").is_err());
+            assert!(parse_disk_grow_volumes("{}").is_err());
+            assert!(parse_disk_grow_volumes(r#"{"Volumes":[]}"#).unwrap().is_empty());
+        }
+
+        #[test]
+        fn the_size_and_root_device_parsers_read_their_replies() {
+            assert_eq!(parse_volume_size_gib(r#"{"Volumes":[{"Size":250}]}"#), Ok(250));
+            assert!(parse_volume_size_gib(r#"{"Volumes":[]}"#).is_err());
+            assert!(parse_volume_size_gib("garbage").is_err());
+            let inst = r#"{"Reservations":[{"Instances":[{"RootDeviceName":"/dev/xvda"}]}]}"#;
+            assert_eq!(parse_root_device_name(inst), Ok("/dev/xvda".to_string()));
+            assert!(parse_root_device_name(r#"{"Reservations":[]}"#).is_err());
         }
 
         /// `start-instance-refresh` reaches `aws` from exactly one function,
