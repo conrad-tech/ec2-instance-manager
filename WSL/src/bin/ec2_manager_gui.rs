@@ -4998,6 +4998,7 @@ mod gui {
         unhealthy_cfg: ec2_manager::features::UnhealthyHostFeature,
         instance_age_cfg: ec2_manager::features::InstanceAgeFeature,
         grafana_cfg: ec2_manager::features::GrafanaFeature,
+        disk_grow_cfg: ec2_manager::features::DiskGrowFeature,
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
         mailbox: Option<String>,
@@ -5013,6 +5014,8 @@ mod gui {
         instance_age_allowed: bool,
         /// The same for the Grafana watcher.
         grafana_allowed: bool,
+        /// The same for the disk-utilization watcher.
+        disk_grow_allowed: bool,
     }
 
     /// Why a manual Run Remediation must not proceed for `route`, if it must
@@ -5026,6 +5029,7 @@ mod gui {
         unhealthy_allowed: bool,
         instance_age_allowed: bool,
         grafana_allowed: bool,
+        disk_grow_allowed: bool,
     ) -> Option<&'static str> {
         match route {
             DryRunRoute::Reaper => None,
@@ -5045,6 +5049,12 @@ mod gui {
             DryRunRoute::Grafana => Some(
                 "this is a Grafana alert, and you are not on grafana.allowed_users \
                  (or the watcher is not enabled) — nothing was terminated",
+            ),
+            DryRunRoute::DiskGrow if disk_grow_allowed => None,
+            DryRunRoute::DiskGrow => Some(
+                "this is a disk-utilization alert, and you are not on \
+                 disk_grow.allowed_users (or the watcher is not enabled) — no volume \
+                 was grown",
             ),
             DryRunRoute::Pingdom => Some(
                 "this is a Pingdom alert: Pingdom has no remediation (it only \
@@ -5110,6 +5120,7 @@ mod gui {
                 env.unhealthy_allowed,
                 env.instance_age_allowed,
                 env.grafana_allowed,
+                env.disk_grow_allowed,
             ) {
                 let _ = tx.send(ReaperEvent::SourcedNote {
                     source: LogSource::AlertTest,
@@ -5136,6 +5147,7 @@ mod gui {
                 DryRunRoute::UnhealthyHost => run_unhealthy_host_remediation(&env, full),
                 DryRunRoute::InstanceAge => run_instance_age_remediation(&env, full),
                 DryRunRoute::Grafana => run_grafana_remediation(&env, full),
+                DryRunRoute::DiskGrow => run_disk_grow_remediation(&env, full),
                 // Refused above.
                 DryRunRoute::Pingdom | DryRunRoute::Neither => {}
             }
@@ -6035,6 +6047,270 @@ mod gui {
         }
     }
 
+    /// Why a manual disk grow must not run for an alert in `environment`, if
+    /// it must not. The poll's two environment rules, in the poll's order:
+    /// while anything is excluded an environment that cannot be read is left
+    /// alone (it might be an excluded one), and an excluded one is left alone.
+    fn disk_grow_manual_env_refusal(
+        cfg: &ec2_manager::features::DiskGrowFeature,
+        environment: &str,
+    ) -> Option<String> {
+        let env = environment.trim();
+        if cfg.names_any_exclusion() && ec2_manager::disk_grow::environment_unreadable(env) {
+            return Some(format!(
+                "its environment cannot be read ({env:?}) and environments are excluded here, \
+                 so it might be an excluded one — nothing was acknowledged or grown"
+            ));
+        }
+        if cfg.excludes(env) {
+            return Some(format!(
+                "environment {env} is excluded (disk_grow.excluded_environments) — nothing was \
+                 acknowledged or grown"
+            ));
+        }
+        None
+    }
+
+    /// Why a manual disk grow must not touch a volume in this modification
+    /// state, if it must not. A manual run shares no state with the poll, so
+    /// a volume already modifying or optimizing may be an incident the poll
+    /// is in the middle of; a second resize or filesystem grow would race
+    /// it. A state that is unknown or cannot be read cannot rule that out,
+    /// so it refuses too. Never modified, completed or failed: proceed.
+    fn disk_grow_manual_state_refusal(
+        state: &std::result::Result<ec2_manager::disk_grow::ModState, String>,
+    ) -> Option<String> {
+        use ec2_manager::disk_grow::{ModState, NO_MODIFICATION};
+        match state {
+            Ok(ModState::Completed) | Ok(ModState::Failed) => None,
+            Err(e) if e == NO_MODIFICATION => None,
+            Ok(ModState::Modifying) | Ok(ModState::Optimizing) => Some(format!(
+                "the volume is already being modified ({}) — a manual run shares no state with \
+                 the watcher's poll and could race an incident it is already handling; nothing \
+                 was acknowledged or grown",
+                match state {
+                    Ok(ModState::Modifying) => "modifying",
+                    _ => "optimizing",
+                }
+            )),
+            Ok(ModState::Unknown(s)) => Some(format!(
+                "the volume's modification state is {s:?}, which cannot rule out a grow already \
+                 in flight — nothing was acknowledged or grown"
+            )),
+            Err(e) => Some(format!(
+                "the volume's modification state could not be read ({e}), so a grow already in \
+                 flight cannot be ruled out — nothing was acknowledged or grown"
+            )),
+        }
+    }
+
+    /// Run Remediation for a disk-utilization alert: the poll's owner chain
+    /// (`disk_grow_grow_once`, shared so the two cannot drift), run once,
+    /// here, for one alert a person pointed at. Acknowledges first only when
+    /// on call, like the other manual routes. Blocks until the filesystem is
+    /// grown and the alert commented; it does not wait for the volume to
+    /// finish optimizing and puts no line on the toolbar.
+    fn run_disk_grow_remediation(env: &ManualRemediationEnv, alert: ec2_manager::alerts::Alert) {
+        use ec2_manager::{alerts, disk_grow as dg, instance_age as ia, oncall};
+
+        let cfg = &env.disk_grow_cfg;
+        let alert_id = alert.id.clone();
+        let mut end = RemediationStatusGuard::new(env.status_tx.clone(), &alert_id);
+        end.status = AlertActionStatus::Failed(format!(
+            "alert {alert_id}: stopped before the volume was grown — see the log under \
+             Sources -> Disk Utilization"
+        ));
+        let note = |level: LogLevel, message: String| {
+            let _ = env.tx.send(ReaperEvent::SourcedNote {
+                source: LogSource::DiskGrow,
+                level,
+                message: format!("disk grow: manual {message}"),
+            });
+        };
+        let fail = |end: &mut RemediationStatusGuard, why: String| {
+            note(LogLevel::Error, format!("{alert_id} — {why}"));
+            end.status = AlertActionStatus::Failed(format!("alert {alert_id}: {why}"));
+        };
+        let escalate = |why: &str| {
+            note(LogLevel::Error, format!("{alert_id} — {why}; escalating once"));
+            match env.mailbox.as_deref() {
+                Some(m) if !m.trim().is_empty() => {
+                    match send_escalation_email(m, &disk_grow_escalation_subject(&alert.created_at)) {
+                        // The address is never logged: the app log gets pasted into tickets.
+                        Ok(_) => note(LogLevel::Warn, "escalation sent".to_string()),
+                        Err(e) => note(LogLevel::Error, format!("escalation FAILED TO SEND — {e}")),
+                    }
+                }
+                _ => note(LogLevel::Error, "no escalation mailbox is configured — nothing was sent".to_string()),
+            }
+        };
+
+        let Some(_claim) = claim_in_flight(&env.in_flight, &alert_id) else {
+            fail(&mut end, "a remediation for this alert is already running".to_string());
+            return;
+        };
+        note(LogLevel::Warn, format!("remediation requested for alert {alert_id}"));
+
+        let facts = ia::parse_facts(&alert.description);
+        if let Some(why) = disk_grow_manual_env_refusal(cfg, &facts.environment) {
+            return fail(&mut end, why);
+        }
+        if facts.instance_id.is_empty() {
+            return fail(&mut end, "names no readable instance id — nothing to act on".to_string());
+        }
+        let ctx = match instance_age_context(&env.mode, &env.app_config, &facts) {
+            Ok(c) => c,
+            Err(e) => return fail(&mut end, e),
+        };
+        // The refusal the poll does not need: read the data volume's state
+        // before anything is acknowledged, and leave an in-flight one alone.
+        let volume = match disk_grow_volumes(&ctx, &facts.instance_id)
+            .and_then(|(vols, root)| dg::choose_volume(&vols, &root))
+        {
+            Ok(v) => v,
+            Err(e) => return fail(&mut end, format!("choosing the data volume: {e}")),
+        };
+        if let Some(why) = disk_grow_manual_state_refusal(&volume_modification_state(&ctx, &volume.id)) {
+            return fail(&mut end, format!("{}: {why}", volume.id));
+        }
+
+        let on_call = match oncall::is_on_call(
+            &env.auth,
+            &env.reaper_cfg.resolved_schedule_id(),
+            &env.reaper_cfg.resolved_atlassian_account_id(),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                note(LogLevel::Warn, format!("on-call lookup failed ({e}) — treating as off call"));
+                false
+            }
+        };
+        if on_call && !alert.acknowledged {
+            match alerts::acknowledge_alert(&env.auth, &alert_id) {
+                Ok(()) => note(LogLevel::Info, format!("acknowledged {alert_id}")),
+                Err(e) => note(
+                    LogLevel::Warn,
+                    format!("could not acknowledge {alert_id}: {e} — carrying on"),
+                ),
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let now_ms = || started.elapsed().as_millis() as u64;
+        let inc = match disk_grow_grow_once(&env.auth, &ctx, &env.mode, &alert, &facts, now_ms(), &note) {
+            GrowOnce::Started(inc) => *inc,
+            GrowOnce::Nothing(why) => {
+                note(LogLevel::Info, why.clone());
+                end.status = AlertActionStatus::Ok(format!("alert {alert_id}: nothing to do — {why}"));
+                return;
+            }
+            GrowOnce::Failed(why) => {
+                fail(&mut end, why.clone());
+                escalate(&why);
+                return;
+            }
+        };
+        let done = |end: &mut RemediationStatusGuard| {
+            note(
+                LogLevel::Warn,
+                format!(
+                    "{alert_id} — filesystem at {} on {} grown and the alert commented; not \
+                     waiting for {} to finish optimizing (no toolbar line for a manual run)",
+                    inc.mount, inc.instance, inc.volume_id
+                ),
+            );
+            end.status = AlertActionStatus::Ok(format!(
+                "alert {alert_id}: {} grown and the alert commented",
+                inc.volume_id
+            ));
+        };
+        if inc.fs_grown {
+            return done(&mut end);
+        }
+
+        // Resized (or recovering a resize): wait, once per poll interval, for
+        // the new size to be usable, then grow the filesystem once.
+        let usable_wait_ms = cfg.usable_wait().as_millis() as u64;
+        let optimize_ceiling_ms = cfg.optimize_ceiling().as_millis() as u64;
+        let mut unknown = 0u32;
+        loop {
+            std::thread::sleep(cfg.poll_interval());
+            let elapsed_ms = now_ms().saturating_sub(inc.started_ms);
+            let mod_state = match volume_modification_state(&ctx, &inc.volume_id) {
+                Ok(s) => s,
+                Err(e) => {
+                    note(
+                        LogLevel::Warn,
+                        format!("could not read the modification state of {}, retrying: {e}", inc.volume_id),
+                    );
+                    if elapsed_ms >= usable_wait_ms {
+                        let why = format!(
+                            "the modification state of {} could not be read within {} minute(s) \
+                             of the resize",
+                            inc.volume_id,
+                            usable_wait_ms / 60_000
+                        );
+                        fail(&mut end, why.clone());
+                        escalate(&why);
+                        return;
+                    }
+                    continue;
+                }
+            };
+            match dg::transition(
+                dg::Phase::Modifying,
+                &mod_state,
+                false,
+                elapsed_ms,
+                usable_wait_ms,
+                optimize_ceiling_ms,
+            ) {
+                dg::Transition::Wait => {}
+                dg::Transition::GrowFilesystem => {
+                    let target = FsTarget {
+                        volume_id: &inc.volume_id,
+                        mount: &inc.mount,
+                        df_before: &inc.df_before,
+                        fs_recorded: inc.fs_bytes_before,
+                    };
+                    match disk_grow_fs_and_comment(&env.auth, &ctx, &inc.instance, &target, &alert_id) {
+                        DiskGrowFs::Done => return done(&mut end),
+                        DiskGrowFs::Unknown(e) => {
+                            unknown += 1;
+                            if disk_grow_unknown_exhausted(unknown) {
+                                let why = format!(
+                                    "the filesystem grow gave no clear answer {unknown} times \
+                                     running: {e}"
+                                );
+                                fail(&mut end, why.clone());
+                                escalate(&why);
+                                return;
+                            }
+                            note(
+                                LogLevel::Warn,
+                                format!(
+                                    "filesystem grow: {e}; retrying ({unknown}/{DISK_GROW_MAX_FS_UNKNOWN})"
+                                ),
+                            );
+                        }
+                        DiskGrowFs::Failed(why) => {
+                            fail(&mut end, why.clone());
+                            escalate(&why);
+                            return;
+                        }
+                    }
+                }
+                // Not reachable with fs_grown false, but never read as done.
+                dg::Transition::Complete | dg::Transition::StopFlashing(_) => {}
+                dg::Transition::Escalate(why) => {
+                    fail(&mut end, why.clone());
+                    escalate(&why);
+                    return;
+                }
+            }
+        }
+    }
+
     /// The right-click menu on a row in the Alerts window.
     ///
     /// The same two actions the Alert ID box offers, aimed at the row under
@@ -6110,6 +6386,9 @@ mod gui {
                  For an instance-age alert: reads the instance, its auto scaling group, \
                  its recent scaling activity and its target health, and reports what would \
                  be terminated; terminates nothing.\n\n\
+                 For a disk-utilization alert: reads the instance's volumes and the box, \
+                 and reports the data volume, its mount and the planned sizes; modifies \
+                 nothing and grows nothing.\n\n\
                  Then it escalates as though the fix had failed. Nothing is \
                  acknowledged and nothing is changed. Every step is in the log under \
                  On-Call -> Alert Test.",
@@ -6203,6 +6482,8 @@ mod gui {
         Reaper,
         UnhealthyHost,
         Grafana,
+        /// An EC2 `DiskUtilization` alert: grow the data volume.
+        DiskGrow,
         InstanceAge,
         Pingdom,
         /// No watcher claims it. Nothing is run and nothing is escalated —
@@ -6216,8 +6497,12 @@ mod gui {
     /// thorough run — which answers the pingdom question along the way.
     /// **Unhealthy-host outranks instance-age**, the older claim on the same
     /// `UnHealthyHostCount` alarms — `instance_age::claims` already excludes
-    /// both reaper and unhealthy-host, so this is four deep: reaper, then
-    /// unhealthy-host, then Grafana, then instance-age, then pingdom.
+    /// both reaper and unhealthy-host, so this is five deep: reaper, then
+    /// unhealthy-host, then Grafana, then disk grow, then instance-age, then
+    /// pingdom. Disk grow reads only the title (`[EC2]` + `DiskUtilization`),
+    /// so it takes no config of its own; the shipped instance-age rules do
+    /// not match such a title (pinned by a test), so placing it above them
+    /// needs no change to `instance_age::claims`.
     ///
     /// Pure, so the precedence is pinned by a test rather than by the order
     /// of `if`s inside a thread.
@@ -6235,6 +6520,8 @@ mod gui {
             DryRunRoute::UnhealthyHost
         } else if ec2_manager::grafana::claims(alert, grafana_cfg, reaper_cfg, unhealthy_cfg) {
             DryRunRoute::Grafana
+        } else if ec2_manager::disk_grow::claims(alert, reaper_cfg, unhealthy_cfg, grafana_cfg) {
+            DryRunRoute::DiskGrow
         } else if ec2_manager::instance_age::claims(
             alert,
             instance_age_cfg,
@@ -6292,6 +6579,7 @@ mod gui {
         unhealthy_cfg: ec2_manager::features::UnhealthyHostFeature,
         instance_age_cfg: ec2_manager::features::InstanceAgeFeature,
         grafana_cfg: ec2_manager::features::GrafanaFeature,
+        disk_grow_cfg: ec2_manager::features::DiskGrowFeature,
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
         mailbox: Option<String>,
@@ -6646,13 +6934,235 @@ mod gui {
                             .to_string(),
                     );
                 }
+                DryRunRoute::DiskGrow => {
+                    use ec2_manager::{disk_grow as dg, instance_age as ia};
+                    note(
+                        LogLevel::Info,
+                        format!("dry run: alert {} matches the disk-utilization rules", alert.id),
+                    );
+                    let facts = ia::parse_facts(&alert.description);
+                    note(
+                        LogLevel::Info,
+                        format!(
+                            "dry run: the description names instance={:?} environment={:?} \
+                             account={:?} region={:?}",
+                            facts.instance_id, facts.environment, facts.account, facts.region
+                        ),
+                    );
+                    // Every step is a read. The block ends early wherever a
+                    // real run would stop, and the escalation below still goes.
+                    'walk: {
+                        if disk_grow_cfg.names_any_exclusion()
+                            && dg::environment_unreadable(&facts.environment)
+                        {
+                            note(
+                                LogLevel::Warn,
+                                format!(
+                                    "dry run: the environment cannot be read ({:?}) and \
+                                     environments are excluded ({:?}) — a real run would do \
+                                     nothing: no acknowledge, no grow",
+                                    facts.environment.trim(),
+                                    disk_grow_cfg.excluded_environments
+                                ),
+                            );
+                            break 'walk;
+                        }
+                        if disk_grow_cfg.excludes(&facts.environment) {
+                            note(
+                                LogLevel::Info,
+                                format!(
+                                    "dry run: environment {} is excluded — a real run would do \
+                                     nothing",
+                                    facts.environment.trim()
+                                ),
+                            );
+                            break 'walk;
+                        }
+                        if facts.instance_id.is_empty() {
+                            note(
+                                LogLevel::Warn,
+                                "dry run: the alert names no readable instance id — a real run \
+                                 would escalate without acting"
+                                    .to_string(),
+                            );
+                            break 'walk;
+                        }
+                        let ctx = match instance_age_context(&mode, &app_config, &facts) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                note(
+                                    LogLevel::Error,
+                                    format!("dry run: could not resolve the account — {e}"),
+                                );
+                                break 'walk;
+                            }
+                        };
+                        let (volumes, root) = match disk_grow_volumes(&ctx, &facts.instance_id) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                note(
+                                    LogLevel::Error,
+                                    format!("dry run: could not list the volumes — {e}"),
+                                );
+                                break 'walk;
+                            }
+                        };
+                        let listing: Vec<String> = volumes
+                            .iter()
+                            .map(|v| format!("{} {} GiB {} at {}", v.id, v.size_gib, v.volume_type, v.device))
+                            .collect();
+                        note(
+                            LogLevel::Info,
+                            format!("dry run: volumes {listing:?}, root device {root}"),
+                        );
+                        let volume = match dg::choose_volume(&volumes, &root) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                note(
+                                    LogLevel::Warn,
+                                    format!(
+                                        "dry run: no data volume chosen — {e}; a real run would \
+                                         escalate"
+                                    ),
+                                );
+                                break 'walk;
+                            }
+                        };
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: data volume {} ({} GiB {})",
+                                volume.id, volume.size_gib, volume.volume_type
+                            ),
+                        );
+                        let mod_state = volume_modification_state(&ctx, &volume.id);
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: modification state of {}: {}",
+                                volume.id,
+                                match &mod_state {
+                                    Ok(s) => format!("{s:?}"),
+                                    Err(e) => e.clone(),
+                                }
+                            ),
+                        );
+                        if let Some(why) = disk_grow_manual_state_refusal(&mod_state) {
+                            note(
+                                LogLevel::Warn,
+                                format!("dry run: Run Remediation would refuse — {why}"),
+                            );
+                        }
+                        let probe = match disk_grow_probe(&ctx, &facts.instance_id) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                note(
+                                    LogLevel::Error,
+                                    format!(
+                                        "dry run: could not read the box over SSM — {e}; a real \
+                                         run would escalate"
+                                    ),
+                                );
+                                break 'walk;
+                            }
+                        };
+                        let dev = match dg::resolve_data_device(&probe, &volume.id) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                note(
+                                    LogLevel::Error,
+                                    format!(
+                                        "dry run: could not find {} on the box — {e}; a real run \
+                                         would escalate",
+                                        volume.id
+                                    ),
+                                );
+                                break 'walk;
+                            }
+                        };
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: {} is {} mounted at {}{}",
+                                volume.id,
+                                dev.disk,
+                                dev.mount,
+                                if dev.mount == "/data" {
+                                    " (/data)"
+                                } else {
+                                    " (not /data; a real run grows it anyway)"
+                                }
+                            ),
+                        );
+                        if let Some(row) = dg::df_h_for_mount(&probe.df_h, &dev.mount) {
+                            note(LogLevel::Info, format!("dry run: df -h now: {row}"));
+                        }
+                        let device_ahead = match dg::fs_bytes_for_mount(&probe, &dev.mount) {
+                            Some(fs) => {
+                                let ahead = dg::device_ahead_of_fs(dev.device_bytes, fs);
+                                note(
+                                    LogLevel::Info,
+                                    format!(
+                                        "dry run: device {} bytes, filesystem {fs} bytes — \
+                                         device_ahead_of_fs={ahead}",
+                                        dev.device_bytes
+                                    ),
+                                );
+                                ahead
+                            }
+                            None => {
+                                note(
+                                    LogLevel::Warn,
+                                    format!(
+                                        "dry run: the box reports no filesystem size for {} — a \
+                                         real run would escalate",
+                                        dev.mount
+                                    ),
+                                );
+                                break 'walk;
+                            }
+                        };
+                        let options: Vec<String> = dg::growth_options(&volume)
+                            .iter()
+                            .map(|g| format!("{} GiB ({:?})", g.new_gib, g.kind))
+                            .collect();
+                        note(
+                            LogLevel::Info,
+                            format!("dry run: planned growth options, in order: {options:?}"),
+                        );
+                        let plan = match disk_grow_next_move(alert.acknowledged, device_ahead) {
+                            NextMove::Full => {
+                                "acknowledge (on call), resize to the first option AWS accepts, \
+                                 wait for the new size, grow the filesystem and comment the \
+                                 alert"
+                            }
+                            NextMove::FilesystemOnly => {
+                                "acknowledge (on call) and grow the filesystem only — the device \
+                                 is already larger than it — then comment the alert"
+                            }
+                            NextMove::Nothing => {
+                                "nothing new: the alert is already acknowledged and the device \
+                                 is not ahead (an acknowledged alert is never resized)"
+                            }
+                        };
+                        note(LogLevel::Info, format!("dry run: a real run would {plan}"));
+                    }
+                    note(
+                        LogLevel::Info,
+                        "dry run: nothing was acknowledged, no volume was modified, the \
+                         filesystem was not grown and the alert was not commented — this will \
+                         escalate next, as though the run had failed"
+                            .to_string(),
+                    );
+                }
                 DryRunRoute::Neither => {
                     fail(format!(
                         "alert {} matches no watcher — not a reaper alert \
                          (alertname~{:?} app~{:?} message~{:?}), not an unhealthy-host alert \
                          (alertname~{:?} app~{:?} message~{:?}) and not a pingdom alert \
                          (alertname~{:?} app~{:?} message~{:?}) and not a Grafana alert \
-                         (grafana.title_contains {:?}). Nothing was escalated.",
+                         (grafana.title_contains {:?}) and not a disk-utilization alert (its \
+                         title needs both [EC2] and DiskUtilization). Nothing was escalated.",
                         alert.id,
                         reaper_cfg.alertname_contains,
                         reaper_cfg.app_contains,
@@ -11774,6 +12284,9 @@ mod gui {
         /// The compiled-in Grafana rules, for the dry run's matcher and the
         /// manual remediation. The watcher's own copy is moved into its thread.
         grafana_cfg: ec2_manager::features::GrafanaFeature,
+        /// The compiled-in disk-utilization rules, for the dry run and the
+        /// manual remediation. The watcher's own copy is moved into its thread.
+        disk_grow_cfg: ec2_manager::features::DiskGrowFeature,
         /// Where a dry run reports back to the *window* — an alert that
         /// could not be fetched, one no watcher claims, a send that did not
         /// go, and the address a send that did go reached. A channel, not a
@@ -12739,6 +13252,7 @@ mod gui {
                 unhealthy_host_cfg: features.unhealthy_host.clone(),
                 instance_age_cfg: features.instance_age.clone(),
                 grafana_cfg: features.grafana.clone(),
+                disk_grow_cfg: features.disk_grow.clone(),
                 dry_run_status_tx,
                 dry_run_status_rx,
                 reaper_probe_enabled: features
@@ -20989,6 +21503,7 @@ mod gui {
                         unhealthy_cfg: self.unhealthy_host_cfg.clone(),
                         instance_age_cfg: self.instance_age_cfg.clone(),
                         grafana_cfg: self.grafana_cfg.clone(),
+                        disk_grow_cfg: self.disk_grow_cfg.clone(),
                         app_config: self.config.clone(),
                         mode: self.options.mode.clone(),
                         mailbox: ec2_manager::jsm_auth::escalation_mailbox(),
@@ -20998,6 +21513,7 @@ mod gui {
                         unhealthy_allowed: self.unhealthy_host_cfg.is_allowed_user(&os_user),
                         instance_age_allowed: self.instance_age_cfg.is_allowed_user(&os_user),
                         grafana_allowed: self.grafana_cfg.is_allowed_user(&os_user),
+                        disk_grow_allowed: self.disk_grow_cfg.is_allowed_user(&os_user),
                     },
                     alert_id,
                     override_health,
@@ -23266,6 +23782,9 @@ mod gui {
                  For an instance-age alert: reads the instance, its auto scaling group, \
                  its recent scaling activity and its target health, and reports what would \
                  be terminated; terminates nothing.\n\n\
+                 For a disk-utilization alert: reads the instance's volumes and the box, \
+                 and reports the data volume, its mount and the planned sizes; modifies \
+                 nothing and grows nothing.\n\n\
                  Then it escalates as though the fix had failed. Nothing is \
                  acknowledged and nothing is changed. Every step is in the log under \
                  On-Call -> Alert Test.",
@@ -23560,6 +24079,7 @@ mod gui {
                                 DryRunRoute::Reaper => Some("On-Call -> Reaper Down"),
                                 DryRunRoute::UnhealthyHost => Some("Sources -> Unhealthy Host"),
                                 DryRunRoute::Grafana => Some("Sources -> Grafana"),
+                                DryRunRoute::DiskGrow => Some("Sources -> Disk Utilization"),
                                 DryRunRoute::InstanceAge => Some("Sources -> Instance Age"),
                                 DryRunRoute::Pingdom | DryRunRoute::Neither => None,
                             }
@@ -23589,6 +24109,7 @@ mod gui {
                     self.unhealthy_host_cfg.clone(),
                     self.instance_age_cfg.clone(),
                     self.grafana_cfg.clone(),
+                    self.disk_grow_cfg.clone(),
                     self.config.clone(),
                     self.options.mode.clone(),
                     ec2_manager::jsm_auth::escalation_mailbox(),
@@ -65156,10 +65677,191 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn a_manual_grafana_remediation_needs_the_grafana_list() {
-            assert!(manual_remediation_refusal(DryRunRoute::Grafana, false, false, true).is_none());
-            let refused = manual_remediation_refusal(DryRunRoute::Grafana, true, true, false)
+            assert!(manual_remediation_refusal(DryRunRoute::Grafana, false, false, true, false).is_none());
+            let refused = manual_remediation_refusal(DryRunRoute::Grafana, true, true, false, false)
                 .expect("refused");
             assert!(refused.contains("grafana.allowed_users"));
+        }
+
+        const DISK_TITLE: &str = "[EC2]: dev1-Cassandra-100-DiskUtilization-Warning";
+
+        fn populated_disk_grow_cfg() -> ec2_manager::features::DiskGrowFeature {
+            ec2_manager::features::DiskGrowFeature {
+                enabled: true,
+                allowed_users: listed(&["bconrad"]),
+                excluded_environments: listed(&["PROD"]),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn a_disk_utilization_alert_routes_to_disk_grow() {
+            use ec2_manager::features::*;
+            // The disk-grow claim reads only the title; the populated config
+            // is what a real site would hold, and must not change the route.
+            let _cfg = populated_disk_grow_cfg();
+            let route = dry_run_route(
+                &dry_run_alert(DISK_TITLE),
+                &ReaperFeature::default(),
+                &PingdomFeature::default(),
+                &UnhealthyHostFeature::default(),
+                &InstanceAgeFeature::default(),
+                &GrafanaFeature::default(),
+            );
+            assert_eq!(route, DryRunRoute::DiskGrow);
+            // The shipped instance-age rules sit below it and do not steal it.
+            let shipped = ec2_manager::features::load();
+            assert_eq!(
+                dry_run_route(
+                    &dry_run_alert(DISK_TITLE),
+                    &ReaperFeature::default(),
+                    &PingdomFeature::default(),
+                    &UnhealthyHostFeature::default(),
+                    &shipped.instance_age,
+                    &GrafanaFeature::default(),
+                ),
+                DryRunRoute::DiskGrow
+            );
+        }
+
+        #[test]
+        fn reaper_and_grafana_still_outrank_disk_grow() {
+            use ec2_manager::features::*;
+            // A title both claim: reaper wins (its title word plus a rule).
+            let reaper = ReaperFeature {
+                message_contains: "DiskUtilization".to_string(),
+                ..Default::default()
+            };
+            let reaper_title = "[EC2]: dev1-cassandra-reaper-DiskUtilization-Warning";
+            assert_eq!(
+                dry_run_route(
+                    &dry_run_alert(reaper_title),
+                    &reaper,
+                    &PingdomFeature::default(),
+                    &UnhealthyHostFeature::default(),
+                    &InstanceAgeFeature::default(),
+                    &GrafanaFeature::default(),
+                ),
+                DryRunRoute::Reaper
+            );
+            let grafana = GrafanaFeature {
+                title_contains: vec!["DiskUtilization".to_string()],
+                ..Default::default()
+            };
+            assert_eq!(
+                dry_run_route(
+                    &dry_run_alert(DISK_TITLE),
+                    &ReaperFeature::default(),
+                    &PingdomFeature::default(),
+                    &UnhealthyHostFeature::default(),
+                    &InstanceAgeFeature::default(),
+                    &grafana,
+                ),
+                DryRunRoute::Grafana
+            );
+        }
+
+        #[test]
+        fn instance_age_does_not_claim_a_disk_utilization_title() {
+            let shipped = ec2_manager::features::load();
+            assert!(!ec2_manager::instance_age::identifies(
+                &dry_run_alert(DISK_TITLE),
+                &shipped.instance_age
+            ));
+        }
+
+        #[test]
+        fn manual_remediation_refuses_disk_grow_for_a_user_off_the_list() {
+            assert!(
+                manual_remediation_refusal(DryRunRoute::DiskGrow, true, true, true, true).is_none()
+            );
+            let refused = manual_remediation_refusal(DryRunRoute::DiskGrow, true, true, true, false)
+                .expect("refused");
+            assert!(refused.contains("disk_grow.allowed_users"), "{refused}");
+            // And the other routes do not consult the disk-grow list.
+            assert!(
+                manual_remediation_refusal(DryRunRoute::Grafana, true, true, true, false).is_none()
+            );
+        }
+
+        #[test]
+        fn nothing_in_the_disk_grow_test_path_acknowledges_modifies_or_grows() {
+            let src = disk_grow_prod_src();
+            let from = src.find("fn start_alert_dry_run").expect("the dry-run fn");
+            let rest = &src[from..];
+            let start = rest.find("DryRunRoute::DiskGrow => {").expect("the dry-run arm");
+            let arm = &rest[start..];
+            let end = arm.find("DryRunRoute::Neither => {").expect("the next arm");
+            let arm = &arm[..end];
+            assert!(arm.contains("dry run:"), "the slice must be the dry-run arm");
+            for banned in [
+                "acknowledge_alert",
+                "modify_volume(",
+                "disk_grow_run_fs(",
+                "add_note(",
+                "disk_grow_grow_once(",
+                "disk_grow_fs_and_comment(",
+            ] {
+                assert!(!arm.contains(banned), "Test Alert Match must not call {banned}");
+            }
+            // It does read the box and report the plan.
+            assert!(arm.contains("disk_grow_probe("));
+            assert!(arm.contains("growth_options("));
+            assert!(arm.contains("device_ahead_of_fs("));
+        }
+
+        #[test]
+        fn disk_grow_remediation_refuses_an_excluded_environment() {
+            let cfg = populated_disk_grow_cfg();
+            let why = disk_grow_manual_env_refusal(&cfg, "prod").expect("refused");
+            assert!(why.contains("excluded"), "{why}");
+            assert!(why.contains("prod"), "{why}");
+            assert_eq!(disk_grow_manual_env_refusal(&cfg, "DEV1"), None);
+            // Nothing excluded: any environment, even blank, proceeds.
+            let open = ec2_manager::features::DiskGrowFeature::default();
+            assert_eq!(disk_grow_manual_env_refusal(&open, "PROD"), None);
+            assert_eq!(disk_grow_manual_env_refusal(&open, ""), None);
+        }
+
+        #[test]
+        fn disk_grow_remediation_refuses_an_unreadable_environment_while_anything_is_excluded() {
+            let cfg = populated_disk_grow_cfg();
+            for env in ["", "  ", "{{env}}", "&{%x%}%"] {
+                let why = disk_grow_manual_env_refusal(&cfg, env)
+                    .unwrap_or_else(|| panic!("{env:?} must be refused"));
+                assert!(why.contains("cannot be read"), "{why}");
+            }
+        }
+
+        #[test]
+        fn disk_grow_remediation_refuses_a_volume_mid_modification() {
+            use ec2_manager::disk_grow::{ModState, NO_MODIFICATION};
+            for s in [ModState::Modifying, ModState::Optimizing] {
+                let why = disk_grow_manual_state_refusal(&Ok(s.clone())).expect("refused");
+                assert!(why.contains("already being modified"), "{why}");
+                assert!(why.contains("poll"), "the reason names the race: {why}");
+            }
+            // Unknown and an unreadable state are refused too: nothing here
+            // can say no modification is in flight.
+            assert!(disk_grow_manual_state_refusal(&Ok(ModState::Unknown("x".into()))).is_some());
+            assert!(disk_grow_manual_state_refusal(&Err("boom".to_string())).is_some());
+            // Settled, or never modified: proceed.
+            assert_eq!(disk_grow_manual_state_refusal(&Ok(ModState::Completed)), None);
+            assert_eq!(disk_grow_manual_state_refusal(&Ok(ModState::Failed)), None);
+            assert_eq!(disk_grow_manual_state_refusal(&Err(NO_MODIFICATION.to_string())), None);
+        }
+
+        #[test]
+        fn the_manual_disk_grow_runs_the_shared_chain_and_refuses_first() {
+            let body = disk_grow_fn_body(disk_grow_prod_src(), "fn run_disk_grow_remediation(");
+            let claim = body.find("claim_in_flight(").expect("in-flight claim");
+            let env = body.find("disk_grow_manual_env_refusal(").expect("env refusal");
+            let state = body.find("disk_grow_manual_state_refusal(").expect("state refusal");
+            let ack = body.find("acknowledge_alert(").expect("ack");
+            let chain = body.find("disk_grow_grow_once(").expect("the shared chain");
+            assert!(claim < env && env < state && state < ack && ack < chain, "{body}");
+            assert!(!body.contains("modify_volume("), "the resize lives in the shared chain only");
+            assert!(body.contains("if on_call"), "acknowledges only on call");
         }
 
         fn dry_run_instance_age_cfg() -> ec2_manager::features::InstanceAgeFeature {
@@ -65180,13 +65882,13 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         #[test]
         fn manual_remediation_is_refused_unless_the_alert_type_has_a_fix_you_may_run() {
             use DryRunRoute::*;
-            assert_eq!(manual_remediation_refusal(Reaper, false, false, false), None);
-            assert_eq!(manual_remediation_refusal(UnhealthyHost, true, false, false), None);
-            assert!(manual_remediation_refusal(UnhealthyHost, false, true, false).is_some());
-            assert_eq!(manual_remediation_refusal(InstanceAge, false, true, false), None);
-            assert!(manual_remediation_refusal(InstanceAge, true, false, false).is_some());
-            assert!(manual_remediation_refusal(Pingdom, true, true, false).is_some());
-            assert!(manual_remediation_refusal(Neither, true, true, false).is_some());
+            assert_eq!(manual_remediation_refusal(Reaper, false, false, false, false), None);
+            assert_eq!(manual_remediation_refusal(UnhealthyHost, true, false, false, false), None);
+            assert!(manual_remediation_refusal(UnhealthyHost, false, true, false, false).is_some());
+            assert_eq!(manual_remediation_refusal(InstanceAge, false, true, false, false), None);
+            assert!(manual_remediation_refusal(InstanceAge, true, false, false, false).is_some());
+            assert!(manual_remediation_refusal(Pingdom, true, true, false, false).is_some());
+            assert!(manual_remediation_refusal(Neither, true, true, false, false).is_some());
         }
 
         /// The confirmation must hand off to the router, not straight to the
