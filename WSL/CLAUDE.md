@@ -62,26 +62,26 @@ baseline immediately before that work was 1522 tests / 24 warnings, on the
 same tree. (Before phase 1 of the resource browser this line had been stale
 for months, reading 356 tests / 21 warnings.)
 - `cargo build --features gui` — zero warnings (Linux)
-- `cargo test --features gui` — 2221 tests pass, 0 fail (1386 lib + 3 CLI + 832 GUI),
+- `cargo test --features gui` — 2231 tests pass, 0 fail (1389 lib + 3 CLI + 839 GUI),
   remeasured 2026-10-28 on `disk-utilization-watcher` after the disk-utilization
-  watcher (Windows release cross-compile exit 0; its only warning is the lib's
-  `unused mut` at `config.rs:350`, not from this work). Clippy on that tree
-  prints 36 `^warning` lines (11 lib + 23 GUI + 2 summaries), none in
-  `disk_grow.rs` or in any line the branch added; the other lints are in files
-  the branch did not touch, so the 30 below belongs to an earlier base tree.
-- `cargo clippy --features gui` — no errors; **30 `^warning` lines**, measured
-  2026-10-19, identical to the pre-Grafana tree at `4e4b95b`. The Grafana work
-  adds no lint: the one it introduced (`too_many_arguments` on
-  `start_instance_age_poll`) is covered by `#[allow(clippy::too_many_arguments)]`.
-  **That is a count of `^warning` lines** — 28 warnings (7 lib + 21 GUI) plus the
-  two per-crate "generated N warnings" summary lines — across 13 distinct lints.
-  Lib (7): derivable_impls on Mode, too_many_arguments on sim::make_instance,
-  three manual_is_multiple_of, one manual_div_ceil, one type_complexity
-  (cassandra_flow). GUI (21): four too_many_arguments, five collapsible_if, four
+  watcher's final review fixes (Windows release cross-compile exit 0; its only
+  warning is the lib's `unused mut` at `config.rs:350`, not from this work).
+- `cargo clippy --features gui` — no errors. **36 `^warning` lines** on that
+  tree (11 lib + 23 GUI warnings plus the two per-crate "generated N warnings"
+  summary lines), none in `disk_grow.rs` or in any line the branch added; the
+  other lints sit in files the branch did not touch. The earlier **30**
+  (28 warnings: 7 lib + 21 GUI, plus the two summaries, across 13 distinct
+  lints) was measured 2026-10-19 on the pre-Grafana tree at `4e4b95b` and
+  belongs to that older base, not to this branch; the difference came in
+  with the base, not with the watcher. Lints counted then — lib:
+  derivable_impls on Mode, too_many_arguments on sim::make_instance, three
+  manual_is_multiple_of, one manual_div_ceil, one type_complexity
+  (cassandra_flow); GUI: four too_many_arguments, five collapsible_if, four
   let_and_return, two manual_strip, two manual case-insensitive ASCII
   comparisons, manual `Range::contains`, a clamp-like pattern, a simplifiable
-  `map_or`, one unneeded `return`. (The older "24 / 22 distinct lints" figure
-  was measured on an earlier tree and no longer applies.)
+  `map_or`, one unneeded `return`. The Grafana work's one lint
+  (`too_many_arguments` on `start_instance_age_poll`) is covered by
+  `#[allow(clippy::too_many_arguments)]`.
 - The Windows release cross-compile
   (`ALLOW_NO_FORWARDS=1 CARGO_TARGET_DIR=/tmp/ec2m cargo build --release
   --target x86_64-pc-windows-gnu --features gui`) — reverified 2026-09-18,
@@ -1436,10 +1436,14 @@ run.** Run Remediation and Override are unchanged.
   alert is not known until it has been fetched, so a tooltip promising
   `compose down` is simply wrong on a pingdom alert — it said exactly that
   until a user hovered one. It now names what each watcher does.
-- **Run Remediation is reaper-only**, and its tooltip says so in the first
-  line. The row menu offers it on every alert because the menu is drawn
-  before anything is fetched; on a pingdom alert there is no fix to run and
-  the log says so.
+- **Run Remediation routes by alert type, and its hover is watcher-neutral**
+  (`RUN_REMEDIATION_HOVER`, shared by the button and the row menu): it names
+  what each route does, disk utilization included, as the Test Alert Match
+  hover does. It used to open with "Reaper alerts only ... compose down",
+  which was wrong for every other route. The confirmation dialog lists the
+  disk-utilization route too. The row menu offers it on every alert because
+  the menu is drawn before anything is fetched; on a pingdom alert there is
+  no fix to run and the log says so.
 - **A failure the person needs to see goes to the window, not just the log**
   (`alert_submit_error`, a red line under the Alert ID box): an alert id that
   could not be fetched, one no watcher claims, or a send that did not go. The
@@ -1711,8 +1715,12 @@ GUI thread (`start_disk_grow_poll`) makes every call. Spec:
 - **A title must carry BOTH `[EC2]` and `DiskUtilization`**
   (`disk_grow::TITLE_MARKERS`, case-insensitive, hard AND in code like reaper's
   title word). **Kafka disk alerts are deliberately not claimed**: a different
-  alert family with a different fix, and the two-marker rule is what keeps this
-  watcher from acting on it. `claims` yields to reaper, unhealthy host and
+  alert family with a different fix. The two markers alone do **not** keep
+  them out — `[EC2]: dev1-Kafka-100-DiskUtilization-Warning` carries both — so
+  `identifies` also requires the title NOT to contain `kafka`
+  (`disk_grow::EXCLUDED_TITLE_WORD`, case-insensitive, a hard-coded AND like
+  reaper's title word, not a config value).
+  `an_ec2_kafka_disk_alert_is_never_identified`. `claims` yields to reaper, unhealthy host and
   Grafana, so it never takes what they take.
 - **Two-key gate, `"*"` not honoured**: `disk_grow.enabled` AND a named user in
   `allowed_users` (`disk_grow_enabled_for`). This acknowledges a live page and
@@ -1849,21 +1857,47 @@ GUI thread (`start_disk_grow_poll`) makes every call. Spec:
   **listed by name** in `disk_grow.allowed_users` (`"*"` does not open it), and
   it has a **Manage Fixes** row, `Disk Utilization (EC2)`. The shared `gates:`
   line does not name it.
+- **The poll reads the modification state before any resize**
+  (`disk_grow::resize_gate`, in the `NextMove::Full` arm). A modification in
+  flight (`Modifying`, `Optimizing` or an unrecognised state) is tracked as a
+  recovery incident through `recovery`, never resized again; an unreadable
+  state escalates; only completed, failed or "never modified" resize. This
+  closes the manual-run/poll race, an off-call manual run followed by a shift
+  start, a restart after a failed owner acknowledge, and the false
+  `IncorrectModificationState` page after the 12h ceiling.
+  `the_poll_reads_the_modification_state_before_any_resize`.
+- **The poll claims the shared in-flight set** (`ReaperInFlight`, the one Run
+  Remediation's `claim_in_flight` uses) for each new alert before its chain;
+  an alert a person is remediating is skipped **without** being marked seen,
+  so the next poll looks again. Manual and poll runs on one alert cannot
+  overlap. `the_poll_claims_the_shared_in_flight_set_before_the_chain`.
+- **`acked` counts as acknowledged** (`disk_grow::alert_acknowledged`), as
+  well as the `acknowledged` flag: JSM's third status, which some replies
+  carry without the flag.
+- **On an already-acknowledged alert a failed modification is not ours.** The
+  volume's latest-ever modification can be months old: `recovery` reads
+  `Failed` as nothing to do, with one Warn — no page, no 6h hold. A failed
+  state *read* still escalates.
+- **Consequences worth knowing:**
+  - **A failed incident holds its instance for 6h** (`FAILED_HOLD_MS`), so
+    later alerts for that box are acknowledged by this app and otherwise
+    ignored for that window — nobody else is paged by them; the one
+    escalation is the page.
+  - **Seen-state is in memory.** After a restart an incident that already
+    escalated can escalate again — the filesystem-only path failing again, or
+    recovery hitting an unreadable state, are the ways.
+  - **The filesystem-only path fails at once on an `Unknown`** (no clear
+    answer from SSM), while a running incident retries
+    `DISK_GROW_MAX_FS_UNKNOWN` (10) polls first.
 - **Known and left alone:**
-  - **Manual runs share no state with the poll.** The poll can adopt a manual
-    run's acknowledged alert and grow the filesystem / post the comment a second
-    time; a shift starting during an off-call manual run can make the poll
-    attempt a resize that AWS refuses, which pages falsely.
-  - **A restart after a FAILED owner acknowledge**, with the modification more
-    than 6h old and still optimizing, could reach a second resize attempt. AWS's
-    own rules (one modification per 6h) are the backstop.
   - **Errors on an already-acknowledged alert still escalate**, unlike Grafana,
     which leaves acknowledged alerts alone. If a person was working it, this
     pages about their incident.
   - **The manual wait loop mirrors the poll's running-incident step**; a shared
     step function would remove the drift risk.
-  - **`IncorrectModificationState` escalates** (Ambiguous) rather than trying
-    +10%.
+  - **`IncorrectModificationState` from `modify-volume` escalates**
+    (Ambiguous) rather than trying +10%; the state read before the resize
+    makes it rare.
   - **The dry run still escalates for an excluded or unreadable environment**,
     and its plan line says "a real run would acknowledge/resize" even where the
     manual refusal would fire.
@@ -1894,8 +1928,12 @@ minutes, optionally escalate with the same `RE-F` email. Spec:
   on-call lookup fails. Off-call periods do NOT freeze or re-base timers: watches
   from an earlier on-call shift keep running and can fire together when you come
   back on call (Pingdom has the same shape).
-- **Built-ins win:** an alert the Pingdom, unhealthy-host or reaper watchers
-  claim (`dry_run_route`) is skipped. When two custom alerts match, the first
+- **Built-ins win:** an alert the Pingdom, unhealthy-host, reaper, Grafana or
+  instance-age watchers claim (`dry_run_route`) is skipped. **Disk utilization
+  counts only while it is armed for this user** (`disk_grow_enabled_for`,
+  `custom_alerts_should_skip`): it claims every `[EC2] DiskUtilization` title
+  with no config at all, so on the shipped closed build it would otherwise
+  swallow those alerts from custom alerts with nothing acting on them. When two custom alerts match, the first
   saved wins.
 - **Duplicate rule:** keyed on alert id, no environment grouping; each matching
   alert is its own incident.

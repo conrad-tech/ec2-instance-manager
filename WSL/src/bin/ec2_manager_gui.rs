@@ -6185,7 +6185,7 @@ mod gui {
                 false
             }
         };
-        if on_call && !alert.acknowledged {
+        if on_call && !dg::alert_acknowledged(&alert) {
             match alerts::acknowledge_alert(&env.auth, &alert_id) {
                 Ok(()) => note(LogLevel::Info, format!("acknowledged {alert_id}")),
                 Err(e) => note(
@@ -6400,16 +6400,7 @@ mod gui {
         }
         if ui
             .button("Run Remediation")
-            .on_hover_text(
-                "Reaper alerts only.\n\n\
-                 Remediate this alert now, as if it had just come in: acknowledge \
-                 (only if you are on call), compose down, \
-                 compose up -d, then watch for the alert to close.\n\n\
-                 A pingdom alert has no fix to run — use Test Alert Match for those.\n\n\
-                 Works on an open, closed, acknowledged or unacknowledged alert, and \
-                 ignores the cooldown and whatever this session has already handled.\n\n\
-                 Asks for confirmation first.",
-            )
+            .on_hover_text(format!("{RUN_REMEDIATION_HOVER}\n\nAsks for confirmation first."))
             .clicked()
         {
             *remediate = Some(alert.id.clone());
@@ -6473,6 +6464,38 @@ mod gui {
                 Self::Ok(m) => format!("\u{2714} {m}"),
                 Self::Failed(m) | Self::Warning(m) => format!("\u{26a0} {m}"),
             }
+        }
+    }
+
+    /// The Run Remediation hover, shared by the button and the row menu.
+    /// Watcher-neutral: which watcher claims the alert is not known until it
+    /// has been fetched, so it names what each route does.
+    const RUN_REMEDIATION_HOVER: &str = "Remediate this alert now, as if it had just come in. \
+         The alert is read first and routed by its type; if you are on call it is \
+         acknowledged first.\n\n\
+         Reaper down: docker compose down / up -d on its instance, then watch for the \
+         alert to close.\n\
+         Unhealthy host: terminates (or refreshes) one unhealthy ASG instance in its target \
+         group, then escalates if still open.\n\
+         Grafana: terminates the instance the alert names and waits for its replacement.\n\
+         Disk utilization (EC2): grows the larger EBS volume (+1 TB, else +10%) and its XFS \
+         filesystem, then comments on the alert.\n\
+         Instance age: terminates the aged instance if the safety checks allow it.\n\
+         Pingdom: no fix to run - use Test Alert Match.\n\n\
+         Each route needs you on that watcher's allowed_users. Works on an open, closed, \
+         acknowledged or unacknowledged alert, and ignores the cooldown and whatever this \
+         session has already handled.";
+
+    /// Whether the custom-alerts poll should leave an alert to a built-in
+    /// watcher. Disk grow claims every `[EC2] DiskUtilization` title with no
+    /// config at all, so it only counts while it is armed for this user;
+    /// otherwise a closed build would swallow those alerts from custom
+    /// alerts with nothing acting on them.
+    fn custom_alerts_should_skip(route: DryRunRoute, disk_grow_active: bool) -> bool {
+        match route {
+            DryRunRoute::Neither => false,
+            DryRunRoute::DiskGrow => disk_grow_active,
+            _ => true,
         }
     }
 
@@ -7130,7 +7153,7 @@ mod gui {
                             LogLevel::Info,
                             format!("dry run: planned growth options, in order: {options:?}"),
                         );
-                        let plan = match disk_grow_next_move(alert.acknowledged, device_ahead) {
+                        let plan = match disk_grow_next_move(ec2_manager::disk_grow::alert_acknowledged(&alert), device_ahead) {
                             NextMove::Full => {
                                 "acknowledge (on call), resize to the first option AWS accepts, \
                                  wait for the new size, grow the filesystem and comment the \
@@ -12986,6 +13009,7 @@ mod gui {
                         config.clone(),
                         options.mode.clone(),
                         mailbox.unwrap_or_default(),
+                        Arc::clone(&reaper_in_flight),
                     ))
                 } else {
                     None
@@ -21434,6 +21458,9 @@ mod gui {
                          group (ASG-managed only), then escalates if still open",
                     );
                     ui.label(
+                        "  Disk utilization (EC2): grows the larger EBS volume (+1 TB, else +10%) and its XFS filesystem on the instance.",
+                    );
+                    ui.label(
                         "  Instance age: terminates the aged instance if the safety checks \
                          allow it",
                     );
@@ -21760,8 +21787,9 @@ mod gui {
                                 LogLevel::Error,
                                 format!(
                                     "disk grow: escalation for {alert_id} FAILED TO SEND — \
-                                     {detail}. The alert is acknowledged and nothing will \
-                                     ring; handle it by hand"
+                                     {detail}. Nothing was sent and nothing will ring; check \
+                                     the alert in JSM (it may or may not have been \
+                                     acknowledged) and handle it by hand"
                                 ),
                             );
                         }
@@ -23803,15 +23831,7 @@ mod gui {
                                     !id.is_empty(),
                                     egui::Button::new("Run Remediation"),
                                 )
-                                .on_hover_text(
-                                    "Reaper alerts only.\n\n\
-                 Remediate this alert now, as if it had just come in: acknowledge \
-                 (only if you are on call), compose down, \
-                 compose up -d, then watch for the alert to close.\n\n\
-                 A pingdom alert has no fix to run — use Test Alert Match for those.\n\n\
-                 Works on an open, closed, acknowledged or unacknowledged alert, and \
-                 ignores the cooldown and whatever this session has already handled.",
-                                )
+                                .on_hover_text(RUN_REMEDIATION_HOVER)
                                 .clicked()
                             {
                                 confirm_remediation_id =
@@ -47039,6 +47059,10 @@ mod gui {
         // the newest alerts, against minute-granular timers.
         const POLL: std::time::Duration = std::time::Duration::from_secs(30);
         const FETCH: u32 = 25;
+        // Disk grow takes its alerts from custom alerts only while it is
+        // armed for this user (see `custom_alerts_should_skip`).
+        let disk_grow_active =
+            features.disk_grow_enabled_for(&ec2_manager::features::current_os_user());
 
         let defs: ec2_manager::custom_alerts::SharedDefs =
             std::sync::Arc::new(std::sync::Mutex::new(initial));
@@ -47096,7 +47120,7 @@ mod gui {
                 match alerts::fetch_latest(&auth, FETCH) {
                     Ok(list) => {
                         for alert in &list {
-                            let claimed = !matches!(
+                            let claimed = custom_alerts_should_skip(
                                 dry_run_route(
                                     alert,
                                     &features.reaper,
@@ -47105,7 +47129,7 @@ mod gui {
                                     &features.instance_age,
                                     &features.grafana,
                                 ),
-                                DryRunRoute::Neither
+                                disk_grow_active,
                             );
                             let now_ms = monotonic_ms(started);
                             if let Considered::Watching { name } =
@@ -49038,30 +49062,44 @@ mod gui {
                 facts: facts.clone(),
             }))
         };
-        match disk_grow_next_move(alert.acknowledged, device_ahead) {
+        match disk_grow_next_move(dg::alert_acknowledged(alert), device_ahead) {
             // Already acknowledged and nothing to grow on the box yet. If a
             // modification is under way (this app resized, then restarted),
             // track it so the filesystem is grown once it is usable. Never
             // a resize here.
-            NextMove::Nothing => match dg::recovery(&volume_modification_state(ctx, &volume.id), dev.device_bytes, volume.size_gib) {
-                dg::Recovery::Track => {
+            NextMove::Nothing => {
+                let state = volume_modification_state(ctx, &volume.id);
+                if state == Ok(dg::ModState::Failed) {
+                    // Possibly months old and not ours: said once, nothing done.
                     note(
                         LogLevel::Warn,
                         format!(
-                            "{tag} — already acknowledged and {} is mid-modification; \
-                             recovering: the filesystem is grown once the new size is usable \
-                             (no resize)",
+                            "{tag} — already acknowledged; {}'s last modification failed. Not \
+                             one this run started, so nothing is done and nothing pages",
                             volume.id
                         ),
                     );
-                    incident(dg::Phase::Modifying, false)
                 }
-                dg::Recovery::Nothing(why) => GrowOnce::Nothing(format!(
-                    "{tag} — already acknowledged and {why}; nothing to do (an acknowledged \
-                     alert is never resized)"
-                )),
-                dg::Recovery::Failed(why) => fail("checking for a grow to recover", why),
-            },
+                match dg::recovery(&state, dev.device_bytes, volume.size_gib) {
+                    dg::Recovery::Track => {
+                        note(
+                            LogLevel::Warn,
+                            format!(
+                                "{tag} — already acknowledged and {} is mid-modification; \
+                                 recovering: the filesystem is grown once the new size is usable \
+                                 (no resize)",
+                                volume.id
+                            ),
+                        );
+                        incident(dg::Phase::Modifying, false)
+                    }
+                    dg::Recovery::Nothing(why) => GrowOnce::Nothing(format!(
+                        "{tag} — already acknowledged and {why}; nothing to do (an acknowledged \
+                         alert is never resized)"
+                    )),
+                    dg::Recovery::Failed(why) => fail("checking for a grow to recover", why),
+                }
+            }
             NextMove::FilesystemOnly => {
                 note(
                     LogLevel::Warn,
@@ -49089,6 +49127,42 @@ mod gui {
                 }
             }
             NextMove::Full => {
+                // Read the volume's modification state before any resize. A
+                // modification already in flight (a manual run, a grow from
+                // before a restart, or one still optimizing past the 12h
+                // ceiling) is recovered, never resized again: a second
+                // modify-volume would race it and be refused, which pages.
+                let state = volume_modification_state(ctx, &volume.id);
+                match dg::resize_gate(&state) {
+                    dg::ResizeGate::Unreadable(e) => {
+                        return fail("reading the volume's modification state", e)
+                    }
+                    dg::ResizeGate::InFlight => {
+                        return match dg::recovery(&state, dev.device_bytes, volume.size_gib) {
+                            dg::Recovery::Track => {
+                                note(
+                                    LogLevel::Warn,
+                                    format!(
+                                        "{tag} — {} is already being modified; tracking it \
+                                         (no resize): the filesystem is grown once the new size \
+                                         is usable",
+                                        volume.id
+                                    ),
+                                );
+                                incident(dg::Phase::Modifying, false)
+                            }
+                            dg::Recovery::Nothing(why) => GrowOnce::Nothing(format!(
+                                "{tag} — {} is already being modified and {why}; not resized \
+                                 again",
+                                volume.id
+                            )),
+                            dg::Recovery::Failed(why) => {
+                                fail("checking the modification in flight", why)
+                            }
+                        };
+                    }
+                    dg::ResizeGate::Resize => {}
+                }
                 let options = dg::growth_options(&volume);
                 match disk_grow_resize(
                     &options,
@@ -49224,6 +49298,7 @@ mod gui {
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
         mailbox: String,
+        in_flight: ReaperInFlight,
     ) -> DiskGrowRuntime {
         use ec2_manager::{alerts, disk_grow as dg, instance_age as ia, oncall, reaper};
 
@@ -49309,6 +49384,7 @@ mod gui {
                             ),
                         );
                         let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
+                        fs_unknown.remove(&inc.instance);
                         state.finish(&inc.instance);
                         continue;
                     }
@@ -49339,6 +49415,7 @@ mod gui {
                                 );
                                 escalate(&inc.owner_alert, &inc.created_at, &why);
                                 let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
+                                fs_unknown.remove(&inc.instance);
                                 state.failed(&inc.instance, now_ms);
                             }
                             continue;
@@ -49378,6 +49455,7 @@ mod gui {
                                     );
                                     state.fs_grown(&inc.instance);
                                     state.set_phase(&inc.instance, dg::Phase::Optimizing);
+                                    fs_unknown.remove(&inc.instance);
                                 }
                                 // No clear answer: retry next poll. Never
                                 // another resize; bounded, then escalated.
@@ -49394,6 +49472,7 @@ mod gui {
                                         let _ = tx.send(DiskGrowEvent::GrowEnded {
                                             key: inc.instance.clone(),
                                         });
+                                        fs_unknown.remove(&inc.instance);
                                         state.failed(&inc.instance, now_ms);
                                     } else {
                                         note(
@@ -49411,6 +49490,7 @@ mod gui {
                                     let _ = tx.send(DiskGrowEvent::GrowEnded {
                                         key: inc.instance.clone(),
                                     });
+                                    fs_unknown.remove(&inc.instance);
                                     state.failed(&inc.instance, now_ms);
                                 }
                             }
@@ -49421,16 +49501,19 @@ mod gui {
                                 format!("{tag} — {} completed; the incident is over", inc.volume_id),
                             );
                             let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
+                            fs_unknown.remove(&inc.instance);
                             state.finish(&inc.instance);
                         }
                         dg::Transition::Escalate(why) => {
                             escalate(&inc.owner_alert, &inc.created_at, &why);
                             let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
+                            fs_unknown.remove(&inc.instance);
                             state.failed(&inc.instance, now_ms);
                         }
                         dg::Transition::StopFlashing(why) => {
                             note(LogLevel::Warn, format!("{tag} — {why}"));
                             let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
+                            fs_unknown.remove(&inc.instance);
                             state.finish(&inc.instance);
                         }
                     }
@@ -49450,6 +49533,23 @@ mod gui {
                                 {
                                     continue;
                                 }
+                                // The shared in-flight set Run Remediation
+                                // claims: an alert a person is remediating is
+                                // skipped WITHOUT being marked seen, so the
+                                // next poll looks again. Otherwise the poll
+                                // holds it itself for the whole chain
+                                // (released on Drop at the end of this pass).
+                                let Some(_claim) = claim_in_flight(&in_flight, &listed.id) else {
+                                    note(
+                                        LogLevel::Info,
+                                        format!(
+                                            "disk grow: {} is being remediated by hand — left \
+                                             to that run this poll",
+                                            listed.id
+                                        ),
+                                    );
+                                    continue;
+                                };
                                 // The list omits `description`, where the
                                 // instance, account and environment live. A
                                 // failed read is not marked seen, so the next
@@ -49506,8 +49606,9 @@ mod gui {
                                     );
                                     continue;
                                 }
-                                // Local, so decided before acknowledging. One
-                                // alert pages once: its slot is held.
+                                // Local, so decided before acknowledging (and
+                                // nothing is acknowledged). The alert is
+                                // already marked seen, so it pages once.
                                 let located = if facts.instance_id.is_empty() {
                                     Err("the alert names no readable instance id".to_string())
                                 } else {
@@ -49518,7 +49619,6 @@ mod gui {
                                     Err(e) => {
                                         let why = format!("cannot act on it: {e}");
                                         escalate(&alert.id, &alert.created_at, &why);
-                                        state.failed(&format!("instance {}", alert.id), now_ms);
                                         continue;
                                     }
                                 };
@@ -49531,7 +49631,7 @@ mod gui {
                                         }
                                         _ => format!("{instance} is held after a failed attempt"),
                                     };
-                                    if !alert.acknowledged {
+                                    if !dg::alert_acknowledged(&alert) {
                                         if let Err(e) = alerts::acknowledge_alert(&auth, &alert.id) {
                                             note(
                                                 LogLevel::Warn,
@@ -49554,7 +49654,7 @@ mod gui {
                                 // Owner. Acknowledge FIRST, unless somebody
                                 // (or this app before a restart) already
                                 // did: then it is recovery only.
-                                if !alert.acknowledged {
+                                if !dg::alert_acknowledged(&alert) {
                                     if let Err(e) = alerts::acknowledge_alert(&auth, &alert.id) {
                                         note(
                                             LogLevel::Error,
@@ -65699,7 +65799,6 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             use ec2_manager::features::*;
             // The disk-grow claim reads only the title; the populated config
             // is what a real site would hold, and must not change the route.
-            let _cfg = populated_disk_grow_cfg();
             let route = dry_run_route(
                 &dry_run_alert(DISK_TITLE),
                 &ReaperFeature::default(),
@@ -74590,13 +74689,13 @@ fed_expire = 4000000000
             let dup = body.find("begun != dg::Begin::Owner").expect("the duplicate/held branch");
             let dup_block = disk_grow_block_after(body, dup);
             assert_eq!(dup_block.matches("acknowledge_alert(").count(), 1, "{dup_block}");
-            assert!(dup_block.contains("!alert.acknowledged"), "{dup_block}");
+            assert!(dup_block.contains("!dg::alert_acknowledged(&alert)"), "{dup_block}");
             assert!(dup_block.contains("continue"), "{dup_block}");
             // The owner's acknowledge is after the duplicate branch and also
             // skips an alert somebody already took.
             let owner_ack = acks[1];
             assert!(owner_ack > dup + dup_block.len());
-            assert!(body[dup + dup_block.len()..owner_ack].contains("!alert.acknowledged"));
+            assert!(body[dup + dup_block.len()..owner_ack].contains("!dg::alert_acknowledged(&alert)"));
 
             // An excluded environment: one log line, nothing else.
             let ex = body.find("if cfg.excludes(&facts.environment)").expect("the exclusion");
@@ -74663,7 +74762,7 @@ fed_expire = 4000000000
             let src = disk_grow_prod_src();
             let once = disk_grow_fn_body(src, "fn disk_grow_grow_once(");
             assert_eq!(once.matches("modify_volume(").count(), 1, "{once}");
-            assert!(once.contains("disk_grow_next_move(alert.acknowledged, device_ahead)"));
+            assert!(once.contains("disk_grow_next_move(dg::alert_acknowledged(alert), device_ahead)"));
             let full = once.find("NextMove::Full =>").expect("the Full arm");
             let arm = disk_grow_block_after(once, full);
             assert!(arm.contains("modify_volume("), "{arm}");
@@ -74854,7 +74953,9 @@ fed_expire = 4000000000
             let block = disk_grow_block_after(once, nothing);
             let end = once[nothing..].find(block).expect("the arm's block") + block.len();
             let arm = &once[nothing..nothing + end];
-            assert!(arm.contains("dg::recovery(&volume_modification_state(ctx, &volume.id), dev.device_bytes, volume.size_gib)"), "{arm}");
+            assert!(arm.contains("let state = volume_modification_state(ctx, &volume.id);"), "{arm}");
+            assert!(arm.contains("dg::recovery(&state, dev.device_bytes, volume.size_gib)"), "{arm}");
+            assert_eq!(arm.matches("volume_modification_state(").count(), 1, "read once: {arm}");
             // Only Track starts an incident; Nothing (the box already shows
             // the full size) creates none.
             assert_eq!(arm.matches("incident(").count(), 1, "{arm}");
@@ -74885,6 +74986,113 @@ fed_expire = 4000000000
             // Marked seen before the guard, so it is logged once, not per poll.
             let seen = body[..facts].rfind("state.mark_seen(&alert.id)").expect("marked seen");
             assert!(seen < guard);
+        }
+
+        #[test]
+        fn custom_alerts_yield_to_disk_grow_only_while_it_is_armed() {
+            use DryRunRoute::*;
+            assert!(!custom_alerts_should_skip(DiskGrow, false), "a closed build must not swallow it");
+            assert!(custom_alerts_should_skip(DiskGrow, true));
+            assert!(!custom_alerts_should_skip(Neither, true));
+            assert!(!custom_alerts_should_skip(Neither, false));
+            for r in [Reaper, UnhealthyHost, Grafana, InstanceAge, Pingdom] {
+                assert!(custom_alerts_should_skip(r, false) && custom_alerts_should_skip(r, true));
+            }
+            // Assembled: a literal would count as a call site in another scan.
+            let sig = format!("fn start_custom_alerts_{}(", "poll");
+            let poll = disk_grow_fn_body(disk_grow_prod_src(), &sig);
+            assert!(poll.contains("custom_alerts_should_skip("), "{poll}");
+            assert!(poll.contains("disk_grow_enabled_for("), "{poll}");
+        }
+
+        #[test]
+        fn the_poll_reads_the_modification_state_before_any_resize() {
+            let once = disk_grow_fn_body(disk_grow_prod_src(), "fn disk_grow_grow_once(");
+            let full = once.find("NextMove::Full =>").expect("the Full arm");
+            let arm = disk_grow_block_after(once, full);
+            let read = arm.find("volume_modification_state(ctx, &volume.id)").expect("the state read");
+            let resize = arm.find("disk_grow_resize(").expect("the resize");
+            assert!(read < resize, "{arm}");
+            // A modification in flight is recovered, never resized again.
+            assert!(arm.contains("dg::recovery("), "{arm}");
+            assert!(arm.contains("dg::resize_gate(&state)"), "{arm}");
+            let gate = arm.find("dg::resize_gate(&state)").unwrap();
+            assert!(gate < resize, "{arm}");
+        }
+
+        #[test]
+        fn the_poll_claims_the_shared_in_flight_set_before_the_chain() {
+            let body = disk_grow_fn_body(disk_grow_prod_src(), "fn start_disk_grow_poll(");
+            let claim = body
+                .find("claim_in_flight(&in_flight, &listed.id)")
+                .expect("the poll claims the alert");
+            let seen = body.find("state.mark_seen(&alert.id)").expect("mark_seen");
+            let chain = body.find("disk_grow_grow_once(").expect("the chain");
+            assert!(claim < seen && claim < chain);
+            // Skipped without being marked seen, so the next poll looks again.
+            let skip = disk_grow_block_after(body, claim);
+            assert!(skip.contains("continue") && !skip.contains("mark_seen"), "{skip}");
+            let src = disk_grow_prod_src();
+            assert!(src.contains("Arc::clone(&reaper_in_flight),\n                    ))"), "passed in");
+        }
+
+        #[test]
+        fn new_alerts_are_only_read_on_call() {
+            let body = disk_grow_fn_body(disk_grow_prod_src(), "fn start_disk_grow_poll(");
+            assert_eq!(body.matches("alerts::fetch_latest(").count(), 1);
+            let on_call = body.find("\n                if on_call {\n").expect("the on-call gate");
+            let block = disk_grow_block_after(body, on_call);
+            assert!(block.contains("alerts::fetch_latest("), "{block}");
+        }
+
+        #[test]
+        fn every_end_of_a_running_incident_drops_its_line_and_its_retry_count() {
+            let body = disk_grow_fn_body(disk_grow_prod_src(), "fn start_disk_grow_poll(");
+            let start = body.find("for inc in state.incidents()").expect("the running loop");
+            let end = body.find("// 2. New alerts").expect("the new-alert step");
+            let lp = &body[start..end];
+            let mut ends: Vec<usize> = lp
+                .match_indices("state.finish(")
+                .chain(lp.match_indices("state.failed("))
+                .map(|(i, _)| i)
+                .collect();
+            ends.sort();
+            assert!(ends.len() >= 6, "{ends:?}");
+            let mut from = 0;
+            for e in ends {
+                let seg = &lp[from..e];
+                assert!(seg.contains("GrowEnded"), "an end without GrowEnded: {seg}");
+                assert!(seg.contains("fs_unknown.remove(&inc.instance)"), "{seg}");
+                from = e + 1;
+            }
+            // Moving to Optimizing also ends the filesystem retries.
+            let done = lp.find("DiskGrowFs::Done =>").expect("the Done arm");
+            let arm = disk_grow_block_after(lp, done);
+            assert!(arm.contains("fs_unknown.remove(&inc.instance)"), "{arm}");
+        }
+
+        #[test]
+        fn a_failed_disk_grow_send_does_not_claim_the_alert_is_acknowledged() {
+            let drain = method_body(disk_grow_prod_src(), "fn poll_disk_grow_events(");
+            assert!(!drain.contains("The alert is acknowledged and nothing will"), "{drain}");
+            assert!(drain.contains("Nothing was sent and nothing will ring"), "{drain}");
+            assert!(drain.contains("the alert in JSM"), "{drain}");
+            let poll = disk_grow_fn_body(disk_grow_prod_src(), "fn start_disk_grow_poll(");
+            assert!(!poll.contains("format!(\"instance {}\", alert.id)"), "unused slot key");
+        }
+
+        #[test]
+        fn run_remediation_names_the_disk_route_and_is_watcher_neutral() {
+            let src = disk_grow_prod_src();
+            let confirm = method_body(src, "fn render_run_remediation_confirm(");
+            assert!(confirm.contains(
+                "Disk utilization (EC2): grows the larger EBS volume (+1 TB, else +10%) and its XFS filesystem on the instance."
+            ));
+            assert!(!src.contains("Reaper alerts only."), "the hover is not reaper-only");
+            assert_eq!(src.matches("RUN_REMEDIATION_HOVER").count(), 3, "defined once, used twice");
+            for route in ["Reaper down", "Unhealthy host", "Grafana", "Disk utilization", "Instance age", "Pingdom"] {
+                assert!(RUN_REMEDIATION_HOVER.contains(route), "{route}");
+            }
         }
 
         #[test]

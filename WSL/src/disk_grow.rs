@@ -19,9 +19,17 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
     hay.to_ascii_lowercase().contains(&n.to_ascii_lowercase())
 }
 
-/// Does the title carry both markers?
+/// Never claimed, whatever else the title says: Kafka disk alerts are a
+/// different family with a different fix. A hard AND in code, not a config
+/// value, like reaper's title word, so no rule can widen it.
+pub const EXCLUDED_TITLE_WORD: &str = "kafka";
+
+/// Does the title carry both markers, and not the Kafka word? The two
+/// markers alone do NOT keep Kafka out: `[EC2]: dev1-Kafka-100-
+/// DiskUtilization-Warning` carries both.
 pub fn identifies(alert: &Alert) -> bool {
     TITLE_MARKERS.iter().all(|m| contains_ci(&alert.message, m))
+        && !contains_ci(&alert.message, EXCLUDED_TITLE_WORD)
 }
 
 /// Ours to act on: identified, and not claimed by an older watcher.
@@ -117,6 +125,7 @@ pub fn classify_modify_error(stderr: &str) -> ModifyError {
     if s.contains("volumemodificationrateexceeded")
         || s.contains("within the last 6 hours")
         || s.contains("in the last 6 hours")
+        || s.contains("6 hours")
     {
         return ModifyError::RateLimited;
     }
@@ -362,6 +371,35 @@ pub enum Recovery {
     Failed(String),
 }
 
+/// Whether the poll's Full path may resize, read from the volume's latest
+/// modification. Only a finished one (completed or failed), or none at all,
+/// allows it; a modification in flight (or a state this cannot name) means
+/// a grow is already under way -- resizing again would race it and be
+/// refused by AWS, which pages falsely.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResizeGate {
+    Resize,
+    InFlight,
+    Unreadable(String),
+}
+
+pub fn resize_gate(state: &Result<ModState, String>) -> ResizeGate {
+    match state {
+        Ok(ModState::Completed | ModState::Failed) => ResizeGate::Resize,
+        Err(e) if e == NO_MODIFICATION => ResizeGate::Resize,
+        Ok(ModState::Modifying | ModState::Optimizing | ModState::Unknown(_)) => ResizeGate::InFlight,
+        Err(e) => ResizeGate::Unreadable(e.clone()),
+    }
+}
+
+/// Acknowledged by anyone: the flag, or JSM's third status `acked` (some
+/// replies carry only one of the two).
+pub fn alert_acknowledged(alert: &Alert) -> bool {
+    alert.acknowledged || alert.status.trim().eq_ignore_ascii_case("acked")
+}
+
+/// What recovery on an already-acknowledged alert (or a Full path that
+/// found a modification in flight) should do.
 ///
 /// Called only when the device is NOT ahead of its filesystem, so the
 /// filesystem already fills whatever size the box shows. Optimizing or
@@ -378,7 +416,12 @@ pub fn recovery(state: &Result<ModState, String>, device_bytes: u64, volume_gib:
         Ok(ModState::Optimizing | ModState::Completed) => Recovery::Nothing(
             "the box already shows the volume's full size and the filesystem fills it".into(),
         ),
-        Ok(ModState::Failed) => Recovery::Failed("the volume's last modification failed".into()),
+        // The latest-ever modification, possibly months old, and not one
+        // this run started: nothing to finish. Never a page or a 6h hold;
+        // the caller logs one Warn.
+        Ok(ModState::Failed) => Recovery::Nothing(
+            "the volume's last modification failed (not one this run started)".into(),
+        ),
         Err(e) if e == NO_MODIFICATION => {
             Recovery::Nothing("the volume has never been modified".into())
         }
@@ -647,7 +690,6 @@ impl DiskGrowState {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,6 +709,38 @@ mod tests {
         assert!(!identifies(&alert("[Kafka]: x-DiskUtilization-Warning")));
         assert!(!identifies(&alert("[EC2]: x-CPUUtilization-Warning")));
         assert!(identifies(&alert("[ec2]: x-diskutilization-warning")));
+    }
+
+    #[test]
+    fn an_ec2_kafka_disk_alert_is_never_identified() {
+        // Both markers present: only the hard-coded Kafka word keeps it out.
+        assert!(!identifies(&alert("[EC2]: dev1-Kafka-100-DiskUtilization-Warning")));
+        assert!(!identifies(&alert("[EC2]: prod-KAFKA-broker-DiskUtilization-Critical")));
+    }
+
+    #[test]
+    fn a_resize_waits_on_any_modification_in_flight() {
+        assert_eq!(resize_gate(&Ok(ModState::Completed)), ResizeGate::Resize);
+        assert_eq!(resize_gate(&Ok(ModState::Failed)), ResizeGate::Resize);
+        assert_eq!(resize_gate(&Err(NO_MODIFICATION.to_string())), ResizeGate::Resize);
+        assert_eq!(resize_gate(&Ok(ModState::Modifying)), ResizeGate::InFlight);
+        assert_eq!(resize_gate(&Ok(ModState::Optimizing)), ResizeGate::InFlight);
+        assert_eq!(resize_gate(&Ok(ModState::Unknown("x".into()))), ResizeGate::InFlight);
+        assert!(matches!(resize_gate(&Err("AccessDenied".into())), ResizeGate::Unreadable(_)));
+    }
+
+    #[test]
+    fn acked_status_counts_as_acknowledged() {
+        let with = |status: &str, acknowledged: bool| Alert {
+            status: status.into(),
+            acknowledged,
+            ..Default::default()
+        };
+        assert!(alert_acknowledged(&with("open", true)));
+        assert!(alert_acknowledged(&with("acked", false)));
+        assert!(alert_acknowledged(&with(" ACKED ", false)));
+        assert!(!alert_acknowledged(&with("open", false)));
+        assert!(!alert_acknowledged(&with("closed", false)));
     }
 
     #[test]
@@ -762,6 +836,19 @@ mod tests {
         );
         assert_eq!(
             classify_modify_error("InvalidParameterValue: size exceeds"),
+            ModifyError::Refused
+        );
+        // AWS's own wording, and checked ahead of the Refused keywords.
+        assert_eq!(
+            classify_modify_error("Wait at least 6 hours between modifications"),
+            ModifyError::RateLimited
+        );
+        assert_eq!(
+            classify_modify_error("you have reached the maximum; wait at least 6 hours"),
+            ModifyError::RateLimited
+        );
+        assert_eq!(
+            classify_modify_error("An error occurred (VolumeLimitExceeded) when calling ModifyVolume"),
             ModifyError::Refused
         );
         assert_eq!(classify_modify_error(""), ModifyError::Ambiguous);
@@ -1210,7 +1297,11 @@ mod tests {
         assert!(matches!(recovery(&Ok(ModState::Completed), caught_up, vol), Recovery::Nothing(_)));
         // (d) Completed but the box lags: track.
         assert_eq!(recovery(&Ok(ModState::Completed), lag, vol), Recovery::Track);
-        assert!(matches!(recovery(&Ok(ModState::Failed), lag, vol), Recovery::Failed(_)));
+        // A failed modification may be months old and was not started by
+        // this run: nothing to do (the caller logs a Warn), never a page or
+        // a 6h hold.
+        assert!(matches!(recovery(&Ok(ModState::Failed), lag, vol), Recovery::Nothing(_)));
+        assert!(matches!(recovery(&Ok(ModState::Failed), caught_up, vol), Recovery::Nothing(_)));
         // Never modified at all: a person took it; nothing of ours to finish.
         let none = parse_mod_state(r#"{"VolumesModifications":[]}"#);
         assert!(matches!(recovery(&none, lag, vol), Recovery::Nothing(_)), "{none:?}");
