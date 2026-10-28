@@ -385,6 +385,191 @@ pub fn alert_comment(before: &str, after: &str) -> String {
     format!("Before:\n{before}\n\nAfter:\n{after}")
 }
 
+// ---- Incident state machine ------------------------------------------------
+
+/// AWS's modification state for a volume.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModState {
+    Modifying,
+    Optimizing,
+    Completed,
+    Failed,
+    Unknown(String),
+}
+
+/// Reads `VolumesModifications[0].ModificationState`. No entry is an `Err`.
+pub fn parse_mod_state(json: &str) -> Result<ModState, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("unreadable modification reply: {e}"))?;
+    let state = v
+        .get("VolumesModifications")
+        .and_then(|m| m.get(0))
+        .and_then(|m| m.get("ModificationState"))
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| "no volume modification was reported".to_string())?;
+    Ok(match state {
+        "modifying" => ModState::Modifying,
+        "optimizing" => ModState::Optimizing,
+        "completed" => ModState::Completed,
+        "failed" => ModState::Failed,
+        other => ModState::Unknown(other.to_string()),
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    Modifying,
+    Optimizing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Transition {
+    Wait,
+    GrowFilesystem,
+    Complete,
+    Escalate(String),
+    StopFlashing(String),
+}
+
+/// What to do next for one incident. Reasons carry no ids.
+pub fn transition(
+    phase: Phase,
+    mod_state: &ModState,
+    fs_grown: bool,
+    elapsed_ms: u64,
+    usable_wait_ms: u64,
+    optimize_ceiling_ms: u64,
+) -> Transition {
+    match mod_state {
+        ModState::Failed => Transition::Escalate("the volume modification failed".into()),
+        ModState::Optimizing | ModState::Completed if !fs_grown => Transition::GrowFilesystem,
+        ModState::Completed => Transition::Complete,
+        ModState::Optimizing => {
+            if elapsed_ms >= optimize_ceiling_ms {
+                Transition::StopFlashing(
+                    "the volume is still optimizing; the disk is already grown".into(),
+                )
+            } else {
+                Transition::Wait
+            }
+        }
+        ModState::Modifying | ModState::Unknown(_) => {
+            if phase == Phase::Modifying && elapsed_ms >= usable_wait_ms {
+                Transition::Escalate(
+                    "the volume did not become usable within the expected time".into(),
+                )
+            } else {
+                Transition::Wait
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Incident {
+    pub instance: String,
+    pub owner_alert: String,
+    pub created_at: String,
+    pub volume_id: String,
+    pub df_before: String,
+    pub mount: String,
+    pub started_ms: u64,
+    pub phase: Phase,
+    pub fs_grown: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Begin {
+    Owner,
+    Duplicate { owner: String },
+    Held,
+}
+
+/// A failed instance keeps its slot for AWS's 6-hour modification window.
+pub const FAILED_HOLD_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// Owned by one poll thread; no locks.
+#[derive(Default)]
+pub struct DiskGrowState {
+    seen: std::collections::HashSet<String>,
+    running: std::collections::HashMap<String, Incident>,
+    failed: std::collections::HashMap<String, u64>,
+}
+
+impl DiskGrowState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_seen(&self, alert_id: &str) -> bool {
+        self.seen.contains(alert_id)
+    }
+
+    pub fn mark_seen(&mut self, alert_id: &str) {
+        self.seen.insert(alert_id.to_string());
+    }
+
+    pub fn begin(&mut self, instance: &str, _alert_id: &str, now_ms: u64) -> Begin {
+        if let Some(inc) = self.running.get(instance) {
+            return Begin::Duplicate { owner: inc.owner_alert.clone() };
+        }
+        if let Some(&at) = self.failed.get(instance) {
+            if now_ms.saturating_sub(at) < FAILED_HOLD_MS {
+                return Begin::Held;
+            }
+            self.failed.remove(instance);
+        }
+        Begin::Owner
+    }
+
+    pub fn start(&mut self, incident: Incident) {
+        self.running.insert(incident.instance.clone(), incident);
+    }
+
+    pub fn incidents(&self) -> Vec<Incident> {
+        let mut v: Vec<Incident> = self.running.values().cloned().collect();
+        v.sort_by(|a, b| a.instance.cmp(&b.instance));
+        v
+    }
+
+    pub fn fs_grown(&mut self, instance: &str) {
+        if let Some(i) = self.running.get_mut(instance) {
+            i.fs_grown = true;
+        }
+    }
+
+    pub fn set_phase(&mut self, instance: &str, phase: Phase) {
+        if let Some(i) = self.running.get_mut(instance) {
+            i.phase = phase;
+        }
+    }
+
+    pub fn finish(&mut self, instance: &str) {
+        self.running.remove(instance);
+    }
+
+    /// Ends the incident and holds the instance's slot from `now_ms`.
+    pub fn failed(&mut self, instance: &str, now_ms: u64) {
+        self.running.remove(instance);
+        self.failed.insert(instance.to_string(), now_ms);
+    }
+
+    pub fn expire_failed(&mut self, now_ms: u64) {
+        self.failed.retain(|_, at| now_ms.saturating_sub(*at) < FAILED_HOLD_MS);
+    }
+
+    pub fn owner_of(&self, instance: &str) -> Option<&str> {
+        self.running.get(instance).map(|i| i.owner_alert.as_str())
+    }
+
+    pub fn growing_keys(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.running.keys().cloned().collect();
+        v.sort();
+        v
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,5 +924,159 @@ mod tests {
             assert!(!body.contains(bad), "{bad}");
         }
         assert!(!body.contains("__DG_OK__") && !body.contains("__DG_FAIL__"));
+    }
+
+    fn inc(instance: &str, owner: &str) -> Incident {
+        Incident {
+            instance: instance.into(),
+            owner_alert: owner.into(),
+            created_at: "t".into(),
+            volume_id: "vol-1".into(),
+            df_before: "df".into(),
+            mount: "/data".into(),
+            started_ms: 0,
+            phase: Phase::Modifying,
+            fs_grown: false,
+        }
+    }
+
+    #[test]
+    fn begin_makes_the_first_alert_the_owner_and_later_ones_duplicates() {
+        let mut s = DiskGrowState::new();
+        assert_eq!(s.begin("i-1", "a1", 0), Begin::Owner);
+        s.start(inc("i-1", "a1"));
+        assert_eq!(s.begin("i-1", "a2", 10), Begin::Duplicate { owner: "a1".into() });
+        assert_eq!(s.begin("i-2", "a3", 10), Begin::Owner);
+        assert!(!s.is_seen("a1"));
+        s.mark_seen("a1");
+        assert!(s.is_seen("a1"));
+    }
+
+    #[test]
+    fn a_duplicate_never_replaces_the_owner() {
+        let mut s = DiskGrowState::new();
+        s.begin("i-1", "a1", 0);
+        s.start(inc("i-1", "a1"));
+        s.begin("i-1", "a2", 5);
+        assert_eq!(s.owner_of("i-1"), Some("a1"));
+        assert_eq!(s.incidents().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_instance_holds_its_slot_for_six_hours_then_frees_it() {
+        let mut s = DiskGrowState::new();
+        s.start(inc("i-1", "a1"));
+        s.failed("i-1", 1_000);
+        let h = 60 * 60 * 1000;
+        assert_eq!(s.begin("i-1", "a2", 1_000 + 6 * h - 60_000), Begin::Held);
+        assert_eq!(s.begin("i-1", "a2", 1_000 + 6 * h), Begin::Owner);
+        let mut s = DiskGrowState::new();
+        s.start(inc("i-1", "a1"));
+        s.failed("i-1", 0);
+        s.expire_failed(6 * h - 1);
+        assert_eq!(s.begin("i-1", "a2", 6 * h - 1), Begin::Held);
+        s.expire_failed(6 * h);
+        assert_eq!(s.begin("i-1", "a2", 6 * h), Begin::Owner);
+    }
+
+    #[test]
+    fn a_finished_incident_frees_the_instance() {
+        let mut s = DiskGrowState::new();
+        s.start(inc("i-1", "a1"));
+        s.finish("i-1");
+        assert_eq!(s.begin("i-1", "a2", 0), Begin::Owner);
+        assert!(s.owner_of("i-1").is_none());
+    }
+
+    #[test]
+    fn transition_waits_while_modifying_then_escalates_after_the_usable_window() {
+        let t = |e| transition(Phase::Modifying, &ModState::Modifying, false, e, 100, 500);
+        assert_eq!(t(0), Transition::Wait);
+        assert_eq!(t(99), Transition::Wait);
+        assert!(matches!(t(100), Transition::Escalate(_)));
+    }
+
+    #[test]
+    fn transition_grows_the_filesystem_once_usable() {
+        for m in [ModState::Optimizing, ModState::Completed] {
+            for p in [Phase::Modifying, Phase::Optimizing] {
+                assert_eq!(transition(p, &m, false, 0, 100, 500), Transition::GrowFilesystem);
+            }
+        }
+        assert_ne!(
+            transition(Phase::Optimizing, &ModState::Optimizing, true, 0, 100, 500),
+            Transition::GrowFilesystem
+        );
+        assert_ne!(
+            transition(Phase::Optimizing, &ModState::Completed, true, 0, 100, 500),
+            Transition::GrowFilesystem
+        );
+    }
+
+    #[test]
+    fn a_failed_modification_escalates() {
+        for p in [Phase::Modifying, Phase::Optimizing] {
+            for g in [false, true] {
+                assert!(matches!(
+                    transition(p, &ModState::Failed, g, 0, 100, 500),
+                    Transition::Escalate(_)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn completed_after_the_filesystem_grew_is_complete() {
+        assert_eq!(
+            transition(Phase::Optimizing, &ModState::Completed, true, 0, 100, 500),
+            Transition::Complete
+        );
+    }
+
+    #[test]
+    fn optimizing_past_the_ceiling_stops_flashing_without_escalating() {
+        let t = |e| transition(Phase::Optimizing, &ModState::Optimizing, true, e, 100, 500);
+        assert_eq!(t(499), Transition::Wait);
+        assert!(matches!(t(500), Transition::StopFlashing(_)));
+        assert!(matches!(t(10_000), Transition::StopFlashing(_)));
+    }
+
+    #[test]
+    fn an_unknown_modification_state_is_never_success() {
+        let u = ModState::Unknown("weird".into());
+        assert_eq!(transition(Phase::Optimizing, &u, true, 0, 100, 500), Transition::Wait);
+        assert_eq!(transition(Phase::Modifying, &u, false, 99, 100, 500), Transition::Wait);
+        assert!(matches!(
+            transition(Phase::Modifying, &u, false, 100, 100, 500),
+            Transition::Escalate(_)
+        ));
+        for e in [0, 100, 10_000] {
+            assert_ne!(transition(Phase::Modifying, &u, false, e, 100, 500), Transition::Complete);
+        }
+    }
+
+    #[test]
+    fn parse_mod_state_reads_the_state_and_rejects_an_empty_list() {
+        let j = |s: &str| format!(r#"{{"VolumesModifications":[{{"ModificationState":"{s}"}}]}}"#);
+        assert_eq!(parse_mod_state(&j("modifying")), Ok(ModState::Modifying));
+        assert_eq!(parse_mod_state(&j("optimizing")), Ok(ModState::Optimizing));
+        assert_eq!(parse_mod_state(&j("completed")), Ok(ModState::Completed));
+        assert_eq!(parse_mod_state(&j("failed")), Ok(ModState::Failed));
+        assert_eq!(parse_mod_state(&j("odd")), Ok(ModState::Unknown("odd".into())));
+        assert!(parse_mod_state(r#"{"VolumesModifications":[]}"#).is_err());
+        assert!(parse_mod_state("not json").is_err());
+    }
+
+    #[test]
+    fn growing_keys_lists_every_running_incident() {
+        let mut s = DiskGrowState::new();
+        s.start(inc("i-b", "a2"));
+        s.start(inc("i-a", "a1"));
+        s.set_phase("i-a", Phase::Optimizing);
+        assert_eq!(s.growing_keys(), vec!["i-a".to_string(), "i-b".to_string()]);
+        s.fs_grown("i-a");
+        assert!(s.incidents().iter().any(|i| i.instance == "i-a" && i.fs_grown));
+        s.finish("i-a");
+        assert_eq!(s.growing_keys(), vec!["i-b".to_string()]);
     }
 }
