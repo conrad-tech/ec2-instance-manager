@@ -568,6 +568,25 @@ pub fn acknowledge_alert(auth: &AlertsAuth, alert_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The JSON body for a note: `{"note": "<text>"}`, built with `serde_json`
+/// so quotes, backslashes and newlines in arbitrary text cannot break out.
+pub fn note_body(note: &str) -> String {
+    serde_json::json!({ "note": note }).to_string()
+}
+
+/// Add a note to an alert (`POST .../alerts/{id}/notes`).
+///
+/// The endpoint and body are assumed from the Opsgenie-compatible API and
+/// must be verified against the live tenant on first real use. A non-2xx
+/// surfaces as an error via `curl_request`'s `--fail-with-body`.
+pub fn add_note(auth: &AlertsAuth, alert_id: &str, note: &str) -> Result<()> {
+    require_complete(auth)?;
+    validate_alert_id(alert_id)?;
+    let url = format!("{}/alerts/{alert_id}/notes", ops_base(auth));
+    curl_request(auth, &url, &[], Some(&note_body(note)))?;
+    Ok(())
+}
+
 /// Raw body of the schedule's current on-call response. Returned unparsed:
 /// `oncall::response_mentions` scans it, since the shape is not stable.
 pub fn fetch_on_calls(auth: &AlertsAuth, schedule_id: &str) -> Result<String> {
@@ -608,6 +627,24 @@ pub fn cutoff_string(window_min: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The note text will be multi-line `df -h` output; quotes, backslashes,
+    /// newlines and non-ASCII must all survive the trip through JSON.
+    #[test]
+    fn a_note_body_cannot_break_out_of_its_json() {
+        let text = "Filesystem \"root\"\n/dev/xvda1 80% C:\\path \u{00e9}\u{2714}\r\n\ttab";
+        let body = note_body(text);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(v["note"].as_str(), Some(text));
+    }
+
+    #[test]
+    fn the_note_body_has_one_field_named_note() {
+        let v: serde_json::Value = serde_json::from_str(&note_body("hi")).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.len(), 1);
+        assert_eq!(obj["note"], "hi");
+    }
 
     fn row(status: &str) -> Alert {
         Alert { status: status.to_string(), ..Default::default() }
