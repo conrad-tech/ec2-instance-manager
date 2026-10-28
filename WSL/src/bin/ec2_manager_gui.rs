@@ -48522,7 +48522,7 @@ mod gui {
             // modification is under way (this app resized, then restarted),
             // track it so the filesystem is grown once it is usable. Never
             // a resize here.
-            NextMove::Nothing => match dg::recovery(&volume_modification_state(ctx, &volume.id)) {
+            NextMove::Nothing => match dg::recovery(&volume_modification_state(ctx, &volume.id), dev.device_bytes, volume.size_gib) {
                 dg::Recovery::Track => {
                     note(
                         LogLevel::Warn,
@@ -74152,7 +74152,11 @@ fed_expire = 4000000000
             let block = disk_grow_block_after(once, nothing);
             let end = once[nothing..].find(block).expect("the arm's block") + block.len();
             let arm = &once[nothing..nothing + end];
-            assert!(arm.contains("dg::recovery(&volume_modification_state(ctx, &volume.id))"), "{arm}");
+            assert!(arm.contains("dg::recovery(&volume_modification_state(ctx, &volume.id), dev.device_bytes, volume.size_gib)"), "{arm}");
+            // Only Track starts an incident; Nothing (the box already shows
+            // the full size) creates none.
+            assert_eq!(arm.matches("incident(").count(), 1, "{arm}");
+            assert!(arm.contains("dg::Recovery::Nothing(why) => GrowOnce::Nothing("), "{arm}");
             assert!(arm.contains("dg::Recovery::Track"), "{arm}");
             assert!(arm.contains("incident(dg::Phase::Modifying, false)"), "{arm}");
             assert!(!arm.contains("modify_volume(") && !arm.contains("disk_grow_resize("), "{arm}");

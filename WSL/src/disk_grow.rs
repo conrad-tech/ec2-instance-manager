@@ -362,11 +362,21 @@ pub enum Recovery {
     Failed(String),
 }
 
-pub fn recovery(state: &Result<ModState, String>) -> Recovery {
+///
+/// Called only when the device is NOT ahead of its filesystem, so the
+/// filesystem already fills whatever size the box shows. Optimizing or
+/// Completed is therefore ours to finish only while the box still shows
+/// less than the volume's size (`device_bytes < volume_gib` GiB): once it
+/// shows the full size, the filesystem was already grown (before a restart,
+/// or by hand) and tracking it would wait for a grow that cannot come and
+/// page falsely. A Modifying volume cannot yet have a grown filesystem.
+pub fn recovery(state: &Result<ModState, String>, device_bytes: u64, volume_gib: u64) -> Recovery {
+    let box_lags = device_bytes < volume_gib.saturating_mul(1024 * 1024 * 1024);
     match state {
-        Ok(ModState::Modifying | ModState::Optimizing | ModState::Unknown(_)) => Recovery::Track,
-        Ok(ModState::Completed) => Recovery::Nothing(
-            "the last modification completed and the filesystem already fills the volume".into(),
+        Ok(ModState::Modifying | ModState::Unknown(_)) => Recovery::Track,
+        Ok(ModState::Optimizing | ModState::Completed) if box_lags => Recovery::Track,
+        Ok(ModState::Optimizing | ModState::Completed) => Recovery::Nothing(
+            "the box already shows the volume's full size and the filesystem fills it".into(),
         ),
         Ok(ModState::Failed) => Recovery::Failed("the volume's last modification failed".into()),
         Err(e) if e == NO_MODIFICATION => {
@@ -1177,15 +1187,34 @@ mod tests {
 
     #[test]
     fn recovery_tracks_a_live_modification_and_never_guesses_otherwise() {
-        assert_eq!(recovery(&Ok(ModState::Modifying)), Recovery::Track);
-        assert_eq!(recovery(&Ok(ModState::Optimizing)), Recovery::Track);
-        assert_eq!(recovery(&Ok(ModState::Unknown("x".into()))), Recovery::Track);
-        assert!(matches!(recovery(&Ok(ModState::Completed)), Recovery::Nothing(_)));
-        assert!(matches!(recovery(&Ok(ModState::Failed)), Recovery::Failed(_)));
+        let gib = 1024 * 1024 * 1024u64;
+        // A 2000 GiB volume; the box shows 1000 GiB (lagging) or 2000 GiB.
+        let (lag, caught_up, vol) = (1000 * gib, 2000 * gib, 2000u64);
+        // (e) Modifying and Unknown track whatever the sizes.
+        for dev in [lag, caught_up] {
+            assert_eq!(recovery(&Ok(ModState::Modifying), dev, vol), Recovery::Track);
+            assert_eq!(recovery(&Ok(ModState::Unknown("x".into())), dev, vol), Recovery::Track);
+        }
+        // (a) Optimizing and the box already shows the full size (grown and
+        // commented before a restart, or by hand): nothing. This was a false
+        // page.
+        assert!(matches!(recovery(&Ok(ModState::Optimizing), caught_up, vol), Recovery::Nothing(_)));
+        assert!(matches!(
+            recovery(&Ok(ModState::Optimizing), caught_up + gib, vol),
+            Recovery::Nothing(_)
+        ));
+        // (b) Optimizing and the box lags the volume: track.
+        assert_eq!(recovery(&Ok(ModState::Optimizing), lag, vol), Recovery::Track);
+        assert_eq!(recovery(&Ok(ModState::Optimizing), caught_up - 1, vol), Recovery::Track);
+        // (c) Completed and caught up: nothing.
+        assert!(matches!(recovery(&Ok(ModState::Completed), caught_up, vol), Recovery::Nothing(_)));
+        // (d) Completed but the box lags: track.
+        assert_eq!(recovery(&Ok(ModState::Completed), lag, vol), Recovery::Track);
+        assert!(matches!(recovery(&Ok(ModState::Failed), lag, vol), Recovery::Failed(_)));
         // Never modified at all: a person took it; nothing of ours to finish.
         let none = parse_mod_state(r#"{"VolumesModifications":[]}"#);
-        assert!(matches!(recovery(&none), Recovery::Nothing(_)), "{none:?}");
+        assert!(matches!(recovery(&none, lag, vol), Recovery::Nothing(_)), "{none:?}");
         // Any other unreadable answer is a failure, never "nothing to do".
-        assert!(matches!(recovery(&Err("AccessDenied".into())), Recovery::Failed(_)));
+        assert!(matches!(recovery(&Err("AccessDenied".into()), lag, vol), Recovery::Failed(_)));
     }
 }
