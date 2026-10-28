@@ -129,6 +129,10 @@ pub enum Wait {
     AfterTerminate,
     /// `vault_retry_mins`, then read health and plan again.
     VaultRetry,
+    /// An ASG instance refresh was attempted: escalate if the alert is still
+    /// open `after_refresh_mins` after the **acknowledge**, not after the
+    /// refresh call.
+    AfterRefresh,
 }
 
 /// What one health check decided.
@@ -268,12 +272,26 @@ pub fn parse_asg_group(json: &str) -> Option<String> {
     })
 }
 
+/// The `--preferences` JSON for the instance refresh. 100% minimum healthy
+/// with 110% maximum is AWS's launch-before-terminate: a replacement is
+/// started and must be up before an old instance is terminated.
+pub const REFRESH_PREFERENCES: &str = r#"{"MinHealthyPercentage":100,"MaxHealthyPercentage":110}"#;
+
+/// An ASG name is interpolated into an argv entry; accept only what AWS
+/// allows in one (no whitespace, quotes or control characters).
+pub fn is_safe_asg_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:/@+=,".contains(c))
+}
+
 /// The four windows, in milliseconds, so the state machine never reads the
 /// feature struct and every test can name its own numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timing {
     pub ack_wait_ms: u64,
     pub after_terminate_ms: u64,
+    pub after_refresh_ms: u64,
     pub vault_retry_ms: u64,
     pub insurance_window_ms: u64,
 }
@@ -283,6 +301,7 @@ impl Timing {
         Self {
             ack_wait_ms: cfg.ack_wait().as_millis() as u64,
             after_terminate_ms: cfg.after_terminate().as_millis() as u64,
+            after_refresh_ms: cfg.after_refresh().as_millis() as u64,
             vault_retry_ms: cfg.vault_retry().as_millis() as u64,
             insurance_window_ms: cfg.insurance_window().as_millis() as u64,
         }
@@ -347,6 +366,9 @@ struct Incident {
     stage: Stage,
     deadline_ms: u64,
     spent: u32,
+    /// When the alert was acknowledged and the incident began; the
+    /// `after_refresh` window is measured from here.
+    acked_ms: u64,
 }
 
 /// What the caller must do now for one incident.
@@ -437,6 +459,7 @@ impl UnhealthyHostState {
                 stage: Stage::AwaitingCheck,
                 deadline_ms: now_ms.saturating_add(self.timing.ack_wait_ms),
                 spent: 0,
+                acked_ms: now_ms,
             },
         );
         Action::AckAndWatch
@@ -495,9 +518,18 @@ impl UnhealthyHostState {
         if terminated {
             inc.spent += 1;
         }
+        if wait == Wait::AfterRefresh {
+            // Measured from the acknowledge. Never earlier than now, so a
+            // window shorter than the ack wait escalates at once rather than
+            // sitting in the past.
+            inc.stage = Stage::AwaitingDeadline;
+            inc.deadline_ms = inc.acked_ms.saturating_add(self.timing.after_refresh_ms).max(now_ms);
+            return;
+        }
         let (stage, ms) = match wait {
             Wait::AfterTerminate => (Stage::AwaitingDeadline, self.timing.after_terminate_ms),
             Wait::VaultRetry => (Stage::AwaitingCheck, self.timing.vault_retry_ms),
+            Wait::AfterRefresh => unreachable!("handled above"),
         };
         inc.stage = stage;
         inc.deadline_ms = now_ms.saturating_add(ms);
@@ -877,12 +909,58 @@ mod tests {
         assert_eq!(l.record("tg/other", 70 * MIN, 60 * MIN), 1);
     }
 
+    // ---- refresh ----
+
+    #[test]
+    fn the_refresh_waits_for_the_replacement_before_terminating() {
+        let v: serde_json::Value = serde_json::from_str(REFRESH_PREFERENCES).unwrap();
+        assert_eq!(v["MinHealthyPercentage"], 100);
+        assert_eq!(v["MaxHealthyPercentage"], 110);
+    }
+
+    #[test]
+    fn asg_names_are_whitelisted() {
+        assert!(is_safe_asg_name("prod-vault-asg"));
+        assert!(!is_safe_asg_name(""));
+        assert!(!is_safe_asg_name("a b"));
+        assert!(!is_safe_asg_name("a\"b"));
+    }
+
+    #[test]
+    fn the_refresh_window_is_measured_from_the_acknowledge() {
+        let mut s = UnhealthyHostState::new(timing());
+        assert_eq!(
+            s.consider(&open("a1", "111"), "tg/app", Kind::Ordinary, 1_000),
+            Action::AckAndWatch
+        );
+        let due = s.due(1_000 + 7 * MIN);
+        assert_eq!(due.len(), 1);
+        // The refresh call lands a few seconds after the check came due.
+        s.advance("tg/app", Wait::AfterRefresh, false, 1_000 + 7 * MIN + 5_000);
+        assert!(s.due(1_000 + 20 * MIN - 1).is_empty());
+        let due = s.due(1_000 + 20 * MIN);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].phase, Phase::Escalate);
+    }
+
+    #[test]
+    fn a_refresh_window_shorter_than_the_ack_wait_escalates_at_once() {
+        let mut t = timing();
+        t.after_refresh_ms = 3 * MIN;
+        let mut s = UnhealthyHostState::new(t);
+        s.consider(&open("a1", "111"), "tg/app", Kind::Ordinary, 0);
+        s.due(7 * MIN);
+        s.advance("tg/app", Wait::AfterRefresh, false, 7 * MIN);
+        assert_eq!(s.due(7 * MIN)[0].phase, Phase::Escalate);
+    }
+
     // ---- state ----
 
     fn timing() -> Timing {
         Timing {
             ack_wait_ms: 7 * MIN,
             after_terminate_ms: 10 * MIN,
+            after_refresh_ms: 20 * MIN,
             vault_retry_ms: 7 * MIN,
             insurance_window_ms: 60 * MIN,
         }

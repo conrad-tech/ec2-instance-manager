@@ -39,6 +39,11 @@ rfd = { version = "0.15", optional = true }
 base64 = "0.22"
 # Used by the alerts module (lib) as well as the GUI, so not gui-gated.
 chrono = "0.4"
+# Terraform/HCL syntax errors for the file editor (hcl_check.rs). Parser only;
+# nothing here runs terraform.
+hcl-rs = { version = "0.19", default-features = false }
+# YAML syntax errors (Ansible playbooks, compose files) for the same checker.
+yaml-rust2 = { version = "0.10", default-features = false }
 
 # Windows Credential Manager (CredReadW) for the five JSM Ops credentials
 # (email/token pair, cloud id, schedule id, Atlassian account id, Opsgenie

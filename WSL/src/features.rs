@@ -1003,6 +1003,9 @@ pub struct UnhealthyHostFeature {
     /// Minutes to wait for the alert to clear after a terminate (or after a
     /// check that terminated nothing) before escalating.
     pub after_terminate_mins: u64,
+    /// Minutes, **from the acknowledge**, to wait for the alert to clear after
+    /// an ASG instance refresh was attempted before escalating.
+    pub after_refresh_mins: u64,
     /// Minutes to wait after terminating one of two unhealthy Vault instances
     /// before re-reading health.
     pub vault_retry_mins: u64,
@@ -1077,6 +1080,10 @@ impl UnhealthyHostFeature {
 
     pub fn after_terminate(&self) -> std::time::Duration {
         Self::mins_or(self.after_terminate_mins, 10)
+    }
+
+    pub fn after_refresh(&self) -> std::time::Duration {
+        Self::mins_or(self.after_refresh_mins, 20)
     }
 
     pub fn vault_retry(&self) -> std::time::Duration {
@@ -3238,6 +3245,7 @@ mod unhealthy_host_feature_tests {
         assert_eq!(shipped.unhealthy_host.vault_tg_contains, "vault");
         assert_eq!(shipped.unhealthy_host.ack_wait_mins, 7);
         assert_eq!(shipped.unhealthy_host.after_terminate_mins, 10);
+        assert_eq!(shipped.unhealthy_host.after_refresh_mins, 20);
         assert_eq!(shipped.unhealthy_host.vault_retry_mins, 7);
         assert_eq!(shipped.unhealthy_host.insurance_window_mins, 60);
     }
@@ -3260,6 +3268,7 @@ mod unhealthy_host_feature_tests {
         let d = UnhealthyHostFeature::default();
         assert_eq!(d.ack_wait(), std::time::Duration::from_secs(7 * 60));
         assert_eq!(d.after_terminate(), std::time::Duration::from_secs(10 * 60));
+        assert_eq!(d.after_refresh(), std::time::Duration::from_secs(20 * 60));
         assert_eq!(d.vault_retry(), std::time::Duration::from_secs(7 * 60));
         assert_eq!(d.insurance_window(), std::time::Duration::from_secs(60 * 60));
         assert_eq!(d.poll_interval(), std::time::Duration::from_secs(30));

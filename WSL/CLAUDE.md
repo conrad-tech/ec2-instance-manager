@@ -1261,6 +1261,27 @@ every call.
     which reaper's own alarm reaches this watcher, and the reaper block's
     own rules — which ship blank, matching nothing — are what stop it.
     `reaper_still_wins_over_a_listed_app` pins that.
+- **2026-10-27: an ASG instance gets an instance refresh, not a terminate.**
+  `refresh_asg_instance` reads the chosen unhealthy instance's
+  `aws:autoscaling:groupName` tag (same refusal rules as before) and calls
+  `start_instance_refresh` — the one `start-instance-refresh` call site, Live
+  only, 100% min / 110% max healthy (`REFRESH_PREFERENCES`) so a replacement is
+  up before anything old is terminated. **It refreshes the whole group**, not
+  one instance: intended, since one unhealthy member usually means another is
+  about to be. Consequences: the per-incident budget and the Vault 7-minute
+  re-plan no longer apply on this path (one refresh, one wait).
+  - **`after_refresh_mins` (20) is measured from the ACKNOWLEDGE**, not the
+    refresh call (`Incident.acked_ms`, `Wait::AfterRefresh`); never earlier
+    than now. It is used whenever a refresh was attempted, success or failure;
+    a refused one (no ASG tag) keeps the old `after_terminate` wait.
+  - A failed refresh, or `InstanceRefreshInProgress`, is logged and **not
+    retried**; the alert keeps timing to the same deadline.
+  - **Flashing yellow toolbar line** `<target group> refreshing`
+    (`unhealthy_host_refreshing`, keyed on the owning alert id), not
+    clearable; removed when the incident closes or escalates.
+  - Test Alert Match's unhealthy-host route still reports a terminate plan and
+    was not updated. `MinHealthy/MaxHealthy` 100/110 is unverified against a
+    live group (esp. desired=1, and an already-unhealthy member).
 - **Reaper wins.** The reaper alarm *is* an `UnHealthyHostCount` alarm, so
   `claims` refuses any alert `reaper::identifies` — whether or not reaper is
   armed. Reaper's fix must never be replaced by a terminate.

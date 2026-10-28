@@ -38,6 +38,8 @@ pub mod region_search;
 pub mod resources;
 pub mod route53;
 pub mod s3;
+pub mod code_check;
+pub mod syntax;
 pub mod script_env;
 pub mod sim;
 pub mod ssh_config;

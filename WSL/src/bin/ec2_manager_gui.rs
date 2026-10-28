@@ -3529,145 +3529,91 @@ mod gui {
     /// so the two timeouts can't stack.
     const SESSION_START_WAIT: Duration = Duration::from_secs(30);
 
-    /// Comment prefixes for a file extension, used by the editor's
-    /// lightweight syntax highlighter.
-    fn comment_prefixes(ext: &str) -> &'static [&'static str] {
-        match ext {
-            "rs" | "c" | "cc" | "cpp" | "h" | "hpp" | "js" | "ts" | "jsx" | "tsx"
-            | "go" | "java" | "kt" | "swift" | "json" | "css" | "scss" => &["//"],
-            "py" | "sh" | "bash" | "zsh" | "yaml" | "yml" | "toml" | "conf"
-            | "ini" | "cfg" | "rb" | "pl" | "tf" | "dockerfile" => &["#"],
-            "sql" | "lua" | "hs" => &["--"],
-            _ => &["#", "//"],
+    /// Colour for one syntax token (VS Code "Dark+" / "Light+" flavoured).
+    fn syntax_color(kind: ec2_manager::syntax::Kind, dark: bool) -> egui::Color32 {
+        use ec2_manager::syntax::Kind;
+        let c = egui::Color32::from_rgb;
+        if dark {
+            match kind {
+                Kind::Normal => c(212, 212, 212),
+                Kind::Comment => c(106, 153, 85),
+                Kind::Str => c(206, 145, 120),
+                Kind::Interp => c(215, 186, 125),
+                Kind::Number => c(181, 206, 168),
+                Kind::Keyword => c(197, 134, 192),
+                Kind::Constant => c(86, 156, 214),
+                Kind::Type => c(78, 201, 176),
+                Kind::Block => c(86, 156, 214),
+                Kind::Attr => c(156, 220, 254),
+                Kind::Func => c(220, 220, 170),
+                Kind::Builtin => c(78, 201, 176),
+                Kind::Bracket(0) => c(255, 215, 0),
+                Kind::Bracket(1) => c(218, 112, 214),
+                Kind::Bracket(_) => c(23, 159, 255),
+                Kind::BadBracket => c(255, 80, 80),
+            }
+        } else {
+            match kind {
+                Kind::Normal => c(0, 0, 0),
+                Kind::Comment => c(0, 128, 0),
+                Kind::Str => c(163, 21, 21),
+                Kind::Interp => c(175, 120, 0),
+                Kind::Number => c(9, 134, 88),
+                Kind::Keyword => c(175, 0, 219),
+                Kind::Constant => c(0, 0, 255),
+                Kind::Type => c(38, 127, 153),
+                Kind::Block => c(0, 0, 255),
+                Kind::Attr => c(0, 16, 128),
+                Kind::Func => c(121, 94, 38),
+                Kind::Builtin => c(38, 127, 153),
+                Kind::Bracket(0) => c(180, 140, 0),
+                Kind::Bracket(1) => c(160, 32, 160),
+                Kind::Bracket(_) => c(0, 100, 200),
+                Kind::BadBracket => c(205, 20, 20),
+            }
         }
     }
 
-    /// A broad union of keywords across common languages. Good enough for
-    /// the editor's at-a-glance highlighting without per-language grammars.
-    const HL_KEYWORDS: &[&str] = &[
-        "fn", "let", "mut", "pub", "use", "mod", "impl", "struct", "enum",
-        "trait", "match", "if", "else", "for", "while", "loop", "return",
-        "break", "continue", "const", "static", "ref", "as", "where", "self",
-        "super", "crate", "move", "async", "await", "dyn", "type", "in",
-        "def", "class", "import", "from", "lambda", "pass", "with", "try",
-        "except", "finally", "raise", "yield", "global", "nonlocal", "and",
-        "or", "not", "is", "None", "True", "False", "var", "function",
-        "func", "package", "interface", "public", "private", "protected",
-        "void", "int", "bool", "string", "new", "null", "nil", "true",
-        "false", "then", "do", "end", "echo", "export", "local", "elif",
-        "fi", "esac", "case", "default", "switch", "extends", "implements",
-    ];
-
-    /// Build a colorized `LayoutJob` for the in-app editor. Single-line
-    /// tokenizer: comments, strings, numbers, and keywords. Falls back to
-    /// plain text for very large files to keep per-frame layout cheap.
-    fn highlight_code(
+    /// Build the colourised `LayoutJob` for the editor from cached tokens.
+    /// An unpaired bracket is drawn red with a red underline.
+    fn layout_job_from_tokens(
         text: &str,
-        ext: &str,
+        tokens: &[ec2_manager::syntax::Token],
         dark: bool,
         font: egui::FontId,
     ) -> egui::text::LayoutJob {
+        use ec2_manager::syntax::Kind;
         use egui::text::{LayoutJob, TextFormat};
-
-        let (c_comment, c_string, c_number, c_keyword, c_normal) = if dark {
-            (
-                egui::Color32::from_rgb(106, 153, 85),
-                egui::Color32::from_rgb(206, 145, 120),
-                egui::Color32::from_rgb(181, 206, 168),
-                egui::Color32::from_rgb(86, 156, 214),
-                egui::Color32::from_rgb(212, 212, 212),
-            )
-        } else {
-            (
-                egui::Color32::from_rgb(0, 128, 0),
-                egui::Color32::from_rgb(163, 21, 21),
-                egui::Color32::from_rgb(9, 134, 88),
-                egui::Color32::from_rgb(0, 0, 255),
-                egui::Color32::from_rgb(0, 0, 0),
-            )
-        };
-        let fmt = |color: egui::Color32| TextFormat {
-            font_id: font.clone(),
-            color,
-            ..Default::default()
-        };
         let mut job = LayoutJob::default();
-
-        // Files past this size skip highlighting (layout runs every frame).
-        if text.len() > 200_000 {
-            job.append(text, 0.0, fmt(c_normal));
-            return job;
-        }
-
-        let comment_marks = comment_prefixes(ext);
-        for piece in text.split_inclusive('\n') {
-            let (content, newline) = match piece.strip_suffix('\n') {
-                Some(c) => (c, "\n"),
-                None => (piece, ""),
+        job.text.reserve(text.len());
+        for t in tokens {
+            let mut fmt = TextFormat {
+                font_id: font.clone(),
+                color: syntax_color(t.kind, dark),
+                ..Default::default()
             };
-            let chars: Vec<char> = content.chars().collect();
-            let mut i = 0usize;
-            while i < chars.len() {
-                let rest: String = chars[i..].iter().collect();
-                // Comment runs to end of line.
-                if comment_marks.iter().any(|m| rest.starts_with(m)) {
-                    job.append(&rest, 0.0, fmt(c_comment));
-                    break;
-                }
-                let ch = chars[i];
-                if ch == '"' || ch == '\'' {
-                    let quote = ch;
-                    let mut j = i + 1;
-                    while j < chars.len() {
-                        if chars[j] == '\\' {
-                            j += 2;
-                            continue;
-                        }
-                        if chars[j] == quote {
-                            j += 1;
-                            break;
-                        }
-                        j += 1;
-                    }
-                    let tok: String = chars[i..j.min(chars.len())].iter().collect();
-                    job.append(&tok, 0.0, fmt(c_string));
-                    i = j.min(chars.len());
-                } else if ch.is_ascii_digit() {
-                    let mut j = i;
-                    while j < chars.len()
-                        && (chars[j].is_ascii_alphanumeric() || chars[j] == '.' || chars[j] == '_')
-                    {
-                        j += 1;
-                    }
-                    let tok: String = chars[i..j].iter().collect();
-                    job.append(&tok, 0.0, fmt(c_number));
-                    i = j;
-                } else if ch.is_alphabetic() || ch == '_' {
-                    let mut j = i;
-                    while j < chars.len()
-                        && (chars[j].is_alphanumeric() || chars[j] == '_')
-                    {
-                        j += 1;
-                    }
-                    let tok: String = chars[i..j].iter().collect();
-                    let color = if HL_KEYWORDS.contains(&tok.as_str()) {
-                        c_keyword
+            if t.kind == Kind::BadBracket {
+                fmt.underline = egui::Stroke::new(
+                    1.5,
+                    if dark {
+                        egui::Color32::from_rgb(255, 60, 60)
                     } else {
-                        c_normal
-                    };
-                    job.append(&tok, 0.0, fmt(color));
-                    i = j;
-                } else {
-                    let tok: String = std::iter::once(ch).collect();
-                    job.append(&tok, 0.0, fmt(c_normal));
-                    i += 1;
-                }
+                        egui::Color32::from_rgb(220, 0, 0)
+                    },
+                );
             }
-            if !newline.is_empty() {
-                job.append(newline, 0.0, fmt(c_normal));
-            }
+            job.append(&text[t.range.clone()], 0.0, fmt);
         }
         job
+    }
+
+    /// Cheap content fingerprint for the editor's per-frame caches.
+    fn text_fingerprint(text: &str, salt: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        salt.hash(&mut h);
+        h.finish()
     }
 
     /// A single find-in-file match: a byte range into the source text.
@@ -3683,50 +3629,28 @@ mod gui {
 
     /// Find every (case-insensitive) occurrence of `query` in `text`.
     /// Matches are non-overlapping, returned in order. Comparison is
-    /// ASCII-case-insensitive (non-ASCII compares exactly), which keeps
-    /// the returned ranges on valid char boundaries.
+    /// ASCII-case-insensitive (non-ASCII compares exactly). ASCII lowercasing
+    /// preserves byte offsets, so the ranges stay on char boundaries.
     fn find_matches_in_text(text: &str, query: &str) -> Vec<FindMatch> {
-        let mut out = Vec::new();
         if query.is_empty() {
-            return out;
+            return Vec::new();
         }
-        let q: Vec<char> = query.chars().collect();
-        let m = q.len();
-        let chars: Vec<(usize, char)> = text.char_indices().collect();
-        let n = chars.len();
-        if m == 0 || m > n {
-            return out;
-        }
-        let mut i = 0usize;
-        while i + m <= n {
-            let mut k = 0usize;
-            while k < m
-                && chars[i + k].1.to_ascii_lowercase() == q[k].to_ascii_lowercase()
-            {
-                k += 1;
-            }
-            if k == m {
-                let byte_start = chars[i].0;
-                let byte_end = if i + m < n { chars[i + m].0 } else { text.len() };
-                out.push(FindMatch {
-                    byte_start,
-                    byte_end,
-                });
-                if out.len() >= FIND_MAX_MATCHES {
-                    break;
-                }
-                i += m;
-            } else {
-                i += 1;
-            }
-        }
-        out
+        let hay = text.to_ascii_lowercase();
+        let needle = query.to_ascii_lowercase();
+        hay.match_indices(&needle)
+            .take(FIND_MAX_MATCHES)
+            .map(|(start, m)| FindMatch {
+                byte_start: start,
+                byte_end: start + m.len(),
+            })
+            .collect()
     }
 
     /// Overlay search-match backgrounds onto an already-built syntax-highlight
     /// `LayoutJob`. Sections that straddle a match boundary are split so each
     /// matched span gets a background colour; the match at `current` byte range
-    /// gets the stronger `current_bg`. Ranges past the job's text are clamped.
+    /// gets the stronger `current_bg`. One merge pass over sections and
+    /// matches (both ascending), so it is linear: this runs every frame.
     fn apply_find_highlights(
         job: &mut egui::text::LayoutJob,
         matches: &[FindMatch],
@@ -3737,48 +3661,86 @@ mod gui {
         if matches.is_empty() {
             return;
         }
-        let mut new_sections = Vec::with_capacity(job.sections.len());
+        let mut new_sections = Vec::with_capacity(job.sections.len() + matches.len() * 2);
+        let mut mi = 0usize;
         for section in &job.sections {
-            let s = section.byte_range.start;
-            let e = section.byte_range.end;
-            // Cut points inside this section where a match starts or ends.
-            let mut points = vec![s, e];
-            for m in matches {
-                if m.byte_end > s && m.byte_start < e {
-                    if m.byte_start > s && m.byte_start < e {
-                        points.push(m.byte_start);
-                    }
-                    if m.byte_end > s && m.byte_end < e {
-                        points.push(m.byte_end);
-                    }
-                }
+            let (s, e) = (section.byte_range.start, section.byte_range.end);
+            while mi < matches.len() && matches[mi].byte_end <= s {
+                mi += 1;
             }
-            points.sort_unstable();
-            points.dedup();
-            for w in points.windows(2) {
-                let (a, b) = (w[0], w[1]);
-                if a >= b {
-                    continue;
+            let mut a = s;
+            let mut k = mi;
+            let mut emit = |range: std::ops::Range<usize>, bg: Option<egui::Color32>| {
+                if range.start >= range.end {
+                    return;
                 }
                 let mut fmt = section.format.clone();
-                if let Some(m) = matches
-                    .iter()
-                    .find(|m| m.byte_start <= a && b <= m.byte_end)
-                {
-                    fmt.background = if current == Some((m.byte_start, m.byte_end)) {
-                        current_bg
-                    } else {
-                        match_bg
-                    };
+                if let Some(bg) = bg {
+                    fmt.background = bg;
                 }
                 new_sections.push(egui::text::LayoutSection {
-                    leading_space: section.leading_space,
-                    byte_range: a..b,
+                    leading_space: if range.start == s { section.leading_space } else { 0.0 },
+                    byte_range: range,
                     format: fmt,
                 });
+            };
+            while k < matches.len() && matches[k].byte_start < e {
+                let m = matches[k];
+                let ms = m.byte_start.max(a);
+                let me = m.byte_end.min(e);
+                emit(a..ms, None);
+                let bg = if current == Some((m.byte_start, m.byte_end)) {
+                    current_bg
+                } else {
+                    match_bg
+                };
+                emit(ms..me, Some(bg));
+                a = me.max(a);
+                if m.byte_end > e {
+                    break;
+                }
+                k += 1;
             }
+            emit(a..e, None);
         }
         job.sections = new_sections;
+    }
+
+    /// Underline `range` (a syntax error) in red, splitting the sections that
+    /// straddle its edges. One pass; the sections are ascending.
+    fn apply_error_underline(
+        job: &mut egui::text::LayoutJob,
+        range: &std::ops::Range<usize>,
+        color: egui::Color32,
+    ) {
+        let mut out = Vec::with_capacity(job.sections.len() + 2);
+        for section in &job.sections {
+            let (s, e) = (section.byte_range.start, section.byte_range.end);
+            if e <= range.start || s >= range.end {
+                out.push(section.clone());
+                continue;
+            }
+            let (a, b) = (s.max(range.start), e.min(range.end));
+            let piece = |r: std::ops::Range<usize>, hit: bool| {
+                let mut fmt = section.format.clone();
+                if hit {
+                    fmt.underline = egui::Stroke::new(1.5, color);
+                }
+                egui::text::LayoutSection {
+                    leading_space: if r.start == s { section.leading_space } else { 0.0 },
+                    byte_range: r,
+                    format: fmt,
+                }
+            };
+            if s < a {
+                out.push(piece(s..a, false));
+            }
+            out.push(piece(a..b, true));
+            if b < e {
+                out.push(piece(b..e, false));
+            }
+        }
+        job.sections = out;
     }
 
     /// Basename of a pem path, for compact display in dropdowns.
@@ -5189,27 +5151,62 @@ mod gui {
         }
     }
 
-    /// Terminate `id` only if an auto scaling group will replace it. True
-    /// when the terminate landed. Refuses on anything short of a confirmed
-    /// `aws:autoscaling:groupName` tag — an instance terminated by mistake is
-    /// never coming back.
-    fn terminate_asg_instance(
+    /// What an attempt to refresh an instance's auto scaling group came to.
+    enum AsgRefresh {
+        /// The refresh was accepted.
+        Started,
+        /// The group was confirmed but the call failed (or one is already
+        /// running). Not retried; the alert keeps timing to the same deadline.
+        Failed,
+        /// No confirmed `aws:autoscaling:groupName` tag, so nothing was tried.
+        Refused,
+    }
+
+    /// Start an instance refresh on the group `id` belongs to, but only on a
+    /// confirmed `aws:autoscaling:groupName` tag. The refresh covers the whole
+    /// group, launch-before-terminate: nothing old is terminated until its
+    /// replacement is up. Used by the poll thread and manual remediation, so
+    /// both log and decide the same way.
+    fn refresh_asg_instance(
         ctx: &AwsContext,
         mode: &Mode,
         id: &str,
         note: &impl Fn(LogLevel, String),
-    ) -> bool {
+    ) -> AsgRefresh {
         match instance_asg_group(&ctx.profile, &ctx.region, id) {
             Ok(Some(group)) => {
                 note(LogLevel::Info, format!("{id} is managed by ASG {group}"));
-                match terminate_instance(&ctx.profile, &ctx.region, id, mode) {
-                    Ok(()) => {
-                        note(LogLevel::Warn, format!("TERMINATED {id}; {group} will replace it"));
-                        true
+                match start_instance_refresh(&ctx.profile, &ctx.region, &group, mode) {
+                    Ok(refresh_id) => {
+                        note(
+                            LogLevel::Warn,
+                            format!(
+                                "started instance refresh {refresh_id} on {group} for \
+                                 unhealthy {id} (whole group, new instance up before any is \
+                                 terminated)"
+                            ),
+                        );
+                        AsgRefresh::Started
+                    }
+                    Err(e) if e.contains("InstanceRefreshInProgress") => {
+                        note(
+                            LogLevel::Warn,
+                            format!(
+                                "a refresh is already running on {group} — not starting \
+                                 another; still timing the alert"
+                            ),
+                        );
+                        AsgRefresh::Failed
                     }
                     Err(e) => {
-                        note(LogLevel::Error, format!("terminate of {id} FAILED — {e}. Not retried"));
-                        false
+                        note(
+                            LogLevel::Error,
+                            format!(
+                                "instance refresh of {group} FAILED — {e}. Not retried; still \
+                                 timing the alert"
+                            ),
+                        );
+                        AsgRefresh::Failed
                     }
                 }
             }
@@ -5217,20 +5214,58 @@ mod gui {
                 note(
                     LogLevel::Error,
                     format!(
-                        "refusing to terminate {id} — it carries no aws:autoscaling:groupName \
-                         tag, so nothing would replace it"
+                        "refusing to refresh for {id} — it carries no aws:autoscaling:groupName \
+                         tag, so it is not in an ASG. Nothing done; still timing the alert"
                     ),
                 );
-                false
+                AsgRefresh::Refused
             }
             Err(e) => {
                 note(
                     LogLevel::Error,
-                    format!("could not confirm {id} is ASG-managed ({e}) — refusing to terminate"),
+                    format!(
+                        "could not confirm {id} is ASG-managed ({e}) — refusing to refresh. \
+                         Still timing the alert"
+                    ),
                 );
-                false
+                AsgRefresh::Refused
             }
         }
+    }
+
+    /// `autoscaling start-instance-refresh` is the one refresh call, and it
+    /// must reach `aws` from here only. Live mode only, checked here rather
+    /// than trusted from the caller.
+    fn start_instance_refresh(
+        profile: &str,
+        region: &str,
+        group: &str,
+        mode: &Mode,
+    ) -> std::result::Result<String, String> {
+        if *mode != Mode::Live {
+            return Err("refusing to refresh: not in Live mode".to_string());
+        }
+        if !ec2_manager::unhealthy_host::is_safe_asg_name(group) {
+            return Err(format!("refusing to refresh {group:?}: not an ASG name"));
+        }
+        let output = aws_command()
+            .args([
+                "autoscaling", "start-instance-refresh",
+                "--profile", profile,
+                "--region", region,
+                "--auto-scaling-group-name", group,
+                "--preferences", ec2_manager::unhealthy_host::REFRESH_PREFERENCES,
+                "--output", "json",
+            ])
+            .output()
+            .map_err(|e| format!("refresh failed to run: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr: String = stderr.trim().chars().take(300).collect();
+            return Err(format!("refresh error: {stderr}"));
+        }
+        let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+        Ok(v["InstanceRefreshId"].as_str().unwrap_or("(no id)").to_string())
     }
 
     /// Manual unhealthy-host remediation: the watcher's `plan` and ASG guard
@@ -5341,25 +5376,41 @@ mod gui {
             );
             let plan = uh::plan(&members, kind, spent);
             note(LogLevel::Warn, plan.reason.clone());
+            let mut refreshed = false;
             let terminated = match &plan.terminate {
-                Some(id) => terminate_asg_instance(&ctx, &env.mode, id, &note),
+                Some(id) => match refresh_asg_instance(&ctx, &env.mode, id, &note) {
+                    AsgRefresh::Started => {
+                        refreshed = true;
+                        true
+                    }
+                    AsgRefresh::Failed => {
+                        refreshed = true;
+                        false
+                    }
+                    AsgRefresh::Refused => false,
+                },
                 None => false,
             };
             if terminated {
                 spent += 1;
-            } else if spent == 0 {
+            } else if spent == 0 && !refreshed {
                 // Nothing has changed, so there is nothing to watch for. The
-                // person is here; they get the reason rather than a ten
-                // minute wait and an email.
+                // person is here; they get the reason rather than a long
+                // wait and an email.
                 end.status = AlertActionStatus::Failed(format!(
-                    "alert {alert_id}: nothing terminated — {}",
+                    "alert {alert_id}: nothing changed — {}",
                     plan.reason
                 ));
                 return;
             }
-            let wait = wait_after_check(terminated, plan.wait);
+            let wait = if refreshed {
+                uh::Wait::AfterRefresh
+            } else {
+                wait_after_check(terminated, plan.wait)
+            };
             let window = match wait {
                 uh::Wait::AfterTerminate => cfg.after_terminate(),
+                uh::Wait::AfterRefresh => cfg.after_refresh(),
                 uh::Wait::VaultRetry => cfg.vault_retry(),
             };
             note(
@@ -11318,6 +11369,9 @@ mod gui {
         /// Connections toolbar until dismissed. A later insured alert
         /// replaces it.
         unhealthy_host_notice: Option<String>,
+        /// (owning alert id, short text): one flashing line per running
+        /// instance refresh. Not clearable; it ends with the incident.
+        unhealthy_host_refreshing: Vec<(String, String)>,
         /// The instance-age watcher's own toolbar line: the one refusal or
         /// escalation a human needs to see without opening the Logs tab.
         /// Drawn red beside the insurance one, and dismissed the same way.
@@ -12452,6 +12506,7 @@ mod gui {
                 custom_alert_note: None,
                 unhealthy_host,
                 unhealthy_host_notice: None,
+                unhealthy_host_refreshing: Vec::new(),
                 instance_age,
                 grafana,
                 instance_age_notice: None,
@@ -20799,6 +20854,13 @@ mod gui {
                     }
                     UnhealthyHostEvent::Insured { title, count } => {
                         self.unhealthy_host_notice = Some(insured_banner(&title, count));
+                    }
+                    UnhealthyHostEvent::RefreshStarted { key, text } => {
+                        self.unhealthy_host_refreshing.retain(|(k, _)| *k != key);
+                        self.unhealthy_host_refreshing.push((key, text));
+                    }
+                    UnhealthyHostEvent::RefreshEnded { key } => {
+                        self.unhealthy_host_refreshing.retain(|(k, _)| *k != key);
                     }
                     UnhealthyHostEvent::Escalated { resource, detail, ok } => {
                         if ok {
@@ -40624,7 +40686,7 @@ mod gui {
 
             // Find bar (Ctrl+F). Matches are recomputed each frame against the
             // current editor text so the highlight stays in sync with edits.
-            let mut matches: Vec<FindMatch> = Vec::new();
+            let mut matches: std::sync::Arc<Vec<FindMatch>> = std::sync::Arc::new(Vec::new());
             let mut query_changed = false;
             if find_open {
                 let prev_query = find_query.clone();
@@ -40652,7 +40714,25 @@ mod gui {
                         want_focus = true;
                     }
 
-                    matches = find_matches_in_text(&editor_content, &find_query);
+                    // Recomputed only when the text or the query changed: the
+                    // scan is O(file) and this closure runs every frame.
+                    let find_key = text_fingerprint(&editor_content, &find_query);
+                    let cache_id = egui::Id::new(("editor_find_cache", tab_id));
+                    let cached = ui.ctx().data(|d| {
+                        d.get_temp::<(u64, std::sync::Arc<Vec<FindMatch>>)>(cache_id)
+                    });
+                    matches = match cached {
+                        Some((k, m)) if k == find_key => m,
+                        _ => {
+                            let m = std::sync::Arc::new(find_matches_in_text(
+                                &editor_content,
+                                &find_query,
+                            ));
+                            ui.ctx()
+                                .data_mut(|d| d.insert_temp(cache_id, (find_key, m.clone())));
+                            m
+                        }
+                    };
 
                     if ui
                         .small_button("◀")
@@ -40760,8 +40840,51 @@ mod gui {
                 ui.style_mut().spacing.scroll = ss;
             }
 
+            // Syntax check (Terraform / JSON): parsed again only when the
+            // text changed, since this runs every frame.
+            let check_ext = remote_path
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let mut error_range: Option<std::ops::Range<usize>> = None;
+            if ec2_manager::code_check::can_check(&check_ext) {
+                let check_id = egui::Id::new(("editor_check", tab_id, remote_path.clone()));
+                let key = text_fingerprint(&editor_content, &check_ext);
+                let cached = ui.ctx().data(|d| {
+                    d.get_temp::<(u64, Option<ec2_manager::code_check::Problem>)>(check_id)
+                });
+                let problem = match cached {
+                    Some((k, p)) if k == key => p,
+                    _ => {
+                        let p = ec2_manager::code_check::check(&editor_content, &check_ext);
+                        ui.ctx().data_mut(|d| d.insert_temp(check_id, (key, p.clone())));
+                        p
+                    }
+                };
+                if let Some(p) = &problem {
+                    error_range = ec2_manager::code_check::problem_range(&editor_content, p);
+                    ui.horizontal(|ui| {
+                        let msg = p.message.lines().next().unwrap_or("");
+                        note_label(
+                            ui,
+                            egui::Color32::RED,
+                            &format!("Syntax error, line {}: {}", p.line + 1, msg),
+                        );
+                        if ui.small_button("Go to").clicked() {
+                            scroll_to_line = Some(p.line);
+                        }
+                    });
+                }
+            }
+
             // Code editor with line numbers
-            let scroll = egui::ScrollArea::both().id_salt(("editor_scroll", tab_id));
+            // Keyed on the file as well as the browser tab: each open file
+            // keeps its own scroll position and cursor, instead of every
+            // file in the browser sharing one.
+            let scroll = egui::ScrollArea::both()
+                .id_salt(("editor_scroll", tab_id, remote_path.clone()));
+            let syntax_id = egui::Id::new(("editor_syntax", tab_id, remote_path.clone()));
             scroll.show(ui, |ui| {
                     ui.horizontal_top(|ui| {
                         let line_count = editor_content.lines().count().max(1);
@@ -40786,12 +40909,28 @@ mod gui {
                         let mut layouter = |ui: &egui::Ui,
                                             buf: &dyn egui::TextBuffer,
                                             wrap_width: f32| {
-                            let mut job = highlight_code(
-                                buf.as_str(),
-                                &ext,
-                                dark,
-                                mono.clone(),
-                            );
+                            // Tokenize only when the text changed.
+                            let text = buf.as_str();
+                            let key = text_fingerprint(text, &ext);
+                            let cached = ui.ctx().data(|d| {
+                                d.get_temp::<(u64, std::sync::Arc<Vec<ec2_manager::syntax::Token>>)>(
+                                    syntax_id,
+                                )
+                            });
+                            let tokens = match cached {
+                                Some((k, t)) if k == key => t,
+                                _ => {
+                                    let t = std::sync::Arc::new(ec2_manager::syntax::tokenize(
+                                        text, &ext,
+                                    ));
+                                    ui.ctx().data_mut(|d| {
+                                        d.insert_temp(syntax_id, (key, t.clone()))
+                                    });
+                                    t
+                                }
+                            };
+                            let mut job =
+                                layout_job_from_tokens(text, &tokens, dark, mono.clone());
                             apply_find_highlights(
                                 &mut job,
                                 matches_ref,
@@ -40799,6 +40938,17 @@ mod gui {
                                 match_bg,
                                 current_bg,
                             );
+                            if let Some(r) = &error_range {
+                                apply_error_underline(
+                                    &mut job,
+                                    r,
+                                    if dark {
+                                        egui::Color32::from_rgb(255, 60, 60)
+                                    } else {
+                                        egui::Color32::from_rgb(220, 0, 0)
+                                    },
+                                );
+                            }
                             // No word wrap: each logical line stays on one row so
                             // the line-number gutter aligns and long lines scroll
                             // horizontally instead of wrapping.
@@ -40810,6 +40960,7 @@ mod gui {
                             .font(egui::TextStyle::Monospace)
                             .desired_width(f32::INFINITY)
                             .code_editor()
+                            .id_salt(("editor_text", tab_id, remote_path.clone()))
                             .layouter(&mut layouter)
                             .show(ui);
                         let response = output.response;
@@ -43289,6 +43440,7 @@ mod gui {
                     || self.tunnel_status.is_some()
                     || self.script_status_highlight.is_some()
                     || self.unhealthy_host_notice.is_some()
+                    || !self.unhealthy_host_refreshing.is_empty()
                     || self.instance_age_notice.is_some()
                     || !self.instance_age_protected_lines.is_empty()
                     || !cassandra_rows.is_empty()
@@ -43335,6 +43487,10 @@ mod gui {
                             if let Some(text) = self.unhealthy_host_notice.clone() {
                                 let c = status_color(&ScriptState::Failed, ui);
                                 ui.label(notification_text(ui, c, text));
+                            }
+                            for (_, text) in self.unhealthy_host_refreshing.clone() {
+                                let c = flashing_yellow(ui);
+                                note_label(ui, c, text);
                             }
                             if let Some(text) = self.instance_age_notice.clone() {
                                 let c = status_color(&ScriptState::Failed, ui);
@@ -45419,13 +45575,13 @@ mod gui {
             format!(
                 "unhealthy host: armed, ON CALL ONLY — polling every {}s over the {} newest \
                  alert(s); acknowledge, check the target group after {} minute(s) and \
-                 terminate one unhealthy instance, escalate if still open {} minute(s) \
-                 later (vault re-check {} minute(s), insurance window {} minute(s)); \
+                 start an ASG instance refresh, escalate if still open {} minute(s) \
+                 after the acknowledge (vault re-check {} minute(s), insurance window {} minute(s)); \
                  matching alertname~{:?} app~{:?} message~{:?}, vault groups ~{:?}",
                 cfg.poll_interval().as_secs(),
                 cfg.alerts_per_poll(),
                 cfg.ack_wait().as_secs() / 60,
-                cfg.after_terminate().as_secs() / 60,
+                cfg.after_refresh().as_secs() / 60,
                 cfg.vault_retry().as_secs() / 60,
                 cfg.insurance_window().as_secs() / 60,
                 cfg.alertname_contains,
@@ -46192,6 +46348,16 @@ mod gui {
         Escalated { resource: String, detail: String, ok: bool },
         /// The insurance case: for the toolbar banner.
         Insured { title: String, count: usize },
+        /// An instance refresh was started for the incident owned by `key`
+        /// (the alert id): a flashing toolbar line until it ends.
+        RefreshStarted { key: String, text: String },
+        /// The incident owned by `key` closed or escalated.
+        RefreshEnded { key: String },
+    }
+
+    /// The toolbar line while a refresh is running: deliberately short.
+    fn refresh_notice(target_group: &str) -> String {
+        format!("{} refreshing", target_group.trim())
     }
 
     struct UnhealthyHostRuntime {
@@ -46445,6 +46611,7 @@ mod gui {
                                 format!("unhealthy host: {id} closed — incident over, nothing escalated"),
                             );
                             state.closed(&id);
+                            let _ = tx.send(UnhealthyHostEvent::RefreshEnded { key: id.clone() });
                         }
                         Ok(_) => {}
                         Err(e) => note(
@@ -46503,69 +46670,38 @@ mod gui {
                                 ),
                             );
                             let plan = uh::plan(&members, due.kind, due.spent);
-                            let mut terminated = false;
+                            let mut refresh_attempted = false;
                             match &plan.terminate {
                                 Some(id) => {
                                     note(LogLevel::Warn, format!("unhealthy host: {}", plan.reason));
-                                    // The whole justification for terminating
-                                    // is that an ASG replaces the instance.
-                                    // Refuse outright on anything short of a
-                                    // confirmed tag — an instance this
-                                    // watcher terminates by mistake is never
-                                    // coming back.
-                                    match instance_asg_group(&ctx.profile, &ctx.region, id) {
-                                        Ok(Some(group)) => {
-                                            note(
-                                                LogLevel::Info,
-                                                format!(
-                                                    "unhealthy host: {id} is managed by ASG \
-                                                     {group}",
-                                                ),
-                                            );
-                                            match terminate_instance(&ctx.profile, &ctx.region, id, &mode) {
-                                                Ok(()) => {
-                                                    terminated = true;
-                                                    note(
-                                                        LogLevel::Warn,
-                                                        format!(
-                                                            "unhealthy host: TERMINATED {id} in \
-                                                             {} (account {})",
-                                                            due.resource, due.account_id
-                                                        ),
-                                                    );
-                                                }
-                                                Err(e) => note(
-                                                    LogLevel::Error,
-                                                    format!(
-                                                        "unhealthy host: terminate of {id} \
-                                                         FAILED — {e}. Not retried; still \
-                                                         timing the alert"
-                                                    ),
-                                                ),
-                                            }
+                                    // An instance refresh replaces the whole
+                                    // group, launch-before-terminate, so this
+                                    // watcher terminates nothing itself. It
+                                    // still acts only on a confirmed ASG tag.
+                                    let prefixed = |l: LogLevel, m: String| {
+                                        note(l, format!("unhealthy host: {m}"))
+                                    };
+                                    match refresh_asg_instance(&ctx, &mode, id, &prefixed) {
+                                        AsgRefresh::Started => {
+                                            refresh_attempted = true;
+                                            let name = reaper::target_group_name(&due.resource)
+                                                .unwrap_or(due.resource.as_str());
+                                            let _ = tx.send(UnhealthyHostEvent::RefreshStarted {
+                                                key: due.owner.clone(),
+                                                text: refresh_notice(name),
+                                            });
                                         }
-                                        Ok(None) => note(
-                                            LogLevel::Error,
-                                            format!(
-                                                "unhealthy host: refusing to terminate {id} — \
-                                                 it carries no aws:autoscaling:groupName tag, \
-                                                 so nothing would replace it. Not terminated; \
-                                                 still timing the alert"
-                                            ),
-                                        ),
-                                        Err(e) => note(
-                                            LogLevel::Error,
-                                            format!(
-                                                "unhealthy host: could not confirm {id} is \
-                                                 ASG-managed ({e}) — refusing to terminate. \
-                                                 Still timing the alert"
-                                            ),
-                                        ),
+                                        AsgRefresh::Failed => refresh_attempted = true,
+                                        AsgRefresh::Refused => {}
                                     }
                                 }
                                 None => note(LogLevel::Warn, format!("unhealthy host: {}", plan.reason)),
                             }
-                            let wait = wait_after_check(terminated, plan.wait);
+                            let wait = if refresh_attempted {
+                                uh::Wait::AfterRefresh
+                            } else {
+                                wait_after_check(false, plan.wait)
+                            };
                             note(
                                 LogLevel::Info,
                                 match wait {
@@ -46575,6 +46711,12 @@ mod gui {
                                         due.resource,
                                         cfg.after_terminate().as_secs() / 60
                                     ),
+                                    uh::Wait::AfterRefresh => format!(
+                                        "unhealthy host: escalating for {} if the alert is \
+                                         still open {} minute(s) after the acknowledge",
+                                        due.resource,
+                                        cfg.after_refresh().as_secs() / 60
+                                    ),
                                     uh::Wait::VaultRetry => format!(
                                         "unhealthy host: re-reading {} in {} minute(s)",
                                         due.resource,
@@ -46582,16 +46724,17 @@ mod gui {
                                     ),
                                 },
                             );
-                            state.advance(&due.resource, wait, terminated, monotonic_ms(started));
+                            state.advance(&due.resource, wait, false, monotonic_ms(started));
                         }
                         uh::Phase::Escalate => {
+                            let _ = tx.send(UnhealthyHostEvent::RefreshEnded { key: due.owner.clone() });
                             let subject = unhealthy_host_escalation_subject(&due);
                             note(
                                 LogLevel::Error,
                                 format!(
                                     "unhealthy host: {} ({}) is still open at the deadline after \
-                                     {} terminate(s) — escalating",
-                                    due.owner, due.resource, due.spent
+                                     the remediation attempt — escalating",
+                                    due.owner, due.resource
                                 ),
                             );
                             let tx2 = tx.clone();
@@ -64349,6 +64492,24 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             // count as a hit of its own — self-matching regardless of what
             // the rest of the file does.
             assert_eq!(hits.len(), 1, "{needle} must appear once, found at lines {hits:?}");
+        }
+
+        /// `start-instance-refresh` reaches `aws` from exactly one function,
+        /// which re-checks Live mode and the ASG name itself.
+        #[test]
+        fn start_instance_refresh_has_exactly_one_call_site() {
+            let src = include_str!("ec2_manager_gui.rs");
+            let needle = format!("start-{}", "instance-refresh");
+            let hits = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//") && l.contains(&needle))
+                .count();
+            assert_eq!(hits, 1, "{needle} must appear once");
+        }
+
+        #[test]
+        fn the_refresh_notice_is_short() {
+            assert_eq!(refresh_notice(" prod-vault "), "prod-vault refreshing");
         }
 
         /// Start / Stop / Restart must stay behind the allow-list, and there
