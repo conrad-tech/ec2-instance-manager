@@ -5435,11 +5435,19 @@ mod gui {
         if !is_safe_volume_id(volume_id) {
             return Err(format!("refusing {volume_id:?}: not a volume id"));
         }
-        let raw = aws_json(
+        // A volume that has never been modified may answer with an error
+        // rather than an empty list; that is "no modification", not unreadable.
+        let raw = match aws_json(
             &ctx.profile,
             &ctx.region,
             &["ec2", "describe-volumes-modifications", "--volume-ids", volume_id],
-        )?;
+        ) {
+            Ok(raw) => raw,
+            Err(e) if e.contains("InvalidVolumeModification.NotFound") => {
+                return Err(ec2_manager::disk_grow::NO_MODIFICATION.to_string())
+            }
+            Err(e) => return Err(e),
+        };
         ec2_manager::disk_grow::parse_mod_state(&raw)
     }
 
@@ -49151,11 +49159,12 @@ mod gui {
                                 );
                                 incident(dg::Phase::Modifying, false)
                             }
-                            dg::Recovery::Nothing(why) => GrowOnce::Nothing(format!(
-                                "{tag} — {} is already being modified and {why}; not resized \
-                                 again",
-                                volume.id
-                            )),
+                            // The poll has already acknowledged the alert, so
+                            // doing nothing here would be silent: escalate.
+                            dg::Recovery::Nothing(why) => fail(
+                                "a modification is in flight and there is nothing to track",
+                                format!("{} is already being modified and {why}", volume.id),
+                            ),
                             dg::Recovery::Failed(why) => {
                                 fail("checking the modification in flight", why)
                             }
@@ -74944,6 +74953,19 @@ fed_expire = 4000000000
             assert!(matches!(out, DiskGrowFs::Failed(_)) && posted.is_empty());
             let poll = disk_grow_fn_body(disk_grow_prod_src(), "fn start_disk_grow_poll(");
             assert!(poll.contains("disk_grow_unknown_exhausted(*n)"), "the poll uses the bound");
+        }
+
+        #[test]
+        fn a_never_modified_volume_and_an_in_flight_one_with_nothing_to_track_are_handled() {
+            let src = disk_grow_prod_src();
+            let state = disk_grow_fn_body(src, "fn volume_modification_state(");
+            assert!(state.contains("InvalidVolumeModification.NotFound"), "{state}");
+            assert!(state.contains("NO_MODIFICATION"), "{state}");
+            let once = disk_grow_fn_body(src, "fn disk_grow_grow_once(");
+            let at = once.find("dg::ResizeGate::InFlight").expect("the in-flight arm");
+            let arm = &once[at..];
+            let nothing = arm.find("dg::Recovery::Nothing(why) =>").expect("the Nothing arm");
+            assert!(arm[nothing..].trim_start_matches("dg::Recovery::Nothing(why) =>").trim_start().starts_with("fail("), "silent after the acknowledge");
         }
 
         #[test]

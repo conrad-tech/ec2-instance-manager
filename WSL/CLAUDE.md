@@ -61,7 +61,7 @@ toolbar badge counts, the editable due date and Open in Jira — the measured
 baseline immediately before that work was 1522 tests / 24 warnings, on the
 same tree. (Before phase 1 of the resource browser this line had been stale
 for months, reading 356 tests / 21 warnings.)
-- `cargo build --features gui` — zero warnings (Linux)
+- `cargo build --features gui` — one pre-existing warning (`config.rs:350` unused `mut`)
 - `cargo test --features gui` — 2231 tests pass, 0 fail (1389 lib + 3 CLI + 839 GUI),
   remeasured 2026-10-28 on `disk-utilization-watcher` after the disk-utilization
   watcher's final review fixes (Windows release cross-compile exit 0; its only
@@ -1863,8 +1863,14 @@ GUI thread (`start_disk_grow_poll`) makes every call. Spec:
   recovery incident through `recovery`, never resized again; an unreadable
   state escalates; only completed, failed or "never modified" resize. This
   closes the manual-run/poll race, an off-call manual run followed by a shift
-  start, a restart after a failed owner acknowledge, and the false
-  `IncorrectModificationState` page after the 12h ceiling.
+  start and a restart after a failed owner acknowledge. A volume AWS has
+  never modified may answer `describe-volumes-modifications` with
+  `InvalidVolumeModification.NotFound` rather than an empty list;
+  `volume_modification_state` maps that to "never modified" (resize), or the
+  first grow of any volume would escalate. **Unverified against a real
+  volume.** When a modification is in flight and the box already shows the
+  full size, the poll (which has already acknowledged) escalates rather than
+  staying silent, so a volume still optimizing past the 12h ceiling can page.
   `the_poll_reads_the_modification_state_before_any_resize`.
 - **The poll claims the shared in-flight set** (`ReaperInFlight`, the one Run
   Remediation's `claim_in_flight` uses) for each new alert before its chain;
