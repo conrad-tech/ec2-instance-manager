@@ -5380,6 +5380,12 @@ mod gui {
         })
     }
 
+    /// An `aws` command line as the dry run reports it: what was (or would be)
+    /// run, with the profile and region it ran under. Display only.
+    fn dry_run_aws_line(ctx: &AwsContext, args: &str) -> String {
+        format!("aws {args} --profile {} --region {} --output json", ctx.profile, ctx.region)
+    }
+
     /// The instance's attached volumes plus its root device name.
     fn disk_grow_volumes(
         ctx: &AwsContext,
@@ -7050,6 +7056,37 @@ mod gui {
                                 break 'walk;
                             }
                         };
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: account resolved — profile {} region {}",
+                                ctx.profile, ctx.region
+                            ),
+                        );
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: RAN (read-only): {}",
+                                dry_run_aws_line(
+                                    &ctx,
+                                    &format!(
+                                        "ec2 describe-volumes --filters \
+                                         Name=attachment.instance-id,Values={}",
+                                        facts.instance_id
+                                    )
+                                )
+                            ),
+                        );
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: RAN (read-only): {}",
+                                dry_run_aws_line(
+                                    &ctx,
+                                    &format!("ec2 describe-instances --instance-ids {}", facts.instance_id)
+                                )
+                            ),
+                        );
                         let (volumes, root) = match disk_grow_volumes(&ctx, &facts.instance_id) {
                             Ok(v) => v,
                             Err(e) => {
@@ -7088,6 +7125,16 @@ mod gui {
                                 volume.id, volume.size_gib, volume.volume_type
                             ),
                         );
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: RAN (read-only): {}",
+                                dry_run_aws_line(
+                                    &ctx,
+                                    &format!("ec2 describe-volumes-modifications --volume-ids {}", volume.id)
+                                )
+                            ),
+                        );
                         let mod_state = volume_modification_state(&ctx, &volume.id);
                         note(
                             LogLevel::Info,
@@ -7106,6 +7153,17 @@ mod gui {
                                 format!("dry run: Run Remediation would refuse — {why}"),
                             );
                         }
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: RAN (read-only) over SSM on {}: aws ssm send-command \
+                                 (AWS-RunShellScript, base64 of disk_grow_probe.sh) --profile {} \
+                                 --region {}; the script runs only: df -h; df -B1 \
+                                 --output=target,size; lsblk -b -P -o \
+                                 NAME,TYPE,SERIAL,FSTYPE,MOUNTPOINT,PKNAME,SIZE",
+                                facts.instance_id, ctx.profile, ctx.region
+                            ),
+                        );
                         let probe = match disk_grow_probe(&ctx, &facts.instance_id) {
                             Ok(p) => p,
                             Err(e) => {
@@ -7119,6 +7177,20 @@ mod gui {
                                 break 'walk;
                             }
                         };
+                        for line in probe.df_h.lines() {
+                            note(LogLevel::Info, format!("dry run: box df -h: {line}"));
+                        }
+                        for b in &probe.blocks {
+                            note(
+                                LogLevel::Info,
+                                format!(
+                                    "dry run: box lsblk: {} type={} serial={:?} fstype={:?} \
+                                     mount={:?} parent={:?} {} bytes",
+                                    b.name, b.dev_type, b.serial, b.fstype, b.mountpoint, b.pkname,
+                                    b.size_bytes
+                                ),
+                            );
+                        }
                         let dev = match dg::resolve_data_device(&probe, &volume.id) {
                             Ok(d) => d,
                             Err(e) => {
@@ -7175,6 +7247,17 @@ mod gui {
                                 break 'walk;
                             }
                         };
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: matched on serial {:?} (= {} without the dash) -> \
+                                 disk {}, partition {:?}",
+                                volume.id.replace('-', ""),
+                                volume.id,
+                                dev.disk,
+                                dev.partition
+                            ),
+                        );
                         let options: Vec<String> = dg::growth_options(&volume)
                             .iter()
                             .map(|g| format!("{} GiB ({:?})", g.new_gib, g.kind))
@@ -7199,6 +7282,63 @@ mod gui {
                             }
                         };
                         note(LogLevel::Info, format!("dry run: a real run would {plan}"));
+                        for g in dg::growth_options(&volume) {
+                            note(
+                                LogLevel::Info,
+                                format!(
+                                    "dry run: would run (NOT run): {} — {} -> {} GiB",
+                                    dry_run_aws_line(
+                                        &ctx,
+                                        &format!(
+                                            "ec2 modify-volume --volume-id {} --size {}",
+                                            volume.id, g.new_gib
+                                        )
+                                    ),
+                                    volume.size_gib,
+                                    g.new_gib
+                                ),
+                            );
+                        }
+                        match dg::fs_grow_command(&dev) {
+                            Ok(_) => note(
+                                LogLevel::Info,
+                                format!(
+                                    "dry run: would run (NOT run) over SSM once the volume is \
+                                     usable: RE_DG_DISK={:?} RE_DG_PART={:?} RE_DG_MOUNT={:?} \
+                                     disk_grow_fs.sh -> {}xfs_growfs {}; then df -h",
+                                    dev.disk,
+                                    dev.partition.as_deref().unwrap_or(""),
+                                    dev.mount,
+                                    if dev.partition.is_some() {
+                                        "growpart, then "
+                                    } else {
+                                        ""
+                                    },
+                                    dev.mount
+                                ),
+                            ),
+                            Err(e) => note(
+                                LogLevel::Error,
+                                format!("dry run: the filesystem grow would be refused — {e}"),
+                            ),
+                        }
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: would comment (NOT posted) on the alert: {:?}",
+                                dg::alert_comment(
+                                    &dg::df_h_for_mount(&probe.df_h, &dev.mount).unwrap_or_default(),
+                                    "<df -h row after the grow>"
+                                )
+                            ),
+                        );
+                        note(
+                            LogLevel::Info,
+                            "dry run: everything a real run needs was found: account profile, \
+                             instance, volumes, data volume, modification state, box probe, \
+                             device by serial, mount, and the commands above"
+                                .to_string(),
+                        );
                     }
                     note(
                         LogLevel::Info,
@@ -74928,7 +75068,8 @@ fed_expire = 4000000000
             assert!(fs.contains("dg::df_h_for_mount(&after.df_h, mount)"), "{fs}");
             assert!(!fs.contains("Grown { df_after"), "the script's own output is never the comment");
             let calls = src.matches("dg::alert_comment(").count();
-            assert_eq!(calls, 1, "alert_comment is built in one place");
+            // One real build, plus the Test Alert Match preview of the same text.
+            assert_eq!(calls, 2, "alert_comment is built in the real path and the dry-run preview");
             let once = disk_grow_fn_body(src, "fn disk_grow_grow_once(");
             assert!(once.contains("dg::df_h_for_mount(&probe.df_h, &dev.mount)"), "{once}");
         }
