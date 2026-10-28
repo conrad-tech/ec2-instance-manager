@@ -24,6 +24,7 @@ pub enum Fix {
     InstanceAge,
     Grafana,
     CustomAlerts,
+    DiskGrow,
 }
 
 impl Fix {
@@ -35,6 +36,7 @@ impl Fix {
             Fix::InstanceAge => "Instance Age",
             Fix::Grafana => "Grafana Missing-* Info",
             Fix::CustomAlerts => "Custom Alerts",
+            Fix::DiskGrow => "Disk Utilization (EC2)",
         }
     }
 }
@@ -95,5 +97,18 @@ mod tests {
         set_paused(Fix::Reaper, false);
         assert!(!is_paused(Fix::Reaper));
         assert!(!hold(Fix::Reaper));
+    }
+
+    #[test]
+    fn fix_pause_lists_disk_grow() {
+        assert_eq!(Fix::DiskGrow.label(), "Disk Utilization (EC2)");
+        // Not paused by default, and pausing it touches no other watcher.
+        // Uses DiskGrow only, so it cannot race the Reaper test above.
+        assert!(!is_paused(Fix::DiskGrow));
+        set_paused(Fix::DiskGrow, true);
+        assert!(is_paused(Fix::DiskGrow));
+        assert!(!is_paused(Fix::Grafana));
+        set_paused(Fix::DiskGrow, false);
+        assert!(!is_paused(Fix::DiskGrow));
     }
 }
