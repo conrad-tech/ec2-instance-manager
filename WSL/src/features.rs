@@ -1346,7 +1346,11 @@ pub struct DiskGrowFeature {
     /// honoured: this acknowledges a live page and changes live volumes.
     pub allowed_users: Vec<String>,
     /// Environments (`MMODAL_ENV`, case-insensitive) the watcher leaves
-    /// alone. A blank entry excludes nothing.
+    /// alone. A blank entry excludes nothing. While any exclusion is
+    /// configured, an alert whose environment cannot be read (blank, or an
+    /// unrendered `{{…}}`/`%…%` template; see
+    /// `disk_grow::environment_unreadable`) is left alone too: it might be
+    /// an excluded one. It is logged once and keeps ringing for a human.
     pub excluded_environments: Vec<String>,
     /// Feed poll interval.
     pub poll_secs: u64,

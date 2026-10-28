@@ -317,6 +317,65 @@ pub fn df_h_for_mount(df_h: &str, mount: &str) -> Option<String> {
     Some(format!("{header}\n{row}"))
 }
 
+/// An alert environment nothing can be decided from: blank, or carrying a
+/// template character (`{ } % < >`). This feed has been seen serving
+/// unrendered `{{…}}` and `&{%…%}%` where values should be, and either could
+/// be an excluded environment.
+pub fn environment_unreadable(env: &str) -> bool {
+    let t = env.trim();
+    t.is_empty() || t.contains(['{', '}', '%', '<', '>'])
+}
+
+/// What a filesystem grow attempt should do, from a fresh probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FsPlan {
+    /// The device is ahead of its filesystem: grow it.
+    Grow,
+    /// Not ahead, but the filesystem is larger than it was before the
+    /// incident: a grow already landed and its answer was lost.
+    AlreadyGrown,
+    /// Not ahead and not larger: the new size has not reached the box yet.
+    NotYet,
+}
+
+pub fn fs_plan(device_bytes: u64, fs_now: u64, fs_recorded: u64) -> FsPlan {
+    if device_ahead_of_fs(device_bytes, fs_now) {
+        FsPlan::Grow
+    } else if fs_now > fs_recorded {
+        FsPlan::AlreadyGrown
+    } else {
+        FsPlan::NotYet
+    }
+}
+
+/// An already-acknowledged alert whose filesystem fills its device: is a
+/// modification under way that this app (before a restart) started?
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Recovery {
+    /// Modifying, optimizing or an unrecognised state: track it as an
+    /// incident (never resizing) so the filesystem is grown when it is
+    /// usable, or it escalates when it is not.
+    Track,
+    /// Nothing of ours to finish.
+    Nothing(String),
+    /// Escalate.
+    Failed(String),
+}
+
+pub fn recovery(state: &Result<ModState, String>) -> Recovery {
+    match state {
+        Ok(ModState::Modifying | ModState::Optimizing | ModState::Unknown(_)) => Recovery::Track,
+        Ok(ModState::Completed) => Recovery::Nothing(
+            "the last modification completed and the filesystem already fills the volume".into(),
+        ),
+        Ok(ModState::Failed) => Recovery::Failed("the volume's last modification failed".into()),
+        Err(e) if e == NO_MODIFICATION => {
+            Recovery::Nothing("the volume has never been modified".into())
+        }
+        Err(e) => Recovery::Failed(format!("could not read the modification state: {e}")),
+    }
+}
+
 pub fn fs_bytes_for_mount(probe: &Probe, mount: &str) -> Option<u64> {
     probe.fs_bytes.iter().find(|(m, _)| m == mount).map(|(_, b)| *b)
 }
@@ -397,6 +456,9 @@ pub enum ModState {
     Unknown(String),
 }
 
+/// The `Err` text when a volume has no modification on record.
+pub const NO_MODIFICATION: &str = "no volume modification was reported";
+
 /// Reads `VolumesModifications[0].ModificationState`. No entry is an `Err`.
 pub fn parse_mod_state(json: &str) -> Result<ModState, String> {
     let v: serde_json::Value =
@@ -406,7 +468,7 @@ pub fn parse_mod_state(json: &str) -> Result<ModState, String> {
         .and_then(|m| m.get(0))
         .and_then(|m| m.get("ModificationState"))
         .and_then(|s| s.as_str())
-        .ok_or_else(|| "no volume modification was reported".to_string())?;
+        .ok_or_else(|| NO_MODIFICATION.to_string())?;
     Ok(match state {
         "modifying" => ModState::Modifying,
         "optimizing" => ModState::Optimizing,
@@ -476,6 +538,9 @@ pub struct Incident {
     pub started_ms: u64,
     pub phase: Phase,
     pub fs_grown: bool,
+    /// The filesystem's size in bytes before any grow, so a retry can tell
+    /// a grow whose answer was lost from one that never happened.
+    pub fs_bytes_before: u64,
     /// What the alert said about the box (account, region, instance), kept
     /// so every later poll resolves the same AWS context the owner did.
     pub facts: crate::instance_age::AlertFacts,
@@ -940,6 +1005,7 @@ mod tests {
             started_ms: 0,
             phase: Phase::Modifying,
             fs_grown: false,
+            fs_bytes_before: 0,
             facts: Default::default(),
         }
     }
@@ -1082,5 +1148,44 @@ mod tests {
         assert!(s.incidents().iter().any(|i| i.instance == "i-a" && i.fs_grown));
         s.finish("i-a");
         assert_eq!(s.growing_keys(), vec!["i-b".to_string()]);
+    }
+
+    #[test]
+    fn an_unreadable_environment_is_blank_or_a_template() {
+        for env in ["", "  ", "{{env}}", "&{%x%}%", "<env>"] {
+            assert!(environment_unreadable(env), "{env:?}");
+        }
+        for env in ["prod", "PROD ONE", "dev1"] {
+            assert!(!environment_unreadable(env), "{env:?}");
+        }
+    }
+
+    #[test]
+    fn the_filesystem_plan_tells_a_lost_answer_from_a_device_not_yet_grown() {
+        let gib = 1024 * 1024 * 1024u64;
+        // The device is ahead: grow.
+        assert_eq!(fs_plan(2000 * gib, 1000 * gib, 1000 * gib), FsPlan::Grow);
+        // Not ahead, but the filesystem is larger than recorded: a grow that
+        // landed and whose answer was lost.
+        assert_eq!(fs_plan(2000 * gib, 2000 * gib, 1000 * gib), FsPlan::AlreadyGrown);
+        // Not ahead and not larger: the new size has not reached the box.
+        assert_eq!(fs_plan(1000 * gib, 1000 * gib, 1000 * gib), FsPlan::NotYet);
+        // XFS overhead (under the 512 MiB threshold) is not a pending grow.
+        let mib = 1024 * 1024u64;
+        assert_eq!(fs_plan(1000 * gib, 1000 * gib - 100 * mib, 1000 * gib), FsPlan::NotYet);
+    }
+
+    #[test]
+    fn recovery_tracks_a_live_modification_and_never_guesses_otherwise() {
+        assert_eq!(recovery(&Ok(ModState::Modifying)), Recovery::Track);
+        assert_eq!(recovery(&Ok(ModState::Optimizing)), Recovery::Track);
+        assert_eq!(recovery(&Ok(ModState::Unknown("x".into()))), Recovery::Track);
+        assert!(matches!(recovery(&Ok(ModState::Completed)), Recovery::Nothing(_)));
+        assert!(matches!(recovery(&Ok(ModState::Failed)), Recovery::Failed(_)));
+        // Never modified at all: a person took it; nothing of ours to finish.
+        let none = parse_mod_state(r#"{"VolumesModifications":[]}"#);
+        assert!(matches!(recovery(&none), Recovery::Nothing(_)), "{none:?}");
+        // Any other unreadable answer is a failure, never "nothing to do".
+        assert!(matches!(recovery(&Err("AccessDenied".into())), Recovery::Failed(_)));
     }
 }
