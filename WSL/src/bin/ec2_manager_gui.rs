@@ -10417,6 +10417,11 @@ mod gui {
         terminal_had_focus: bool,
         /// Currently selected file in tree view (full_path, filename)
         selected_file: Option<(String, String)>,
+        /// Path of the editor tab the tree was last pointed at, so the tree
+        /// follows the active tab only when that changes.
+        synced_editor_path: Option<String>,
+        /// Scroll the tree to the selected file once its row exists.
+        scroll_to_selected: bool,
         /// When the connection tab was opened — used to delay the hidden
         /// control channel so it doesn't compete with the visible
         /// terminal's SSM connection.
@@ -10462,6 +10467,8 @@ mod gui {
                 fetching_dirs: std::collections::HashSet::new(),
                 terminal_had_focus: false,
                 selected_file: None,
+                synced_editor_path: None,
+                scroll_to_selected: false,
                 opened_at: Instant::now(),
                 path_completion: None,
                 remember_path_on_success: None,
@@ -41394,7 +41401,35 @@ mod gui {
             let mut toggle_expand: Option<String> = None;
             let mut dirs_to_prefetch: Vec<String> = Vec::new();
 
+            // Follow the active editor tab: select its file in the tree and
+            // open the folders leading to it.
+            if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                let active_path = fb
+                    .active_editor
+                    .and_then(|i| fb.editor_tabs.get(i))
+                    .map(|t| t.remote_path.clone());
+                if active_path != fb.synced_editor_path {
+                    fb.synced_editor_path = active_path.clone();
+                    if let Some(path) = active_path {
+                        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+                        fb.selected_file = Some((path.clone(), name));
+                        let root = fb.current_path.trim_end_matches('/').to_string();
+                        if let Some(rest) = path.strip_prefix(&format!("{root}/")) {
+                            let mut dir = root.clone();
+                            let parts: Vec<&str> = rest.split('/').collect();
+                            for part in &parts[..parts.len().saturating_sub(1)] {
+                                dir = format!("{dir}/{part}");
+                                fb.expanded_dirs.insert(dir.clone());
+                            }
+                        }
+                        fb.scroll_to_selected = true;
+                    }
+                }
+            }
+
             // Snapshot expanded dirs and cache for rendering
+            let scroll_to_selected = self.file_browsers.get(&tab_id).is_some_and(|fb| fb.scroll_to_selected);
+            let mut scrolled_to_selected = false;
             let expanded = self.file_browsers.get(&tab_id)
                 .map(|fb| fb.expanded_dirs.clone())
                 .unwrap_or_default();
@@ -41415,6 +41450,8 @@ mod gui {
                         toggle_expand: Option<String>,
                         prefetch: Vec<String>,
                         selected_file: Option<(String, String)>, // (full_path, filename)
+                        scroll_to_selected: bool,
+                        scrolled: bool,
                     }
                     fn render_tree_level(
                         ui: &mut egui::Ui,
@@ -41481,6 +41518,10 @@ mod gui {
                                     let is_sel = actions.selected_file.as_ref()
                                         .map(|(p, _)| p == &full_path).unwrap_or(false);
                                     let file_response = ui.selectable_label(is_sel, truncate(&entry.name, 25));
+                                    if is_sel && actions.scroll_to_selected && !actions.scrolled {
+                                        file_response.scroll_to_me(Some(egui::Align::Center));
+                                        actions.scrolled = true;
+                                    }
                                     if file_response.clicked() {
                                         actions.selected_file = Some((full_path.clone(), entry.name.clone()));
                                     }
@@ -41515,6 +41556,8 @@ mod gui {
                         double_clicked_file: None,
                         toggle_expand: None,
                         selected_file: prev_selected,
+                        scroll_to_selected,
+                        scrolled: false,
                         prefetch: Vec::new(),
                     };
 
@@ -41532,8 +41575,12 @@ mod gui {
                     toggle_expand = actions.toggle_expand;
                     dirs_to_prefetch = actions.prefetch;
                     // Save selected file
+                    scrolled_to_selected = actions.scrolled;
                     if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
                         fb.selected_file = actions.selected_file;
+                        if scrolled_to_selected {
+                            fb.scroll_to_selected = false;
+                        }
                     }
                 });
 
@@ -42149,6 +42196,143 @@ mod gui {
                             .id_salt(("editor_text", tab_id, remote_path.clone()))
                             .layouter(&mut layouter)
                             .show(ui);
+                        {
+                            // Indentation guides: a faint line at each indent
+                            // level, and a brighter one at the column the
+                            // cursor's line should line up with.
+                            let cw = ui.fonts_mut(|f| f.glyph_width(&mono, ' '));
+                            let indents = ec2_manager::syntax::effective_indents(&editor_content);
+                            let unit = ec2_manager::syntax::indent_unit(&indents);
+                            let cur_line = output.cursor_range.map(|r| {
+                                editor_content
+                                    .chars()
+                                    .take(r.primary.index)
+                                    .filter(|c| *c == '\n')
+                                    .count()
+                            });
+                            let cur_blank = cur_line.is_some_and(|l| {
+                                editor_content.split('\n').nth(l).is_some_and(|s| s.trim().is_empty())
+                            });
+                            let active_col = cur_line.map(|l| {
+                                if cur_blank {
+                                    ec2_manager::syntax::indent_above(&editor_content, l)
+                                } else {
+                                    let ind = indents.get(l).copied().unwrap_or(0);
+                                    if ind == 0 { 0 } else { (ind - 1) / unit * unit }
+                                }
+                            });
+                            let clip = ui.clip_rect();
+                            let painter = ui.painter_at(clip);
+                            let (faint, bright) = if dark {
+                                (
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 120),
+                                )
+                            } else {
+                                (
+                                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 30),
+                                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+                                )
+                            };
+                            // Lines of the cursor's block, for the bright guide.
+                            let in_block = |l: usize| {
+                                Some(l) == cur_line
+                                    || active_col.is_some_and(|c| {
+                                        indents.get(l).copied().unwrap_or(0) > c
+                                    })
+                            };
+                            let mut block_range: Option<(usize, usize)> = None;
+                            if let Some(cl) = cur_line {
+                                let (mut a, mut z) = (cl, cl);
+                                while a > 0 && in_block(a - 1) { a -= 1; }
+                                while z + 1 < indents.len() && in_block(z + 1) { z += 1; }
+                                block_range = Some((a, z));
+                            }
+                            for (l, row) in output.galley.rows.iter().enumerate() {
+                                let y0 = output.galley_pos.y + row.pos.y;
+                                let y1 = y0 + row.height();
+                                if y1 < clip.top() || y0 > clip.bottom() {
+                                    continue;
+                                }
+                                let ind = indents.get(l).copied().unwrap_or(0);
+                                let mut col = 0;
+                                while col < ind {
+                                    let x = output.galley_pos.x + col as f32 * cw;
+                                    let is_active = Some(col) == active_col
+                                        && block_range.is_some_and(|(a, z)| l >= a && l <= z);
+                                    painter.line_segment(
+                                        [egui::pos2(x, y0), egui::pos2(x, y1)],
+                                        egui::Stroke::new(1.0, if is_active { bright } else { faint }),
+                                    );
+                                    col += unit;
+                                }
+                                // A new, still-empty line: mark the column to line up with.
+                                if cur_blank && Some(l) == cur_line {
+                                    if let Some(c) = active_col {
+                                        let x = output.galley_pos.x + c as f32 * cw;
+                                        painter.line_segment(
+                                            [egui::pos2(x, y0), egui::pos2(x, y1)],
+                                            egui::Stroke::new(1.0, bright),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        // Bracket under / beside the cursor: shade it and its partner.
+                        if let Some(r) = output.cursor_range {
+                            let byte = editor_content
+                                .char_indices()
+                                .nth(r.primary.index)
+                                .map_or(editor_content.len(), |(b, _)| b);
+                            let key = (text_fingerprint(&editor_content, &ext), byte);
+                            let cache_id = syntax_id.with("bracket");
+                            let pair = match ui.ctx().data(|d| {
+                                d.get_temp::<((u64, usize), Option<(usize, usize)>)>(cache_id)
+                            }) {
+                                Some((k, p)) if k == key => p,
+                                _ => {
+                                    let toks: std::sync::Arc<Vec<ec2_manager::syntax::Token>> =
+                                        match ui.ctx().data(|d| {
+                                            d.get_temp::<(u64, std::sync::Arc<Vec<ec2_manager::syntax::Token>>)>(syntax_id)
+                                        }) {
+                                            Some((_, t)) => t,
+                                            None => std::sync::Arc::new(
+                                                ec2_manager::syntax::tokenize(&editor_content, &ext),
+                                            ),
+                                        };
+                                    let p = ec2_manager::syntax::matching_bracket(
+                                        &editor_content,
+                                        &toks,
+                                        byte,
+                                    );
+                                    ui.ctx().data_mut(|d| d.insert_temp(cache_id, (key, p)));
+                                    p
+                                }
+                            };
+                            if let Some((a, z)) = pair {
+                                let shade = if dark {
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50)
+                                } else {
+                                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 45)
+                                };
+                                let cw = ui.fonts_mut(|f| f.glyph_width(&mono, ' '));
+                                let painter = ui.painter_at(ui.clip_rect());
+                                for at in [a, z] {
+                                    let ci = editor_content[..at].chars().count();
+                                    let rc = output
+                                        .galley
+                                        .pos_from_cursor(egui::text::CCursor::new(ci));
+                                    let rect = egui::Rect::from_min_size(
+                                        egui::pos2(
+                                            output.galley_pos.x + rc.min.x,
+                                            output.galley_pos.y + rc.min.y,
+                                        ),
+                                        egui::vec2(cw, rc.height()),
+                                    );
+                                    painter.rect_filled(rect, 2.0, shade);
+                                }
+                            }
+                        }
                         let response = output.response;
                         if let Some(line) = scroll_to_line {
                             if let Some(row) = output.galley.rows.get(line) {

@@ -220,6 +220,9 @@ pub fn tokenize(text: &str, ext: &str) -> Vec<Token> {
     if n > MAX_HIGHLIGHT_BYTES {
         return vec![Token { range: 0..n, kind: Kind::Normal }];
     }
+    if matches!(ext, "yaml" | "yml") {
+        return tokenize_yaml(text);
+    }
     let tf = is_terraform(ext);
     let marks = comment_prefixes(ext);
     let block_comments = has_block_comments(ext);
@@ -445,6 +448,394 @@ pub fn tokenize(text: &str, ext: &str) -> Vec<Token> {
     out.tokens
 }
 
+// ---------------------------------------------------------------------------
+// YAML (Ansible playbooks, compose files)
+// ---------------------------------------------------------------------------
+
+fn tokenize_yaml(text: &str) -> Vec<Token> {
+    let b = text.as_bytes();
+    let mut out = Out { tokens: Vec::new() };
+    let mut block_parent: Option<usize> = None;
+    let mut ls = 0usize;
+    loop {
+        let nl = text[ls..].find('\n').map(|p| ls + p);
+        let le = nl.unwrap_or(text.len());
+        let mut ce = le;
+        if ce > ls && b[ce - 1] == b'\r' {
+            ce -= 1;
+        }
+        yaml_line(text, ls, ce, &mut block_parent, &mut out);
+        out.push(Kind::Normal, ce, le);
+        match nl {
+            Some(p) => {
+                out.push(Kind::Normal, p, p + 1);
+                ls = p + 1;
+            }
+            None => break,
+        }
+    }
+    out.tokens
+}
+
+fn skip_blanks(b: &[u8], mut i: usize, end: usize) -> usize {
+    while i < end && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    i
+}
+
+fn yaml_line(text: &str, ls: usize, ce: usize, bp: &mut Option<usize>, out: &mut Out) {
+    let b = text.as_bytes();
+    let mut i = skip_blanks(b, ls, ce);
+    out.push(Kind::Normal, ls, i);
+    let indent = i - ls;
+    if i >= ce {
+        return;
+    }
+    if let Some(p) = *bp {
+        if indent > p {
+            emit_jinja(text, i, ce, Kind::Normal, out);
+            return;
+        }
+        *bp = None;
+    }
+    if b[i] == b'#' {
+        out.push(Kind::Comment, i, ce);
+        return;
+    }
+    if indent == 0
+        && (text[i..ce].starts_with("---") || text[i..ce].starts_with("..."))
+        && (ce - i == 3 || b[i + 3] == b' ')
+    {
+        out.push(Kind::Keyword, i, i + 3);
+        let j = skip_blanks(b, i + 3, ce);
+        out.push(Kind::Normal, i + 3, j);
+        yaml_value(text, j, ce, indent, bp, out);
+        return;
+    }
+    while i < ce && b[i] == b'-' && (i + 1 == ce || b[i + 1] == b' ') {
+        out.push(Kind::Keyword, i, i + 1);
+        let j = skip_blanks(b, i + 1, ce);
+        out.push(Kind::Normal, i + 1, j);
+        i = j;
+    }
+    if i >= ce {
+        return;
+    }
+    if let Some((kend, colon)) = yaml_key(text, i, ce) {
+        out.push(Kind::Attr, i, kend);
+        out.push(Kind::Normal, kend, colon + 1);
+        let j = skip_blanks(b, colon + 1, ce);
+        out.push(Kind::Normal, colon + 1, j);
+        i = j;
+    }
+    yaml_value(text, i, ce, indent, bp, out);
+}
+
+/// `(end of key, index of its colon)` when the text at `i` is `key:`.
+fn yaml_key(text: &str, i: usize, ce: usize) -> Option<(usize, usize)> {
+    let b = text.as_bytes();
+    if b[i] == b'"' || b[i] == b'\'' {
+        let end = quote_end(b, i, ce);
+        if end > ce || end <= i + 1 || b[end - 1] != b[i] {
+            return None;
+        }
+        let k = skip_blanks(b, end, ce);
+        if k < ce && b[k] == b':' && (k + 1 == ce || b[k + 1] == b' ') {
+            return Some((end, k));
+        }
+        return None;
+    }
+    if matches!(b[i], b'{' | b'[' | b'|' | b'>' | b'&' | b'*' | b'!' | b'%' | b'@' | b'`') {
+        return None;
+    }
+    let mut j = i;
+    while j < ce {
+        if b[j] == b':' && (j + 1 == ce || b[j + 1] == b' ') {
+            let kend = i + text[i..j].trim_end().len();
+            return if kend == i { None } else { Some((kend, j)) };
+        }
+        if b[j] == b'#' && j > i && b[j - 1] == b' ' {
+            return None;
+        }
+        j += 1;
+    }
+    None
+}
+
+/// End (exclusive) of the quoted string starting at `j`; `limit` + 1 never
+/// happens: an unterminated string runs to `limit`.
+fn quote_end(b: &[u8], j: usize, limit: usize) -> usize {
+    let q = b[j];
+    let mut k = j + 1;
+    while k < limit {
+        if q == b'"' && b[k] == b'\\' {
+            k += 2;
+            continue;
+        }
+        if b[k] == q {
+            if q == b'\'' && k + 1 < limit && b[k + 1] == q {
+                k += 2;
+                continue;
+            }
+            return k + 1;
+        }
+        k += 1;
+    }
+    limit
+}
+
+/// Where a trailing ` # comment` begins (or `ce`), ignoring quoted text.
+fn value_end(b: &[u8], i: usize, ce: usize) -> usize {
+    let mut j = i;
+    while j < ce {
+        match b[j] {
+            b'"' | b'\'' if j == i || matches!(b[j - 1], b' ' | b'\t' | b'[' | b'{' | b',') => {
+                j = quote_end(b, j, ce);
+            }
+            b'#' if j > i && matches!(b[j - 1], b' ' | b'\t') => return j,
+            _ => j += 1,
+        }
+    }
+    ce
+}
+
+/// Push `s..e` as `base`, with `{{ }}` / `{% %}` / `{# #}` as `Interp`.
+fn emit_jinja(text: &str, s: usize, e: usize, base: Kind, out: &mut Out) {
+    let b = text.as_bytes();
+    let mut i = s;
+    let mut run = s;
+    while i < e {
+        if b[i] == b'{' && i + 1 < e && matches!(b[i + 1], b'{' | b'%' | b'#') {
+            let close = match b[i + 1] {
+                b'{' => "}}",
+                b'%' => "%}",
+                _ => "#}",
+            };
+            let end = text[i + 2..e].find(close).map_or(e, |p| i + 2 + p + 2);
+            out.push(base, run, i);
+            out.push(Kind::Interp, i, end);
+            i = end;
+            run = end;
+        } else {
+            i += 1;
+        }
+    }
+    out.push(base, run, e);
+}
+
+fn yaml_word_kind(word: &str, single: bool) -> Kind {
+    let first = word.as_bytes()[0];
+    if matches!(first, b'&' | b'*' | b'!') {
+        return Kind::Type;
+    }
+    if single {
+        let low = word.to_ascii_lowercase();
+        if matches!(
+            low.as_str(),
+            "true" | "false" | "null" | "~" | "yes" | "no" | "on" | "off"
+        ) {
+            return Kind::Constant;
+        }
+        if (first.is_ascii_digit() || matches!(first, b'-' | b'+' | b'.'))
+            && word.parse::<f64>().is_ok()
+        {
+            return Kind::Number;
+        }
+    }
+    Kind::Str
+}
+
+fn yaml_value(text: &str, i: usize, ce: usize, indent: usize, bp: &mut Option<usize>, out: &mut Out) {
+    let b = text.as_bytes();
+    if i >= ce {
+        return;
+    }
+    let vend = value_end(b, i, ce);
+    let vt = text[i..vend].trim_end();
+    let vend2 = i + vt.len();
+    if vt.is_empty() {
+        out.push(Kind::Normal, i, vend);
+        out.push(Kind::Comment, vend, ce);
+        return;
+    }
+    let vb = vt.as_bytes();
+    if matches!(vb[0], b'|' | b'>')
+        && vb.len() <= 4
+        && vb[1..].iter().all(|c| matches!(c, b'+' | b'-' | b'0'..=b'9'))
+    {
+        out.push(Kind::Keyword, i, vend2);
+        *bp = Some(indent);
+        out.push(Kind::Normal, vend2, vend);
+        out.push(Kind::Comment, vend, ce);
+        return;
+    }
+    let single = !vt.contains(' ');
+    let mut j = i;
+    while j < vend2 {
+        let c = b[j];
+        if c == b' ' || c == b'\t' {
+            let k = skip_blanks(b, j, vend2);
+            out.push(Kind::Normal, j, k);
+            j = k;
+        } else if c == b'"' || c == b'\'' {
+            let end = quote_end(b, j, vend2);
+            emit_jinja(text, j, end, Kind::Str, out);
+            j = end;
+        } else if c == b'{' && j + 1 < vend2 && matches!(b[j + 1], b'{' | b'%' | b'#') {
+            let close = match b[j + 1] {
+                b'{' => "}}",
+                b'%' => "%}",
+                _ => "#}",
+            };
+            let end = text[j + 2..vend2].find(close).map_or(vend2, |p| j + 2 + p + 2);
+            out.push(Kind::Interp, j, end);
+            j = end;
+        } else if matches!(c, b'[' | b']' | b'{' | b'}' | b',') {
+            out.push(Kind::Normal, j, j + 1);
+            j += 1;
+        } else {
+            let mut k = j;
+            while k < vend2
+                && !matches!(b[k], b' ' | b'\t' | b',' | b'[' | b']' | b'}')
+                && !(b[k] == b'{' && k + 1 < vend2 && matches!(b[k + 1], b'{' | b'%' | b'#'))
+            {
+                k += 1;
+            }
+            if k == j {
+                k = j + 1;
+            }
+            out.push(yaml_word_kind(&text[j..k], single), j, k);
+            j = k;
+        }
+    }
+    out.push(Kind::Normal, vend2, vend);
+    out.push(Kind::Comment, vend, ce);
+}
+
+// ---------------------------------------------------------------------------
+// Indentation guides
+// ---------------------------------------------------------------------------
+
+/// Leading-space width of each line, with blank lines taking the smaller of
+/// their neighbours' indents so guides run unbroken through gaps.
+pub fn effective_indents(text: &str) -> Vec<usize> {
+    let raw: Vec<Option<usize>> = text
+        .split('\n')
+        .map(|l| {
+            let l = l.trim_end_matches('\r');
+            if l.trim().is_empty() {
+                None
+            } else {
+                Some(l.len() - l.trim_start_matches([' ', '\t']).len())
+            }
+        })
+        .collect();
+    let mut next = vec![None; raw.len()];
+    let mut n = None;
+    for (i, r) in raw.iter().enumerate().rev() {
+        if r.is_some() {
+            n = *r;
+        }
+        next[i] = n;
+    }
+    let mut prev = None;
+    raw.iter()
+        .enumerate()
+        .map(|(i, r)| {
+            if r.is_some() {
+                prev = *r;
+            }
+            match r {
+                Some(v) => *v,
+                None => match (prev, next[i]) {
+                    (Some(a), Some(c)) => a.min(c),
+                    (Some(a), None) => a,
+                    (None, Some(c)) => c,
+                    (None, None) => 0,
+                },
+            }
+        })
+        .collect()
+}
+
+/// The indent step a file uses: its smallest non-zero indent, 2..=8.
+pub fn indent_unit(indents: &[usize]) -> usize {
+    indents.iter().copied().filter(|&n| n > 0).min().unwrap_or(2).clamp(2, 8)
+}
+
+/// The bracket next to byte offset `at` (after it, else before it) and its
+/// partner, as byte offsets `(this, partner)`. Brackets inside comments and
+/// strings are ignored, as are unmatched ones (`None`).
+pub fn matching_bracket(text: &str, tokens: &[Token], at: usize) -> Option<(usize, usize)> {
+    let b = text.as_bytes();
+    let skip = |k: Kind| matches!(k, Kind::Comment | Kind::Str | Kind::Interp);
+    let token_at = |p: usize| tokens.partition_point(|t| t.range.end <= p);
+    let cand = [Some(at), at.checked_sub(1)].into_iter().flatten().find(|&p| {
+        p < b.len()
+            && matches!(b[p], b'(' | b')' | b'[' | b']' | b'{' | b'}')
+            && tokens.get(token_at(p)).is_some_and(|t| !skip(t.kind))
+    })?;
+    let c = b[cand];
+    let (open, close, forward) = match c {
+        b'(' => (b'(', b')', true),
+        b'[' => (b'[', b']', true),
+        b'{' => (b'{', b'}', true),
+        b')' => (b'(', b')', false),
+        b']' => (b'[', b']', false),
+        _ => (b'{', b'}', false),
+    };
+    let first = token_at(cand);
+    let mut depth = 0i32;
+    if forward {
+        for t in &tokens[first..] {
+            if skip(t.kind) {
+                continue;
+            }
+            for q in t.range.start.max(cand)..t.range.end {
+                if b[q] == open {
+                    depth += 1;
+                } else if b[q] == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((cand, q));
+                    }
+                }
+            }
+        }
+    } else {
+        for t in tokens[..=first].iter().rev() {
+            if skip(t.kind) {
+                continue;
+            }
+            for q in (t.range.start..t.range.end.min(cand + 1)).rev() {
+                if b[q] == close {
+                    depth += 1;
+                } else if b[q] == open {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((cand, q));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Indent of the nearest non-blank line above `line` (0 when none): the
+/// column a new line should line up with.
+pub fn indent_above(text: &str, line: usize) -> usize {
+    let lines: Vec<&str> = text.split('\n').take(line).collect();
+    for l in lines.iter().rev() {
+        let l = l.trim_end_matches('\r');
+        if !l.trim().is_empty() {
+            return l.len() - l.trim_start_matches([' ', '\t']).len();
+        }
+    }
+    0
+}
+
 fn classify_tf(text: &str, word: &str, end: usize, at_line_start: bool) -> Kind {
     let b = text.as_bytes();
     let mut k = end;
@@ -667,5 +1058,68 @@ mod tests {
         let toks = tokenize(text, "tf");
         assert!(!toks.is_empty());
         assert!(start.elapsed().as_secs() < 5, "tokenizer is not linear");
+    }
+
+    fn yaml_kinds(text: &str, ext: &str) -> Vec<(String, Kind)> {
+        tokenize(text, ext)
+            .into_iter()
+            .map(|t| (text[t.range].to_string(), t.kind))
+            .collect()
+    }
+
+    #[test]
+    fn yaml_tokens_are_contiguous() {
+        let t = "- name: \"é {{ x }}\"\n  when: a # c\n  shell: |\n    echo {{ y }}\n";
+        let mut at = 0;
+        for tok in tokenize(t, "yml") {
+            assert_eq!(tok.range.start, at);
+            at = tok.range.end;
+        }
+        assert_eq!(at, t.len());
+    }
+
+    #[test]
+    fn yaml_keys_dashes_strings_and_jinja_get_their_own_colours() {
+        let k = yaml_kinds("- name: \"a {{ v }}\"\n  become: true\n  n: 3\n", "yml");
+        assert!(k.contains(&("-".into(), Kind::Keyword)));
+        assert!(k.contains(&("name".into(), Kind::Attr)));
+        assert!(k.contains(&("{{ v }}".into(), Kind::Interp)));
+        assert!(k.contains(&("become".into(), Kind::Attr)));
+        assert!(k.contains(&("true".into(), Kind::Constant)));
+        assert!(k.contains(&("3".into(), Kind::Number)));
+    }
+
+    #[test]
+    fn yaml_block_scalar_content_is_not_read_as_keys() {
+        let k = yaml_kinds("a: |\n  x: y\nb: 1\n", "yaml");
+        assert!(!k.iter().any(|(s, kd)| s.as_str() == "x" && *kd == Kind::Attr));
+        assert!(k.contains(&("b".into(), Kind::Attr)));
+    }
+
+    #[test]
+    fn indents_flow_through_blank_lines() {
+        assert_eq!(effective_indents("a:\n  b\n\n  c\n"), vec![0, 2, 2, 2, 2]);
+        assert_eq!(indent_above("a:\n    b\n\n", 3), 4);
+        assert_eq!(indent_above("x", 0), 0);
+    }
+
+    #[test]
+    fn brackets_pair_across_kinds_and_skip_strings() {
+        let text = "a = f(\"(\", [1])\n";
+        let toks = tokenize(text, "sh");
+        let open = text.find("f(").unwrap() + 1;
+        let close = text.rfind(')').unwrap();
+        assert_eq!(matching_bracket(text, &toks, open), Some((open, close)));
+        assert_eq!(matching_bracket(text, &toks, close + 1), Some((close, open)));
+        let tf = tokenize(text, "tf");
+        assert_eq!(matching_bracket(text, &tf, open), Some((open, close)));
+        assert_eq!(matching_bracket("x )", &tokenize("x )", "sh"), 3), None);
+    }
+
+    #[test]
+    fn the_indent_unit_follows_the_file() {
+        assert_eq!(indent_unit(&[0, 4, 8]), 4);
+        assert_eq!(indent_unit(&[0, 2, 4]), 2);
+        assert_eq!(indent_unit(&[0, 0]), 2);
     }
 }
