@@ -5510,6 +5510,30 @@ mod gui {
         ec2_manager::disk_grow::parse_probe(&out)
     }
 
+    /// A long compression of a big log directory outlasts the 90s the other
+    /// disk-grow SSM calls get.
+    const DISK_GROW_GZIP_TIMEOUT: Duration = Duration::from_secs(600);
+
+    /// Gzips the box's `/var/log` files last modified before today, or with
+    /// `dry` only counts them. Never deletes; `gunzip` restores a file.
+    fn disk_grow_gzip(
+        ctx: &AwsContext,
+        instance_id: &str,
+        dry: bool,
+    ) -> std::result::Result<ec2_manager::disk_grow::GzipResult, String> {
+        if !is_safe_instance_id(instance_id) {
+            return Err(format!("refusing {instance_id:?}: not an instance id"));
+        }
+        let out = exec_remote_command(
+            &None,
+            ctx,
+            instance_id,
+            &b64_script_command(&ec2_manager::disk_grow::gzip_command(dry)),
+            DISK_GROW_GZIP_TIMEOUT,
+        )?;
+        ec2_manager::disk_grow::parse_gzip(&out)
+    }
+
     /// Grow the filesystem on the box. The `RE_DG_*` assignments are part of
     /// the body before it is base64'd, so they reach the script.
     fn disk_grow_run_fs(
@@ -5895,7 +5919,8 @@ mod gui {
         }
     }
 
-    /// Run Remediation for a Grafana alert: acknowledge (on call), terminate,
+    /// Run Remediation for a Grafana alert: acknowledge (on call), start an
+    /// instance refresh of its group (new instance up before the old goes),
     /// wait for the replacement to be fully running, give the alert its settle
     /// window, and escalate if it is still open. The same rules as the poll,
     /// run once, here, for one alert a person pointed at.
@@ -5971,7 +5996,7 @@ mod gui {
         if let Err(why) = read_group(&ctx, &asg_name)
             .and_then(|g| gf::group_shape_ok(g.min_size, g.max_size, g.desired_capacity))
         {
-            let why = format!("{asg_name}: {why} — {} is not terminated", facts.instance_id);
+            let why = format!("{asg_name}: {why} — {} is not refreshed", facts.instance_id);
             fail(&mut end, why.clone());
             escalate(&why);
             return;
@@ -5998,13 +6023,25 @@ mod gui {
             }
         }
 
-        if let Err(e) = terminate_instance(&ctx.profile, &ctx.region, &facts.instance_id, &env.mode) {
-            return fail(&mut end, format!("terminate of {} failed: {e}", facts.instance_id));
+        match start_instance_refresh(&ctx.profile, &ctx.region, &asg_name, &env.mode) {
+            Ok(refresh_id) => note(
+                LogLevel::Warn,
+                format!(
+                    "{alert_id} — started instance refresh {refresh_id} on {asg_name}; waiting \
+                     for its replacement"
+                ),
+            ),
+            Err(e) if e.contains("InstanceRefreshInProgress") => note(
+                LogLevel::Warn,
+                format!(
+                    "{alert_id} — a refresh is already running on {asg_name}; not starting \
+                     another, waiting for its replacement"
+                ),
+            ),
+            Err(e) => {
+                return fail(&mut end, format!("instance refresh of {asg_name} failed: {e}"));
+            }
         }
-        note(
-            LogLevel::Warn,
-            format!("{alert_id} — terminated {}; waiting for {asg_name} to replace it", facts.instance_id),
-        );
 
         // Wait for the replacement, once per poll interval, up to the ceiling.
         let ceiling = std::time::Instant::now() + cfg.replacement_ceiling();
@@ -6198,6 +6235,23 @@ mod gui {
             Ok(c) => c,
             Err(e) => return fail(&mut end, e),
         };
+        // An app whose volume is never grown (reaper): compress the logs and
+        // stop. No acknowledge, no wait and no escalation from a manual run;
+        // the poll's timer is for alerts it picked up itself.
+        if cfg.no_grow(&alert.message) {
+            return match disk_grow_gzip(&ctx, &facts.instance_id, false) {
+                Ok(r) => {
+                    let msg = format!(
+                        "gzipped {} old log file(s), {} bytes before compression, {} failed; the \
+                         volume is not grown for this app",
+                        r.files, r.bytes, r.failed
+                    );
+                    note(LogLevel::Warn, format!("{alert_id} — {msg}"));
+                    end.status = AlertActionStatus::Ok(format!("alert {alert_id}: {msg}"));
+                }
+                Err(e) => fail(&mut end, format!("compressing the logs: {e}")),
+            };
+        }
         // The refusal the poll does not need: read the data volume's state
         // before anything is acknowledged, and leave an in-flight one alone.
         let volume = match disk_grow_volumes(&ctx, &facts.instance_id)
@@ -6231,6 +6285,18 @@ mod gui {
             }
         }
 
+        // Gzip first, as the poll does. A failure is logged and the grow goes on.
+        match disk_grow_gzip(&ctx, &facts.instance_id, false) {
+            Ok(r) => note(
+                LogLevel::Info,
+                format!(
+                    "{alert_id} — gzipped {} old log file(s), {} bytes before compression, {} \
+                     failed",
+                    r.files, r.bytes, r.failed
+                ),
+            ),
+            Err(e) => note(LogLevel::Warn, format!("{alert_id} — could not compress logs: {e}")),
+        }
         let started = std::time::Instant::now();
         let now_ms = || started.elapsed().as_millis() as u64;
         let inc = match disk_grow_grow_once(&env.auth, &ctx, &env.mode, &alert, &facts, now_ms(), &note) {
@@ -7087,6 +7153,46 @@ mod gui {
                                 )
                             ),
                         );
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: RAN (counts only, nothing compressed) over SSM on {}: \
+                                 disk_grow_gzip.sh with RE_DG_DRY=1 — it would gzip every regular \
+                                 file under /var/log last modified before today (not *.gz/xz/bz2/\
+                                 zst/zip, wtmp, btmp, lastlog, faillog or the journal)",
+                                facts.instance_id
+                            ),
+                        );
+                        match disk_grow_gzip(&ctx, &facts.instance_id, true) {
+                            Ok(r) => note(
+                                LogLevel::Info,
+                                format!(
+                                    "dry run: {} old log file(s), {} bytes, would be gzipped",
+                                    r.files, r.bytes
+                                ),
+                            ),
+                            Err(e) => note(
+                                LogLevel::Error,
+                                format!(
+                                    "dry run: could not count the logs over SSM — {e}; a real \
+                                     run would not be able to compress them"
+                                ),
+                            ),
+                        }
+                        if disk_grow_cfg.no_grow(&alert.message) {
+                            note(
+                                LogLevel::Info,
+                                format!(
+                                    "dry run: the title matches no_grow_title_words {:?} — a \
+                                     real run would acknowledge (on call), gzip the logs, NOT \
+                                     grow the volume, wait {} minute(s) for the alert to close, \
+                                     and escalate if it is still open",
+                                    disk_grow_cfg.no_grow_title_words,
+                                    disk_grow_cfg.no_grow_wait().as_secs() / 60
+                                ),
+                            );
+                            break 'walk;
+                        }
                         let (volumes, root) = match disk_grow_volumes(&ctx, &facts.instance_id) {
                             Ok(v) => v,
                             Err(e) => {
@@ -49108,7 +49214,7 @@ mod gui {
                                         });
                                         if let Err(why) = shape {
                                             let why = format!(
-                                                "{asg_name}: {why} — {} is not terminated",
+                                                "{asg_name}: {why} — {} is not refreshed",
                                                 facts.instance_id
                                             );
                                             note(
@@ -49122,31 +49228,46 @@ mod gui {
                                         note(
                                             LogLevel::Warn,
                                             format!(
-                                                "grafana: {} — terminating {} in {asg_name}",
+                                                "grafana: {} — refreshing {asg_name} (unhealthy \
+                                                 {}; new instance up before the old is terminated)",
                                                 alert.id, facts.instance_id
                                             ),
                                         );
-                                        match terminate_instance(
+                                        match start_instance_refresh(
                                             &ctx.profile,
                                             &ctx.region,
-                                            &facts.instance_id,
+                                            &asg_name,
                                             &mode,
                                         ) {
-                                            Ok(()) => {
+                                            Ok(refresh_id) => {
                                                 note(
                                                     LogLevel::Warn,
                                                     format!(
-                                                        "grafana: {} — terminated {}; waiting \
-                                                         for {asg_name} to replace it",
-                                                        alert.id, facts.instance_id
+                                                        "grafana: {} — started instance refresh \
+                                                         {refresh_id} on {asg_name}; waiting for \
+                                                         its replacement",
+                                                        alert.id
+                                                    ),
+                                                );
+                                                state.terminated(&asg_name, now_ms);
+                                            }
+                                            // A refresh already running is already
+                                            // replacing the instance: track it, do not page.
+                                            Err(e) if e.contains("InstanceRefreshInProgress") => {
+                                                note(
+                                                    LogLevel::Warn,
+                                                    format!(
+                                                        "grafana: {} — a refresh is already \
+                                                         running on {asg_name}; not starting \
+                                                         another, waiting for its replacement",
+                                                        alert.id
                                                     ),
                                                 );
                                                 state.terminated(&asg_name, now_ms);
                                             }
                                             Err(e) => {
                                                 let why = format!(
-                                                    "terminate of {} failed: {e}",
-                                                    facts.instance_id
+                                                    "instance refresh of {asg_name} failed: {e}"
                                                 );
                                                 note(
                                                     LogLevel::Error,
@@ -49155,7 +49276,7 @@ mod gui {
                                                 escalate(&alert.id, &alert.created_at, &why);
                                                 // Held, never freed: the rest of
                                                 // this outage's alerts must not
-                                                // retry the terminate and page again.
+                                                // retry the refresh and page again.
                                                 state.failed(&asg_name, now_ms);
                                             }
                                         }
@@ -49828,6 +49949,13 @@ mod gui {
                 });
             };
 
+            // Alerts whose logs were gzipped and which are now given
+            // `no_grow_wait` to close: (alert id, created_at, instance,
+            // deadline in `monotonic_ms`). Nothing is grown for these. A
+            // restart drops the timer; the alert is then acknowledged, which
+            // the poll treats as taken by a person.
+            let mut settling: Vec<(String, String, String, u64)> = Vec::new();
+
             loop {
                 if ec2_manager::fix_pause::hold(ec2_manager::fix_pause::Fix::DiskGrow) {
                     continue;
@@ -50009,6 +50137,49 @@ mod gui {
                     }
                 }
 
+                // 1b. Alerts waiting to close after their logs were gzipped.
+                //     Like a running grow, these finish whether or not we are
+                //     still on call. Closed ends it silently; still open at
+                //     the deadline (or unreadable then) escalates once.
+                settling.retain(|(alert_id, created_at, instance, deadline)| {
+                    let read = alerts::fetch_alert(&auth, alert_id);
+                    match &read {
+                        Ok(a) if reaper::alert_is_closed(&a.status) => {
+                            note(
+                                LogLevel::Info,
+                                format!(
+                                    "disk grow: {alert_id} ({instance}) closed after the logs \
+                                     were compressed — nothing more to do"
+                                ),
+                            );
+                            return false;
+                        }
+                        _ if now_ms < *deadline => {
+                            if let Err(e) = &read {
+                                note(
+                                    LogLevel::Warn,
+                                    format!(
+                                        "disk grow: could not re-read {alert_id}: {e} — \
+                                         retrying"
+                                    ),
+                                );
+                            }
+                            return true;
+                        }
+                        _ => {}
+                    }
+                    escalate(
+                        alert_id,
+                        created_at,
+                        &format!(
+                            "{instance} is still open {} minute(s) after its logs were \
+                             compressed (the volume is not grown for this app)",
+                            cfg.no_grow_wait().as_secs() / 60
+                        ),
+                    );
+                    false
+                });
+
                 // 2. New alerts, on call only.
                 if on_call {
                     match alerts::fetch_latest(&auth, cfg.alerts_per_poll()) {
@@ -50141,6 +50312,27 @@ mod gui {
                                     );
                                     continue;
                                 }
+                                let no_grow = cfg.no_grow(&alert.message);
+                                // A second alert for a box already waiting to
+                                // close is a duplicate, acknowledged only.
+                                if no_grow && settling.iter().any(|s| s.2 == instance) {
+                                    if !dg::alert_acknowledged(&alert) {
+                                        let _ = alerts::acknowledge_alert(&auth, &alert.id);
+                                    }
+                                    note(
+                                        LogLevel::Info,
+                                        format!(
+                                            "disk grow: {} acknowledged and ignored — {instance} \
+                                             is already waiting for an alert to close",
+                                            alert.id
+                                        ),
+                                    );
+                                    continue;
+                                }
+                                // Only a fresh alert is touched: an already
+                                // acknowledged one is a person's (or ours
+                                // before a restart), recovery only.
+                                let fresh = !dg::alert_acknowledged(&alert);
                                 // Owner. Acknowledge FIRST, unless somebody
                                 // (or this app before a restart) already
                                 // did: then it is recovery only.
@@ -50155,6 +50347,75 @@ mod gui {
                                             ),
                                         );
                                     }
+                                }
+                                if fresh {
+                                    // Every disk alert: gzip old logs first.
+                                    let gz = disk_grow_gzip(&ctx, &instance, false);
+                                    match &gz {
+                                        Ok(r) => note(
+                                            LogLevel::Info,
+                                            format!(
+                                                "disk grow: {} ({instance}) — gzipped {} old \
+                                                 log file(s), {} bytes before compression, {} \
+                                                 failed",
+                                                alert.id, r.files, r.bytes, r.failed
+                                            ),
+                                        ),
+                                        Err(e) => note(
+                                            LogLevel::Warn,
+                                            format!(
+                                                "disk grow: {} ({instance}) — could not \
+                                                 compress logs: {e}",
+                                                alert.id
+                                            ),
+                                        ),
+                                    }
+                                    if no_grow {
+                                        // Never grown: wait for the alert to
+                                        // close, or escalate.
+                                        match gz {
+                                            Ok(_) => {
+                                                let wait = cfg.no_grow_wait();
+                                                note(
+                                                    LogLevel::Info,
+                                                    format!(
+                                                        "disk grow: {} ({instance}) — the \
+                                                         volume is not grown for this app; \
+                                                         waiting {} minute(s) for the alert to \
+                                                         close",
+                                                        alert.id,
+                                                        wait.as_secs() / 60
+                                                    ),
+                                                );
+                                                settling.push((
+                                                    alert.id.clone(),
+                                                    alert.created_at.clone(),
+                                                    instance.clone(),
+                                                    now_ms + wait.as_millis() as u64,
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                escalate(
+                                                    &alert.id,
+                                                    &alert.created_at,
+                                                    &format!("compressing the logs: {e}"),
+                                                );
+                                                state.failed(&instance, now_ms);
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                } else if no_grow {
+                                    note(
+                                        LogLevel::Info,
+                                        format!(
+                                            "disk grow: {} ({instance}) — already acknowledged \
+                                             and the volume is not grown for this app; left to \
+                                             a person",
+                                            alert.id
+                                        ),
+                                    );
+                                    continue;
                                 }
                                 match disk_grow_grow_once(
                                     &auth, &ctx, &mode, &alert, &facts, now_ms, &note,
@@ -58453,7 +58714,7 @@ mod gui {
             // the poll and the manual path.
             for (name, body) in [("poll", grafana_poll_body()), ("manual", grafana_manual_body())] {
                 let shape = body.find("gf::group_shape_ok(").unwrap_or_else(|| panic!("{name}: no shape check"));
-                let term = body.find("terminate_instance(").unwrap_or_else(|| panic!("{name}: no terminate"));
+                let term = body.find("start_instance_refresh(").unwrap_or_else(|| panic!("{name}: no refresh"));
                 assert!(shape < term, "{name}: the shape check must come before the terminate");
                 let read = body[..shape].rfind("read_group(").unwrap_or_else(|| panic!("{name}: no group read"));
                 assert!(read < shape);
@@ -66324,9 +66585,11 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         }
 
         #[test]
-        fn reaper_and_grafana_still_outrank_disk_grow() {
+        fn grafana_outranks_disk_grow_and_reaper_no_longer_claims_disk_alerts() {
             use ec2_manager::features::*;
-            // A title both claim: reaper wins (its title word plus a rule).
+            // A title both match: disk grow wins. Reaper no longer claims any
+            // disk-utilization alert (it would `compose down` for a full disk);
+            // the disk watcher compresses its logs and never grows it.
             let reaper = ReaperFeature {
                 message_contains: "DiskUtilization".to_string(),
                 ..Default::default()
@@ -66341,7 +66604,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     &InstanceAgeFeature::default(),
                     &GrafanaFeature::default(),
                 ),
-                DryRunRoute::Reaper
+                DryRunRoute::DiskGrow
             );
             let grafana = GrafanaFeature {
                 title_contains: vec!["DiskUtilization".to_string()],
@@ -75183,7 +75446,11 @@ fed_expire = 4000000000
             let body = disk_grow_fn_body(src, "fn start_disk_grow_poll(");
             let acks: Vec<usize> =
                 body.match_indices("acknowledge_alert(").map(|(i, _)| i).collect();
-            assert_eq!(acks.len(), 2, "exactly the duplicate and the owner acknowledge");
+            assert_eq!(
+                acks.len(),
+                3,
+                "exactly the duplicate, the no-grow duplicate and the owner acknowledge"
+            );
             let begin = body.find("state.begin(").expect("the duplicate decision");
             assert!(acks.iter().all(|&a| a > begin), "nothing is acknowledged before begin");
             let dup = body.find("begun != dg::Begin::Owner").expect("the duplicate/held branch");
@@ -75193,7 +75460,7 @@ fed_expire = 4000000000
             assert!(dup_block.contains("continue"), "{dup_block}");
             // The owner's acknowledge is after the duplicate branch and also
             // skips an alert somebody already took.
-            let owner_ack = acks[1];
+            let owner_ack = acks[2];
             assert!(owner_ack > dup + dup_block.len());
             assert!(body[dup + dup_block.len()..owner_ack].contains("!dg::alert_acknowledged(&alert)"));
 

@@ -142,6 +142,42 @@ pub fn classify_modify_error(stderr: &str) -> ModifyError {
 
 pub const PROBE_SCRIPT: &str = include_str!("../assets/scripts/disk_grow_probe.sh");
 pub const FS_SCRIPT: &str = include_str!("../assets/scripts/disk_grow_fs.sh");
+pub const GZIP_SCRIPT: &str = include_str!("../assets/scripts/disk_grow_gzip.sh");
+
+/// The gzip script with its mode set. `dry` only counts what it would
+/// compress.
+pub fn gzip_command(dry: bool) -> String {
+    format!("RE_DG_DRY='{}'\n{}", u8::from(dry), GZIP_SCRIPT)
+}
+
+/// What the gzip script reported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GzipResult {
+    pub files: u64,
+    pub bytes: u64,
+    pub failed: u64,
+    pub dry: bool,
+}
+
+/// Reads the script's marker line. No marker is an error.
+pub fn parse_gzip(output: &str) -> Result<GzipResult, String> {
+    let line = output
+        .lines()
+        .find(|l| l.starts_with("__DG_GZ__"))
+        .ok_or_else(|| "the log compression reported no result".to_string())?;
+    let field = |name: &str| -> Result<u64, String> {
+        line.split_whitespace()
+            .find_map(|w| w.strip_prefix(name).and_then(|v| v.strip_prefix('=')))
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| format!("the log compression result has no {name}"))
+    };
+    Ok(GzipResult {
+        files: field("files")?,
+        bytes: field("bytes")?,
+        failed: field("failed")?,
+        dry: field("dry")? == 1,
+    })
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BlockDev {
@@ -753,8 +789,12 @@ mod tests {
         let g = GrafanaFeature::default();
         let plain = alert("[EC2]: dev1-Cassandra-100-DiskUtilization-Warning");
         assert!(claims(&plain, &reaper_cfg, &u, &g));
+        // A reaper-titled disk alert is ours too (it gets the log gzip but
+        // never a grow, see `DiskGrowFeature::no_grow`); reaper no longer
+        // claims any disk-utilization alert.
         let reapery = alert("[EC2]: reaper-DiskUtilization-Warning");
-        assert!(!claims(&reapery, &reaper_cfg, &u, &g));
+        assert!(claims(&reapery, &reaper_cfg, &u, &g));
+        assert!(!reaper::identifies(&reapery, &reaper_cfg));
         assert!(!claims(&alert("[EC2]: x-CPUUtilization"), &reaper_cfg, &u, &g));
     }
 
@@ -1037,6 +1077,33 @@ mod tests {
 
     fn exec_lines(script: &str) -> Vec<&str> {
         script.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).collect()
+    }
+
+    #[test]
+    fn the_gzip_result_is_parsed_and_a_missing_marker_is_an_error() {
+        let r = parse_gzip("noise\n__DG_GZ__ files=3 bytes=1024 failed=1 dry=0\n").unwrap();
+        assert_eq!(r, GzipResult { files: 3, bytes: 1024, failed: 1, dry: false });
+        assert!(parse_gzip("__DG_GZ__ files=0 bytes=0 failed=0 dry=1").unwrap().dry);
+        assert!(parse_gzip("done").is_err());
+        assert!(parse_gzip("__DG_GZ__ files=x bytes=0 failed=0 dry=0").is_err());
+    }
+
+    #[test]
+    fn the_gzip_script_only_compresses_old_logs_under_var_log() {
+        let all = exec_lines(GZIP_SCRIPT);
+        let text = all.join("\n");
+        // The only thing it changes is `gzip` on files `find` listed; today's
+        // files are excluded by the find, and nothing is removed or moved.
+        for banned in ["rm ", "mv ", "unlink", "truncate", "shred", "dd ", "> /", "-delete", "-exec"] {
+            assert!(!text.contains(banned), "gzip script contains {banned:?}");
+        }
+        assert!(text.contains("find /var/log -xdev -type f"));
+        assert!(text.contains("! -newermt \"$today\""), "today's logs must be skipped");
+        assert!(text.contains("! -name '*.gz'"));
+        assert_eq!(text.matches("gzip -n --").count(), 1);
+        assert!(!all.iter().any(|l| l.contains("__DG_GZ__")), "literal marker");
+        let dry = gzip_command(true);
+        assert!(dry.starts_with("RE_DG_DRY='1'\n") && gzip_command(false).starts_with("RE_DG_DRY='0'\n"));
     }
 
     #[test]

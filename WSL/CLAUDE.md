@@ -1630,6 +1630,15 @@ escalate once (`RE-F`) if it has not. The state machine is pure; the GUI thread
   account context, no ASG tag, an instance read error) take a slot keyed
   `instance <id>`, so they too page once per box. Later alerts in a lockout are
   acknowledged and ignored, with no escalation.
+- **2026-10-29: the action is an instance refresh, not a terminate.** After the
+  1/1/1 shape check the poll and Run Remediation call `start_instance_refresh`
+  (100% min / 110% max healthy, shared with unhealthy host) on the ASG instead
+  of `terminate_instance`, so the replacement is up before the old instance is
+  terminated. Everything after is unchanged: replacement readiness, the 12
+  minute settle, the 25 minute ceiling. A failed refresh escalates and holds
+  the slot, as a failed terminate did. `InstanceRefreshInProgress` is treated as
+  "replacement already coming": tracked, not paged. The 100/110 setting is
+  unverified on a desired=1 group (110% of 1 may round down to no headroom).
 - **The 12-minute timer starts at "fully running", not at the terminate.** Ready
   means a group member that is `InService` and `Healthy` in the ASG **and**
   `running` in EC2 (the old instance never counts as its own replacement).
@@ -1872,6 +1881,20 @@ GUI thread (`start_disk_grow_poll`) makes every call. Spec:
   full size, the poll (which has already acknowledged) escalates rather than
   staying silent, so a volume still optimizing past the 12h ceiling can page.
   `the_poll_reads_the_modification_state_before_any_resize`.
+- **Log gzip and the no-grow apps.** Every fresh disk alert the poll handles first
+  runs `assets/scripts/disk_grow_gzip.sh` over SSM: gzip every regular file
+  under `/var/log` last modified before today's midnight (box time), skipping
+  already-compressed files, wtmp/btmp/lastlog/faillog and the journal. Nothing
+  is deleted; `gunzip` restores. A gzip failure is logged and the grow goes on.
+  Titles containing a `no_grow_title_words` entry (shipped `["reaper"]`) are
+  never grown: acknowledge, gzip, wait `no_grow_wait_mins` (12) for the alert
+  to close, escalate (RE-F) if still open (or unreadable at the deadline). A
+  gzip error escalates at once. **Reaper no longer claims disk-utilization
+  alerts** (`reaper::identifies` returns false for them), so a reaper-titled
+  disk alert reaches this watcher instead of `compose down`. An already
+  acknowledged alert is left to a person, so an app restart during the
+  12-minute wait drops the timer. Test Alert Match runs the script with
+  `RE_DG_DRY=1` (counts only) and reports the no-grow path.
 - **The poll claims the shared in-flight set** (`ReaperInFlight`, the one Run
   Remediation's `claim_in_flight` uses) for each new alert before its chain;
   an alert a person is remediating is skipped **without** being marked seen,

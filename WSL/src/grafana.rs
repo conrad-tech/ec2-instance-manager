@@ -3,13 +3,14 @@
 //! Pure — alerts, auto scaling group members and a clock in, decisions out —
 //! so every rule is pinned by a test rather than by reading a poll loop. The
 //! GUI owns every network hop: the on-call lookup, the JSM reads, the AWS
-//! describes, the `terminate-instances` and the escalation email.
+//! describes, the instance refresh and the escalation email.
 //!
 //! The job, on call only:
 //!
 //! 1. acknowledge the alert;
-//! 2. terminate the instance it names (the Grafana group is always 1/1/1, so
-//!    there is no health gate to apply);
+//! 2. start an instance refresh of the group of the instance it names,
+//!    launch-before-terminate (the Grafana group is always 1/1/1, so there is
+//!    no health gate to apply);
 //! 3. wait for the group's replacement to be `InService`, `Healthy` **and**
 //!    `running` in EC2;
 //! 4. give the alert `settle_mins` from that moment to clear, and escalate

@@ -214,6 +214,12 @@ impl AlertMatch {
 /// `match_alert` reports as `None`, and the second of which must never be
 /// silent: it means the remediation is declining the alerts it exists for.
 pub fn identifies(alert: &Alert, cfg: &ReaperFeature) -> bool {
+    // A disk-utilization alert belongs to the disk watcher, even one that
+    // names reaper: its fix is compressing logs (and, for other apps, growing
+    // the volume), never `compose down`.
+    if crate::disk_grow::identifies(alert) {
+        return false;
+    }
     // The title must name reaper, whatever else matched. The three rules
     // below are ORed, so one broad rule (an `UnHealthyHostCount` message, a
     // shared App tag) claimed other apps' alarms and ran `compose down`

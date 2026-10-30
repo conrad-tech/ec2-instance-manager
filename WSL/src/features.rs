@@ -1352,6 +1352,15 @@ pub struct DiskGrowFeature {
     /// `disk_grow::environment_unreadable`) is left alone too: it might be
     /// an excluded one. It is logged once and keeps ringing for a human.
     pub excluded_environments: Vec<String>,
+    /// Words (case-insensitive) in an alert's title that mean "compress the
+    /// logs but never grow the volume", e.g. `["reaper"]`. For such an alert
+    /// the watcher acknowledges, gzips old logs, then waits
+    /// `no_grow_wait_mins` for the alert to close and escalates if it has
+    /// not. A blank entry matches nothing.
+    pub no_grow_title_words: Vec<String>,
+    /// Minutes a no-grow alert is given to close after the logs are
+    /// compressed (default 12).
+    pub no_grow_wait_mins: u64,
     /// Feed poll interval.
     pub poll_secs: u64,
     /// Alerts pulled per poll.
@@ -1415,6 +1424,20 @@ impl DiskGrowFeature {
         } else {
             self.fetch_count
         }
+    }
+
+    /// True when the alert title names an app whose volume is never grown.
+    pub fn no_grow(&self, title: &str) -> bool {
+        let title = title.to_ascii_lowercase();
+        self.no_grow_title_words
+            .iter()
+            .map(|w| w.trim().to_ascii_lowercase())
+            .any(|w| !w.is_empty() && title.contains(&w))
+    }
+
+    /// How long a no-grow alert is given to close (default 12 min).
+    pub fn no_grow_wait(&self) -> std::time::Duration {
+        Self::mins_or(self.no_grow_wait_mins, 12)
     }
 
     /// How long the grown space is given to become usable (default 15 min).
@@ -3778,6 +3801,23 @@ mod disk_grow_feature_tests {
         };
         assert!(f.disk_grow_enabled_for("bconrad"));
         assert!(!f.disk_grow_enabled_for("other"));
+    }
+
+    #[test]
+    fn no_grow_matches_title_words_case_insensitively_and_ignores_blanks() {
+        let cfg = DiskGrowFeature {
+            no_grow_title_words: vec![" Reaper ".into(), "".into(), "  ".into()],
+            ..Default::default()
+        };
+        assert!(cfg.no_grow("[EC2]: dev1-REAPER-100-DiskUtilization-Warning"));
+        assert!(!cfg.no_grow("[EC2]: dev1-Cassandra-100-DiskUtilization-Warning"));
+        assert!(!DiskGrowFeature::default().no_grow("anything reaper"));
+        assert_eq!(cfg.no_grow_wait().as_secs(), 12 * 60);
+        assert!(ec2_manager_shipped_no_grow_includes_reaper());
+    }
+
+    fn ec2_manager_shipped_no_grow_includes_reaper() -> bool {
+        load().disk_grow.no_grow("[EC2]: x-Reaper-DiskUtilization-Warning")
     }
 
     #[test]
