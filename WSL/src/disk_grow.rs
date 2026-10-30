@@ -469,11 +469,17 @@ pub fn fs_bytes_for_mount(probe: &Probe, mount: &str) -> Option<u64> {
     probe.fs_bytes.iter().find(|(m, _)| m == mount).map(|(_, b)| *b)
 }
 
-/// True when the device is at least 512 MiB larger than its filesystem, i.e.
-/// a resize landed but the filesystem was never grown. XFS metadata overhead
-/// never approaches that.
+/// True when the device is meaningfully larger than its filesystem, i.e. a
+/// resize landed but the filesystem was never grown.
+///
+/// A fully grown XFS filesystem is still smaller than its device: the log and
+/// metadata take a little, about 2 GiB on a 16 TB volume (a real box showed
+/// 17177732186112 bytes of filesystem on a 17179869184000 byte device). So
+/// the margin is the larger of 512 MiB and 0.5% of the device. The smallest
+/// grow this app asks for is +10%, far past that.
 pub fn device_ahead_of_fs(device_bytes: u64, fs_bytes: u64) -> bool {
-    device_bytes.saturating_sub(fs_bytes) >= 512 * 1024 * 1024
+    let margin = (512 * 1024 * 1024u64).max(device_bytes / 200);
+    device_bytes.saturating_sub(fs_bytes) >= margin
 }
 
 fn safe_device_name(s: &str) -> bool {
@@ -640,6 +646,8 @@ pub enum Begin {
     Owner,
     Duplicate { owner: String },
     Held,
+    /// A fix for this instance started within the cooldown window.
+    Cooling,
 }
 
 /// A failed instance keeps its slot for AWS's 6-hour modification window.
@@ -651,6 +659,8 @@ pub struct DiskGrowState {
     seen: std::collections::HashSet<String>,
     running: std::collections::HashMap<String, Incident>,
     failed: std::collections::HashMap<String, u64>,
+    /// When the last fix for an instance started (`monotonic_ms`).
+    cooled: std::collections::HashMap<String, u64>,
 }
 
 impl DiskGrowState {
@@ -677,6 +687,20 @@ impl DiskGrowState {
             self.failed.remove(instance);
         }
         Begin::Owner
+    }
+
+    /// Records that a fix for `instance` started now. Whatever its outcome
+    /// (grown, escalated, closed, timed out), a new alert for the instance
+    /// inside the cooldown is not acted on.
+    pub fn cool(&mut self, instance: &str, now_ms: u64) {
+        self.cooled.insert(instance.to_string(), now_ms);
+    }
+
+    /// True when a fix for `instance` started less than `window_ms` ago.
+    pub fn cooling(&self, instance: &str, now_ms: u64, window_ms: u64) -> bool {
+        self.cooled
+            .get(instance)
+            .is_some_and(|&at| now_ms.saturating_sub(at) < window_ms)
     }
 
     pub fn start(&mut self, incident: Incident) {
@@ -1025,6 +1049,10 @@ mod tests {
         assert!(device_ahead_of_fs(fs + 1024 * GIB, fs));
         assert!(!device_ahead_of_fs(fs + 100 * 1024 * 1024, fs));
         assert!(!device_ahead_of_fs(fs - 1, fs));
+        // A fully grown 16 TB XFS filesystem sits about 2 GiB under its device.
+        assert!(!device_ahead_of_fs(17_179_869_184_000, 17_177_732_186_112));
+        // A real +1 TB on that volume is still caught.
+        assert!(device_ahead_of_fs(17_179_869_184_000 + 1024 * GIB, 17_177_732_186_112));
     }
 
     fn dd(disk: &str, part: Option<&str>, mount: &str) -> DataDevice {
@@ -1077,6 +1105,17 @@ mod tests {
 
     fn exec_lines(script: &str) -> Vec<&str> {
         script.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).collect()
+    }
+
+    #[test]
+    fn a_started_fix_cools_the_instance_for_the_window_only() {
+        let mut s = DiskGrowState::new();
+        let day = 24 * 60 * 60 * 1000;
+        assert!(!s.cooling("i-1", 5, day));
+        s.cool("i-1", 1_000);
+        assert!(s.cooling("i-1", 1_000 + day - 1, day));
+        assert!(!s.cooling("i-1", 1_000 + day, day));
+        assert!(!s.cooling("i-2", 1_001, day), "per instance");
     }
 
     #[test]

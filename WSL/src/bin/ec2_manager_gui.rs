@@ -49332,6 +49332,34 @@ mod gui {
         )
     }
 
+    /// The toolbar line for a volume that was grown: the same flashing yellow
+    /// line, replaced (same key) from "growing" to "grown in the past Nh" for
+    /// the cooldown window, which runs from when the fix started. Past the
+    /// window already, the line just ends.
+    fn disk_grow_note_grown(
+        tx: &std::sync::mpsc::Sender<DiskGrowEvent>,
+        shown: &mut Vec<(String, u64)>,
+        instance: &str,
+        started_ms: u64,
+        now_ms: u64,
+        cooldown: Duration,
+    ) {
+        let until = started_ms + cooldown.as_millis() as u64;
+        shown.retain(|(k, _)| k != instance);
+        if now_ms >= until {
+            let _ = tx.send(DiskGrowEvent::GrowEnded { key: instance.to_string() });
+            return;
+        }
+        let _ = tx.send(DiskGrowEvent::GrowStarted {
+            key: instance.to_string(),
+            text: format!(
+                "{instance} grown in the past {} hour(s) — no further disk fixes until it passes",
+                cooldown.as_secs() / 3600
+            ),
+        });
+        shown.push((instance.to_string(), until));
+    }
+
     /// What the owner path does to a box, decided from the alert and the box
     /// alone.
     ///
@@ -49559,7 +49587,10 @@ mod gui {
         let Some(fs_after) = dg::fs_bytes_for_mount(&after, mount) else {
             return DiskGrowFs::Failed(format!("the box reports no filesystem size for {mount}"));
         };
-        if fs_after <= fs_recorded || dg::device_ahead_of_fs(after_dev.device_bytes, fs_after) {
+        // The test is that the filesystem now fills the device. An unchanged
+        // size is fine when nothing was left to grow (it already filled the
+        // device); only a smaller one, or one still short of the device, fails.
+        if fs_after < fs_recorded || dg::device_ahead_of_fs(after_dev.device_bytes, fs_after) {
             return DiskGrowFs::Failed(format!(
                 "the grow reported OK but the filesystem at {mount} did not grow to fill the \
                  device ({fs_recorded} -> {fs_after} bytes, device {} bytes)",
@@ -49955,12 +49986,24 @@ mod gui {
             // restart drops the timer; the alert is then acknowledged, which
             // the poll treats as taken by a person.
             let mut settling: Vec<(String, String, String, u64)> = Vec::new();
+            // Instances showing "grown in the past 24h" on the toolbar, with
+            // when each line ends. A restart drops them.
+            let mut grown_shown: Vec<(String, u64)> = Vec::new();
 
             loop {
                 if ec2_manager::fix_pause::hold(ec2_manager::fix_pause::Fix::DiskGrow) {
                     continue;
                 }
                 let now_ms = monotonic_ms(started);
+
+                grown_shown.retain(|(key, until)| {
+                    if now_ms >= *until {
+                        let _ = tx.send(DiskGrowEvent::GrowEnded { key: key.clone() });
+                        false
+                    } else {
+                        true
+                    }
+                });
 
                 // A failed incident holds its slot for a while, so the rest
                 // of that outage's alerts are duplicates rather than a fresh
@@ -50001,7 +50044,7 @@ mod gui {
                                 optimize_ceiling_ms / 60_000
                             ),
                         );
-                        let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
+                        disk_grow_note_grown(&tx, &mut grown_shown, &inc.instance, inc.started_ms, now_ms, cfg.cooldown());
                         fs_unknown.remove(&inc.instance);
                         state.finish(&inc.instance);
                         continue;
@@ -50118,7 +50161,7 @@ mod gui {
                                 LogLevel::Info,
                                 format!("{tag} — {} completed; the incident is over", inc.volume_id),
                             );
-                            let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
+                            disk_grow_note_grown(&tx, &mut grown_shown, &inc.instance, inc.started_ms, now_ms, cfg.cooldown());
                             fs_unknown.remove(&inc.instance);
                             state.finish(&inc.instance);
                         }
@@ -50130,7 +50173,7 @@ mod gui {
                         }
                         dg::Transition::StopFlashing(why) => {
                             note(LogLevel::Warn, format!("{tag} — {why}"));
-                            let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
+                            disk_grow_note_grown(&tx, &mut grown_shown, &inc.instance, inc.started_ms, now_ms, cfg.cooldown());
                             fs_unknown.remove(&inc.instance);
                             state.finish(&inc.instance);
                         }
@@ -50284,7 +50327,34 @@ mod gui {
                                     }
                                 };
                                 let instance = facts.instance_id.clone();
-                                let begun = state.begin(&instance, &alert.id, now_ms);
+                                let begun = match state.begin(&instance, &alert.id, now_ms) {
+                                    dg::Begin::Owner
+                                        if state.cooling(
+                                            &instance,
+                                            now_ms,
+                                            cfg.cooldown().as_millis() as u64,
+                                        ) =>
+                                    {
+                                        dg::Begin::Cooling
+                                    }
+                                    other => other,
+                                };
+                                // Inside the cooldown the alert is left exactly as
+                                // it is: not acknowledged, not gzipped, not grown,
+                                // not escalated. It keeps ringing for a person.
+                                if begun == dg::Begin::Cooling {
+                                    note(
+                                        LogLevel::Info,
+                                        format!(
+                                            "disk grow: {} left alone — {instance} was fixed \
+                                             less than {} hour(s) ago (cooldown); not \
+                                             acknowledged, no gzip, grow or escalation",
+                                            alert.id,
+                                            cfg.cooldown().as_secs() / 3600
+                                        ),
+                                    );
+                                    continue;
+                                }
                                 if begun != dg::Begin::Owner {
                                     let why = match &begun {
                                         dg::Begin::Duplicate { owner } => {
@@ -50333,6 +50403,11 @@ mod gui {
                                 // acknowledged one is a person's (or ours
                                 // before a restart), recovery only.
                                 let fresh = !dg::alert_acknowledged(&alert);
+                                if fresh {
+                                    // The cooldown runs from here, whatever the
+                                    // outcome.
+                                    state.cool(&instance, now_ms);
+                                }
                                 // Owner. Acknowledge FIRST, unless somebody
                                 // (or this app before a restart) already
                                 // did: then it is recovery only.
@@ -75441,6 +75516,41 @@ fed_expire = 4000000000
         }
 
         #[test]
+        fn a_grown_volume_flashes_for_the_cooldown_window_then_clears() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut shown = Vec::new();
+            let day = Duration::from_secs(24 * 3600);
+            disk_grow_note_grown(&tx, &mut shown, "i-1", 1_000, 5_000, day);
+            match rx.try_recv().expect("a line") {
+                DiskGrowEvent::GrowStarted { key, text } => {
+                    assert_eq!(key, "i-1");
+                    assert!(text.contains("grown in the past 24 hour(s)"), "{text}");
+                }
+                _ => panic!("expected the grown line"),
+            }
+            assert_eq!(shown, vec![("i-1".to_string(), 1_000 + 24 * 3600 * 1000)]);
+            // Already past the window: the line just ends.
+            disk_grow_note_grown(&tx, &mut shown, "i-1", 0, 24 * 3600 * 1000 + 1, day);
+            assert!(matches!(rx.try_recv(), Ok(DiskGrowEvent::GrowEnded { .. })));
+            assert!(shown.is_empty());
+            let body = disk_grow_fn_body(disk_grow_prod_src(), "fn start_disk_grow_poll(");
+            assert_eq!(body.matches("disk_grow_note_grown(").count(), 3, "ceiling, complete, stop");
+            assert!(body.contains("grown_shown.retain("), "expiry");
+        }
+
+        #[test]
+        fn an_alert_inside_the_cooldown_is_left_alone_not_acknowledged() {
+            let body = disk_grow_fn_body(disk_grow_prod_src(), "fn start_disk_grow_poll(");
+            let at = body.find("if begun == dg::Begin::Cooling").expect("the cooldown branch");
+            let block = disk_grow_block_after(body, at);
+            for banned in ["acknowledge_alert(", "add_note(", "escalate(", "state.failed(", "grow_once(", "disk_grow_gzip("] {
+                assert!(!block.contains(banned), "{banned} in {block}");
+            }
+            assert!(block.contains("continue"), "{block}");
+            assert!(at < body.find("if begun != dg::Begin::Owner").expect("the duplicate branch"));
+        }
+
+        #[test]
         fn the_disk_grow_poll_acknowledges_only_on_the_owner_and_duplicate_paths() {
             let src = disk_grow_prod_src();
             let body = disk_grow_fn_body(src, "fn start_disk_grow_poll(");
@@ -75495,7 +75605,7 @@ fed_expire = 4000000000
                 .expect("the poll's own optimizing ceiling");
             assert!(ceiling < read);
             let stop = disk_grow_block_after(body, ceiling);
-            assert!(stop.contains("GrowEnded") && stop.contains("state.finish("), "{stop}");
+            assert!(stop.contains("disk_grow_note_grown(") && stop.contains("state.finish("), "{stop}");
         }
 
         #[test]
@@ -75661,6 +75771,28 @@ fed_expire = 4000000000
                 fs_recorded_gib * 1024 * 1024 * 1024,
             );
             (out, grows.into_inner(), posted.into_inner())
+        }
+
+        #[test]
+        fn an_unchanged_filesystem_that_already_fills_the_device_is_a_success() {
+            use ec2_manager::disk_grow::FsGrow;
+            let grown = || Ok(FsGrow::Grown { df_after: "x".into() });
+            // Grown OK, the filesystem is the size it was recorded at, and the
+            // device is not ahead of it: nothing was left to grow. Not an error.
+            let (out, grows, posted) = disk_grow_fs_run(
+                vec![Ok(disk_grow_fake_probe(2000, 1000)), Ok(disk_grow_fake_probe(1000, 1000))],
+                grown(),
+                1000,
+            );
+            assert!(matches!(out, DiskGrowFs::Done), "{}", matches!(out, DiskGrowFs::Failed(_)));
+            assert_eq!((grows, posted.len()), (1, 1));
+            // Still short of the device afterwards: that does fail.
+            let (out, _, posted) = disk_grow_fs_run(
+                vec![Ok(disk_grow_fake_probe(2000, 1000)), Ok(disk_grow_fake_probe(2000, 1000))],
+                grown(),
+                1000,
+            );
+            assert!(matches!(out, DiskGrowFs::Failed(_)) && posted.is_empty());
         }
 
         #[test]
@@ -75842,7 +75974,7 @@ fed_expire = 4000000000
             let mut from = 0;
             for e in ends {
                 let seg = &lp[from..e];
-                assert!(seg.contains("GrowEnded"), "an end without GrowEnded: {seg}");
+                assert!(seg.contains("GrowEnded") || seg.contains("disk_grow_note_grown("), "an end without GrowEnded or the grown line: {seg}");
                 assert!(seg.contains("fs_unknown.remove(&inc.instance)"), "{seg}");
                 from = e + 1;
             }

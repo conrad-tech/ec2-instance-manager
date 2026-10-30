@@ -1895,6 +1895,12 @@ GUI thread (`start_disk_grow_poll`) makes every call. Spec:
   acknowledged alert is left to a person, so an app restart during the
   12-minute wait drops the timer. Test Alert Match runs the script with
   `RE_DG_DRY=1` (counts only) and reports the no-grow path.
+- **24-hour cooldown per instance** (`disk_grow.cooldown_mins`, 1440).
+  `DiskGrowState::cool` runs when the poll starts a fix on a fresh alert, so it
+  covers every outcome (grown, escalated, closed, timed out). A later alert for
+  that instance inside the window is left alone: **not acknowledged**, no gzip,
+  grow or escalation (`Begin::Cooling`); it keeps ringing for a person. It starts when the fix begins, not when it
+  ends, and an app restart clears it. Run Remediation ignores it.
 - **The poll claims the shared in-flight set** (`ReaperInFlight`, the one Run
   Remediation's `claim_in_flight` uses) for each new alert before its chain;
   an alert a person is remediating is skipped **without** being marked seen,

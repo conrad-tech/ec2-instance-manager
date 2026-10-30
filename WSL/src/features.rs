@@ -1361,6 +1361,10 @@ pub struct DiskGrowFeature {
     /// Minutes a no-grow alert is given to close after the logs are
     /// compressed (default 12).
     pub no_grow_wait_mins: u64,
+    /// Minutes after a fix starts during which a new alert for the same
+    /// instance is left alone, not even acknowledged: no gzip, no grow, no escalation
+    /// (default 1440 = 24 hours).
+    pub cooldown_mins: u64,
     /// Feed poll interval.
     pub poll_secs: u64,
     /// Alerts pulled per poll.
@@ -1433,6 +1437,11 @@ impl DiskGrowFeature {
             .iter()
             .map(|w| w.trim().to_ascii_lowercase())
             .any(|w| !w.is_empty() && title.contains(&w))
+    }
+
+    /// The per-instance cooldown after a fix starts (default 24 hours).
+    pub fn cooldown(&self) -> std::time::Duration {
+        Self::mins_or(self.cooldown_mins, 24 * 60)
     }
 
     /// How long a no-grow alert is given to close (default 12 min).
@@ -3813,6 +3822,8 @@ mod disk_grow_feature_tests {
         assert!(!cfg.no_grow("[EC2]: dev1-Cassandra-100-DiskUtilization-Warning"));
         assert!(!DiskGrowFeature::default().no_grow("anything reaper"));
         assert_eq!(cfg.no_grow_wait().as_secs(), 12 * 60);
+        assert_eq!(cfg.cooldown().as_secs(), 24 * 60 * 60);
+        assert_eq!(load().disk_grow.cooldown().as_secs(), 24 * 60 * 60);
         assert!(ec2_manager_shipped_no_grow_includes_reaper());
     }
 

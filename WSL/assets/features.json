@@ -246,13 +246,14 @@
     "poll_secs": 30,
     "fetch_count": 10
   },
-  "_disk_grow_comment": "Disk-utilization watcher on the JSM alert feed: acknowledges a disk alert, grows the volume, then waits for the space to become usable. ON CALL ONLY: nothing happens off call. BOTH keys are required: set enabled to true AND name the OS username in allowed_users; '*' is deliberately NOT honoured, because this acknowledges a live page and changes live volumes. excluded_environments lists MMODAL_ENV values (case-insensitive, e.g. [\"DEV1\"]) the watcher leaves alone entirely: an alert from an excluded environment is neither acknowledged nor grown. A blank entry excludes nothing. usable_wait_mins (default 15) is how long grown space is given to become usable; optimize_ceiling_mins (default 720) is when the optimizing watch stops with a warning, without escalating, because the grow itself succeeded. Every disk alert it handles first gzips /var/log files last modified before today (todays logs are never touched). no_grow_title_words (default [\"reaper\"], case-insensitive, matched against the alert title) names apps whose volume is NEVER grown: for those the watcher acknowledges, gzips, then waits no_grow_wait_mins (default 12) for the alert to close and escalates if it has not. poll_secs (30) and fetch_count (10) pace the feed. Shipped closed.",
+  "_disk_grow_comment": "Disk-utilization watcher on the JSM alert feed: acknowledges a disk alert, grows the volume, then waits for the space to become usable. ON CALL ONLY: nothing happens off call. BOTH keys are required: set enabled to true AND name the OS username in allowed_users; '*' is deliberately NOT honoured, because this acknowledges a live page and changes live volumes. excluded_environments lists MMODAL_ENV values (case-insensitive, e.g. [\"DEV1\"]) the watcher leaves alone entirely: an alert from an excluded environment is neither acknowledged nor grown. A blank entry excludes nothing. usable_wait_mins (default 15) is how long grown space is given to become usable; optimize_ceiling_mins (default 720) is when the optimizing watch stops with a warning, without escalating, because the grow itself succeeded. Every disk alert it handles first gzips /var/log files last modified before today (todays logs are never touched). no_grow_title_words (default [\"reaper\"], case-insensitive, matched against the alert title) names apps whose volume is NEVER grown: for those the watcher acknowledges, gzips, then waits no_grow_wait_mins (default 12) for the alert to close and escalates if it has not. cooldown_mins (default 1440 = 24h) starts when a fix for an instance begins: any further alert for that instance inside it is left alone (NOT acknowledged), with no gzip, grow or escalation. A restart clears it. poll_secs (30) and fetch_count (10) pace the feed. Shipped closed.",
   "disk_grow": {
     "enabled": false,
     "allowed_users": [],
     "excluded_environments": [],
     "no_grow_title_words": ["reaper"],
     "no_grow_wait_mins": 12,
+    "cooldown_mins": 1440,
     "poll_secs": 30,
     "fetch_count": 10,
     "usable_wait_mins": 15,
