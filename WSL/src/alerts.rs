@@ -587,6 +587,54 @@ pub fn add_note(auth: &AlertsAuth, alert_id: &str, note: &str) -> Result<()> {
     Ok(())
 }
 
+/// One note on an alert.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AlertNote {
+    pub note: String,
+    pub owner: String,
+    /// As the API returned it (RFC 3339, UTC).
+    pub created_at: String,
+}
+
+/// Reads a notes reply: `{"data":[{"note":..,"owner":..,"createdAt":..}]}`
+/// (a bare array is accepted too). A reply with neither is an error -- "no
+/// notes" and "could not read them" must not look alike.
+pub fn parse_notes(body: &str) -> Result<Vec<AlertNote>> {
+    let v: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| AppError::Parse(format!("alerts: unreadable notes reply: {e}")))?;
+    let list = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .or_else(|| v.as_array())
+        .ok_or_else(|| AppError::Parse("alerts: the notes reply has no list".to_string()))?;
+    let text = |n: &serde_json::Value, keys: &[&str]| -> String {
+        keys.iter()
+            .find_map(|k| n.get(*k).and_then(|x| x.as_str()))
+            .unwrap_or("")
+            .to_string()
+    };
+    Ok(list
+        .iter()
+        .map(|n| AlertNote {
+            note: text(n, &["note", "text", "message"]),
+            owner: text(n, &["owner", "user", "createdBy"]),
+            created_at: text(n, &["createdAt", "created_at", "createdDate"]),
+        })
+        .collect())
+}
+
+/// Read an alert's notes (`GET .../alerts/{id}/notes`).
+///
+/// The endpoint is assumed from the Opsgenie-compatible API, like
+/// `add_note`'s, and is unverified against the live tenant.
+pub fn fetch_notes(auth: &AlertsAuth, alert_id: &str) -> Result<Vec<AlertNote>> {
+    require_complete(auth)?;
+    validate_alert_id(alert_id)?;
+    let url = format!("{}/alerts/{alert_id}/notes", ops_base(auth));
+    let body = curl_request(auth, &url, &[], None)?;
+    parse_notes(&body)
+}
+
 /// Raw body of the schedule's current on-call response. Returned unparsed:
 /// `oncall::response_mentions` scans it, since the shape is not stable.
 pub fn fetch_on_calls(auth: &AlertsAuth, schedule_id: &str) -> Result<String> {
@@ -1021,5 +1069,19 @@ mod window_tests {
         // Nothing parseable on the page says nothing about the cutoff, so
         // keep walking rather than stopping early on a malformed row.
         assert!(!page_is_past_cutoff(None, cutoff()));
+    }
+
+    #[test]
+    fn notes_are_read_and_an_unreadable_reply_is_an_error_not_no_notes() {
+        let body = r#"{"data":[{"note":"grown +1TB","owner":"a@b","createdAt":"2026-11-01T18:00:00Z"},{"text":"x"}]}"#;
+        let n = parse_notes(body).unwrap();
+        assert_eq!(n.len(), 2);
+        assert_eq!(n[0].note, "grown +1TB");
+        assert_eq!(n[0].owner, "a@b");
+        assert_eq!(n[1].note, "x");
+        assert!(parse_notes(r#"{"data":[]}"#).unwrap().is_empty());
+        assert!(parse_notes("[]").unwrap().is_empty());
+        assert!(parse_notes(r#"{"oops":1}"#).is_err());
+        assert!(parse_notes("not json").is_err());
     }
 }

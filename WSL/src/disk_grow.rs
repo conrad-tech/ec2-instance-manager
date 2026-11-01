@@ -92,8 +92,23 @@ pub fn use_pct_for_mount(df_h: &str, mount: &str) -> Option<u32> {
         .and_then(|n| n.parse().ok())
 }
 
+/// The mount the alert itself names (its `mountpoint` property, e.g.
+/// `/data`). `None` when absent, unrendered or not a plain absolute path.
+pub fn alert_mount(alert: &Alert) -> Option<String> {
+    let (_, v) = alert
+        .extra
+        .iter()
+        .find(|(k, _)| !k.contains("{{") && k.trim().eq_ignore_ascii_case("mountpoint"))?;
+    let m = v.trim();
+    (safe_mount(m)).then(|| m.to_string())
+}
+
 /// The volumes to grow.
 ///
+/// * When the alert names its mount (`alert_mount`): exactly the non-root
+///   volume mounted there, whatever its use now (the alert is the evidence,
+///   and the log compression that runs first may have freed space). The
+///   root mount `/` is refused outright.
 /// * One data volume (the instance has two volumes): the larger one, as
 ///   `choose_volume` picks it, and only when its filesystem is above
 ///   `above_pct`. A data volume the box cannot resolve or read a use% for is
@@ -109,7 +124,21 @@ pub fn choose_targets(
     probe: &Probe,
     data_mounts: &[String],
     above_pct: u32,
+    alert_mount: Option<&str>,
 ) -> Result<Vec<Volume>, String> {
+    if let Some(mount) = alert_mount {
+        if mount == "/" {
+            return Err("the alert names the root filesystem (/); it is never grown".into());
+        }
+        for v in volumes.iter().filter(|v| v.device != root_device) {
+            if let Ok(dev) = resolve_data_device(probe, &v.id) {
+                if dev.mount == mount {
+                    return Ok(vec![v.clone()]);
+                }
+            }
+        }
+        return Err(format!("the alert names {mount}, but no non-root xfs volume is mounted there"));
+    }
     if volumes.len() <= 2 {
         let v = choose_volume(volumes, root_device)?;
         if let Ok(dev) = resolve_data_device(probe, &v.id) {
@@ -1520,8 +1549,26 @@ mod tests {
             vol("vol-b", 1000, "gp3", "/dev/sdg"),
         ];
         let mounts: Vec<String> = vec!["/".into(), "/data".into(), "/data2".into()];
-        let r = choose_targets(&vols, "/dev/xvda", &p, &mounts, 79).unwrap();
+        let r = choose_targets(&vols, "/dev/xvda", &p, &mounts, 79, None).unwrap();
         assert!(r.iter().all(|v| v.id != "vol-root"), "{r:?}");
+    }
+
+    #[test]
+    fn the_alert_names_the_mount_to_grow_and_the_root_is_refused() {
+        let mut a = alert("[EC2]: x-Cassandra-DiskUtilization-Warning");
+        assert_eq!(alert_mount(&a), None);
+        a.extra.insert("mountpoint".into(), "/data2".into());
+        assert_eq!(alert_mount(&a).as_deref(), Some("/data2"));
+        a.extra.insert("mountpoint".into(), "{{ $labels.mountpoint }}".into());
+        assert_eq!(alert_mount(&a), None, "an unrendered template is not a mount");
+        let p = probe_two_data(10, 10); // both well under the threshold
+        let vols = three_volumes();
+        let mounts: Vec<String> = vec!["/data".into(), "/data2".into()];
+        // Named: grown whatever its use, and only that one.
+        let r = choose_targets(&vols, "/dev/xvda", &p, &mounts, 79, Some("/data2")).unwrap();
+        assert_eq!(r.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(), vec!["vol-b"]);
+        assert!(choose_targets(&vols, "/dev/xvda", &p, &mounts, 79, Some("/")).is_err());
+        assert!(choose_targets(&vols, "/dev/xvda", &p, &mounts, 79, Some("/nope")).is_err());
     }
 
     #[test]
@@ -1538,7 +1585,7 @@ mod tests {
         let ids = |r: Result<Vec<Volume>, String>| -> Vec<String> {
             r.unwrap().into_iter().map(|v| v.id).collect()
         };
-        let go = |a, b| choose_targets(&three_volumes(), "/dev/xvda", &probe_two_data(a, b), &mounts, 80);
+        let go = |a, b| choose_targets(&three_volumes(), "/dev/xvda", &probe_two_data(a, b), &mounts, 80, None);
         assert_eq!(ids(go(85, 50)), vec!["vol-a"]);
         assert_eq!(ids(go(50, 85)), vec!["vol-b"]);
         assert_eq!(ids(go(90, 95)), vec!["vol-a", "vol-b"]);
@@ -1550,15 +1597,15 @@ mod tests {
     #[test]
     fn two_volumes_grow_the_larger_one_only_when_it_is_above_the_threshold() {
         let vols = vec![vol("vol-root", 100, "gp3", "/dev/xvda"), vol("vol-a", 1000, "gp3", "/dev/sdf")];
-        let r = choose_targets(&vols, "/dev/xvda", &probe_two_data(80, 10), &[], 79).unwrap();
+        let r = choose_targets(&vols, "/dev/xvda", &probe_two_data(80, 10), &[], 79, None).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].id, "vol-a");
         // 79 is not above 79.
-        assert!(choose_targets(&vols, "/dev/xvda", &probe_two_data(79, 10), &[], 79).is_err());
+        assert!(choose_targets(&vols, "/dev/xvda", &probe_two_data(79, 10), &[], 79, None).is_err());
         // A box that cannot be read for use% leaves it to the grow chain.
         let mut unreadable = probe_two_data(10, 10);
         unreadable.df_h = "Filesystem Size Used Avail Use% Mounted on".into();
-        assert_eq!(choose_targets(&vols, "/dev/xvda", &unreadable, &[], 79).unwrap().len(), 1);
+        assert_eq!(choose_targets(&vols, "/dev/xvda", &unreadable, &[], 79, None).unwrap().len(), 1);
     }
 
     #[test]
@@ -1567,7 +1614,7 @@ mod tests {
         p.blocks[2].mountpoint = "/var/lib/other".into();
         p.df_h = p.df_h.replace("/data2", "/var/lib/other");
         let mounts: Vec<String> = DEFAULT_DATA_MOUNTS.iter().map(|s| s.to_string()).collect();
-        let r = choose_targets(&three_volumes(), "/dev/xvda", &p, &mounts, 80).unwrap();
+        let r = choose_targets(&three_volumes(), "/dev/xvda", &p, &mounts, 80, None).unwrap();
         assert_eq!(r.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(), vec!["vol-a"]);
     }
 

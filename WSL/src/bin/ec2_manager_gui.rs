@@ -3120,6 +3120,8 @@ mod gui {
         error: Option<String>,
         ack_in_flight: bool,
         note: Option<std::result::Result<String, String>>,
+        /// The alert's notes: `None` until read, `Err` when they could not be.
+        notes: Option<std::result::Result<Vec<alerts::AlertNote>, String>>,
     }
 
     impl AlertWindow {
@@ -3132,6 +3134,7 @@ mod gui {
                 error: None,
                 ack_in_flight: false,
                 note: None,
+                notes: None,
             }
         }
     }
@@ -3145,6 +3148,10 @@ mod gui {
         Acked {
             id: String,
             result: std::result::Result<(), String>,
+        },
+        Notes {
+            id: String,
+            result: std::result::Result<Vec<alerts::AlertNote>, String>,
         },
     }
 
@@ -6256,7 +6263,14 @@ mod gui {
         // before anything is acknowledged, and leave an in-flight one alone.
         let volumes = match disk_grow_volumes(&ctx, &facts.instance_id).and_then(|(vols, root)| {
             let probe = disk_grow_probe(&ctx, &facts.instance_id)?;
-            dg::choose_targets(&vols, &root, &probe, &cfg.data_mounts(), cfg.grow_above())
+            dg::choose_targets(
+                &vols,
+                &root,
+                &probe,
+                &cfg.data_mounts(),
+                cfg.grow_above(),
+                dg::alert_mount(&alert).as_deref(),
+            )
         }) {
             Ok(v) => v,
             Err(e) => return fail(&mut end, format!("choosing the data volume(s): {e}")),
@@ -7284,6 +7298,7 @@ mod gui {
                             &probe,
                             &disk_grow_cfg.data_mounts(),
                             disk_grow_cfg.grow_above(),
+                            dg::alert_mount(&alert).as_deref(),
                         ) {
                             Ok(v) => v,
                             Err(e) => {
@@ -21497,7 +21512,11 @@ mod gui {
                 let result = alerts::fetch_alert(&auth, &id)
                     .map(Box::new)
                     .map_err(|e| e.to_string());
-                let _ = tx.send(AlertDetailEvent::Loaded { id, result });
+                let _ = tx.send(AlertDetailEvent::Loaded { id: id.clone(), result });
+                // Its own event: a token that can read the alert but not its
+                // notes must leave the alert readable.
+                let notes = alerts::fetch_notes(&auth, &id).map_err(|e| e.to_string());
+                let _ = tx.send(AlertDetailEvent::Notes { id, result: notes });
             });
         }
 
@@ -21551,6 +21570,14 @@ mod gui {
                                     win.error = Some(err);
                                 }
                             }
+                        }
+                    }
+                    AlertDetailEvent::Notes { id, result } => {
+                        if let Err(e) = &result {
+                            self.log_alerts(LogLevel::Warn, format!("alerts: {id}: notes: {e}"));
+                        }
+                        if let Some(win) = self.alert_windows.iter_mut().find(|w| w.id == id) {
+                            win.notes = Some(result);
                         }
                     }
                     AlertDetailEvent::Acked { id, result } => {
@@ -23855,6 +23882,7 @@ mod gui {
                     )
                 };
                 let protected_line = self.protected_alerts.get(&id).cloned();
+                let notes = self.alert_windows[idx].notes.clone();
                 let title = match &alert {
                     Some(a) if !a.message.is_empty() => format!(
                         "#{}  ·  {}",
@@ -23987,6 +24015,40 @@ mod gui {
                                     ui.weak("(none)");
                                 } else {
                                     ui.add(egui::Label::new(&alert.description).wrap());
+                                }
+
+                                ui.add_space(8.0);
+                                ui.separator();
+                                match &notes {
+                                    None => {
+                                        ui.strong("Notes");
+                                        ui.weak("loading…");
+                                    }
+                                    Some(Err(e)) => {
+                                        ui.strong("Notes");
+                                        note_label(
+                                            ui,
+                                            egui::Color32::from_rgb(200, 60, 60),
+                                            egui::RichText::new(format!("could not read the notes: {e}")),
+                                        );
+                                    }
+                                    Some(Ok(list)) if list.is_empty() => {
+                                        ui.strong("Notes (0)");
+                                        ui.weak("(none)");
+                                    }
+                                    Some(Ok(list)) => {
+                                        ui.strong(format!("Notes ({})", list.len()));
+                                        for n in list {
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.weak(format_local_time(&n.created_at));
+                                                if !n.owner.is_empty() {
+                                                    ui.weak(&n.owner);
+                                                }
+                                            });
+                                            ui.add(egui::Label::new(&n.note).wrap());
+                                            ui.add_space(4.0);
+                                        }
+                                    }
                                 }
 
                                 if !alert.tags.is_empty() {
@@ -49716,7 +49778,14 @@ mod gui {
             Err(e) => return fail("listing the instance's volumes", e),
         };
         let targets =
-            match dg::choose_targets(&volumes, &root, &probe, &cfg.data_mounts(), cfg.grow_above()) {
+            match dg::choose_targets(
+                &volumes,
+                &root,
+                &probe,
+                &cfg.data_mounts(),
+                cfg.grow_above(),
+                dg::alert_mount(alert).as_deref(),
+            ) {
                 Ok(v) => v,
                 Err(e) => return fail("choosing the data volume(s)", e),
             };

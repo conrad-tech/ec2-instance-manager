@@ -1907,6 +1907,15 @@ GUI thread (`start_disk_grow_poll`) makes every call. Spec:
   changes only when the instance's last volume ends. **Run Remediation grows
   an alert someone else already acknowledged** (it works on a fresh copy);
   only the unattended poll refuses to resize an acknowledged alert.
+- **The alert names the mount** (`disk_grow::alert_mount`: its `mountpoint`
+  property, e.g. `/data2`). When present, exactly the non-root volume mounted
+  there is grown, whatever its use now (the alert is the evidence, and the
+  gzip that runs first may have freed space); `/` is refused outright, and
+  `resolve_data_device` refuses any disk or partition holding `/` on every
+  path. Absent or unrendered, the data-mount/threshold rules above apply.
+  **The alert window shows the alert's notes** (`alerts::fetch_notes`,
+  `GET .../alerts/{id}/notes`, endpoint assumed like `add_note`'s and
+  unverified live); a read failure is shown in red, never as "no notes".
 - **24-hour cooldown per instance** (`disk_grow.cooldown_mins`, 1440).
   `DiskGrowState::cool` runs when the poll starts a fix on a fresh alert, so it
   covers every outcome (grown, escalated, closed, timed out). A later alert for
