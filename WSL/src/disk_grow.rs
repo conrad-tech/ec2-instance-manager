@@ -79,7 +79,7 @@ pub const DEFAULT_DATA_MOUNTS: [&str; 2] = ["/data", "/data2"];
 
 /// A data filesystem is grown only when it is ABOVE this use. Overridable by
 /// `disk_grow.grow_above_pct`.
-pub const DEFAULT_GROW_ABOVE_PCT: u32 = 80;
+pub const DEFAULT_GROW_ABOVE_PCT: u32 = 79;
 
 /// The `Use%` of `mount`'s row in `df -h` output.
 pub fn use_pct_for_mount(df_h: &str, mount: &str) -> Option<u32> {
@@ -94,9 +94,10 @@ pub fn use_pct_for_mount(df_h: &str, mount: &str) -> Option<u32> {
 
 /// The volumes to grow.
 ///
-/// * One data volume (the instance has two volumes): the larger one, exactly
-///   as `choose_volume` has always picked it, whatever its use -- the alert
-///   is the evidence there.
+/// * One data volume (the instance has two volumes): the larger one, as
+///   `choose_volume` picks it, and only when its filesystem is above
+///   `above_pct`. A data volume the box cannot resolve or read a use% for is
+///   still returned: the grow chain reports that failure itself.
 /// * More than one (three or more volumes, e.g. `/data` and `/data2`): every
 ///   non-root volume mounted at one of `data_mounts` whose filesystem is
 ///   above `above_pct`. Either one, or both when both are. None above the
@@ -110,7 +111,18 @@ pub fn choose_targets(
     above_pct: u32,
 ) -> Result<Vec<Volume>, String> {
     if volumes.len() <= 2 {
-        return choose_volume(volumes, root_device).map(|v| vec![v]);
+        let v = choose_volume(volumes, root_device)?;
+        if let Ok(dev) = resolve_data_device(probe, &v.id) {
+            if let Some(pct) = use_pct_for_mount(&probe.df_h, &dev.mount) {
+                if pct <= above_pct {
+                    return Err(format!(
+                        "the data filesystem {} is at {pct}%, not above {above_pct}%",
+                        dev.mount
+                    ));
+                }
+            }
+        }
+        return Ok(vec![v]);
     }
     let mut seen: Vec<String> = Vec::new();
     let mut over: Vec<Volume> = Vec::new();
@@ -398,6 +410,12 @@ pub fn resolve_data_device(probe: &Probe, volume_id: &str) -> Result<DataDevice,
             let kind = if b.dev_type == "lvm" { "lvm" } else { "raid" };
             return Err(format!("{} sits on {kind} ({}); refusing to grow it", disk.name, b.name));
         }
+    }
+    // The root filesystem is never grown, whatever the EBS device names say
+    // about which volume is root: a disk (or any partition of it) holding `/`
+    // is refused outright.
+    if disk.mountpoint == "/" || children.iter().any(|c| c.mountpoint == "/") {
+        return Err(format!("{} holds the root filesystem (/); refusing to grow it", disk.name));
     }
     let has_mount = |b: &BlockDev| b.mountpoint.starts_with('/');
     let (holder, partition) = if has_mount(disk) {
@@ -1475,6 +1493,38 @@ mod tests {
     }
 
     #[test]
+    fn the_root_filesystem_is_never_resolved_as_a_data_device() {
+        // Plain disk mounted at /.
+        let mut p = probe_two_data(95, 95);
+        p.blocks[0].mountpoint = "/".into();
+        p.blocks[0].fstype = "xfs".into();
+        assert!(resolve_data_device(&p, "vol-root").unwrap_err().contains("root filesystem"));
+        // Partitioned root disk: / is on the partition, /boot/efi on another.
+        let part = |name: &str, mount: &str| BlockDev {
+            name: name.into(),
+            dev_type: "part".into(),
+            fstype: "xfs".into(),
+            mountpoint: mount.into(),
+            pkname: "nvme0n1".into(),
+            ..Default::default()
+        };
+        let mut p = probe_two_data(95, 95);
+        p.blocks.push(part("nvme0n1p128", "/boot/efi"));
+        p.blocks.push(part("nvme0n1p1", "/"));
+        assert!(resolve_data_device(&p, "vol-root").unwrap_err().contains("root filesystem"));
+        // And a volume that is on the box's / is never a target, even if the
+        // EBS device name did not say root.
+        let vols = vec![
+            vol("vol-root", 5000, "gp3", "/dev/sdz"),
+            vol("vol-a", 1000, "gp3", "/dev/sdf"),
+            vol("vol-b", 1000, "gp3", "/dev/sdg"),
+        ];
+        let mounts: Vec<String> = vec!["/".into(), "/data".into(), "/data2".into()];
+        let r = choose_targets(&vols, "/dev/xvda", &p, &mounts, 79).unwrap();
+        assert!(r.iter().all(|v| v.id != "vol-root"), "{r:?}");
+    }
+
+    #[test]
     fn use_percent_is_read_from_the_mounts_df_row() {
         let p = probe_two_data(91, 40);
         assert_eq!(use_pct_for_mount(&p.df_h, "/data"), Some(91));
@@ -1498,11 +1548,17 @@ mod tests {
     }
 
     #[test]
-    fn two_volumes_keep_the_old_larger_volume_rule_whatever_the_use() {
+    fn two_volumes_grow_the_larger_one_only_when_it_is_above_the_threshold() {
         let vols = vec![vol("vol-root", 100, "gp3", "/dev/xvda"), vol("vol-a", 1000, "gp3", "/dev/sdf")];
-        let r = choose_targets(&vols, "/dev/xvda", &probe_two_data(10, 10), &[], 80).unwrap();
+        let r = choose_targets(&vols, "/dev/xvda", &probe_two_data(80, 10), &[], 79).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].id, "vol-a");
+        // 79 is not above 79.
+        assert!(choose_targets(&vols, "/dev/xvda", &probe_two_data(79, 10), &[], 79).is_err());
+        // A box that cannot be read for use% leaves it to the grow chain.
+        let mut unreadable = probe_two_data(10, 10);
+        unreadable.df_h = "Filesystem Size Used Avail Use% Mounted on".into();
+        assert_eq!(choose_targets(&vols, "/dev/xvda", &unreadable, &[], 79).unwrap().len(), 1);
     }
 
     #[test]

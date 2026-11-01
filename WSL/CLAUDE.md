@@ -1896,10 +1896,11 @@ GUI thread (`start_disk_grow_poll`) makes every call. Spec:
   12-minute wait drops the timer. Test Alert Match runs the script with
   `RE_DG_DRY=1` (counts only) and reports the no-grow path.
 - **More than one data volume (`/data` and `/data2`).** With two volumes
-  (root + one data) the larger is grown as always. With three or more,
+  (root + one data) the larger is grown only when its use is above the same
+  threshold (a use% the box cannot give is left to the grow chain). With three or more,
   `disk_grow::choose_targets` picks every non-root volume mounted at one of
   `disk_grow.data_mounts` (default `/data`, `/data2`) whose `df` use% is
-  **above** `grow_above_pct` (80): one or both. None above is an escalation,
+  **above** `grow_above_pct` (79, i.e. 80% or more): one or both. None above is an escalation,
   not a quiet success. Each volume is its own incident (`Incident::key` =
   `instance|volume`), each posts its own before/after note, a failed one
   escalates without dropping its sibling, and the toolbar line/cooldown line

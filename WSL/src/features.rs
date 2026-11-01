@@ -1369,7 +1369,7 @@ pub struct DiskGrowFeature {
     /// one data volume (default `["/data", "/data2"]`).
     pub data_mounts: Vec<String>,
     /// With more than one data volume, a filesystem is grown only when its
-    /// use is ABOVE this percent (default 80).
+    /// use is ABOVE this percent (default 79).
     pub grow_above_pct: u32,
     /// Feed poll interval.
     pub poll_secs: u64,
@@ -1465,7 +1465,7 @@ impl DiskGrowFeature {
         }
     }
 
-    /// Use percent a data filesystem must exceed to be grown (default 80).
+    /// Use percent a data filesystem must exceed to be grown (default 79).
     pub fn grow_above(&self) -> u32 {
         if self.grow_above_pct == 0 || self.grow_above_pct >= 100 {
             crate::disk_grow::DEFAULT_GROW_ABOVE_PCT

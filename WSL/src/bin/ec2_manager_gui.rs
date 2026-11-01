@@ -49839,10 +49839,15 @@ mod gui {
                         );
                         incident(dg::Phase::Modifying, false)
                     }
-                    dg::Recovery::Nothing(why) => GrowOnce::Nothing(format!(
-                        "{tag} — already acknowledged and {why}; nothing to do (an acknowledged \
-                         alert is never resized)"
-                    )),
+                    // The reason is deliberately not logged: it reads as though a
+                    // resize was attempted and found the volume full.
+                    dg::Recovery::Nothing(why) => GrowOnce::Nothing({
+                        let _ = why;
+                        format!(
+                            "{tag} — already acknowledged; nothing to do (an acknowledged alert \
+                             is never resized)"
+                        )
+                    }),
                     dg::Recovery::Failed(why) => fail("checking for a grow to recover", why),
                 }
             }
@@ -50352,6 +50357,24 @@ mod gui {
                                 {
                                     continue;
                                 }
+                                // Already acknowledged (by a person, or this
+                                // app before a restart): the poll does
+                                // NOTHING with it -- no claim, no read of the
+                                // box, no gzip, grow or escalation. Run
+                                // Remediation is how a person has one handled.
+                                if dg::alert_acknowledged(listed) {
+                                    state.mark_seen(&listed.id);
+                                    note(
+                                        LogLevel::Info,
+                                        format!(
+                                            "disk grow: {} is already acknowledged — left alone \
+                                             (the automatic fix never touches an acknowledged \
+                                             alert)",
+                                            listed.id
+                                        ),
+                                    );
+                                    continue;
+                                }
                                 // The shared in-flight set Run Remediation
                                 // claims: an alert a person is remediating is
                                 // skipped WITHOUT being marked seen, so the
@@ -50389,6 +50412,18 @@ mod gui {
                                 };
                                 state.mark_seen(&alert.id);
                                 if reaper::alert_is_closed(&alert.status) {
+                                    continue;
+                                }
+                                // The full read is the authority: acknowledged
+                                // since the list was read is still left alone.
+                                if dg::alert_acknowledged(&alert) {
+                                    note(
+                                        LogLevel::Info,
+                                        format!(
+                                            "disk grow: {} was acknowledged — left alone",
+                                            alert.id
+                                        ),
+                                    );
                                     continue;
                                 }
                                 claimed += 1;
@@ -75756,6 +75791,17 @@ fed_expire = 4000000000
             assert_eq!(calls, 2, "alert_comment is built in the real path and the dry-run preview");
             let once = disk_grow_fn_body(src, "fn disk_grow_grow_volume(");
             assert!(once.contains("dg::df_h_for_mount(&probe.df_h, &dev.mount)"), "{once}");
+        }
+
+        #[test]
+        fn the_poll_never_touches_an_acknowledged_alert() {
+            let body = disk_grow_fn_body(disk_grow_prod_src(), "fn start_disk_grow_poll(");
+            let claim = body.find("claim_in_flight(&in_flight, &listed.id)").expect("the claim");
+            let skip = body.find("if dg::alert_acknowledged(listed) {").expect("the list-row skip");
+            assert!(skip < claim, "an acknowledged alert is skipped before it is claimed");
+            let full = body.find("if dg::alert_acknowledged(&alert) {").expect("the full-read skip");
+            let probe = body.find("disk_grow_grow_once(").expect("the chain");
+            assert!(full < probe);
         }
 
         #[test]
