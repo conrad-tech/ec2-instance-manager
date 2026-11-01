@@ -49,7 +49,7 @@ pub struct AlertFacts {
 ///
 /// The feed writes `Name (123456789012)`. A bare 12-digit value is a number
 /// with no name. Anything else is a name with no number.
-fn split_account(value: &str) -> (String, String) {
+pub fn split_account(value: &str) -> (String, String) {
     let v = value.trim();
     let is_id = |t: &str| t.len() == 12 && t.bytes().all(|b| b.is_ascii_digit());
     if is_id(v) {

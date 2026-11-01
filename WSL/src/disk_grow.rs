@@ -92,6 +92,61 @@ pub fn use_pct_for_mount(df_h: &str, mount: &str) -> Option<u32> {
         .and_then(|n| n.parse().ok())
 }
 
+/// The alert's facts, with the instance id taken from the `InstanceId`
+/// property (and the account and environment from their tags) when the
+/// description yielded none. The description wins whenever
+/// it has a readable id; the property is only a fallback, and goes through
+/// the same whitelist (`reaper::find_instance_id`) before it reaches argv.
+/// A tag value, trimmed, or `None` when blank or an unrendered template.
+fn usable(v: &str) -> Option<String> {
+    let v = v.trim();
+    (!v.is_empty() && !v.contains(['{', '}', '%', '<', '>'])).then(|| v.to_string())
+}
+
+pub fn facts_with_instance_and_account(
+    mut facts: crate::instance_age::AlertFacts,
+    alert: &Alert,
+) -> crate::instance_age::AlertFacts {
+    if facts.instance_id.is_empty() {
+        if let Some((_, v)) = alert
+            .extra
+            .iter()
+            .find(|(k, _)| !k.contains("{{") && k.trim().eq_ignore_ascii_case("InstanceId"))
+        {
+            if let Some(id) = reaper::find_instance_id(v) {
+                facts.instance_id = id;
+            }
+        }
+    }
+    // The account, the same way: only when the description gave none. It is a tag on the alert (`Account: <id>`),
+    // already split out as `alert.account`. Unrendered templates are refused.
+    if facts.account.is_empty() && facts.account_id.is_empty() {
+        if let Some(v) = usable(&alert.account) {
+            let (name, id) = crate::instance_age::split_account(&v);
+            facts.account = name;
+            facts.account_id = id;
+        }
+    }
+    facts
+}
+
+/// `facts_with_instance_and_account`, plus the environment from its tag.
+/// Only the disk-utilization watcher uses the environment fallback: it is
+/// what an exclusion list is matched against, so the other watchers (whose
+/// behaviour must not change for alerts they decline today) do not get it.
+pub fn facts_with_property(
+    facts: crate::instance_age::AlertFacts,
+    alert: &Alert,
+) -> crate::instance_age::AlertFacts {
+    let mut facts = facts_with_instance_and_account(facts, alert);
+    if facts.environment.trim().is_empty() {
+        if let Some(v) = usable(&alert.environment) {
+            facts.environment = v;
+        }
+    }
+    facts
+}
+
 /// The mount the alert itself names (its `mountpoint` property, e.g.
 /// `/data`). `None` when absent, unrendered or not a plain absolute path.
 pub fn alert_mount(alert: &Alert) -> Option<String> {
@@ -1551,6 +1606,56 @@ mod tests {
         let mounts: Vec<String> = vec!["/".into(), "/data".into(), "/data2".into()];
         let r = choose_targets(&vols, "/dev/xvda", &p, &mounts, 79, None).unwrap();
         assert!(r.iter().all(|v| v.id != "vol-root"), "{r:?}");
+    }
+
+    #[test]
+    fn the_instance_id_property_is_only_a_fallback() {
+        let mut a = alert("[EC2]: x-Cassandra-DiskUtilization-Warning");
+        a.extra.insert("InstanceId".into(), "i-022a4cc66a1fcb45a".into());
+        let none = crate::instance_age::AlertFacts::default();
+        assert_eq!(facts_with_property(none, &a).instance_id, "i-022a4cc66a1fcb45a");
+        // The description's own id wins.
+        let own = crate::instance_age::AlertFacts { instance_id: "i-0123456789abcdef0".into(), ..Default::default() };
+        assert_eq!(facts_with_property(own, &a).instance_id, "i-0123456789abcdef0");
+        // Not an instance id: stays empty.
+        a.extra.insert("InstanceId".into(), "{{ $labels.instance }}".into());
+        assert_eq!(facts_with_property(Default::default(), &a).instance_id, "");
+    }
+
+    #[test]
+    fn the_account_and_environment_fall_back_to_their_tags() {
+        let mut a = alert("[EC2]: x-Cassandra-DiskUtilization-Warning");
+        a.account = "123456789012".into();
+        a.environment = "DEV1".into();
+        let f = facts_with_property(Default::default(), &a);
+        assert_eq!(f.account_id, "123456789012");
+        assert_eq!(f.environment, "DEV1");
+        // The description's own values win.
+        let own = crate::instance_age::AlertFacts {
+            account_id: "111111111111".into(),
+            environment: "PROD".into(),
+            ..Default::default()
+        };
+        let f = facts_with_property(own, &a);
+        assert_eq!((f.account_id.as_str(), f.environment.as_str()), ("111111111111", "PROD"));
+        // A template is never an account or an environment.
+        a.account = "{{ $labels.account }}".into();
+        a.environment = "&{%env%}%".into();
+        let f = facts_with_property(Default::default(), &a);
+        assert!(f.account.is_empty() && f.account_id.is_empty() && f.environment.is_empty());
+    }
+
+    #[test]
+    fn the_other_watchers_get_instance_and_account_but_never_the_environment() {
+        let mut a = alert("x");
+        a.account = "123456789012".into();
+        a.environment = "DEV1".into();
+        a.extra.insert("InstanceId".into(), "i-022a4cc66a1fcb45a".into());
+        let f = facts_with_instance_and_account(Default::default(), &a);
+        assert_eq!(f.instance_id, "i-022a4cc66a1fcb45a");
+        assert_eq!(f.account_id, "123456789012");
+        assert!(f.environment.is_empty(), "the environment fallback is the disk watcher's only");
+        assert_eq!(facts_with_property(Default::default(), &a).environment, "DEV1");
     }
 
     #[test]

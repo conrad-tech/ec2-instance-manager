@@ -5824,7 +5824,7 @@ mod gui {
         };
         note(LogLevel::Warn, format!("remediation requested for alert {alert_id}"));
 
-        let facts = ia::parse_facts(&alert.description);
+        let facts = ec2_manager::disk_grow::facts_with_instance_and_account(ia::parse_facts(&alert.description), &alert);
         if facts.instance_id.is_empty() {
             fail(&mut end, "names no readable instance id — nothing to act on".to_string());
             return;
@@ -5959,7 +5959,7 @@ mod gui {
         };
         note(LogLevel::Warn, format!("remediation requested for alert {alert_id}"));
 
-        let facts = ia::parse_facts(&alert.description);
+        let facts = ec2_manager::disk_grow::facts_with_instance_and_account(ia::parse_facts(&alert.description), &alert);
         if facts.instance_id.is_empty() {
             fail(&mut end, "names no readable instance id — nothing to act on".to_string());
             return;
@@ -6231,7 +6231,7 @@ mod gui {
         };
         note(LogLevel::Warn, format!("remediation requested for alert {alert_id}"));
 
-        let facts = ia::parse_facts(&alert.description);
+        let facts = dg::facts_with_property(ia::parse_facts(&alert.description), &alert);
         if let Some(why) = disk_grow_manual_env_refusal(cfg, &facts.environment) {
             return fail(&mut end, why);
         }
@@ -6954,7 +6954,7 @@ mod gui {
                         LogLevel::Info,
                         format!("dry run: alert {} matches the instance-age rules", alert.id),
                     );
-                    let facts = ia::parse_facts(&alert.description);
+                    let facts = ec2_manager::disk_grow::facts_with_instance_and_account(ia::parse_facts(&alert.description), &alert);
                     note(
                         LogLevel::Info,
                         format!(
@@ -7046,7 +7046,7 @@ mod gui {
                         LogLevel::Info,
                         format!("dry run: alert {} matches the Grafana rules", alert.id),
                     );
-                    let facts = ia::parse_facts(&alert.description);
+                    let facts = ec2_manager::disk_grow::facts_with_instance_and_account(ia::parse_facts(&alert.description), &alert);
                     note(
                         LogLevel::Info,
                         format!(
@@ -7108,7 +7108,7 @@ mod gui {
                         LogLevel::Info,
                         format!("dry run: alert {} matches the disk-utilization rules", alert.id),
                     );
-                    let facts = ia::parse_facts(&alert.description);
+                    let facts = dg::facts_with_property(ia::parse_facts(&alert.description), &alert);
                     note(
                         LogLevel::Info,
                         format!(
@@ -48757,7 +48757,7 @@ mod gui {
                                         continue;
                                     }
                                 };
-                                let facts = ia::parse_facts(&alert.description);
+                                let facts = ec2_manager::disk_grow::facts_with_instance_and_account(ia::parse_facts(&alert.description), &alert);
                                 if !ia::names_an_app(&facts, &cfg) {
                                     note(
                                         LogLevel::Debug,
@@ -49221,7 +49221,7 @@ mod gui {
                                     state.mark_seen(&alert.id);
                                     continue;
                                 }
-                                let facts = ia::parse_facts(&alert.description);
+                                let facts = ec2_manager::disk_grow::facts_with_instance_and_account(ia::parse_facts(&alert.description), &alert);
                                 if facts.instance_id.is_empty() {
                                     note(
                                         LogLevel::Warn,
@@ -50496,7 +50496,7 @@ mod gui {
                                     continue;
                                 }
                                 claimed += 1;
-                                let facts = ia::parse_facts(&alert.description);
+                                let facts = dg::facts_with_property(ia::parse_facts(&alert.description), &alert);
                                 // An environment nothing can be decided from
                                 // might be an excluded one: while anything is
                                 // excluded, leave it alone entirely. Already
@@ -76129,7 +76129,7 @@ fed_expire = 4000000000
         #[test]
         fn an_unreadable_environment_is_left_alone_while_anything_is_excluded() {
             let body = disk_grow_fn_body(disk_grow_prod_src(), "fn start_disk_grow_poll(");
-            let facts = body.find("let facts = ia::parse_facts(").expect("the facts");
+            let facts = body.find("let facts = dg::facts_with_property(").expect("the facts");
             let guard = body
                 .find("if cfg.names_any_exclusion() && dg::environment_unreadable(&facts.environment)")
                 .expect("the unreadable-environment branch");
