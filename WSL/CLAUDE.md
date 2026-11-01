@@ -1895,6 +1895,17 @@ GUI thread (`start_disk_grow_poll`) makes every call. Spec:
   acknowledged alert is left to a person, so an app restart during the
   12-minute wait drops the timer. Test Alert Match runs the script with
   `RE_DG_DRY=1` (counts only) and reports the no-grow path.
+- **More than one data volume (`/data` and `/data2`).** With two volumes
+  (root + one data) the larger is grown as always. With three or more,
+  `disk_grow::choose_targets` picks every non-root volume mounted at one of
+  `disk_grow.data_mounts` (default `/data`, `/data2`) whose `df` use% is
+  **above** `grow_above_pct` (80): one or both. None above is an escalation,
+  not a quiet success. Each volume is its own incident (`Incident::key` =
+  `instance|volume`), each posts its own before/after note, a failed one
+  escalates without dropping its sibling, and the toolbar line/cooldown line
+  changes only when the instance's last volume ends. **Run Remediation grows
+  an alert someone else already acknowledged** (it works on a fresh copy);
+  only the unattended poll refuses to resize an acknowledged alert.
 - **24-hour cooldown per instance** (`disk_grow.cooldown_mins`, 1440).
   `DiskGrowState::cool` runs when the poll starts a fix on a fresh alert, so it
   covers every outcome (grown, escalated, closed, timed out). A later alert for

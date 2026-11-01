@@ -73,6 +73,73 @@ pub fn choose_volume(volumes: &[Volume], root_device: &str) -> Result<Volume, St
     Ok(sorted[0].clone())
 }
 
+/// Mounts treated as data filesystems when an instance has more than one
+/// data volume. Overridable by `disk_grow.data_mounts`.
+pub const DEFAULT_DATA_MOUNTS: [&str; 2] = ["/data", "/data2"];
+
+/// A data filesystem is grown only when it is ABOVE this use. Overridable by
+/// `disk_grow.grow_above_pct`.
+pub const DEFAULT_GROW_ABOVE_PCT: u32 = 80;
+
+/// The `Use%` of `mount`'s row in `df -h` output.
+pub fn use_pct_for_mount(df_h: &str, mount: &str) -> Option<u32> {
+    let row = df_h
+        .lines()
+        .skip(1)
+        .find(|l| l.split_whitespace().last() == Some(mount))?;
+    row.split_whitespace()
+        .find_map(|w| w.strip_suffix('%'))
+        .and_then(|n| n.parse().ok())
+}
+
+/// The volumes to grow.
+///
+/// * One data volume (the instance has two volumes): the larger one, exactly
+///   as `choose_volume` has always picked it, whatever its use -- the alert
+///   is the evidence there.
+/// * More than one (three or more volumes, e.g. `/data` and `/data2`): every
+///   non-root volume mounted at one of `data_mounts` whose filesystem is
+///   above `above_pct`. Either one, or both when both are. None above the
+///   threshold is an error, not a quiet success: the alert says a disk is
+///   full and this cannot find it.
+pub fn choose_targets(
+    volumes: &[Volume],
+    root_device: &str,
+    probe: &Probe,
+    data_mounts: &[String],
+    above_pct: u32,
+) -> Result<Vec<Volume>, String> {
+    if volumes.len() <= 2 {
+        return choose_volume(volumes, root_device).map(|v| vec![v]);
+    }
+    let mut seen: Vec<String> = Vec::new();
+    let mut over: Vec<Volume> = Vec::new();
+    for v in volumes.iter().filter(|v| v.device != root_device) {
+        let Ok(dev) = resolve_data_device(probe, &v.id) else { continue };
+        if !data_mounts.iter().any(|m| m == &dev.mount) {
+            continue;
+        }
+        let Some(pct) = use_pct_for_mount(&probe.df_h, &dev.mount) else {
+            return Err(format!("no df -h use% for {}", dev.mount));
+        };
+        seen.push(format!("{} {pct}%", dev.mount));
+        if pct > above_pct {
+            over.push(v.clone());
+        }
+    }
+    if seen.is_empty() {
+        return Err(format!(
+            "no non-root volume is an xfs mount at one of {}",
+            data_mounts.join(", ")
+        ));
+    }
+    if over.is_empty() {
+        return Err(format!("no data filesystem is above {above_pct}% ({})", seen.join(", ")));
+    }
+    over.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(over)
+}
+
 /// Largest size, in GiB, the volume type allows.
 pub fn max_gib(volume_type: &str) -> u64 {
     match volume_type {
@@ -641,6 +708,13 @@ pub struct Incident {
     pub facts: crate::instance_age::AlertFacts,
 }
 
+impl Incident {
+    /// One incident per volume: an instance with two data volumes runs two.
+    pub fn key(&self) -> String {
+        format!("{}|{}", self.instance, self.volume_id)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Begin {
     Owner,
@@ -677,7 +751,7 @@ impl DiskGrowState {
     }
 
     pub fn begin(&mut self, instance: &str, _alert_id: &str, now_ms: u64) -> Begin {
-        if let Some(inc) = self.running.get(instance) {
+        if let Some(inc) = self.running.values().find(|i| i.instance == instance) {
             return Begin::Duplicate { owner: inc.owner_alert.clone() };
         }
         if let Some(&at) = self.failed.get(instance) {
@@ -704,34 +778,48 @@ impl DiskGrowState {
     }
 
     pub fn start(&mut self, incident: Incident) {
-        self.running.insert(incident.instance.clone(), incident);
+        self.running.insert(incident.key(), incident);
     }
 
     pub fn incidents(&self) -> Vec<Incident> {
         let mut v: Vec<Incident> = self.running.values().cloned().collect();
-        v.sort_by(|a, b| a.instance.cmp(&b.instance));
+        v.sort_by(|a, b| a.key().cmp(&b.key()));
         v
     }
 
-    pub fn fs_grown(&mut self, instance: &str) {
-        if let Some(i) = self.running.get_mut(instance) {
+    /// Marks the incident `key` (`Incident::key`) filesystem-grown.
+    pub fn fs_grown(&mut self, key: &str) {
+        if let Some(i) = self.running.get_mut(key) {
             i.fs_grown = true;
         }
     }
 
-    pub fn set_phase(&mut self, instance: &str, phase: Phase) {
-        if let Some(i) = self.running.get_mut(instance) {
+    pub fn set_phase(&mut self, key: &str, phase: Phase) {
+        if let Some(i) = self.running.get_mut(key) {
             i.phase = phase;
         }
     }
 
-    pub fn finish(&mut self, instance: &str) {
-        self.running.remove(instance);
+    /// Ends the one incident `key`.
+    pub fn finish(&mut self, key: &str) {
+        self.running.remove(key);
     }
 
-    /// Ends the incident and holds the instance's slot from `now_ms`.
-    pub fn failed(&mut self, instance: &str, now_ms: u64) {
-        self.running.remove(instance);
+    /// True while any incident for `instance` is still running.
+    pub fn instance_busy(&self, instance: &str) -> bool {
+        self.running.values().any(|i| i.instance == instance)
+    }
+
+    /// True while the incident `key` is running.
+    pub fn is_running(&self, key: &str) -> bool {
+        self.running.contains_key(key)
+    }
+
+    /// Ends the incident `key` and holds the instance's slot from `now_ms`.
+    /// A sibling incident on another volume of the same instance carries on:
+    /// dropping it would leave its volume grown under a small filesystem.
+    pub fn failed(&mut self, key: &str, instance: &str, now_ms: u64) {
+        self.running.remove(key);
         self.failed.insert(instance.to_string(), now_ms);
     }
 
@@ -740,12 +828,13 @@ impl DiskGrowState {
     }
 
     pub fn owner_of(&self, instance: &str) -> Option<&str> {
-        self.running.get(instance).map(|i| i.owner_alert.as_str())
+        self.running.values().find(|i| i.instance == instance).map(|i| i.owner_alert.as_str())
     }
 
     pub fn growing_keys(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.running.keys().cloned().collect();
+        let mut v: Vec<String> = self.running.values().map(|i| i.instance.clone()).collect();
         v.sort();
+        v.dedup();
         v
     }
 }
@@ -1239,13 +1328,13 @@ mod tests {
     fn a_failed_instance_holds_its_slot_for_six_hours_then_frees_it() {
         let mut s = DiskGrowState::new();
         s.start(inc("i-1", "a1"));
-        s.failed("i-1", 1_000);
+        s.failed("i-1|vol-1", "i-1", 1_000);
         let h = 60 * 60 * 1000;
         assert_eq!(s.begin("i-1", "a2", 1_000 + 6 * h - 60_000), Begin::Held);
         assert_eq!(s.begin("i-1", "a2", 1_000 + 6 * h), Begin::Owner);
         let mut s = DiskGrowState::new();
         s.start(inc("i-1", "a1"));
-        s.failed("i-1", 0);
+        s.failed("i-1|vol-1", "i-1", 0);
         s.expire_failed(6 * h - 1);
         assert_eq!(s.begin("i-1", "a2", 6 * h - 1), Begin::Held);
         s.expire_failed(6 * h);
@@ -1256,7 +1345,7 @@ mod tests {
     fn a_finished_incident_frees_the_instance() {
         let mut s = DiskGrowState::new();
         s.start(inc("i-1", "a1"));
-        s.finish("i-1");
+        s.finish("i-1|vol-1");
         assert_eq!(s.begin("i-1", "a2", 0), Begin::Owner);
         assert!(s.owner_of("i-1").is_none());
     }
@@ -1345,12 +1434,104 @@ mod tests {
         let mut s = DiskGrowState::new();
         s.start(inc("i-b", "a2"));
         s.start(inc("i-a", "a1"));
-        s.set_phase("i-a", Phase::Optimizing);
+        s.set_phase("i-a|vol-1", Phase::Optimizing);
         assert_eq!(s.growing_keys(), vec!["i-a".to_string(), "i-b".to_string()]);
-        s.fs_grown("i-a");
+        s.fs_grown("i-a|vol-1");
         assert!(s.incidents().iter().any(|i| i.instance == "i-a" && i.fs_grown));
-        s.finish("i-a");
+        s.finish("i-a|vol-1");
         assert_eq!(s.growing_keys(), vec!["i-b".to_string()]);
+    }
+
+
+    fn probe_two_data(pct_a: u32, pct_b: u32) -> Probe {
+        let blk = |name: &str, ty: &str, serial: &str, mount: &str, pk: &str| BlockDev {
+            name: name.into(),
+            dev_type: ty.into(),
+            serial: serial.into(),
+            fstype: if mount.is_empty() { "".into() } else { "xfs".into() },
+            mountpoint: mount.into(),
+            pkname: pk.into(),
+            size_bytes: 1 << 40,
+        };
+        Probe {
+            df_h: format!(
+                "Filesystem Size Used Avail Use% Mounted on\n/dev/nvme1n1 1T 1T 1T {pct_a}% /data\n/dev/nvme2n1 1T 1T 1T {pct_b}% /data2"
+            ),
+            fs_bytes: vec![],
+            blocks: vec![
+                blk("nvme0n1", "disk", "volroot", "", ""),
+                blk("nvme1n1", "disk", "vola", "/data", ""),
+                blk("nvme2n1", "disk", "volb", "/data2", ""),
+            ],
+        }
+    }
+
+    fn three_volumes() -> Vec<Volume> {
+        vec![
+            vol("vol-root", 100, "gp3", "/dev/xvda"),
+            vol("vol-a", 1000, "gp3", "/dev/sdf"),
+            vol("vol-b", 1000, "gp3", "/dev/sdg"),
+        ]
+    }
+
+    #[test]
+    fn use_percent_is_read_from_the_mounts_df_row() {
+        let p = probe_two_data(91, 40);
+        assert_eq!(use_pct_for_mount(&p.df_h, "/data"), Some(91));
+        assert_eq!(use_pct_for_mount(&p.df_h, "/data2"), Some(40));
+        assert_eq!(use_pct_for_mount(&p.df_h, "/nope"), None);
+    }
+
+    #[test]
+    fn two_data_volumes_grow_whichever_is_above_the_threshold() {
+        let mounts: Vec<String> = DEFAULT_DATA_MOUNTS.iter().map(|s| s.to_string()).collect();
+        let ids = |r: Result<Vec<Volume>, String>| -> Vec<String> {
+            r.unwrap().into_iter().map(|v| v.id).collect()
+        };
+        let go = |a, b| choose_targets(&three_volumes(), "/dev/xvda", &probe_two_data(a, b), &mounts, 80);
+        assert_eq!(ids(go(85, 50)), vec!["vol-a"]);
+        assert_eq!(ids(go(50, 85)), vec!["vol-b"]);
+        assert_eq!(ids(go(90, 95)), vec!["vol-a", "vol-b"]);
+        // "above 80", so exactly 80 is not.
+        assert!(go(80, 80).is_err());
+        assert!(go(10, 20).unwrap_err().contains("above 80%"));
+    }
+
+    #[test]
+    fn two_volumes_keep_the_old_larger_volume_rule_whatever_the_use() {
+        let vols = vec![vol("vol-root", 100, "gp3", "/dev/xvda"), vol("vol-a", 1000, "gp3", "/dev/sdf")];
+        let r = choose_targets(&vols, "/dev/xvda", &probe_two_data(10, 10), &[], 80).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].id, "vol-a");
+    }
+
+    #[test]
+    fn a_non_data_mount_or_the_root_is_never_a_target() {
+        let mut p = probe_two_data(95, 95);
+        p.blocks[2].mountpoint = "/var/lib/other".into();
+        p.df_h = p.df_h.replace("/data2", "/var/lib/other");
+        let mounts: Vec<String> = DEFAULT_DATA_MOUNTS.iter().map(|s| s.to_string()).collect();
+        let r = choose_targets(&three_volumes(), "/dev/xvda", &p, &mounts, 80).unwrap();
+        assert_eq!(r.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(), vec!["vol-a"]);
+    }
+
+    #[test]
+    fn two_incidents_on_one_instance_finish_and_fail_independently() {
+        let mut s = DiskGrowState::new();
+        let mut a = inc("i-1", "a1");
+        a.volume_id = "vol-a".into();
+        let mut b = inc("i-1", "a1");
+        b.volume_id = "vol-b".into();
+        s.start(a.clone());
+        s.start(b.clone());
+        assert_eq!(s.incidents().len(), 2);
+        assert_eq!(s.growing_keys(), vec!["i-1".to_string()]);
+        s.finish(&a.key());
+        assert!(s.instance_busy("i-1"));
+        assert!(s.is_running(&b.key()));
+        s.failed(&b.key(), "i-1", 0);
+        assert!(!s.instance_busy("i-1"));
+        assert_eq!(s.begin("i-1", "a2", 1), Begin::Held);
     }
 
     #[test]

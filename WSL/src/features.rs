@@ -1365,6 +1365,12 @@ pub struct DiskGrowFeature {
     /// instance is left alone, not even acknowledged: no gzip, no grow, no escalation
     /// (default 1440 = 24 hours).
     pub cooldown_mins: u64,
+    /// Mounts that count as data filesystems on an instance with more than
+    /// one data volume (default `["/data", "/data2"]`).
+    pub data_mounts: Vec<String>,
+    /// With more than one data volume, a filesystem is grown only when its
+    /// use is ABOVE this percent (default 80).
+    pub grow_above_pct: u32,
     /// Feed poll interval.
     pub poll_secs: u64,
     /// Alerts pulled per poll.
@@ -1442,6 +1448,30 @@ impl DiskGrowFeature {
     /// The per-instance cooldown after a fix starts (default 24 hours).
     pub fn cooldown(&self) -> std::time::Duration {
         Self::mins_or(self.cooldown_mins, 24 * 60)
+    }
+
+    /// The data mounts (blank entries dropped; default `/data`, `/data2`).
+    pub fn data_mounts(&self) -> Vec<String> {
+        let v: Vec<String> = self
+            .data_mounts
+            .iter()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .collect();
+        if v.is_empty() {
+            crate::disk_grow::DEFAULT_DATA_MOUNTS.iter().map(|m| m.to_string()).collect()
+        } else {
+            v
+        }
+    }
+
+    /// Use percent a data filesystem must exceed to be grown (default 80).
+    pub fn grow_above(&self) -> u32 {
+        if self.grow_above_pct == 0 || self.grow_above_pct >= 100 {
+            crate::disk_grow::DEFAULT_GROW_ABOVE_PCT
+        } else {
+            self.grow_above_pct
+        }
     }
 
     /// How long a no-grow alert is given to close (default 12 min).

@@ -6254,14 +6254,19 @@ mod gui {
         }
         // The refusal the poll does not need: read the data volume's state
         // before anything is acknowledged, and leave an in-flight one alone.
-        let volume = match disk_grow_volumes(&ctx, &facts.instance_id)
-            .and_then(|(vols, root)| dg::choose_volume(&vols, &root))
-        {
+        let volumes = match disk_grow_volumes(&ctx, &facts.instance_id).and_then(|(vols, root)| {
+            let probe = disk_grow_probe(&ctx, &facts.instance_id)?;
+            dg::choose_targets(&vols, &root, &probe, &cfg.data_mounts(), cfg.grow_above())
+        }) {
             Ok(v) => v,
-            Err(e) => return fail(&mut end, format!("choosing the data volume: {e}")),
+            Err(e) => return fail(&mut end, format!("choosing the data volume(s): {e}")),
         };
-        if let Some(why) = disk_grow_manual_state_refusal(&volume_modification_state(&ctx, &volume.id)) {
-            return fail(&mut end, format!("{}: {why}", volume.id));
+        for volume in &volumes {
+            if let Some(why) =
+                disk_grow_manual_state_refusal(&volume_modification_state(&ctx, &volume.id))
+            {
+                return fail(&mut end, format!("{}: {why}", volume.id));
+            }
         }
 
         let on_call = match oncall::is_on_call(
@@ -6299,117 +6304,141 @@ mod gui {
         }
         let started = std::time::Instant::now();
         let now_ms = || started.elapsed().as_millis() as u64;
-        let inc = match disk_grow_grow_once(&env.auth, &ctx, &env.mode, &alert, &facts, now_ms(), &note) {
-            GrowOnce::Started(inc) => *inc,
-            GrowOnce::Nothing(why) => {
+        // A person asked for this, so the alert is treated as if it had just
+        // arrived: one somebody else already acknowledged (a cover shift) is
+        // still grown. The poll's "an acknowledged alert is never resized"
+        // rule is for unattended runs.
+        let mut as_fresh = alert.clone();
+        as_fresh.acknowledged = false;
+        if as_fresh.status.trim().eq_ignore_ascii_case("acked") {
+            as_fresh.status = "open".to_string();
+        }
+        let (incidents, start_failure) = match disk_grow_grow_once(
+            &env.auth, &ctx, &env.mode, cfg, &as_fresh, &facts, now_ms(), &note,
+        ) {
+            GrowAll::Started { incidents, failure } => (incidents, failure),
+            GrowAll::Nothing(why) => {
                 note(LogLevel::Info, why.clone());
                 end.status = AlertActionStatus::Ok(format!("alert {alert_id}: nothing to do — {why}"));
                 return;
             }
-            GrowOnce::Failed(why) => {
+            GrowAll::Failed(why) => {
                 fail(&mut end, why.clone());
                 escalate(&why);
                 return;
             }
         };
-        let done = |end: &mut RemediationStatusGuard| {
-            note(
-                LogLevel::Warn,
-                format!(
-                    "{alert_id} — filesystem at {} on {} grown and the alert commented; not \
-                     waiting for {} to finish optimizing (no toolbar line for a manual run)",
-                    inc.mount, inc.instance, inc.volume_id
-                ),
-            );
-            end.status = AlertActionStatus::Ok(format!(
-                "alert {alert_id}: {} grown and the alert commented",
-                inc.volume_id
-            ));
-        };
-        if inc.fs_grown {
-            return done(&mut end);
+        if let Some(why) = &start_failure {
+            // The volumes that did start are still finished below.
+            fail(&mut end, why.clone());
+            escalate(why);
         }
 
         // Resized (or recovering a resize): wait, once per poll interval, for
-        // the new size to be usable, then grow the filesystem once.
+        // each new size to be usable, then grow its filesystem once. The
+        // volumes modify in parallel in AWS, so one after another is fine.
         let usable_wait_ms = cfg.usable_wait().as_millis() as u64;
         let optimize_ceiling_ms = cfg.optimize_ceiling().as_millis() as u64;
-        let mut unknown = 0u32;
-        loop {
-            std::thread::sleep(cfg.poll_interval());
-            let elapsed_ms = now_ms().saturating_sub(inc.started_ms);
-            let mod_state = match volume_modification_state(&ctx, &inc.volume_id) {
-                Ok(s) => s,
-                Err(e) => {
-                    note(
-                        LogLevel::Warn,
-                        format!("could not read the modification state of {}, retrying: {e}", inc.volume_id),
-                    );
-                    if elapsed_ms >= usable_wait_ms {
-                        let why = format!(
-                            "the modification state of {} could not be read within {} minute(s) \
-                             of the resize",
-                            inc.volume_id,
-                            usable_wait_ms / 60_000
+        let mut grown: Vec<String> = Vec::new();
+        for inc in incidents {
+            let done_note = |inc: &dg::Incident| {
+                note(
+                    LogLevel::Warn,
+                    format!(
+                        "{alert_id} — filesystem at {} on {} grown and the alert commented; not \
+                         waiting for {} to finish optimizing (no toolbar line for a manual run)",
+                        inc.mount, inc.instance, inc.volume_id
+                    ),
+                );
+            };
+            if inc.fs_grown {
+                done_note(&inc);
+                grown.push(inc.volume_id.clone());
+                continue;
+            }
+            let mut unknown = 0u32;
+            let outcome: std::result::Result<(), String> = loop {
+                std::thread::sleep(cfg.poll_interval());
+                let elapsed_ms = now_ms().saturating_sub(inc.started_ms);
+                let mod_state = match volume_modification_state(&ctx, &inc.volume_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        note(
+                            LogLevel::Warn,
+                            format!(
+                                "could not read the modification state of {}, retrying: {e}",
+                                inc.volume_id
+                            ),
                         );
-                        fail(&mut end, why.clone());
-                        escalate(&why);
-                        return;
+                        if elapsed_ms >= usable_wait_ms {
+                            break Err(format!(
+                                "the modification state of {} could not be read within {} \
+                                 minute(s) of the resize",
+                                inc.volume_id,
+                                usable_wait_ms / 60_000
+                            ));
+                        }
+                        continue;
                     }
-                    continue;
+                };
+                match dg::transition(
+                    dg::Phase::Modifying,
+                    &mod_state,
+                    false,
+                    elapsed_ms,
+                    usable_wait_ms,
+                    optimize_ceiling_ms,
+                ) {
+                    dg::Transition::Wait => {}
+                    dg::Transition::GrowFilesystem => {
+                        let target = FsTarget {
+                            volume_id: &inc.volume_id,
+                            mount: &inc.mount,
+                            df_before: &inc.df_before,
+                            fs_recorded: inc.fs_bytes_before,
+                        };
+                        match disk_grow_fs_and_comment(&env.auth, &ctx, &inc.instance, &target, &alert_id) {
+                            DiskGrowFs::Done => break Ok(()),
+                            DiskGrowFs::Unknown(e) => {
+                                unknown += 1;
+                                if disk_grow_unknown_exhausted(unknown) {
+                                    break Err(format!(
+                                        "the filesystem grow gave no clear answer {unknown} times \
+                                         running: {e}"
+                                    ));
+                                }
+                                note(
+                                    LogLevel::Warn,
+                                    format!(
+                                        "filesystem grow: {e}; retrying ({unknown}/{DISK_GROW_MAX_FS_UNKNOWN})"
+                                    ),
+                                );
+                            }
+                            DiskGrowFs::Failed(why) => break Err(why),
+                        }
+                    }
+                    // Not reachable with fs_grown false, but never read as done.
+                    dg::Transition::Complete | dg::Transition::StopFlashing(_) => {}
+                    dg::Transition::Escalate(why) => break Err(why),
                 }
             };
-            match dg::transition(
-                dg::Phase::Modifying,
-                &mod_state,
-                false,
-                elapsed_ms,
-                usable_wait_ms,
-                optimize_ceiling_ms,
-            ) {
-                dg::Transition::Wait => {}
-                dg::Transition::GrowFilesystem => {
-                    let target = FsTarget {
-                        volume_id: &inc.volume_id,
-                        mount: &inc.mount,
-                        df_before: &inc.df_before,
-                        fs_recorded: inc.fs_bytes_before,
-                    };
-                    match disk_grow_fs_and_comment(&env.auth, &ctx, &inc.instance, &target, &alert_id) {
-                        DiskGrowFs::Done => return done(&mut end),
-                        DiskGrowFs::Unknown(e) => {
-                            unknown += 1;
-                            if disk_grow_unknown_exhausted(unknown) {
-                                let why = format!(
-                                    "the filesystem grow gave no clear answer {unknown} times \
-                                     running: {e}"
-                                );
-                                fail(&mut end, why.clone());
-                                escalate(&why);
-                                return;
-                            }
-                            note(
-                                LogLevel::Warn,
-                                format!(
-                                    "filesystem grow: {e}; retrying ({unknown}/{DISK_GROW_MAX_FS_UNKNOWN})"
-                                ),
-                            );
-                        }
-                        DiskGrowFs::Failed(why) => {
-                            fail(&mut end, why.clone());
-                            escalate(&why);
-                            return;
-                        }
-                    }
+            match outcome {
+                Ok(()) => {
+                    done_note(&inc);
+                    grown.push(inc.volume_id.clone());
                 }
-                // Not reachable with fs_grown false, but never read as done.
-                dg::Transition::Complete | dg::Transition::StopFlashing(_) => {}
-                dg::Transition::Escalate(why) => {
+                Err(why) => {
                     fail(&mut end, why.clone());
                     escalate(&why);
                     return;
                 }
             }
+        }
+        if start_failure.is_none() {
+            end.status = AlertActionStatus::Ok(format!(
+                "alert {alert_id}: {} grown and the alert commented",
+                grown.join(", ")
+            ));
         }
     }
 
@@ -7211,54 +7240,6 @@ mod gui {
                             LogLevel::Info,
                             format!("dry run: volumes {listing:?}, root device {root}"),
                         );
-                        let volume = match dg::choose_volume(&volumes, &root) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                note(
-                                    LogLevel::Warn,
-                                    format!(
-                                        "dry run: no data volume chosen — {e}; a real run would \
-                                         escalate"
-                                    ),
-                                );
-                                break 'walk;
-                            }
-                        };
-                        note(
-                            LogLevel::Info,
-                            format!(
-                                "dry run: data volume {} ({} GiB {})",
-                                volume.id, volume.size_gib, volume.volume_type
-                            ),
-                        );
-                        note(
-                            LogLevel::Info,
-                            format!(
-                                "dry run: RAN (read-only): {}",
-                                dry_run_aws_line(
-                                    &ctx,
-                                    &format!("ec2 describe-volumes-modifications --volume-ids {}", volume.id)
-                                )
-                            ),
-                        );
-                        let mod_state = volume_modification_state(&ctx, &volume.id);
-                        note(
-                            LogLevel::Info,
-                            format!(
-                                "dry run: modification state of {}: {}",
-                                volume.id,
-                                match &mod_state {
-                                    Ok(s) => format!("{s:?}"),
-                                    Err(e) => e.clone(),
-                                }
-                            ),
-                        );
-                        if let Some(why) = disk_grow_manual_state_refusal(&mod_state) {
-                            note(
-                                LogLevel::Warn,
-                                format!("dry run: Run Remediation would refuse — {why}"),
-                            );
-                        }
                         note(
                             LogLevel::Info,
                             format!(
@@ -7295,6 +7276,71 @@ mod gui {
                                     b.name, b.dev_type, b.serial, b.fstype, b.mountpoint, b.pkname,
                                     b.size_bytes
                                 ),
+                            );
+                        }
+                        let targets = match dg::choose_targets(
+                            &volumes,
+                            &root,
+                            &probe,
+                            &disk_grow_cfg.data_mounts(),
+                            disk_grow_cfg.grow_above(),
+                        ) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                note(
+                                    LogLevel::Warn,
+                                    format!(
+                                        "dry run: no data volume chosen — {e}; a real run would \
+                                         escalate"
+                                    ),
+                                );
+                                break 'walk;
+                            }
+                        };
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: {} data volume(s) a real run would grow (a filesystem \
+                                 above {}% when there is more than one data volume): {}",
+                                targets.len(),
+                                disk_grow_cfg.grow_above(),
+                                targets.iter().map(|v| v.id.as_str()).collect::<Vec<_>>().join(", ")
+                            ),
+                        );
+                        for volume in targets {
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: data volume {} ({} GiB {})",
+                                volume.id, volume.size_gib, volume.volume_type
+                            ),
+                        );
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: RAN (read-only): {}",
+                                dry_run_aws_line(
+                                    &ctx,
+                                    &format!("ec2 describe-volumes-modifications --volume-ids {}", volume.id)
+                                )
+                            ),
+                        );
+                        let mod_state = volume_modification_state(&ctx, &volume.id);
+                        note(
+                            LogLevel::Info,
+                            format!(
+                                "dry run: modification state of {}: {}",
+                                volume.id,
+                                match &mod_state {
+                                    Ok(s) => format!("{s:?}"),
+                                    Err(e) => e.clone(),
+                                }
+                            ),
+                        );
+                        if let Some(why) = disk_grow_manual_state_refusal(&mod_state) {
+                            note(
+                                LogLevel::Warn,
+                                format!("dry run: Run Remediation would refuse — {why}"),
                             );
                         }
                         let dev = match dg::resolve_data_device(&probe, &volume.id) {
@@ -7438,6 +7484,7 @@ mod gui {
                                 )
                             ),
                         );
+                        }
                         note(
                             LogLevel::Info,
                             "dry run: everything a real run needs was found: account profile, \
@@ -49615,7 +49662,16 @@ mod gui {
         count >= DISK_GROW_MAX_FS_UNKNOWN
     }
 
-    /// How one owner-path run of the grow chain ended.
+    /// How the whole owner-path run ended, across every volume it grew.
+    enum GrowAll {
+        /// At least one volume was started; `failure` names the ones that
+        /// were not (escalate once, but keep timing the ones that started).
+        Started { incidents: Vec<ec2_manager::disk_grow::Incident>, failure: Option<String> },
+        Nothing(String),
+        Failed(String),
+    }
+
+    /// How one volume's run of the grow chain ended.
     enum GrowOnce {
         /// An incident to time: a resize was accepted (phase Modifying), or
         /// the filesystem was grown onto a device already ahead of it (phase
@@ -49640,15 +49696,16 @@ mod gui {
         auth: &ec2_manager::alerts::AlertsAuth,
         ctx: &AwsContext,
         mode: &Mode,
+        cfg: &ec2_manager::features::DiskGrowFeature,
         alert: &ec2_manager::alerts::Alert,
         facts: &ec2_manager::instance_age::AlertFacts,
         now_ms: u64,
         note: &dyn Fn(LogLevel, String),
-    ) -> GrowOnce {
+    ) -> GrowAll {
         use ec2_manager::disk_grow as dg;
         let instance = facts.instance_id.as_str();
         let tag = format!("disk grow: {} ({instance})", alert.id);
-        let fail = |step: &str, e: String| GrowOnce::Failed(format!("{step}: {e}"));
+        let fail = |step: &str, e: String| GrowAll::Failed(format!("{step}: {e}"));
 
         let probe = match disk_grow_probe(ctx, instance) {
             Ok(p) => p,
@@ -49658,11 +49715,59 @@ mod gui {
             Ok(v) => v,
             Err(e) => return fail("listing the instance's volumes", e),
         };
-        let volume = match dg::choose_volume(&volumes, &root) {
-            Ok(v) => v,
-            Err(e) => return fail("choosing the data volume", e),
-        };
-        let dev = match dg::resolve_data_device(&probe, &volume.id) {
+        let targets =
+            match dg::choose_targets(&volumes, &root, &probe, &cfg.data_mounts(), cfg.grow_above()) {
+                Ok(v) => v,
+                Err(e) => return fail("choosing the data volume(s)", e),
+            };
+        if targets.len() > 1 {
+            note(
+                LogLevel::Info,
+                format!(
+                    "{tag} — {} data volumes need growing: {}",
+                    targets.len(),
+                    targets.iter().map(|v| v.id.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+            );
+        }
+        let mut incidents: Vec<ec2_manager::disk_grow::Incident> = Vec::new();
+        let mut nothing: Vec<String> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        for volume in targets {
+            match disk_grow_grow_volume(auth, ctx, mode, alert, facts, now_ms, note, &probe, volume) {
+                GrowOnce::Started(i) => incidents.push(*i),
+                GrowOnce::Nothing(w) => nothing.push(w),
+                GrowOnce::Failed(w) => failures.push(w),
+            }
+        }
+        let failure = (!failures.is_empty()).then(|| failures.join("; "));
+        match (incidents.is_empty(), failure) {
+            (false, failure) => GrowAll::Started { incidents, failure },
+            (true, Some(f)) => GrowAll::Failed(f),
+            (true, None) => GrowAll::Nothing(nothing.join("; ")),
+        }
+    }
+
+    /// One data volume's chain: find it on the box, then the filesystem grow
+    /// alone or the resize. The poll and Run Remediation reach it through
+    /// `disk_grow_grow_once`, once per volume to grow.
+    #[allow(clippy::too_many_arguments)]
+    fn disk_grow_grow_volume(
+        auth: &ec2_manager::alerts::AlertsAuth,
+        ctx: &AwsContext,
+        mode: &Mode,
+        alert: &ec2_manager::alerts::Alert,
+        facts: &ec2_manager::instance_age::AlertFacts,
+        now_ms: u64,
+        note: &dyn Fn(LogLevel, String),
+        probe: &ec2_manager::disk_grow::Probe,
+        volume: ec2_manager::disk_grow::Volume,
+    ) -> GrowOnce {
+        use ec2_manager::disk_grow as dg;
+        let instance = facts.instance_id.as_str();
+        let tag = format!("disk grow: {} ({instance})", alert.id);
+        let fail = |step: &str, e: String| GrowOnce::Failed(format!("{step}: {e}"));
+        let dev = match dg::resolve_data_device(probe, &volume.id) {
             Ok(d) => d,
             Err(e) => return fail("finding the data volume on the box", e),
         };
@@ -50021,7 +50126,7 @@ mod gui {
 
                 let usable_wait_ms = cfg.usable_wait().as_millis() as u64;
                 let optimize_ceiling_ms = cfg.optimize_ceiling().as_millis() as u64;
-                fs_unknown.retain(|k, _| state.owner_of(k).is_some());
+                fs_unknown.retain(|k, _| state.is_running(k));
 
                 // 1. Incidents already running. These finish whether or not
                 //    we are still on call: stopping between the resize and the
@@ -50044,9 +50149,11 @@ mod gui {
                                 optimize_ceiling_ms / 60_000
                             ),
                         );
-                        disk_grow_note_grown(&tx, &mut grown_shown, &inc.instance, inc.started_ms, now_ms, cfg.cooldown());
-                        fs_unknown.remove(&inc.instance);
-                        state.finish(&inc.instance);
+                        fs_unknown.remove(&inc.key());
+                        state.finish(&inc.key());
+                        if !state.instance_busy(&inc.instance) {
+                            disk_grow_note_grown(&tx, &mut grown_shown, &inc.instance, inc.started_ms, now_ms, cfg.cooldown());
+                        }
                         continue;
                     }
                     let read = instance_age_context(&mode, &app_config, &inc.facts).and_then(|ctx| {
@@ -50075,9 +50182,11 @@ mod gui {
                                     usable_wait_ms / 60_000
                                 );
                                 escalate(&inc.owner_alert, &inc.created_at, &why);
-                                let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
-                                fs_unknown.remove(&inc.instance);
-                                state.failed(&inc.instance, now_ms);
+                                fs_unknown.remove(&inc.key());
+                                state.failed(&inc.key(), &inc.instance, now_ms);
+                                if !state.instance_busy(&inc.instance) {
+                                    let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
+                                }
                             }
                             continue;
                         }
@@ -50114,14 +50223,14 @@ mod gui {
                                             inc.mount, inc.volume_id
                                         ),
                                     );
-                                    state.fs_grown(&inc.instance);
-                                    state.set_phase(&inc.instance, dg::Phase::Optimizing);
-                                    fs_unknown.remove(&inc.instance);
+                                    state.fs_grown(&inc.key());
+                                    state.set_phase(&inc.key(), dg::Phase::Optimizing);
+                                    fs_unknown.remove(&inc.key());
                                 }
                                 // No clear answer: retry next poll. Never
                                 // another resize; bounded, then escalated.
                                 DiskGrowFs::Unknown(e) => {
-                                    let n = fs_unknown.entry(inc.instance.clone()).or_insert(0);
+                                    let n = fs_unknown.entry(inc.key()).or_insert(0);
                                     *n += 1;
                                     if disk_grow_unknown_exhausted(*n) {
                                         let why = format!(
@@ -50130,11 +50239,11 @@ mod gui {
                                             *n
                                         );
                                         escalate(&inc.owner_alert, &inc.created_at, &why);
-                                        let _ = tx.send(DiskGrowEvent::GrowEnded {
-                                            key: inc.instance.clone(),
-                                        });
-                                        fs_unknown.remove(&inc.instance);
-                                        state.failed(&inc.instance, now_ms);
+                                        fs_unknown.remove(&inc.key());
+                                        state.failed(&inc.key(), &inc.instance, now_ms);
+                                        if !state.instance_busy(&inc.instance) {
+                                            let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
+                                        }
                                     } else {
                                         note(
                                             LogLevel::Warn,
@@ -50148,11 +50257,11 @@ mod gui {
                                 }
                                 DiskGrowFs::Failed(why) => {
                                     escalate(&inc.owner_alert, &inc.created_at, &why);
-                                    let _ = tx.send(DiskGrowEvent::GrowEnded {
-                                        key: inc.instance.clone(),
-                                    });
-                                    fs_unknown.remove(&inc.instance);
-                                    state.failed(&inc.instance, now_ms);
+                                    fs_unknown.remove(&inc.key());
+                                    state.failed(&inc.key(), &inc.instance, now_ms);
+                                    if !state.instance_busy(&inc.instance) {
+                                        let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
+                                    }
                                 }
                             }
                         }
@@ -50161,21 +50270,27 @@ mod gui {
                                 LogLevel::Info,
                                 format!("{tag} — {} completed; the incident is over", inc.volume_id),
                             );
-                            disk_grow_note_grown(&tx, &mut grown_shown, &inc.instance, inc.started_ms, now_ms, cfg.cooldown());
-                            fs_unknown.remove(&inc.instance);
-                            state.finish(&inc.instance);
+                            fs_unknown.remove(&inc.key());
+                            state.finish(&inc.key());
+                            if !state.instance_busy(&inc.instance) {
+                                disk_grow_note_grown(&tx, &mut grown_shown, &inc.instance, inc.started_ms, now_ms, cfg.cooldown());
+                            }
                         }
                         dg::Transition::Escalate(why) => {
                             escalate(&inc.owner_alert, &inc.created_at, &why);
-                            let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
-                            fs_unknown.remove(&inc.instance);
-                            state.failed(&inc.instance, now_ms);
+                            fs_unknown.remove(&inc.key());
+                            state.failed(&inc.key(), &inc.instance, now_ms);
+                            if !state.instance_busy(&inc.instance) {
+                                let _ = tx.send(DiskGrowEvent::GrowEnded { key: inc.instance.clone() });
+                            }
                         }
                         dg::Transition::StopFlashing(why) => {
                             note(LogLevel::Warn, format!("{tag} — {why}"));
-                            disk_grow_note_grown(&tx, &mut grown_shown, &inc.instance, inc.started_ms, now_ms, cfg.cooldown());
-                            fs_unknown.remove(&inc.instance);
-                            state.finish(&inc.instance);
+                            fs_unknown.remove(&inc.key());
+                            state.finish(&inc.key());
+                            if !state.instance_busy(&inc.instance) {
+                                disk_grow_note_grown(&tx, &mut grown_shown, &inc.instance, inc.started_ms, now_ms, cfg.cooldown());
+                            }
                         }
                     }
                 }
@@ -50475,7 +50590,7 @@ mod gui {
                                                     &alert.created_at,
                                                     &format!("compressing the logs: {e}"),
                                                 );
-                                                state.failed(&instance, now_ms);
+                                                state.failed(&instance, &instance, now_ms);
                                             }
                                         }
                                         continue;
@@ -50493,21 +50608,29 @@ mod gui {
                                     continue;
                                 }
                                 match disk_grow_grow_once(
-                                    &auth, &ctx, &mode, &alert, &facts, now_ms, &note,
+                                    &auth, &ctx, &mode, &cfg, &alert, &facts, now_ms, &note,
                                 ) {
                                     // Started on this thread straight after
-                                    // `begin`: `begin` does not reserve.
-                                    GrowOnce::Started(incident) => {
+                                    // `begin`: `begin` does not reserve. One
+                                    // incident per volume grown.
+                                    GrowAll::Started { incidents, failure } => {
                                         let _ = tx.send(DiskGrowEvent::GrowStarted {
                                             key: instance.clone(),
                                             text: format!("{instance} growing"),
                                         });
-                                        state.start(*incident);
+                                        for incident in incidents {
+                                            state.start(incident);
+                                        }
+                                        // A volume that could not be started
+                                        // pages once; the others keep going.
+                                        if let Some(why) = failure {
+                                            escalate(&alert.id, &alert.created_at, &why);
+                                        }
                                     }
-                                    GrowOnce::Nothing(why) => note(LogLevel::Info, why),
-                                    GrowOnce::Failed(why) => {
+                                    GrowAll::Nothing(why) => note(LogLevel::Info, why),
+                                    GrowAll::Failed(why) => {
                                         escalate(&alert.id, &alert.created_at, &why);
-                                        state.failed(&instance, now_ms);
+                                        state.failed(&instance, &instance, now_ms);
                                     }
                                 }
                             }
@@ -75631,14 +75754,24 @@ fed_expire = 4000000000
             let calls = src.matches("dg::alert_comment(").count();
             // One real build, plus the Test Alert Match preview of the same text.
             assert_eq!(calls, 2, "alert_comment is built in the real path and the dry-run preview");
-            let once = disk_grow_fn_body(src, "fn disk_grow_grow_once(");
+            let once = disk_grow_fn_body(src, "fn disk_grow_grow_volume(");
             assert!(once.contains("dg::df_h_for_mount(&probe.df_h, &dev.mount)"), "{once}");
+        }
+
+        #[test]
+        fn run_remediation_grows_an_alert_somebody_else_acknowledged() {
+            let body = disk_grow_fn_body(disk_grow_prod_src(), "fn run_disk_grow_remediation(");
+            let at = body.find("let mut as_fresh = alert.clone();").expect("a fresh copy");
+            let call = body.find("disk_grow_grow_once(").expect("the chain");
+            assert!(at < call, "the copy is made before the chain");
+            assert!(body[call..call + 120].contains("&as_fresh"), "the chain gets the fresh copy");
+            assert!(body[at..call].contains("acknowledged = false"));
         }
 
         #[test]
         fn an_already_acknowledged_alert_never_reaches_modify_volume() {
             let src = disk_grow_prod_src();
-            let once = disk_grow_fn_body(src, "fn disk_grow_grow_once(");
+            let once = disk_grow_fn_body(src, "fn disk_grow_grow_volume(");
             assert_eq!(once.matches("modify_volume(").count(), 1, "{once}");
             assert!(once.contains("disk_grow_next_move(dg::alert_acknowledged(alert), device_ahead)"));
             let full = once.find("NextMove::Full =>").expect("the Full arm");
@@ -75852,7 +75985,7 @@ fed_expire = 4000000000
             let state = disk_grow_fn_body(src, "fn volume_modification_state(");
             assert!(state.contains("InvalidVolumeModification.NotFound"), "{state}");
             assert!(state.contains("NO_MODIFICATION"), "{state}");
-            let once = disk_grow_fn_body(src, "fn disk_grow_grow_once(");
+            let once = disk_grow_fn_body(src, "fn disk_grow_grow_volume(");
             let at = once.find("dg::ResizeGate::InFlight").expect("the in-flight arm");
             let arm = &once[at..];
             let nothing = arm.find("dg::Recovery::Nothing(why) =>").expect("the Nothing arm");
@@ -75861,7 +75994,7 @@ fed_expire = 4000000000
 
         #[test]
         fn a_restart_mid_resize_tracks_the_grow_and_never_resizes() {
-            let once = disk_grow_fn_body(disk_grow_prod_src(), "fn disk_grow_grow_once(");
+            let once = disk_grow_fn_body(disk_grow_prod_src(), "fn disk_grow_grow_volume(");
             let nothing = once.find("NextMove::Nothing =>").expect("the recovery arm");
             let block = disk_grow_block_after(once, nothing);
             let end = once[nothing..].find(block).expect("the arm's block") + block.len();
@@ -75920,7 +76053,7 @@ fed_expire = 4000000000
 
         #[test]
         fn the_poll_reads_the_modification_state_before_any_resize() {
-            let once = disk_grow_fn_body(disk_grow_prod_src(), "fn disk_grow_grow_once(");
+            let once = disk_grow_fn_body(disk_grow_prod_src(), "fn disk_grow_grow_volume(");
             let full = once.find("NextMove::Full =>").expect("the Full arm");
             let arm = disk_grow_block_after(once, full);
             let read = arm.find("volume_modification_state(ctx, &volume.id)").expect("the state read");
@@ -75971,17 +76104,26 @@ fed_expire = 4000000000
                 .collect();
             ends.sort();
             assert!(ends.len() >= 6, "{ends:?}");
+            // Each end removes its retry count first and, once the instance has
+            // no other volume running, drops the line (GrowEnded or the grown
+            // line) straight after.
+            let bounds: Vec<usize> = ends.iter().copied().chain(std::iter::once(lp.len())).collect();
             let mut from = 0;
-            for e in ends {
-                let seg = &lp[from..e];
-                assert!(seg.contains("GrowEnded") || seg.contains("disk_grow_note_grown("), "an end without GrowEnded or the grown line: {seg}");
-                assert!(seg.contains("fs_unknown.remove(&inc.instance)"), "{seg}");
-                from = e + 1;
+            for (n, e) in ends.iter().enumerate() {
+                let before = &lp[from..*e];
+                let after = &lp[*e..bounds[n + 1]];
+                assert!(before.contains("fs_unknown.remove(&inc.key())"), "{before}");
+                assert!(
+                    after.contains("instance_busy(&inc.instance)")
+                        && (after.contains("GrowEnded") || after.contains("disk_grow_note_grown(")),
+                    "an end without GrowEnded or the grown line: {after}"
+                );
+                from = *e + 1;
             }
             // Moving to Optimizing also ends the filesystem retries.
             let done = lp.find("DiskGrowFs::Done =>").expect("the Done arm");
             let arm = disk_grow_block_after(lp, done);
-            assert!(arm.contains("fs_unknown.remove(&inc.instance)"), "{arm}");
+            assert!(arm.contains("fs_unknown.remove(&inc.key())"), "{arm}");
         }
 
         #[test]
