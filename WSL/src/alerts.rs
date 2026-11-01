@@ -602,11 +602,19 @@ pub struct AlertNote {
 pub fn parse_notes(body: &str) -> Result<Vec<AlertNote>> {
     let v: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| AppError::Parse(format!("alerts: unreadable notes reply: {e}")))?;
-    let list = v
-        .get("data")
-        .and_then(|d| d.as_array())
+    // This API wraps lists in `values` (as the alert feed does); the
+    // Opsgenie-compatible spelling is `data`.
+    let list = ["values", "data", "value", "notes", "items"]
+        .iter()
+        .find_map(|k| v.get(*k).and_then(|d| d.as_array()))
         .or_else(|| v.as_array())
-        .ok_or_else(|| AppError::Parse("alerts: the notes reply has no list".to_string()))?;
+        .ok_or_else(|| {
+            let keys: Vec<&str> = v
+                .as_object()
+                .map(|o| o.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            AppError::Parse(format!("alerts: the notes reply has no list (keys: {keys:?})"))
+        })?;
     let text = |n: &serde_json::Value, keys: &[&str]| -> String {
         keys.iter()
             .find_map(|k| n.get(*k).and_then(|x| x.as_str()))
@@ -1081,7 +1089,10 @@ mod window_tests {
         assert_eq!(n[1].note, "x");
         assert!(parse_notes(r#"{"data":[]}"#).unwrap().is_empty());
         assert!(parse_notes("[]").unwrap().is_empty());
-        assert!(parse_notes(r#"{"oops":1}"#).is_err());
+        let v = parse_notes(r#"{"values":[{"note":"n","owner":"o","createdAt":"t"}]}"#).unwrap();
+        assert_eq!(v[0].note, "n");
+        let e = parse_notes(r#"{"oops":1}"#).unwrap_err().to_string();
+        assert!(e.contains("oops"), "{e}");
         assert!(parse_notes("not json").is_err());
     }
 }
