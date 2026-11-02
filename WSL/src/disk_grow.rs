@@ -158,6 +158,14 @@ pub fn alert_mount(alert: &Alert) -> Option<String> {
     (safe_mount(m)).then(|| m.to_string())
 }
 
+/// An alert whose volume is never grown: the title carries a
+/// `no_grow_title_words` entry (reaper), or the alert names the root
+/// filesystem (`/`). Both get the same handling: compress the logs, wait
+/// `no_grow_wait` for the alert to close, escalate if it has not.
+pub fn never_grown(cfg: &crate::features::DiskGrowFeature, alert: &Alert) -> bool {
+    cfg.no_grow(&alert.message) || alert_mount(alert).as_deref() == Some("/")
+}
+
 /// The volumes to grow.
 ///
 /// * When the alert names its mount (`alert_mount`): exactly the non-root
@@ -1656,6 +1664,17 @@ mod tests {
         assert_eq!(f.account_id, "123456789012");
         assert!(f.environment.is_empty(), "the environment fallback is the disk watcher's only");
         assert_eq!(facts_with_property(Default::default(), &a).environment, "DEV1");
+    }
+
+    #[test]
+    fn an_alert_for_the_root_filesystem_is_never_grown() {
+        let cfg = crate::features::DiskGrowFeature::default();
+        let mut a = alert("[EC2]: x-Cassandra-DiskUtilization-Warning");
+        assert!(!never_grown(&cfg, &a));
+        a.extra.insert("mountpoint".into(), "/data".into());
+        assert!(!never_grown(&cfg, &a));
+        a.extra.insert("mountpoint".into(), "/".into());
+        assert!(never_grown(&cfg, &a));
     }
 
     #[test]

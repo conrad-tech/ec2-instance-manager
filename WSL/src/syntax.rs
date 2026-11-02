@@ -877,6 +877,86 @@ fn classify_tf(text: &str, word: &str, end: usize, at_line_start: bool) -> Kind 
     Kind::Normal
 }
 
+// ---------------------------------------------------------------------------
+// Terminal viewers (vim / nano / cat ...)
+// ---------------------------------------------------------------------------
+
+/// Commands whose argument is a file shown in the terminal.
+const VIEWERS: &[&str] = &[
+    "vim", "vi", "nvim", "view", "nano", "pico", "cat", "bat", "less", "more", "tail", "head",
+];
+
+/// The (lower-case) extension of the file a typed command opens, e.g.
+/// `sudo vim /etc/app/main.tf` -> `tf`. `None` when the line is not a viewer
+/// command or the file has no extension to pick a colour scheme by.
+pub fn viewed_ext(line: &str) -> Option<String> {
+    let mut words = line.split_whitespace().peekable();
+    while matches!(words.peek(), Some(&"sudo") | Some(&"-E")) {
+        words.next();
+    }
+    let cmd = words.next()?.rsplit('/').next()?;
+    if !VIEWERS.contains(&cmd) {
+        return None;
+    }
+    let file = words
+        .filter(|w| !w.starts_with('-') && !w.starts_with('+'))
+        .last()?
+        .trim_matches(|c| c == '"' || c == '\'');
+    let name = file.rsplit('/').next()?;
+    let (stem, ext) = name.rsplit_once('.')?;
+    if stem.is_empty() || ext.is_empty() || ext.len() > 8 {
+        return None;
+    }
+    Some(ext.to_ascii_lowercase())
+}
+
+/// Kind of every screen cell, `[row][col]`, for terminal rows read as `ext`.
+/// Each row must hold exactly one char per column.
+pub fn screen_kinds(rows: &[String], ext: &str) -> Vec<Vec<Kind>> {
+    let text = rows.join("\n");
+    let mut out: Vec<Vec<Kind>> = rows
+        .iter()
+        .map(|r| vec![Kind::Normal; r.chars().count()])
+        .collect();
+    if text.len() > MAX_HIGHLIGHT_BYTES {
+        return out;
+    }
+    let mut line_starts = Vec::with_capacity(rows.len());
+    let mut at = 0;
+    for r in rows {
+        line_starts.push(at);
+        at += r.len() + 1;
+    }
+    for t in tokenize(&text, ext) {
+        if t.kind == Kind::Normal {
+            continue;
+        }
+        let mut row = match line_starts.binary_search(&t.range.start) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+        let mut b = t.range.start;
+        while b < t.range.end && row < rows.len() {
+            let row_end = line_starts[row] + rows[row].len();
+            if b >= row_end {
+                row += 1;
+                b = line_starts.get(row).copied().unwrap_or(t.range.end);
+                continue;
+            }
+            let end = t.range.end.min(row_end);
+            let c0 = text[line_starts[row]..b].chars().count();
+            let n = text[b..end].chars().count();
+            for k in c0..c0 + n {
+                if let Some(cell) = out[row].get_mut(k) {
+                    *cell = t.kind;
+                }
+            }
+            b = end;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1121,5 +1201,28 @@ mod tests {
         assert_eq!(indent_unit(&[0, 4, 8]), 4);
         assert_eq!(indent_unit(&[0, 2, 4]), 2);
         assert_eq!(indent_unit(&[0, 0]), 2);
+    }
+
+    #[test]
+    fn viewer_commands_give_the_file_extension() {
+        assert_eq!(viewed_ext("vim main.tf").as_deref(), Some("tf"));
+        assert_eq!(viewed_ext("sudo nano /etc/x/Play.YML").as_deref(), Some("yml"));
+        assert_eq!(viewed_ext("cat -n \"a/b.json\"").as_deref(), Some("json"));
+        assert_eq!(viewed_ext("vi +10 run.sh").as_deref(), Some("sh"));
+        assert_eq!(viewed_ext("ls main.tf"), None);
+        assert_eq!(viewed_ext("cat Makefile"), None);
+        assert_eq!(viewed_ext("vim .bashrc"), None);
+    }
+
+    #[test]
+    fn screen_kinds_map_tokens_onto_rows_and_columns() {
+        let rows = vec!["# hi   ".to_string(), "a = \"x\"".to_string()];
+        let k = screen_kinds(&rows, "tf");
+        assert_eq!(k.len(), 2);
+        assert_eq!(k[0][0], Kind::Comment);
+        assert_eq!(k[0][4], Kind::Comment);
+        assert_eq!(k[1][0], Kind::Attr);
+        assert_eq!(k[1][4], Kind::Str);
+        assert!(k.iter().zip(&rows).all(|(a, r)| a.len() == r.chars().count()));
     }
 }

@@ -1196,6 +1196,12 @@ mod gui {
         /// detect commands like `sudo su` / `sudo su - <user>` and re-run
         /// the prep-terminal sequence after the new shell prompt appears.
         input_line_buf: String,
+        /// Extension of the file the last typed `vim`/`nano`/`cat`/... line
+        /// opened; the terminal colours default-coloured text as that type.
+        view_ext: Option<String>,
+        /// Whether the alternate screen was up last frame, so leaving
+        /// vim/nano/less drops `view_ext`.
+        view_was_alt: bool,
         /// Set when the most recently submitted line was a `sudo su` form;
         /// the next prompt detected in output triggers re-prep.
         pending_reprep: bool,
@@ -6245,7 +6251,7 @@ mod gui {
         // An app whose volume is never grown (reaper): compress the logs and
         // stop. No acknowledge, no wait and no escalation from a manual run;
         // the poll's timer is for alerts it picked up itself.
-        if cfg.no_grow(&alert.message) {
+        if dg::never_grown(&cfg, &alert) {
             return match disk_grow_gzip(&ctx, &facts.instance_id, false) {
                 Ok(r) => {
                     let msg = format!(
@@ -7222,11 +7228,11 @@ mod gui {
                                 ),
                             ),
                         }
-                        if disk_grow_cfg.no_grow(&alert.message) {
+                        if dg::never_grown(&disk_grow_cfg, &alert) {
                             note(
                                 LogLevel::Info,
                                 format!(
-                                    "dry run: the title matches no_grow_title_words {:?} — a \
+                                    "dry run: the volume is never grown here (title matches no_grow_title_words {:?}, or the alert names /) — a \
                                      real run would acknowledge (on call), gzip the logs, NOT \
                                      grow the volume, wait {} minute(s) for the alert to close, \
                                      and escalate if it is still open",
@@ -31969,6 +31975,13 @@ mod gui {
             for &b in payload {
                 match b {
                     b'\r' | b'\n' => {
+                        // Enter inside vim/nano is not a new command.
+                        if !session.parser.screen().alternate_screen()
+                            && !session.input_line_buf.trim().is_empty()
+                        {
+                            session.view_ext =
+                                ec2_manager::syntax::viewed_ext(&session.input_line_buf);
+                        }
                         if apply_submitted_line_to_user_stack(
                             &mut session.session_user_stack,
                             &session.input_line_buf,
@@ -40800,6 +40813,7 @@ mod gui {
                                                     let norm_sel = self.terminal_selections
                                                         .get(&tab_id)
                                                         .and_then(|s| s.normalized());
+                                                    let mut term_guides: Option<(Vec<usize>, usize)> = None;
                                                     let mut terminal_job =
                                                         if let Some(session) =
                                                             self.pty_sessions
@@ -40824,13 +40838,26 @@ mod gui {
                                                             let layout_find = find_for_layout.as_ref().map(|(m, cur, off)| {
                                                                 (m.as_slice(), *cur, *off)
                                                             });
-                                                            let job = terminal_layout_job(
+                                                            if session.view_was_alt && !on_alt {
+                                                                session.view_ext = None;
+                                                            }
+                                                            session.view_was_alt = on_alt;
+                                                            let syn = session.view_ext.as_deref().map(|ext| {
+                                                                let rows_text = terminal_screen_rows(session.parser.screen());
+                                                                let kinds = ec2_manager::syntax::screen_kinds(&rows_text, ext);
+                                                                let ind = ec2_manager::syntax::effective_indents(&rows_text.join("\n"));
+                                                                let unit = ec2_manager::syntax::indent_unit(&ind);
+                                                                (kinds, ind, unit)
+                                                            });
+                                                            let job = terminal_layout_job_syn(
                                                                 session.parser.screen(),
                                                                 cursor_visible,
                                                                 font_id.clone(),
                                                                 layout_sel,
                                                                 layout_find,
+                                                                syn.as_ref().map(|(k, _, _)| k.as_slice()),
                                                             );
+                                                            term_guides = syn.map(|(_, i, u)| (i, u));
                                                             if effective_offset > 0 {
                                                                 session.parser.screen_mut().set_scrollback(0);
                                                             }
@@ -40859,12 +40886,37 @@ mod gui {
                                                             // from that outer response and
                                                             // breaks right-click copy and
                                                             // double-click word selection.
-                                                            ui.add(
+                                                            let resp = ui.add(
                                                                 egui::Label::new(
                                                                     terminal_job,
                                                                 )
                                                                 .selectable(false),
-                                                            )
+                                                            );
+                                                            // Indentation guides over a viewed file.
+                                                            if let Some((ind, unit)) = &term_guides {
+                                                                let r = resp.rect;
+                                                                let nrows = ind.len().max(1) as f32;
+                                                                let ch = r.height() / nrows;
+                                                                let cw = r.width() / cols.max(1) as f32;
+                                                                let painter = ui.painter_at(r);
+                                                                let stroke = egui::Stroke::new(
+                                                                    1.0,
+                                                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36),
+                                                                );
+                                                                for (l, &n) in ind.iter().enumerate() {
+                                                                    let y0 = r.top() + l as f32 * ch;
+                                                                    let mut col = 0;
+                                                                    while col < n {
+                                                                        let x = r.left() + col as f32 * cw;
+                                                                        painter.line_segment(
+                                                                            [egui::pos2(x, y0), egui::pos2(x, y0 + ch)],
+                                                                            stroke,
+                                                                        );
+                                                                        col += *unit;
+                                                                    }
+                                                                }
+                                                            }
+                                                            resp
                                                         },
                                                     )
                                                     .inner
@@ -46573,6 +46625,8 @@ mod gui {
             scroll_offset: 0,
             ps1_auto_sent: false,
             input_line_buf: String::new(),
+            view_ext: None,
+            view_was_alt: false,
             pending_reprep: false,
             session_user_stack: Vec::new(),
             last_prepped_prompt: String::new(),
@@ -50420,7 +50474,7 @@ mod gui {
                         created_at,
                         &format!(
                             "{instance} is still open {} minute(s) after its logs were \
-                             compressed (the volume is not grown for this app)",
+                             compressed (the volume is not grown for this alert)",
                             cfg.no_grow_wait().as_secs() / 60
                         ),
                     );
@@ -50616,7 +50670,7 @@ mod gui {
                                     );
                                     continue;
                                 }
-                                let no_grow = cfg.no_grow(&alert.message);
+                                let no_grow = dg::never_grown(&cfg, &alert);
                                 // A second alert for a box already waiting to
                                 // close is a duplicate, acknowledged only.
                                 if no_grow && settling.iter().any(|s| s.2 == instance) {
@@ -53502,12 +53556,45 @@ mod gui {
     /// baked directly into the galley so it is pixel-perfect on every display.
     /// `find` is `(matches, current_index, scroll_offset)` for Ctrl+F; find
     /// colours override the selection on matched cells (current is strongest).
+    #[cfg(test)]
     fn terminal_layout_job(
         screen: &vt100::Screen,
         show_cursor: bool,
         font_id: egui::FontId,
         selection: Option<(AbsPos, AbsPos, usize)>,
         find: Option<(&[TermFindMatch], usize, usize)>,
+    ) -> egui::text::LayoutJob {
+        terminal_layout_job_syn(screen, show_cursor, font_id, selection, find, None)
+    }
+
+    /// Text the terminal shows, one string per row, one char per column.
+    fn terminal_screen_rows(screen: &vt100::Screen) -> Vec<String> {
+        let (rows, cols) = screen.size();
+        (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| {
+                        screen
+                            .cell(r, c)
+                            .filter(|cell| !cell.is_wide_continuation())
+                            .and_then(|cell| cell.contents().chars().next())
+                            .unwrap_or(' ')
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// As `terminal_layout_job`, but cells still in the terminal's default
+    /// colours take the colour of `syn[row][col]` (a viewed file's syntax).
+    /// Anything the program coloured itself, and inverse video, is left alone.
+    fn terminal_layout_job_syn(
+        screen: &vt100::Screen,
+        show_cursor: bool,
+        font_id: egui::FontId,
+        selection: Option<(AbsPos, AbsPos, usize)>,
+        find: Option<(&[TermFindMatch], usize, usize)>,
+        syn: Option<&[Vec<ec2_manager::syntax::Kind>]>,
     ) -> egui::text::LayoutJob {
         let (rows, cols) = screen.size();
         let default_fg = terminal_panel_text();
@@ -53569,6 +53656,22 @@ mod gui {
                     };
                     (" ", format)
                 };
+
+                if let (Some(syn), Some(cell)) = (syn, screen.cell(row, col)) {
+                    if cell.fgcolor() == vt100::Color::Default
+                        && cell.bgcolor() == vt100::Color::Default
+                        && !cell.inverse()
+                        && !cursor_cell
+                    {
+                        if let Some(&kind) =
+                            syn.get(row as usize).and_then(|r| r.get(col as usize))
+                        {
+                            if kind != ec2_manager::syntax::Kind::Normal {
+                                format.color = syntax_color(kind, true);
+                            }
+                        }
+                    }
+                }
 
                 // systemctl state colouring (skipped on the cursor cell so
                 // inverse video keeps working there).
