@@ -878,6 +878,118 @@ fn classify_tf(text: &str, word: &str, end: usize, at_line_start: bool) -> Kind 
 }
 
 // ---------------------------------------------------------------------------
+// Auto-closing pairs
+// ---------------------------------------------------------------------------
+
+/// File types where typing `"` / `{` / `[` / `(` should add the closer.
+/// Prose-like files are left alone: an apostrophe or a lone quote is common
+/// there and a stray closer would be a nuisance.
+pub fn auto_closes(ext: &str) -> bool {
+    !matches!(ext, "txt" | "md" | "markdown" | "log" | "csv" | "rst" | "")
+}
+
+/// What typing `typed` at char index `cursor` does in an editor with no
+/// selection: `Some((new_text, new_cursor))` when it should be handled here
+/// (adding the closing half, or stepping over one already present), `None`
+/// to leave the keystroke to the text box.
+pub fn auto_close(text: &str, cursor: usize, typed: char) -> Option<(String, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    if cursor > chars.len() {
+        return None;
+    }
+    let next = chars.get(cursor).copied();
+    let prev = cursor.checked_sub(1).and_then(|i| chars.get(i)).copied();
+    let closer = match typed {
+        '"' => '"',
+        '{' => '}',
+        '[' => ']',
+        '(' => ')',
+        '}' | ']' | ')' => {
+            return (next == Some(typed)).then(|| (text.to_string(), cursor + 1));
+        }
+        _ => return None,
+    };
+    if typed == '"' {
+        if next == Some('"') {
+            return Some((text.to_string(), cursor + 1));
+        }
+        // After a word char, a quote or a backslash it is a closing or
+        // escaped quote, not the start of a string.
+        if prev.is_some_and(|c| c.is_alphanumeric() || c == '"' || c == '\\' || c == '_') {
+            return None;
+        }
+    }
+    // Only open a pair where nothing follows to be wrapped by accident.
+    if !next.is_none_or(|c| c.is_whitespace() || matches!(c, ')' | ']' | '}' | ',' | ';' | '"')) {
+        return None;
+    }
+    let mut out: String = chars[..cursor].iter().collect();
+    out.push(typed);
+    out.push(closer);
+    out.extend(&chars[cursor..]);
+    Some((out, cursor + 1))
+}
+
+/// What pressing Enter at char index `cursor` does: the new text and the
+/// cursor's char index, keeping the line's indentation and adding a level
+/// after an opener (`{ [ (`, a YAML `key:`, a shell `then` / `do`). Pressing
+/// Enter between a bracket pair puts the closer on its own line below.
+/// `None` when `cursor` is out of range.
+pub fn newline_indent(text: &str, cursor: usize, ext: &str) -> Option<(String, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    if cursor > chars.len() {
+        return None;
+    }
+    let line_start = chars[..cursor].iter().rposition(|&c| c == '\n').map_or(0, |i| i + 1);
+    let before: String = chars[line_start..cursor].iter().collect();
+    let indent: String = before.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+    let unit = if indent.contains('\t') {
+        "\t".to_string()
+    } else {
+        " ".repeat(indent_unit(&effective_indents(text)))
+    };
+    let trimmed = before.trim_end();
+    let last = trimmed.chars().last();
+    let body = trimmed.trim_start();
+    let yaml = matches!(ext, "yaml" | "yml");
+    let shell = matches!(ext, "sh" | "bash" | "zsh");
+    let opener = matches!(last, Some('{') | Some('[') | Some('('));
+    let mut extra = String::new();
+    if opener
+        || (yaml && last == Some(':') && !body.starts_with('#'))
+        || (shell
+            && ["then", "do", "else"].iter().any(|k| {
+                body == *k || body.ends_with(&format!("; {k}")) || body.ends_with(&format!(" {k}"))
+            }))
+    {
+        extra = unit.clone();
+    } else if yaml {
+        // `- name: x` continues under `name`, two columns in.
+        if let Some(rest) = body.strip_prefix("- ") {
+            if rest.contains(": ") || rest.ends_with(':') {
+                extra = "  ".to_string();
+            }
+        }
+    }
+    let next = chars.get(cursor).copied();
+    let closes_pair = matches!(
+        (last, next),
+        (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')'))
+    );
+    let mut out: String = chars[..cursor].iter().collect();
+    out.push('\n');
+    out.push_str(&indent);
+    out.push_str(&extra);
+    let at = out.chars().count();
+    if closes_pair {
+        out.push('\n');
+        out.push_str(&indent);
+    }
+    out.extend(&chars[cursor..]);
+    Some((out, at))
+}
+
+// ---------------------------------------------------------------------------
 // Terminal viewers (vim / nano / cat ...)
 // ---------------------------------------------------------------------------
 
@@ -1242,5 +1354,58 @@ mod tests {
         assert_eq!(command_after_prompt("ec2-user@ip-1:~$ cat a.yml   "), "cat a.yml");
         assert_eq!(command_after_prompt("# vim x.tf"), "vim x.tf");
         assert_eq!(command_after_prompt("vi a.sh"), "vi a.sh");
+    }
+
+    #[test]
+    fn typing_an_opener_adds_its_closer() {
+        assert_eq!(auto_close("resource ", 9, '"'), Some(("resource \"\"".into(), 10)));
+        assert_eq!(auto_close("a = ", 4, '{'), Some(("a = {}".into(), 5)));
+        assert_eq!(auto_close("x(", 2, '['), Some(("x([]".into(), 3)));
+        // Before a word it would wrap by accident.
+        assert_eq!(auto_close("ab", 0, '{'), None);
+    }
+
+    #[test]
+    fn typing_a_closer_steps_over_the_one_already_there() {
+        assert_eq!(auto_close("{}", 1, '}'), Some(("{}".into(), 2)));
+        assert_eq!(auto_close("\"a\"", 2, '"'), Some(("\"a\"".into(), 3)));
+        assert_eq!(auto_close("ab", 1, ')'), None);
+    }
+
+    #[test]
+    fn a_quote_after_a_word_is_not_an_opener() {
+        assert_eq!(auto_close("say", 3, '"'), None);
+        assert_eq!(auto_close("\"\"", 2, '"'), None);
+    }
+
+    #[test]
+    fn auto_close_handles_multibyte_text() {
+        assert_eq!(auto_close("é ", 2, '{'), Some(("é {}".into(), 3)));
+    }
+
+    #[test]
+    fn enter_keeps_the_indent_and_adds_a_level_after_an_opener() {
+        assert_eq!(newline_indent("  a = 1", 7, "tf"), Some(("  a = 1\n  ".into(), 10)));
+        let (t, c) = newline_indent("x {", 3, "tf").unwrap();
+        assert_eq!((t.as_str(), c), ("x {\n  ", 6));
+        let (t, c) = newline_indent("a:\n  b:", 7, "yml").unwrap();
+        assert_eq!((t.as_str(), c), ("a:\n  b:\n    ", 12));
+    }
+
+    #[test]
+    fn enter_between_a_pair_opens_it_out() {
+        let (t, c) = newline_indent("  x {}", 5, "tf").unwrap();
+        assert_eq!(t, "  x {\n    \n  }");
+        assert_eq!(c, 10);
+    }
+
+    #[test]
+    fn enter_aligns_a_yaml_list_item_and_shell_blocks() {
+        let (t, _) = newline_indent("- name: x", 9, "yml").unwrap();
+        assert_eq!(t, "- name: x\n  ");
+        let (t, _) = newline_indent("if true; then", 13, "sh").unwrap();
+        assert_eq!(t, "if true; then\n  ");
+        let (t, _) = newline_indent("- item", 6, "yml").unwrap();
+        assert_eq!(t, "- item\n");
     }
 }

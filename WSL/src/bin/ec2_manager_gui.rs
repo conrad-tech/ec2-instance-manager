@@ -10594,6 +10594,9 @@ mod gui {
         /// Path of the editor tab the tree was last pointed at, so the tree
         /// follows the active tab only when that changes.
         synced_editor_path: Option<String>,
+        /// Remote path of an unsaved editor tab whose X was clicked, awaiting
+        /// the answer to "close without saving?".
+        confirm_close_path: Option<String>,
         /// Scroll the tree to the selected file once its row exists.
         scroll_to_selected: bool,
         /// When the connection tab was opened — used to delay the hidden
@@ -10642,6 +10645,7 @@ mod gui {
                 terminal_had_focus: false,
                 selected_file: None,
                 synced_editor_path: None,
+                confirm_close_path: None,
                 scroll_to_selected: false,
                 opened_at: Instant::now(),
                 path_completion: None,
@@ -10736,7 +10740,7 @@ mod gui {
     /// The sudo-su re-prep hook re-runs this for the switched-to user,
     /// so root (etc.) gets its own `~/.ssh/config` too.
     const PREP_TERMINAL_COMMAND: &[u8] =
-        b"exec bash\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\rgrep -qxF 'set paste' ~/.vimrc 2>/dev/null || echo 'set paste' >> ~/.vimrc\rmkdir -p ~/.ssh && chmod 700 ~/.ssh 2>/dev/null\rgrep -qs 'StrictHostKeyChecking accept-new' ~/.ssh/config 2>/dev/null || printf 'Host *\\n  StrictHostKeyChecking accept-new\\n  UserKnownHostsFile ~/.ssh/known_hosts\\n' >> ~/.ssh/config\rchmod 600 ~/.ssh/config 2>/dev/null\rclear\r";
+        b"exec bash\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\rgrep -qxF 'set paste' ~/.vimrc 2>/dev/null || echo 'set paste' >> ~/.vimrc\rgrep -qxF 'set autoindent smartindent' ~/.vimrc 2>/dev/null || echo 'set autoindent smartindent' >> ~/.vimrc\rgrep -qxF 'set autoindent' ~/.nanorc 2>/dev/null || echo 'set autoindent' >> ~/.nanorc\rmkdir -p ~/.ssh && chmod 700 ~/.ssh 2>/dev/null\rgrep -qs 'StrictHostKeyChecking accept-new' ~/.ssh/config 2>/dev/null || printf 'Host *\\n  StrictHostKeyChecking accept-new\\n  UserKnownHostsFile ~/.ssh/known_hosts\\n' >> ~/.ssh/config\rchmod 600 ~/.ssh/config 2>/dev/null\rclear\r";
 
     /// Build the prep-terminal byte sequence with an explicit `stty rows
     /// R cols C` prefix. The local PTY's resize messages don't always
@@ -42036,6 +42040,7 @@ mod gui {
                 .and_then(|fb| fb.active_editor);
             let mut new_active: Option<usize> = active_editor;
             let mut close_editor: Option<usize> = None;
+            let mut ask_close: Option<usize> = None;
 
             egui::ScrollArea::horizontal()
                 .id_salt(("editor_tabs", tab_id))
@@ -42060,13 +42065,77 @@ mod gui {
                                         new_active = Some(*idx);
                                     }
                                     if ui.small_button("x").clicked() {
-                                        close_editor = Some(*idx);
+                                        if *dirty {
+                                            ask_close = Some(*idx);
+                                        } else {
+                                            close_editor = Some(*idx);
+                                        }
                                     }
                                 });
                             });
                         }
                     });
                 });
+
+            // An unsaved tab asks before it closes.
+            if let Some(idx) = ask_close {
+                if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                    fb.confirm_close_path = fb.editor_tabs.get(idx).map(|t| t.remote_path.clone());
+                }
+            }
+            let pending = self
+                .file_browsers
+                .get(&tab_id)
+                .and_then(|fb| fb.confirm_close_path.clone());
+            if let Some(path) = pending {
+                // The tab may have been saved or closed since the click.
+                let found = self.file_browsers.get(&tab_id).and_then(|fb| {
+                    fb.editor_tabs
+                        .iter()
+                        .position(|t| t.remote_path == path && t.dirty)
+                });
+                match found {
+                    None => {
+                        if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                            fb.confirm_close_path = None;
+                        }
+                    }
+                    Some(idx) => {
+                        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+                        let mut discard = false;
+                        let mut cancel = false;
+                        egui::Window::new("Unsaved changes")
+                            .id(egui::Id::new(("confirm_close_editor", tab_id)))
+                            .collapsible(false)
+                            .resizable(false)
+                            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                            .show(ui.ctx(), |ui| {
+                                ui.label(format!(
+                                    "{name} has unsaved changes. Close it and lose them?"
+                                ));
+                                ui.horizontal(|ui| {
+                                    if ui.button("Close without saving").clicked() {
+                                        discard = true;
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        cancel = true;
+                                    }
+                                });
+                            });
+                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            cancel = true;
+                        }
+                        if discard {
+                            close_editor = Some(idx);
+                        }
+                        if discard || cancel {
+                            if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                                fb.confirm_close_path = None;
+                            }
+                        }
+                    }
+                }
+            }
 
             // Handle tab close
             if let Some(close_idx) = close_editor {
@@ -42481,6 +42550,89 @@ mod gui {
                             job.wrap.max_width = f32::INFINITY;
                             ui.fonts_mut(|f| f.layout_job(job))
                         };
+                        // Auto-close: typing `"` `{` `[` `(` adds the closer,
+                        // and typing a closer over one steps past it. Done
+                        // before the text box sees the keystroke.
+                        let mut auto_closed = false;
+                        let edit_id = ui.make_persistent_id((
+                            "editor_text",
+                            tab_id,
+                            remote_path.clone(),
+                        ));
+                        if ec2_manager::syntax::auto_closes(&ext)
+                            && ui.memory(|m| m.has_focus(edit_id))
+                        {
+                            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), edit_id) {
+                                if let Some(r) = state.cursor.char_range() {
+                                    if r.primary.index == r.secondary.index {
+                                        let mut cur = r.primary.index;
+                                        ui.input_mut(|i| {
+                                            i.events.retain(|e| {
+                                                let egui::Event::Text(t) = e else { return true };
+                                                let mut cs = t.chars();
+                                                let (Some(c), None) = (cs.next(), cs.next()) else {
+                                                    return true;
+                                                };
+                                                match ec2_manager::syntax::auto_close(&editor_content, cur, c) {
+                                                    Some((text, at)) => {
+                                                        editor_content = text;
+                                                        cur = at;
+                                                        auto_closed = true;
+                                                        false
+                                                    }
+                                                    None => true,
+                                                }
+                                            });
+                                        });
+                                        if auto_closed {
+                                            state.cursor.set_char_range(Some(
+                                                egui::text::CCursorRange::one(egui::text::CCursor::new(cur)),
+                                            ));
+                                            egui::TextEdit::store_state(ui.ctx(), edit_id, state);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Smart Enter: the new line starts at the right column
+                        // (current indent, one more after an opener) instead of
+                        // column 0.
+                        if ui.memory(|m| m.has_focus(edit_id)) {
+                            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), edit_id) {
+                                if let Some(r) = state.cursor.char_range() {
+                                    if r.primary.index == r.secondary.index {
+                                        let mut cur = r.primary.index;
+                                        let mut entered = false;
+                                        ui.input_mut(|i| {
+                                            i.events.retain(|e| {
+                                                let egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. } = e else {
+                                                    return true;
+                                                };
+                                                if modifiers.command || modifiers.alt || entered {
+                                                    return true;
+                                                }
+                                                match ec2_manager::syntax::newline_indent(&editor_content, cur, &ext) {
+                                                    Some((text, at)) => {
+                                                        editor_content = text;
+                                                        cur = at;
+                                                        entered = true;
+                                                        false
+                                                    }
+                                                    None => true,
+                                                }
+                                            });
+                                        });
+                                        if entered {
+                                            auto_closed = true;
+                                            state.cursor.set_char_range(Some(
+                                                egui::text::CCursorRange::one(egui::text::CCursor::new(cur)),
+                                            ));
+                                            egui::TextEdit::store_state(ui.ctx(), edit_id, state);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         let output = egui::TextEdit::multiline(&mut editor_content)
                             .font(egui::TextStyle::Monospace)
                             .desired_width(f32::INFINITY)
@@ -42648,7 +42800,7 @@ mod gui {
                             editor_content = toggle_line_comments(&editor_content, comment_prefix);
                         }
 
-                        if response.changed() {
+                        if response.changed() || auto_closed {
                             if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
                                 if let Some(idx) = fb.active_editor {
                                     if let Some(et) = fb.editor_tabs.get_mut(idx) {
@@ -44221,7 +44373,7 @@ mod gui {
                         let edit_menu_resp = ui.menu_button("Edit", |ui| {
                             let mut syntax_on = !self.config.terminal_syntax_off;
                             if ui
-                                .checkbox(&mut syntax_on, "Terminal syntax colours")
+                                .checkbox(&mut syntax_on, "Terminal syntax colors")
                                 .on_hover_text(
                                     "Colour and draw indent guides on a file shown in the \
                                      terminal with vim, nano, cat and the like.",
