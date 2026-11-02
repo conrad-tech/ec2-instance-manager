@@ -127,6 +127,10 @@ pub struct AppConfig {
     /// somewhere other than the machine's own. Read-only, always — see
     /// `crate::forwards`.
     pub forwards_hosts_file: Option<String>,
+    /// Turns off the syntax colours and indent guides the terminal adds
+    /// to a file shown with vim / nano / cat. Off-switch so the default
+    /// (colours on) needs no stored key.
+    pub terminal_syntax_off: bool,
     /// Port forwards the user unticked, keyed like the other VS Code
     /// settings (`vscode_key`) with the DNS names as the value.
     ///
@@ -230,6 +234,7 @@ impl Default for AppConfig {
             ssh_pem_instance: BTreeMap::new(),
             vscode_pem_suppressed: BTreeMap::new(),
             forwards_hosts_file: None,
+            terminal_syntax_off: false,
             disabled_forwards: BTreeMap::new(),
             user_forwards: BTreeMap::new(),
             tunnel_off: BTreeMap::new(),
@@ -1399,6 +1404,9 @@ impl AppConfig {
                         Some(value.to_string())
                     };
                 }
+                "terminal_syntax_off" => {
+                    cfg.terminal_syntax_off = value == "1";
+                }
                 "forwards_hosts_file" => {
                     cfg.forwards_hosts_file = if value.is_empty() {
                         None
@@ -1490,6 +1498,9 @@ impl AppConfig {
         }
         for (env, rec) in &self.cassandra_schedules {
             lines.push(format!("cassandra_schedule.{env}={rec}"));
+        }
+        if self.terminal_syntax_off {
+            lines.push("terminal_syntax_off=1".to_string());
         }
         if let Some(ref p) = self.forwards_hosts_file {
             lines.push(format!("forwards_hosts_file={p}"));
@@ -3049,5 +3060,11 @@ mod tests {
     fn an_empty_region_searched_list_writes_no_line() {
         let cfg = AppConfig::default();
         assert!(!cfg.to_text().contains("region_searched"));
+    }
+
+    #[test]
+    fn the_terminal_syntax_switch_defaults_on_and_parses_off() {
+        assert!(!AppConfig::parse("").terminal_syntax_off);
+        assert!(AppConfig::parse("terminal_syntax_off=1\n").terminal_syntax_off);
     }
 }

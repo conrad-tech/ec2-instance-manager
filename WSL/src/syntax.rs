@@ -910,6 +910,17 @@ pub fn viewed_ext(line: &str) -> Option<String> {
     Some(ext.to_ascii_lowercase())
 }
 
+/// The command on a terminal row: everything after the last shell prompt
+/// marker (`$ ` or `# `), or the whole row when there is none.
+pub fn command_after_prompt(row: &str) -> &str {
+    let row = row.trim_end();
+    match (row.rfind("$ "), row.rfind("# ")) {
+        (Some(a), Some(b)) => &row[a.max(b) + 2..],
+        (Some(a), None) | (None, Some(a)) => &row[a + 2..],
+        (None, None) => row,
+    }
+}
+
 /// Kind of every screen cell, `[row][col]`, for terminal rows read as `ext`.
 /// Each row must hold exactly one char per column.
 pub fn screen_kinds(rows: &[String], ext: &str) -> Vec<Vec<Kind>> {
@@ -1224,5 +1235,12 @@ mod tests {
         assert_eq!(k[1][0], Kind::Attr);
         assert_eq!(k[1][4], Kind::Str);
         assert!(k.iter().zip(&rows).all(|(a, r)| a.len() == r.chars().count()));
+    }
+
+    #[test]
+    fn the_command_is_read_after_the_prompt() {
+        assert_eq!(command_after_prompt("ec2-user@ip-1:~$ cat a.yml   "), "cat a.yml");
+        assert_eq!(command_after_prompt("# vim x.tf"), "vim x.tf");
+        assert_eq!(command_after_prompt("vi a.sh"), "vi a.sh");
     }
 }

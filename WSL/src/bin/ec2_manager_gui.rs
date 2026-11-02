@@ -31976,11 +31976,20 @@ mod gui {
                 match b {
                     b'\r' | b'\n' => {
                         // Enter inside vim/nano is not a new command.
-                        if !session.parser.screen().alternate_screen()
-                            && !session.input_line_buf.trim().is_empty()
-                        {
-                            session.view_ext =
-                                ec2_manager::syntax::viewed_ext(&session.input_line_buf);
+                        if !session.parser.screen().alternate_screen() {
+                            // Read the line as the shell shows it: tab
+                            // completion and history recall never pass
+                            // through `input_line_buf`.
+                            let screen = session.parser.screen();
+                            let (crow, _) = screen.cursor_position();
+                            let shown = terminal_screen_rows(screen)
+                                .into_iter()
+                                .nth(crow as usize)
+                                .unwrap_or_default();
+                            let cmd = ec2_manager::syntax::command_after_prompt(&shown);
+                            let ext = ec2_manager::syntax::viewed_ext(cmd)
+                                .or_else(|| ec2_manager::syntax::viewed_ext(&session.input_line_buf));
+                            session.view_ext = ext;
                         }
                         if apply_submitted_line_to_user_stack(
                             &mut session.session_user_stack,
@@ -40813,6 +40822,7 @@ mod gui {
                                                     let norm_sel = self.terminal_selections
                                                         .get(&tab_id)
                                                         .and_then(|s| s.normalized());
+                                                    let syntax_off = self.config.terminal_syntax_off;
                                                     let mut term_guides: Option<(Vec<usize>, usize)> = None;
                                                     let mut terminal_job =
                                                         if let Some(session) =
@@ -40842,7 +40852,7 @@ mod gui {
                                                                 session.view_ext = None;
                                                             }
                                                             session.view_was_alt = on_alt;
-                                                            let syn = session.view_ext.as_deref().map(|ext| {
+                                                            let syn = session.view_ext.as_deref().filter(|_| !syntax_off).map(|ext| {
                                                                 let rows_text = terminal_screen_rows(session.parser.screen());
                                                                 let kinds = ec2_manager::syntax::screen_kinds(&rows_text, ext);
                                                                 let ind = ec2_manager::syntax::effective_indents(&rows_text.join("\n"));
@@ -44209,6 +44219,18 @@ mod gui {
                 egui::TopBottomPanel::top("top").show(ctx, |ui| {
                     egui::MenuBar::new().ui(ui, |ui| {
                         let edit_menu_resp = ui.menu_button("Edit", |ui| {
+                            let mut syntax_on = !self.config.terminal_syntax_off;
+                            if ui
+                                .checkbox(&mut syntax_on, "Terminal syntax colours")
+                                .on_hover_text(
+                                    "Colour and draw indent guides on a file shown in the \
+                                     terminal with vim, nano, cat and the like.",
+                                )
+                                .changed()
+                            {
+                                self.config.terminal_syntax_off = !syntax_on;
+                                let _ = self.config.save();
+                            }
                             if ui.button("Update VS Code Pem").clicked() {
                                 let profile_id = self
                                     .selected_profile
