@@ -998,28 +998,58 @@ const VIEWERS: &[&str] = &[
     "vim", "vi", "nvim", "view", "nano", "pico", "cat", "bat", "less", "more", "tail", "head",
 ];
 
-/// The (lower-case) extension of the file a typed command opens, e.g.
-/// `sudo vim /etc/app/main.tf` -> `tf`. `None` when the line is not a viewer
-/// command or the file has no extension to pick a colour scheme by.
-pub fn viewed_ext(line: &str) -> Option<String> {
+/// The viewer command and file a typed line opens, e.g.
+/// `sudo vim /etc/app/main.tf` -> `("vim", "/etc/app/main.tf")`.
+pub fn viewed_file(line: &str) -> Option<(String, String)> {
     let mut words = line.split_whitespace().peekable();
     while matches!(words.peek(), Some(&"sudo") | Some(&"-E")) {
         words.next();
     }
-    let cmd = words.next()?.rsplit('/').next()?;
-    if !VIEWERS.contains(&cmd) {
+    let cmd = words.next()?.rsplit('/').next()?.to_string();
+    if !VIEWERS.contains(&cmd.as_str()) {
         return None;
     }
     let file = words
         .filter(|w| !w.starts_with('-') && !w.starts_with('+'))
         .last()?
-        .trim_matches(|c| c == '"' || c == '\'');
+        .trim_matches(|c| c == '"' || c == '\'')
+        .to_string();
+    (!file.is_empty()).then_some((cmd, file))
+}
+
+/// The (lower-case) extension of the file a typed command opens, e.g.
+/// `sudo vim /etc/app/main.tf` -> `tf`. `None` when the line is not a viewer
+/// command or the file has no extension to pick a colour scheme by.
+pub fn viewed_ext(line: &str) -> Option<String> {
+    let (_, file) = viewed_file(line)?;
     let name = file.rsplit('/').next()?;
     let (stem, ext) = name.rsplit_once('.')?;
     if stem.is_empty() || ext.is_empty() || ext.len() > 8 {
         return None;
     }
     Some(ext.to_ascii_lowercase())
+}
+
+/// The file a typed line opens in a text editor (vi, vim, nvim, view, nano,
+/// pico), with a relative name placed under `cwd` when that is known.
+pub fn edited_path(line: &str, cwd: Option<&str>) -> Option<String> {
+    let (cmd, file) = viewed_file(line)?;
+    if !matches!(cmd.as_str(), "vi" | "vim" | "nvim" | "view" | "nano" | "pico") {
+        return None;
+    }
+    if file.starts_with('/') || file.starts_with('~') {
+        return Some(file);
+    }
+    match cwd.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(dir) => Some(format!("{}/{}", dir.trim_end_matches('/'), file.trim_start_matches("./"))),
+        None => Some(file),
+    }
+}
+
+/// The working directory shown on a prompt's path row (`user@host SSM ~/dir`).
+pub fn prompt_cwd(row: &str) -> Option<&str> {
+    let rest = row.split_once(" SSM ")?.1.trim();
+    (!rest.is_empty()).then_some(rest)
 }
 
 /// The command on a terminal row: everything after the last shell prompt
@@ -1031,6 +1061,39 @@ pub fn command_after_prompt(row: &str) -> &str {
         (Some(a), None) | (None, Some(a)) => &row[a + 2..],
         (None, None) => row,
     }
+}
+
+/// The bracket under (or just before) the terminal cursor at `(row, col)`
+/// and its partner, as `[(row, col); 2]`, reading the visible `rows` as
+/// `ext`. `None` when the cursor is not at a paired bracket.
+pub fn screen_bracket_pair(
+    rows: &[String],
+    ext: &str,
+    row: usize,
+    col: usize,
+) -> Option<[(usize, usize); 2]> {
+    let text = rows.join("\n");
+    if text.len() > MAX_HIGHLIGHT_BYTES || row >= rows.len() {
+        return None;
+    }
+    let mut starts = Vec::with_capacity(rows.len());
+    let mut at = 0;
+    for r in rows {
+        starts.push(at);
+        at += r.len() + 1;
+    }
+    let line = &rows[row];
+    let in_row = line.char_indices().nth(col).map_or(line.len(), |(b, _)| b);
+    let tokens = tokenize(&text, ext);
+    let (a, b) = matching_bracket(&text, &tokens, starts[row] + in_row)?;
+    let cell = |byte: usize| {
+        let r = match starts.binary_search(&byte) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+        (r, text[starts[r]..byte].chars().count())
+    };
+    Some([cell(a), cell(b)])
 }
 
 /// Kind of every screen cell, `[row][col]`, for terminal rows read as `ext`.
@@ -1407,5 +1470,24 @@ mod tests {
         assert_eq!(t, "if true; then\n  ");
         let (t, _) = newline_indent("- item", 6, "yml").unwrap();
         assert_eq!(t, "- item\n");
+    }
+
+    #[test]
+    fn the_cursor_on_a_brace_finds_its_partner_on_screen() {
+        let rows = vec!["x {      ".to_string(), "  a = 1  ".to_string(), "}        ".to_string()];
+        assert_eq!(screen_bracket_pair(&rows, "tf", 0, 2), Some([(0, 2), (2, 0)]));
+        assert_eq!(screen_bracket_pair(&rows, "tf", 2, 0), Some([(2, 0), (0, 2)]));
+        assert_eq!(screen_bracket_pair(&rows, "tf", 1, 4), None);
+    }
+
+    #[test]
+    fn an_edited_file_is_placed_under_the_prompts_directory() {
+        assert_eq!(edited_path("vim /etc/x.conf", None).as_deref(), Some("/etc/x.conf"));
+        assert_eq!(edited_path("sudo nano a.tf", Some("~/infra")).as_deref(), Some("~/infra/a.tf"));
+        assert_eq!(edited_path("vi ./a.tf", Some("/srv/")).as_deref(), Some("/srv/a.tf"));
+        assert_eq!(edited_path("cat a.tf", Some("/srv")), None);
+        assert_eq!(edited_path("vim Dockerfile", None).as_deref(), Some("Dockerfile"));
+        assert_eq!(prompt_cwd("ec2-user@ip-1 SSM ~/infra  "), Some("~/infra"));
+        assert_eq!(prompt_cwd("no marker"), None);
     }
 }

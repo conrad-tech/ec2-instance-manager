@@ -1199,6 +1199,9 @@ mod gui {
         /// Extension of the file the last typed `vim`/`nano`/`cat`/... line
         /// opened; the terminal colours default-coloured text as that type.
         view_ext: Option<String>,
+        /// Path of the file the last `vi`/`vim`/`nano` line opened, shown
+        /// under the terminal while the editor is up.
+        view_file: Option<String>,
         /// Whether the alternate screen was up last frame, so leaving
         /// vim/nano/less drops `view_ext`.
         view_was_alt: bool,
@@ -31991,6 +31994,13 @@ mod gui {
                                 .nth(crow as usize)
                                 .unwrap_or_default();
                             let cmd = ec2_manager::syntax::command_after_prompt(&shown);
+                            let above = if crow > 0 {
+                                terminal_screen_rows(screen).into_iter().nth(crow as usize - 1)
+                            } else {
+                                None
+                            };
+                            let cwd = above.as_deref().and_then(ec2_manager::syntax::prompt_cwd);
+                            session.view_file = ec2_manager::syntax::edited_path(cmd, cwd);
                             let ext = ec2_manager::syntax::viewed_ext(cmd)
                                 .or_else(|| ec2_manager::syntax::viewed_ext(&session.input_line_buf));
                             session.view_ext = ext;
@@ -40854,6 +40864,7 @@ mod gui {
                                                             });
                                                             if session.view_was_alt && !on_alt {
                                                                 session.view_ext = None;
+                                                                session.view_file = None;
                                                             }
                                                             session.view_was_alt = on_alt;
                                                             let syn = session.view_ext.as_deref().filter(|_| !syntax_off).map(|ext| {
@@ -40863,6 +40874,19 @@ mod gui {
                                                                 let unit = ec2_manager::syntax::indent_unit(&ind);
                                                                 (kinds, ind, unit)
                                                             });
+                                                            let bracket_cells: Vec<(usize, usize)> = match (
+                                                                session.view_ext.as_deref().filter(|_| !syntax_off),
+                                                                session.parser.screen().hide_cursor(),
+                                                            ) {
+                                                                (Some(ext), false) => {
+                                                                    let (cr, cc) = session.parser.screen().cursor_position();
+                                                                    let rows_text = terminal_screen_rows(session.parser.screen());
+                                                                    ec2_manager::syntax::screen_bracket_pair(&rows_text, ext, cr as usize, cc as usize)
+                                                                        .map(|p| p.to_vec())
+                                                                        .unwrap_or_default()
+                                                                }
+                                                                _ => Vec::new(),
+                                                            };
                                                             let job = terminal_layout_job_syn(
                                                                 session.parser.screen(),
                                                                 cursor_visible,
@@ -40870,6 +40894,7 @@ mod gui {
                                                                 layout_sel,
                                                                 layout_find,
                                                                 syn.as_ref().map(|(k, _, _)| k.as_slice()),
+                                                                &bracket_cells,
                                                             );
                                                             term_guides = syn.map(|(_, i, u)| (i, u));
                                                             if effective_offset > 0 {
@@ -40940,6 +40965,18 @@ mod gui {
                                         })
                                         .inner
                                 });
+                            // The file open in vi / vim / nano, under the terminal.
+                            if let Some(path) = self
+                                .pty_sessions
+                                .get(&tab_id)
+                                .filter(|s| s.parser.screen().alternate_screen())
+                                .and_then(|s| s.view_file.clone())
+                            {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(80, 220, 120),
+                                    egui::RichText::new(path).monospace(),
+                                );
+                            }
                             let terminal_focus_id =
                                 ui.make_persistent_id(("terminal_focus", tab_id));
                             let terminal_focus_response = ui.interact(
@@ -46800,6 +46837,7 @@ mod gui {
             ps1_auto_sent: false,
             input_line_buf: String::new(),
             view_ext: None,
+            view_file: None,
             view_was_alt: false,
             pending_reprep: false,
             session_user_stack: Vec::new(),
@@ -53738,7 +53776,7 @@ mod gui {
         selection: Option<(AbsPos, AbsPos, usize)>,
         find: Option<(&[TermFindMatch], usize, usize)>,
     ) -> egui::text::LayoutJob {
-        terminal_layout_job_syn(screen, show_cursor, font_id, selection, find, None)
+        terminal_layout_job_syn(screen, show_cursor, font_id, selection, find, None, &[])
     }
 
     /// Text the terminal shows, one string per row, one char per column.
@@ -53769,6 +53807,7 @@ mod gui {
         selection: Option<(AbsPos, AbsPos, usize)>,
         find: Option<(&[TermFindMatch], usize, usize)>,
         syn: Option<&[Vec<ec2_manager::syntax::Kind>]>,
+        bracket_cells: &[(usize, usize)],
     ) -> egui::text::LayoutJob {
         let (rows, cols) = screen.size();
         let default_fg = terminal_panel_text();
@@ -53845,6 +53884,11 @@ mod gui {
                             }
                         }
                     }
+                }
+
+                // The bracket under the cursor and its partner.
+                if !cursor_cell && bracket_cells.contains(&(row as usize, col as usize)) {
+                    format.background = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70);
                 }
 
                 // systemctl state colouring (skipped on the cursor cell so
