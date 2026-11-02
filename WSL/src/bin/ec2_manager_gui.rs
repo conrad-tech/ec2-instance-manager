@@ -40894,6 +40894,7 @@ mod gui {
                                                                 layout_sel,
                                                                 layout_find,
                                                                 syn.as_ref().map(|(k, _, _)| k.as_slice()),
+                                                                on_alt,
                                                                 &bracket_cells,
                                                             );
                                                             term_guides = syn.map(|(_, i, u)| (i, u));
@@ -53776,7 +53777,7 @@ mod gui {
         selection: Option<(AbsPos, AbsPos, usize)>,
         find: Option<(&[TermFindMatch], usize, usize)>,
     ) -> egui::text::LayoutJob {
-        terminal_layout_job_syn(screen, show_cursor, font_id, selection, find, None, &[])
+        terminal_layout_job_syn(screen, show_cursor, font_id, selection, find, None, false, &[])
     }
 
     /// Text the terminal shows, one string per row, one char per column.
@@ -53807,6 +53808,11 @@ mod gui {
         selection: Option<(AbsPos, AbsPos, usize)>,
         find: Option<(&[TermFindMatch], usize, usize)>,
         syn: Option<&[Vec<ec2_manager::syntax::Kind>]>,
+        // Recolour cells a program already coloured (vim's own syntax),
+        // not only default-coloured ones, so a full-screen editor matches
+        // the file editor. Inverse video and cells with a background of
+        // their own (status lines, vim's match highlight) are still left.
+        force_syn: bool,
         bracket_cells: &[(usize, usize)],
     ) -> egui::text::LayoutJob {
         let (rows, cols) = screen.size();
@@ -53871,7 +53877,7 @@ mod gui {
                 };
 
                 if let (Some(syn), Some(cell)) = (syn, screen.cell(row, col)) {
-                    if cell.fgcolor() == vt100::Color::Default
+                    if (force_syn || cell.fgcolor() == vt100::Color::Default)
                         && cell.bgcolor() == vt100::Color::Default
                         && !cell.inverse()
                         && !cursor_cell
@@ -53879,7 +53885,9 @@ mod gui {
                         if let Some(&kind) =
                             syn.get(row as usize).and_then(|r| r.get(col as usize))
                         {
-                            if kind != ec2_manager::syntax::Kind::Normal {
+                            if kind != ec2_manager::syntax::Kind::Normal
+                                || (force_syn && cell.fgcolor() != vt100::Color::Default)
+                            {
                                 format.color = syntax_color(kind, true);
                             }
                         }
