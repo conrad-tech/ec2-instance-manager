@@ -24314,6 +24314,21 @@ mod gui {
                                     .desired_width(300.0),
                             );
                             let id = self.reaper_probe_id.trim().to_string();
+                            // Read-only: opens the same window a click on an
+                            // alert's #id does, which reads the alert in
+                            // full by id. Works on a closed alert, since
+                            // nothing here filters by status.
+                            if ui
+                                .add_enabled(!id.is_empty(), egui::Button::new("View"))
+                                .on_hover_text(
+                                    "Open this alert and show everything the API returns \
+                                     for it: description, notes, tags and properties. \
+                                     Changes nothing, and works on closed alerts.",
+                                )
+                                .clicked()
+                            {
+                                open_alert = Some((id.clone(), String::new()));
+                            }
                             // The dry run. Everything a real run does except
                             // the thing that changes something — and then a
                             // REAL escalation, which is the half that cannot
