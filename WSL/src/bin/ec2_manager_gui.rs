@@ -1202,6 +1202,10 @@ mod gui {
         /// Path of the file the last `vi`/`vim`/`nano` line opened, shown
         /// under the terminal while the editor is up.
         view_file: Option<String>,
+        /// Whether the editor that `view_file` names is vi/vim/nvim, whose
+        /// normal mode reads a paste as commands (see
+        /// `paste_to_connection_tab`).
+        view_is_vim: bool,
         /// Whether the alternate screen was up last frame, so leaving
         /// vim/nano/less drops `view_ext`.
         view_was_alt: bool,
@@ -31878,12 +31882,44 @@ mod gui {
                 user_host || bare
             };
             let skip_dripfeed = on_alt_screen || !at_shell_prompt;
+            // vim in normal mode reads a paste as commands: the text up to
+            // the first `i`/`a`/`o` is executed instead of inserted, and what
+            // follows is typed. If the editor asked for bracketed paste, use
+            // it. Otherwise, when vim is up and not showing INSERT/REPLACE,
+            // send Esc (cancels a pending command or `:` line) and `i`
+            // first, separated so vim does not read them as Alt-i.
+            let bracketed = on_alt_screen && session.parser.screen().bracketed_paste();
+            let vim_needs_insert = on_alt_screen
+                && !bracketed
+                && session.view_is_vim
+                && !terminal_screen_rows(session.parser.screen())
+                    .iter()
+                    .rev()
+                    .take(2)
+                    .any(|r| r.contains("INSERT") || r.contains("REPLACE"));
+            let payload = if bracketed {
+                let mut v = b"\x1b[200~".to_vec();
+                v.extend_from_slice(&payload);
+                v.extend_from_slice(b"\x1b[201~");
+                v
+            } else {
+                payload
+            };
             self.log_debug(format!(
-                "paste worker spawn tab={tab_id} bytes={total_len} alt_screen={on_alt_screen} at_prompt={at_shell_prompt} skip_dripfeed={skip_dripfeed}"
+                "paste worker spawn tab={tab_id} bytes={total_len} alt_screen={on_alt_screen} at_prompt={at_shell_prompt} skip_dripfeed={skip_dripfeed} bracketed={bracketed} vim_insert_prefix={vim_needs_insert}"
             ));
             if skip_dripfeed {
                 std::thread::spawn(move || {
                     let Ok(mut w) = writer.lock() else { return; };
+                    if vim_needs_insert {
+                        let _ = w.write_all(b"\x1b");
+                        let _ = w.flush();
+                        std::thread::sleep(Duration::from_millis(150));
+                        if let Err(err) = w.write_all(b"i") {
+                            eprintln!("paste worker tab={tab_id} write error: {err}");
+                            return;
+                        }
+                    }
                     if let Err(err) = w.write_all(&payload) {
                         eprintln!("paste worker tab={tab_id} write error: {err}");
                         return;
@@ -32001,6 +32037,10 @@ mod gui {
                             };
                             let cwd = above.as_deref().and_then(ec2_manager::syntax::prompt_cwd);
                             session.view_file = ec2_manager::syntax::edited_path(cmd, cwd);
+                            session.view_is_vim = session.view_file.is_some()
+                                && ec2_manager::syntax::viewed_file(cmd).is_some_and(|(c, _)| {
+                                    matches!(c.as_str(), "vi" | "vim" | "nvim")
+                                });
                             let ext = ec2_manager::syntax::viewed_ext(cmd)
                                 .or_else(|| ec2_manager::syntax::viewed_ext(&session.input_line_buf));
                             session.view_ext = ext;
@@ -40865,6 +40905,7 @@ mod gui {
                                                             if session.view_was_alt && !on_alt {
                                                                 session.view_ext = None;
                                                                 session.view_file = None;
+                                                                session.view_is_vim = false;
                                                             }
                                                             session.view_was_alt = on_alt;
                                                             let syn = session.view_ext.as_deref().filter(|_| !syntax_off).map(|ext| {
@@ -46839,6 +46880,7 @@ mod gui {
             input_line_buf: String::new(),
             view_ext: None,
             view_file: None,
+            view_is_vim: false,
             view_was_alt: false,
             pending_reprep: false,
             session_user_stack: Vec::new(),
