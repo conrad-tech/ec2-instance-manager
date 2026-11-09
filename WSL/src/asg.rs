@@ -550,6 +550,125 @@ pub fn instance_label(summary: InstanceSummary) -> String {
     format!("{}/{}", summary.serving, summary.total)
 }
 
+/// How many instances are protected from scale-in, over how many the group
+/// holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProtectionSummary {
+    pub protected: usize,
+    pub total: usize,
+}
+
+pub fn protection_summary(instances: &[AsgInstance]) -> ProtectionSummary {
+    ProtectionSummary {
+        protected: instances.iter().filter(|i| i.protected_from_scale_in).count(),
+        total: instances.len(),
+    }
+}
+
+/// The Instance protection cell's text: `protected/total`, or `no instances`
+/// in words for the same reason `instance_label` says it.
+pub fn protection_label(summary: ProtectionSummary) -> String {
+    if summary.total == 0 {
+        return "no instances".to_string();
+    }
+    format!("{}/{}", summary.protected, summary.total)
+}
+
+/// Where a group stands on instance protection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProtectionState {
+    /// Every instance is protected.
+    On,
+    /// No instance is protected.
+    Off,
+    /// Some are and some are not. Neither "on" nor "off" is true of it, and
+    /// folding it into either hides the half that disagrees.
+    Partial,
+    /// Nothing to protect.
+    Empty,
+}
+
+impl ProtectionState {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProtectionState::On => "on",
+            ProtectionState::Off => "off",
+            ProtectionState::Partial => "partial",
+            ProtectionState::Empty => "no instances",
+        }
+    }
+}
+
+pub fn protection_state(g: &AutoScalingGroup) -> ProtectionState {
+    let s = protection_summary(&g.instances);
+    if s.total == 0 {
+        ProtectionState::Empty
+    } else if s.protected == s.total {
+        ProtectionState::On
+    } else if s.protected == 0 {
+        ProtectionState::Off
+    } else {
+        ProtectionState::Partial
+    }
+}
+
+/// The dropdown row for a group: `on - name`, `off - name`.
+pub fn protection_choice_label(g: &AutoScalingGroup) -> String {
+    format!("{} - {}", protection_state(g).label(), g.name)
+}
+
+/// What the selected groups' states add up to, for the confirmation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProtectionMix {
+    pub on: usize,
+    pub off: usize,
+    pub partial: usize,
+    pub empty: usize,
+}
+
+impl ProtectionMix {
+    /// More than one kind of group among those that hold instances. An empty
+    /// group says nothing either way, so it never makes a selection "mixed".
+    pub fn is_mixed(self) -> bool {
+        [self.on, self.off, self.partial].iter().filter(|n| **n > 0).count() > 1
+            || self.partial > 0
+    }
+}
+
+pub fn protection_mix<'a>(groups: impl IntoIterator<Item = &'a AutoScalingGroup>) -> ProtectionMix {
+    let mut mix = ProtectionMix::default();
+    for g in groups {
+        match protection_state(g) {
+            ProtectionState::On => mix.on += 1,
+            ProtectionState::Off => mix.off += 1,
+            ProtectionState::Partial => mix.partial += 1,
+            ProtectionState::Empty => mix.empty += 1,
+        }
+    }
+    mix
+}
+
+/// The instances protection is set on: everything the group holds except
+/// those on their way out. `set-instance-protection` refuses an instance that
+/// is already terminating, and one such instance would fail the whole call.
+pub fn protectable_instance_ids(g: &AutoScalingGroup) -> Vec<String> {
+    g.instances
+        .iter()
+        .filter(|i| {
+            let state = i.lifecycle_state.to_ascii_lowercase();
+            !(state.starts_with("terminat") || state.starts_with("detach") || state.contains("warmed"))
+        })
+        .map(|i| i.instance_id.clone())
+        .filter(|id| is_instance_id(id))
+        .collect()
+}
+
+/// `i-` and hex, nothing else: the id goes straight onto a command line.
+fn is_instance_id(id: &str) -> bool {
+    id.strip_prefix("i-")
+        .is_some_and(|rest| !rest.is_empty() && rest.len() <= 17 && rest.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 /// `MaxInstanceLifetime` of `0` means **no limit**, not zero seconds.
 ///
 /// Rendering the raw number puts `0s` next to a field whose other values are
@@ -601,6 +720,7 @@ pub fn asg_searchable_text(g: &AutoScalingGroup) -> String {
     push(&g.launch_source.label());
     push(g.launch_source.name());
     push(&instance_label(instance_summary(&g.instances)));
+    push(&protection_label(protection_summary(&g.instances)));
     for n in [g.min_size, g.max_size, g.desired_capacity] {
         push(&n.to_string());
     }
@@ -945,6 +1065,47 @@ pub fn set_capacity(
         ],
     )?;
     Ok(())
+}
+
+/// The API takes at most this many instance ids per call.
+const PROTECTION_BATCH: usize = 50;
+
+/// Turn scale-in protection on or off for the given instances of one group.
+///
+/// **The only call here that sets protection**, and it reaches
+/// `set-instance-protection` from this one place only. It changes instances
+/// that exist now: instances the group launches later take the group's own
+/// `NewInstancesProtectedFromScaleIn`, which this does not touch.
+pub fn set_instance_protection(
+    profile: &str,
+    region: &str,
+    group_name: &str,
+    instance_ids: &[String],
+    protect: bool,
+) -> std::result::Result<usize, FetchError> {
+    if instance_ids.iter().any(|id| !is_instance_id(id)) {
+        return Err(FetchError::Failed(format!(
+            "refusing to change protection on {group_name}: an instance id is not valid"
+        )));
+    }
+    let flag = if protect {
+        "--protected-from-scale-in"
+    } else {
+        "--no-protected-from-scale-in"
+    };
+    for chunk in instance_ids.chunks(PROTECTION_BATCH) {
+        let mut args: Vec<&str> = vec![
+            "autoscaling",
+            "set-instance-protection",
+            "--auto-scaling-group-name",
+            group_name,
+            flag,
+            "--instance-ids",
+        ];
+        args.extend(chunk.iter().map(String::as_str));
+        run(profile, region, &args)?;
+    }
+    Ok(instance_ids.len())
 }
 
 #[cfg(test)]
@@ -1639,5 +1800,88 @@ mod tests {
         assert!(parse_scaling_policies("{").is_empty());
         assert!(parse_scheduled_actions(r#"{"Nope":[]}"#).is_empty());
         assert!(parse_scaling_activities("").is_empty());
+    }
+
+    fn protected_group(flags: &[bool]) -> AutoScalingGroup {
+        AutoScalingGroup {
+            name: "vault".to_string(),
+            instances: flags
+                .iter()
+                .enumerate()
+                .map(|(i, p)| AsgInstance {
+                    instance_id: format!("i-{i:017x}"),
+                    lifecycle_state: "InService".to_string(),
+                    health_status: "Healthy".to_string(),
+                    protected_from_scale_in: *p,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn protection_reads_as_x_of_y_and_empty_in_words() {
+        let g = protected_group(&[true, false, true]);
+        assert_eq!(protection_label(protection_summary(&g.instances)), "2/3");
+        assert_eq!(protection_label(protection_summary(&[])), "no instances");
+        assert!(asg_searchable_text(&g).contains("2/3"));
+    }
+
+    #[test]
+    fn a_group_is_on_only_when_every_instance_is_protected() {
+        assert_eq!(protection_state(&protected_group(&[true, true])), ProtectionState::On);
+        assert_eq!(protection_state(&protected_group(&[false, false])), ProtectionState::Off);
+        assert_eq!(protection_state(&protected_group(&[true, false])), ProtectionState::Partial);
+        assert_eq!(protection_state(&protected_group(&[])), ProtectionState::Empty);
+        assert_eq!(
+            protection_choice_label(&protected_group(&[true])),
+            "on - vault"
+        );
+        assert_eq!(
+            protection_choice_label(&protected_group(&[false])),
+            "off - vault"
+        );
+    }
+
+    #[test]
+    fn a_selection_is_mixed_when_groups_disagree_and_empty_ones_say_nothing() {
+        let on = protected_group(&[true]);
+        let off = protected_group(&[false]);
+        let part = protected_group(&[true, false]);
+        let empty = protected_group(&[]);
+        assert!(!protection_mix([&on, &on, &empty]).is_mixed());
+        assert!(!protection_mix([&off, &empty]).is_mixed());
+        assert!(protection_mix([&on, &off]).is_mixed());
+        // One partial group is already mixed: it disagrees with itself.
+        assert!(protection_mix([&part]).is_mixed());
+        let mix = protection_mix([&on, &off, &part, &empty]);
+        assert_eq!((mix.on, mix.off, mix.partial, mix.empty), (1, 1, 1, 1));
+    }
+
+    #[test]
+    fn instances_on_their_way_out_are_left_alone() {
+        let mut g = protected_group(&[false, false, false]);
+        g.instances[1].lifecycle_state = "Terminating".to_string();
+        g.instances[2].lifecycle_state = "Detaching".to_string();
+        assert_eq!(protectable_instance_ids(&g), vec![g.instances[0].instance_id.clone()]);
+    }
+
+    #[test]
+    fn an_odd_instance_id_is_refused_before_anything_runs() {
+        let bad = vec!["i-abc; rm -rf /".to_string()];
+        assert!(set_instance_protection("p", "us-east-1", "vault", &bad, true).is_err());
+        let mut g = protected_group(&[false]);
+        g.instances[0].instance_id = "not-an-id".to_string();
+        assert!(protectable_instance_ids(&g).is_empty());
+    }
+
+    /// `set-instance-protection` is reached from exactly one place.
+    #[test]
+    fn set_instance_protection_has_exactly_one_call_site() {
+        let src = include_str!("asg.rs");
+        let live = &src[..src.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let needle = format!("\"set-{}\"", "instance-protection");
+        assert_eq!(live.matches(&needle).count(), 1);
     }
 }

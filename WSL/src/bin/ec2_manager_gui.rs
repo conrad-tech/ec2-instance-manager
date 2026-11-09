@@ -990,6 +990,20 @@ mod gui {
         /// A capacity edit finished. `Ok` carries the sentence for the
         /// status line; `Err` carries the failure, which is also logged at
         /// error level.
+        /// One account's groups for the Instance Protection dialog.
+        AsgProtectionLoaded {
+            profile_id: String,
+            result: std::result::Result<(PoolAccount, Vec<AutoScalingGroup>), String>,
+        },
+        AsgProtectionDone {
+            protect: bool,
+            outcomes: Vec<AsgProtectionOutcome>,
+        },
+        AsgRefreshDone {
+            arn: String,
+            name: String,
+            result: std::result::Result<String, String>,
+        },
         AsgCapacityDone {
             arn: String,
             name: String,
@@ -2875,6 +2889,66 @@ mod gui {
     /// red one is not — but its own constant, because nothing says the two
     /// have to move together.
     const ASG_CAPACITY_OK_BANNER: Duration = Duration::from_secs(30);
+
+    /// One account's auto scaling groups as the Instance Protection dialog
+    /// read them. The dialog fetches for itself rather than borrowing the
+    /// table's cache: it must be able to look at accounts the page is not
+    /// showing, and it should be acting on fresh numbers.
+    enum ProtectionLoad {
+        Loading,
+        Loaded {
+            account: PoolAccount,
+            groups: Vec<AutoScalingGroup>,
+        },
+        Failed(String),
+    }
+
+    enum ProtectionStage {
+        Pick,
+        /// Turning protection on (`true`) or off (`false`), waiting for the
+        /// user to confirm.
+        Confirm { protect: bool },
+        Running,
+        Done(Vec<String>),
+    }
+
+    /// The "Instance Protection" dialog: choose accounts, filter, tick the
+    /// groups, turn protection on or off.
+    struct AsgProtectionDialog {
+        /// Profile ids of the accounts being looked at.
+        checked: Vec<String>,
+        filter: String,
+        accounts: HashMap<String, ProtectionLoad>,
+        /// ARNs of the ticked groups.
+        selected: HashSet<String>,
+        stage: ProtectionStage,
+    }
+
+    struct AsgProtectionTarget {
+        account: PoolAccount,
+        group: AutoScalingGroup,
+    }
+
+    struct AsgProtectionOutcome {
+        name: String,
+        arn: String,
+        account_id: String,
+        region: String,
+        /// Instances changed; `Ok(0)` is a group holding nothing to change.
+        result: std::result::Result<usize, String>,
+    }
+
+    /// A refresh the user asked for and has not yet agreed to.
+    struct AsgRefreshConfirm {
+        arn: String,
+        name: String,
+        account_id: String,
+        profile: String,
+        region: String,
+        protected: usize,
+        total: usize,
+        confirmed: bool,
+    }
 
     /// The Start / Stop / Restart status line above the inventory table.
     struct PowerStatus {
@@ -12420,6 +12494,8 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         /// would otherwise both pass the check.
         asg_capacity_in_flight: Arc<Mutex<HashSet<String>>>,
         asg_capacity_status: Option<AsgCapacityStatus>,
+        asg_protection_dialog: Option<Box<AsgProtectionDialog>>,
+        asg_refresh_confirm: Option<Box<AsgRefreshConfirm>>,
         /// Buckets per cache key — the same arrangement as the other lists,
         /// except that S3 is global so the key carries no region and one
         /// account checked in two regions maps to ONE entry. See
@@ -13706,6 +13782,8 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 asg_capacity_edit: None,
                 asg_capacity_in_flight: Arc::new(Mutex::new(HashSet::new())),
                 asg_capacity_status: None,
+                asg_protection_dialog: None,
+                asg_refresh_confirm: None,
                 buckets: HashMap::new(),
                 bucket_list_loading: HashSet::new(),
                 bucket_list_errors: HashMap::new(),
@@ -25402,6 +25480,8 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 || self.pending_script_delete.is_some()
                 || self.power_confirm.is_some()
                 || self.asg_capacity_edit.is_some()
+                || self.asg_protection_dialog.is_some()
+                || self.asg_refresh_confirm.is_some()
                 || (self.default_scripts.is_empty()
                     && self.config.personal_scripts.is_empty())
             {
@@ -30752,6 +30832,124 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                             }
                             Err(err) => {
                                 self.log_error(format!("asg capacity {name}: {err}"));
+                                self.asg_capacity_status = Some(AsgCapacityStatus {
+                                    name,
+                                    text: err,
+                                    state: ScriptState::Failed,
+                                    settled_at: Some(Instant::now()),
+                                });
+                            }
+                        }
+                    }
+                    ProcEvent::AsgProtectionLoaded { profile_id, result } => {
+                        if let Some(dlg) = self.asg_protection_dialog.as_mut() {
+                            // Only an account still being looked at: a reply
+                            // for one unticked meanwhile is dropped.
+                            if dlg.checked.contains(&profile_id) {
+                                dlg.accounts.insert(
+                                    profile_id,
+                                    match result {
+                                        Ok((account, groups)) => {
+                                            ProtectionLoad::Loaded { account, groups }
+                                        }
+                                        Err(e) => ProtectionLoad::Failed(e),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    ProcEvent::AsgProtectionDone { protect, outcomes } => {
+                        let verb = if protect { "on" } else { "off" };
+                        if let Ok(mut guard) = self.asg_capacity_in_flight.lock() {
+                            for o in &outcomes {
+                                guard.remove(&o.arn);
+                            }
+                        }
+                        let mode = self.options.mode.as_str().to_string();
+                        let mut lines = Vec::new();
+                        let mut failed: Vec<String> = Vec::new();
+                        let mut done = 0usize;
+                        for o in &outcomes {
+                            match &o.result {
+                                Ok(0) => lines.push(format!("{}: holds no instances, nothing to change", o.name)),
+                                Ok(n) => {
+                                    done += 1;
+                                    lines.push(format!("{}: protection turned {verb} on {n} instance(s)", o.name));
+                                }
+                                Err(e) => {
+                                    failed.push(format!("{} ({e})", o.name));
+                                    lines.push(format!("{}: FAILED - {e}", o.name));
+                                }
+                            }
+                        }
+                        for line in &lines {
+                            self.log_warn(format!("asg instance protection: {line}"));
+                        }
+                        // The table's x/x is wrong the moment this lands.
+                        // Backdated rather than removed, for the reason the
+                        // capacity edit gives.
+                        if let Some(stale) = Instant::now().checked_sub(resources::RESOURCE_TTL) {
+                            for o in &outcomes {
+                                let key = PoolAccount {
+                                    profile: String::new(),
+                                    account_id: o.account_id.clone(),
+                                    region: o.region.clone(),
+                                    authed: true,
+                                }
+                                .cache_key(ResourceKind::Asg, &mode);
+                                if let Some((at, _)) = self.asgs.get_mut(&key) {
+                                    *at = stale;
+                                }
+                                self.asg_list_failures.remove(&key);
+                            }
+                        }
+                        let total = outcomes.len();
+                        let (text, state) = if failed.is_empty() {
+                            (
+                                format!("protection turned {verb} for {done} of {total} group(s)"),
+                                ScriptState::Ok,
+                            )
+                        } else {
+                            let why: String = failed.join("; ").chars().take(220).collect();
+                            (
+                                format!(
+                                    "protection turned {verb} for {done} of {total} group(s); failed: {why}"
+                                ),
+                                ScriptState::Failed,
+                            )
+                        };
+                        self.asg_capacity_status = Some(AsgCapacityStatus {
+                            name: "Instance protection".to_string(),
+                            text,
+                            state,
+                            settled_at: Some(Instant::now()),
+                        });
+                        if let Some(dlg) = self.asg_protection_dialog.as_mut() {
+                            dlg.stage = ProtectionStage::Done(lines);
+                            // Reloaded on the next frame, so the list shows
+                            // what AWS now says.
+                            dlg.accounts.clear();
+                            dlg.selected.clear();
+                        }
+                    }
+                    ProcEvent::AsgRefreshDone { arn, name, result } => {
+                        if let Ok(mut guard) = self.asg_capacity_in_flight.lock() {
+                            guard.remove(&arn);
+                        }
+                        match result {
+                            Ok(id) => {
+                                self.log_warn(format!(
+                                    "asg instance refresh {name}: started (refresh id {id})"
+                                ));
+                                self.asg_capacity_status = Some(AsgCapacityStatus {
+                                    name,
+                                    text: format!("instance refresh started (id {id})"),
+                                    state: ScriptState::Ok,
+                                    settled_at: Some(Instant::now()),
+                                });
+                            }
+                            Err(err) => {
+                                self.log_error(format!("asg instance refresh {name}: {err}"));
                                 self.asg_capacity_status = Some(AsgCapacityStatus {
                                     name,
                                     text: err,
@@ -38110,6 +38308,699 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
 
 
 
+        /// Open the Instance Protection dialog. `preset` is the group the
+        /// details page was showing: its account is ticked, its name is the
+        /// filter and it is ticked, so the common case is one click to confirm.
+        fn open_asg_protection_dialog(&mut self, preset: Option<&AutoScalingGroup>) {
+            // Sim fakes credentials, so this is refused on the MODE, as the
+            // capacity edit is.
+            if self.options.mode != Mode::Live {
+                self.message =
+                    "Instance protection is Live-mode only (this profile is Sim)".to_string();
+                self.log_warn(self.message.clone());
+                return;
+            }
+            // The page's own accounts: the selected profile plus every
+            // multi-account lookup tick. With none ticked that is just the
+            // selected one.
+            let mut checked: Vec<String> = Vec::new();
+            if let Some(pid) = self.selected_profile.clone() {
+                checked.push(pid);
+            }
+            let mut extra: Vec<String> = self.multi_account_ids.iter().cloned().collect();
+            extra.sort();
+            for pid in extra {
+                if !checked.contains(&pid) {
+                    checked.push(pid);
+                }
+            }
+            let mut filter = String::new();
+            let mut selected = HashSet::new();
+            if let Some(g) = preset {
+                if let Some(p) = self
+                    .config
+                    .profiles
+                    .iter()
+                    .find(|p| p.account_id == g.account_id || p.profile_id == g.account_id)
+                {
+                    checked = vec![p.profile_id.clone()];
+                }
+                filter = g.name.clone();
+                selected.insert(g.arn.clone());
+            }
+            checked.retain(|pid| self.script_env_auth(pid) == AuthStatus::Ok);
+            self.asg_protection_dialog = Some(Box::new(AsgProtectionDialog {
+                checked,
+                filter,
+                accounts: HashMap::new(),
+                selected,
+                stage: ProtectionStage::Pick,
+            }));
+        }
+
+        /// Read one account's groups for the dialog, on a thread. The context
+        /// is built there because it asks STS who the credentials belong to.
+        fn spawn_asg_protection_load(&self, profile_id: &str) {
+            let mode = self.options.mode.clone();
+            let config = self.config.clone();
+            let region_override = refresh_region_override(
+                &self.config.profiles,
+                self.selected_profile.as_deref(),
+                self.options.region.as_deref(),
+                profile_id,
+            )
+            .map(|source| source.region().to_string());
+            let tx = self.proc_tx.clone();
+            let repaint = self.egui_ctx.clone();
+            let pid = profile_id.to_string();
+            std::thread::spawn(move || {
+                let result = (|| {
+                    let ctx = build_context_with_profile(
+                        mode,
+                        &config,
+                        region_override.as_deref(),
+                        Some(&pid),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let account_id = ctx
+                        .account_id
+                        .clone()
+                        .filter(|_| ctx.auth_status == AuthStatus::Ok)
+                        .ok_or_else(|| {
+                            "credentials are not valid for this account - renew them first"
+                                .to_string()
+                        })?;
+                    let groups =
+                        asg::fetch_auto_scaling_groups(&ctx.profile, &ctx.region, &account_id)
+                            .map_err(|e| e.message())?;
+                    Ok((
+                        PoolAccount {
+                            profile: ctx.profile.to_string(),
+                            account_id,
+                            region: ctx.region.clone(),
+                            authed: true,
+                        },
+                        groups,
+                    ))
+                })();
+                let _ = tx.send(ProcEvent::AsgProtectionLoaded {
+                    profile_id: pid,
+                    result,
+                });
+                if let Some(c) = &repaint {
+                    c.request_repaint();
+                }
+            });
+        }
+
+        fn render_asg_protection_dialog(&mut self, ctx: &egui::Context) {
+            let Some(mut dlg) = self.asg_protection_dialog.take() else {
+                return;
+            };
+            // Re-checked here, not trusted from the click that opened it.
+            if self.options.mode != Mode::Live {
+                return;
+            }
+            let mut profiles: Vec<(String, String)> = self
+                .config
+                .profiles
+                .iter()
+                .filter(|p| self.script_env_auth(&p.profile_id) == AuthStatus::Ok)
+                .map(|p| (p.profile_id.clone(), self.profile_display_name(&p.profile_id)))
+                .collect();
+            profiles.sort_by_key(|(_, name)| name.to_lowercase());
+            let name_of = |pid: &str| -> String {
+                profiles
+                    .iter()
+                    .find(|(p, _)| p == pid)
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_else(|| pid.to_string())
+            };
+
+            // Anything ticked and not yet read is read now.
+            let to_load: Vec<String> = dlg
+                .checked
+                .iter()
+                .filter(|pid| !dlg.accounts.contains_key(*pid))
+                .cloned()
+                .collect();
+            for pid in to_load {
+                dlg.accounts.insert(pid.clone(), ProtectionLoad::Loading);
+                self.spawn_asg_protection_load(&pid);
+            }
+            let loading = dlg
+                .checked
+                .iter()
+                .any(|pid| matches!(dlg.accounts.get(pid), Some(ProtectionLoad::Loading)));
+            if loading {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+
+            // The same include matching the Inventory search box uses.
+            let matchers = build_matchers(&[dlg.filter.trim().to_string()]);
+            let mut rows: Vec<(String, AutoScalingGroup)> = Vec::new();
+            for pid in &dlg.checked {
+                if let Some(ProtectionLoad::Loaded { groups, .. }) = dlg.accounts.get(pid) {
+                    for g in groups {
+                        if text_matches(&asg::asg_searchable_text(g), &matchers, &[]) {
+                            rows.push((pid.clone(), g.clone()));
+                        }
+                    }
+                }
+            }
+            rows.sort_by(|a, b| {
+                a.1.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.1.name.to_ascii_lowercase())
+                    .then_with(|| a.1.account_id.cmp(&b.1.account_id))
+            });
+            // A ticked group the filter or an unticked account has hidden is
+            // dropped, so what is ticked is always what is on screen. Held
+            // back while anything is still loading, or a preset would be
+            // dropped before its account answered.
+            if !loading && matches!(dlg.stage, ProtectionStage::Pick) {
+                let visible: HashSet<&String> = rows.iter().map(|(_, g)| &g.arn).collect();
+                dlg.selected.retain(|arn| visible.contains(arn));
+            }
+            // Every loaded group, whatever the filter: what Confirm and Run
+            // act on is what is ticked.
+            let chosen: Vec<AutoScalingGroup> = dlg
+                .checked
+                .iter()
+                .filter_map(|pid| match dlg.accounts.get(pid) {
+                    Some(ProtectionLoad::Loaded { groups, .. }) => Some(groups),
+                    _ => None,
+                })
+                .flatten()
+                .filter(|g| dlg.selected.contains(&g.arn))
+                .cloned()
+                .collect();
+
+            let mut open = true;
+            let mut close = false;
+            let mut go_confirm: Option<bool> = None;
+            let mut run: Option<bool> = None;
+            let mut back = false;
+            let mut reload = false;
+
+            egui::Window::new("Instance Protection")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(560.0)
+                .open(&mut open)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
+                .show(ctx, |ui| match &dlg.stage {
+                    ProtectionStage::Pick => {
+                        ui.horizontal(|ui| {
+                            ui.label("Account(s):");
+                            let label = if dlg.checked.is_empty() {
+                                "none".to_string()
+                            } else {
+                                dlg.checked
+                                    .iter()
+                                    .map(|p| name_of(p))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            };
+                            egui::ComboBox::from_id_salt("asg_protection_accounts")
+                                .selected_text(label)
+                                .show_ui(ui, |ui| {
+                                    for (pid, display) in &profiles {
+                                        let mut on = dlg.checked.contains(pid);
+                                        if ui.checkbox(&mut on, display).changed() {
+                                            if on {
+                                                dlg.checked.push(pid.clone());
+                                            } else {
+                                                dlg.checked.retain(|p| p != pid);
+                                            }
+                                        }
+                                    }
+                                });
+                            if ui
+                                .button("Reload")
+                                .on_hover_text("Read the groups again from AWS")
+                                .clicked()
+                            {
+                                reload = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Filter:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut dlg.filter)
+                                    .hint_text("e.g. vault")
+                                    .desired_width(280.0),
+                            );
+                        });
+                        for pid in &dlg.checked {
+                            match dlg.accounts.get(pid) {
+                                Some(ProtectionLoad::Loading) => {
+                                    note_label(
+                                        ui,
+                                        ui.visuals().warn_fg_color,
+                                        format!("Loading {}...", name_of(pid)),
+                                    );
+                                }
+                                Some(ProtectionLoad::Failed(e)) => {
+                                    note_label(
+                                        ui,
+                                        ui.visuals().error_fg_color,
+                                        format!("{}: {e}", name_of(pid)),
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "{} shown - {} ticked",
+                                rows.len(),
+                                dlg.selected.len()
+                            ));
+                            if ui.button("Tick all shown").clicked() {
+                                for (_, g) in &rows {
+                                    dlg.selected.insert(g.arn.clone());
+                                }
+                            }
+                            if ui.button("Clear ticks").clicked() {
+                                dlg.selected.clear();
+                            }
+                        });
+                        let several = dlg.checked.len() > 1;
+                        egui::ScrollArea::vertical()
+                            .max_height(320.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                if rows.is_empty() && !loading {
+                                    ui.label("No auto scaling groups match.");
+                                }
+                                for (pid, g) in &rows {
+                                    let mut on = dlg.selected.contains(&g.arn);
+                                    let summary = asg::protection_summary(&g.instances);
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .checkbox(&mut on, asg::protection_choice_label(g))
+                                            .on_hover_text(format!(
+                                                "{} of {} instance(s) protected from scale-in",
+                                                summary.protected, summary.total
+                                            ))
+                                            .changed()
+                                        {
+                                            if on {
+                                                dlg.selected.insert(g.arn.clone());
+                                            } else {
+                                                dlg.selected.remove(&g.arn);
+                                            }
+                                        }
+                                        if several {
+                                            ui.label(
+                                                egui::RichText::new(name_of(pid)).weak(),
+                                            );
+                                        }
+                                    });
+                                }
+                            });
+                        ui.separator();
+                        let any = !dlg.selected.is_empty();
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(any, egui::Button::new("Turn on"))
+                                .on_hover_text("Protect every instance in the ticked groups from scale-in")
+                                .clicked()
+                            {
+                                go_confirm = Some(true);
+                            }
+                            if ui
+                                .add_enabled(any, egui::Button::new("Turn off"))
+                                .on_hover_text("Remove scale-in protection from every instance in the ticked groups")
+                                .clicked()
+                            {
+                                go_confirm = Some(false);
+                            }
+                            if ui.button("Close").clicked() {
+                                close = true;
+                            }
+                        });
+                    }
+                    ProtectionStage::Confirm { protect } => {
+                        let protect = *protect;
+                        let verb = if protect { "on" } else { "off" };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Turn instance protection {verb} for {} group(s)?",
+                                chosen.len()
+                            ))
+                            .strong(),
+                        );
+                        let mix = asg::protection_mix(chosen.iter());
+                        if mix.is_mixed() {
+                            note_label(
+                                ui,
+                                ui.visuals().warn_fg_color,
+                                format!(
+                                    "The ticked groups are not all the same: {} on, {} off, {} \
+                                     partly protected. Every instance in all of them will be set \
+                                     {verb}.",
+                                    mix.on, mix.off, mix.partial
+                                ),
+                            );
+                        }
+                        let instances: usize =
+                            chosen.iter().map(|g| asg::protectable_instance_ids(g).len()).sum();
+                        ui.label(format!("{instances} instance(s) will be set {verb}."));
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for g in &chosen {
+                                    ui.label(format!(
+                                        "{}  ({})",
+                                        asg::protection_choice_label(g),
+                                        asg::protection_label(asg::protection_summary(&g.instances))
+                                    ));
+                                }
+                            });
+                        ui.label(
+                            egui::RichText::new(
+                                "Applies to the instances running now. Instances a group \
+                                 launches later are not changed.",
+                            )
+                            .weak(),
+                        );
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button(format!("Confirm - turn {verb}")).clicked() {
+                                run = Some(protect);
+                            }
+                            if ui.button("Back").clicked() {
+                                back = true;
+                            }
+                        });
+                    }
+                    ProtectionStage::Running => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Applying...");
+                        });
+                        ctx.request_repaint_after(Duration::from_millis(200));
+                    }
+                    ProtectionStage::Done(lines) => {
+                        egui::ScrollArea::vertical()
+                            .max_height(260.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for line in lines {
+                                    ui.label(line);
+                                }
+                            });
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("Back to the list").clicked() {
+                                back = true;
+                            }
+                            if ui.button("Close").clicked() {
+                                close = true;
+                            }
+                        });
+                    }
+                });
+
+            if reload {
+                dlg.accounts.clear();
+            }
+            if let Some(protect) = go_confirm {
+                dlg.stage = ProtectionStage::Confirm { protect };
+            }
+            if back {
+                dlg.stage = ProtectionStage::Pick;
+            }
+            if let Some(protect) = run {
+                self.start_asg_protection_run(&mut dlg, protect);
+            }
+            if open && !close {
+                self.asg_protection_dialog = Some(dlg);
+            }
+        }
+
+        /// Spawn the worker for a confirmed protection change.
+        fn start_asg_protection_run(&mut self, dlg: &mut AsgProtectionDialog, protect: bool) {
+            let verb = if protect { "on" } else { "off" };
+            if self.options.mode != Mode::Live {
+                dlg.stage = ProtectionStage::Done(vec!["Live mode only.".to_string()]);
+                return;
+            }
+            let mut wanted: Vec<AsgProtectionTarget> = Vec::new();
+            for pid in &dlg.checked {
+                if let Some(ProtectionLoad::Loaded { account, groups }) = dlg.accounts.get(pid) {
+                    for g in groups {
+                        if dlg.selected.contains(&g.arn) {
+                            wanted.push(AsgProtectionTarget {
+                                account: account.clone(),
+                                group: g.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            // Claimed before the spawn, for the reason the capacity edit
+            // claims. Scoped so the guard is gone before any `&mut self` call.
+            let mut already: Vec<String> = Vec::new();
+            let targets: Vec<AsgProtectionTarget> = match self.asg_capacity_in_flight.lock() {
+                Ok(mut guard) => wanted
+                    .into_iter()
+                    .filter(|t| {
+                        if guard.insert(t.group.arn.clone()) {
+                            true
+                        } else {
+                            already.push(t.group.name.clone());
+                            false
+                        }
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            if targets.is_empty() {
+                let mut lines = vec!["Nothing was started.".to_string()];
+                for name in already {
+                    lines.push(format!("{name}: another change is already running"));
+                }
+                dlg.stage = ProtectionStage::Done(lines);
+                return;
+            }
+            let names: Vec<String> = targets.iter().map(|t| t.group.name.clone()).collect();
+            self.log_warn(format!(
+                "asg instance protection: turning {verb} for {} group(s) requested by the user: {}",
+                targets.len(),
+                names.join(", ")
+            ));
+            self.asg_capacity_status = Some(AsgCapacityStatus {
+                name: "Instance protection".to_string(),
+                text: format!("turning {verb} for {} group(s)...", targets.len()),
+                state: ScriptState::Running,
+                settled_at: None,
+            });
+            dlg.stage = ProtectionStage::Running;
+            let tx = self.proc_tx.clone();
+            let egui_ctx = self.egui_ctx.clone();
+            let in_flight = Arc::clone(&self.asg_capacity_in_flight);
+            std::thread::spawn(move || {
+                let mut outcomes = Vec::new();
+                for t in targets {
+                    let ids = asg::protectable_instance_ids(&t.group);
+                    let result = if ids.is_empty() {
+                        Ok(0)
+                    } else {
+                        asg::set_instance_protection(
+                            &t.account.profile,
+                            &t.account.region,
+                            &t.group.name,
+                            &ids,
+                            protect,
+                        )
+                        .map_err(|e| e.message())
+                    };
+                    if let Ok(mut guard) = in_flight.lock() {
+                        guard.remove(&t.group.arn);
+                    }
+                    outcomes.push(AsgProtectionOutcome {
+                        name: t.group.name.clone(),
+                        arn: t.group.arn.clone(),
+                        account_id: t.account.account_id.clone(),
+                        region: t.account.region.clone(),
+                        result,
+                    });
+                }
+                let _ = tx.send(ProcEvent::AsgProtectionDone { protect, outcomes });
+                if let Some(c) = &egui_ctx {
+                    c.request_repaint();
+                }
+            });
+        }
+
+        /// "Start Instance Refresh" was picked on the details page. Raises
+        /// the confirmation; nothing reaches AWS until it is agreed to.
+        fn request_asg_refresh(&mut self, group: &AutoScalingGroup) {
+            if self
+                .asg_capacity_in_flight
+                .lock()
+                .map(|g| g.contains(&group.arn))
+                .unwrap_or(false)
+            {
+                self.message = format!("{}: a change is already running", group.name);
+                self.log_warn(self.message.clone());
+                return;
+            }
+            if self.options.mode != Mode::Live {
+                self.message =
+                    "Instance refresh is Live-mode only (this profile is Sim)".to_string();
+                self.log_warn(self.message.clone());
+                return;
+            }
+            let Some(account) = self
+                .resource_pool_accounts()
+                .into_iter()
+                .find(|a| a.account_id == group.account_id)
+            else {
+                self.message = format!("no AWS context for account {}", group.account_id);
+                self.log_error(self.message.clone());
+                return;
+            };
+            if !account.authed {
+                self.message = format!(
+                    "account {} is not authorized - renew credentials first",
+                    group.account_id
+                );
+                self.log_warn(self.message.clone());
+                return;
+            }
+            let summary = asg::protection_summary(&group.instances);
+            self.asg_refresh_confirm = Some(Box::new(AsgRefreshConfirm {
+                arn: group.arn.clone(),
+                name: group.name.clone(),
+                account_id: group.account_id.clone(),
+                profile: account.profile.clone(),
+                region: account.region.clone(),
+                protected: summary.protected,
+                total: summary.total,
+                confirmed: false,
+            }));
+        }
+
+        fn render_asg_refresh_confirm(&mut self, ctx: &egui::Context) {
+            let Some(mut pending) = self.asg_refresh_confirm.take() else {
+                return;
+            };
+            let mut open = true;
+            let mut start = false;
+            let mut cancel = false;
+            egui::Window::new("Start instance refresh")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
+                .show(ctx, |ui| {
+                    ui.label(egui::RichText::new(&pending.name).strong());
+                    ui.label(format!(
+                        "Account {} - region {}",
+                        pending.account_id, pending.region
+                    ));
+                    ui.add_space(4.0);
+                    ui.label(
+                        "Replaces every instance in the group, a few at a time: a new one is \
+                         launched before an old one is terminated (100% minimum healthy, 110% \
+                         maximum). It runs in AWS and can take a long while.",
+                    );
+                    if pending.protected > 0 {
+                        note_label(
+                            ui,
+                            ui.visuals().warn_fg_color,
+                            format!(
+                                "{} of {} instance(s) are protected from scale-in. By default AWS \
+                                 waits for protection to be removed before replacing them, so the \
+                                 refresh can stall until it is.",
+                                pending.protected, pending.total
+                            ),
+                        );
+                    }
+                    ui.add_space(6.0);
+                    ui.checkbox(
+                        &mut pending.confirmed,
+                        format!("Yes, start an instance refresh on {}", pending.name),
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(pending.confirmed, egui::Button::new("Start refresh"))
+                            .on_disabled_hover_text("Tick the box to enable this")
+                            .clicked()
+                        {
+                            start = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if start {
+                self.start_asg_refresh_run(*pending);
+            } else if !cancel && open {
+                self.asg_refresh_confirm = Some(pending);
+            }
+        }
+
+        fn start_asg_refresh_run(&mut self, pending: AsgRefreshConfirm) {
+            if !pending.confirmed {
+                self.log_error(format!(
+                    "asg instance refresh {}: refused at the last check",
+                    pending.name
+                ));
+                return;
+            }
+            let claimed = match self.asg_capacity_in_flight.lock() {
+                Ok(mut guard) => guard.insert(pending.arn.clone()),
+                Err(_) => false,
+            };
+            if !claimed {
+                self.log_warn(format!(
+                    "{}: a change is already running, refusing to start another",
+                    pending.name
+                ));
+                return;
+            }
+            self.log_warn(format!(
+                "asg instance refresh {}: requested by the user (account {} region {})",
+                pending.name, pending.account_id, pending.region
+            ));
+            self.asg_capacity_status = Some(AsgCapacityStatus {
+                name: pending.name.clone(),
+                text: "starting instance refresh...".to_string(),
+                state: ScriptState::Running,
+                settled_at: None,
+            });
+            let mode = self.options.mode.clone();
+            let tx = self.proc_tx.clone();
+            let egui_ctx = self.egui_ctx.clone();
+            let in_flight = Arc::clone(&self.asg_capacity_in_flight);
+            std::thread::spawn(move || {
+                let result =
+                    start_instance_refresh(&pending.profile, &pending.region, &pending.name, &mode);
+                if let Ok(mut guard) = in_flight.lock() {
+                    guard.remove(&pending.arn);
+                }
+                let _ = tx.send(ProcEvent::AsgRefreshDone {
+                    arn: pending.arn,
+                    name: pending.name,
+                    result,
+                });
+                if let Some(c) = &egui_ctx {
+                    c.request_repaint();
+                }
+            });
+        }
+
         /// Is the saved-filter dropdown asking for favorites only?
         ///
         /// Read live from `selected_saved_filter` rather than mirrored into a
@@ -39339,6 +40230,16 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                     self.asg_list_errors.clear();
                     self.asg_list_failures.clear();
                 }
+                if ui
+                    .button("Instance Protection")
+                    .on_hover_text(
+                        "Turn scale-in protection on or off for the instances of one or \
+                         more groups, across accounts. You pick the groups and confirm first.",
+                    )
+                    .clicked()
+                {
+                    self.open_asg_protection_dialog(None);
+                }
             });
 
             // Named accounts that could not be listed, shown even when others
@@ -39480,12 +40381,25 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                     tg_cell(ui, cw(5), TG_ROW_H, g.health_check_type.clone())
                                         .on_hover_text(asg_health_check_hover(g));
 
+                                let psum = asg::protection_summary(&g.instances);
+                                let r_protect = tg_cell(
+                                    ui,
+                                    cw(6),
+                                    TG_ROW_H,
+                                    asg::protection_label(psum),
+                                )
+                                .on_hover_text(format!(
+                                    "{} of {} instance(s) protected from scale-in",
+                                    psum.protected, psum.total
+                                ));
+
                                 let row = r_name
                                     .union(r_desired)
                                     .union(r_min)
                                     .union(r_max)
                                     .union(r_instances)
-                                    .union(r_health);
+                                    .union(r_health)
+                                    .union(r_protect);
                                 if row.hovered() || fav.hovered() {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                     ui.painter().rect_filled(
@@ -39636,6 +40550,8 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         ) {
             let st = self.asg_details.get(&g.arn).cloned().unwrap_or_default();
             let mut edit_capacity = false;
+            let mut start_refresh = false;
+            let mut edit_protection = false;
             ui.horizontal(|ui| {
                 ui.heading(title);
                 if ui.button("Copy All").clicked() {
@@ -39658,11 +40574,37 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 {
                     edit_capacity = true;
                 }
+                if ui
+                    .button("Start Instance Refresh")
+                    .on_hover_text(
+                        "Replace every instance in the group, launching the new one before \
+                         terminating the old. You are asked to confirm first.",
+                    )
+                    .clicked()
+                {
+                    start_refresh = true;
+                }
+                if ui
+                    .button("Edit Instance Protection")
+                    .on_hover_text(
+                        "Turn scale-in protection on or off for this group's instances. \
+                         Opens the Instance Protection dialog with this group ticked.",
+                    )
+                    .clicked()
+                {
+                    edit_protection = true;
+                }
             });
             // Raised after the row is drawn, so the borrow of `ui` above is
             // finished before this `&mut self` call.
             if edit_capacity {
                 self.request_asg_capacity(&g);
+            }
+            if start_refresh {
+                self.request_asg_refresh(&g);
+            }
+            if edit_protection {
+                self.open_asg_protection_dialog(Some(&g));
             }
             self.render_asg_capacity_status(ui);
             ui.separator();
@@ -39699,6 +40641,11 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                         }
                         ui.end_row();
 
+                        row(
+                            ui,
+                            "Instance protection",
+                            asg::protection_label(asg::protection_summary(&g.instances)),
+                        );
                         row(ui, "Health check", asg_health_check_hover(&g));
                         row(ui, "Launch", g.launch_source.label());
                         row(
@@ -44998,6 +45945,8 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 self.render_script_delete_confirm(ctx);
                 self.render_power_confirm(ctx);
                 self.render_asg_capacity_dialog(ctx);
+                self.render_asg_protection_dialog(ctx);
+                self.render_asg_refresh_confirm(ctx);
                 self.render_pat_dialog(ctx);
                 self.render_fed_stall_prompt(ctx);
                 self.render_script_result_popup(ctx);
@@ -58790,6 +59739,13 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 x.serving.cmp(&y.serving).then_with(|| x.total.cmp(&y.total))
             }
             5 => cmp_str(&a.health_check_type, &b.health_check_type),
+            6 => {
+                let (x, y) = (
+                    asg::protection_summary(&a.instances),
+                    asg::protection_summary(&b.instances),
+                );
+                x.protected.cmp(&y.protected).then_with(|| x.total.cmp(&y.total))
+            }
             _ => std::cmp::Ordering::Equal,
         }
     }
@@ -59213,19 +60169,26 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
     /// launch template, the zones, the subnets, the target groups and the
     /// account are all still searchable (`asg::asg_searchable_text`) and all
     /// still in the detail view — the same trade the other two tables made.
-    const ASG_COLUMN_LABELS: [&str; 6] =
-        ["Name", "Desired", "Min", "Max", "Instances", "Health check"];
+    const ASG_COLUMN_LABELS: [&str; 7] = [
+        "Name",
+        "Desired",
+        "Min",
+        "Max",
+        "Instances",
+        "Health check",
+        "Instance protection",
+    ];
 
-    const ASG_MIN_COL_W: [f32; 6] = [200.0, 60.0, 45.0, 45.0, 100.0, 100.0];
-    const ASG_MAX_COL_W: [f32; 6] = [560.0, 70.0, 60.0, 60.0, 130.0, 130.0];
+    const ASG_MIN_COL_W: [f32; 7] = [200.0, 60.0, 45.0, 45.0, 100.0, 100.0, 130.0];
+    const ASG_MAX_COL_W: [f32; 7] = [560.0, 70.0, 60.0, 60.0, 130.0, 130.0, 170.0];
 
     /// Each column sized to its widest cell and clamped — `tg_auto_widths` and
     /// `lb_auto_widths` for the other tables, and the same reasoning: sized to
     /// content with a horizontal scrollbar, never divided out of the window's
     /// width.
-    fn asg_auto_widths(rows: &[AutoScalingGroup]) -> [f32; 6] {
+    fn asg_auto_widths(rows: &[AutoScalingGroup]) -> [f32; 7] {
         let text_w = |s: &str| s.chars().count() as f32 * TG_CHAR_W + 8.0;
-        let mut out = [0.0f32; 6];
+        let mut out = [0.0f32; 7];
         for (idx, label) in ASG_COLUMN_LABELS.iter().enumerate() {
             out[idx] = text_w(label) + 6.0;
         }
@@ -59238,6 +60201,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 text_w(&g.max_size.to_string()),
                 text_w(&asg::instance_label(asg::instance_summary(&g.instances))),
                 text_w(&g.health_check_type),
+                text_w(&asg::protection_label(asg::protection_summary(&g.instances))),
             ];
             for (idx, w) in cells.iter().enumerate() {
                 out[idx] = out[idx].max(*w);
@@ -59491,6 +60455,10 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         out.push_str(&format!(
             "Instances: {}\n",
             asg::instance_label(asg::instance_summary(&g.instances))
+        ));
+        out.push_str(&format!(
+            "Instance protection: {}\n",
+            asg::protection_label(asg::protection_summary(&g.instances))
         ));
         out.push_str(&format!("Health check: {}\n", asg_health_check_hover(g)));
         out.push_str(&format!("Launch: {}\n", g.launch_source.label()));
@@ -74253,6 +75221,57 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert_eq!(
                 asc.iter().map(|z| z.id.as_str()).collect::<Vec<_>>(),
                 vec!["Z1", "Z2", "Z3"]
+            );
+        }
+
+        /// The Instance protection column sorts by how many are protected as a
+        /// number, then by how many the group holds.
+        #[test]
+        fn the_protection_column_sorts_as_numbers() {
+            let group = |flags: &[bool]| {
+                let mut g = asg_row("g");
+                g.instances = flags
+                    .iter()
+                    .map(|p| {
+                        let mut i = asg_instance("InService", "Healthy");
+                        i.protected_from_scale_in = *p;
+                        i
+                    })
+                    .collect();
+                g
+            };
+            let ten = group(&[true; 10]);
+            let two = group(&[true, true, false]);
+            assert_eq!(ASG_COLUMN_LABELS[6], "Instance protection");
+            assert_eq!(cmp_asgs(&two, &ten, 6), std::cmp::Ordering::Less);
+            assert_eq!(cmp_asgs(&ten, &two, 6), std::cmp::Ordering::Greater);
+        }
+
+        /// Protection is written from one place, and only after the dialog's
+        /// own Confirm step: `start_asg_protection_run` is reached from the
+        /// `run` flag that only the Confirm button sets, and the refresh only
+        /// from the confirmation window's Start button.
+        #[test]
+        fn instance_protection_and_refresh_only_run_after_their_confirmation() {
+            let whole = include_str!("ec2_manager_gui.rs");
+            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
+            let calls = |needle: &str| {
+                src.lines()
+                    .filter(|l| !l.trim_start().starts_with("//") && l.contains(needle))
+                    .count()
+            };
+            assert_eq!(calls("asg::set_instance_protection("), 1);
+            assert_eq!(calls("self.start_asg_protection_run(&mut dlg"), 1);
+            assert_eq!(calls("self.start_asg_refresh_run(*pending)"), 1);
+            assert_eq!(calls("run = Some(protect)"), 1);
+            let at = src.find("run = Some(protect)").unwrap();
+            assert!(
+                src[..at].rfind("Confirm - turn").is_some_and(|c| at - c < 200),
+                "`run` is set by the Confirm button only"
+            );
+            assert!(
+                src.contains("refused at the last check"),
+                "the refresh re-checks its confirmation before it spawns"
             );
         }
 
