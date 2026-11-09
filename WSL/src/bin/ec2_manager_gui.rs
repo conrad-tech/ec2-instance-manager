@@ -848,6 +848,8 @@ mod gui {
 
     enum ProcEvent {
         Output { tab_id: u64, bytes: Vec<u8> },
+        /// A Scripts-menu volume upgrade moved: its toolbar line.
+        DiskScriptStatus { key: String, text: String, state: ScriptState },
         Exited { tab_id: u64, code: i32 },
         Error { tab_id: u64, error: String },
         VolumeResult {
@@ -1781,8 +1783,8 @@ mod gui {
         /// Create and Restore (with a key reset): build the account around a
         /// PEM the operator supplies instead of generating a new one.
         use_own_pem: bool,
-        /// The Jira ticket the access was requested in. Required to create,
-        /// optional to restore; goes in the email subject.
+        /// The Jira ticket the access was requested in. Optional; goes in the
+        /// email subject when given.
         ticket: String,
         /// (ticket, username) already checked against Jira, or accepted
         /// despite the check, so Run does not ask twice.
@@ -1876,6 +1878,107 @@ mod gui {
         vault2_id: String,
         vault2_label: String,
         /// Inline validation error, shown in red.
+        error: Option<String>,
+    }
+
+    /// One running instance the Disk Utilization Check can aim at, drawn from
+    /// every cached account.
+    #[derive(Clone, Debug, PartialEq)]
+    struct DiskScriptCandidate {
+        profile_id: String,
+        /// The `MMODAL_ENV` tag as written; `None` when the box has none.
+        env: Option<String>,
+        /// What the dropdown shows after the id: the environment upper-cased,
+        /// or the account's name when the box carries no environment.
+        env_label: String,
+        id: String,
+        name: String,
+    }
+
+    impl DiskScriptCandidate {
+        /// `i-0abc - DEV1  name`: the id first, then the environment, because
+        /// the same id can sit in more than one environment.
+        fn label(&self) -> String {
+            if self.name.trim().is_empty() {
+                format!("{} - {}", self.id, self.env_label)
+            } else {
+                format!("{} - {}  {}", self.id, self.env_label, self.name)
+            }
+        }
+    }
+
+    /// The candidates the three boxes narrow to. `env` is the dropdown's
+    /// choice (`None` = any environment). A typed id that equals one exactly
+    /// matches only that id; otherwise id and name are case-insensitive
+    /// substrings. Stable order: name, id, environment.
+    fn disk_script_matches(
+        all: &[DiskScriptCandidate],
+        env: Option<(&str, &str)>,
+        id_text: &str,
+        name_text: &str,
+    ) -> Vec<DiskScriptCandidate> {
+        let id = id_text.trim().to_ascii_lowercase();
+        let name = name_text.trim().to_ascii_lowercase();
+        let in_env: Vec<&DiskScriptCandidate> = all
+            .iter()
+            .filter(|c| match env {
+                Some((profile, env_name)) => {
+                    c.profile_id == profile
+                        && ec2_manager::script_env::env_matches(c.env.as_deref(), env_name)
+                }
+                None => true,
+            })
+            .filter(|c| name.is_empty() || c.name.to_ascii_lowercase().contains(&name))
+            .collect();
+        let exact = !id.is_empty() && in_env.iter().any(|c| c.id.to_ascii_lowercase() == id);
+        let mut out: Vec<DiskScriptCandidate> = in_env
+            .into_iter()
+            .filter(|c| {
+                let cid = c.id.to_ascii_lowercase();
+                id.is_empty() || if exact { cid == id } else { cid.contains(&id) }
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
+                .then_with(|| a.env_label.cmp(&b.env_label))
+        });
+        out
+    }
+
+    /// What the check's worker thread tells the dialog.
+    enum DiskScriptEvent {
+        Checked(std::result::Result<ec2_manager::disk_grow::ScriptCheck, String>),
+        /// One report line (also written to the Disk Utilization log).
+        Line(LogLevel, String),
+        /// An upgrade finished; the text is the report block for it.
+        Upgraded { volume_id: String, result: std::result::Result<String, String> },
+    }
+
+    /// Modal state for "Scripts -> Disk Utilization Check": pick an
+    /// instance, Check reads it (read-only), then each volume at 80% or more
+    /// gets its own Upgrade. It never touches an alert.
+    #[derive(Default)]
+    struct DiskScriptDialog {
+        /// The environment filter; both empty means any environment.
+        env_profile_id: String,
+        env_name: String,
+        id_text: String,
+        name_text: String,
+        /// An explicit pick when several instances match: (profile, id).
+        picked: Option<(String, String)>,
+        /// The last Check's answer and the instance it was made for.
+        check: Option<ec2_manager::disk_grow::ScriptCheck>,
+        checked_for: Option<(String, String)>,
+        /// The GiB to add per volume id, as typed.
+        add_gib: HashMap<String, String>,
+        /// What the worker is doing, or `None` when idle.
+        busy: Option<String>,
+        report: String,
+        rx: Option<Receiver<DiskScriptEvent>>,
         error: Option<String>,
     }
 
@@ -2783,6 +2886,23 @@ mod gui {
         /// screen for its whole five minutes.
         settled_at: Option<Instant>,
     }
+
+    /// One line on the Connections toolbar for a Scripts-menu volume upgrade:
+    /// flashing yellow while it runs, green for a minute once it is done, red
+    /// until dismissed (Clear Notifications) if it failed. Keyed on
+    /// `instance|volume` and owned by the app, not the dialog, so it is there
+    /// whether or not the dialog is still open.
+    #[derive(Clone)]
+    struct DiskScriptLine {
+        key: String,
+        text: String,
+        state: ScriptState,
+        /// When a finished line was raised, for the green line's auto-hide.
+        settled_at: Option<Instant>,
+    }
+
+    /// How long a finished upgrade's green line stays up.
+    const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
 
     /// How long a finished Start / Stop / Restart line stays up before
     /// hiding itself. A failure is left for the user to dismiss, on the same
@@ -5575,6 +5695,146 @@ mod gui {
         Ok(ec2_manager::disk_grow::parse_fs_grow(&out))
     }
 
+    /// The Disk Utilization Check's read: the instance's volumes and the box,
+    /// nothing changed. A volume holding `/` is never a row.
+    fn disk_script_check(
+        ctx: &AwsContext,
+        instance_id: &str,
+    ) -> std::result::Result<ec2_manager::disk_grow::ScriptCheck, String> {
+        let (volumes, root) = disk_grow_volumes(ctx, instance_id)?;
+        let probe = disk_grow_probe(ctx, instance_id)?;
+        Ok(ec2_manager::disk_grow::script_check(&volumes, &root, &probe))
+    }
+
+    /// One volume's upgrade for the Scripts menu: resize to `new_gib`, wait
+    /// for the new size to be usable, grow the xfs filesystem, and report the
+    /// `df -h` before and after. It adds no alert note (there is no alert).
+    ///
+    /// The size is exactly what the person chose: a refusal is reported, not
+    /// retried with another size, and an unclear answer is never repeated
+    /// (`disk_grow_resize`). The volume is re-read first, so a size worked out
+    /// from a stale Check cannot be applied to a volume that has moved on.
+    fn disk_script_upgrade(
+        ctx: &AwsContext,
+        instance_id: &str,
+        row: &ec2_manager::disk_grow::ScriptRow,
+        new_gib: u64,
+        say: &dyn Fn(LogLevel, String),
+    ) -> std::result::Result<String, String> {
+        use ec2_manager::disk_grow as dg;
+        let vol = &row.volume;
+        if new_gib <= vol.size_gib {
+            return Err(format!("{new_gib} GiB is not larger than the {} GiB it has", vol.size_gib));
+        }
+        say(
+            LogLevel::Info,
+            format!("{} at {}: {} GiB -> {new_gib} GiB requested", vol.id, row.mount, vol.size_gib),
+        );
+        match volume_size_gib(ctx, &vol.id) {
+            Ok(n) if n == vol.size_gib => {}
+            Ok(n) => {
+                return Err(format!(
+                    "{} is now {n} GiB, not the {} GiB it was checked at; run Check again",
+                    vol.id, vol.size_gib
+                ))
+            }
+            Err(e) => return Err(format!("could not re-read the size of {}: {e}", vol.id)),
+        }
+        if let Some(why) = disk_grow_manual_state_refusal(&volume_modification_state(ctx, &vol.id)) {
+            return Err(why.replace("nothing was acknowledged or grown", "nothing was grown"));
+        }
+        // One size only: the person's. The kind is a label the resize helper
+        // carries and this path never reads.
+        let options = [dg::Growth { new_gib, kind: dg::GrowthKind::OneTb }];
+        disk_grow_resize(
+            &options,
+            vol.size_gib,
+            |gib| modify_volume(ctx, &vol.id, gib, &ctx.mode),
+            || volume_size_gib(ctx, &vol.id),
+            say,
+        )?;
+        say(
+            LogLevel::Info,
+            format!("{} resized to {new_gib} GiB; waiting for the new size to become usable", vol.id),
+        );
+        let after = |why: String| format!("{} was resized to {new_gib} GiB but {why}", vol.id);
+
+        let cfg = ec2_manager::features::DiskGrowFeature::default();
+        let usable_wait_ms = cfg.usable_wait().as_millis() as u64;
+        let optimize_ceiling_ms = cfg.optimize_ceiling().as_millis() as u64;
+        let started = std::time::Instant::now();
+        loop {
+            std::thread::sleep(cfg.poll_interval());
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let state = match volume_modification_state(ctx, &vol.id) {
+                Ok(s) => s,
+                Err(e) => {
+                    say(LogLevel::Warn, format!("could not read the modification state of {}, retrying: {e}", vol.id));
+                    if elapsed_ms >= usable_wait_ms {
+                        return Err(after(format!(
+                            "its modification state could not be read within {} minute(s)",
+                            usable_wait_ms / 60_000
+                        )));
+                    }
+                    continue;
+                }
+            };
+            match dg::transition(
+                dg::Phase::Modifying,
+                &state,
+                false,
+                elapsed_ms,
+                usable_wait_ms,
+                optimize_ceiling_ms,
+            ) {
+                dg::Transition::Wait => {}
+                dg::Transition::GrowFilesystem => break,
+                dg::Transition::Complete | dg::Transition::StopFlashing(_) => {}
+                dg::Transition::Escalate(why) => return Err(after(why)),
+            }
+        }
+
+        let mut unknown = 0u32;
+        loop {
+            let mut report = String::new();
+            let outcome = disk_grow_fs_with(
+                || disk_grow_probe(ctx, instance_id),
+                |dev| disk_grow_run_fs(ctx, instance_id, dev),
+                // No alert here: the comment is only the before/after report.
+                |comment| {
+                    report = comment.to_string();
+                    Ok(())
+                },
+                &vol.id,
+                &row.mount,
+                &row.df,
+                row.fs_bytes,
+            );
+            match outcome {
+                DiskGrowFs::Done => {
+                    return Ok(format!(
+                        "{} at {}: {} GiB -> {new_gib} GiB, filesystem grown.\n{report}",
+                        vol.id, row.mount, vol.size_gib
+                    ))
+                }
+                DiskGrowFs::Unknown(e) => {
+                    unknown += 1;
+                    if disk_grow_unknown_exhausted(unknown) {
+                        return Err(after(format!(
+                            "the filesystem grow gave no clear answer {unknown} times running: {e}"
+                        )));
+                    }
+                    say(
+                        LogLevel::Warn,
+                        format!("filesystem grow: {e}; retrying ({unknown}/{DISK_GROW_MAX_FS_UNKNOWN})"),
+                    );
+                    std::thread::sleep(cfg.poll_interval());
+                }
+                DiskGrowFs::Failed(why) => return Err(after(why)),
+            }
+        }
+    }
+
     /// `autoscaling start-instance-refresh` is the one refresh call, and it
     /// must reach `aws` from here only. Live mode only, checked here rather
     /// than trusted from the caller.
@@ -6262,9 +6522,8 @@ mod gui {
             return match disk_grow_gzip(&ctx, &facts.instance_id, false) {
                 Ok(r) => {
                     let msg = format!(
-                        "gzipped {} old log file(s), {} bytes before compression, {} failed; the \
-                         volume is not grown for this app",
-                        r.files, r.bytes, r.failed
+                        "logs: {}; the volume is not grown for this app",
+                        r.summary()
                     );
                     note(LogLevel::Warn, format!("{alert_id} — {msg}"));
                     end.status = AlertActionStatus::Ok(format!("alert {alert_id}: {msg}"));
@@ -6321,11 +6580,7 @@ mod gui {
         match disk_grow_gzip(&ctx, &facts.instance_id, false) {
             Ok(r) => note(
                 LogLevel::Info,
-                format!(
-                    "{alert_id} — gzipped {} old log file(s), {} bytes before compression, {} \
-                     failed",
-                    r.files, r.bytes, r.failed
-                ),
+                format!("{alert_id} — logs: {}", r.summary()),
             ),
             Err(e) => note(LogLevel::Warn, format!("{alert_id} — could not compress logs: {e}")),
         }
@@ -7222,10 +7477,7 @@ mod gui {
                         match disk_grow_gzip(&ctx, &facts.instance_id, true) {
                             Ok(r) => note(
                                 LogLevel::Info,
-                                format!(
-                                    "dry run: {} old log file(s), {} bytes, would be gzipped",
-                                    r.files, r.bytes
-                                ),
+                                format!("dry run: logs: {}", r.summary()),
                             ),
                             Err(e) => note(
                                 LogLevel::Error,
@@ -11964,6 +12216,9 @@ mod gui {
                 title,
                 native_options,
                 Box::new(move |cc| {
+                    // Fonts, sizes and palettes first: set_theme below only
+                    // picks which of the two already-painted palettes shows.
+                    ec2_manager::style::install(&cc.egui_ctx);
                     let app = Ec2GuiApp::new(app_options.clone());
                     if app.dark_mode {
                         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
@@ -12216,9 +12471,6 @@ mod gui {
         detail_tabs: Vec<DetailSubject>,
         /// Which of `detail_tabs` is showing. Always a valid index while the
         /// vec is non-empty — `close_detail` is what keeps that true.
-                    // Fonts, sizes and palettes first: set_theme below only
-                    // picks which of the two already-painted palettes shows.
-                    ec2_manager::style::install(&cc.egui_ctx);
         detail_active: usize,
         /// Fetched state per tab, keyed by `DetailSubject::key`.
         instance_details: HashMap<String, InstanceDetailState>,
@@ -12422,6 +12674,14 @@ mod gui {
         /// Build-time gate: whether the Vault Health Check entry is shown to
         /// the current OS user (features.json `vault_health.allowed_users`).
         vault_health_enabled: bool,
+        /// Active "Scripts -> Disk Utilization Check" dialog, if any.
+        disk_script_dialog: Option<DiskScriptDialog>,
+        /// Whether the Disk Utilization Check entry is shown to the current OS
+        /// user: the disk-utilization watcher's own two-key gate
+        /// (`disk_grow.enabled` and a named user), since it resizes volumes.
+        disk_script_enabled: bool,
+        /// Toolbar lines for Scripts-menu volume upgrades.
+        disk_script_lines: Vec<DiskScriptLine>,
         /// Active "Scripts → Bastion User Sync" dialog, if any.
         user_sync_dialog: Option<UserSyncDialog>,
         /// Whether the Bastion User Sync entry is shown to the current OS
@@ -13572,6 +13832,10 @@ mod gui {
                 vault_health_run: None,
                 vault_health_enabled: features
                     .vault_health_enabled_for(&ec2_manager::features::current_os_user()),
+                disk_script_dialog: None,
+                disk_script_lines: Vec::new(),
+                disk_script_enabled: features
+                    .disk_grow_enabled_for(&ec2_manager::features::current_os_user()),
                 vault_iam_enabled: features
                     .vault_iam_enabled_for(&ec2_manager::features::current_os_user()),
                 vault_iam_delete_enabled: features.vault_iam_delete_enabled_for(
@@ -16905,6 +17169,7 @@ mod gui {
                 || self.unhealthy_host_notice.is_some()
                 || self.instance_age_notice.is_some()
                 || !self.instance_age_protected_lines.is_empty()
+                || self.disk_script_lines.iter().any(|l| l.state == ScriptState::Failed)
                 || !self.message.is_empty()
         }
 
@@ -16924,6 +17189,7 @@ mod gui {
             self.unhealthy_host_notice = None;
             self.instance_age_notice = None;
             self.instance_age_protected_lines.clear();
+            self.disk_script_lines.retain(|l| l.state != ScriptState::Failed);
 
             if let Some((_, ScriptState::Failed)) = self.tunnel_status {
                 let rows = self.port_forward_rows();
@@ -25556,15 +25822,10 @@ mod gui {
                             }
                             ui.end_row();
 
-                            // Where the access was asked for. Required to
-                            // create, optional to restore, and it ends up in
+                            // Where the access was asked for. Optional, and it ends up in
                             // the email subject. Not shown for a delete.
                             if !dlg.mode.is_delete() {
-                                ui.label(if dlg.mode.is_restore() {
-                                    "Jira ticket (optional):"
-                                } else {
-                                    "Jira ticket:"
-                                });
+                                ui.label("Jira ticket (optional):");
                                 ui.add(
                                     egui::TextEdit::singleline(&mut dlg.ticket)
                                         .hint_text("CATDO-123")
@@ -25836,16 +26097,11 @@ mod gui {
                 // it is the right ticket is asked of Jira further down.
                 if !dlg.mode.is_delete() {
                     let ticket = dlg.ticket.trim().to_ascii_uppercase();
-                    if ticket.is_empty() {
-                        if !dlg.mode.is_restore() {
-                            dlg.error = Some(
-                                "Enter the Jira ticket number this access was requested in (e.g. CATDO-123)."
-                                    .to_string(),
-                            );
-                            self.create_user_dialog = Some(dlg);
-                            return;
-                        }
-                    } else if ec2_manager::jira::validate_issue_key(&ticket).is_err() {
+                    // Blank is fine for create and restore alike; the shape is
+                    // checked only when one was typed.
+                    if !ticket.is_empty()
+                        && ec2_manager::jira::validate_issue_key(&ticket).is_err()
+                    {
                         dlg.error = Some(format!(
                             "'{ticket}' is not a Jira ticket number (expected something like CATDO-123)."
                         ));
@@ -26581,6 +26837,500 @@ mod gui {
             }
 
             self.vault_health_dialog = Some(dlg);
+        }
+
+        /// Raise or replace the toolbar line for one volume upgrade. A finished
+        /// green line starts its minute now; a running or failed one has no
+        /// clock.
+        fn set_disk_script_line(&mut self, key: String, text: String, state: ScriptState) {
+            self.disk_script_lines.retain(|l| l.key != key);
+            self.disk_script_lines.push(DiskScriptLine {
+                key,
+                text,
+                state,
+                settled_at: (state == ScriptState::Ok).then(Instant::now),
+            });
+        }
+
+        /// Open "Scripts -> Disk Utilization Check". Priming the accounts'
+        /// inventories is what makes their instances findable by id or name.
+        fn open_disk_script_dialog(&mut self) {
+            if !self.disk_script_enabled {
+                return;
+            }
+            let _ = self.script_environments();
+            self.disk_script_dialog = Some(DiskScriptDialog::default());
+        }
+
+        /// Every running instance in every cached account.
+        fn disk_script_candidates(&self) -> Vec<DiskScriptCandidate> {
+            let mut out = Vec::new();
+            for (profile_id, (inv, _)) in &self.profile_inventory_cache {
+                let account = self
+                    .config
+                    .profiles
+                    .iter()
+                    .find(|p| p.profile_id == *profile_id)
+                    .map(|p| p.display_name.clone())
+                    .unwrap_or_else(|| profile_id.clone());
+                for i in inv.instances.iter().filter(|i| i.state.eq_ignore_ascii_case("running")) {
+                    let env = instance_env(i);
+                    out.push(DiskScriptCandidate {
+                        profile_id: profile_id.clone(),
+                        env_label: env
+                            .as_ref()
+                            .map(|e| e.to_uppercase())
+                            .unwrap_or_else(|| account.clone()),
+                        env,
+                        id: i.instance_id.clone(),
+                        name: i.name.clone().unwrap_or_default(),
+                    });
+                }
+            }
+            out
+        }
+
+        /// Run a Check (`job` None) or an Upgrade followed by a fresh Check on
+        /// a worker thread. Live mode and a usable login are required, and the
+        /// worker always ends with a `Checked` event, which is what clears the
+        /// dialog's busy state.
+        fn start_disk_script_worker(
+            &mut self,
+            dlg: &mut DiskScriptDialog,
+            cand: &DiskScriptCandidate,
+            job: Option<(ec2_manager::disk_grow::ScriptRow, u64)>,
+        ) {
+            if !self.disk_script_enabled || dlg.busy.is_some() {
+                return;
+            }
+            let Some(aws) = self
+                .profile_inventory_cache
+                .get(&cand.profile_id)
+                .map(|(_, c)| c.clone())
+            else {
+                dlg.error = Some("no AWS context for that account".to_string());
+                return;
+            };
+            if aws.mode != Mode::Live {
+                dlg.error = Some("Live mode only: this profile is Sim.".to_string());
+                return;
+            }
+            if let Some(warn) = self.script_env_auth_warning(&cand.profile_id) {
+                dlg.error = Some(warn);
+                return;
+            }
+            let (tx, rx) = mpsc::channel();
+            dlg.rx = Some(rx);
+            dlg.error = None;
+            dlg.checked_for = Some((cand.profile_id.clone(), cand.id.clone()));
+            dlg.busy = Some(match &job {
+                Some((row, _)) => format!("Upgrading {} ({})…", row.volume.id, row.mount),
+                None => "Checking…".to_string(),
+            });
+            self.log_disk_grow(
+                LogLevel::Warn,
+                format!(
+                    "disk script: {} on {} ({})",
+                    if job.is_some() { "upgrade" } else { "check" },
+                    cand.id,
+                    cand.env_label
+                ),
+            );
+            let egui_ctx = self.egui_ctx.clone();
+            let instance = cand.id.clone();
+            let proc_tx = self.proc_tx.clone();
+            if let Some((row, _)) = &job {
+                self.set_disk_script_line(
+                    format!("{}|{}", cand.id, row.volume.id),
+                    format!("{} growing ({})", cand.id, row.mount),
+                    ScriptState::Running,
+                );
+            }
+            std::thread::spawn(move || {
+                let wake = || {
+                    if let Some(c) = &egui_ctx {
+                        c.request_repaint();
+                    }
+                };
+                let say = |level: LogLevel, text: String| {
+                    let _ = tx.send(DiskScriptEvent::Line(level, text));
+                    wake();
+                };
+                // A Check compresses and clears the old logs first, so the
+                // use% it reports is after that. A failure is reported and
+                // the read goes on.
+                if job.is_none() {
+                    say(LogLevel::Info, "Compressing and clearing old logs…".to_string());
+                    match disk_grow_gzip(&aws, &instance, false) {
+                        Ok(r) => say(LogLevel::Warn, format!("Logs: {}", r.summary())),
+                        Err(e) => say(LogLevel::Warn, format!("Logs: could not compress or clear them: {e}")),
+                    }
+                }
+                if let Some((row, new_gib)) = job {
+                    let result = disk_script_upgrade(&aws, &instance, &row, new_gib, &say);
+                    // To the app, not the dialog: the line must settle even if
+                    // the dialog was closed while this ran.
+                    let (text, state) = match &result {
+                        Ok(_) => (format!("{instance} grown ({})", row.mount), ScriptState::Ok),
+                        Err(e) => (
+                            format!("{instance} grow failed ({}): {e}", row.mount),
+                            ScriptState::Failed,
+                        ),
+                    };
+                    let _ = proc_tx.send(ProcEvent::DiskScriptStatus {
+                        key: format!("{instance}|{}", row.volume.id),
+                        text,
+                        state,
+                    });
+                    let _ = tx.send(DiskScriptEvent::Upgraded {
+                        volume_id: row.volume.id.clone(),
+                        result,
+                    });
+                }
+                let _ = tx.send(DiskScriptEvent::Checked(disk_script_check(&aws, &instance)));
+                wake();
+            });
+        }
+
+        /// Render the "Scripts -> Disk Utilization Check" modal.
+        fn render_disk_script_dialog(&mut self, ctx: &egui::Context) {
+            let Some(mut dlg) = self.disk_script_dialog.take() else {
+                return;
+            };
+            // Re-checked every frame, like the other gated dialogs.
+            if !self.disk_script_enabled {
+                return;
+            }
+            let environments: Vec<ScriptEnv> = self.script_environments();
+            let all = self.disk_script_candidates();
+
+            let mut events = Vec::new();
+            if let Some(rx) = &dlg.rx {
+                while let Ok(e) = rx.try_recv() {
+                    events.push(e);
+                }
+            }
+            for e in events {
+                match e {
+                    DiskScriptEvent::Checked(result) => {
+                        dlg.busy = None;
+                        match result {
+                            Ok(c) => {
+                                dlg.report.push_str("Utilization:\n");
+                                for row in &c.rows {
+                                    dlg.report.push_str(&format!(
+                                        "  {}  {}  {}%{}\n",
+                                        row.mount,
+                                        row.volume.id,
+                                        row.use_pct,
+                                        if row.needs_grow() { "  (80% or more)" } else { "" }
+                                    ));
+                                }
+                                for s in &c.skipped {
+                                    dlg.report.push_str(&format!("  not checked: {s}\n"));
+                                }
+                                for row in &c.rows {
+                                    dlg.add_gib
+                                        .entry(row.volume.id.clone())
+                                        .or_insert_with(|| ec2_manager::disk_grow::SCRIPT_DEFAULT_ADD_GIB.to_string());
+                                }
+                                dlg.check = Some(c);
+                            }
+                            Err(e) => {
+                                dlg.check = None;
+                                self.log_disk_grow(LogLevel::Error, format!("disk script: check failed: {e}"));
+                                dlg.error = Some(e);
+                            }
+                        }
+                    }
+                    DiskScriptEvent::Line(level, text) => {
+                        self.log_disk_grow(level, format!("disk script: {text}"));
+                        dlg.report.push_str(&text);
+                        dlg.report.push('\n');
+                    }
+                    DiskScriptEvent::Upgraded { volume_id, result } => match result {
+                        Ok(block) => {
+                            self.log_disk_grow(LogLevel::Warn, format!("disk script: {volume_id} upgraded"));
+                            dlg.report.push_str(&format!("DONE  {block}\n"));
+                        }
+                        Err(e) => {
+                            self.log_disk_grow(LogLevel::Error, format!("disk script: {volume_id} FAILED: {e}"));
+                            dlg.report.push_str(&format!("FAILED  {volume_id}: {e}\n"));
+                        }
+                    },
+                }
+            }
+
+            let env_filter = (!dlg.env_profile_id.is_empty())
+                .then(|| (dlg.env_profile_id.as_str(), dlg.env_name.as_str()));
+            let matches = disk_script_matches(&all, env_filter, &dlg.id_text, &dlg.name_text);
+            let selected: Option<DiskScriptCandidate> = if matches.len() == 1 {
+                Some(matches[0].clone())
+            } else {
+                dlg.picked.as_ref().and_then(|(p, i)| {
+                    matches.iter().find(|c| &c.profile_id == p && &c.id == i).cloned()
+                })
+            };
+            let selected_key = selected.as_ref().map(|c| (c.profile_id.clone(), c.id.clone()));
+            // A result belongs to the instance it was read from.
+            if dlg.busy.is_none() && dlg.check.is_some() && dlg.checked_for != selected_key {
+                dlg.check = None;
+                dlg.checked_for = None;
+            }
+            let selected_live = selected
+                .as_ref()
+                .and_then(|c| self.profile_inventory_cache.get(&c.profile_id))
+                .is_some_and(|(_, c)| c.mode == Mode::Live);
+            let auth_warning = selected
+                .as_ref()
+                .and_then(|c| self.script_env_auth_warning(&c.profile_id));
+
+            let mut window_open = true;
+            let mut do_check = false;
+            let mut upgrade: Option<(ec2_manager::disk_grow::ScriptRow, u64)> = None;
+            let amber = egui::Color32::from_rgb(220, 150, 60);
+            let red = egui::Color32::from_rgb(220, 80, 80);
+
+            egui::Window::new("Scripts — Disk Utilization Check")
+                .collapsible(false)
+                .resizable(true)
+                .open(&mut window_open)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
+                .default_width(660.0)
+                .show(ctx, |ui| {
+                    let idle = dlg.busy.is_none();
+                    ui.add_enabled_ui(idle, |ui| {
+                        egui::Grid::new("disk_script_grid")
+                            .num_columns(2)
+                            .spacing([10.0, 8.0])
+                            .show(ui, |ui| {
+                                ui.label("Environment:");
+                                let env_label = environments
+                                    .iter()
+                                    .find(|e| {
+                                        e.account_id == dlg.env_profile_id && e.env == dlg.env_name
+                                    })
+                                    .map(script_env_label)
+                                    .unwrap_or_else(|| "Any environment".to_string());
+                                egui::ComboBox::from_id_salt("disk_script_env")
+                                    .selected_text(env_label)
+                                    .width(360.0)
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(
+                                                dlg.env_profile_id.is_empty(),
+                                                "Any environment",
+                                            )
+                                            .clicked()
+                                        {
+                                            dlg.env_profile_id.clear();
+                                            dlg.env_name.clear();
+                                            dlg.picked = None;
+                                            ui.close();
+                                        }
+                                        for row in &environments {
+                                            let on = row.account_id == dlg.env_profile_id
+                                                && row.env == dlg.env_name;
+                                            if ui.selectable_label(on, script_env_label(row)).clicked() {
+                                                dlg.env_profile_id = row.account_id.clone();
+                                                dlg.env_name = row.env.clone();
+                                                dlg.picked = None;
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label("Instance name:");
+                                let name_edit = ui.add(
+                                    egui::TextEdit::singleline(&mut dlg.name_text)
+                                        .hint_text("type to filter by name")
+                                        .desired_width(360.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("Instance ID:");
+                                let mut id_changed = false;
+                                ui.horizontal(|ui| {
+                                    let id_edit = ui.add(
+                                        egui::TextEdit::singleline(&mut dlg.id_text)
+                                            .hint_text("paste an instance id")
+                                            .desired_width(200.0),
+                                    );
+                                    id_changed = id_edit.changed();
+                                    if matches.len() > 1 {
+                                        let shown = selected
+                                            .as_ref()
+                                            .map(|c| c.label())
+                                            .unwrap_or_else(|| format!("choose ({} match)", matches.len()));
+                                        egui::ComboBox::from_id_salt("disk_script_pick")
+                                            .selected_text(shown)
+                                            .width(300.0)
+                                            .show_ui(ui, |ui| {
+                                                for c in &matches {
+                                                    let on = selected_key.as_ref()
+                                                        == Some(&(c.profile_id.clone(), c.id.clone()));
+                                                    if ui.selectable_label(on, c.label()).clicked() {
+                                                        dlg.picked =
+                                                            Some((c.profile_id.clone(), c.id.clone()));
+                                                        ui.close();
+                                                    }
+                                                }
+                                            });
+                                    }
+                                });
+                                if id_changed || name_edit.changed() {
+                                    dlg.picked = None;
+                                }
+                                ui.end_row();
+                            });
+                    });
+
+                    ui.add_space(4.0);
+                    match &selected {
+                        Some(c) => {
+                            ui.label(egui::RichText::new(format!("Selected: {}", c.label())).strong());
+                        }
+                        None if all.is_empty() => {
+                            note_label(ui, amber, "No inventory is loaded yet: open the Inventory tab so the accounts load.");
+                        }
+                        None if matches.is_empty() => {
+                            note_label(ui, amber, "No running instance matches.");
+                        }
+                        None => {
+                            ui.label(format!(
+                                "{} instances match: pick one from the Instance ID list.",
+                                matches.len()
+                            ));
+                        }
+                    }
+                    if selected.is_some() && !selected_live {
+                        note_label(ui, red, "Live mode only: this profile is Sim.");
+                    }
+                    if let Some(warn) = &auth_warning {
+                        note_label(ui, red, warn);
+                    }
+                    if let Some(err) = &dlg.error {
+                        note_label(ui, red, err);
+                    }
+
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let ready = selected.is_some()
+                            && selected_live
+                            && auth_warning.is_none()
+                            && dlg.busy.is_none();
+                        if ui
+                            .add_enabled(ready, egui::Button::new("Check"))
+                            .on_hover_text(
+                                "Read-only: lists the instance's non-root volumes and their use.",
+                            )
+                            .clicked()
+                        {
+                            do_check = true;
+                        }
+                        if let Some(b) = &dlg.busy {
+                            ui.spinner();
+                            ui.label(b.as_str());
+                        }
+                    });
+
+                    if let Some(check) = dlg.check.clone() {
+                        ui.separator();
+                        for s in &check.skipped {
+                            ui.weak(format!("Not checked: {s}"));
+                        }
+                        if check.rows.is_empty() {
+                            ui.label("No non-root xfs volume was found on this instance.");
+                        } else if !check.rows.iter().any(|r| r.needs_grow()) {
+                            ui.label("No volume is at 80% or more.");
+                        }
+                        let idle = dlg.busy.is_none();
+                        for row in &check.rows {
+                            ui.horizontal(|ui| {
+                                let text = format!(
+                                    "{}  {}  {} GiB {}  {}%",
+                                    row.mount,
+                                    row.volume.id,
+                                    row.volume.size_gib,
+                                    row.volume.volume_type,
+                                    row.use_pct
+                                );
+                                if !row.needs_grow() {
+                                    ui.label(text);
+                                    ui.weak("below 80%");
+                                    return;
+                                }
+                                ui.label(egui::RichText::new(text).strong().color(amber));
+                                let typed = dlg.add_gib.entry(row.volume.id.clone()).or_insert_with(|| {
+                                    ec2_manager::disk_grow::SCRIPT_DEFAULT_ADD_GIB.to_string()
+                                });
+                                ui.label("Add");
+                                ui.add(egui::TextEdit::singleline(typed).desired_width(70.0));
+                                ui.label("GiB");
+                                match ec2_manager::disk_grow::script_new_size(&row.volume, typed) {
+                                    Ok(n) => {
+                                        ui.label(format!("-> {n} GiB"));
+                                        if ui
+                                            .add_enabled(idle, egui::Button::new("Upgrade"))
+                                            .on_hover_text(
+                                                "Resize this volume, then grow its filesystem. \
+                                                 No alert note is added.",
+                                            )
+                                            .clicked()
+                                        {
+                                            upgrade = Some((row.clone(), n));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        note_label(ui, red, &e);
+                                    }
+                                }
+                            });
+                        }
+                    }
+
+                    if !dlg.report.is_empty() {
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Report").strong());
+                            if ui.small_button("Copy").clicked() {
+                                ui.ctx().copy_text(dlg.report.clone());
+                            }
+                            if ui.small_button("Clear").clicked() {
+                                dlg.report.clear();
+                            }
+                        });
+                        egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut dlg.report.as_str())
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                    }
+                });
+
+            if !window_open {
+                self.disk_script_dialog = None;
+                return;
+            }
+            if dlg.busy.is_some() {
+                ctx.request_repaint_after(Duration::from_millis(500));
+            }
+            if let Some(cand) = selected {
+                if do_check {
+                    self.start_disk_script_worker(&mut dlg, &cand, None);
+                } else if let Some(job) = upgrade {
+                    dlg.report.push_str(&format!(
+                        "Upgrading {} at {}: {} GiB -> {} GiB\n",
+                        job.0.volume.id, job.0.mount, job.0.volume.size_gib, job.1
+                    ));
+                    self.start_disk_script_worker(&mut dlg, &cand, Some(job));
+                }
+            }
+            self.disk_script_dialog = Some(dlg);
         }
 
         /// Open a session on each Vault box and queue the health check on
@@ -30131,6 +30881,9 @@ mod gui {
                                 st.tags = Some(tags);
                             }
                         }
+                    }
+                    ProcEvent::DiskScriptStatus { key, text, state } => {
+                        self.set_disk_script_line(key, text, state);
                     }
                     ProcEvent::PowerProgress { instance_id, phase } => {
                         // Only the run that owns the line may move it: a
@@ -43971,6 +44724,25 @@ mod gui {
                 // can suppress the key press for the focused terminal.
                 self.poll_script_hotkeys(ctx);
 
+                // Ctrl+Tab / Ctrl+Shift+Tab cycle the connection tabs, as in
+                // a browser. Consumed here, and `hotkey_consumed_frame` stops
+                // the terminal typing the Tab into the shell. Shift variant
+                // first: a plain Ctrl match would also take Ctrl+Shift+Tab.
+                if self.main_tab == MainTab::Connections && ctx.input(|i| i.focused) {
+                    let (back, fwd) = ctx.input_mut(|i| {
+                        let back = i.consume_key(
+                            egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                            egui::Key::Tab,
+                        );
+                        let fwd = !back && i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab);
+                        (back, fwd)
+                    });
+                    if back || fwd {
+                        self.hotkey_consumed_frame = true;
+                        self.connections.cycle(fwd);
+                    }
+                }
+
                 // Auto-focus the visible terminal when:
                 //   - the user just switched into the Connections tab
                 //   - the active connection tab changed (new tab opened
@@ -44206,6 +44978,7 @@ mod gui {
                 self.render_ticket_check(ctx);
                 self.render_vault_iam_dialog(ctx);
                 self.render_vault_health_dialog(ctx);
+                self.render_disk_script_dialog(ctx);
                 self.poll_vault_health_run(ctx);
                 self.poll_cassandra_events();
                 self.poll_cassandra_schedules();
@@ -44847,6 +45620,7 @@ mod gui {
                             + usize::from(self.user_sync_enabled)
                             + usize::from(self.vault_iam_enabled)
                             + usize::from(self.vault_health_enabled)
+                            + usize::from(self.disk_script_enabled)
                             + usize::from(self.vault_iam_delete_enabled)
                             + usize::from(self.cassandra_cert_enabled)
                             + self.default_scripts.len()
@@ -44860,6 +45634,7 @@ mod gui {
                         let mut edit_pat = false;
                         let mut open_vault_iam: Option<bool> = None;
                         let mut open_vault_health = false;
+                        let mut open_disk_script = false;
                         let mut open_cassandra = false;
                         let mut open_user_sync = false;
                         egui::ComboBox::from_id_salt("scripts_menu")
@@ -44955,20 +45730,45 @@ mod gui {
                                     open_vault_iam = Some(true);
                                     ui.close();
                                 }
-                                if self.vault_health_enabled
-                                    && ui
-                                        .selectable_label(false, "Vault Health Check")
-                                        .on_hover_text(
-                                            "Check a pair of Vault boxes: opens a tab on \
-                                             each, runs the Vault health check and docker \
-                                             ps as root (read-only), then reports whether \
-                                             there is one leader and one follower on the \
-                                             same version with the vault container up.",
-                                        )
-                                        .clicked()
-                                {
-                                    open_vault_health = true;
-                                    ui.close();
+                                // On-call scripts live in their own submenu; it is
+                                // hidden unless one of its entries is armed.
+                                if self.vault_health_enabled || self.disk_script_enabled {
+                                    ui.menu_button("On-Call", |ui| {
+                                        if self.vault_health_enabled
+                                            && ui
+                                                .selectable_label(false, "Vault Health Check")
+                                                .on_hover_text(
+                                                    "Check a pair of Vault boxes: opens a tab on \
+                                                     each, runs the Vault health check and docker \
+                                                     ps as root (read-only), then reports whether \
+                                                     there is one leader and one follower on the \
+                                                     same version with the vault container up.",
+                                                )
+                                                .clicked()
+                                        {
+                                            open_vault_health = true;
+                                            ui.close();
+                                        }
+                                        if self.disk_script_enabled
+                                            && ui
+                                                .selectable_label(false, "Disk Utilization Check")
+                                                .on_hover_text(
+                                                    "Compress and clear old logs on one instance, \
+                                                     report each non-root volume's use, and offer \
+                                                     an upgrade for each one at 80% or more. \
+                                                     Upgrade resizes that volume and grows its \
+                                                     filesystem. No alert is touched.",
+                                                )
+                                                .clicked()
+                                        {
+                                            open_disk_script = true;
+                                            ui.close();
+                                        }
+                                    });
+                                    // Closing the submenu leaves this list open.
+                                    if open_vault_health || open_disk_script {
+                                        ui.close();
+                                    }
                                 }
                                 // Hidden, not greyed out, off the two-key gate
                                 // (`cassandra_cert_enabled_for`), like the
@@ -45110,6 +45910,9 @@ mod gui {
                         }
                         if open_vault_health {
                             self.open_vault_health_dialog();
+                        }
+                        if open_disk_script {
+                            self.open_disk_script_dialog();
                         }
                         if open_cassandra {
                             self.open_cassandra_dialog();
@@ -45361,7 +46164,13 @@ mod gui {
                 // so it put every message on a line of its own and pushed
                 // the button to a line below all of them, level with
                 // nothing.
-                let has_status = self.script_status.is_some()
+                // A finished upgrade's green line clears itself after its minute.
+                self.disk_script_lines.retain(|l| {
+                    !(l.state == ScriptState::Ok
+                        && l.settled_at.is_some_and(|t| t.elapsed() >= DISK_SCRIPT_OK_BANNER))
+                });
+                let has_status = !self.disk_script_lines.is_empty()
+                    || self.script_status.is_some()
                     || self.tunnel_status.is_some()
                     || self.script_status_highlight.is_some()
                     || self.unhealthy_host_notice.is_some()
@@ -45428,6 +46237,31 @@ mod gui {
                                 let c = flashing_yellow(ui);
                                 note_label(ui, c, text);
                             }
+                            // Volume upgrades from the Scripts menu. Running
+                            // flashes, green hides itself on time (a repaint is
+                            // asked for at the expiry), red stays for Clear.
+                            for line in self.disk_script_lines.clone() {
+                                match line.state {
+                                    ScriptState::Running => {
+                                        ctx.request_repaint_after(Duration::from_millis(100));
+                                        let c = flashing_yellow(ui);
+                                        note_label(ui, c, line.text);
+                                    }
+                                    ScriptState::Ok => {
+                                        if let Some(at) = line.settled_at {
+                                            ctx.request_repaint_after(
+                                                DISK_SCRIPT_OK_BANNER.saturating_sub(at.elapsed()),
+                                            );
+                                        }
+                                        let c = status_color(&ScriptState::Ok, ui);
+                                        note_label(ui, c, line.text);
+                                    }
+                                    ScriptState::Failed => {
+                                        let c = status_color(&ScriptState::Failed, ui);
+                                        note_label(ui, c, line.text);
+                                    }
+                                }
+                            }
                             if let Some(text) = self.instance_age_notice.clone() {
                                 let c = status_color(&ScriptState::Failed, ui);
                                 ui.label(notification_text(ui, c, text));
@@ -45492,6 +46326,7 @@ mod gui {
 
                 if self.main_tab == MainTab::Inventory {
                 egui::SidePanel::left("controls")
+                    .frame(ec2_manager::style::side_panel_frame(ctx))
                     .resizable(true)
                     .show(ctx, |ui| {
                     egui::ScrollArea::vertical()
@@ -46326,7 +47161,6 @@ mod gui {
 
     #[cfg(test)]
     fn shell_plan(terminal: Option<&TerminalOption>) -> (String, Vec<String>) {
-                    .frame(ec2_manager::style::side_panel_frame(ctx))
         if cfg!(windows) {
             let fallback = || {
                 (
@@ -50979,10 +51813,9 @@ mod gui {
                                         Ok(r) => note(
                                             LogLevel::Info,
                                             format!(
-                                                "disk grow: {} ({instance}) — gzipped {} old \
-                                                 log file(s), {} bytes before compression, {} \
-                                                 failed",
-                                                alert.id, r.files, r.bytes, r.failed
+                                                "disk grow: {} ({instance}) — logs: {}",
+                                                alert.id,
+                                                r.summary()
                                             ),
                                         ),
                                         Err(e) => note(
@@ -64064,12 +64897,12 @@ mod gui {
         }
 
         #[test]
-        fn a_create_needs_a_ticket_and_a_restore_does_not() {
+        fn the_ticket_is_optional_for_create_and_restore() {
             let src = include_str!("ec2_manager_gui.rs");
             let body = src.split("fn render_create_user_dialog(").nth(1).unwrap();
             let body = body.split("fn render_ticket_check(").next().unwrap();
-            // Blank is refused only when this is not a restore.
-            assert!(body.contains("if ticket.is_empty() {\n                        if !dlg.mode.is_restore() {"));
+            // Blank is never refused; no "Enter the Jira ticket" error remains.
+            assert!(!body.contains("Enter the Jira ticket number"));
             // The shape is checked whenever one was typed, restore included.
             assert!(body.contains("validate_issue_key(&ticket)"));
             // And Jira is asked only for a ticket that was given.
@@ -64144,8 +64977,9 @@ mod gui {
         /// Every status-coloured label goes through `note_label`, so a stray
         /// direct call would be a notification that stays thin on a light
         /// panel — the exact thing this fixes, and invisible in review. The
-        /// only two allowed are the deliberately-grey ones, where weight would
-        /// fight the colour's purpose.
+        /// only three allowed are the two deliberately-grey ones, where weight
+        /// would fight the colour's purpose, and the plain green file path
+        /// shown under a terminal that is viewing a file.
         #[test]
         fn status_coloured_labels_all_carry_the_light_theme_weight() {
             // Built at runtime: spelled out, this test's own source would
@@ -64159,8 +64993,8 @@ mod gui {
                 .collect();
             assert_eq!(
                 lines.len(),
-                2,
-                "only the two grey labels may bypass note_label; found:\n{}",
+                3,
+                "only the two grey labels and the file-path line may bypass note_label; found:\n{}",
                 lines
                     .iter()
                     .map(|(i, l)| format!("{}: {}", i + 1, l.trim()))
@@ -64173,8 +65007,9 @@ mod gui {
             for (i, line) in &lines {
                 let window = all[*i..(*i + 3).min(all.len())].join(" ");
                 assert!(
-                    window.contains("palette::MUTED"),
-                    "a non-grey label bypassed note_label at line {}: {}",
+                    window.contains("palette::MUTED")
+                        || window.contains("Color32::from_rgb(80, 220, 120)"),
+                    "a label other than the grey ones and the file path bypassed note_label at line {}: {}",
                     i + 1,
                     line.trim()
                 );
@@ -76289,7 +77124,13 @@ fed_expire = 4000000000
                 .lines()
                 .filter(|l| !l.trim_start().starts_with("//") && l.contains("modify_volume("))
                 .count();
-            assert_eq!(calls, 2, "the definition and the grow chain's one call");
+            assert_eq!(
+                calls, 3,
+                "the definition, the grow chain's one call, and the Scripts-menu upgrade"
+            );
+            let upgrade = disk_grow_fn_body(src, "fn disk_script_upgrade(");
+            assert_eq!(upgrade.matches("modify_volume(").count(), 1, "{upgrade}");
+            assert!(!upgrade.contains("add_note(") && !upgrade.contains("acknowledge_alert("));
             assert_eq!(disk_grow_next_move(true, false), NextMove::Nothing);
             assert_ne!(disk_grow_next_move(true, true), NextMove::Full);
         }
@@ -76661,6 +77502,78 @@ fed_expire = 4000000000
         fn the_disk_grow_line_is_not_clearable() {
             let clearable = method_body(disk_grow_prod_src(), "fn has_clearable_status(");
             assert!(!clearable.contains("disk_grow"), "{clearable}");
+        }
+
+        #[test]
+        fn a_disk_script_upgrade_has_a_toolbar_line_that_outlives_its_dialog() {
+            let src = disk_grow_prod_src();
+            // The worker reports to the app's own channel, not the dialog's.
+            let worker = disk_grow_fn_body(src, "fn start_disk_script_worker(");
+            assert!(worker.contains("ProcEvent::DiskScriptStatus"), "{worker}");
+            assert!(worker.contains("ScriptState::Running") && worker.contains("ScriptState::Ok"));
+            assert!(worker.contains("ScriptState::Failed"));
+            // Red is cleared by Clear Notifications; yellow and green are not.
+            let clearable = method_body(src, "fn has_clearable_status(");
+            assert!(clearable.contains("disk_script_lines") && clearable.contains("ScriptState::Failed"));
+            let clear = method_body(src, "fn clear_status_messages(");
+            assert!(clear.contains("l.state != ScriptState::Failed"), "{clear}");
+            assert_eq!(DISK_SCRIPT_OK_BANNER, Duration::from_secs(60));
+        }
+
+        fn disk_script_cand(profile: &str, env: Option<&str>, id: &str, name: &str) -> DiskScriptCandidate {
+            DiskScriptCandidate {
+                profile_id: profile.into(),
+                env: env.map(str::to_string),
+                env_label: env.map(str::to_uppercase).unwrap_or_else(|| profile.to_string()),
+                id: id.into(),
+                name: name.into(),
+            }
+        }
+
+        #[test]
+        fn the_disk_script_finds_an_instance_by_pasted_id_name_or_environment() {
+            let all = vec![
+                disk_script_cand("a", Some("dev1"), "i-0aaa", "cassandra-001"),
+                disk_script_cand("b", Some("prod"), "i-0aaa", "cassandra-001"),
+                disk_script_cand("a", Some("dev1"), "i-0bbb", "kafka-001"),
+                disk_script_cand("a", Some("dev1"), "i-0bbbc", "kafka-002"),
+            ];
+            let ids = |v: Vec<DiskScriptCandidate>| -> Vec<String> {
+                v.into_iter().map(|c| format!("{}/{}", c.profile_id, c.id)).collect()
+            };
+            // A pasted id found in two environments offers both, id - env.
+            let both = disk_script_matches(&all, None, " i-0aaa ", "");
+            assert_eq!(ids(both.clone()), vec!["a/i-0aaa", "b/i-0aaa"]);
+            assert_eq!(both[0].label(), "i-0aaa - DEV1  cassandra-001");
+            // Choosing the environment narrows it to one.
+            assert_eq!(ids(disk_script_matches(&all, Some(("b", "prod")), "i-0aaa", "")), vec!["b/i-0aaa"]);
+            // An exact id never also matches a longer id that contains it.
+            assert_eq!(ids(disk_script_matches(&all, None, "i-0bbb", "")), vec!["a/i-0bbb"]);
+            // A partial id and a typed name both filter, case-insensitively.
+            assert_eq!(ids(disk_script_matches(&all, None, "0bb", "")).len(), 2);
+            assert_eq!(ids(disk_script_matches(&all, None, "", "KAFKA-002")), vec!["a/i-0bbbc"]);
+            assert_eq!(disk_script_matches(&all, None, "", "").len(), 4);
+            assert!(disk_script_matches(&all, None, "i-nope", "").is_empty());
+        }
+
+        #[test]
+        fn the_disk_script_sits_under_the_on_call_submenu_behind_the_watchers_gate() {
+            let src = disk_grow_prod_src();
+            let at = src.find("ui.menu_button(\"On-Call\"").expect("the On-Call submenu");
+            let menu = disk_grow_block_after(src, at);
+            assert!(menu.contains("\"Vault Health Check\"") && menu.contains("\"Disk Utilization Check\""));
+            assert!(menu.contains("self.disk_script_enabled") && menu.contains("self.vault_health_enabled"));
+            // Neither entry is also drawn at the top level of the Scripts menu.
+            assert_eq!(src.matches("selectable_label(false, \"Vault Health Check\")").count(), 1);
+            assert_eq!(src.matches("selectable_label(false, \"Disk Utilization Check\")").count(), 1);
+            let dialog = disk_grow_fn_body(src, "fn render_disk_script_dialog(");
+            assert!(dialog.contains("self.disk_script_enabled"), "the dialog re-checks its gate");
+            let worker = disk_grow_fn_body(src, "fn start_disk_script_worker(");
+            assert!(worker.contains("self.disk_script_enabled"));
+            assert!(worker.contains("Mode::Live"));
+            // A Check compresses the logs; an Upgrade does not re-run the clean-up.
+            assert!(worker.contains("if job.is_none()") && worker.contains("disk_grow_gzip("));
+            assert!(!worker.contains("add_note(") && !worker.contains("acknowledge_alert("));
         }
 
         #[test]

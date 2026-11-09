@@ -244,6 +244,92 @@ pub fn choose_targets(
     Ok(over)
 }
 
+/// The Scripts-menu check offers a grow for a filesystem at this use% or
+/// more (the watcher's own threshold is "above 79", the same line).
+pub const SCRIPT_AT_LEAST_PCT: u32 = 80;
+
+/// What the Scripts-menu check offers by default: +1 TiB.
+pub const SCRIPT_DEFAULT_ADD_GIB: u64 = 1024;
+
+/// One non-root xfs volume as the Scripts-menu check found it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScriptRow {
+    pub volume: Volume,
+    pub mount: String,
+    pub use_pct: u32,
+    /// The `df -h` header and this mount's row, as the report shows it.
+    pub df: String,
+    pub fs_bytes: u64,
+}
+
+impl ScriptRow {
+    /// Whether this volume is offered a grow.
+    pub fn needs_grow(&self) -> bool {
+        self.use_pct >= SCRIPT_AT_LEAST_PCT
+    }
+}
+
+/// The check's answer: every non-root volume it could read, plus a line for
+/// each one it could not (never silently dropped).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScriptCheck {
+    pub rows: Vec<ScriptRow>,
+    pub skipped: Vec<String>,
+}
+
+/// Every non-root volume mounted as xfs with its use%. A volume holding `/`
+/// is never a row (`resolve_data_device` refuses any disk or partition that
+/// does), whatever device name the instance reports it under.
+pub fn script_check(volumes: &[Volume], root_device: &str, probe: &Probe) -> ScriptCheck {
+    let mut rows = Vec::new();
+    let mut skipped = Vec::new();
+    for v in volumes.iter().filter(|v| v.device != root_device) {
+        let dev = match resolve_data_device(probe, &v.id) {
+            Ok(d) => d,
+            Err(e) => {
+                skipped.push(format!("{} ({}): {e}", v.id, v.device));
+                continue;
+            }
+        };
+        let (Some(use_pct), Some(df), Some(fs_bytes)) = (
+            use_pct_for_mount(&probe.df_h, &dev.mount),
+            df_h_for_mount(&probe.df_h, &dev.mount),
+            fs_bytes_for_mount(probe, &dev.mount),
+        ) else {
+            skipped.push(format!("{} at {}: the box gave no usable df -h / size row", v.id, dev.mount));
+            continue;
+        };
+        rows.push(ScriptRow { volume: v.clone(), mount: dev.mount, use_pct, df, fs_bytes });
+    }
+    rows.sort_by(|a, b| a.mount.cmp(&b.mount));
+    ScriptCheck { rows, skipped }
+}
+
+/// The size a typed "add this many GiB" gives `volume`, or why it is refused.
+/// Blank, non-numeric, negative and zero are refused with a sentence naming
+/// the box; a result over the volume type's maximum is refused too.
+pub fn script_new_size(volume: &Volume, typed: &str) -> Result<u64, String> {
+    let t = typed.trim();
+    if t.is_empty() {
+        return Err("enter how many GiB to add".into());
+    }
+    if t.starts_with('-') {
+        return Err("the amount to add cannot be negative".into());
+    }
+    let add: u64 = t.parse().map_err(|_| "the amount to add must be a whole number of GiB".to_string())?;
+    if add == 0 {
+        return Err("the amount to add must be at least 1 GiB".into());
+    }
+    let max = max_gib(&volume.volume_type);
+    match volume.size_gib.checked_add(add) {
+        Some(n) if n <= max => Ok(n),
+        _ => Err(format!(
+            "{} GiB + {add} GiB is over the {} maximum of {max} GiB",
+            volume.size_gib, volume.volume_type
+        )),
+    }
+}
+
 /// Largest size, in GiB, the volume type allows.
 pub fn max_gib(volume_type: &str) -> u64 {
     match volume_type {
@@ -328,6 +414,24 @@ pub struct GzipResult {
     pub bytes: u64,
     pub failed: u64,
     pub dry: bool,
+    /// Files the clean-up steps emptied or removed (docker logs, /tmp, old
+    /// `*.log`), and the bytes they held. Dry: what would be.
+    pub cleaned: u64,
+    pub cleaned_bytes: u64,
+    /// The journal vacuum: `ok`, `failed`, `none` (no journalctl) or `skipped`.
+    pub journal: String,
+}
+
+impl GzipResult {
+    /// One sentence for a log line or report.
+    pub fn summary(&self) -> String {
+        let verb = if self.dry { "would be" } else { "was" };
+        format!(
+            "{} old log file(s), {} bytes, {verb} gzipped ({} failed); {} file(s), {} bytes, {verb} \
+             emptied or removed (docker logs, /tmp, old *.log); journal vacuum: {}",
+            self.files, self.bytes, self.failed, self.cleaned, self.cleaned_bytes, self.journal
+        )
+    }
 }
 
 /// Reads the script's marker line. No marker is an error.
@@ -347,6 +451,14 @@ pub fn parse_gzip(output: &str) -> Result<GzipResult, String> {
         bytes: field("bytes")?,
         failed: field("failed")?,
         dry: field("dry")? == 1,
+        // Absent from a reply by an older script: nothing was cleaned.
+        cleaned: field("cleaned").unwrap_or(0),
+        cleaned_bytes: field("cleaned_bytes").unwrap_or(0),
+        journal: line
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix("journal="))
+            .unwrap_or("none")
+            .to_string(),
     })
 }
 
@@ -1320,25 +1432,56 @@ mod tests {
     #[test]
     fn the_gzip_result_is_parsed_and_a_missing_marker_is_an_error() {
         let r = parse_gzip("noise\n__DG_GZ__ files=3 bytes=1024 failed=1 dry=0\n").unwrap();
-        assert_eq!(r, GzipResult { files: 3, bytes: 1024, failed: 1, dry: false });
+        assert_eq!(
+            r,
+            GzipResult {
+                files: 3,
+                bytes: 1024,
+                failed: 1,
+                dry: false,
+                cleaned: 0,
+                cleaned_bytes: 0,
+                journal: "none".into()
+            }
+        );
+        let r = parse_gzip(
+            "__DG_GZ__ files=1 bytes=2 failed=0 dry=0 cleaned=4 cleaned_bytes=900 journal=ok",
+        )
+        .unwrap();
+        assert_eq!((r.cleaned, r.cleaned_bytes, r.journal.as_str()), (4, 900, "ok"));
+        assert!(r.summary().contains("4 file(s), 900 bytes, was emptied"), "{}", r.summary());
         assert!(parse_gzip("__DG_GZ__ files=0 bytes=0 failed=0 dry=1").unwrap().dry);
         assert!(parse_gzip("done").is_err());
         assert!(parse_gzip("__DG_GZ__ files=x bytes=0 failed=0 dry=0").is_err());
     }
 
     #[test]
-    fn the_gzip_script_only_compresses_old_logs_under_var_log() {
+    fn the_cleanup_script_runs_only_its_listed_steps_and_never_when_dry() {
         let all = exec_lines(GZIP_SCRIPT);
         let text = all.join("\n");
-        // The only thing it changes is `gzip` on files `find` listed; today's
-        // files are excluded by the find, and nothing is removed or moved.
-        for banned in ["rm ", "mv ", "unlink", "truncate", "shred", "dd ", "> /", "-delete", "-exec"] {
-            assert!(!text.contains(banned), "gzip script contains {banned:?}");
+        // The only mutating verbs: the four listed clean-up steps and gzip.
+        assert_eq!(text.matches("truncate -s 0 --").count(), 1, "one truncate, in sweep()");
+        assert_eq!(text.matches("rm -f --").count(), 1, "one removal, in sweep()");
+        assert_eq!(text.matches("journalctl --vacuum-time=2d").count(), 1);
+        assert_eq!(text.matches("gzip -n --").count(), 1);
+        for banned in ["mv ", "unlink", "shred", "dd ", "> /", "-delete", "-exec", "rm -rf", "rm -r "] {
+            assert!(!text.contains(banned), "cleanup script contains {banned:?}");
         }
+        // The four steps, each aimed at exactly the path it was asked for.
+        assert!(text.contains("find /var/lib/docker/containers -type f -name '*-json.log'"));
+        assert!(text.contains("find /tmp -type f -atime +10 -print0"));
+        assert!(text.contains("find /var/log -type f -name '*.log' -size +0 -mtime +7"));
+        // Today's logs are never gzipped; already-compressed files are skipped.
         assert!(text.contains("find /var/log -xdev -type f"));
         assert!(text.contains("! -newermt \"$today\""), "today's logs must be skipped");
         assert!(text.contains("! -name '*.gz'"));
-        assert_eq!(text.matches("gzip -n --").count(), 1);
+        // Dry is checked before either mutation in sweep() and before the vacuum.
+        let sweep = text.find("sweep()").expect("sweep");
+        let dry_check = text[sweep..].find("[ \"$dry\" = \"1\" ]").expect("dry check") + sweep;
+        assert!(dry_check < text[sweep..].find("truncate -s 0 --").unwrap() + sweep);
+        assert!(text.contains("if [ \"$dry\" = \"1\" ]; then\njournal=skipped"));
+        // The clean-up runs before the gzip, or step 4 would find nothing.
+        assert!(text.find("sweep truncate").unwrap() < text.find("gzip -n --").unwrap());
         assert!(!all.iter().any(|l| l.contains("__DG_GZ__")), "literal marker");
         let dry = gzip_command(true);
         assert!(dry.starts_with("RE_DG_DRY='1'\n") && gzip_command(false).starts_with("RE_DG_DRY='0'\n"));
@@ -1821,5 +1964,55 @@ mod tests {
         assert!(matches!(recovery(&none, lag, vol), Recovery::Nothing(_)), "{none:?}");
         // Any other unreadable answer is a failure, never "nothing to do".
         assert!(matches!(recovery(&Err("AccessDenied".into()), lag, vol), Recovery::Failed(_)));
+    }
+
+    #[test]
+    fn the_script_check_lists_every_non_root_volume_and_flags_those_at_80_or_more() {
+        let mut p = probe_two_data(80, 79);
+        p.fs_bytes = vec![("/data".into(), 1 << 40), ("/data2".into(), 1 << 40)];
+        let c = script_check(&three_volumes(), "/dev/xvda", &p);
+        assert!(c.skipped.is_empty(), "{:?}", c.skipped);
+        let seen: Vec<(String, u32, bool)> =
+            c.rows.iter().map(|r| (r.mount.clone(), r.use_pct, r.needs_grow())).collect();
+        assert_eq!(
+            seen,
+            vec![("/data".to_string(), 80, true), ("/data2".to_string(), 79, false)]
+        );
+        assert!(c.rows[0].df.contains("/data"));
+    }
+
+    #[test]
+    fn the_script_check_never_offers_root_and_reports_what_it_could_not_read() {
+        let mut p = probe_two_data(95, 95);
+        p.fs_bytes = vec![("/data".into(), 1 << 40)];
+        // The root volume holds / and is never a row; /data2 has no size row.
+        let c = script_check(&three_volumes(), "/dev/xvda", &p);
+        assert_eq!(c.rows.len(), 1);
+        assert_eq!(c.skipped.len(), 1, "{:?}", c.skipped);
+        assert!(c.rows.iter().all(|r| r.mount != "/"));
+        // A volume on the box's / is skipped even when named as a data device.
+        let mut p = probe_two_data(95, 95);
+        p.blocks[0].mountpoint = "/".into();
+        p.blocks[0].fstype = "xfs".into();
+        let vols = vec![vol("vol-root", 100, "gp3", "/dev/sdz")];
+        let c = script_check(&vols, "/dev/xvda", &p);
+        assert!(c.rows.is_empty());
+        assert!(c.skipped[0].contains("root filesystem"), "{:?}", c.skipped);
+    }
+
+    #[test]
+    fn a_typed_growth_is_a_positive_whole_number_that_fits_the_volume_type() {
+        let v = vol("vol-a", 1000, "gp3", "/dev/sdf");
+        assert_eq!(script_new_size(&v, "1024"), Ok(2024));
+        assert_eq!(script_new_size(&v, " 1 "), Ok(1001));
+        for bad in ["", "  ", "-1", "-1024", "0", "abc", "1.5", "1e3"] {
+            assert!(script_new_size(&v, bad).is_err(), "{bad:?}");
+        }
+        assert!(script_new_size(&v, "-5").unwrap_err().contains("negative"));
+        // Over the type's maximum, and an overflowing number, are refused.
+        assert!(script_new_size(&v, "65000").is_err());
+        assert!(script_new_size(&v, "18446744073709551615").is_err());
+        assert_eq!(script_new_size(&v, "64536"), Ok(65536));
+        assert_eq!(SCRIPT_DEFAULT_ADD_GIB, 1024);
     }
 }

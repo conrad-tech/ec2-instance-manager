@@ -69,6 +69,28 @@ impl ConnectionTabs {
         }
     }
 
+    /// Select the next (or previous) tab, wrapping at the ends, as
+    /// Ctrl+Tab / Ctrl+Shift+Tab do in a browser. Returns the newly
+    /// selected id, or `None` when there are fewer than two tabs.
+    pub fn cycle(&mut self, forward: bool) -> Option<u64> {
+        let n = self.tabs.len();
+        if n < 2 {
+            return None;
+        }
+        let cur = self
+            .selected
+            .and_then(|id| self.tabs.iter().position(|t| t.id == id));
+        let next = match (cur, forward) {
+            (Some(i), true) => (i + 1) % n,
+            (Some(i), false) => (i + n - 1) % n,
+            (None, true) => 0,
+            (None, false) => n - 1,
+        };
+        let id = self.tabs[next].id;
+        self.selected = Some(id);
+        Some(id)
+    }
+
     pub fn rename(&mut self, id: u64, new_title: String) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
             tab.title = new_title;
@@ -237,5 +259,20 @@ mod tests {
         let selected = tabs.selected_ref().expect("selected tab must exist");
         assert_eq!(selected.lines.len(), 10_000);
         assert_eq!(selected.lines.first().map(String::as_str), Some("line 200"));
+    }
+
+    #[test]
+    fn cycle_wraps_both_ways_and_ignores_a_lone_tab() {
+        let mut t = ConnectionTabs::new();
+        assert_eq!(t.cycle(true), None);
+        let a = t.open("a".into(), "i-a".into(), "p".into());
+        assert_eq!(t.cycle(true), None);
+        let b = t.open("b".into(), "i-b".into(), "p".into());
+        let c = t.open("c".into(), "i-c".into(), "p".into());
+        assert_eq!(t.cycle(true), Some(a));
+        assert_eq!(t.cycle(true), Some(b));
+        assert_eq!(t.cycle(false), Some(a));
+        assert_eq!(t.cycle(false), Some(c));
+        assert_eq!(t.selected(), Some(c));
     }
 }
