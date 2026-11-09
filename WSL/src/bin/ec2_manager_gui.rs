@@ -42025,16 +42025,17 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                     ui.painter().circle_filled(rect.center(), 4.0, color);
                                 }
 
-                                let text_color = if selected {
+                                // Selected or hovered tabs pop (strong colour,
+                                // bold); everything else recedes to the muted grey.
+                                let emphasised = selected || hovered;
+                                let text_color = if emphasised {
                                     ui.visuals().strong_text_color()
-                                } else if hovered {
-                                    ui.visuals().widgets.hovered.text_color()
                                 } else {
-                                    ui.visuals().text_color()
+                                    ui.visuals().weak_text_color()
                                 };
                                 let mut rich = egui::RichText::new(title.clone())
                                     .color(text_color);
-                                if selected {
+                                if emphasised {
                                     rich = rich.strong();
                                 }
                                 ui.add(egui::Label::new(rich).selectable(false));
