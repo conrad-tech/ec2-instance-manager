@@ -2902,7 +2902,12 @@ mod gui {
     }
 
     /// How long a finished upgrade's green line stays up.
-    const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
+    /// Whether the Disk Utilization Check script is visible to anyone. Off for
+/// now, for every user; a per-user gate can replace this later. The menu
+/// entry, the dialog and the worker all read it through `disk_script_enabled`.
+const DISK_SCRIPT_VISIBLE: bool = false;
+
+const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
 
     /// How long a finished Start / Stop / Restart line stays up before
     /// hiding itself. A failure is left for the user to dismiss, on the same
@@ -12220,6 +12225,10 @@ mod gui {
                     // picks which of the two already-painted palettes shows.
                     ec2_manager::style::install(&cc.egui_ctx);
                     let app = Ec2GuiApp::new(app_options.clone());
+                    ec2_manager::style::set_accent(
+                        &cc.egui_ctx,
+                        ec2_manager::style::Accent::from_key(app.config.accent.as_deref()),
+                    );
                     if app.dark_mode {
                         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
                     } else {
@@ -12676,9 +12685,8 @@ mod gui {
         vault_health_enabled: bool,
         /// Active "Scripts -> Disk Utilization Check" dialog, if any.
         disk_script_dialog: Option<DiskScriptDialog>,
-        /// Whether the Disk Utilization Check entry is shown to the current OS
-        /// user: the disk-utilization watcher's own two-key gate
-        /// (`disk_grow.enabled` and a named user), since it resizes volumes.
+        /// Whether the Disk Utilization Check entry is shown, set from
+        /// `DISK_SCRIPT_VISIBLE`. Nothing in features.json controls it.
         disk_script_enabled: bool,
         /// Toolbar lines for Scripts-menu volume upgrades.
         disk_script_lines: Vec<DiskScriptLine>,
@@ -13834,8 +13842,7 @@ mod gui {
                     .vault_health_enabled_for(&ec2_manager::features::current_os_user()),
                 disk_script_dialog: None,
                 disk_script_lines: Vec::new(),
-                disk_script_enabled: features
-                    .disk_grow_enabled_for(&ec2_manager::features::current_os_user()),
+                disk_script_enabled: DISK_SCRIPT_VISIBLE,
                 vault_iam_enabled: features
                     .vault_iam_enabled_for(&ec2_manager::features::current_os_user()),
                 vault_iam_delete_enabled: features.vault_iam_delete_enabled_for(
@@ -45348,6 +45355,20 @@ mod gui {
                                     ui.close();
                                 }
                             });
+                            ui.menu_button("Accent", |ui| {
+                                let current = ec2_manager::style::current_accent();
+                                for accent in ec2_manager::style::Accent::ALL {
+                                    let colors = accent.colors();
+                                    let ink = if self.dark_mode { colors.accent } else { colors.light_link };
+                                    let label = egui::RichText::new(accent.label()).color(ink);
+                                    if ui.selectable_label(accent == current, label).clicked() {
+                                        ec2_manager::style::set_accent(ctx, accent);
+                                        self.config.accent = Some(accent.key().to_string());
+                                        let _ = self.config.save();
+                                        ui.close();
+                                    }
+                                }
+                            });
                             ui.menu_button("Scroll Sensitivity", |ui| {
                                 for &(label, value) in &[("Low", 20.0f32), ("Medium (Default)", 10.0), ("High", 5.0)] {
                                     if ui.selectable_label(self.scroll_sensitivity == value, label).clicked() {
@@ -45640,6 +45661,49 @@ mod gui {
                         egui::ComboBox::from_id_salt("scripts_menu")
                             .selected_text(format!("Scripts ({script_count})"))
                             .show_ui(ui, |ui| {
+                                // On-call scripts live in their own submenu at the top; it
+                                // is hidden unless one of its entries is armed.
+                                if self.vault_health_enabled || self.disk_script_enabled {
+                                    ui.menu_button("On-Call", |ui| {
+                                        if self.disk_script_enabled
+                                            && ui
+                                                .selectable_label(false, "Disk Utilization Check")
+                                                .on_hover_text(
+                                                    "Compress and clear old logs on one instance, \
+                                                     report each non-root volume's use, and offer \
+                                                     an upgrade for each one at 80% or more. \
+                                                     Upgrade resizes that volume and grows its \
+                                                     filesystem. No alert is touched.",
+                                                )
+                                                .clicked()
+                                        {
+                                            open_disk_script = true;
+                                            ui.close();
+                                        }
+                                        if self.vault_health_enabled
+                                            && ui
+                                                .selectable_label(false, "Vault Health Check")
+                                                .on_hover_text(
+                                                    "Check a pair of Vault boxes: opens a tab on \
+                                                     each, runs the Vault health check and docker \
+                                                     ps as root (read-only), then reports whether \
+                                                     there is one leader and one follower on the \
+                                                     same version with the vault container up.",
+                                                )
+                                                .clicked()
+                                        {
+                                            open_vault_health = true;
+                                            ui.close();
+                                        }
+                                    });
+                                    // Closing the submenu leaves this list open.
+                                    if open_vault_health || open_disk_script {
+                                        ui.close();
+                                    }
+                                }
+                                if self.vault_health_enabled || self.disk_script_enabled {
+                                    ui.separator();
+                                }
                                 if ui
                                     .selectable_label(false, "Bastion New User")
                                     .on_hover_text(
@@ -45849,49 +45913,6 @@ mod gui {
                                             ui.close();
                                         }
                                     });
-                                }
-                                if self.vault_health_enabled || self.disk_script_enabled {
-                                    ui.separator();
-                                }
-                                // On-call scripts live in their own submenu at the bottom; it
-                                // is hidden unless one of its entries is armed.
-                                if self.vault_health_enabled || self.disk_script_enabled {
-                                    ui.menu_button("On-Call", |ui| {
-                                        if self.disk_script_enabled
-                                            && ui
-                                                .selectable_label(false, "Disk Utilization Check")
-                                                .on_hover_text(
-                                                    "Compress and clear old logs on one instance, \
-                                                     report each non-root volume's use, and offer \
-                                                     an upgrade for each one at 80% or more. \
-                                                     Upgrade resizes that volume and grows its \
-                                                     filesystem. No alert is touched.",
-                                                )
-                                                .clicked()
-                                        {
-                                            open_disk_script = true;
-                                            ui.close();
-                                        }
-                                        if self.vault_health_enabled
-                                            && ui
-                                                .selectable_label(false, "Vault Health Check")
-                                                .on_hover_text(
-                                                    "Check a pair of Vault boxes: opens a tab on \
-                                                     each, runs the Vault health check and docker \
-                                                     ps as root (read-only), then reports whether \
-                                                     there is one leader and one follower on the \
-                                                     same version with the vault container up.",
-                                                )
-                                                .clicked()
-                                        {
-                                            open_vault_health = true;
-                                            ui.close();
-                                        }
-                                    });
-                                    // Closing the submenu leaves this list open.
-                                    if open_vault_health || open_disk_script {
-                                        ui.close();
-                                    }
                                 }
                             });
                         if let Some(i) = run_default {

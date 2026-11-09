@@ -44,6 +44,8 @@ pub struct AppConfig {
     pub user_environments: Vec<UserEnvironment>,
     pub last_selected_profile: Option<String>,
     pub theme: Option<String>,
+    /// Accent colour key (`style::Accent::key`); absent means the default.
+    pub accent: Option<String>,
     pub scroll_sensitivity: Option<f32>,
     pub ui_scale: Option<f32>,
     pub account_colors_enabled: bool,
@@ -207,6 +209,7 @@ impl Default for AppConfig {
             user_environments: Vec::new(),
             last_selected_profile: None,
             theme: None,
+            accent: None,
             scroll_sensitivity: None,
             ui_scale: None,
             account_colors_enabled: true,
@@ -1338,6 +1341,13 @@ impl AppConfig {
                         Some(value.to_string())
                     };
                 }
+                "accent" => {
+                    cfg.accent = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
                 "scroll_sensitivity" => {
                     if let Ok(val) = value.parse::<f32>() {
                         cfg.scroll_sensitivity = Some(val);
@@ -1452,6 +1462,9 @@ impl AppConfig {
 
         if let Some(theme) = &self.theme {
             lines.push(format!("theme={theme}"));
+        }
+        if let Some(accent) = &self.accent {
+            lines.push(format!("accent={accent}"));
         }
 
         if let Some(val) = self.scroll_sensitivity {
