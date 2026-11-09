@@ -8929,9 +8929,9 @@ mod gui {
         match category.trim().to_ascii_lowercase().as_str() {
             "done" => egui::Color32::from_rgb(90, 190, 110),
             "indeterminate" => egui::Color32::from_rgb(90, 150, 230),
-            "new" => egui::Color32::from_rgb(150, 150, 160),
+            "new" => ec2_manager::style::palette::MUTED,
             // An unknown category is not coloured as anything in particular.
-            _ => egui::Color32::GRAY,
+            _ => ec2_manager::style::palette::MUTED,
         }
     }
 
@@ -9224,7 +9224,7 @@ mod gui {
         match priority.trim().to_ascii_uppercase().as_str() {
             "P1" | "P2" => egui::Color32::from_rgb(220, 60, 60),
             "P3" => egui::Color32::from_rgb(220, 160, 60),
-            _ => egui::Color32::GRAY,
+            _ => ec2_manager::style::palette::MUTED,
         }
     }
 
@@ -12216,6 +12216,9 @@ mod gui {
         detail_tabs: Vec<DetailSubject>,
         /// Which of `detail_tabs` is showing. Always a valid index while the
         /// vec is non-empty — `close_detail` is what keeps that true.
+                    // Fonts, sizes and palettes first: set_theme below only
+                    // picks which of the two already-painted palettes shows.
+                    ec2_manager::style::install(&cc.egui_ctx);
         detail_active: usize,
         /// Fetched state per tab, keyed by `DetailSubject::key`.
         instance_details: HashMap<String, InstanceDetailState>,
@@ -17465,7 +17468,7 @@ mod gui {
                                     });
                                 } else if !enabled {
                                     ui.colored_label(
-                                        egui::Color32::GRAY,
+                                        ec2_manager::style::palette::MUTED,
                                         "off",
                                     );
                                 } else {
@@ -17484,7 +17487,7 @@ mod gui {
                                             // Still shown here — this window
                                             // is where you come to look.
                                             ui.colored_label(
-                                                egui::Color32::GRAY,
+                                                ec2_manager::style::palette::MUTED,
                                                 format!("{why} (cleared)"),
                                             );
                                         } else {
@@ -24565,7 +24568,7 @@ mod gui {
                                             // nothing left to acknowledge, so amber
                                             // would be a call to action that is gone.
                                             menu(note_label(ui,
-                                                egui::Color32::GRAY,
+                                                ec2_manager::style::palette::MUTED,
                                                 "unack",
                                             ));
                                         } else {
@@ -43553,7 +43556,7 @@ mod gui {
                 // yet. Say which, or it reads as the trace being broken.
                 note_label(
                     ui,
-                    egui::Color32::GRAY,
+                    ec2_manager::style::palette::MUTED,
                     "No calls recorded yet - open the Alerts window, or wait \
                      for the next 10s poll.",
                 );
@@ -44447,7 +44450,9 @@ mod gui {
                     .as_ref()
                     .filter(|j| j.kind == CassandraJobKind::CancelSchedule)
                     .map(|j| cassandra_progress_text(j.kind, &j.env.to_uppercase(), &j.nodes));
-                egui::TopBottomPanel::top("top").show(ctx, |ui| {
+                egui::TopBottomPanel::top("top")
+                    .frame(ec2_manager::style::side_panel_frame(ctx))
+                    .show(ctx, |ui| {
                     egui::MenuBar::new().ui(ui, |ui| {
                         let edit_menu_resp = ui.menu_button("Edit", |ui| {
                             let mut syntax_on = !self.config.terminal_syntax_off;
@@ -46321,6 +46326,7 @@ mod gui {
 
     #[cfg(test)]
     fn shell_plan(terminal: Option<&TerminalOption>) -> (String, Vec<String>) {
+                    .frame(ec2_manager::style::side_panel_frame(ctx))
         if cfg!(windows) {
             let fallback = || {
                 (
@@ -52906,7 +52912,7 @@ mod gui {
     ) -> Option<(egui::Color32, String)> {
         const RED: egui::Color32 = egui::Color32::from_rgb(220, 80, 80);
         const AMBER: egui::Color32 = egui::Color32::from_rgb(220, 150, 60);
-        const GREY: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
+        const GREY: egui::Color32 = ec2_manager::style::palette::MUTED;
         const GREEN: egui::Color32 = egui::Color32::from_rgb(120, 180, 120);
         // The same yellow as `flashing_yellow`, without the animation.
         const YELLOW: egui::Color32 = egui::Color32::from_rgb(255, 205, 0);
@@ -63857,7 +63863,7 @@ mod gui {
             use ec2_manager::fed_auth::FedError;
             let red = egui::Color32::from_rgb(220, 80, 80);
             let amber = egui::Color32::from_rgb(220, 150, 60);
-            let grey = egui::Color32::from_rgb(150, 150, 150);
+            let grey = ec2_manager::style::palette::MUTED;
             let state = FedState::Stalled(FedError::Command("nope".into()));
             let (color, text) = fed_status_for(&state, Some("PA (1234)")).expect("line");
             assert_ne!(color, red, "the alarm was dismissed");
@@ -64167,7 +64173,7 @@ mod gui {
             for (i, line) in &lines {
                 let window = all[*i..(*i + 3).min(all.len())].join(" ");
                 assert!(
-                    window.contains("Color32::GRAY"),
+                    window.contains("palette::MUTED"),
                     "a non-grey label bypassed note_label at line {}: {}",
                     i + 1,
                     line.trim()
@@ -68531,8 +68537,8 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert_ne!(jira_status_color("done"), jira_status_color("new"));
             assert_ne!(jira_status_color("indeterminate"), jira_status_color("new"));
             // A category nobody recognises is not coloured as anything.
-            assert_eq!(jira_status_color("Shipped It"), egui::Color32::GRAY);
-            assert_eq!(jira_status_color(""), egui::Color32::GRAY);
+            assert_eq!(jira_status_color("Shipped It"), ec2_manager::style::palette::MUTED);
+            assert_eq!(jira_status_color(""), ec2_manager::style::palette::MUTED);
         }
 
         #[test]

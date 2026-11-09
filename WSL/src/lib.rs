@@ -44,6 +44,8 @@ pub mod syntax;
 pub mod script_env;
 pub mod sim;
 pub mod ssh_config;
+#[cfg(feature = "gui")]
+pub mod style;
 pub mod terminal;
 pub mod tunnel;
 pub mod unhealthy_host;
