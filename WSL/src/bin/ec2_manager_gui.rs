@@ -45653,21 +45653,6 @@ mod gui {
                                     open_dialog = Some(UserScriptMode::Create);
                                     ui.close();
                                 }
-                                if ui
-                                    .selectable_label(false, "Bastion User Restore")
-                                    .on_hover_text(
-                                        "Issue a new key to a user who already \
-                                         exists — for someone who lost their PEM. \
-                                         Replaces their authorized_keys, so the \
-                                         old key stops working. Leaves sudo, the \
-                                         account and the home directory alone, \
-                                         and fails if the user does not exist.",
-                                    )
-                                    .clicked()
-                                {
-                                    open_dialog = Some(UserScriptMode::Restore);
-                                    ui.close();
-                                }
                                 if self.allow_delete_user
                                     && ui
                                         .selectable_label(false, "Bastion User Delete")
@@ -45681,6 +45666,21 @@ mod gui {
                                         .clicked()
                                 {
                                     open_dialog = Some(UserScriptMode::Delete);
+                                    ui.close();
+                                }
+                                if ui
+                                    .selectable_label(false, "Bastion User Restore")
+                                    .on_hover_text(
+                                        "Issue a new key to a user who already \
+                                         exists — for someone who lost their PEM. \
+                                         Replaces their authorized_keys, so the \
+                                         old key stops working. Leaves sudo, the \
+                                         account and the home directory alone, \
+                                         and fails if the user does not exist.",
+                                    )
+                                    .clicked()
+                                {
+                                    open_dialog = Some(UserScriptMode::Restore);
                                     ui.close();
                                 }
                                 if self.user_sync_enabled
@@ -45700,6 +45700,25 @@ mod gui {
                                     open_user_sync = true;
                                     ui.close();
                                 }
+                                // Hidden, not greyed out, off the two-key gate
+                                // (`cassandra_cert_enabled_for`), like the
+                                // instance power entries.
+                                if self.cassandra_cert_enabled
+                                    && ui
+                                        .selectable_label(false, "Cassandra Cert Update")
+                                        .on_hover_text(
+                                            "Renew the keystore cert on selected \
+                                             Cassandra nodes (dry run first; the \
+                                             update only stages it, then each node \
+                                             is restarted on request), or roll them \
+                                             back (restarts them together).",
+                                        )
+                                        .clicked()
+                                {
+                                    open_cassandra = true;
+                                    ui.close();
+                                }
+
                                 if self.vault_iam_enabled
                                     && ui
                                         .selectable_label(false, "Vault IAM Access")
@@ -45730,71 +45749,15 @@ mod gui {
                                     open_vault_iam = Some(true);
                                     ui.close();
                                 }
-                                // On-call scripts live in their own submenu; it is
-                                // hidden unless one of its entries is armed.
-                                if self.vault_health_enabled || self.disk_script_enabled {
-                                    ui.menu_button("On-Call", |ui| {
-                                        if self.vault_health_enabled
-                                            && ui
-                                                .selectable_label(false, "Vault Health Check")
-                                                .on_hover_text(
-                                                    "Check a pair of Vault boxes: opens a tab on \
-                                                     each, runs the Vault health check and docker \
-                                                     ps as root (read-only), then reports whether \
-                                                     there is one leader and one follower on the \
-                                                     same version with the vault container up.",
-                                                )
-                                                .clicked()
-                                        {
-                                            open_vault_health = true;
-                                            ui.close();
-                                        }
-                                        if self.disk_script_enabled
-                                            && ui
-                                                .selectable_label(false, "Disk Utilization Check")
-                                                .on_hover_text(
-                                                    "Compress and clear old logs on one instance, \
-                                                     report each non-root volume's use, and offer \
-                                                     an upgrade for each one at 80% or more. \
-                                                     Upgrade resizes that volume and grows its \
-                                                     filesystem. No alert is touched.",
-                                                )
-                                                .clicked()
-                                        {
-                                            open_disk_script = true;
-                                            ui.close();
-                                        }
-                                    });
-                                    // Closing the submenu leaves this list open.
-                                    if open_vault_health || open_disk_script {
-                                        ui.close();
-                                    }
-                                }
-                                // Hidden, not greyed out, off the two-key gate
-                                // (`cassandra_cert_enabled_for`), like the
-                                // instance power entries.
-                                if self.cassandra_cert_enabled
-                                    && ui
-                                        .selectable_label(false, "Cassandra Cert Update")
-                                        .on_hover_text(
-                                            "Renew the keystore cert on selected \
-                                             Cassandra nodes (dry run first; the \
-                                             update only stages it, then each node \
-                                             is restarted on request), or roll them \
-                                             back (restarts them together).",
-                                        )
-                                        .clicked()
-                                {
-                                    open_cassandra = true;
-                                    ui.close();
-                                }
-
                                 // Hardcoded default scripts (features.json) —
                                 // runnable, with their hotkey, but read-only.
                                 if !self.default_scripts.is_empty() {
                                     ui.separator();
                                 }
-                                for (i, script) in self.default_scripts.iter().enumerate() {
+                                let mut default_order: Vec<usize> = (0..self.default_scripts.len()).collect();
+                                default_order.sort_by_key(|&i| self.default_scripts[i].name.to_lowercase());
+                                for i in default_order {
+                                    let script = &self.default_scripts[i];
                                     let label = if script.hotkey.is_empty() {
                                         script.name.clone()
                                     } else {
@@ -45815,9 +45778,13 @@ mod gui {
                                 if !self.config.personal_scripts.is_empty() {
                                     ui.separator();
                                 }
-                                for (i, script) in
-                                    self.config.personal_scripts.iter().enumerate()
-                                {
+                                let mut personal_order: Vec<usize> =
+                                    (0..self.config.personal_scripts.len()).collect();
+                                personal_order.sort_by_key(|&i| {
+                                    self.config.personal_scripts[i].name.to_lowercase()
+                                });
+                                for i in personal_order {
+                                    let script = &self.config.personal_scripts[i];
                                     ui.horizontal(|ui| {
                                         let label = if script.hotkey.is_empty() {
                                             script.name.clone()
@@ -45882,6 +45849,49 @@ mod gui {
                                             ui.close();
                                         }
                                     });
+                                }
+                                if self.vault_health_enabled || self.disk_script_enabled {
+                                    ui.separator();
+                                }
+                                // On-call scripts live in their own submenu at the bottom; it
+                                // is hidden unless one of its entries is armed.
+                                if self.vault_health_enabled || self.disk_script_enabled {
+                                    ui.menu_button("On-Call", |ui| {
+                                        if self.disk_script_enabled
+                                            && ui
+                                                .selectable_label(false, "Disk Utilization Check")
+                                                .on_hover_text(
+                                                    "Compress and clear old logs on one instance, \
+                                                     report each non-root volume's use, and offer \
+                                                     an upgrade for each one at 80% or more. \
+                                                     Upgrade resizes that volume and grows its \
+                                                     filesystem. No alert is touched.",
+                                                )
+                                                .clicked()
+                                        {
+                                            open_disk_script = true;
+                                            ui.close();
+                                        }
+                                        if self.vault_health_enabled
+                                            && ui
+                                                .selectable_label(false, "Vault Health Check")
+                                                .on_hover_text(
+                                                    "Check a pair of Vault boxes: opens a tab on \
+                                                     each, runs the Vault health check and docker \
+                                                     ps as root (read-only), then reports whether \
+                                                     there is one leader and one follower on the \
+                                                     same version with the vault container up.",
+                                                )
+                                                .clicked()
+                                        {
+                                            open_vault_health = true;
+                                            ui.close();
+                                        }
+                                    });
+                                    // Closing the submenu leaves this list open.
+                                    if open_vault_health || open_disk_script {
+                                        ui.close();
+                                    }
                                 }
                             });
                         if let Some(i) = run_default {
