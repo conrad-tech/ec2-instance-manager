@@ -2836,6 +2836,9 @@ mod gui {
         /// The state the row carried when the entry was clicked, so the
         /// dialog can say what it is acting on.
         state: String,
+        /// Terminate only: the tick naming the instance. Deleting an
+        /// instance cannot be undone, so the button stays disabled without it.
+        confirm_terminate: bool,
     }
 
     /// A capacity edit the user has typed and not yet agreed to.
@@ -33519,6 +33522,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 action,
                 context,
                 state: instance.state.clone(),
+                confirm_terminate: false,
             });
         }
 
@@ -33526,7 +33530,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         /// entries sit in a row-click menu next to Quick Connect, and a
         /// misclick that stops a production box has no undo.
         fn render_power_confirm(&mut self, ctx: &egui::Context) {
-            let Some(pending) = self.power_confirm.take() else {
+            let Some(mut pending) = self.power_confirm.take() else {
                 return;
             };
             let mut window_open = true;
@@ -33555,11 +33559,20 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                         ui.add_space(4.0);
                         note_label(ui, ui.visuals().error_fg_color, format!("Cannot run: {why}"));
                     }
+                    let terminating = pending.action == PowerAction::Terminate;
+                    if terminating {
+                        ui.add_space(6.0);
+                        let label = format!(
+                            "I understand {} will be permanently deleted",
+                            pending.label,
+                        );
+                        ui.checkbox(&mut pending.confirm_terminate, label);
+                    }
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui
                             .add_enabled(
-                                refusal.is_none(),
+                                refusal.is_none() && (!terminating || pending.confirm_terminate),
                                 egui::Button::new(pending.action.verb()),
                             )
                             .clicked()
@@ -36485,6 +36498,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                         PowerAction::Start,
                                         PowerAction::Stop,
                                         PowerAction::Restart,
+                                        PowerAction::Terminate,
                                     ] {
                                         // The same call the row menu makes,
                                         // so the two cannot disagree about
@@ -37096,6 +37110,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                         PowerAction::Start,
                                         PowerAction::Stop,
                                         PowerAction::Restart,
+                                        PowerAction::Terminate,
                                     ] {
                                         // The row can be up to 45s stale, so
                                         // this is a courtesy — the worker
@@ -57177,6 +57192,23 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         let state = fetch_instance_state(profile, region, instance_id)?;
         power::action_allowed(&state, action)?;
 
+        // Protection is read live, here, because the row does not carry it.
+        // Terminate and Stop fail closed: if it cannot be read they are not
+        // sent. Restart does not need it to be safe -- an unreadable answer
+        // falls back to stop-then-start, which AWS itself refuses on a
+        // stop-protected box before anything has changed.
+        let protection = fetch_instance_protection(profile, region, instance_id);
+        if let Ok(p) = &protection {
+            if let Some(why) = power::protection_refusal(*p, action) {
+                return Err(format!("not sent: {why}"));
+            }
+        } else if matches!(action, PowerAction::Stop | PowerAction::Terminate) {
+            return Err(format!(
+                "not sent: could not read the instance's protection settings ({})",
+                protection.err().unwrap_or_default(),
+            ));
+        }
+
         match action {
             PowerAction::Start => {
                 send_power_call(profile, region, instance_id, true)?;
@@ -57186,8 +57218,80 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 send_power_call(profile, region, instance_id, false)?;
                 Ok("stop requested — the instance is shutting down".to_string())
             }
-            PowerAction::Restart => restart_instance(profile, region, instance_id, progress),
+            PowerAction::Terminate => {
+                terminate_instance(profile, region, instance_id, &context.mode)?;
+                Ok("terminate requested — the instance is shutting down for good".to_string())
+            }
+            PowerAction::Restart => {
+                if protection.map(power::restart_is_reboot).unwrap_or(false) {
+                    // Stop protection: it cannot be stopped, so a normal
+                    // reboot is the restart. No protection blocks one.
+                    reboot_instance(profile, region, instance_id)?;
+                    Ok("stop protection is on, so it was rebooted instead — reboot requested"
+                        .to_string())
+                } else {
+                    restart_instance(profile, region, instance_id, progress)
+                }
+            }
         }
+    }
+
+    /// Read the two EC2 API protections for one instance.
+    fn fetch_instance_protection(
+        profile: &str,
+        region: &str,
+        instance_id: &str,
+    ) -> std::result::Result<power::Protection, String> {
+        let read = |attr: &str, query: &str| -> std::result::Result<bool, String> {
+            let output = aws_command()
+                .args([
+                    "ec2", "describe-instance-attribute",
+                    "--profile", profile,
+                    "--region", region,
+                    "--instance-id", instance_id,
+                    "--attribute", attr,
+                    "--query", query,
+                    "--output", "text",
+                ])
+                .output()
+                .map_err(|e| format!("describe-instance-attribute failed: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("describe-instance-attribute error: {}", stderr.trim()));
+            }
+            match String::from_utf8_lossy(&output.stdout).trim().to_ascii_lowercase().as_str() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                other => Err(format!("unexpected {attr} value '{other}'")),
+            }
+        };
+        Ok(power::Protection {
+            termination: read("disableApiTermination", "DisableApiTermination.Value")?,
+            stop: read("disableApiStop", "DisableApiStop.Value")?,
+        })
+    }
+
+    /// A plain EC2 reboot. Used only by Restart on a stop-protected instance;
+    /// the one call site of the reboot verb in this file.
+    fn reboot_instance(
+        profile: &str,
+        region: &str,
+        instance_id: &str,
+    ) -> std::result::Result<(), String> {
+        let output = aws_command()
+            .args([
+                "ec2", "reboot-instances",
+                "--profile", profile,
+                "--region", region,
+                "--instance-ids", instance_id,
+            ])
+            .output()
+            .map_err(|e| format!("reboot failed to run: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("reboot error: {}", stderr.trim()));
+        }
+        Ok(())
     }
 
     /// Stop, poll until `stopped`, hold [`power::SETTLE_SECS`], start.
@@ -69847,24 +69951,28 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         /// Restart is a stop and a start. `ec2 reboot-instances` keeps the
         /// same underlying host and never reports `stopped`, so it is not
-        /// what was asked for and must not creep in as a "simplification".
+        /// what was asked for in general. The one permitted use is
+        /// `reboot_instance`, reached only for a stop-protected instance,
+        /// which cannot be stopped at all.
         #[test]
-        fn nothing_here_ever_calls_reboot_instances() {
+        fn reboot_instances_is_only_called_for_a_stop_protected_restart() {
             let src = include_str!("ec2_manager_gui.rs");
             // Assembled rather than written out, or this scan matches its
             // own source and can never pass.
             let banned = format!("reboot-{}", "instances");
-            for (n, line) in src.lines().enumerate() {
-                if line.trim_start().starts_with("//") {
-                    continue;
-                }
-                assert!(
-                    !line.contains(&banned),
-                    "line {}: Restart must stay a stop-then-start: {}",
-                    n + 1,
-                    line.trim(),
-                );
-            }
+            let hits: Vec<usize> = src
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| !l.trim_start().starts_with("//") && l.contains(&banned))
+                .map(|(n, _)| n + 1)
+                .collect();
+            assert_eq!(hits.len(), 1, "{banned} must appear once, found at {hits:?}");
+            let whole = &src[..src.find("    mod tests {").expect("the test module")];
+            assert_eq!(whole.matches("reboot_instance(").count(), 2, "one definition, one call");
+            assert!(
+                whole.contains("power::restart_is_reboot"),
+                "the reboot must be gated on stop protection",
+            );
         }
 
         /// `terminate-instances` is the one destructive call the on-call

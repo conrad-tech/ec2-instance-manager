@@ -39,6 +39,8 @@ pub enum PowerAction {
     Start,
     Stop,
     Restart,
+    /// `ec2 terminate-instances`: the instance is gone for good.
+    Terminate,
 }
 
 impl PowerAction {
@@ -57,6 +59,7 @@ impl PowerAction {
             // instance`, which it must never become -- so the dialog is the
             // only place a reader is told, and its wording is load-bearing.
             Self::Restart => "Restart instance",
+            Self::Terminate => "Terminate instance",
         }
     }
 
@@ -66,8 +69,41 @@ impl PowerAction {
             Self::Start => "Start",
             Self::Stop => "Stop",
             Self::Restart => "Restart",
+            Self::Terminate => "Terminate",
         }
     }
+}
+
+/// The two EC2 API protections that bear on a power action, read live from
+/// the instance (`describe-instance-attribute`), never from the cached row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Protection {
+    /// `disableApiTermination`: `terminate-instances` is refused.
+    pub termination: bool,
+    /// `disableApiStop`: `stop-instances` is refused.
+    pub stop: bool,
+}
+
+/// Whether a protection forbids `action` outright.
+///
+/// Termination protection blocks Terminate and stop protection blocks Stop.
+/// Neither blocks Start, and neither blocks Restart: with stop protection the
+/// restart is carried out as a plain reboot (see [`restart_is_reboot`]), which
+/// no protection stops.
+pub fn protection_refusal(p: Protection, action: PowerAction) -> Option<&'static str> {
+    match action {
+        PowerAction::Terminate if p.termination => {
+            Some("termination protection is enabled on this instance")
+        }
+        PowerAction::Stop if p.stop => Some("stop protection is enabled on this instance"),
+        _ => None,
+    }
+}
+
+/// True when a Restart must be a plain reboot rather than stop-then-start:
+/// the instance cannot be stopped, but a reboot is not a stop.
+pub fn restart_is_reboot(p: Protection) -> bool {
+    p.stop
 }
 
 /// Normalised state string: the column is free text from the API, and the
@@ -103,11 +139,12 @@ pub fn action_allowed(state: &str, action: PowerAction) -> std::result::Result<(
     match norm(state).as_str() {
         "running" => match action {
             PowerAction::Start => Err("already running".to_string()),
-            PowerAction::Stop | PowerAction::Restart => Ok(()),
+            PowerAction::Stop | PowerAction::Restart | PowerAction::Terminate => Ok(()),
         },
         "stopped" => match action {
             PowerAction::Start => Ok(()),
             PowerAction::Stop => Err("already stopped".to_string()),
+            PowerAction::Terminate => Ok(()),
             // Not silently downgraded to a Start: a restart is a stop and a
             // start, and turning a click on one into the other is a
             // different action from the one that was agreed to.
@@ -173,6 +210,12 @@ pub fn confirm_text(action: PowerAction, label: &str) -> String {
             "Stop {label}?\n\nRuns: aws ec2 stop-instances\n\
              Anything running on the instance is shut down."
         ),
+        PowerAction::Terminate => format!(
+            "TERMINATE {label}?\n\nRuns: aws ec2 terminate-instances\n\
+             The instance is deleted and cannot be brought back. Its \
+             instance store is lost, and EBS volumes set to delete on \
+             termination go with it."
+        ),
         PowerAction::Restart => format!(
             "Restart {label}?\n\n\
              This is a stop and a start, not an EC2 reboot:\n\
@@ -181,7 +224,9 @@ pub fn confirm_text(action: PowerAction, label: &str) -> String {
              \u{2022} hold {SETTLE_SECS}s\n\
              \u{2022} aws ec2 start-instances\n\n\
              The instance keeps its id and private IP, but anything on \
-             instance store is lost and a public IP would change."
+             instance store is lost and a public IP would change.\n\n\
+             If the instance has stop protection enabled it is rebooted \
+             instead (aws ec2 reboot-instances), since it cannot be stopped."
         ),
     }
 }
@@ -247,6 +292,42 @@ mod tests {
     fn state_matching_ignores_case_and_surrounding_space() {
         assert!(action_allowed("  Running  ", PowerAction::Stop).is_ok());
         assert!(action_allowed("STOPPED", PowerAction::Start).is_ok());
+    }
+
+    // ---- protection ------------------------------------------------------
+
+    #[test]
+    fn termination_protection_blocks_terminate_only() {
+        let p = Protection { termination: true, stop: false };
+        assert!(protection_refusal(p, PowerAction::Terminate).is_some());
+        assert!(protection_refusal(p, PowerAction::Stop).is_none());
+        assert!(protection_refusal(p, PowerAction::Restart).is_none());
+        assert!(!restart_is_reboot(p));
+    }
+
+    #[test]
+    fn stop_protection_blocks_stop_and_turns_restart_into_a_reboot() {
+        let p = Protection { termination: false, stop: true };
+        assert!(protection_refusal(p, PowerAction::Stop).is_some());
+        assert!(protection_refusal(p, PowerAction::Terminate).is_none());
+        assert!(protection_refusal(p, PowerAction::Restart).is_none());
+        assert!(protection_refusal(p, PowerAction::Start).is_none());
+        assert!(restart_is_reboot(p));
+    }
+
+    #[test]
+    fn an_unprotected_instance_is_never_refused() {
+        for a in [PowerAction::Start, PowerAction::Stop, PowerAction::Restart, PowerAction::Terminate] {
+            assert!(protection_refusal(Protection::default(), a).is_none());
+        }
+    }
+
+    #[test]
+    fn terminate_is_allowed_from_running_and_stopped_only() {
+        assert!(action_allowed("running", PowerAction::Terminate).is_ok());
+        assert!(action_allowed("stopped", PowerAction::Terminate).is_ok());
+        assert!(action_allowed("stopping", PowerAction::Terminate).is_err());
+        assert!(action_allowed("terminated", PowerAction::Terminate).is_err());
     }
 
     // ---- the restart wait ------------------------------------------------
