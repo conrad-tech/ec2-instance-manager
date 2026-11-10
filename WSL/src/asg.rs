@@ -1150,6 +1150,36 @@ pub fn fetch_refresh_progress(
     Ok(parse_refresh_progress(&raw))
 }
 
+/// The group's most recent instance refresh, whoever started it (the console,
+/// another person, this app). The API lists newest first.
+pub fn fetch_latest_refresh(
+    profile: &str,
+    region: &str,
+    group_name: &str,
+) -> std::result::Result<Option<RefreshProgress>, FetchError> {
+    let raw = run(
+        profile,
+        region,
+        &[
+            "autoscaling",
+            "describe-instance-refreshes",
+            "--auto-scaling-group-name",
+            group_name,
+            "--max-records",
+            "1",
+            "--output",
+            "json",
+        ],
+    )?;
+    Ok(parse_refresh_progress(&raw))
+}
+
+/// Is a group in the middle of a change: short of its desired capacity, or a
+/// refresh that has not reached a terminal status?
+pub fn is_changing(g: &AutoScalingGroup, refresh: Option<&RefreshProgress>) -> bool {
+    !capacity_settled(g) || refresh.is_some_and(|r| !r.is_terminal())
+}
+
 /// One group, re-read by name, so a watch polls one group rather than the
 /// whole account every few seconds.
 pub fn fetch_auto_scaling_group(
@@ -1250,6 +1280,16 @@ mod tests {
         assert_eq!(p.describe(), "instance refresh InProgress (40%)");
         assert!(super::parse_refresh_progress(r#"{"InstanceRefreshes":[]}"#).is_none());
         assert!(super::parse_refresh_progress("nonsense").is_none());
+    }
+
+    #[test]
+    fn a_running_refresh_means_changing_even_when_capacity_is_met() {
+        let g = super::AutoScalingGroup::default();
+        let r = |s: &str| super::RefreshProgress { status: s.into(), percent: None, reason: None };
+        assert!(!super::is_changing(&g, None));
+        assert!(!super::is_changing(&g, Some(&r("Successful"))));
+        assert!(super::is_changing(&g, Some(&r("InProgress"))));
+        assert!(super::is_changing(&g, Some(&r("Pending"))));
     }
 
     #[test]

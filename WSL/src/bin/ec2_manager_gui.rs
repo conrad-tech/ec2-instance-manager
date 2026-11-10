@@ -1004,6 +1004,15 @@ mod gui {
             name: String,
             result: std::result::Result<String, String>,
         },
+        /// One poll of the open ASG details tab (see `AsgPoll`).
+        AsgDetailPoll {
+            arn: String,
+            name: String,
+            cache_key: String,
+            group: Option<Box<AutoScalingGroup>>,
+            refresh: Option<asg::RefreshProgress>,
+            error: Option<String>,
+        },
         /// One poll of a group being watched after an instance refresh or a
         /// capacity edit. `finish` is `None` while it is still settling.
         AsgWatchTick {
@@ -2965,6 +2974,22 @@ mod gui {
         total: usize,
         confirmed: bool,
     }
+
+    /// Per-open-ASG-tab polling state: fast while the group is mid-change
+    /// (a refresh started anywhere, or short of desired), slow otherwise.
+    #[derive(Default)]
+    struct AsgPoll {
+        last: Option<Instant>,
+        busy: bool,
+        changing: bool,
+        refresh: Option<asg::RefreshProgress>,
+        /// The last read's failure, shown on the tab: a poll that cannot read
+        /// the group must not look like a group that has not changed.
+        error: Option<String>,
+    }
+
+    const ASG_POLL_ACTIVE_SECS: u64 = 10;
+    const ASG_POLL_IDLE_SECS: u64 = 60;
 
     /// The Start / Stop / Restart status line above the inventory table.
     struct PowerStatus {
@@ -12598,6 +12623,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         asg_capacity_status: Option<AsgCapacityStatus>,
         asg_protection_dialog: Option<Box<AsgProtectionDialog>>,
         asg_refresh_confirm: Option<Box<AsgRefreshConfirm>>,
+        asg_poll: HashMap<String, AsgPoll>,
         /// Buckets per cache key — the same arrangement as the other lists,
         /// except that S3 is global so the key carries no region and one
         /// account checked in two regions maps to ONE entry. See
@@ -13893,6 +13919,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 asg_capacity_status: None,
                 asg_protection_dialog: None,
                 asg_refresh_confirm: None,
+                asg_poll: HashMap::new(),
                 buckets: HashMap::new(),
                 bucket_list_loading: HashSet::new(),
                 bucket_list_errors: HashMap::new(),
@@ -31211,6 +31238,68 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                             }
                         }
                     }
+                    ProcEvent::AsgDetailPoll {
+                        arn,
+                        name,
+                        cache_key,
+                        group,
+                        refresh,
+                        error,
+                    } => {
+                        if let Some(e) = &error {
+                            self.log_warn(format!("asg {name}: could not read the group: {e}"));
+                        }
+                        let was_changing = self
+                            .asg_poll
+                            .get(&arn)
+                            .is_some_and(|p| p.changing);
+                        let mut changing = was_changing;
+                        if let Some(g) = group {
+                            changing = asg::is_changing(&g, refresh.as_ref());
+                            for tab in self.detail_tabs.iter_mut() {
+                                if let DetailSubject::Asg(t) = tab {
+                                    if t.arn == arn {
+                                        **t = (*g).clone();
+                                    }
+                                }
+                            }
+                            if let Some((_, rows)) = self.asgs.get_mut(&cache_key) {
+                                if let Some(row) = rows.iter_mut().find(|r| r.arn == arn) {
+                                    *row = *g;
+                                }
+                            }
+                        }
+                        if let Some(p) = self.asg_poll.get_mut(&arn) {
+                            p.busy = false;
+                            p.changing = changing;
+                            p.refresh = refresh.clone();
+                            p.error = error;
+                        }
+                        // Settled since the last look: say so, and re-read the
+                        // EC2 inventory, whose cache has not seen the change.
+                        if was_changing && !changing {
+                            let text = match &refresh {
+                                Some(r) if r.is_terminal() && !r.is_success() => {
+                                    format!("Instance refresh did not complete - {}", r.describe())
+                                }
+                                Some(r) if r.is_success() => {
+                                    "Instance refresh completed successfully".to_string()
+                                }
+                                _ => "Capacity settled".to_string(),
+                            };
+                            let ok = !text.contains("did not complete");
+                            self.log_warn(format!("asg {name}: {text}"));
+                            self.asg_capacity_status = Some(AsgCapacityStatus {
+                                name,
+                                text,
+                                state: if ok { ScriptState::Ok } else { ScriptState::Failed },
+                                settled_at: Some(Instant::now()),
+                            });
+                            if let Some(profile_id) = self.selected_profile.clone() {
+                                self.enqueue_refresh(&profile_id, true, true);
+                            }
+                        }
+                    }
                     ProcEvent::AsgWatchTick {
                         arn,
                         name,
@@ -40898,6 +40987,76 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             self.focus_detail_tab(DetailSubject::Asg(Box::new(group)));
         }
 
+        /// Poll the open ASG tab: every `ASG_POLL_ACTIVE_SECS` while the group
+        /// is mid-change, every `ASG_POLL_IDLE_SECS` otherwise, so a refresh
+        /// started in the console is noticed and its end is caught. Called
+        /// only while the tab is on screen.
+        fn poll_asg_detail(&mut self, ctx: &egui::Context, g: &AutoScalingGroup) {
+            if self.options.mode != Mode::Live {
+                return;
+            }
+            let poll = self.asg_poll.entry(g.arn.clone()).or_default();
+            let secs = if poll.changing { ASG_POLL_ACTIVE_SECS } else { ASG_POLL_IDLE_SECS };
+            let due = poll.last.is_none_or(|t| t.elapsed() >= Duration::from_secs(secs));
+            if poll.busy || !due {
+                if !poll.busy {
+                    let left = poll
+                        .last
+                        .map(|t| Duration::from_secs(secs).saturating_sub(t.elapsed()))
+                        .unwrap_or_default();
+                    ctx.request_repaint_after(left);
+                }
+                return;
+            }
+            let Some(account) = self
+                .resource_pool_accounts()
+                .into_iter()
+                .find(|a| a.account_id == g.account_id && a.authed)
+            else {
+                return;
+            };
+            let mode = self.options.mode.as_str().to_string();
+            let cache_key = account.cache_key(ResourceKind::Asg, &mode);
+            if let Some(p) = self.asg_poll.get_mut(&g.arn) {
+                p.busy = true;
+                p.last = Some(Instant::now());
+            }
+            let (arn, name) = (g.arn.clone(), g.name.clone());
+            let tx = self.proc_tx.clone();
+            let repaint = self.egui_ctx.clone();
+            std::thread::spawn(move || {
+                let (group, mut error) = match asg::fetch_auto_scaling_group(
+                    &account.profile,
+                    &account.region,
+                    &account.account_id,
+                    &name,
+                ) {
+                    Ok(Some(g)) => (Some(g), None),
+                    Ok(None) => (None, Some("group not found".to_string())),
+                    Err(e) => (None, Some(e.message())),
+                };
+                let refresh = match asg::fetch_latest_refresh(&account.profile, &account.region, &name) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error.get_or_insert(format!("refresh status: {}", e.message()));
+                        None
+                    }
+                };
+                let _ = tx.send(ProcEvent::AsgDetailPoll {
+                    arn,
+                    name,
+                    cache_key,
+                    group: group.map(Box::new),
+                    refresh,
+                    error,
+                });
+                if let Some(c) = &repaint {
+                    c.request_repaint();
+                }
+            });
+            ctx.request_repaint_after(Duration::from_secs(ASG_POLL_ACTIVE_SECS));
+        }
+
         fn render_asg_details(
             &mut self,
             ui: &mut egui::Ui,
@@ -40905,6 +41064,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             title: &str,
         ) {
             let st = self.asg_details.get(&g.arn).cloned().unwrap_or_default();
+            self.poll_asg_detail(ui.ctx(), &g);
             let mut edit_capacity = false;
             let mut start_refresh = false;
             let mut edit_protection = false;
@@ -40963,6 +41123,26 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 self.open_asg_protection_dialog(Some(&g));
             }
             self.render_asg_capacity_status(ui);
+            if let Some(p) = self.asg_poll.get(&g.arn) {
+                if let Some(e) = &p.error {
+                    note_label(
+                        ui,
+                        egui::Color32::RED,
+                        format!("could not refresh this group: {e}"),
+                    );
+                }
+                if p.changing {
+                    let what = match &p.refresh {
+                        Some(r) if !r.is_terminal() => r.describe(),
+                        _ => "capacity changing".to_string(),
+                    };
+                    note_label(
+                        ui,
+                        egui::Color32::from_rgb(220, 160, 40),
+                        format!("{what} - checking every {ASG_POLL_ACTIVE_SECS}s"),
+                    );
+                }
+            }
             ui.separator();
 
             // One scroll area, and nothing inside it with a fixed height — the
@@ -41223,11 +41403,11 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 ui.separator();
                 if let Some(activities) = detail_section(ui, &st.activities, "recent activity") {
                     egui::Grid::new("asg_activity_grid")
-                        .num_columns(3)
+                        .num_columns(4)
                         .spacing([12.0, 4.0])
                         .striped(true)
                         .show(ui, |ui| {
-                            for h in ["When", "Status", "What happened"] {
+                            for h in ["When", "Status", "What happened", "Cause"] {
                                 ui.strong(h);
                             }
                             ui.end_row();
@@ -41254,6 +41434,9 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                 // stays readable.
                                 ui.label(&a.description)
                                     .on_hover_text(activity_hover(a));
+                                // Also a column of its own: hover alone hid
+                                // the one field the section exists for.
+                                ui.label(if a.cause.is_empty() { "—" } else { &a.cause });
                                 ui.end_row();
                             }
                         });
@@ -45137,6 +45320,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 }
                 DetailSubject::Asg(_) => {
                     self.asg_details.remove(&key);
+                    self.asg_poll.remove(&key);
                 }
                 DetailSubject::Bucket(_) => {
                     self.bucket_details.remove(&key);
@@ -45236,14 +45420,16 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                         );
                                         ui.painter().circle_filled(rect.center(), 4.0, c);
                                     }
-                                    // Selection is weight and text colour, the
-                                    // Connections tab's own vocabulary.
-                                    let text_color = if idx == active {
+                                    // Exactly the Connections tab's rule: selected or
+                                    // hovered pops (strong colour, bold), everything
+                                    // else recedes to the muted grey.
+                                    let emphasised = idx == active
+                                        || hovered
+                                        || ui.response().is_pointer_button_down_on();
+                                    let text_color = if emphasised {
                                         ui.visuals().strong_text_color()
-                                    } else if hovered {
-                                        ui.visuals().widgets.hovered.text_color()
                                     } else {
-                                        ui.visuals().text_color()
+                                        ui.visuals().weak_text_color()
                                     };
                                     // The kind prefix earns its place: a target
                                     // group and the load balancer in front of it
@@ -45256,7 +45442,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                     );
                                     let mut rich =
                                         egui::RichText::new(label).color(text_color);
-                                    if idx == active {
+                                    if emphasised {
                                         rich = rich.strong();
                                     }
                                     ui.add(egui::Label::new(rich).selectable(false));
@@ -45369,16 +45555,18 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 DetailSubject::TargetGroup(tg) => self.open_target_group_details(*tg),
                 DetailSubject::LoadBalancer(lb) => self.open_load_balancer_details(*lb),
                 DetailSubject::Asg(g) => {
-                    // The group on the tab is a snapshot from when it was
-                    // opened; the cached list (kept current by the watchers)
-                    // is newer, so prefer its row.
-                    let latest = self
-                        .asgs
-                        .values()
-                        .flat_map(|(_, rows)| rows.iter())
-                        .find(|r| r.arn == g.arn)
-                        .cloned();
-                    self.open_asg_details(latest.unwrap_or(*g));
+                    // Not the cached list row: that can be OLDER than the tab
+                    // (it is only re-read every 5 minutes), and re-opening
+                    // from it put stale instance states back on screen. The
+                    // live group is fetched by the poll, forced due now.
+                    if let Some(p) = self.asg_poll.get_mut(&g.arn) {
+                        p.last = None;
+                        p.busy = false;
+                    }
+                    self.open_asg_details(*g);
+                    if let Some(c) = &self.egui_ctx {
+                        c.request_repaint();
+                    }
                 }
                 DetailSubject::Bucket(b) => self.open_bucket_details(*b),
                 DetailSubject::HostedZone(z) => self.open_hosted_zone_details(*z),
