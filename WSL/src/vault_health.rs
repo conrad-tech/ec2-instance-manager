@@ -24,6 +24,16 @@ pub const HEALTH_COMMAND: &str = concat!(
     r#"then echo "OVERALL: HEALTHY"; else echo "OVERALL: UNHEALTHY"; fi"#,
 );
 
+/// Memory and disk use, read-only. Memory is used/total from `free` (using
+/// "available", so cache does not count as used); disk is one `use% mount`
+/// line per mounted filesystem, skipping in-memory and container overlay
+/// mounts. Headings are exact lines, like the health command's.
+pub const RESOURCE_COMMAND: &str = concat!(
+    r#"echo "MEMORY"; free | awk '/^Mem:/ {printf "%d\n", ($2-$7)*100/$2}'; "#,
+    r#"echo "DISK"; df -P -x tmpfs -x devtmpfs -x overlay -x squashfs -x efivarfs | tail -n +2 | awk '{print $5, $6}'; "#,
+    r#"echo "END RESOURCES""#,
+);
+
 /// Keep only what is safe to put in a shell command and in a marker line.
 fn clean(nonce: &str) -> String {
     nonce.chars().filter(char::is_ascii_alphanumeric).collect()
@@ -53,6 +63,7 @@ pub fn steps(nonce: &str) -> Vec<String> {
     vec![
         marker_step("START", nonce),
         HEALTH_COMMAND.to_string(),
+        RESOURCE_COMMAND.to_string(),
         "docker ps".to_string(),
         marker_step("DONE", nonce),
     ]
@@ -80,6 +91,27 @@ fn this_run<'a>(screen: &'a str, nonce: &str) -> Option<&'a str> {
     found.map(|at| &screen[at..])
 }
 
+/// How full a resource is: 90% or more is red, 80% or more yellow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Level {
+    Ok,
+    Yellow,
+    Red,
+}
+
+pub const RED_PCT: u8 = 90;
+pub const YELLOW_PCT: u8 = 80;
+
+pub fn level(pct: u8) -> Level {
+    if pct >= RED_PCT {
+        Level::Red
+    } else if pct >= YELLOW_PCT {
+        Level::Yellow
+    } else {
+        Level::Ok
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Leader,
@@ -100,10 +132,23 @@ pub struct BoxReport {
     pub container_up: Option<bool>,
     /// How long the vault container has been Up: seconds, and docker's words.
     pub uptime: Option<(u64, String)>,
+    /// Memory in use, percent. `None` = not read.
+    pub memory_pct: Option<u8>,
+    /// `(mount, percent used)` for every mounted filesystem. Empty = not read.
+    pub disks: Vec<(String, u8)>,
     pub done: bool,
 }
 
 impl BoxReport {
+    /// The worst level among memory and every disk; `None` when neither was read.
+    pub fn worst_level(&self) -> Option<Level> {
+        self.memory_pct
+            .map(level)
+            .into_iter()
+            .chain(self.disks.iter().map(|(_, p)| level(*p)))
+            .max()
+    }
+
     pub fn role(&self) -> Role {
         if self.is_self == Some(true) && self.standby != Some(true) {
             Role::Leader
@@ -263,6 +308,37 @@ fn vault_up_row(screen: &str) -> Option<Option<Vec<String>>> {
     Some(None)
 }
 
+/// Memory and disk from the resource section of this run's output. The
+/// headings are matched as whole lines, so the echoed command never counts;
+/// only well-formed lines are taken, so a wrapped or garbled one is skipped
+/// rather than guessed at.
+fn parse_resources(screen: &str) -> (Option<u8>, Vec<(String, u8)>) {
+    let lines: Vec<&str> = screen.lines().map(str::trim).collect();
+    let Some(mem_at) = lines.iter().rposition(|l| *l == "MEMORY") else {
+        return (None, Vec::new());
+    };
+    let pct = |t: &str| t.trim_end_matches('%').parse::<u8>().ok().filter(|p| *p <= 100);
+    let memory = lines.get(mem_at + 1).and_then(|l| {
+        if l.ends_with('%') { None } else { pct(l) }
+    });
+    let mut disks = Vec::new();
+    if let Some(d) = lines.iter().skip(mem_at).position(|l| *l == "DISK") {
+        for l in lines.iter().skip(mem_at + d + 1) {
+            if *l == "END RESOURCES" {
+                break;
+            }
+            if let Some((p, mount)) = l.split_once(' ') {
+                if p.ends_with('%') && mount.starts_with('/') {
+                    if let Some(p) = pct(p) {
+                        disks.push((mount.trim().to_string(), p));
+                    }
+                }
+            }
+        }
+    }
+    (memory, disks)
+}
+
 /// Read one box's tab text, from this run's start marker onwards.
 pub fn parse_box(screen: &str, nonce: &str) -> BoxReport {
     let Some(screen) = this_run(screen, nonce) else {
@@ -280,7 +356,10 @@ pub fn parse_box(screen: &str, nonce: &str) -> BoxReport {
             "OVERALL: UNHEALTHY" => Some(false),
             _ => None,
         });
+    let (memory_pct, disks) = parse_resources(screen);
     BoxReport {
+        memory_pct,
+        disks,
         initialized: json_bool(&health, "initialized").or_else(|| json_bool(&seal, "initialized")),
         sealed: json_bool(&health, "sealed").or_else(|| json_bool(&seal, "sealed")),
         standby: json_bool(&health, "standby"),
@@ -323,6 +402,21 @@ pub fn judge(a: &BoxReport, b: &BoxReport, label_a: &str, label_b: &str) -> Verd
         }
         if r.container_up != Some(true) {
             problems.push(format!("{label}: the vault container is not Up in docker ps"));
+        }
+        match r.memory_pct {
+            None => problems.push(format!("{label}: memory use could not be read")),
+            Some(p) if level(p) == Level::Red => {
+                problems.push(format!("{label}: memory is at {p}% (90% or more)"))
+            }
+            Some(_) => {}
+        }
+        if r.disks.is_empty() {
+            problems.push(format!("{label}: disk use could not be read"));
+        }
+        for (mount, p) in &r.disks {
+            if level(*p) == Level::Red {
+                problems.push(format!("{label}: disk {mount} is at {p}% (90% or more)"));
+            }
         }
     }
     if readable.len() == 2 {
@@ -450,11 +544,33 @@ pub fn judge_target_group(
             labels[0], states[0], labels[1], states[1]
         ));
     }
+    // The one-healthy-one-unhealthy split is what a good pair looks like, so
+    // when the check passes the unhealthy box is marked as expected. Both
+    // unhealthy is a problem above and is left unmarked.
+    let shown = |i: usize| {
+        if problems.is_empty() && states[i] == "unhealthy" {
+            format!("{} (expected)", states[i])
+        } else {
+            states[i].clone()
+        }
+    };
     let line = format!(
         "Target group {name}: {} {}, {} {}.",
-        labels[0], states[0], labels[1], states[1]
+        labels[0], shown(0), labels[1], shown(1)
     );
     (problems, line)
+}
+
+/// How a report line is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    /// The healthy headline (drawn in a darker green).
+    Good,
+    Plain,
+    /// 80% or more.
+    Warn,
+    /// A problem, or 90% or more.
+    Bad,
 }
 
 /// Everything the result popup needs.
@@ -463,11 +579,34 @@ pub struct Report {
     pub verdict: Verdict,
     /// The popup's message: the verdict in words.
     pub summary: String,
+    /// The same text, line by line, each with the tone it is drawn in.
+    pub lines: Vec<(String, Tone)>,
     /// The popup's details pane: the verdict, then each box's full output.
     pub details: String,
     /// A vault container has been Up for two minutes or less: the popup
     /// shows its message red even when the pair is healthy.
     pub fresh: bool,
+}
+
+/// One box's memory and disk, in words, and the tone of the worst of them.
+fn resource_line(label: &str, r: &BoxReport) -> (String, Tone) {
+    let mem = r
+        .memory_pct
+        .map(|p| format!("memory {p}%"))
+        .unwrap_or_else(|| "memory not read".to_string());
+    let disks = if r.disks.is_empty() {
+        "disk not read".to_string()
+    } else {
+        let d: Vec<String> = r.disks.iter().map(|(m, p)| format!("{m} {p}%")).collect();
+        format!("disk {}", d.join(", "))
+    };
+    let (tone, note) = match r.worst_level() {
+        Some(Level::Red) => (Tone::Bad, " (CRITICAL: 90% or more)"),
+        Some(Level::Yellow) => (Tone::Warn, " (warning: 80% or more)"),
+        Some(Level::Ok) => (Tone::Plain, ""),
+        None => (Tone::Bad, ""),
+    };
+    (format!("{label}: {mem}; {disks}{note}"), tone)
 }
 
 /// Judge the two tabs' text and render the report. `None` is a tab that never
@@ -490,64 +629,67 @@ pub fn build_report_with_target_group(
         parse_box(texts[1].unwrap_or_default(), nonce),
     ];
     let mut verdict = judge(&reports[0], &reports[1], labels[0], labels[1]);
+    let mut tg_problem = false;
     let tg_line = tg.map(|tg| {
         let (problems, line) =
             judge_target_group(tg, [reports[0].role(), reports[1].role()], labels);
+        tg_problem = !problems.is_empty();
         verdict.problems.extend(problems);
         verdict.healthy = verdict.problems.is_empty();
         line
     });
+    let tg_tone = if tg_problem { Tone::Bad } else { Tone::Plain };
 
     let fresh = reports
         .iter()
         .any(|r| r.uptime.as_ref().is_some_and(|(secs, _)| *secs <= FRESH_UPTIME_SECS));
-    let summary = if verdict.healthy {
+    let mut lines: Vec<(String, Tone)> = Vec::new();
+    if verdict.healthy {
         let (leader, follower) = if reports[0].role() == Role::Leader {
             (labels[0], labels[1])
         } else {
             (labels[1], labels[0])
         };
-        let mut s = format!(
-            "Vault is healthy: {leader} is the leader and {follower} is the follower, \
-             both on version {}, with the vault container up on both.",
-            reports[0].version.as_deref().unwrap_or("?")
-        );
+        // A container that has only just started turns the whole message red.
+        let headline = if fresh { Tone::Bad } else { Tone::Good };
+        lines.push((
+            format!(
+                "Vault is healthy: {leader} is the leader and {follower} is the follower, \
+                 both on version {}, with the vault container up on both.",
+                reports[0].version.as_deref().unwrap_or("?")
+            ),
+            headline,
+        ));
         let ups: Vec<String> = labels
             .iter()
             .zip(reports.iter())
             .filter_map(|(l, r)| r.uptime.as_ref().map(|(_, t)| format!("{l} {t}")))
             .collect();
         if !ups.is_empty() {
-            s.push_str(&format!("\nDocker uptime: {}.", ups.join(", ")));
+            lines.push((format!("Docker uptime: {}.", ups.join(", ")), Tone::Plain));
+        }
+        for (l, r) in labels.iter().zip(reports.iter()) {
+            lines.push(resource_line(l, r));
         }
         if let Some(line) = &tg_line {
-            s.push('\n');
-            s.push_str(line);
+            lines.push((line.clone(), tg_tone));
         }
         if fresh {
-            s.push_str("\nA vault container started two minutes ago or less.");
+            lines.push(("A vault container started two minutes ago or less.".to_string(), Tone::Bad));
         }
-        s
     } else {
-        let mut s = String::from("Vault is NOT healthy:");
+        lines.push(("Vault is NOT healthy:".to_string(), Tone::Bad));
         for p in &verdict.problems {
-            if let Some(line) = &tg_line {
-            s.push('\n');
-            s.push_str(line);
+            lines.push((format!(" - {p}"), Tone::Bad));
         }
-        s.push_str("\n - ");
-            if let Some(line) = &tg_line {
-            s.push('\n');
-            s.push_str(line);
-        }
-        s.push_str(p);
+        for (l, r) in labels.iter().zip(reports.iter()) {
+            lines.push(resource_line(l, r));
         }
         if let Some(line) = &tg_line {
-            s.push('\n');
-            s.push_str(line);
+            lines.push((line.clone(), tg_tone));
         }
-        s
-    };
+    }
+    let summary = lines.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>().join("\n");
 
     let mut details = summary.clone();
     for (label, text) in labels.iter().zip(texts.iter()) {
@@ -557,7 +699,7 @@ pub fn build_report_with_target_group(
             None => details.push_str("(no output)"),
         }
     }
-    Report { verdict, summary, details, fresh }
+    Report { verdict, summary, lines, details, fresh }
 }
 
 #[cfg(test)]
@@ -572,6 +714,7 @@ mod tests {
     /// What a tab's text looks like after the steps ran: the echoed command
     /// lines (which contain the result words), then the real output.
     fn tab(standby: bool, is_self: bool, version: &str, sealed: bool, overall: &str, ps: &str, done: bool) -> String {
+        let (mem, disk) = ("40", "30% /\n55% /data");
         let mut s = String::new();
         s.push_str("# sudo su\n# ");
         s.push_str(&format!("# n={NONCE}; echo \"__VAULT_HEALTH_START_${{n}}__\"\n__VAULT_HEALTH_START_{NONCE}__\n# "));
@@ -587,7 +730,8 @@ mod tests {
             "SEAL STATUS\n{{\n  \"initialized\": true,\n  \"sealed\": {sealed},\n  \"t\": 1,\n  \"n\": 1,\n  \"progress\": 0,\n  \"version\": \"{version}\"\n}}\n---\n"
         ));
         s.push_str(overall);
-        s.push_str("\n# docker ps\n");
+        s.push_str(&format!("\n# {RESOURCE_COMMAND}\nMEMORY\n{mem}\nDISK\n{disk}\nEND RESOURCES\n"));
+        s.push_str("# docker ps\n");
         s.push_str(ps);
         s.push_str("\n# m=DONE; echo \"__VAULT_HEALTH_${m}__\"\n");
         if done {
@@ -739,7 +883,8 @@ mod tests {
             assert!(!all.contains(bad), "step mentions {bad}");
         }
         assert!(!all.replace(">/dev/null 2>&1", "").contains('>'));
-        assert_eq!(steps(NONCE)[2], "docker ps");
+        assert_eq!(steps(NONCE)[3], "docker ps");
+        assert_eq!(steps(NONCE)[2], RESOURCE_COMMAND);
         assert_eq!(steps(NONCE)[1], HEALTH_COMMAND);
     }
 
@@ -946,5 +1091,108 @@ mod tests {
         assert!(bad.summary.contains("Target group vault-tg"), "{}", bad.summary);
         // Not asked (no AWS access): the Vault checks decide alone.
         assert!(build_report(["Vault 1", "Vault 2"], [Some(&l), Some(&f)], NONCE).verdict.healthy);
+    }
+
+    /// A healthy tab with its memory and disk numbers swapped.
+    fn with_resources(tab: &str, mem: &str, disk: &str) -> String {
+        tab.replace("MEMORY\n40\nDISK\n30% /\n55% /data\n", &format!("MEMORY\n{mem}\nDISK\n{disk}\n"))
+    }
+
+    #[test]
+    fn levels_use_90_red_and_80_yellow() {
+        assert_eq!(level(79), Level::Ok);
+        assert_eq!(level(80), Level::Yellow);
+        assert_eq!(level(89), Level::Yellow);
+        assert_eq!(level(90), Level::Red);
+        assert_eq!(level(100), Level::Red);
+    }
+
+    #[test]
+    fn memory_and_every_mounted_disk_are_read() {
+        let b = parse_box(&with_resources(&leader(), "37", "12% /\n81% /data\n5% /efs"), NONCE);
+        assert_eq!(b.memory_pct, Some(37));
+        assert_eq!(
+            b.disks,
+            vec![("/".to_string(), 12), ("/data".to_string(), 81), ("/efs".to_string(), 5)]
+        );
+        assert_eq!(b.worst_level(), Some(Level::Yellow));
+    }
+
+    #[test]
+    fn the_echoed_resource_command_is_not_a_reading() {
+        let echo = format!("__VAULT_HEALTH_START_{NONCE}__\n# {RESOURCE_COMMAND}\n");
+        let b = parse_box(&echo, NONCE);
+        assert_eq!(b.memory_pct, None);
+        assert!(b.disks.is_empty());
+    }
+
+    #[test]
+    fn red_memory_or_disk_makes_the_pair_unhealthy_and_yellow_does_not() {
+        let ok = judged(&leader(), &follower());
+        assert!(ok.healthy, "{:?}", ok.problems);
+        let yellow = judged(&with_resources(&leader(), "85", "30% /\n85% /data"), &follower());
+        assert!(yellow.healthy, "{:?}", yellow.problems);
+        let red_mem = judged(&with_resources(&leader(), "90", "30% /"), &follower());
+        assert!(!red_mem.healthy);
+        assert!(red_mem.problems.iter().any(|p| p.contains("memory is at 90%")));
+        let red_disk = judged(&leader(), &with_resources(&follower(), "40", "30% /\n95% /data"));
+        assert!(red_disk.problems.iter().any(|p| p.contains("Vault 2") && p.contains("/data") && p.contains("95%")));
+    }
+
+    #[test]
+    fn an_unread_memory_or_disk_is_a_problem() {
+        let none = leader().replace("MEMORY\n40\nDISK\n30% /\n55% /data\n", "");
+        let v = judged(&none, &follower());
+        assert!(v.problems.iter().any(|p| p.contains("memory use could not be read")));
+        assert!(v.problems.iter().any(|p| p.contains("disk use could not be read")));
+    }
+
+    fn tg_found(a: &str, b: &str) -> TargetGroupResult {
+        TargetGroupResult::Found { name: "vault-tg".into(), states: [a.into(), b.into()] }
+    }
+
+    #[test]
+    fn the_unhealthy_box_in_a_good_pair_is_marked_expected() {
+        let (problems, line) = judge_target_group(
+            &tg_found("healthy", "unhealthy"),
+            [Role::Leader, Role::Follower],
+            ["Vault 1", "Vault 2"],
+        );
+        assert!(problems.is_empty());
+        assert!(line.contains("Vault 1 healthy"), "{line}");
+        assert!(line.contains("Vault 2 unhealthy (expected)"), "{line}");
+    }
+
+    #[test]
+    fn both_unhealthy_is_a_problem_and_is_not_marked_expected() {
+        let (problems, line) = judge_target_group(
+            &tg_found("unhealthy", "unhealthy"),
+            [Role::Leader, Role::Follower],
+            ["Vault 1", "Vault 2"],
+        );
+        assert!(!problems.is_empty());
+        assert!(!line.contains("expected"), "{line}");
+    }
+
+    #[test]
+    fn the_report_tones_the_headline_and_the_resource_lines() {
+        let labels = ["Vault 1", "Vault 2"];
+        let good = leader();
+        let fol = with_resources(&follower(), "85", "30% /");
+        let r = build_report_with_target_group(
+            labels,
+            [Some(&good), Some(&fol)],
+            NONCE,
+            Some(&tg_found("healthy", "unhealthy")),
+        );
+        assert!(r.verdict.healthy, "{:?}", r.verdict.problems);
+        assert_eq!(r.lines[0].1, Tone::Good);
+        assert!(r.lines.iter().any(|(t, tone)| t.starts_with("Vault 2: memory 85%") && *tone == Tone::Warn));
+        assert!(r.lines.iter().any(|(t, _)| t.contains("Vault 2 unhealthy (expected)")));
+        let red = with_resources(&follower(), "95", "30% /");
+        let r = build_report_with_target_group(labels, [Some(&good), Some(&red)], NONCE, None);
+        assert!(!r.verdict.healthy);
+        assert_eq!(r.lines[0].1, Tone::Bad);
+        assert!(r.lines.iter().any(|(t, tone)| t.starts_with("Vault 2: memory 95%") && *tone == Tone::Bad));
     }
 }

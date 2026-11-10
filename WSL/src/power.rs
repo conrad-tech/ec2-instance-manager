@@ -28,6 +28,12 @@ pub const POLL_INTERVAL_SECS: u64 = 5;
 /// has to finish by hand.
 pub const STOP_TIMEOUT_SECS: u64 = 300;
 
+/// How long to wait for `terminated` before giving up. Longer than a stop:
+/// an instance can sit in `shutting-down` for several minutes (EBS detach,
+/// instance-store wipe). Giving up is not a failure of the terminate -- it
+/// was accepted -- so the message says it is still in progress.
+pub const TERMINATE_TIMEOUT_SECS: u64 = 600;
+
 /// Which lifecycle action was asked for.
 ///
 /// `Restart` is a stop followed by a start — **not** `ec2 reboot-instances`,
@@ -60,6 +66,16 @@ impl PowerAction {
             // only place a reader is told, and its wording is load-bearing.
             Self::Restart => "Restart instance",
             Self::Terminate => "Terminate instance",
+        }
+    }
+
+    /// The status line's text from the click until the first poll lands.
+    pub fn in_progress(&self) -> &'static str {
+        match self {
+            Self::Start => "Start…",
+            Self::Stop => "Stop…",
+            Self::Restart => "Restart…",
+            Self::Terminate => "Terminating…",
         }
     }
 
@@ -119,6 +135,21 @@ fn norm(state: &str) -> String {
 /// poll exists to prevent.
 pub fn is_stopped(state: &str) -> bool {
     norm(state) == "stopped"
+}
+
+/// True once the instance has actually reached `terminated`.
+///
+/// `shutting-down` is the state being waited *out* of and must never satisfy
+/// this: reporting "terminated" while it is still going down is the lie the
+/// poll exists to prevent.
+pub fn is_terminated(state: &str) -> bool {
+    norm(state) == "terminated"
+}
+
+/// True once a terminate has been waited on longer than
+/// [`TERMINATE_TIMEOUT_SECS`].
+pub fn terminate_timed_out(waited: Duration) -> bool {
+    waited >= Duration::from_secs(TERMINATE_TIMEOUT_SECS)
 }
 
 /// True when waiting any longer for `stopped` is pointless: the instance is
@@ -183,6 +214,8 @@ pub enum PowerPhase {
     Settling { secs_left: u64 },
     /// The start call has gone out.
     Starting,
+    /// The terminate call was accepted and `terminated` is being polled for.
+    Terminating { waited_secs: u64 },
 }
 
 impl PowerPhase {
@@ -193,6 +226,7 @@ impl PowerPhase {
             Self::Stopping { waited_secs } => format!("stopping… {waited_secs}s"),
             Self::Settling { secs_left } => format!("stopped — starting in {secs_left}s"),
             Self::Starting => "starting…".to_string(),
+            Self::Terminating { waited_secs } => format!("terminating… {waited_secs}s"),
         }
     }
 }
@@ -363,6 +397,26 @@ mod tests {
 
     /// A stop that ends in `terminated` never reaches `stopped`, so the poll
     /// would otherwise spin for the full five minutes before saying anything.
+    #[test]
+    fn terminate_reads_as_terminating_while_it_runs() {
+        assert_eq!(PowerAction::Terminate.in_progress(), "Terminating…");
+    }
+
+    #[test]
+    fn shutting_down_is_not_terminated() {
+        assert!(is_terminated("terminated"));
+        assert!(is_terminated(" Terminated "));
+        assert!(!is_terminated("shutting-down"));
+        assert!(!is_terminated("running"));
+        assert!(!is_terminated(""));
+    }
+
+    #[test]
+    fn the_terminate_wait_has_its_own_timeout() {
+        assert!(!terminate_timed_out(Duration::from_secs(TERMINATE_TIMEOUT_SECS - 1)));
+        assert!(terminate_timed_out(Duration::from_secs(TERMINATE_TIMEOUT_SECS)));
+    }
+
     #[test]
     fn a_terminated_instance_abandons_the_poll_early() {
         assert!(poll_is_hopeless("terminated"));

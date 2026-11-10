@@ -1004,6 +1004,16 @@ mod gui {
             name: String,
             result: std::result::Result<String, String>,
         },
+        /// One poll of a group being watched after an instance refresh or a
+        /// capacity edit. `finish` is `None` while it is still settling.
+        AsgWatchTick {
+            arn: String,
+            name: String,
+            cache_key: String,
+            group: Option<Box<AutoScalingGroup>>,
+            text: String,
+            finish: Option<std::result::Result<(), ()>>,
+        },
         AsgCapacityDone {
             arn: String,
             name: String,
@@ -2785,6 +2795,9 @@ mod gui {
         title: String,
         /// Result text.
         message: String,
+        /// When set, drawn line by line in these tones instead of `message`
+        /// in one colour (the Vault Health Check's report).
+        tone_lines: Option<Vec<(String, ec2_manager::vault_health::Tone)>>,
         /// Green when true, red when false.
         success: bool,
         /// Saved PEM path (Some for a successful create) — enables the
@@ -5950,6 +5963,92 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         }
         let v: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
         Ok(v["InstanceRefreshId"].as_str().unwrap_or("(no id)").to_string())
+    }
+
+    /// Poll a group until a change the user started has settled, reporting
+    /// each look as `AsgWatchTick`. With a refresh id it follows that refresh
+    /// to a terminal status; without one it waits for the group to hold its
+    /// desired capacity, all in service. Runs on the caller's thread and ends
+    /// on settle, on the time cap, or when the app stops listening, so the
+    /// fast polling pauses by itself once there is nothing left to wait for.
+    #[allow(clippy::too_many_arguments)]
+    fn run_asg_watch(
+        tx: &Sender<ProcEvent>,
+        egui_ctx: &Option<egui::Context>,
+        profile: &str,
+        region: &str,
+        account_id: &str,
+        arn: &str,
+        name: &str,
+        cache_key: &str,
+        refresh_id: Option<&str>,
+    ) {
+        let max = Duration::from_secs(if refresh_id.is_some() {
+            asg::REFRESH_WATCH_MAX_SECS
+        } else {
+            asg::SETTLE_WATCH_MAX_SECS
+        });
+        let began = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_secs(asg::WATCH_INTERVAL_SECS));
+            let group = asg::fetch_auto_scaling_group(profile, region, account_id, name)
+                .ok()
+                .flatten();
+            let counts = group.as_ref().map(|g| {
+                format!(
+                    "{}/{} in service",
+                    g.instances.iter().filter(|i| i.is_serving()).count(),
+                    g.desired_capacity
+                )
+            });
+            let (mut text, mut finish) = match refresh_id {
+                Some(id) => match asg::fetch_refresh_progress(profile, region, name, id) {
+                    Ok(Some(p)) if p.is_terminal() => (
+                        if p.is_success() {
+                            "Instance refresh completed successfully".to_string()
+                        } else {
+                            format!("Instance refresh did not complete - {}", p.describe())
+                        },
+                        Some(if p.is_success() { Ok(()) } else { Err(()) }),
+                    ),
+                    Ok(Some(p)) => (
+                        format!("{} - {}", p.describe(), counts.clone().unwrap_or_default()),
+                        None,
+                    ),
+                    _ => ("instance refresh: status unreadable, retrying".to_string(), None),
+                },
+                None => match &group {
+                    Some(g) if asg::capacity_settled(g) => (
+                        format!("Capacity settled - {}", counts.clone().unwrap_or_default()),
+                        Some(Ok(())),
+                    ),
+                    Some(_) => (
+                        format!("capacity settling - {}", counts.clone().unwrap_or_default()),
+                        None,
+                    ),
+                    None => ("capacity: group unreadable, retrying".to_string(), None),
+                },
+            };
+            if finish.is_none() && began.elapsed() >= max {
+                text = format!("{text} - stopped watching after {} min", max.as_secs() / 60);
+                finish = Some(Err(()));
+            }
+            let done = finish.is_some();
+            let sent = tx.send(ProcEvent::AsgWatchTick {
+                arn: arn.to_string(),
+                name: name.to_string(),
+                cache_key: cache_key.to_string(),
+                group: group.map(Box::new),
+                text,
+                finish,
+            });
+            if let Some(c) = egui_ctx {
+                c.request_repaint();
+            }
+            if done || sent.is_err() {
+                break;
+            }
+        }
     }
 
     /// Manual unhealthy-host remediation: the watcher's `plan` and ASG guard
@@ -13307,6 +13406,13 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         pending_delete: Option<PendingDelete>,
         /// Colored Scripts status line (text + visual state), if any.
         script_status: Option<(String, ScriptState)>,
+        /// When a green Vault Health Check notice was raised, so it can clear
+        /// itself (a green banner that never goes away is noise).
+        script_status_ok_at: Option<Instant>,
+        /// The Vault instance list, to open once the health report is closed.
+        vault_inventory_pending: bool,
+        /// The Vault instance list dialog is open.
+        vault_inventory_open: bool,
         /// Extra status segment always shown flashing-yellow after the main
         /// status text (e.g. "PEM saved to <path>").
         script_status_highlight: Option<String>,
@@ -14105,6 +14211,9 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 create_user_run: None,
                 pending_delete: None,
                 script_status: None,
+                script_status_ok_at: None,
+                vault_inventory_pending: false,
+                vault_inventory_open: false,
                 script_status_highlight: None,
                 script_status_tabs: Vec::new(),
                 script_result_popup: None,
@@ -26735,6 +26844,115 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             }
         }
 
+        /// Clear the green Vault Health Check notice after a while. Judged on
+        /// every frame with a repaint requested for the instant it falls due,
+        /// because egui only draws when something happens.
+        fn expire_vault_health_notice(&mut self, ctx: &egui::Context) {
+            let Some(at) = self.script_status_ok_at else {
+                return;
+            };
+            let still_ok = matches!(self.script_status, Some((_, ScriptState::Ok)));
+            if !still_ok {
+                self.script_status_ok_at = None;
+            } else if at.elapsed() >= VAULT_HEALTH_OK_NOTICE {
+                self.script_status = None;
+                self.script_status_ok_at = None;
+            } else {
+                ctx.request_repaint_after(VAULT_HEALTH_OK_NOTICE.saturating_sub(at.elapsed()));
+            }
+        }
+
+        /// Every Vault instance in the cached inventories, across accounts.
+        fn vault_inventory_rows(&self) -> Vec<VaultInventoryRow> {
+            let mut groups: Vec<(String, &[Instance])> = self
+                .profile_inventory_cache
+                .iter()
+                .map(|(pid, (inv, _))| (self.profile_display_name(pid), inv.instances.as_slice()))
+                .collect();
+            groups.sort_by(|a, b| a.0.cmp(&b.0));
+            vault_inventory_rows_from(&groups)
+        }
+
+        /// The second dialog: the Vault instances for every environment, from
+        /// the inventory. Opens after the health report has been dismissed.
+        fn render_vault_inventory_dialog(&mut self, ctx: &egui::Context) {
+            if self.vault_inventory_pending && self.script_result_popup.is_none() {
+                self.vault_inventory_pending = false;
+                self.vault_inventory_open = true;
+            }
+            if !self.vault_enabled_for_inventory() {
+                self.vault_inventory_open = false;
+                self.vault_inventory_pending = false;
+                return;
+            }
+            if !self.vault_inventory_open {
+                return;
+            }
+            let rows = self.vault_inventory_rows();
+            let unloaded: Vec<String> = self
+                .config
+                .profiles
+                .iter()
+                .filter(|p| !self.profile_inventory_cache.contains_key(&p.profile_id))
+                .map(|p| self.profile_display_name(&p.profile_id))
+                .collect();
+            let mut open = true;
+            let mut close = false;
+            egui::Window::new("Vault Instances")
+                .collapsible(false)
+                .resizable(true)
+                .open(&mut open)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .default_pos(ctx.content_rect().center())
+                .show(ctx, |ui| {
+                    if rows.is_empty() {
+                        ui.label("No instances tagged ApplicationName=vault in the loaded inventory.");
+                    } else {
+                        ui.label(format!("{} Vault instance(s) across all environments", rows.len()));
+                        egui::ScrollArea::both().max_height(420.0).show(ui, |ui| {
+                            egui::Grid::new("vault_inventory_grid")
+                                .striped(true)
+                                .num_columns(6)
+                                .show(ui, |ui| {
+                                    for h in ["Environment", "Name", "Instance type", "State", "Account", "Instance ID"] {
+                                        ui.strong(h);
+                                    }
+                                    ui.end_row();
+                                    for r in &rows {
+                                        ui.label(&r.env);
+                                        ui.label(&r.name);
+                                        ui.label(&r.instance_type);
+                                        ui.label(&r.state);
+                                        ui.label(&r.account);
+                                        ui.monospace(&r.instance_id);
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    }
+                    if !unloaded.is_empty() {
+                        ui.add_space(6.0);
+                        note_label(
+                            ui,
+                            egui::Color32::from_rgb(230, 170, 30),
+                            format!("Inventory not loaded for: {}", unloaded.join(", ")),
+                        );
+                    }
+                    ui.add_space(8.0);
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            if !open || close {
+                self.vault_inventory_open = false;
+            }
+        }
+
+        /// The list belongs to the Vault Health Check, so it keeps that gate.
+        fn vault_enabled_for_inventory(&self) -> bool {
+            self.vault_health_enabled
+        }
+
         /// Render the "Scripts → Vault Health Check" modal.
         fn render_vault_health_dialog(&mut self, ctx: &egui::Context) {
             let Some(mut dlg) = self.vault_health_dialog.take() else {
@@ -27660,6 +27878,21 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 None,
                 Some(report.details),
             );
+            if let Some(popup) = self.script_result_popup.as_mut() {
+                popup.tone_lines = Some(report.lines);
+            }
+            // The toolbar notice. `show_script_result` cleared the status line,
+            // so this is set after it. Green clears itself; red stays until
+            // the toolbar's clear button is pressed.
+            if healthy {
+                self.set_script_status("Vault Health Check - Healthy", ScriptState::Ok);
+                self.script_status_ok_at = Some(Instant::now());
+            } else {
+                self.set_script_status("Vault Health Check - Unhealthy", ScriptState::Failed);
+                self.script_status_ok_at = None;
+            }
+            // The Vault list opens once this report is dismissed.
+            self.vault_inventory_pending = true;
         }
 
         /// Render the "Scripts → Vault IAM Access" modal.
@@ -29050,6 +29283,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         /// only thing shown (yellow while running, red on failure).
         fn set_script_status(&mut self, text: impl Into<String>, state: ScriptState) {
             self.script_status = Some((text.into(), state));
+            self.script_status_ok_at = None;
             self.script_status_highlight = None;
             self.message = String::new();
         }
@@ -29136,6 +29370,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             self.script_result_popup = Some(ScriptResultPopup {
                 title: title.into(),
                 message,
+                tone_lines: None,
                 success,
                 pem_path,
                 details,
@@ -29168,7 +29403,21 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                     } else {
                         egui::Color32::from_rgb(220, 60, 60)
                     };
-                    note_label(ui, color, &popup.message);
+                    if let Some(lines) = &popup.tone_lines {
+                        use ec2_manager::vault_health::Tone;
+                        for (text, tone) in lines {
+                            let c = match tone {
+                                // Darker than the shared success green.
+                                Tone::Good => egui::Color32::from_rgb(34, 139, 34),
+                                Tone::Warn => egui::Color32::from_rgb(230, 170, 30),
+                                Tone::Bad => egui::Color32::from_rgb(220, 60, 60),
+                                Tone::Plain => ui.visuals().text_color(),
+                            };
+                            note_label(ui, c, text);
+                        }
+                    } else {
+                        note_label(ui, color, &popup.message);
+                    }
                     if let Some(path) = &popup.pem_path {
                         ui.add_space(8.0);
                         ui.label("PEM saved to:");
@@ -30959,6 +31208,73 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                     state: ScriptState::Failed,
                                     settled_at: Some(Instant::now()),
                                 });
+                            }
+                        }
+                    }
+                    ProcEvent::AsgWatchTick {
+                        arn,
+                        name,
+                        cache_key,
+                        group,
+                        text,
+                        finish,
+                    } => {
+                        // The row is replaced in place and the list's own
+                        // timestamp left alone: only this group is fresh.
+                        if let Some(g) = group {
+                            // An open details tab holds its own snapshot of
+                            // the group, so it is updated too.
+                            for tab in self.detail_tabs.iter_mut() {
+                                if let DetailSubject::Asg(t) = tab {
+                                    if t.arn == arn {
+                                        **t = (*g).clone();
+                                    }
+                                }
+                            }
+                            if let Some((_, rows)) = self.asgs.get_mut(&cache_key) {
+                                if let Some(row) = rows.iter_mut().find(|r| r.arn == arn) {
+                                    *row = *g;
+                                }
+                            }
+                        }
+                        match finish {
+                            None => {
+                                self.log_debug(format!("asg watch {name}: {text}"));
+                                self.asg_capacity_status = Some(AsgCapacityStatus {
+                                    name,
+                                    text,
+                                    state: ScriptState::Running,
+                                    settled_at: None,
+                                });
+                            }
+                            Some(outcome) => {
+                                let ok = outcome.is_ok();
+                                if ok {
+                                    self.log_warn(format!("asg watch {name}: {text}"));
+                                } else {
+                                    self.log_error(format!("asg watch {name}: {text}"));
+                                }
+                                self.asg_capacity_status = Some(AsgCapacityStatus {
+                                    name,
+                                    text,
+                                    state: if ok { ScriptState::Ok } else { ScriptState::Failed },
+                                    settled_at: Some(Instant::now()),
+                                });
+                                // The EC2 inventory has its own cache, so the
+                                // new instances only appear there once it is
+                                // re-read.
+                                if let Some(profile_id) = self.selected_profile.clone() {
+                                    self.enqueue_refresh(&profile_id, true, true);
+                                }
+                                // One full re-read so the whole table is current.
+                                if let Some(stale) =
+                                    Instant::now().checked_sub(resources::RESOURCE_TTL)
+                                {
+                                    if let Some((at, _)) = self.asgs.get_mut(&cache_key) {
+                                        *at = stale;
+                                    }
+                                    self.asg_list_failures.remove(&cache_key);
+                                }
                             }
                         }
                     }
@@ -33625,7 +33941,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             ));
             self.power_status = Some(PowerStatus {
                 instance_id: instance_id.clone(),
-                text: format!("{}…", action.verb()),
+                text: action.in_progress().to_string(),
                 state: ScriptState::Running,
                 settled_at: None,
             });
@@ -38254,6 +38570,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 profile,
                 region,
                 cache_key,
+                account_id,
                 ..
             } = pending;
             let tx = self.proc_tx.clone();
@@ -38266,14 +38583,22 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 if let Ok(mut guard) = in_flight.lock() {
                     guard.remove(&arn);
                 }
+                let landed = result.is_ok();
                 let _ = tx.send(ProcEvent::AsgCapacityDone {
-                    arn,
-                    name,
-                    cache_key,
+                    arn: arn.clone(),
+                    name: name.clone(),
+                    cache_key: cache_key.clone(),
                     result,
                 });
                 if let Some(c) = &egui_ctx {
                     c.request_repaint();
+                }
+                // Keep reading the group until it holds what was asked for.
+                if landed {
+                    run_asg_watch(
+                        &tx, &egui_ctx, &profile, &region, &account_id, &arn, &name,
+                        &cache_key, None,
+                    );
                 }
             });
         }
@@ -38999,19 +39324,35 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             let tx = self.proc_tx.clone();
             let egui_ctx = self.egui_ctx.clone();
             let in_flight = Arc::clone(&self.asg_capacity_in_flight);
+            let cache_key = self
+                .resource_pool_accounts()
+                .into_iter()
+                .find(|a| a.account_id == pending.account_id)
+                .map(|a| a.cache_key(ResourceKind::Asg, mode.as_str()))
+                .unwrap_or_default();
             std::thread::spawn(move || {
                 let result =
                     start_instance_refresh(&pending.profile, &pending.region, &pending.name, &mode);
                 if let Ok(mut guard) = in_flight.lock() {
                     guard.remove(&pending.arn);
                 }
+                // Follow the refresh to the end, so the user is told when it
+                // is done rather than only that it started.
+                let watch_id = result.as_ref().ok().cloned();
                 let _ = tx.send(ProcEvent::AsgRefreshDone {
-                    arn: pending.arn,
-                    name: pending.name,
+                    arn: pending.arn.clone(),
+                    name: pending.name.clone(),
                     result,
                 });
                 if let Some(c) = &egui_ctx {
                     c.request_repaint();
+                }
+                if let Some(id) = watch_id {
+                    run_asg_watch(
+                        &tx, &egui_ctx, &pending.profile, &pending.region,
+                        &pending.account_id, &pending.arn, &pending.name,
+                        &cache_key, Some(&id),
+                    );
                 }
             });
         }
@@ -44841,6 +45182,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             // one compare with that one", which one slot cannot answer.
             let mut close: Option<usize> = None;
             let mut close_all = false;
+            let mut refresh_active = false;
             let mut select: Option<usize> = None;
             let active = self.detail_active.min(self.detail_tabs.len() - 1);
             // Resolved before the strip is drawn: the loop borrows
@@ -44943,6 +45285,15 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                         select = Some(idx);
                     }
                 }
+                // One Refresh for every kind of subject: it refetches the
+                // active tab, so the panels need no button of their own.
+                if ui
+                    .button("Refresh")
+                    .on_hover_text("Re-read this tab's details from AWS")
+                    .clicked()
+                {
+                    refresh_active = true;
+                }
                 // Always present, and carrying its count, as the Connections
                 // toolbar's own Close All does. Hiding it below two tabs —
                 // which this did — makes a button people look for come and go,
@@ -44973,6 +45324,10 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 self.detail_active = idx;
             }
             self.detail_active = self.detail_active.min(self.detail_tabs.len() - 1);
+            if refresh_active {
+                let subject = self.detail_tabs[self.detail_active].clone();
+                self.refresh_detail_subject(subject);
+            }
 
             // The heading is `DetailSubject::title` for every subject, so one
             // rule names them and the panels cannot drift.
@@ -45002,6 +45357,71 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                     self.render_hosted_zone_details(ui, *z, &title);
                 }
             }
+        }
+
+        /// Refetch one open detail tab. Every kind already has an `open_*`
+        /// that resets the tab's state and refetches (re-opening is how the
+        /// row menu refreshes), so this reuses them rather than adding a
+        /// second fetch path per kind.
+        fn refresh_detail_subject(&mut self, subject: DetailSubject) {
+            match subject {
+                DetailSubject::Instance(i) => self.refresh_instance_details(*i),
+                DetailSubject::TargetGroup(tg) => self.open_target_group_details(*tg),
+                DetailSubject::LoadBalancer(lb) => self.open_load_balancer_details(*lb),
+                DetailSubject::Asg(g) => {
+                    // The group on the tab is a snapshot from when it was
+                    // opened; the cached list (kept current by the watchers)
+                    // is newer, so prefer its row.
+                    let latest = self
+                        .asgs
+                        .values()
+                        .flat_map(|(_, rows)| rows.iter())
+                        .find(|r| r.arn == g.arn)
+                        .cloned();
+                    self.open_asg_details(latest.unwrap_or(*g));
+                }
+                DetailSubject::Bucket(b) => self.open_bucket_details(*b),
+                DetailSubject::HostedZone(z) => self.open_hosted_zone_details(*z),
+            }
+        }
+
+        /// The instance Details refetch, as the row menu's See Details does
+        /// it (that copy is inline because it runs inside the row loop).
+        fn refresh_instance_details(&mut self, instance: Instance) {
+            let iid = instance.instance_id.clone();
+            self.instance_details.insert(
+                iid.clone(),
+                InstanceDetailState {
+                    volumes_loading: true,
+                    security_groups_loading: true,
+                    ..Default::default()
+                },
+            );
+            let Some(ctx) = self.context_for_instance(&iid) else {
+                let err = "no AWS context for this instance".to_string();
+                if let Some(st) = self.instance_details.get_mut(&iid) {
+                    st.volumes_loading = false;
+                    st.security_groups_loading = false;
+                    st.volumes_error = Some(err.clone());
+                    st.security_groups_error = Some(err);
+                }
+                return;
+            };
+            let tx = self.proc_tx.clone();
+            std::thread::spawn(move || {
+                let result = fetch_volumes(&ctx.profile, &ctx.region, &iid);
+                let (iam, sg_ids) = fetch_instance_extras(&ctx.profile, &ctx.region, &iid);
+                let _ = tx.send(ProcEvent::VolumeResult {
+                    instance_id: iid.clone(),
+                    volumes: result,
+                    iam_role: iam,
+                });
+                let groups = fetch_security_groups(&ctx.profile, &ctx.region, &sg_ids);
+                let _ = tx.send(ProcEvent::SecurityGroupResult {
+                    instance_id: iid,
+                    groups,
+                });
+            });
         }
 
         fn render_instance_details(&mut self, ui: &mut egui::Ui, instance: Instance, title: &str) {
@@ -45950,6 +46370,8 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 self.render_vault_health_dialog(ctx);
                 self.render_disk_script_dialog(ctx);
                 self.poll_vault_health_run(ctx);
+                self.expire_vault_health_notice(ctx);
+                self.render_vault_inventory_dialog(ctx);
                 self.poll_cassandra_events();
                 self.poll_cassandra_schedules();
                 self.render_cassandra_dialog(ctx);
@@ -54945,6 +55367,62 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         filtered
     }
 
+    /// How long the green "Vault Health Check - Healthy" notice stays up.
+    const VAULT_HEALTH_OK_NOTICE: Duration = Duration::from_secs(60);
+
+    /// One row of the Vault Instances dialog.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct VaultInventoryRow {
+        env: String,
+        name: String,
+        instance_type: String,
+        state: String,
+        account: String,
+        instance_id: String,
+    }
+
+    /// Every instance tagged `ApplicationName=vault` (key exact, value
+    /// case-insensitive) in any of the `(account name, instances)` groups, in
+    /// any state, sorted by environment, then name, then id. A missing name,
+    /// type or environment reads as a dash rather than a blank cell.
+    fn vault_inventory_rows_from(groups: &[(String, &[Instance])]) -> Vec<VaultInventoryRow> {
+        let dash = |v: Option<&str>| {
+            v.map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| "-".to_string())
+        };
+        let mut out = Vec::new();
+        for (account, instances) in groups {
+            for i in instances.iter() {
+                let is_vault = i
+                    .tags
+                    .get("ApplicationName")
+                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("vault"));
+                if !is_vault {
+                    continue;
+                }
+                out.push(VaultInventoryRow {
+                    env: instance_env(i)
+                        .map(|e| script_env_label_text(&e))
+                        .unwrap_or_else(|| "-".to_string()),
+                    name: dash(i.name.as_deref()),
+                    instance_type: dash(i.instance_type.as_deref()),
+                    state: i.state.clone(),
+                    account: account.clone(),
+                    instance_id: i.instance_id.clone(),
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            a.env
+                .cmp(&b.env)
+                .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+                .then_with(|| a.instance_id.cmp(&b.instance_id))
+        });
+        out
+    }
+
     /// The running Vault boxes in an environment, as `(id, name)` pairs sorted
     /// by name: instances tagged `ApplicationName=vault` (key exact, value
     /// case-insensitive) whose environment matches. An empty `env_name`
@@ -57220,7 +57698,32 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             }
             PowerAction::Terminate => {
                 terminate_instance(profile, region, instance_id, &context.mode)?;
-                Ok("terminate requested — the instance is shutting down for good".to_string())
+                // The call being accepted only means shutting-down began.
+                // Keep reading until it reports `terminated`, so the status
+                // line says it is gone rather than that it was asked to go.
+                let began = Instant::now();
+                loop {
+                    let waited = began.elapsed();
+                    progress(PowerPhase::Terminating { waited_secs: waited.as_secs() });
+                    // One failed read costs one poll, as in restart_instance.
+                    let state = fetch_instance_state(profile, region, instance_id)
+                        .unwrap_or_default();
+                    if power::is_terminated(&state) {
+                        return Ok(format!(
+                            "Instance terminated ({}s)",
+                            waited.as_secs()
+                        ));
+                    }
+                    if power::terminate_timed_out(waited) {
+                        return Err(format!(
+                            "terminate was accepted but the instance is still '{}' after {}s — \
+                             it is still shutting down; check the console",
+                            if state.is_empty() { "unreadable" } else { &state },
+                            waited.as_secs(),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_secs(power::POLL_INTERVAL_SECS));
+                }
             }
             PowerAction::Restart => {
                 if protection.map(power::restart_is_reboot).unwrap_or(false) {
@@ -57424,6 +57927,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                         PowerPhase::Stopping { .. } => 1,
                         PowerPhase::Settling { .. } => 2,
                         PowerPhase::Starting => 3,
+                        PowerPhase::Terminating { .. } => 4,
                     };
                     if last.replace(kind) != kind {
                         note(
@@ -63955,6 +64459,32 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         /// The menu entry and the dialog both sit behind the allow-list, and
         /// the dialog never speaks of a primary or secondary: with Vault the
         /// roles move.
+        #[test]
+        fn the_vault_list_spans_accounts_includes_every_state_and_sorts() {
+            let mk = |id: &str, name: &str, ty: &str, state: &str, env: &str, app: &str| {
+                let mut i = Instance::new(id.to_string(), state.to_string());
+                i.name = Some(name.to_string());
+                i.instance_type = Some(ty.to_string());
+                i.env = Some(env.to_string());
+                i.tags.insert("ApplicationName".to_string(), app.to_string());
+                i
+            };
+            let a = vec![
+                mk("i-2", "vault-b", "m5.large", "running", "dev1", "Vault"),
+                mk("i-1", "vault-a", "m5.xlarge", "stopped", "dev1", "vault"),
+                mk("i-9", "web", "t3.small", "running", "dev1", "web"),
+            ];
+            let b = vec![mk("i-3", "vault-c", "c5.large", "running", "auct", "VAULT")];
+            let groups = vec![("Acct A".to_string(), a.as_slice()), ("Acct B".to_string(), b.as_slice())];
+            let rows = vault_inventory_rows_from(&groups);
+            let ids: Vec<&str> = rows.iter().map(|r| r.instance_id.as_str()).collect();
+            assert_eq!(ids, ["i-3", "i-1", "i-2"], "sorted by env then name; non-vault dropped");
+            assert_eq!(rows[0].env, "AUCT");
+            assert_eq!(rows[1].state, "stopped");
+            assert_eq!(rows[1].instance_type, "m5.xlarge");
+            assert_eq!(rows[0].account, "Acct B");
+        }
+
         #[test]
         fn the_vault_health_check_stays_behind_its_gate() {
             let whole = include_str!("ec2_manager_gui.rs");

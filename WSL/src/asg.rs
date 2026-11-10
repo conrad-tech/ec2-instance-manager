@@ -1067,6 +1067,124 @@ pub fn set_capacity(
     Ok(())
 }
 
+/// Gap between polls while a watched change is settling.
+pub const WATCH_INTERVAL_SECS: u64 = 15;
+/// A refresh can take hours on a big group; a capacity change should not.
+pub const REFRESH_WATCH_MAX_SECS: u64 = 4 * 3600;
+pub const SETTLE_WATCH_MAX_SECS: u64 = 30 * 60;
+
+/// Where an instance refresh has got to, from `describe-instance-refreshes`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefreshProgress {
+    /// `Pending`, `InProgress`, `Successful`, `Failed`, `Cancelling`,
+    /// `Cancelled`, `RollbackInProgress`, `RollbackFailed`,
+    /// `RollbackSuccessful`, `Baking`.
+    pub status: String,
+    pub percent: Option<i64>,
+    pub reason: Option<String>,
+}
+
+impl RefreshProgress {
+    /// Nothing more will happen to this refresh.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "Successful" | "Failed" | "Cancelled" | "RollbackFailed" | "RollbackSuccessful"
+        )
+    }
+
+    /// Only `Successful` is success: a completed rollback means the refresh
+    /// did NOT do what was asked.
+    pub fn is_success(&self) -> bool {
+        self.status == "Successful"
+    }
+
+    pub fn describe(&self) -> String {
+        let mut text = format!("instance refresh {}", self.status);
+        if let Some(p) = self.percent {
+            text.push_str(&format!(" ({p}%)"));
+        }
+        if self.is_terminal() && !self.is_success() {
+            if let Some(r) = self.reason.as_deref().filter(|r| !r.is_empty()) {
+                text.push_str(&format!(": {r}"));
+            }
+        }
+        text
+    }
+}
+
+/// Read one refresh out of a `describe-instance-refreshes` reply. `None` when
+/// the reply holds none (a refresh the API has aged out, or an odd shape):
+/// "could not tell" must not read as finished.
+pub fn parse_refresh_progress(raw: &str) -> Option<RefreshProgress> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let r = v.get("InstanceRefreshes")?.as_array()?.first()?;
+    Some(RefreshProgress {
+        status: r.get("Status")?.as_str()?.to_string(),
+        percent: r.get("PercentageComplete").and_then(|p| p.as_i64()),
+        reason: r.get("StatusReason").and_then(|p| p.as_str()).map(str::to_string),
+    })
+}
+
+/// One refresh's progress. Takes the group's NAME and the refresh id.
+pub fn fetch_refresh_progress(
+    profile: &str,
+    region: &str,
+    group_name: &str,
+    refresh_id: &str,
+) -> std::result::Result<Option<RefreshProgress>, FetchError> {
+    let raw = run(
+        profile,
+        region,
+        &[
+            "autoscaling",
+            "describe-instance-refreshes",
+            "--auto-scaling-group-name",
+            group_name,
+            "--instance-refresh-ids",
+            refresh_id,
+            "--output",
+            "json",
+        ],
+    )?;
+    Ok(parse_refresh_progress(&raw))
+}
+
+/// One group, re-read by name, so a watch polls one group rather than the
+/// whole account every few seconds.
+pub fn fetch_auto_scaling_group(
+    profile: &str,
+    region: &str,
+    account_id: &str,
+    group_name: &str,
+) -> std::result::Result<Option<AutoScalingGroup>, FetchError> {
+    let raw = run(
+        profile,
+        region,
+        &[
+            "autoscaling",
+            "describe-auto-scaling-groups",
+            "--auto-scaling-group-names",
+            group_name,
+            "--output",
+            "json",
+        ],
+    )?;
+    let mut groups = parse_auto_scaling_groups(&raw);
+    for g in &mut groups {
+        g.account_id = account_id.to_string();
+    }
+    Ok(groups.into_iter().next())
+}
+
+/// Has a group finished moving to its desired capacity? Holds exactly the
+/// desired count and every one serving (`is_serving` needs both InService and
+/// Healthy). During a refresh with 110% max the count is above desired, so
+/// this is also false then, which is correct.
+pub fn capacity_settled(g: &AutoScalingGroup) -> bool {
+    g.instances.len() as i64 == g.desired_capacity && g.instances.iter().all(|i| i.is_serving())
+}
+
 /// The API takes at most this many instance ids per call.
 const PROTECTION_BATCH: usize = 50;
 
@@ -1110,6 +1228,47 @@ pub fn set_instance_protection(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_refresh_is_only_finished_in_a_terminal_status() {
+        let p = |s: &str| super::RefreshProgress { status: s.into(), percent: None, reason: None };
+        for s in ["Pending", "InProgress", "Cancelling", "RollbackInProgress", "Baking"] {
+            assert!(!p(s).is_terminal(), "{s}");
+        }
+        for s in ["Successful", "Failed", "Cancelled", "RollbackFailed", "RollbackSuccessful"] {
+            assert!(p(s).is_terminal(), "{s}");
+        }
+        assert!(p("Successful").is_success());
+        assert!(!p("RollbackSuccessful").is_success());
+    }
+
+    #[test]
+    fn a_refresh_reply_is_parsed_and_an_empty_one_is_not_finished() {
+        let raw = r#"{"InstanceRefreshes":[{"Status":"InProgress","PercentageComplete":40}]}"#;
+        let p = super::parse_refresh_progress(raw).unwrap();
+        assert_eq!(p.status, "InProgress");
+        assert_eq!(p.percent, Some(40));
+        assert_eq!(p.describe(), "instance refresh InProgress (40%)");
+        assert!(super::parse_refresh_progress(r#"{"InstanceRefreshes":[]}"#).is_none());
+        assert!(super::parse_refresh_progress("nonsense").is_none());
+    }
+
+    #[test]
+    fn a_group_is_settled_only_at_desired_and_all_serving() {
+        let inst = |l: &str, h: &str| super::AsgInstance {
+            lifecycle_state: l.into(),
+            health_status: h.into(),
+            ..Default::default()
+        };
+        let mut g = super::AutoScalingGroup { desired_capacity: 2, ..Default::default() };
+        g.instances = vec![inst("InService", "Healthy"), inst("InService", "Healthy")];
+        assert!(super::capacity_settled(&g));
+        g.instances.push(inst("Pending", "Healthy"));
+        assert!(!super::capacity_settled(&g));
+        g.instances.pop();
+        g.instances[1] = inst("Pending", "Healthy");
+        assert!(!super::capacity_settled(&g));
+    }
+
     use super::*;
 
 
