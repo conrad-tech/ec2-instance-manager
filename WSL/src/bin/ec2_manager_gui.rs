@@ -1011,6 +1011,9 @@ mod gui {
             cache_key: String,
             group: Option<Box<AutoScalingGroup>>,
             refresh: Option<asg::RefreshProgress>,
+            /// `None` when the read failed: the list on screen is kept and the
+            /// group is not declared settled on evidence we do not have.
+            activities: Option<Vec<asg::ScalingActivity>>,
             error: Option<String>,
         },
         /// One poll of a group being watched after an instance refresh or a
@@ -2990,6 +2993,7 @@ mod gui {
 
     /// How often an open target group re-reads its health while a target is unsettled.
     const TG_POLL_ACTIVE_SECS: u64 = 10;
+    const TG_POLL_IDLE_SECS: u64 = 60;
     const ASG_POLL_ACTIVE_SECS: u64 = 10;
     const ASG_POLL_IDLE_SECS: u64 = 60;
 
@@ -31250,6 +31254,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                         cache_key,
                         group,
                         refresh,
+                        activities,
                         error,
                     } => {
                         if let Some(e) = &error {
@@ -31260,8 +31265,26 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                             .get(&arn)
                             .is_some_and(|p| p.changing);
                         let mut changing = was_changing;
+                        // Keep the Recent activity section current: it was only
+                        // read when the tab opened, so it sat frozen mid-change.
+                        let shown_activities: Vec<asg::ScalingActivity> = match &activities {
+                            Some(list) => list.clone(),
+                            None => self
+                                .asg_details
+                                .get(&arn)
+                                .and_then(|st| st.activities.as_ref())
+                                .and_then(|r| r.as_ref().ok())
+                                .cloned()
+                                .unwrap_or_default(),
+                        };
+                        if let Some(list) = activities {
+                            if let Some(st) = self.asg_details.get_mut(&arn) {
+                                st.activities = Some(Ok(list));
+                            }
+                        }
                         if let Some(g) = group {
-                            changing = asg::is_changing(&g, refresh.as_ref());
+                            changing =
+                                asg::is_changing(&g, refresh.as_ref(), &shown_activities);
                             for tab in self.detail_tabs.iter_mut() {
                                 if let DetailSubject::Asg(t) = tab {
                                     if t.arn == arn {
@@ -38969,6 +38992,10 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                             } else {
                                                 dlg.checked.retain(|p| p != pid);
                                             }
+                                            // Close on pick, like the other
+                                            // account dropdowns, rather than
+                                            // waiting for a click outside.
+                                            ui.close();
                                         }
                                     }
                                 });
@@ -41041,6 +41068,14 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                     Ok(None) => (None, Some("group not found".to_string())),
                     Err(e) => (None, Some(e.message())),
                 };
+                let activities =
+                    match asg::fetch_scaling_activities(&account.profile, &account.region, &name) {
+                        Ok(a) => Some(a),
+                        Err(e) => {
+                            error.get_or_insert(format!("recent activity: {}", e.message()));
+                            None
+                        }
+                    };
                 let refresh = match asg::fetch_latest_refresh(&account.profile, &account.region, &name) {
                     Ok(r) => r,
                     Err(e) => {
@@ -41054,6 +41089,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                     cache_key,
                     group: group.map(Box::new),
                     refresh,
+                    activities,
                     error,
                 });
                 if let Some(c) = &repaint {
@@ -42213,8 +42249,9 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
 
         /// While any target is not settled (unhealthy, initial, draining,
         /// unavailable), re-read the group's health every
-        /// `TG_POLL_ACTIVE_SECS` so the open tab follows it back to healthy.
-        /// A settled group costs nothing.
+        /// `TG_POLL_ACTIVE_SECS` so the open tab follows it back to healthy;
+        /// a settled group is re-read every `TG_POLL_IDLE_SECS` so a newly
+        /// registered target still appears.
         fn poll_tg_detail(&mut self, ctx: &egui::Context, tg: &TargetGroup) {
             if self.options.mode != Mode::Live {
                 return;
@@ -42226,11 +42263,14 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                     "unhealthy" | "initial" | "draining" | "unavailable"
                 ))
             );
-            if !changing {
-                self.tg_poll.remove(&tg.arn);
-                return;
-            }
-            let every = Duration::from_secs(TG_POLL_ACTIVE_SECS);
+            // A settled group is still re-read slowly: a replacement instance
+            // registers as a NEW target in a group that is all healthy, and
+            // nothing about the existing targets says one is coming.
+            let every = Duration::from_secs(if changing {
+                TG_POLL_ACTIVE_SECS
+            } else {
+                TG_POLL_IDLE_SECS
+            });
             let last = self.tg_poll.get(&tg.arn).copied();
             if let Some(t) = last {
                 if t.elapsed() < every {
@@ -45627,9 +45667,10 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                     // fetches nothing for it, so Refresh did nothing. Drop the
                     // cache first so the targets are actually re-read.
                     self.tg_targets.remove(&tg.arn);
-                    if self.tg_health.get(&tg.arn) != Some(&HealthCell::InFlight) {
-                        self.tg_health.insert(tg.arn.clone(), HealthCell::NotRequested);
-                    }
+                    // Unconditionally, even if a read is already in flight: that
+                    // reply may predate the change the user is refreshing to
+                    // see, and a stale answer is what "did nothing" looked like.
+                    self.tg_health.insert(tg.arn.clone(), HealthCell::NotRequested);
                     self.tg_poll.remove(&tg.arn);
                     self.open_target_group_details(*tg);
                 }

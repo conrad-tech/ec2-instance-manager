@@ -1174,10 +1174,27 @@ pub fn fetch_latest_refresh(
     Ok(parse_refresh_progress(&raw))
 }
 
-/// Is a group in the middle of a change: short of its desired capacity, or a
-/// refresh that has not reached a terminal status?
-pub fn is_changing(g: &AutoScalingGroup, refresh: Option<&RefreshProgress>) -> bool {
-    !capacity_settled(g) || refresh.is_some_and(|r| !r.is_terminal())
+/// Has this scaling activity reached an end state? Anything else
+/// (`InProgress`, `PreInService`, `WaitingForInstanceWarmup`,
+/// `MidLifecycleAction`, `WaitingForELBConnectionDraining`, ...) is still
+/// moving, so an unknown status counts as moving rather than as done.
+pub fn activity_in_progress(a: &ScalingActivity) -> bool {
+    !matches!(a.status_code.as_str(), "Successful" | "Failed" | "Cancelled")
+}
+
+/// Is a group in the middle of a change: short of its desired capacity, a
+/// refresh that has not reached a terminal status, or a scaling activity still
+/// running. The last matters on its own: instance counts can look settled while
+/// an activity waits on warmup or a lifecycle hook, and the activity list is
+/// what the user is watching.
+pub fn is_changing(
+    g: &AutoScalingGroup,
+    refresh: Option<&RefreshProgress>,
+    activities: &[ScalingActivity],
+) -> bool {
+    !capacity_settled(g)
+        || refresh.is_some_and(|r| !r.is_terminal())
+        || activities.iter().any(activity_in_progress)
 }
 
 /// One group, re-read by name, so a watch polls one group rather than the
@@ -1286,10 +1303,26 @@ mod tests {
     fn a_running_refresh_means_changing_even_when_capacity_is_met() {
         let g = super::AutoScalingGroup::default();
         let r = |s: &str| super::RefreshProgress { status: s.into(), percent: None, reason: None };
-        assert!(!super::is_changing(&g, None));
-        assert!(!super::is_changing(&g, Some(&r("Successful"))));
-        assert!(super::is_changing(&g, Some(&r("InProgress"))));
-        assert!(super::is_changing(&g, Some(&r("Pending"))));
+        assert!(!super::is_changing(&g, None, &[]));
+        assert!(!super::is_changing(&g, Some(&r("Successful")), &[]));
+        assert!(super::is_changing(&g, Some(&r("InProgress")), &[]));
+        assert!(super::is_changing(&g, Some(&r("Pending")), &[]));
+    }
+
+    #[test]
+    fn a_running_activity_means_changing_even_when_counts_and_refresh_are_settled() {
+        let g = super::AutoScalingGroup::default();
+        let a = |s: &str| super::ScalingActivity {
+            start_time: None,
+            status_code: s.into(),
+            description: String::new(),
+            cause: String::new(),
+            status_message: None,
+        };
+        assert!(!super::is_changing(&g, None, &[a("Successful"), a("Failed"), a("Cancelled")]));
+        for s in ["InProgress", "PreInService", "WaitingForInstanceWarmup", "MidLifecycleAction", "SomethingNew"] {
+            assert!(super::is_changing(&g, None, &[a("Successful"), a(s)]), "{s}");
+        }
     }
 
     #[test]
