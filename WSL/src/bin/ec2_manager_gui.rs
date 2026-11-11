@@ -2988,6 +2988,8 @@ mod gui {
         error: Option<String>,
     }
 
+    /// How often an open target group re-reads its health while a target is unsettled.
+    const TG_POLL_ACTIVE_SECS: u64 = 10;
     const ASG_POLL_ACTIVE_SECS: u64 = 10;
     const ASG_POLL_IDLE_SECS: u64 = 60;
 
@@ -12557,6 +12559,9 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         /// that fills `tg_health`, so opening a group already on screen costs
         /// no second call.
         tg_targets: HashMap<String, Vec<Target>>,
+        /// When each open target group's detail view last re-read its health
+        /// on its own (see `poll_tg_detail`).
+        tg_poll: HashMap<String, Instant>,
         /// Accounts that refused a health call. One denial switches the column
         /// off for that account.
         tg_denied_accounts: HashSet<String>,
@@ -13897,6 +13902,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 target_groups: HashMap::new(),
                 tg_health: HashMap::new(),
                 tg_targets: HashMap::new(),
+                tg_poll: HashMap::new(),
                 tg_denied_accounts: HashSet::new(),
                 tg_list_loading: HashSet::new(),
                 tg_list_errors: HashMap::new(),
@@ -41436,7 +41442,18 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                     .on_hover_text(activity_hover(a));
                                 // Also a column of its own: hover alone hid
                                 // the one field the section exists for.
-                                ui.label(if a.cause.is_empty() { "—" } else { &a.cause });
+                                // Wrapped at the right edge of the view rather than
+                                // run off it, so a long cause is read in full
+                                // without scrolling sideways.
+                                ui.set_min_width(240.0);
+                                ui.add(
+                                    egui::Label::new(if a.cause.is_empty() {
+                                        "—"
+                                    } else {
+                                        a.cause.as_str()
+                                    })
+                                    .wrap(),
+                                );
                                 ui.end_row();
                             }
                         });
@@ -42194,6 +42211,58 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             self.focus_detail_tab(DetailSubject::TargetGroup(Box::new(tg)));
         }
 
+        /// While any target is not settled (unhealthy, initial, draining,
+        /// unavailable), re-read the group's health every
+        /// `TG_POLL_ACTIVE_SECS` so the open tab follows it back to healthy.
+        /// A settled group costs nothing.
+        fn poll_tg_detail(&mut self, ctx: &egui::Context, tg: &TargetGroup) {
+            if self.options.mode != Mode::Live {
+                return;
+            }
+            let changing = matches!(
+                self.tg_details.get(&tg.arn).and_then(|st| st.targets.as_ref()),
+                Some(Ok(targets)) if targets.iter().any(|t| matches!(
+                    t.state.as_str(),
+                    "unhealthy" | "initial" | "draining" | "unavailable"
+                ))
+            );
+            if !changing {
+                self.tg_poll.remove(&tg.arn);
+                return;
+            }
+            let every = Duration::from_secs(TG_POLL_ACTIVE_SECS);
+            let last = self.tg_poll.get(&tg.arn).copied();
+            if let Some(t) = last {
+                if t.elapsed() < every {
+                    ctx.request_repaint_after(every.saturating_sub(t.elapsed()));
+                    return;
+                }
+            }
+            let Some(account) = self
+                .resource_pool_accounts()
+                .into_iter()
+                .find(|a| a.account_id == tg.account_id && a.authed)
+            else {
+                return;
+            };
+            self.tg_poll.insert(tg.arn.clone(), Instant::now());
+            let (arn, account_id) = (tg.arn.clone(), tg.account_id.clone());
+            let tx = self.proc_tx.clone();
+            let repaint = self.egui_ctx.clone();
+            std::thread::spawn(move || {
+                let result = elb::fetch_target_health(&account.profile, &account.region, &arn);
+                let _ = tx.send(ProcEvent::TargetGroupHealth {
+                    arn,
+                    account_id,
+                    result,
+                });
+                if let Some(c) = &repaint {
+                    c.request_repaint();
+                }
+            });
+            ctx.request_repaint_after(every);
+        }
+
         fn render_target_group_details(
             &mut self,
             ui: &mut egui::Ui,
@@ -42201,6 +42270,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             title: &str,
         ) {
             let key = tg.arn.clone();
+            self.poll_tg_detail(ui.ctx(), &tg);
             let st = self.tg_details.get(&key).cloned().unwrap_or_default();
             // The filter box writes back at the end: the state is cloned out of
             // the map so the panel can borrow `self` freely while rendering.
@@ -45552,7 +45622,17 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         fn refresh_detail_subject(&mut self, subject: DetailSubject) {
             match subject {
                 DetailSubject::Instance(i) => self.refresh_instance_details(*i),
-                DetailSubject::TargetGroup(tg) => self.open_target_group_details(*tg),
+                DetailSubject::TargetGroup(tg) => {
+                    // The open path seeds the tab from the cached health and
+                    // fetches nothing for it, so Refresh did nothing. Drop the
+                    // cache first so the targets are actually re-read.
+                    self.tg_targets.remove(&tg.arn);
+                    if self.tg_health.get(&tg.arn) != Some(&HealthCell::InFlight) {
+                        self.tg_health.insert(tg.arn.clone(), HealthCell::NotRequested);
+                    }
+                    self.tg_poll.remove(&tg.arn);
+                    self.open_target_group_details(*tg);
+                }
                 DetailSubject::LoadBalancer(lb) => self.open_load_balancer_details(*lb),
                 DetailSubject::Asg(g) => {
                     // Not the cached list row: that can be OLDER than the tab
