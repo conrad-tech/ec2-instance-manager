@@ -23279,6 +23279,8 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             let mut ack: Option<String> = None;
             let mut assign: Option<String> = None;
             let mut reload: Option<String> = None;
+            let my_email = self.alerts_auth.email.clone();
+            let my_id = my_atlassian_id_cached();
 
             for idx in 0..self.alert_windows.len() {
                 let assign_in_flight = self.alert_windows[idx].assign_in_flight;
@@ -23346,6 +23348,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                 let Some(alert) = &alert else {
                                     return;
                                 };
+                                let assigned_to_me = alert.is_assigned_to(&[my_id, my_email.as_str()]);
 
                                 ui.horizontal_wrapped(|ui| {
                                     ui.heading(format!("#{}", dash_if_blank(&alert.tiny_id)));
@@ -23383,6 +23386,15 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                             &format!("Created ({})", local_tz_label()),
                                             &format_local_time(&alert.created_at),
                                         );
+                                        ui.weak("Assigned to");
+                                        if alert.owner.is_empty() {
+                                            note_label(ui, egui::Color32::from_rgb(220, 160, 60), "unassigned");
+                                        } else if assigned_to_me {
+                                            ui.label(format!("{} (you)", alert.owner));
+                                        } else {
+                                            ui.label(&alert.owner);
+                                        }
+                                        ui.end_row();
                                         field(ui, "Source", &alert.source);
                                         field(ui, "Account", &alert.account);
                                         field(ui, "Environment", &alert.environment);
@@ -23514,11 +23526,21 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                         ui.spinner();
                                     }
                                     if ui
-                                        .add_enabled(!assign_in_flight, egui::Button::new("Assign to me"))
-                                        .on_hover_text("Assign this alert to your Atlassian account")
+                                        .add_enabled(
+                                            !assign_in_flight && !assigned_to_me,
+                                            egui::Button::new("Assign to me"),
+                                        )
+                                        .on_hover_text(if assigned_to_me {
+                                            "Already assigned to you"
+                                        } else {
+                                            "Assign this alert to your Atlassian account"
+                                        })
                                         .clicked()
                                     {
                                         assign = Some(id.clone());
+                                    }
+                                    if assigned_to_me {
+                                        ui.weak("assigned to you");
                                     }
                                     if assign_in_flight {
                                         ui.spinner();
@@ -36080,6 +36102,17 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                 } else {
                                     cmp
                                 }
+                            });
+                        }
+                        // Favorites lead whatever column is chosen, filtered or
+                        // not: 2 starred bastions out of 10 sit at the top of
+                        // the filtered list. The sort is stable, so the chosen
+                        // column's order still holds inside each group. Only
+                        // the Favorite column itself decides its own order.
+                        if self.sort_column.is_some_and(|c| c != SortColumn::Favorite) {
+                            let cfg = &self.config;
+                            float_favorites_first(&mut self.filtered, |i| {
+                                cfg.is_favorite(&account_scope, &region_scope, &i.instance_id)
                             });
                         }
 
@@ -49098,6 +49131,20 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             ),
         ));
         (true, lines)
+    }
+
+    /// The user's Atlassian account id, read once per process. For the alert
+    /// window, which draws every frame: `resolve_id` is a Credential Manager
+    /// read per call and must not run per frame.
+    fn my_atlassian_id_cached() -> &'static str {
+        static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        ID.get_or_init(|| {
+            ec2_manager::jsm_auth::resolve_id(
+                ec2_manager::jsm_auth::ATLASSIAN_ACCOUNT_ID_ENV,
+                ec2_manager::jsm_auth::ATLASSIAN_ACCOUNT_ID_TARGET,
+                "",
+            )
+        })
     }
 
     /// The Atlassian account id escalations assign to (`MY_ID`, or the stored

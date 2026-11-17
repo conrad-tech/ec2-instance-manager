@@ -90,6 +90,13 @@ pub struct Alert {
     /// values that also appear properly, and it disappears the day the
     /// template is fixed.
     pub extra: BTreeMap<String, String>,
+    /// Who the alert is assigned to, as the API names them (an email, a
+    /// username or an account id depending on the tenant). Empty when
+    /// unassigned.
+    pub owner: String,
+    /// Every identifier the `owner` field carried (the string itself, or an
+    /// object's `accountId` / `id` / `username` / `email`), for matching.
+    pub owner_ids: Vec<String>,
 }
 
 /// Raw shape of a single alert in the API response. Unknown fields ignored;
@@ -112,6 +119,7 @@ struct RawAlert {
     description: String,
     #[serde(rename = "extraProperties")]
     extra_properties: serde_json::Map<String, serde_json::Value>,
+    owner: serde_json::Value,
 }
 
 /// The alert list envelope. The API has used both `values` and `data` for the
@@ -128,6 +136,32 @@ struct AlertsPage {
 #[serde(default)]
 struct Links {
     next: Option<String>,
+}
+
+/// Reads the `owner` field, which is a plain string on some tenants and an
+/// object on others. Returns the text to show and every identifier in it.
+fn owner_parts(v: &serde_json::Value) -> (String, Vec<String>) {
+    match v {
+        serde_json::Value::String(s) => {
+            let s = s.trim().to_string();
+            if s.is_empty() { (String::new(), vec![]) } else { (s.clone(), vec![s]) }
+        }
+        serde_json::Value::Object(o) => {
+            let ids: Vec<String> = ["accountId", "id", "username", "email", "name"]
+                .iter()
+                .filter_map(|k| o.get(*k).and_then(|x| x.as_str()))
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect();
+            let shown = ["name", "username", "email", "accountId", "id"]
+                .iter()
+                .find_map(|k| o.get(*k).and_then(|x| x.as_str()).filter(|x| !x.trim().is_empty()))
+                .unwrap_or("")
+                .to_string();
+            (shown, ids)
+        }
+        _ => (String::new(), vec![]),
+    }
 }
 
 /// Pull the value out of a `"Key: value"` tag, case-insensitively on the key.
@@ -158,6 +192,7 @@ impl Alert {
             .into_iter()
             .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
             .collect::<BTreeMap<_, _>>();
+        let (owner, owner_ids) = owner_parts(&raw.owner);
         Self {
             id: raw.id,
             tiny_id: raw.tiny_id,
@@ -174,7 +209,20 @@ impl Alert {
             tags: raw.tags,
             description: raw.description,
             extra,
+            owner,
+            owner_ids,
         }
+    }
+
+    /// True when the alert is assigned to any of `mine` (compared without
+    /// regard to case; blanks never match). The API has not been seen to say
+    /// which spelling it uses, so the caller passes every spelling it knows:
+    /// the Atlassian account id and the login email.
+    pub fn is_assigned_to(&self, mine: &[&str]) -> bool {
+        self.owner_ids.iter().any(|o| {
+            let o = o.trim();
+            !o.is_empty() && mine.iter().any(|m| !m.trim().is_empty() && m.trim().eq_ignore_ascii_case(o))
+        })
     }
 
     /// `createdAt` parsed to a UTC timestamp. `None` when the API sent
@@ -568,10 +616,11 @@ pub fn acknowledge_alert(auth: &AlertsAuth, alert_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The JSON body for an assignment: `{"owner":{"id":"<account id>"}}`.
+/// The JSON body for an assignment: `{"owner":{"accountId":"<account id>"}}`.
+/// (`id` was tried first and the API answered 422 `title: must not be blank`.)
 /// Built with `serde_json` so nothing in the id can break out of the body.
 pub fn assign_body(account_id: &str) -> String {
-    serde_json::json!({ "owner": { "id": account_id } }).to_string()
+    serde_json::json!({ "owner": { "accountId": account_id } }).to_string()
 }
 
 /// Assign an alert to an Atlassian account (`POST .../alerts/{id}/assign`).
@@ -753,6 +802,30 @@ mod tests {
     /// The badge counts alerts that are still live, and an **acknowledged**
     /// alert is one somebody is working — it stays counted. Only `closed`
     /// takes a row off the button.
+    #[test]
+    fn the_assign_body_names_the_account_id() {
+        assert_eq!(assign_body("abc:123"), r#"{"owner":{"accountId":"abc:123"}}"#);
+    }
+
+    #[test]
+    fn owner_is_read_from_a_string_or_an_object() {
+        let (shown, ids) = owner_parts(&serde_json::json!("me@x.com"));
+        assert_eq!((shown.as_str(), ids.len()), ("me@x.com", 1));
+        let (shown, ids) = owner_parts(&serde_json::json!({"accountId":"abc","email":"me@x.com"}));
+        assert_eq!(shown, "me@x.com");
+        assert_eq!(ids, vec!["abc", "me@x.com"]);
+        assert_eq!(owner_parts(&serde_json::json!("")).0, "");
+        assert_eq!(owner_parts(&serde_json::Value::Null).1.len(), 0);
+    }
+
+    #[test]
+    fn assignment_matches_any_known_spelling_and_never_a_blank() {
+        let a = Alert { owner_ids: vec!["Me@X.com".to_string()], ..Default::default() };
+        assert!(a.is_assigned_to(&["abc", "me@x.com"]));
+        assert!(!a.is_assigned_to(&["abc", ""]));
+        assert!(!Alert::default().is_assigned_to(&["", "abc"]));
+    }
+
     #[test]
     fn the_open_count_keeps_acknowledged_alerts_and_drops_closed_ones() {
         let rows = vec![
