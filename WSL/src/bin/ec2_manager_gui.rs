@@ -3378,6 +3378,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         loading: bool,
         error: Option<String>,
         ack_in_flight: bool,
+        assign_in_flight: bool,
         note: Option<std::result::Result<String, String>>,
         /// The alert's notes: `None` until read, `Err` when they could not be.
         notes: Option<std::result::Result<Vec<alerts::AlertNote>, String>>,
@@ -3392,6 +3393,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 loading: true,
                 error: None,
                 ack_in_flight: false,
+                assign_in_flight: false,
                 note: None,
                 notes: None,
             }
@@ -3405,6 +3407,10 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             result: std::result::Result<Box<alerts::Alert>, String>,
         },
         Acked {
+            id: String,
+            result: std::result::Result<(), String>,
+        },
+        Assigned {
             id: String,
             result: std::result::Result<(), String>,
         },
@@ -4897,59 +4903,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         out
     }
 
-    /// What a probe transcript says about the box right now.
-    ///
-    /// One line per fact, and only facts the transcript actually carries: no
-    /// `/opt/cassandra-reaper`, the watchdog's state, and each compose service with
-    /// whether it is up. Deliberately **not** `parse_verdict` — that answers
-    /// "did the fix work" and words its failure as `not running after
-    /// restart`, a restart the probe never performed.
-    ///
-    /// The docker listing is not summarised here: the transcript is sent as
-    /// a `Transcript` event, and `reaper_transcript_lines` already counts and
-    /// prints it.
-    fn reaper_probe_state_lines(instance: &str, output: &str) -> Vec<String> {
-        use ec2_manager::reaper;
-
-        if output.contains(reaper::RE_NODIR) {
-            return vec![format!(
-                "reaper probe: {instance} has no {} — a remediation would report \
-                 NODIR and change nothing",
-                reaper::REAPER_DIR
-            )];
-        }
-
-        let mut out = Vec::new();
-        if let Some(state) = output
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("__RE_WD_STATE__"))
-        {
-            let state = state.trim();
-            // The fix no longer touches the watchdog, so inactive here means
-            // it was stopped by something else (older fix runs left it so).
-            out.push(format!("reaper probe: {instance} reaper-watchdog is {state}"));
-        }
-
-        let services = reaper::compose_services(output);
-        if services.is_empty() {
-            out.push(format!(
-                "reaper probe: {instance} compose ps listed no services"
-            ));
-        } else {
-            let rendered: Vec<String> = services
-                .iter()
-                .map(|(name, up)| format!("{name} ({})", if *up { "running" } else { "not running" }))
-                .collect();
-            let down = services.iter().filter(|(_, up)| !up).count();
-            out.push(format!(
-                "reaper probe: {instance} compose ps — {} service(s), {down} not running: {}",
-                services.len(),
-                rendered.join(", ")
-            ));
-        }
-        out
-    }
-
     /// What the health pre-check decided, and the line that says so.
     ///
     /// Returns `true` when the fix should run. Split out so the rule can be
@@ -5289,7 +5242,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         disk_grow_cfg: ec2_manager::features::DiskGrowFeature,
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
-        mailbox: Option<String>,
         in_flight: ReaperInFlight,
         tx: Sender<ReaperEvent>,
         status_tx: Sender<AlertActionStatus>,
@@ -5644,12 +5596,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         id.strip_prefix("vol-").is_some_and(|rest| {
             (8..=17).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         })
-    }
-
-    /// An `aws` command line as the dry run reports it: what was (or would be)
-    /// run, with the profile and region it ran under. Display only.
-    fn dry_run_aws_line(ctx: &AwsContext, args: &str) -> String {
-        format!("aws {args} --profile {} --region {} --output json", ctx.profile, ctx.region)
     }
 
     /// The instance's attached volumes plus its root device name.
@@ -6245,30 +6191,20 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 LogLevel::Error,
                 format!("{alert_id} ({resource}) is still open after {spent} terminate(s) — escalating"),
             );
-            let subject =
-                reaper::escalation_subject(reaper::OutcomeCode::Failure, &alert.created_at);
-            end.status = match env.mailbox.as_deref() {
-                Some(mailbox) => match send_escalation_email(mailbox, &subject) {
-                    Ok(address) => {
-                        note(LogLevel::Info, format!("escalation sent to {address}"));
-                        AlertActionStatus::Failed(format!(
-                            "alert {alert_id}: still open after the terminate — escalated"
-                        ))
-                    }
-                    Err(reason) => {
-                        note(
-                            LogLevel::Error,
-                            format!("escalation NOT sent ({reason}) — nothing will ring"),
-                        );
-                        AlertActionStatus::Failed(format!(
-                            "alert {alert_id}: still open and the escalation failed: {reason}"
-                        ))
-                    }
-                },
-                None => {
-                    note(LogLevel::Error, "no escalation mailbox configured — nothing will ring".to_string());
+            end.status = match escalate_by_assigning(&env.auth, &alert_id) {
+                Ok(what) => {
+                    note(LogLevel::Info, format!("escalation: {what}"));
                     AlertActionStatus::Failed(format!(
-                        "alert {alert_id}: still open and there is no escalation mailbox"
+                        "alert {alert_id}: still open after the terminate - {what}"
+                    ))
+                }
+                Err(reason) => {
+                    note(
+                        LogLevel::Error,
+                        format!("escalation FAILED ({reason}) - the alert was not assigned"),
+                    );
+                    AlertActionStatus::Failed(format!(
+                        "alert {alert_id}: still open and assigning it failed: {reason}"
                     ))
                 }
             };
@@ -6470,15 +6406,9 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
 
         let escalate = |why: &str| {
             note(LogLevel::Error, format!("{alert_id} — {why}"));
-            match env.mailbox.as_deref() {
-                Some(m) if !m.trim().is_empty() => {
-                    match send_escalation_email(m, &grafana_escalation_subject(&alert.created_at)) {
-                        // The address is never logged: the app log gets pasted into tickets.
-                        Ok(_) => note(LogLevel::Warn, "escalation sent".to_string()),
-                        Err(e) => note(LogLevel::Error, format!("escalation FAILED TO SEND — {e}")),
-                    }
-                }
-                _ => note(LogLevel::Error, "no escalation mailbox is configured — nothing was sent".to_string()),
+            match escalate_by_assigning(&env.auth, &alert_id) {
+                Ok(what) => note(LogLevel::Warn, format!("escalation: {what}")),
+                Err(e) => note(LogLevel::Error, format!("escalation FAILED - not assigned: {e}")),
             }
         };
 
@@ -6698,15 +6628,9 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         };
         let escalate = |why: &str| {
             note(LogLevel::Error, format!("{alert_id} — {why}; escalating once"));
-            match env.mailbox.as_deref() {
-                Some(m) if !m.trim().is_empty() => {
-                    match send_escalation_email(m, &disk_grow_escalation_subject(&alert.created_at)) {
-                        // The address is never logged: the app log gets pasted into tickets.
-                        Ok(_) => note(LogLevel::Warn, "escalation sent".to_string()),
-                        Err(e) => note(LogLevel::Error, format!("escalation FAILED TO SEND — {e}")),
-                    }
-                }
-                _ => note(LogLevel::Error, "no escalation mailbox is configured — nothing was sent".to_string()),
+            match escalate_by_assigning(&env.auth, &alert_id) {
+                Ok(what) => note(LogLevel::Warn, format!("escalation: {what}")),
+                Err(e) => note(LogLevel::Error, format!("escalation FAILED - not assigned: {e}")),
             }
         };
 
@@ -7185,61 +7109,19 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         }
     }
 
-    /// **Test Alert Match**: everything a real run does except the thing that
-    /// changes something, then a **real** escalation.
+    /// **Test Alert Match**: assign the alert to the user, and nothing else.
     ///
-    /// It answers one question — *if this alert fired for real, could we find
-    /// it, read what a fix needs off it, and would my phone ring?* — so every
-    /// step is reported and the escalation is genuinely sent. A simulated
-    /// send would leave the only part that can silently be broken untested.
-    ///
-    /// Per watcher:
-    ///
-    /// * **reaper** — fetch, identify, match, resolve the target group to an
-    ///   instance, and read the box with `reaper_probe.sh` (`docker ps -a`,
-    ///   `compose ps`, the watchdog's state, container uptimes). Everything
-    ///   `run_reaper_remediation` does apart from the `compose down` /
-    ///   `compose up -d`.
-    /// * **unhealthy host** — fetch, identify, resolve the target group, read
-    ///   its health, and report what `plan` would terminate at the first
-    ///   check. No acknowledge, no terminate.
-    /// * **instance age** — parse the facts off the description, resolve the
-    ///   account, read the instance, its auto scaling group, its recent
-    ///   scaling activity and its target health, and report the `Decision` a
-    ///   real run would have made. No acknowledge, no terminate.
-    /// * **pingdom** — fetch and identify, which is all a pingdom decision
-    ///   has ever needed; there is no box in its path to read.
-    ///
-    /// **It never acknowledges**, whichever watcher claims the alert. Acking
-    /// silences a live page, and doing that as a side effect of a test is not
-    /// a test.
-    ///
-    /// **On call is reported but not obeyed.** The escalation goes to the
-    /// operator's own mailbox and is the thing being tested; withholding it
-    /// off call would make the feature untestable exactly when someone is
-    /// setting it up. The line still says what a *real* run would have done,
-    /// since that is the part on-call state actually decides.
-    #[allow(clippy::too_many_arguments)]
+    /// It no longer routes the alert to a watcher or reads any box. The
+    /// escalation is now "assign the alert to me", so the test is exactly
+    /// that: it is assigned whatever its state, which proves the assign call
+    /// and the account id work. It never acknowledges.
     fn start_alert_dry_run(
         auth: ec2_manager::alerts::AlertsAuth,
-        reaper_cfg: ec2_manager::features::ReaperFeature,
-        pingdom_cfg: ec2_manager::features::PingdomFeature,
-        unhealthy_cfg: ec2_manager::features::UnhealthyHostFeature,
-        instance_age_cfg: ec2_manager::features::InstanceAgeFeature,
-        grafana_cfg: ec2_manager::features::GrafanaFeature,
-        disk_grow_cfg: ec2_manager::features::DiskGrowFeature,
-        app_config: ec2_manager::config::AppConfig,
-        mode: Mode,
-        mailbox: Option<String>,
         alert_id: String,
         tx: Sender<ReaperEvent>,
         status_tx: Sender<AlertActionStatus>,
     ) {
-        use ec2_manager::{alerts, oncall, pingdom, reaper};
-
         std::thread::spawn(move || {
-            // Under `AlertTest`, never the claiming watcher's source: this
-            // is one run a person asked for and wants to read end to end.
             let note = |level: LogLevel, message: String| {
                 let _ = tx.send(ReaperEvent::SourcedNote {
                     source: LogSource::AlertTest,
@@ -7247,993 +7129,28 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                     message,
                 });
             };
-            // Both, always: the log is the record, the window line is what
-            // the person who just pressed the button is looking at.
-            let fail = |message: String| {
-                let _ = tx.send(ReaperEvent::SourcedNote {
-                    source: LogSource::AlertTest,
-                    level: LogLevel::Error,
-                    message: format!("dry run: {message}"),
-                });
-                let _ = status_tx.send(AlertActionStatus::Failed(message));
-            };
-
-            note(
-                LogLevel::Warn,
-                format!("dry run: ===== START, alert {alert_id} ====="),
+            note(LogLevel::Warn, format!("test: ===== START, alert {alert_id} ====="));
+            let me = ec2_manager::jsm_auth::resolve_id(
+                ec2_manager::jsm_auth::ATLASSIAN_ACCOUNT_ID_ENV,
+                ec2_manager::jsm_auth::ATLASSIAN_ACCOUNT_ID_TARGET,
+                "",
             );
-            note(LogLevel::Info, format!("dry run: fetching alert {alert_id}"));
-            let alert = match alerts::fetch_alert(&auth, &alert_id) {
-                Ok(a) => a,
-                Err(e) => {
-                    fail(format!("alert {alert_id} could not be found — {e}"));
-                    return;
-                }
-            };
-            // The fields the matchers actually read, spelled out, so a rule
-            // that does not fire can be compared against what it was given
-            // rather than guessed at.
-            note(
-                LogLevel::Info,
-                format!(
-                    "dry run: alert {} found — status={:?} alertname={:?} app={:?} \
-                     account={:?} env={:?}",
-                    alert.id,
-                    alert.status,
-                    alert.extra.get("alertname").map(String::as_str).unwrap_or(""),
-                    alert.app,
-                    alert.account,
-                    alert.environment,
-                ),
-            );
-            note(
-                LogLevel::Info,
-                format!("dry run: message {:?}", clip_for_log(&alert.message, 400)),
-            );
-            // Where a reaper alert's target group usually lives, so it is
-            // reported every run rather than only when something fails.
-            note(
-                LogLevel::Info,
-                format!(
-                    "dry run: description {:?}",
-                    clip_for_log(&alert.description, 400)
-                ),
-            );
-
-            match dry_run_route(
-                &alert,
-                &reaper_cfg,
-                &pingdom_cfg,
-                &unhealthy_cfg,
-                &instance_age_cfg,
-                &grafana_cfg,
-            ) {
-                DryRunRoute::Reaper => {
-                    note(
-                        LogLevel::Info,
-                        format!("dry run: alert {} matches the reaper rules", alert.id),
-                    );
-                    if !dry_run_reaper_details(&alert, &reaper_cfg, &app_config, &mode, &tx)
-                    {
-                        // Already reported in full by the helper. The
-                        // escalation still goes: "we could not get what we
-                        // need" is exactly the failure this pages about.
-                        note(
-                            LogLevel::Warn,
-                            "dry run: could not gather the details a real fix would \
-                             need — escalating anyway, which is what a real failure \
-                             would do"
-                                .to_string(),
-                        );
-                    }
-                }
-                DryRunRoute::Pingdom => {
-                    let (key, source) = pingdom::incident_key_with_source(
-                        &alert,
-                        &pingdom_cfg.environment_after,
-                    );
-                    // The whole reason to dry run a pingdom alert: see what
-                    // the summary yielded before trusting it to group real
-                    // incidents.
-                    note(
-                        LogLevel::Info,
-                        format!(
-                            "dry run: environment {} — {} (markers: {:?})",
-                            match &key {
-                                pingdom::IncidentKey::Environment(e) => format!("{e:?}"),
-                                pingdom::IncidentKey::Alert(_) => "NOT FOUND".to_string(),
-                            },
-                            source.describe(),
-                            pingdom_cfg.environment_after,
-                        ),
-                    );
-                    note(
-                        LogLevel::Info,
-                        format!(
-                            "dry run: alert {} matches the pingdom rules, incident {} \
-                             — a real run would acknowledge it and escalate if it were \
-                             still open {} minute(s) later",
-                            alert.id,
-                            key.label(),
-                            pingdom_cfg.watch_window().as_secs() / 60,
-                        ),
-                    );
-                }
-                DryRunRoute::UnhealthyHost => {
-                    use ec2_manager::unhealthy_host as uh;
-                    note(
-                        LogLevel::Info,
-                        format!("dry run: alert {} matches the unhealthy-host rules", alert.id),
-                    );
-                    match reaper::alert_target_group(&alert) {
-                        None => note(
-                            LogLevel::Warn,
-                            format!(
-                                "dry run: alert {} names no target group — a real run would \
-                                 have nothing to act on",
-                                alert.id
-                            ),
-                        ),
-                        Some(resource) => {
-                            let kind = uh::kind_of(
-                                reaper::target_group_name(&resource).unwrap_or(""),
-                                &unhealthy_cfg,
-                            );
-                            note(
-                                LogLevel::Info,
-                                format!(
-                                    "dry run: the alert names {resource} ({} group) — a real run \
-                                     would acknowledge it and read the group after {} minute(s)",
-                                    kind.label(),
-                                    unhealthy_cfg.ack_wait().as_secs() / 60,
-                                ),
-                            );
-                            let read = reaper_account_context(&mode, &app_config, &alert.account)
-                                .and_then(|ctx| target_group_members(&ctx.profile, &ctx.region, &resource));
-                            match read {
-                                Err(why) => note(
-                                    LogLevel::Error,
-                                    format!("dry run: could not read the target group — {why}"),
-                                ),
-                                Ok(members) => {
-                                    note(
-                                        LogLevel::Info,
-                                        format!(
-                                            "dry run: health now: {}",
-                                            members
-                                                .iter()
-                                                .map(|m| format!("{} ({})", m.id, m.health))
-                                                .collect::<Vec<_>>()
-                                                .join(", ")
-                                        ),
-                                    );
-                                    let p = uh::plan(&members, kind, 0);
-                                    note(
-                                        LogLevel::Warn,
-                                        match &p.terminate {
-                                            Some(id) => format!(
-                                                "dry run: a real check right now would TERMINATE \
-                                                 {id} — {}. The dry run terminates nothing",
-                                                p.reason
-                                            ),
-                                            None => format!(
-                                                "dry run: a real check right now would terminate \
-                                                 nothing — {}",
-                                                p.reason
-                                            ),
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                DryRunRoute::InstanceAge => {
-                    use ec2_manager::instance_age as ia;
-                    note(
-                        LogLevel::Info,
-                        format!("dry run: alert {} matches the instance-age rules", alert.id),
-                    );
-                    let facts = ec2_manager::disk_grow::facts_with_instance_and_account(ia::parse_facts(&alert.description), &alert);
-                    note(
-                        LogLevel::Info,
-                        format!(
-                            "dry run: the description names application={:?} instance={:?} \
-                             environment={:?} account={:?} region={:?}",
-                            facts.application,
-                            facts.instance_id,
-                            facts.environment,
-                            facts.account,
-                            facts.region
-                        ),
-                    );
-                    if !ia::names_an_app(&facts, &instance_age_cfg) {
-                        note(
-                            LogLevel::Warn,
-                            format!(
-                                "dry run: {:?} is not on instance_age.applications — a real run \
-                                 would do nothing",
-                                facts.application
-                            ),
-                        );
-                    } else if facts.instance_id.is_empty() {
-                        note(
-                            LogLevel::Warn,
-                            "dry run: the alert names no readable instance id — a real run would \
-                             have nothing to act on"
-                                .to_string(),
-                        );
-                    } else {
-                        let walked = instance_age_context(&mode, &app_config, &facts).and_then(|ctx| {
-                            let asg = instance_asg_group(&ctx.profile, &ctx.region, &facts.instance_id)?
-                                .ok_or_else(|| {
-                                    format!(
-                                        "{} carries no aws:autoscaling:groupName tag",
-                                        facts.instance_id
-                                    )
-                                })?;
-                            let group = read_group(&ctx, &asg)?;
-                            let history = read_termination_history(
-                                &ctx,
-                                &asg,
-                                instance_age_cfg.recent_terminate_window(),
-                            )?;
-                            let view = read_group_view(&ctx, &group)?;
-                            Ok((asg, group, history, view))
-                        });
-                        match walked {
-                            Err(why) => note(
-                                LogLevel::Error,
-                                format!("dry run: could not read the group — {why}"),
-                            ),
-                            Ok((asg, group, history, view)) => {
-                                let tg_names: Vec<String> = group
-                                    .target_group_arns
-                                    .iter()
-                                    .map(|a| ec2_manager::asg::target_group_name_from_arn(a))
-                                    .collect();
-                                let kind = ia::kind_of(&asg, &tg_names, &instance_age_cfg);
-                                note(
-                                    LogLevel::Info,
-                                    format!(
-                                        "dry run: {} is in {asg} ({} group, {} member(s)); recent \
-                                         activity: {history:?}",
-                                        facts.instance_id,
-                                        kind.label(),
-                                        view.members.len()
-                                    ),
-                                );
-                                note(
-                                    LogLevel::Info,
-                                    format!(
-                                        "dry run: a real run would: {:?}",
-                                        ia::decide(&facts, &view, kind, &history)
-                                    ),
-                                );
-                            }
-                        }
-                    }
-                    note(
-                        LogLevel::Info,
-                        "dry run: nothing was acknowledged and nothing was terminated — this \
-                         will escalate next, as though the run had failed"
-                            .to_string(),
-                    );
-                }
-                DryRunRoute::Grafana => {
-                    use ec2_manager::instance_age as ia;
-                    note(
-                        LogLevel::Info,
-                        format!("dry run: alert {} matches the Grafana rules", alert.id),
-                    );
-                    let facts = ec2_manager::disk_grow::facts_with_instance_and_account(ia::parse_facts(&alert.description), &alert);
-                    note(
-                        LogLevel::Info,
-                        format!(
-                            "dry run: the description names instance={:?} environment={:?} \
-                             account={:?} region={:?}",
-                            facts.instance_id, facts.environment, facts.account, facts.region
-                        ),
-                    );
-                    if facts.instance_id.is_empty() {
-                        note(
-                            LogLevel::Warn,
-                            "dry run: the alert names no readable instance id — a real run \
-                             would have nothing to act on"
-                                .to_string(),
-                        );
-                    } else {
-                        let walked = instance_age_context(&mode, &app_config, &facts).and_then(|ctx| {
-                            let asg = instance_asg_group(&ctx.profile, &ctx.region, &facts.instance_id)?
-                                .ok_or_else(|| {
-                                    format!(
-                                        "{} carries no aws:autoscaling:groupName tag",
-                                        facts.instance_id
-                                    )
-                                })?;
-                            let group = read_group(&ctx, &asg)?;
-                            Ok((asg, group))
-                        });
-                        match walked {
-                            Err(why) => note(
-                                LogLevel::Error,
-                                format!("dry run: could not read the group — {why}"),
-                            ),
-                            Ok((asg, group)) => note(
-                                LogLevel::Info,
-                                format!(
-                                    "dry run: {} is in {asg} ({} member(s), desired {}). A real \
-                                     run would acknowledge, terminate it, wait up to {} \
-                                     minute(s) for a fully running replacement, give the alert \
-                                     {} minute(s), then escalate if it is still open",
-                                    facts.instance_id,
-                                    group.instances.len(),
-                                    group.desired_capacity,
-                                    grafana_cfg.replacement_ceiling().as_secs() / 60,
-                                    grafana_cfg.settle_window().as_secs() / 60,
-                                ),
-                            ),
-                        }
-                    }
-                    note(
-                        LogLevel::Info,
-                        "dry run: nothing was acknowledged and nothing was terminated — this \
-                         will escalate next, as though the run had failed"
-                            .to_string(),
-                    );
-                }
-                DryRunRoute::DiskGrow => {
-                    use ec2_manager::{disk_grow as dg, instance_age as ia};
-                    note(
-                        LogLevel::Info,
-                        format!("dry run: alert {} matches the disk-utilization rules", alert.id),
-                    );
-                    let facts = dg::facts_with_property(ia::parse_facts(&alert.description), &alert);
-                    note(
-                        LogLevel::Info,
-                        format!(
-                            "dry run: the description names instance={:?} environment={:?} \
-                             account={:?} region={:?}",
-                            facts.instance_id, facts.environment, facts.account, facts.region
-                        ),
-                    );
-                    // Every step is a read. The block ends early wherever a
-                    // real run would stop, and the escalation below still goes.
-                    'walk: {
-                        if disk_grow_cfg.names_any_exclusion()
-                            && dg::environment_unreadable(&facts.environment)
-                        {
-                            note(
-                                LogLevel::Warn,
-                                format!(
-                                    "dry run: the environment cannot be read ({:?}) and \
-                                     environments are excluded ({:?}) — a real run would do \
-                                     nothing: no acknowledge, no grow",
-                                    facts.environment.trim(),
-                                    disk_grow_cfg.excluded_environments
-                                ),
-                            );
-                            break 'walk;
-                        }
-                        if disk_grow_cfg.excludes(&facts.environment) {
-                            note(
-                                LogLevel::Info,
-                                format!(
-                                    "dry run: environment {} is excluded — a real run would do \
-                                     nothing",
-                                    facts.environment.trim()
-                                ),
-                            );
-                            break 'walk;
-                        }
-                        if facts.instance_id.is_empty() {
-                            note(
-                                LogLevel::Warn,
-                                "dry run: the alert names no readable instance id — a real run \
-                                 would escalate without acting"
-                                    .to_string(),
-                            );
-                            break 'walk;
-                        }
-                        let ctx = match instance_age_context(&mode, &app_config, &facts) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                note(
-                                    LogLevel::Error,
-                                    format!("dry run: could not resolve the account — {e}"),
-                                );
-                                break 'walk;
-                            }
-                        };
-                        note(
-                            LogLevel::Info,
-                            format!(
-                                "dry run: account resolved — profile {} region {}",
-                                ctx.profile, ctx.region
-                            ),
-                        );
-                        note(
-                            LogLevel::Info,
-                            format!(
-                                "dry run: RAN (read-only): {}",
-                                dry_run_aws_line(
-                                    &ctx,
-                                    &format!(
-                                        "ec2 describe-volumes --filters \
-                                         Name=attachment.instance-id,Values={}",
-                                        facts.instance_id
-                                    )
-                                )
-                            ),
-                        );
-                        note(
-                            LogLevel::Info,
-                            format!(
-                                "dry run: RAN (read-only): {}",
-                                dry_run_aws_line(
-                                    &ctx,
-                                    &format!("ec2 describe-instances --instance-ids {}", facts.instance_id)
-                                )
-                            ),
-                        );
-                        note(
-                            LogLevel::Info,
-                            format!(
-                                "dry run: RAN (counts only, nothing compressed) over SSM on {}: \
-                                 disk_grow_gzip.sh with RE_DG_DRY=1 — it would gzip every regular \
-                                 file under /var/log last modified before today (not *.gz/xz/bz2/\
-                                 zst/zip, wtmp, btmp, lastlog, faillog or the journal)",
-                                facts.instance_id
-                            ),
-                        );
-                        match disk_grow_gzip(&ctx, &facts.instance_id, true) {
-                            Ok(r) => note(
-                                LogLevel::Info,
-                                format!("dry run: logs: {}", r.summary()),
-                            ),
-                            Err(e) => note(
-                                LogLevel::Error,
-                                format!(
-                                    "dry run: could not count the logs over SSM — {e}; a real \
-                                     run would not be able to compress them"
-                                ),
-                            ),
-                        }
-                        if dg::never_grown(&disk_grow_cfg, &alert) {
-                            note(
-                                LogLevel::Info,
-                                format!(
-                                    "dry run: the volume is never grown here (title matches no_grow_title_words {:?}, or the alert names /) — a \
-                                     real run would acknowledge (on call), gzip the logs, NOT \
-                                     grow the volume, wait {} minute(s) for the alert to close, \
-                                     and escalate if it is still open",
-                                    disk_grow_cfg.no_grow_title_words,
-                                    disk_grow_cfg.no_grow_wait().as_secs() / 60
-                                ),
-                            );
-                            break 'walk;
-                        }
-                        let (volumes, root) = match disk_grow_volumes(&ctx, &facts.instance_id) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                note(
-                                    LogLevel::Error,
-                                    format!("dry run: could not list the volumes — {e}"),
-                                );
-                                break 'walk;
-                            }
-                        };
-                        let listing: Vec<String> = volumes
-                            .iter()
-                            .map(|v| format!("{} {} GiB {} at {}", v.id, v.size_gib, v.volume_type, v.device))
-                            .collect();
-                        note(
-                            LogLevel::Info,
-                            format!("dry run: volumes {listing:?}, root device {root}"),
-                        );
-                        note(
-                            LogLevel::Info,
-                            format!(
-                                "dry run: RAN (read-only) over SSM on {}: aws ssm send-command \
-                                 (AWS-RunShellScript, base64 of disk_grow_probe.sh) --profile {} \
-                                 --region {}; the script runs only: df -h; df -B1 \
-                                 --output=target,size; lsblk -b -P -o \
-                                 NAME,TYPE,SERIAL,FSTYPE,MOUNTPOINT,PKNAME,SIZE",
-                                facts.instance_id, ctx.profile, ctx.region
-                            ),
-                        );
-                        let probe = match disk_grow_probe(&ctx, &facts.instance_id) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                note(
-                                    LogLevel::Error,
-                                    format!(
-                                        "dry run: could not read the box over SSM — {e}; a real \
-                                         run would escalate"
-                                    ),
-                                );
-                                break 'walk;
-                            }
-                        };
-                        for line in probe.df_h.lines() {
-                            note(LogLevel::Info, format!("dry run: box df -h: {line}"));
-                        }
-                        for b in &probe.blocks {
-                            note(
-                                LogLevel::Info,
-                                format!(
-                                    "dry run: box lsblk: {} type={} serial={:?} fstype={:?} \
-                                     mount={:?} parent={:?} {} bytes",
-                                    b.name, b.dev_type, b.serial, b.fstype, b.mountpoint, b.pkname,
-                                    b.size_bytes
-                                ),
-                            );
-                        }
-                        let targets = match dg::choose_targets(
-                            &volumes,
-                            &root,
-                            &probe,
-                            &disk_grow_cfg.data_mounts(),
-                            disk_grow_cfg.grow_above(),
-                            dg::alert_mount(&alert).as_deref(),
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                note(
-                                    LogLevel::Warn,
-                                    format!(
-                                        "dry run: no data volume chosen — {e}; a real run would \
-                                         escalate"
-                                    ),
-                                );
-                                break 'walk;
-                            }
-                        };
-                        note(
-                            LogLevel::Info,
-                            format!(
-                                "dry run: {} data volume(s) a real run would grow (a filesystem \
-                                 above {}% when there is more than one data volume): {}",
-                                targets.len(),
-                                disk_grow_cfg.grow_above(),
-                                targets.iter().map(|v| v.id.as_str()).collect::<Vec<_>>().join(", ")
-                            ),
-                        );
-                        for volume in targets {
-                        note(
-                            LogLevel::Info,
-                            format!(
-                                "dry run: data volume {} ({} GiB {})",
-                                volume.id, volume.size_gib, volume.volume_type
-                            ),
-                        );
-                        note(
-                            LogLevel::Info,
-                            format!(
-                                "dry run: RAN (read-only): {}",
-                                dry_run_aws_line(
-                                    &ctx,
-                                    &format!("ec2 describe-volumes-modifications --volume-ids {}", volume.id)
-                                )
-                            ),
-                        );
-                        let mod_state = volume_modification_state(&ctx, &volume.id);
-                        note(
-                            LogLevel::Info,
-                            format!(
-                                "dry run: modification state of {}: {}",
-                                volume.id,
-                                match &mod_state {
-                                    Ok(s) => format!("{s:?}"),
-                                    Err(e) => e.clone(),
-                                }
-                            ),
-                        );
-                        if let Some(why) = disk_grow_manual_state_refusal(&mod_state) {
-                            note(
-                                LogLevel::Warn,
-                                format!("dry run: Run Remediation would refuse — {why}"),
-                            );
-                        }
-                        let dev = match dg::resolve_data_device(&probe, &volume.id) {
-                            Ok(d) => d,
-                            Err(e) => {
-                                note(
-                                    LogLevel::Error,
-                                    format!(
-                                        "dry run: could not find {} on the box — {e}; a real run \
-                                         would escalate",
-                                        volume.id
-                                    ),
-                                );
-                                break 'walk;
-                            }
-                        };
-                        note(
-                            LogLevel::Info,
-                            format!(
-                                "dry run: {} is {} mounted at {}{}",
-                                volume.id,
-                                dev.disk,
-                                dev.mount,
-                                if dev.mount == "/data" {
-                                    " (/data)"
-                                } else {
-                                    " (not /data; a real run grows it anyway)"
-                                }
-                            ),
-                        );
-                        if let Some(row) = dg::df_h_for_mount(&probe.df_h, &dev.mount) {
-                            note(LogLevel::Info, format!("dry run: df -h now: {row}"));
-                        }
-                        let device_ahead = match dg::fs_bytes_for_mount(&probe, &dev.mount) {
-                            Some(fs) => {
-                                let ahead = dg::device_ahead_of_fs(dev.device_bytes, fs);
-                                note(
-                                    LogLevel::Info,
-                                    format!(
-                                        "dry run: device {} bytes, filesystem {fs} bytes — \
-                                         device_ahead_of_fs={ahead}",
-                                        dev.device_bytes
-                                    ),
-                                );
-                                ahead
-                            }
-                            None => {
-                                note(
-                                    LogLevel::Warn,
-                                    format!(
-                                        "dry run: the box reports no filesystem size for {} — a \
-                                         real run would escalate",
-                                        dev.mount
-                                    ),
-                                );
-                                break 'walk;
-                            }
-                        };
-                        note(
-                            LogLevel::Info,
-                            format!(
-                                "dry run: matched on serial {:?} (= {} without the dash) -> \
-                                 disk {}, partition {:?}",
-                                volume.id.replace('-', ""),
-                                volume.id,
-                                dev.disk,
-                                dev.partition
-                            ),
-                        );
-                        let options: Vec<String> = dg::growth_options(&volume)
-                            .iter()
-                            .map(|g| format!("{} GiB ({:?})", g.new_gib, g.kind))
-                            .collect();
-                        note(
-                            LogLevel::Info,
-                            format!("dry run: planned growth options, in order: {options:?}"),
-                        );
-                        let plan = match disk_grow_next_move(ec2_manager::disk_grow::alert_acknowledged(&alert), device_ahead) {
-                            NextMove::Full => {
-                                "acknowledge (on call), resize to the first option AWS accepts, \
-                                 wait for the new size, grow the filesystem and comment the \
-                                 alert"
-                            }
-                            NextMove::FilesystemOnly => {
-                                "acknowledge (on call) and grow the filesystem only — the device \
-                                 is already larger than it — then comment the alert"
-                            }
-                            NextMove::Nothing => {
-                                "nothing new: the alert is already acknowledged and the device \
-                                 is not ahead (an acknowledged alert is never resized)"
-                            }
-                        };
-                        note(LogLevel::Info, format!("dry run: a real run would {plan}"));
-                        for g in dg::growth_options(&volume) {
-                            note(
-                                LogLevel::Info,
-                                format!(
-                                    "dry run: would run (NOT run): {} — {} -> {} GiB",
-                                    dry_run_aws_line(
-                                        &ctx,
-                                        &format!(
-                                            "ec2 modify-volume --volume-id {} --size {}",
-                                            volume.id, g.new_gib
-                                        )
-                                    ),
-                                    volume.size_gib,
-                                    g.new_gib
-                                ),
-                            );
-                        }
-                        match dg::fs_grow_command(&dev) {
-                            Ok(_) => note(
-                                LogLevel::Info,
-                                format!(
-                                    "dry run: would run (NOT run) over SSM once the volume is \
-                                     usable: RE_DG_DISK={:?} RE_DG_PART={:?} RE_DG_MOUNT={:?} \
-                                     disk_grow_fs.sh -> {}xfs_growfs {}; then df -h",
-                                    dev.disk,
-                                    dev.partition.as_deref().unwrap_or(""),
-                                    dev.mount,
-                                    if dev.partition.is_some() {
-                                        "growpart, then "
-                                    } else {
-                                        ""
-                                    },
-                                    dev.mount
-                                ),
-                            ),
-                            Err(e) => note(
-                                LogLevel::Error,
-                                format!("dry run: the filesystem grow would be refused — {e}"),
-                            ),
-                        }
-                        note(
-                            LogLevel::Info,
-                            format!(
-                                "dry run: would comment (NOT posted) on the alert: {:?}",
-                                dg::alert_comment(
-                                    &dg::df_h_for_mount(&probe.df_h, &dev.mount).unwrap_or_default(),
-                                    "<df -h row after the grow>"
-                                )
-                            ),
-                        );
-                        }
-                        note(
-                            LogLevel::Info,
-                            "dry run: everything a real run needs was found: account profile, \
-                             instance, volumes, data volume, modification state, box probe, \
-                             device by serial, mount, and the commands above"
-                                .to_string(),
-                        );
-                    }
-                    note(
-                        LogLevel::Info,
-                        "dry run: nothing was acknowledged, no volume was modified, the \
-                         filesystem was not grown and the alert was not commented — this will \
-                         escalate next, as though the run had failed"
-                            .to_string(),
-                    );
-                }
-                DryRunRoute::Neither => {
-                    fail(format!(
-                        "alert {} matches no watcher — not a reaper alert \
-                         (alertname~{:?} app~{:?} message~{:?}), not an unhealthy-host alert \
-                         (alertname~{:?} app~{:?} message~{:?}) and not a pingdom alert \
-                         (alertname~{:?} app~{:?} message~{:?}) and not a Grafana alert \
-                         (grafana.title_contains {:?}) and not a disk-utilization alert (its \
-                         title needs both [EC2] and DiskUtilization). Nothing was escalated.",
-                        alert.id,
-                        reaper_cfg.alertname_contains,
-                        reaper_cfg.app_contains,
-                        reaper_cfg.message_contains,
-                        unhealthy_cfg.alertname_contains,
-                        unhealthy_cfg.app_contains,
-                        unhealthy_cfg.message_contains,
-                        pingdom_cfg.alertname_contains,
-                        pingdom_cfg.app_contains,
-                        pingdom_cfg.message_contains,
-                        grafana_cfg.title_contains,
-                    ));
-                    return;
-                }
-            }
-
-            // Reported, never a reason to stop: a dry run after the fact is
-            // the normal case, and the escalation is still the thing being
-            // tested.
-            if reaper::alert_is_closed(&alert.status) {
-                note(
-                    LogLevel::Info,
-                    format!(
-                        "dry run: alert {} is closed — a real poll would have stood down \
-                         here",
-                        alert.id
-                    ),
-                );
-            }
-
-            // What a real run would have done about acknowledging. Said, not
-            // obeyed: see this function's doc comment.
-            match oncall::is_on_call(
-                &auth,
-                &reaper_cfg.resolved_schedule_id(),
-                &reaper_cfg.resolved_atlassian_account_id(),
-            ) {
-                Ok(true) => note(
-                    LogLevel::Info,
-                    "dry run: you are on call — a real run would have acknowledged this \
-                     alert; the dry run does not"
-                        .to_string(),
-                ),
-                Ok(false) => note(
-                    LogLevel::Info,
-                    "dry run: you are not on call — a real run would not have \
-                     acknowledged either"
-                        .to_string(),
-                ),
-                Err(e) => note(
-                    LogLevel::Warn,
-                    format!("dry run: on-call lookup failed ({e}) — escalating regardless"),
-                ),
-            }
-
-            // ---- the escalation, for real ----
-            let Some(mailbox) = mailbox.filter(|m| !m.trim().is_empty()) else {
-                fail(
-                    "no escalation mailbox is configured, so nothing can be sent — set \
-                     ESCALATION_MAILBOX or store the ec2_manager/escalation_mailbox \
-                     credential"
-                        .to_string(),
-                );
-                return;
-            };
-
-            let subject = reaper::escalation_subject(
-                // Never a literal: the code has to stay the vocabulary the
-                // Pi-side daemon matches on.
-                reaper::OutcomeCode::Failure,
-                &alert.created_at,
-            );
-            note(
-                LogLevel::Warn,
-                format!("dry run: escalating for real, subject {subject:?}"),
-            );
-            let _ = status_tx.send(AlertActionStatus::Running(format!(
-                "sending escalation to {mailbox}, subject {subject:?}…"
-            )));
-            match send_escalation_email(&mailbox, &subject) {
-                Ok(address) => {
-                    note(
-                        LogLevel::Warn,
-                        format!(
-                            "dry run: escalation SENT to {address} — the call and the \
-                             Telegram message are the Pi daemon's job from here. If \
-                             neither arrives, the mail left this machine and the problem \
-                             is on the Pi side."
-                        ),
-                    );
+            match ec2_manager::alerts::assign_alert(&auth, &alert_id, &me) {
+                Ok(()) => {
+                    note(LogLevel::Warn, format!("test: alert {alert_id} assigned to you"));
                     let _ = status_tx.send(AlertActionStatus::Ok(format!(
-                        "escalation email sent to {address}"
+                        "alert {alert_id} assigned to you"
                     )));
                 }
-                Err(reason) => fail(format!("the escalation could not be sent — {reason}")),
+                Err(e) => {
+                    note(LogLevel::Error, format!("test: could not assign {alert_id}: {e}"));
+                    let _ = status_tx.send(AlertActionStatus::Failed(format!(
+                        "alert {alert_id} could not be assigned: {e}"
+                    )));
+                }
             }
-            note(
-                LogLevel::Warn,
-                format!("dry run: ===== END, alert {alert_id} ====="),
-            );
+            note(LogLevel::Warn, format!("test: ===== END, alert {alert_id} ====="));
         });
-    }
-
-    /// The reaper half of a dry run: resolve the alert to an instance and
-    /// read that box, reporting every step.
-    ///
-    /// `false` when it could not get as far as reading the box. The caller
-    /// escalates either way — being unable to find the details a fix needs is
-    /// itself worth a page — but says which happened.
-    ///
-    /// Everything here is a read. It is the same command the read-only probe
-    /// has always sent (`reaper_probe.sh`, pinned by
-    /// `the_probe_script_changes_nothing_on_the_box`), so the one thing a dry
-    /// run must not do — change something on the box — is enforced by that
-    /// test rather than by this function being careful.
-    fn dry_run_reaper_details(
-        alert: &ec2_manager::alerts::Alert,
-        cfg: &ec2_manager::features::ReaperFeature,
-        app_config: &ec2_manager::config::AppConfig,
-        mode: &Mode,
-        tx: &Sender<ReaperEvent>,
-    ) -> bool {
-        use ec2_manager::reaper;
-
-        let note = |level: LogLevel, message: String| {
-            let _ = tx.send(ReaperEvent::SourcedNote {
-                source: LogSource::AlertTest,
-                level,
-                message,
-            });
-        };
-
-        let Some(m) = reaper::match_alert(alert, cfg) else {
-            note(
-                LogLevel::Warn,
-                format!(
-                    "dry run: alert {} names neither an instance id nor a target group — \
-                     a real fix would have nothing to act on",
-                    alert.id
-                ),
-            );
-            // What was there instead. Reporting only that nothing matched
-            // leaves the one question this tool exists to answer unanswered.
-            for line in reaper_subject_evidence(alert) {
-                note(LogLevel::Warn, line);
-            }
-            return false;
-        };
-        note(
-            LogLevel::Info,
-            match &m.subject {
-                reaper::Subject::Instance(id) => {
-                    format!("dry run: the alert names instance {id}")
-                }
-                reaper::Subject::TargetGroup(tg) => {
-                    format!("dry run: the alert names target group {tg}")
-                }
-            },
-        );
-
-        // Built here rather than left to `resolve_reaper_target`, because it
-        // is needed twice: to resolve the target group, then to send the
-        // read-only command to whatever that resolved to.
-        let ctx = match reaper_account_context(mode, app_config, &m.account_id) {
-            Ok(c) => c,
-            Err(why) => {
-                note(LogLevel::Error, format!("dry run: {why}"));
-                return false;
-            }
-        };
-        let instance = match resolve_reaper_subject(&ctx.profile, &ctx.region, &m.subject) {
-            Ok(id) => id,
-            Err(why) => {
-                note(
-                    LogLevel::Error,
-                    format!("dry run: could not resolve to one instance — {why}"),
-                );
-                return false;
-            }
-        };
-        note(
-            LogLevel::Info,
-            format!("dry run: resolves to instance {instance}"),
-        );
-        note(
-            LogLevel::Info,
-            format!(
-                "dry run: reading {instance} — docker ps -a, compose ps and the watchdog, \
-                 but NOT compose down / compose up -d"
-            ),
-        );
-        match exec_remote_command(
-            &None,
-            &ctx,
-            &instance,
-            &reaper_probe_command(),
-            cfg.send_command_timeout(),
-        ) {
-            Ok(out) => {
-                // Rendered here rather than sent as `Transcript`, so the
-                // whole run lands under one source instead of the transcript
-                // alone being filed as reaper output.
-                for (level, line) in reaper_transcript_lines(&instance, "dry run", &out) {
-                    note(level, line);
-                }
-                for line in reaper_probe_state_lines(&instance, &out) {
-                    note(LogLevel::Info, line);
-                }
-                true
-            }
-            // Not fatal: "the box could not be reached" is itself an answer
-            // about whether a remediation would get anywhere.
-            Err(e) => {
-                note(
-                    LogLevel::Error,
-                    format!("dry run: could not read {instance} — {e}"),
-                );
-                // A real run would take the EC2 fallback here. Both reads
-                // are describes; the plan is reported and never carried out.
-                let plan = reaper::ssm_fallback_plan(
-                    &instance_asg_group(&ctx.profile, &ctx.region, &instance),
-                    &fetch_instance_state(&ctx.profile, &ctx.region, &instance),
-                );
-                note(
-                    LogLevel::Warn,
-                    format!(
-                        "dry run: a real run would fall back to the EC2 API — {plan:?} \
-                         (nothing was stopped or terminated)"
-                    ),
-                );
-                false
-            }
-        }
     }
 
     /// Resolve a matched alert's subject to the instance to remediate,
@@ -10070,70 +8987,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             "Outlook opened - send it manually".to_string()
         };
         Some(EmailStatus::Opened { reason })
-    }
-
-    /// What `send_escalation.ps1` reported.
-    ///
-    /// A separate type from `EmailStatus` because the two scripts answer
-    /// different questions. `EmailStatus::Opened` — "Outlook is up, finish it
-    /// by hand" — has no meaning here: this script either sends or does not,
-    /// and there is no attachment to hand-address. Sharing one enum would
-    /// mean a variant that is unreachable from one of its two producers.
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    #[allow(dead_code)]
-    enum EscalationStatus {
-        /// The mail went out. Carries the address it actually went to.
-        Sent { address: String },
-        /// The script refused, or the send threw. Carries the reason it
-        /// named — never a bare "something went wrong", which sends the user
-        /// nowhere.
-        Failed { reason: String },
-    }
-
-    /// Read one line of `send_escalation.ps1` output and turn a marker into a
-    /// status. Returns `None` for anything else, so the reader keeps the last
-    /// real marker it saw. The marker format is fixed by the script:
-    ///
-    /// ```text
-    /// SENT address='oncall@example.com'
-    /// FAILED reason='Outlook is not available'
-    /// ```
-    ///
-    /// **A sibling of `parse_email_marker`, not an extension of it.** They
-    /// read two different scripts with two different vocabularies: that one
-    /// has `OPEN` and a dozen recipient-gate flags because it attaches a
-    /// private key, and this one has `FAILED` and a free-text reason.
-    /// Folding them together would give one function whose answer depends on
-    /// which script produced the line, and would force `SENT` to mean the
-    /// same thing in both — which is precisely what the spec forbids, since
-    /// this path must not inherit the access-email gates. They share
-    /// `single_quoted_value`, which is the part that genuinely is common.
-    ///
-    /// The script strips apostrophes and newlines out of a reason before
-    /// printing it, so a value arriving here contains neither. That matters:
-    /// `single_quoted_value` stops at the first `'`, so an unstripped
-    /// apostrophe would silently truncate the reason. The agreement is
-    /// pinned by `the_script_strips_what_the_marker_format_cannot_carry`.
-    ///
-    /// Not yet called from production code — the button that spawns the
-    /// script is the GUI half of this feature and lands next. Parsing is
-    /// pure and testable with no Outlook and no network, so it is built and
-    /// tested here rather than deferred with it.
-    #[allow(dead_code)]
-    fn parse_escalation_marker(line: &str) -> Option<EscalationStatus> {
-        let line = line.trim();
-
-        if let Some(rest) = line.strip_prefix("SENT ") {
-            let address = single_quoted_value(rest, "address=").unwrap_or_default();
-            return Some(EscalationStatus::Sent { address });
-        }
-
-        // Every `FAILED` line is a reason the script went to the trouble of
-        // naming. Returning `None` here — as the access-email parser does,
-        // because it has no `FAILED` to read — discarded all of them.
-        let rest = line.strip_prefix("FAILED ")?;
-        let reason = single_quoted_value(rest, "reason=").unwrap_or_default();
-        Some(EscalationStatus::Failed { reason })
     }
 
     /// Pull a bare `key=value` (no quotes, space-terminated) out of a marker.
@@ -13723,8 +12576,8 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             let (pingdom, pingdom_startup_log) = {
                 let user = ec2_manager::features::current_os_user();
                 // One `CredReadW`, at startup, never per frame — the same
-                // rule `resolve_escalation_mailbox`'s own doc comment states.
-                let mailbox = ec2_manager::jsm_auth::escalation_mailbox();
+                // rule `resolve_id`'s own doc comment states.
+                let mailbox = escalation_assignee();
                 let (armed, lines) = pingdom_gate_report(
                     &features.pingdom,
                     &user,
@@ -13735,7 +12588,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                     Some(start_pingdom_poll(
                         resolved_alerts_auth.clone(),
                         features.pingdom.clone(),
-                        mailbox.unwrap_or_default(),
                     ))
                 } else {
                     None
@@ -13750,7 +12602,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 .custom_alerts_enabled_for(&ec2_manager::features::current_os_user());
             let (custom_alerts, custom_alerts_startup_log) = {
                 let user = ec2_manager::features::current_os_user();
-                let mailbox = ec2_manager::jsm_auth::escalation_mailbox();
+                let mailbox = escalation_assignee();
                 let (armed, lines) = custom_alerts_gate_report(
                     &features.custom_alerts,
                     &user,
@@ -13762,7 +12614,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                         resolved_alerts_auth.clone(),
                         features.clone(),
                         config.custom_alerts.clone(),
-                        mailbox.unwrap_or_default(),
                     ))
                 } else {
                     None
@@ -13772,7 +12623,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
 
             let (unhealthy_host, unhealthy_host_startup_log) = {
                 let user = ec2_manager::features::current_os_user();
-                let mailbox = ec2_manager::jsm_auth::escalation_mailbox();
+                let mailbox = escalation_assignee();
                 let (armed, lines) = unhealthy_host_gate_report(
                     &features.unhealthy_host,
                     &user,
@@ -13786,7 +12637,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                         features.reaper.clone(),
                         config.clone(),
                         options.mode.clone(),
-                        mailbox.unwrap_or_default(),
                     ))
                 } else {
                     None
@@ -13799,7 +12649,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             // nothing else, and one being disarmed must never disarm another.
             let (instance_age, instance_age_startup_log) = {
                 let user = ec2_manager::features::current_os_user();
-                let mailbox = ec2_manager::jsm_auth::escalation_mailbox();
+                let mailbox = escalation_assignee();
                 let (armed, lines) = instance_age_gate_report(
                     &options.mode,
                     &features.instance_age,
@@ -13816,7 +12666,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                         features.grafana.clone(),
                         config.clone(),
                         options.mode.clone(),
-                        mailbox.unwrap_or_default(),
                     ))
                 } else {
                     None
@@ -13826,7 +12675,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
 
             let (grafana, grafana_startup_log) = {
                 let user = ec2_manager::features::current_os_user();
-                let mailbox = ec2_manager::jsm_auth::escalation_mailbox();
+                let mailbox = escalation_assignee();
                 let (armed, lines) = grafana_gate_report(
                     &options.mode,
                     &features.grafana,
@@ -13842,7 +12691,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                         features.unhealthy_host.clone(),
                         config.clone(),
                         options.mode.clone(),
-                        mailbox.unwrap_or_default(),
                     ))
                 } else {
                     None
@@ -13854,7 +12702,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             // the feed: one being disarmed must never disarm another.
             let (disk_grow, disk_grow_startup_log) = {
                 let user = ec2_manager::features::current_os_user();
-                let mailbox = ec2_manager::jsm_auth::escalation_mailbox();
+                let mailbox = escalation_assignee();
                 let mailbox_ok = !mailbox.as_deref().map(str::trim).unwrap_or("").is_empty();
                 let (armed, lines) = disk_grow_gate_report(
                     &user,
@@ -13872,7 +12720,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                         features.grafana.clone(),
                         config.clone(),
                         options.mode.clone(),
-                        mailbox.unwrap_or_default(),
                         Arc::clone(&reaper_in_flight),
                     ))
                 } else {
@@ -22065,6 +20912,31 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             });
         }
 
+        /// Assign the alert to the user (`MY_ID`), whatever its state.
+        fn start_alert_assign(&mut self, id: &str) {
+            let Some(win) = self.alert_windows.iter_mut().find(|w| w.id == id) else {
+                return;
+            };
+            if win.assign_in_flight {
+                return;
+            }
+            win.assign_in_flight = true;
+            win.note = None;
+            let id = id.to_string();
+            self.log_alerts(LogLevel::Info, format!("alerts: assigning {id} to you from its window"));
+            let auth = self.alerts_auth.clone();
+            let tx = self.alert_detail_tx.clone();
+            std::thread::spawn(move || {
+                let me = ec2_manager::jsm_auth::resolve_id(
+                    ec2_manager::jsm_auth::ATLASSIAN_ACCOUNT_ID_ENV,
+                    ec2_manager::jsm_auth::ATLASSIAN_ACCOUNT_ID_TARGET,
+                    "",
+                );
+                let result = alerts::assign_alert(&auth, &id, &me).map_err(|e| e.to_string());
+                let _ = tx.send(AlertDetailEvent::Assigned { id, result });
+            });
+        }
+
         /// Drain finished alert-detail work.
         fn poll_alert_detail_events(&mut self) {
             let mut reload: Vec<String> = Vec::new();
@@ -22098,6 +20970,26 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                         }
                         if let Some(win) = self.alert_windows.iter_mut().find(|w| w.id == id) {
                             win.notes = Some(result);
+                        }
+                    }
+                    AlertDetailEvent::Assigned { id, result } => {
+                        if let Some(win) = self.alert_windows.iter_mut().find(|w| w.id == id) {
+                            win.assign_in_flight = false;
+                            win.note = Some(match &result {
+                                Ok(()) => Ok("Assigned to you".to_string()),
+                                Err(e) => Err(e.clone()),
+                            });
+                        } else {
+                            continue;
+                        }
+                        match result {
+                            Ok(()) => {
+                                self.log_alerts(LogLevel::Info, format!("alerts: {id} assigned to you"));
+                                reload.push(id);
+                            }
+                            Err(err) => {
+                                self.log_alerts(LogLevel::Error, format!("alerts: {id}: assign: {err}"));
+                            }
                         }
                     }
                     AlertDetailEvent::Acked { id, result } => {
@@ -22544,7 +21436,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                         disk_grow_cfg: self.disk_grow_cfg.clone(),
                         app_config: self.config.clone(),
                         mode: self.options.mode.clone(),
-                        mailbox: ec2_manager::jsm_auth::escalation_mailbox(),
                         in_flight: Arc::clone(&self.reaper_in_flight),
                         tx: self.reaper_probe_tx.clone(),
                         status_tx: self.dry_run_status_tx.clone(),
@@ -24386,9 +23277,11 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             }
             let mut closed: Vec<String> = Vec::new();
             let mut ack: Option<String> = None;
+            let mut assign: Option<String> = None;
             let mut reload: Option<String> = None;
 
             for idx in 0..self.alert_windows.len() {
+                let assign_in_flight = self.alert_windows[idx].assign_in_flight;
                 let (id, tiny_id, alert, loading, error, ack_in_flight, note) = {
                     let w = &self.alert_windows[idx];
                     (
@@ -24621,6 +23514,16 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                         ui.spinner();
                                     }
                                     if ui
+                                        .add_enabled(!assign_in_flight, egui::Button::new("Assign to me"))
+                                        .on_hover_text("Assign this alert to your Atlassian account")
+                                        .clicked()
+                                    {
+                                        assign = Some(id.clone());
+                                    }
+                                    if assign_in_flight {
+                                        ui.spinner();
+                                    }
+                                    if ui
                                         .add_enabled(!loading, egui::Button::new("Reload"))
                                         .on_hover_text("Re-read this alert")
                                         .clicked()
@@ -24664,6 +23567,9 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             self.alert_windows.retain(|w| !closed.contains(&w.id));
             if let Some(id) = ack {
                 self.start_alert_ack(&id);
+            }
+            if let Some(id) = assign {
+                self.start_alert_assign(&id);
             }
             if let Some(id) = reload {
                 self.start_alert_detail_fetch(&id);
@@ -25179,21 +24085,11 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 self.log_reaper(
                     LogLevel::Warn,
                     format!(
-                        "DRY RUN requested for alert {id} — everything except the fix, \
-                         then a REAL escalation"
+                        "TEST requested for alert {id} - it will be assigned to you"
                     ),
                 );
                 start_alert_dry_run(
                     self.alerts_auth.clone(),
-                    self.reaper_cfg.clone(),
-                    self.pingdom_cfg.clone(),
-                    self.unhealthy_host_cfg.clone(),
-                    self.instance_age_cfg.clone(),
-                    self.grafana_cfg.clone(),
-                    self.disk_grow_cfg.clone(),
-                    self.config.clone(),
-                    self.options.mode.clone(),
-                    ec2_manager::jsm_auth::escalation_mailbox(),
                     id,
                     self.reaper_probe_tx.clone(),
                     self.dry_run_status_tx.clone(),
@@ -37770,10 +36666,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             self.lb_details
                 .insert(lb.arn.clone(), LbDetailState::default());
 
-            let pool = self
-                .resource_pool_accounts()
-                .into_iter()
-                .find(|a| a.account_id == lb.account_id);
+            let pool = self.detail_account(&lb.account_id);
             let Some(account) = pool else {
                 // No context for this account, so nothing will ever post a
                 // result: say so rather than spin on three spinners forever.
@@ -38476,10 +37369,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 return;
             }
             let mode = self.options.mode.as_str().to_string();
-            let pool = self
-                .resource_pool_accounts()
-                .into_iter()
-                .find(|a| a.account_id == group.account_id);
+            let pool = self.detail_account(&group.account_id);
             let Some(account) = pool else {
                 self.message = format!("no AWS context for account {}", group.account_id);
                 self.log_error(self.message.clone());
@@ -38982,6 +37872,10 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                     .join(", ")
                             };
                             egui::ComboBox::from_id_salt("asg_protection_accounts")
+                                // egui closes a ComboBox on ANY click inside it by default,
+                                // and a checkbox click counts, so a tick shut the list. These
+                                // are multi-select: stay open until a click outside.
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                                 .selected_text(label)
                                 .show_ui(ui, |ui| {
                                     for (pid, display) in &profiles {
@@ -38992,10 +37886,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                             } else {
                                                 dlg.checked.retain(|p| p != pid);
                                             }
-                                            // Close on pick, like the other
-                                            // account dropdowns, rather than
-                                            // waiting for a click outside.
-                                            ui.close();
                                         }
                                     }
                                 });
@@ -39320,10 +38210,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 self.log_warn(self.message.clone());
                 return;
             }
-            let Some(account) = self
-                .resource_pool_accounts()
-                .into_iter()
-                .find(|a| a.account_id == group.account_id)
+            let Some(account) = self.detail_account(&group.account_id)
             else {
                 self.message = format!("no AWS context for account {}", group.account_id);
                 self.log_error(self.message.clone());
@@ -39446,10 +38333,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             let tx = self.proc_tx.clone();
             let egui_ctx = self.egui_ctx.clone();
             let in_flight = Arc::clone(&self.asg_capacity_in_flight);
-            let cache_key = self
-                .resource_pool_accounts()
-                .into_iter()
-                .find(|a| a.account_id == pending.account_id)
+            let cache_key = self.detail_account(&pending.account_id)
                 .map(|a| a.cache_key(ResourceKind::Asg, mode.as_str()))
                 .unwrap_or_default();
             std::thread::spawn(move || {
@@ -39882,10 +38766,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             self.zone_details
                 .insert(zone.id.clone(), ZoneDetailState::default());
 
-            let pool = self
-                .resource_pool_accounts()
-                .into_iter()
-                .find(|a| a.account_id == zone.account_id);
+            let pool = self.detail_account(&zone.account_id);
             let Some(account) = pool else {
                 // No context for this account, so nothing will ever post a
                 // result: say so rather than spin on three spinners forever.
@@ -40476,10 +39357,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             self.bucket_details
                 .insert(bucket.name.clone(), BucketDetailState::default());
 
-            let pool = self
-                .resource_pool_accounts()
-                .into_iter()
-                .find(|a| a.account_id == bucket.account_id);
+            let pool = self.detail_account(&bucket.account_id);
             let Some(account) = pool else {
                 // No context for this account, so nothing will ever post a
                 // result: say so rather than spin on eight spinners forever.
@@ -40951,10 +39829,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             self.asg_details
                 .insert(group.arn.clone(), AsgDetailState::default());
 
-            let pool = self
-                .resource_pool_accounts()
-                .into_iter()
-                .find(|a| a.account_id == group.account_id);
+            let pool = self.detail_account(&group.account_id);
             let Some(account) = pool else {
                 // No context for this account, so nothing will ever post a
                 // result: say so rather than spin on three spinners forever.
@@ -41041,10 +39916,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 }
                 return;
             }
-            let Some(account) = self
-                .resource_pool_accounts()
-                .into_iter()
-                .find(|a| a.account_id == g.account_id && a.authed)
+            let Some(account) = self.detail_account(&g.account_id).filter(|a| a.authed)
             else {
                 return;
             };
@@ -41580,6 +40452,38 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                     }
                 });
             }
+        }
+
+        /// The account a detail call should use: the pool first, then any
+        /// account whose inventory is cached. The pool is only the selected
+        /// account plus the ticked multi-account ones, so a detail tab opened
+        /// for another account (or kept after switching) found no context and
+        /// every section read "no AWS context for account".
+        fn detail_account(&self, account_id: &str) -> Option<PoolAccount> {
+            if let Some(a) = self
+                .resource_pool_accounts()
+                .into_iter()
+                .find(|a| a.account_id == account_id)
+            {
+                return Some(a);
+            }
+            let sim = self.options.mode == Mode::Sim;
+            self.profile_inventory_cache.iter().find_map(|(pid, (_, ctx))| {
+                if ctx.account_id.as_deref() != Some(account_id) {
+                    return None;
+                }
+                let live = self
+                    .profile_auth_infos
+                    .iter()
+                    .find(|a| a.profile_id == *pid)
+                    .map(|a| a.auth_status);
+                Some(PoolAccount {
+                    authed: pool_account_is_authed(live, ctx.auth_status, sim),
+                    profile: ctx.profile.to_string(),
+                    account_id: account_id.to_string(),
+                    region: ctx.region.clone(),
+                })
+            })
         }
 
         /// Every account the resource sub-tabs draw from: the selected account
@@ -42278,10 +41182,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                     return;
                 }
             }
-            let Some(account) = self
-                .resource_pool_accounts()
-                .into_iter()
-                .find(|a| a.account_id == tg.account_id && a.authed)
+            let Some(account) = self.detail_account(&tg.account_id).filter(|a| a.authed)
             else {
                 return;
             };
@@ -45487,7 +44388,15 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 .map(|s| self.detail_subject_color(s))
                 .collect();
 
-            ui.horizontal_wrapped(|ui| {
+            // One row that scrolls sideways, not a wrapping one: with several
+            // target groups and ASGs open the strip used to wrap onto extra
+            // rows, pushing the panel down. Refresh and Close All sit at the
+            // end of the same row.
+            egui::ScrollArea::horizontal()
+                .id_salt("detail_tab_strip")
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+            ui.horizontal(|ui| {
                 for (idx, subject) in self.detail_tabs.iter().enumerate() {
                     // The environment's colour goes on the TAB, exactly as a
                     // Connections tab wears it: a stroke in the colour over a
@@ -45603,6 +44512,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                     close_all = true;
                 }
             });
+                });
             ui.separator();
 
             // Applied after the strip is drawn, never during: the loop borrows
@@ -48643,6 +47553,10 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                         let mut changed = false;
                         ui.horizontal(|ui| {
                             egui::ComboBox::from_id_salt("multi_account_lookup")
+                                // egui closes a ComboBox on ANY click inside it by default,
+                                // and a checkbox click counts, so a tick shut the list. These
+                                // are multi-select: stay open until a click outside.
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                                 .selected_text(multi_label)
                                 .show_ui(ui, |ui| {
                                     for (pid, display, _) in &other_profiles {
@@ -49799,27 +48713,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         _handle: std::thread::JoinHandle<()>,
     }
 
-    /// The entire payload of a pingdom escalation: a tier code and the
-    /// alert's own timestamp, and nothing else.
-    ///
-    /// **The code is `OutcomeCode::Failure`, taken from `as_str()` and never
-    /// written as a literal.** Pingdom deliberately reuses reaper's escalating
-    /// code rather than minting its own: the Pi-side daemon tiers on this
-    /// vocabulary, and a code it does not recognise is escalated as unknown —
-    /// a failure that looks exactly like success from this side.
-    ///
-    /// `Escalation::incident` and `Escalation::alert_id` are for the local
-    /// log and are dropped here. The incident label is an environment name,
-    /// which names a corporate estate; this string crosses the org boundary
-    /// into a personal mailbox, on to Telegram, and through a third-party
-    /// text-to-speech service.
-    fn pingdom_escalation_subject(e: &ec2_manager::pingdom::Escalation) -> String {
-        ec2_manager::reaper::escalation_subject(
-            ec2_manager::reaper::OutcomeCode::Failure,
-            &e.created_at,
-        )
-    }
-
     /// Why the **Jira Tickets** button is or is not there.
     ///
     /// Pure, and returns the line instead of logging it, so both dark states
@@ -49912,10 +48805,10 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         if mailbox.map(str::trim).unwrap_or("").is_empty() {
             lines.push((
                 false,
-                "pingdom: no escalation mailbox configured, staying dark — set \
-                 ESCALATION_MAILBOX or store the ec2_manager/escalation_mailbox \
-                 credential. Acknowledging without being able to escalate would \
-                 silence a live page and never ring"
+                "pingdom: no Atlassian account id configured, staying dark — set \
+                 MY_ID or store it in Credential Manager. Acknowledging without \
+                 being able to escalate (assign the alert to you) would silence \
+                 a live page and never hand it to anyone"
                     .to_string(),
             ));
             return (false, lines);
@@ -49994,8 +48887,8 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         if mailbox.map(str::trim).unwrap_or("").is_empty() {
             lines.push((
                 false,
-                "custom alerts: no escalation mailbox configured, staying dark - set \
-                 ESCALATION_MAILBOX or store the ec2_manager/escalation_mailbox credential. \
+                "custom alerts: no Atlassian account id configured, staying dark - set \
+                 MY_ID or store it in Credential Manager. \
                  Acknowledging without being able to escalate would silence a live page and \
                  never ring"
                     .to_string(),
@@ -50063,8 +48956,8 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         if mailbox.map(str::trim).unwrap_or("").is_empty() {
             lines.push((
                 false,
-                "unhealthy host: no escalation mailbox configured, staying dark — set \
-                 ESCALATION_MAILBOX or store the ec2_manager/escalation_mailbox \
+                "unhealthy host: no Atlassian account id configured, staying dark — set \
+                 MY_ID or store it in Credential Manager \
                  credential. Acknowledging without being able to escalate would \
                  silence a live page and never ring"
                     .to_string(),
@@ -50173,7 +49066,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         if mailbox.map(str::trim).unwrap_or("").is_empty() {
             lines.push((
                 false,
-                "instance age: off — no escalation mailbox is configured. It stays dark rather \
+                "instance age: off — no Atlassian account id (MY_ID) is configured. It stays dark rather \
                  than running acknowledge-only: silencing a live page and then never being able \
                  to ring is worse than doing nothing"
                     .to_string(),
@@ -50207,102 +49100,48 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         (true, lines)
     }
 
-    /// Where `send_escalation.ps1` lives: next to the executable.
-    ///
-    /// **Never written to `%TEMP%` and run from there**, and never spawned
-    /// with `-WindowStyle Hidden` — both are patterns EDRs quarantine on
-    /// sight, and this app has a CrowdStrike quarantine in its history.
-    /// `package_windows_zip` copies the script beside the exe for the same
-    /// reason. Mirrors `access_email_script_path`.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    fn escalation_script_path() -> std::path::PathBuf {
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|d| d.join("send_escalation.ps1")))
-            .unwrap_or_else(|| std::path::PathBuf::from("send_escalation.ps1"))
+    /// The Atlassian account id escalations assign to (`MY_ID`, or the stored
+    /// credential), or `None` when it is not set. Read once at startup for the
+    /// gate lines: with no id there is nobody to assign to, so the watchers
+    /// that escalate stay dark rather than run and never escalate.
+    fn escalation_assignee() -> Option<String> {
+        let id = ec2_manager::jsm_auth::resolve_id(
+            ec2_manager::jsm_auth::ATLASSIAN_ACCOUNT_ID_ENV,
+            ec2_manager::jsm_auth::ATLASSIAN_ACCOUNT_ID_TARGET,
+            "",
+        );
+        let id = id.trim();
+        (!id.is_empty()).then(|| id.to_string())
     }
 
-    /// Send one escalation email. `Ok` carries the address it went to.
+    /// The escalation: assign the alert to the user, but only if it is still
+    /// open. `Ok` carries a short sentence for the log; a closed alert is
+    /// `Ok` too (nothing to escalate), and says so.
     ///
-    /// This is the app's outbound path across the org boundary, and it is
-    /// deliberately narrow: one fixed recipient, a subject that is the entire
-    /// payload, an empty body, and no attachment. It must never route through
-    /// `send_access_email.ps1` — that script's recipient gates exist because
-    /// it attaches a private key, and they must not be relaxed to fit this.
+    /// Replaces the old escalation email. The account id is the user's own
+    /// (`MY_ID` / Credential Manager, the one the on-call lookup uses). The
+    /// alert is re-read first, so "do not escalate a closed alert" holds at
+    /// the moment of the call, not only at the moment the timer was set.
     ///
-    /// Blocking: it runs PowerShell and drives Outlook COM, which takes
-    /// seconds. Callers run it off the poll thread.
-    #[cfg(target_os = "windows")]
-    fn send_escalation_email(
-        mailbox: &str,
-        subject: &str,
+    /// Blocking: two HTTP calls through curl. Callers off the poll thread
+    /// spawn it, as they did the email.
+    fn escalate_by_assigning(
+        auth: &ec2_manager::alerts::AlertsAuth,
+        alert_id: &str,
     ) -> std::result::Result<String, String> {
-        // `std::result::Result` spelled out: the crate's own `Result<T>`
-        // alias (src/error.rs) is in scope and takes one parameter. This only
-        // fails on the Windows target, so cross-compile before trusting a
-        // change here.
-        use std::io::Read;
-        use std::os::windows::process::CommandExt;
-
-        let path = escalation_script_path();
-        if !path.exists() {
-            return Err(format!(
-                "send_escalation.ps1 was not found next to the executable ({})",
-                path.display()
-            ));
-        }
-        let mut child = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-            .arg(&path)
-            .arg(escalation_script_args()[0])
-            .arg(mailbox)
-            .arg(escalation_script_args()[1])
-            .arg(subject)
-            // The GUI owns no console, so without this PowerShell gets a
-            // window of its own. An ordinary Win32 flag, and what every other
-            // child process here already uses -- unlike `-WindowStyle
-            // Hidden`, which is a flagged PowerShell switch.
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| format!("could not start PowerShell: {e}"))?;
-
-        let mut out = String::new();
-        if let Some(mut so) = child.stdout.take() {
-            let _ = so.read_to_string(&mut out);
-        }
-        let _ = child.wait();
-
-        // Keep the last real marker seen, so a stray line before it does not
-        // discard the verdict.
-        let mut status = None;
-        for line in out.lines() {
-            if let Some(st) = parse_escalation_marker(line) {
-                status = Some(st);
+        use ec2_manager::alerts::{assign_if_open, AssignOutcome};
+        let me = ec2_manager::jsm_auth::resolve_id(
+            ec2_manager::jsm_auth::ATLASSIAN_ACCOUNT_ID_ENV,
+            ec2_manager::jsm_auth::ATLASSIAN_ACCOUNT_ID_TARGET,
+            "",
+        );
+        match assign_if_open(auth, alert_id, &me) {
+            Ok(AssignOutcome::Assigned) => Ok("assigned to you".to_string()),
+            Ok(AssignOutcome::AlreadyClosed) => {
+                Ok("already closed - not assigned".to_string())
             }
+            Err(e) => Err(e.to_string()),
         }
-        match status {
-            Some(EscalationStatus::Sent { address }) => Ok(address),
-            Some(EscalationStatus::Failed { reason }) => Err(reason),
-            // The script prints exactly one marker on every path, so nothing
-            // here means it did not run as expected. Never read as success.
-            None => Err(format!(
-                "send_escalation.ps1 printed no marker (output: {:?})",
-                out.trim()
-            )),
-        }
-    }
-
-    /// Non-Windows builds have no Outlook to drive. The Linux dev build must
-    /// compile and stay warning-free without weakening the path where it
-    /// actually ships.
-    #[cfg(not(target_os = "windows"))]
-    fn send_escalation_email(
-        _mailbox: &str,
-        _subject: &str,
-    ) -> std::result::Result<String, String> {
-        Err("escalation email is only sent on Windows (Outlook COM)".to_string())
     }
 
     /// Whether the pingdom watcher may act this poll, and the sentence the
@@ -50370,23 +49209,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         }
     }
 
-    /// The argument names `send_escalation_email` passes to
-    /// `send_escalation.ps1`.
-    ///
-    /// Named once so the spawn and the test that checks the script declares
-    /// them read the same list. They live in different files, a rename here
-    /// is not a compile error, and PowerShell would reject the call at
-    /// runtime inside a spawn nobody is watching — on the one path that
-    /// exists to ring a phone.
-    /// Only the Windows spawn consumes it in production; the agreement test
-    /// runs everywhere. Same shape as `EmailStatus` and `parse_email_marker`
-    /// — the Linux dev build stays warning-free without weakening the check
-    /// where it ships.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    fn escalation_script_args() -> [&'static str; 2] {
-        ["-To", "-Subject"]
-    }
-
     /// Poll the alert feed and run the pingdom watcher: acknowledge, wait,
     /// escalate.
     ///
@@ -50401,11 +49223,10 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
     /// thread and never shared — the same property `start_reaper_poll` keeps.
     /// Nothing here blocks longer than one HTTP call, so unlike reaper there
     /// is no per-incident thread: the only work handed off is the escalation
-    /// send, which drives Outlook COM and takes seconds.
+    /// send, which makes HTTP calls and takes seconds.
     fn start_pingdom_poll(
         auth: ec2_manager::alerts::AlertsAuth,
         cfg: ec2_manager::features::PingdomFeature,
-        mailbox: String,
     ) -> PingdomRuntime {
         use ec2_manager::{alerts, oncall, pingdom};
 
@@ -50601,7 +49422,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 }
 
                 for due in state.due(monotonic_ms(started)) {
-                    let subject = pingdom_escalation_subject(&due);
                     note(
                         LogLevel::Error,
                         format!(
@@ -50611,14 +49431,15 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                             cfg.watch_window().as_secs() / 60,
                         ),
                     );
-                    // Off the poll thread: this drives Outlook COM and takes
+                    // Off the poll thread: this makes HTTP calls and takes
                     // seconds, and nothing else here may wait on it.
                     let tx2 = tx.clone();
-                    let mailbox2 = mailbox.clone();
+                    let auth2 = auth.clone();
+                    let alert_id2 = due.alert_id.clone();
                     let incident = due.incident.clone();
                     std::thread::spawn(move || {
-                        let (ok, detail) = match send_escalation_email(&mailbox2, &subject) {
-                            Ok(address) => (true, format!("sent to {address}")),
+                        let (ok, detail) = match escalate_by_assigning(&auth2, &alert_id2) {
+                            Ok(what) => (true, what),
                             Err(reason) => (false, reason),
                         };
                         let _ = tx2.send(PingdomEvent::Escalated { incident, detail, ok });
@@ -50643,7 +49464,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         auth: ec2_manager::alerts::AlertsAuth,
         features: ec2_manager::features::Features,
         initial: Vec<ec2_manager::custom_alerts::CustomAlert>,
-        mailbox: String,
     ) -> CustomAlertsRuntime {
         use ec2_manager::custom_alerts::{
             reread_verdict, Considered, CustomAlertState, Due, RereadVerdict,
@@ -50811,10 +49631,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                             }
                         }
                         Due::Escalate { alert_id, created_at, name } => {
-                            let subject = ec2_manager::reaper::escalation_subject(
-                                ec2_manager::reaper::OutcomeCode::Failure,
-                                &created_at,
-                            );
+                            let _ = &created_at;
                             note(
                                 LogLevel::Error,
                                 format!(
@@ -50822,14 +49639,13 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                      escalating"
                                 ),
                             );
-                            // Off the poll thread: this drives Outlook COM and
+                            // Off the poll thread: this makes HTTP calls and
                             // takes seconds, and nothing here may wait on it.
                             let tx2 = tx.clone();
-                            let mailbox2 = mailbox.clone();
+                            let auth2 = auth.clone();
                             std::thread::spawn(move || {
-                                let (ok, detail) = match send_escalation_email(&mailbox2, &subject)
-                                {
-                                    Ok(_) => (true, "sent".to_string()),
+                                let (ok, detail) = match escalate_by_assigning(&auth2, &alert_id) {
+                                    Ok(what) => (true, what),
                                     Err(reason) => (false, reason),
                                 };
                                 let _ = tx2.send(CustomAlertEvent::Escalated { name, detail, ok });
@@ -50869,16 +49685,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
     struct UnhealthyHostRuntime {
         rx: std::sync::mpsc::Receiver<UnhealthyHostEvent>,
         _handle: std::thread::JoinHandle<()>,
-    }
-
-    /// The entire payload of an unhealthy-host escalation: reaper's `RE-F`
-    /// code and the alert's own timestamp. The target group, the account,
-    /// the alert id and the kind are for the local log and never leave.
-    fn unhealthy_host_escalation_subject(d: &ec2_manager::unhealthy_host::Due) -> String {
-        ec2_manager::reaper::escalation_subject(
-            ec2_manager::reaper::OutcomeCode::Failure,
-            &d.created_at,
-        )
     }
 
     /// Whether a NEW incident may start this poll. Off call — or unable to
@@ -50934,7 +49740,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         reaper_cfg: ec2_manager::features::ReaperFeature,
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
-        mailbox: String,
     ) -> UnhealthyHostRuntime {
         use ec2_manager::{alerts, oncall, reaper, unhealthy_host as uh};
 
@@ -51234,7 +50039,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                         }
                         uh::Phase::Escalate => {
                             let _ = tx.send(UnhealthyHostEvent::RefreshEnded { key: due.owner.clone() });
-                            let subject = unhealthy_host_escalation_subject(&due);
                             note(
                                 LogLevel::Error,
                                 format!(
@@ -51244,11 +50048,12 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                 ),
                             );
                             let tx2 = tx.clone();
-                            let mailbox2 = mailbox.clone();
+                            let auth2 = auth.clone();
+                            let alert_id2 = due.owner.clone();
                             let resource = due.resource.clone();
                             std::thread::spawn(move || {
-                                let (ok, detail) = match send_escalation_email(&mailbox2, &subject) {
-                                    Ok(address) => (true, format!("sent to {address}")),
+                                let (ok, detail) = match escalate_by_assigning(&auth2, &alert_id2) {
+                                    Ok(what) => (true, what),
                                     Err(reason) => (false, reason),
                                 };
                                 let _ = tx2.send(UnhealthyHostEvent::Escalated { resource, detail, ok });
@@ -51281,16 +50086,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
     struct InstanceAgeRuntime {
         rx: std::sync::mpsc::Receiver<InstanceAgeEvent>,
         _handle: std::thread::JoinHandle<()>,
-    }
-
-    /// The entire payload of an instance-age escalation: reaper's `RE-F` code
-    /// and the alert's own timestamp. The application, environment, account,
-    /// instance id and group name are for the local log and never leave.
-    fn instance_age_escalation_subject(created_at: &str) -> String {
-        ec2_manager::reaper::escalation_subject(
-            ec2_manager::reaper::OutcomeCode::Failure,
-            created_at,
-        )
     }
 
     /// Whether a NEW incident may start this poll. Off call — or unable to
@@ -51335,7 +50130,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         grafana_cfg: ec2_manager::features::GrafanaFeature,
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
-        mailbox: String,
     ) -> InstanceAgeRuntime {
         use ec2_manager::{alerts, instance_age as ia, oncall, reaper};
 
@@ -51356,7 +50150,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             // outcome is said.
             //
             // **The send is spawned, never run here.**
-            // `send_escalation_email` drives Outlook COM through PowerShell
+            // `escalate_by_assigning` makes HTTP calls through curl
             // and takes seconds — its own doc comment says callers run it off
             // the poll thread, and `start_unhealthy_host_poll` does exactly
             // this. Inline, a hung mail client stalls the whole poll: the
@@ -51370,16 +50164,16 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             // lands, and the caller has already logged that reason — so the
             // reason precedes its outcome in the log rather than racing it.
             let escalate = |alert_id: &str, created_at: &str, why: &str| {
-                let subject = instance_age_escalation_subject(created_at);
+                let _ = created_at;
                 let _ = tx.send(InstanceAgeEvent::Notice {
                     text: format!("Instance age: {alert_id} — {why}"),
                 });
                 let tx2 = tx.clone();
-                let mailbox2 = mailbox.clone();
+                let auth2 = auth.clone();
                 let id = alert_id.to_string();
                 std::thread::spawn(move || {
-                    let (ok, detail) = match send_escalation_email(&mailbox2, &subject) {
-                        Ok(address) => (true, format!("sent to {address}")),
+                    let (ok, detail) = match escalate_by_assigning(&auth2, &id) {
+                        Ok(what) => (true, what),
                         Err(reason) => (false, reason),
                     };
                     let _ = tx2.send(InstanceAgeEvent::Escalated {
@@ -51757,15 +50551,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         _handle: std::thread::JoinHandle<()>,
     }
 
-    /// The entire payload of a Grafana escalation: reaper's `RE-F` code and
-    /// the alert's own timestamp. The instance, group and account never leave.
-    fn grafana_escalation_subject(created_at: &str) -> String {
-        ec2_manager::reaper::escalation_subject(
-            ec2_manager::reaper::OutcomeCode::Failure,
-            created_at,
-        )
-    }
-
     /// Whether a NEW incident may start this poll. Off call, or unable to
     /// tell, starts nothing. An incident already running is not affected: it
     /// was acknowledged by this machine and must be finished by it.
@@ -51825,7 +50610,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         }
         if mailbox.map(str::trim).unwrap_or("").is_empty() {
             return off(
-                "no escalation mailbox is configured. It stays dark rather than running \
+                "no Atlassian account id (MY_ID) is configured. It stays dark rather than running \
                  acknowledge-only: silencing a live page and then never being able to ring is \
                  worse than doing nothing"
                     .to_string(),
@@ -51872,7 +50657,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         unhealthy_cfg: ec2_manager::features::UnhealthyHostFeature,
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
-        mailbox: String,
     ) -> GrafanaRuntime {
         use ec2_manager::{alerts, grafana as gf, instance_age as ia, oncall, reaper};
 
@@ -51888,18 +50672,17 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 let _ = tx.send(GrafanaEvent::Note { level, message });
             };
 
-            // Spawned, never run on this thread: `send_escalation_email`
-            // drives Outlook COM and takes seconds, and a hung mail client
+            // Spawned, never run on this thread: `escalate_by_assigning`
+            // makes HTTP calls and takes seconds, and a hung mail client
             // must not stall the watcher. A failed send is never retried.
             let escalate = |alert_id: &str, created_at: &str, why: &str| {
-                let subject = grafana_escalation_subject(created_at);
+                let _ = (created_at, why);
                 let tx2 = tx.clone();
-                let mailbox2 = mailbox.clone();
+                let auth2 = auth.clone();
                 let id = alert_id.to_string();
-                let _ = why;
                 std::thread::spawn(move || {
-                    let (ok, detail) = match send_escalation_email(&mailbox2, &subject) {
-                        Ok(_) => (true, "sent".to_string()),
+                    let (ok, detail) = match escalate_by_assigning(&auth2, &id) {
+                        Ok(what) => (true, what),
                         Err(reason) => (false, reason),
                     };
                     let _ = tx2.send(GrafanaEvent::Escalated { alert_id: id, detail, ok });
@@ -52320,16 +51103,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
     struct DiskGrowRuntime {
         rx: std::sync::mpsc::Receiver<DiskGrowEvent>,
         _handle: std::thread::JoinHandle<()>,
-    }
-
-    /// The entire payload of a disk-grow escalation: reaper's `RE-F` code and
-    /// the alert's own timestamp. The instance, volume, environment and
-    /// account never leave.
-    fn disk_grow_escalation_subject(created_at: &str) -> String {
-        ec2_manager::reaper::escalation_subject(
-            ec2_manager::reaper::OutcomeCode::Failure,
-            created_at,
-        )
     }
 
     /// The toolbar line for a volume that was grown: the same flashing yellow
@@ -52952,7 +51725,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         }
         if !mailbox_ok {
             return off(
-                "no escalation mailbox is configured. It stays dark rather than running \
+                "no Atlassian account id (MY_ID) is configured. It stays dark rather than running \
                  acknowledge-only: silencing a live page and then never being able to ring is \
                  worse than doing nothing"
                     .to_string(),
@@ -53009,7 +51782,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         grafana_cfg: ec2_manager::features::GrafanaFeature,
         app_config: ec2_manager::config::AppConfig,
         mode: Mode,
-        mailbox: String,
         in_flight: ReaperInFlight,
     ) -> DiskGrowRuntime {
         use ec2_manager::{alerts, disk_grow as dg, instance_age as ia, oncall, reaper};
@@ -53029,21 +51801,21 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 let _ = tx.send(DiskGrowEvent::Note { level, message });
             };
 
-            // Spawned, never run on this thread: `send_escalation_email`
-            // drives Outlook COM and takes seconds, and a hung mail client
+            // Spawned, never run on this thread: `escalate_by_assigning`
+            // makes HTTP calls and takes seconds, and a hung mail client
             // must not stall the watcher. A failed send is never retried, and
             // the detail logged is "sent" or the failure -- never the address.
             let escalate = |alert_id: &str, created_at: &str, why: &str| {
                 // The reason stays local; the email carries only the code
                 // and the time, and the mailbox never goes in a log line.
                 note(LogLevel::Error, format!("disk grow: {alert_id} — {why}; escalating once"));
-                let subject = disk_grow_escalation_subject(created_at);
+                let _ = created_at;
                 let tx2 = tx.clone();
-                let mailbox2 = mailbox.clone();
+                let auth2 = auth.clone();
                 let id = alert_id.to_string();
                 std::thread::spawn(move || {
-                    let (ok, detail) = match send_escalation_email(&mailbox2, &subject) {
-                        Ok(_) => (true, "sent".to_string()),
+                    let (ok, detail) = match escalate_by_assigning(&auth2, &id) {
+                        Ok(what) => (true, what),
                         Err(reason) => (false, reason),
                     };
                     let _ = tx2.send(DiskGrowEvent::Escalated { alert_id: id, detail, ok });
@@ -62218,21 +60990,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         }
 
         #[test]
-        fn nothing_in_the_grafana_test_path_acknowledges_or_terminates() {
-            let whole = include_str!("ec2_manager_gui.rs");
-            let src = &whole[..whole.find("    mod tests {").expect("the test module")];
-            let from = src.find("fn start_alert_dry_run").expect("the dry-run fn");
-            let rest = &src[from..];
-            let start = rest.find("DryRunRoute::Grafana => {").expect("the dry-run arm");
-            let arm = &rest[start..];
-            let end = arm.find("DryRunRoute::Neither => {").expect("the next arm");
-            let arm = &arm[..end];
-            assert!(arm.contains("dry run:"), "the slice must be the dry-run arm");
-            assert!(!arm.contains("acknowledge_alert"), "Test Alert Match never acknowledges");
-            assert!(!arm.contains("terminate_instance"), "Test Alert Match never terminates");
-        }
-
-        #[test]
         fn saving_replaces_in_place_and_deleting_removes() {
             use ec2_manager::custom_alerts::CustomAlert;
             let def = |n: &str| CustomAlert {
@@ -63616,44 +62373,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             // header names the commands it must never run. Repeating a
             // weaker version of that scan here would only be a second place
             // to get it wrong.
-        }
-
-        #[test]
-        fn the_probe_reports_the_state_of_the_box_without_claiming_a_restart() {
-            let out = "__RE_BEGIN__\n\
-                       __RE_WD_STATE__ inactive\n\
-                       __RE_PS_BEGIN__\n\
-                       {\"Name\":\"reaper\",\"State\":\"running\"}\n\
-                       {\"Name\":\"reaper-db\",\"State\":\"exited\"}\n\
-                       __RE_PS_END__\n__RE_END__\n";
-            let lines = reaper_probe_state_lines("i-0abc", out);
-            let text = lines.join("\n");
-            assert!(text.contains("reaper-watchdog is inactive"), "{text}");
-            assert!(text.contains("2 service(s), 1 not running"), "{text}");
-            assert!(text.contains("reaper (running)"), "{text}");
-            assert!(text.contains("reaper-db (not running)"), "{text}");
-            // The probe restarted nothing, so nothing it prints may say it
-            // did -- that is `parse_verdict`'s wording, not this one's.
-            assert!(!text.contains("after restart"), "{text}");
-        }
-
-        #[test]
-        fn a_box_without_opt_reaper_is_the_only_thing_the_probe_reports() {
-            // Nothing else in the transcript is meaningful once the script
-            // has said it is not on one of our boxes.
-            let lines = reaper_probe_state_lines("i-0abc", "__RE_BEGIN__\n__RE_NODIR__\n__RE_END__\n");
-            assert_eq!(lines.len(), 1);
-            assert!(
-                lines[0].contains(ec2_manager::reaper::REAPER_DIR),
-                "{lines:?}"
-            );
-        }
-
-        #[test]
-        fn a_probe_that_read_nothing_back_says_so_rather_than_inventing_a_state() {
-            let lines = reaper_probe_state_lines("i-0abc", "");
-            assert_eq!(lines.len(), 1);
-            assert!(lines[0].contains("listed no services"), "{lines:?}");
         }
 
         fn test_alert_match(subject: ec2_manager::reaper::Subject) -> ec2_manager::reaper::AlertMatch {
@@ -65751,180 +64470,6 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
             assert!(parse_email_marker("Recipient resolved: True").is_none());
             assert!(parse_email_marker("").is_none());
             assert!(parse_email_marker("SENTINEL something").is_none());
-        }
-
-        // -- send_escalation.ps1 markers ---------------------------------
-        //
-        // The escalation script's own vocabulary. `parse_email_marker` reads
-        // `SENT`/`OPEN` and returns None for everything else -- including
-        // every `FAILED` line, which is every reason that script goes to the
-        // trouble of naming. The spec requires a failure to say what went
-        // wrong, so these are parsed by a sibling.
-
-        /// The source of the script the parser has to agree with. Read at
-        /// compile time so the two cannot drift: the file lives in `assets/`
-        /// and the parser lives here.
-        const SEND_ESCALATION_PS1: &str =
-            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/scripts/send_escalation.ps1"));
-
-        #[test]
-        fn a_sent_escalation_marker_carries_the_address_it_went_to() {
-            assert_eq!(
-                parse_escalation_marker("SENT address='oncall@example.com'"),
-                Some(EscalationStatus::Sent {
-                    address: "oncall@example.com".to_string()
-                })
-            );
-        }
-
-        #[test]
-        fn a_failed_escalation_marker_carries_the_reason() {
-            // Every one of these was discarded before: `parse_email_marker`
-            // has no `FAILED` arm, so it returned None and the GUI would have
-            // reported "no marker" for a script that said exactly what was
-            // wrong.
-            for (line, reason) in [
-                (
-                    "FAILED reason='Outlook is not available'",
-                    "Outlook is not available",
-                ),
-                (
-                    "FAILED reason='no recipient configured'",
-                    "no recipient configured",
-                ),
-            ] {
-                assert_eq!(
-                    parse_escalation_marker(line),
-                    Some(EscalationStatus::Failed {
-                        reason: reason.to_string()
-                    }),
-                    "{line}"
-                );
-            }
-        }
-
-        #[test]
-        fn an_escalation_reason_arrives_with_its_apostrophes_already_stripped() {
-            // What the script emits for a COM message like
-            // "Outlook can't complete the operation": it strips the
-            // apostrophe first. That is load-bearing, not cosmetic --
-            // `single_quoted_value` stops at the first `'`, so an unstripped
-            // one would truncate the reason to "Outlook can" and the user
-            // would be told half of it.
-            assert_eq!(
-                parse_escalation_marker("FAILED reason='Outlook cant complete the operation'"),
-                Some(EscalationStatus::Failed {
-                    reason: "Outlook cant complete the operation".to_string()
-                })
-            );
-        }
-
-        #[test]
-        fn an_escalation_reason_arrives_as_one_line() {
-            // A multi-line COM message reaches the script as one, because the
-            // script folds newlines to spaces before printing. The reader is
-            // line-oriented, so a real embedded newline would split the
-            // marker across two reads and lose the closing quote.
-            assert_eq!(
-                parse_escalation_marker(
-                    "FAILED reason='The operation failed. Try again later.'"
-                ),
-                Some(EscalationStatus::Failed {
-                    reason: "The operation failed. Try again later.".to_string()
-                })
-            );
-        }
-
-        /// The parser's two assumptions are the script's two `-replace`
-        /// clauses. They live in different files, so pin them together.
-        #[test]
-        fn the_script_strips_what_the_marker_format_cannot_carry() {
-            let reason_line = SEND_ESCALATION_PS1
-                .lines()
-                .find(|l| l.contains("$reason ="))
-                .expect("the script builds a reason");
-            assert!(
-                reason_line.contains(r#"-replace "'", ''"#),
-                "the reason must have its apostrophes stripped: {reason_line}"
-            );
-            assert!(
-                reason_line.contains("-replace") && reason_line.contains("n\", ' '"),
-                "the reason must have its newlines folded to spaces: {reason_line}"
-            );
-            // And the markers themselves are what the parser looks for.
-            assert!(SEND_ESCALATION_PS1.contains("SENT address='"));
-            assert!(SEND_ESCALATION_PS1.contains("FAILED reason='"));
-        }
-
-        /// Both guards have to be *reachable* to be worth anything, and one
-        /// PowerShell attribute makes them unreachable.
-        #[test]
-        fn the_escalation_script_can_reach_its_own_guards() {
-            // `Mandatory = $true` has the parameter binder reject `-To ''`
-            // before the script runs, so `FAILED reason='no recipient
-            // configured'` would be dead code -- and an *omitted* mandatory
-            // parameter makes PowerShell prompt, which is an invisible hang
-            // under CREATE_NO_WINDOW rather than a failure the GUI can read.
-            // Comment lines are skipped: the note above the param block
-            // explains why Mandatory is absent, and it says the word.
-            for line in SEND_ESCALATION_PS1
-                .lines()
-                .filter(|l| !l.trim_start().starts_with('#'))
-            {
-                assert!(
-                    !line.contains("Mandatory"),
-                    "no parameter may be Mandatory, the guards must be able to run: {line}"
-                );
-            }
-            assert!(SEND_ESCALATION_PS1.contains("IsNullOrWhiteSpace($To)"));
-            assert!(SEND_ESCALATION_PS1.contains("IsNullOrWhiteSpace($Subject)"));
-        }
-
-        /// `New-Object -ComObject Outlook.Application` generally succeeds
-        /// whenever Outlook is merely installed. The "no mail profile"
-        /// failure only surfaces at the first MAPI call, so that call has to
-        /// be inside the same `try` — otherwise it falls out of the `Send()`
-        /// catch as a raw COM string instead of the sentence that names the
-        /// problem. `send_access_email.ps1` pairs the two for this reason.
-        #[test]
-        fn the_outlook_availability_check_reaches_a_mapi_call() {
-            let new_object = SEND_ESCALATION_PS1
-                .find("New-Object -ComObject Outlook.Application")
-                .expect("the script creates the Outlook COM object");
-            let mapi = SEND_ESCALATION_PS1
-                .find(r#"GetNamespace("MAPI")"#)
-                .expect("the script must touch MAPI while it can still say why");
-            let catch = SEND_ESCALATION_PS1[new_object..]
-                .find("Outlook is not available")
-                .expect("that block reports unavailability")
-                + new_object;
-            assert!(
-                new_object < mapi && mapi < catch,
-                "the MAPI call must sit between New-Object and its catch"
-            );
-        }
-
-        /// Two EDR constraints, and this app has a CrowdStrike quarantine in
-        /// its history. `-WindowStyle Hidden` is a pattern EDRs quarantine on
-        /// sight; the console is suppressed by `CREATE_NO_WINDOW` on the
-        /// spawn instead, which is an ordinary Win32 flag.
-        #[test]
-        fn the_escalation_script_carries_no_flagged_powershell_switch() {
-            assert!(!SEND_ESCALATION_PS1.contains("WindowStyle"));
-            assert!(!SEND_ESCALATION_PS1.to_ascii_lowercase().contains("$env:temp"));
-        }
-
-        #[test]
-        fn a_line_that_is_not_an_escalation_marker_is_ignored() {
-            for line in [
-                "",
-                "SENTINEL something",
-                "FAILEDreason='x'",
-                "OPEN recipient='John Smith' resolved=True",
-                "At line:1 char:1",
-            ] {
-                assert!(parse_escalation_marker(line).is_none(), "{line}");
-            }
         }
 
         #[test]
@@ -70119,32 +68664,6 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         }
 
         #[test]
-        fn nothing_in_the_disk_grow_test_path_acknowledges_modifies_or_grows() {
-            let src = disk_grow_prod_src();
-            let from = src.find("fn start_alert_dry_run").expect("the dry-run fn");
-            let rest = &src[from..];
-            let start = rest.find("DryRunRoute::DiskGrow => {").expect("the dry-run arm");
-            let arm = &rest[start..];
-            let end = arm.find("DryRunRoute::Neither => {").expect("the next arm");
-            let arm = &arm[..end];
-            assert!(arm.contains("dry run:"), "the slice must be the dry-run arm");
-            for banned in [
-                "acknowledge_alert",
-                "modify_volume(",
-                "disk_grow_run_fs(",
-                "add_note(",
-                "disk_grow_grow_once(",
-                "disk_grow_fs_and_comment(",
-            ] {
-                assert!(!arm.contains(banned), "Test Alert Match must not call {banned}");
-            }
-            // It does read the box and report the plan.
-            assert!(arm.contains("disk_grow_probe("));
-            assert!(arm.contains("growth_options("));
-            assert!(arm.contains("device_ahead_of_fs("));
-        }
-
-        #[test]
         fn disk_grow_remediation_refuses_an_excluded_environment() {
             let cfg = populated_disk_grow_cfg();
             let why = disk_grow_manual_env_refusal(&cfg, "prod").expect("refused");
@@ -70452,65 +68971,6 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
         }
 
         #[test]
-        fn the_instance_age_dry_run_never_acknowledges_and_never_terminates() {
-            // A control called "Test" that silences a live page, or takes a
-            // box down, is not a test.
-            let src = include_str!("ec2_manager_gui.rs");
-            let body = &src[..src.find("    mod tests {").expect("the test module")];
-            let start = body
-                .find("DryRunRoute::InstanceAge => {")
-                .expect("the dry-run arm");
-            let end = start
-                + body[start..]
-                    .find("\n                DryRunRoute::")
-                    .or_else(|| body[start..].find("\n            }"))
-                    .expect("the end of the arm");
-            let arm = &body[start..end];
-            assert!(!arm.contains("acknowledge_alert"), "{arm}");
-            assert!(!arm.contains("terminate_instance"), "{arm}");
-            assert!(
-                arm.contains("send_escalation_email") || arm.contains("escalate"),
-                "the dry run must really escalate — a simulated send tests nothing: {arm}"
-            );
-        }
-
-        #[test]
-        fn a_pingdom_escalation_carries_nothing_but_a_code_and_a_time() {
-            // The subject is the entire payload. The incident label and the
-            // alert id are for the local log and must never reach it: the
-            // environment names a corporate estate, and this leaves the org.
-            let e = ec2_manager::pingdom::Escalation {
-                alert_id: "0b3f-alert-id".to_string(),
-                created_at: "2026-08-26T14:03:11Z".to_string(),
-                incident: "PROD".to_string(),
-            };
-            let subject = pingdom_escalation_subject(&e);
-
-            assert_eq!(subject, "RE-F 2026-08-26T14:03:11Z");
-            assert!(!subject.contains("PROD"), "the environment must not leave the org");
-            assert!(!subject.contains("0b3f"), "the alert id must not leave the org");
-        }
-
-        #[test]
-        fn an_unhealthy_host_escalation_carries_nothing_but_a_code_and_a_time() {
-            let d = ec2_manager::unhealthy_host::Due {
-                resource: "targetgroup/prod-secret-app-tg/17bb79ec89f6d7d9".to_string(),
-                owner: "0b3f-alert-id".to_string(),
-                created_at: "2026-09-11T14:03:11Z".to_string(),
-                account_id: "830301468378".to_string(),
-                kind: ec2_manager::unhealthy_host::Kind::Vault,
-                spent: 1,
-                phase: ec2_manager::unhealthy_host::Phase::Escalate,
-            };
-            let subject = unhealthy_host_escalation_subject(&d);
-            assert_eq!(subject, "RE-F 2026-09-11T14:03:11Z");
-            assert!(!subject.contains("secret-app"));
-            assert!(!subject.contains("0b3f"));
-            assert!(!subject.contains("830301468378"));
-            assert!(!subject.contains("vault"));
-        }
-
-        #[test]
         fn off_call_or_an_unanswerable_lookup_starts_nothing() {
             assert!(unhealthy_host_on_call_decision(Ok(true)).0);
             assert!(!unhealthy_host_on_call_decision(Ok(false)).0);
@@ -70540,32 +69000,6 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             // here would spend no budget and schedule another check forever.
             assert_eq!(wait_after_check(false, Wait::AfterTerminate), Wait::AfterTerminate);
             assert_eq!(wait_after_check(false, Wait::VaultRetry), Wait::AfterTerminate);
-        }
-
-        #[test]
-        fn the_pingdom_code_is_taken_from_the_shared_vocabulary() {
-            // Never a literal. A drifted code sends mail the Pi daemon does
-            // not recognise, which it escalates as unknown -- a failure that
-            // looks exactly like success.
-            let e = ec2_manager::pingdom::Escalation {
-                alert_id: "a1".to_string(),
-                created_at: "2026-08-26T14:03:11Z".to_string(),
-                incident: "PROD".to_string(),
-            };
-            assert!(pingdom_escalation_subject(&e)
-                .starts_with(ec2_manager::reaper::OutcomeCode::Failure.as_str()));
-        }
-
-        #[test]
-        fn a_pingdom_escalation_with_no_timestamp_still_sends_the_code() {
-            // An escalation that arrives without a timestamp is worth far
-            // more than one that does not arrive.
-            let e = ec2_manager::pingdom::Escalation {
-                alert_id: "a1".to_string(),
-                created_at: String::new(),
-                incident: "PROD".to_string(),
-            };
-            assert_eq!(pingdom_escalation_subject(&e), "RE-F");
         }
 
         fn jira_cfg(users: &[&str]) -> ec2_manager::features::JiraFeature {
@@ -71393,7 +69827,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 let (armed, lines) = pingdom_gate_report(&pingdom_cfg(), "bconrad", true, mailbox);
                 assert!(!armed, "{mailbox:?}");
                 assert!(
-                    lines.iter().any(|(_, m)| m.contains("escalation mailbox")),
+                    lines.iter().any(|(_, m)| m.contains("Atlassian account id")),
                     "{mailbox:?} {lines:?}"
                 );
             }
@@ -71457,25 +69891,6 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let (act, why) = pingdom_on_call_decision(Err("403 from the schedule API".to_string()));
             assert!(!act, "a lookup that failed must never authorise an ack or a page");
             assert!(why.contains("403"), "the reason has to survive: {why}");
-        }
-
-        #[test]
-        fn the_escalation_spawn_and_the_script_agree_on_their_argument_names() {
-            // They live in different files and drifted apart once already for
-            // the secondary-mirror step. A renamed parameter here is not a
-            // compile error -- PowerShell would reject the call at runtime,
-            // inside a spawn nobody is watching, on the one path that exists
-            // to ring a phone.
-            const SCRIPT: &str = include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/assets/scripts/send_escalation.ps1"
-            ));
-            for arg in escalation_script_args() {
-                assert!(
-                    SCRIPT.contains(&format!("${}", arg.trim_start_matches('-'))),
-                    "send_escalation.ps1 declares no parameter for {arg}"
-                );
-            }
         }
 
         #[test]
@@ -71558,7 +69973,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 let (armed, lines) =
                     unhealthy_host_gate_report(&unhealthy_host_cfg(), "bconrad", true, mailbox);
                 assert!(!armed);
-                assert!(lines[0].1.contains("no escalation mailbox"), "{}", lines[0].1);
+                assert!(lines[0].1.contains("no Atlassian account id"), "{}", lines[0].1);
             }
 
             let (armed, lines) = unhealthy_host_gate_report(
@@ -71865,10 +70280,10 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let (armed, lines) =
                 custom_alerts_gate_report(&custom_cfg(true, &["john"]), "john", true, None);
             assert!(!armed);
-            assert!(lines[0].1.contains("no escalation mailbox"));
+            assert!(lines[0].1.contains("no Atlassian account id"));
             let (_, blank) =
                 custom_alerts_gate_report(&custom_cfg(true, &["john"]), "john", true, Some("  "));
-            assert!(blank[0].1.contains("no escalation mailbox"));
+            assert!(blank[0].1.contains("no Atlassian account id"));
         }
 
         #[test]
@@ -71898,18 +70313,6 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let (on, line) = custom_alerts_on_call_decision(Err("boom".to_string()));
             assert!(!on, "a failed lookup counts as off call");
             assert!(line.contains("boom"));
-        }
-
-        #[test]
-        fn a_custom_alerts_escalation_carries_nothing_but_a_code_and_a_time() {
-            let subject = ec2_manager::reaper::escalation_subject(
-                ec2_manager::reaper::OutcomeCode::Failure,
-                "2026-10-14T14:03:11Z",
-            );
-            assert!(subject.starts_with(ec2_manager::reaper::OutcomeCode::Failure.as_str()));
-            assert!(subject.contains("2026-10-14T14:03:11Z"));
-            // The saved alert's name and the alert id are for the local log.
-            assert!(!subject.contains("Disk"));
         }
 
         /// The poll must only ever start from the one gated site. A second
@@ -74256,7 +72659,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let (armed, lines) =
                 instance_age_gate_report(&Mode::Live, &instance_age_cfg(), "bconrad", true, None);
             assert!(!armed);
-            assert!(lines.iter().any(|(_, l)| l.contains("mailbox")), "{lines:?}");
+            assert!(lines.iter().any(|(_, l)| l.contains("account id")), "{lines:?}");
 
             let (armed, lines) =
                 instance_age_gate_report(&Mode::Live, &instance_age_cfg(), "bconrad", true, mailbox);
@@ -74333,47 +72736,6 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                     .iter()
                     .any(|(warn, l)| *warn && l.contains("more than one user")),
                 "{lines:?}"
-            );
-        }
-
-        #[test]
-        fn an_instance_age_escalation_carries_nothing_but_a_code_and_a_time() {
-            let subject = instance_age_escalation_subject("2026-09-17T14:03:11Z");
-            assert_eq!(subject, "RE-F 2026-09-17T14:03:11Z");
-            for local in [
-                "cassandra",
-                "prod",
-                "acme-prod",
-                "i-0aaa1111bbbb2222c",
-                "prod-cassandra-asg",
-                "us-east-1",
-            ] {
-                assert!(
-                    !subject.contains(local),
-                    "{local:?} must not cross the org boundary"
-                );
-            }
-        }
-
-        #[test]
-        fn the_instance_age_escalation_code_is_never_written_as_a_literal() {
-            // The Pi-side daemon tiers on that vocabulary; a code it does not
-            // recognise is escalated as unknown, which looks exactly like
-            // success from this side.
-            let src = include_str!("ec2_manager_gui.rs");
-            let body = &src[..src.find("    mod tests {").expect("the test module")];
-            let start = body
-                .find("fn instance_age_escalation_subject")
-                .expect("the subject builder");
-            let end = start + body[start..].find("\n    }").expect("its end");
-            let f = &body[start..end];
-            assert!(
-                f.contains("OutcomeCode::Failure"),
-                "the code must come from the enum: {f}"
-            );
-            assert!(
-                !f.contains(&format!("RE{}F", "-")),
-                "the code must not be a literal: {f}"
             );
         }
 
@@ -74595,7 +72957,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             let spawn = escalate.find("thread::spawn(").unwrap_or_else(|| {
                 panic!(
                     "the escalation send must be spawned, not run here. \
-                     `send_escalation_email` drives Outlook COM through PowerShell and takes \
+                     `escalate_by_assigning` makes two HTTP calls through curl and takes \
                      seconds; run inline it stalls the whole poll — the `expired` sweep, the \
                      `pending` re-reads and the new-alert pass all sit behind it — so a hung \
                      mail client makes the watcher stop terminating AND stop escalating. \
@@ -74608,12 +72970,12 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             // exactly as before. The send has to be *inside* the spawn, which
             // for a slice of one closure means after it.
             let send = escalate
-                .find("send_escalation_email(")
+                .find("escalate_by_assigning(")
                 .expect("it must still send");
             assert!(
                 send > spawn,
                 "the send must sit INSIDE the spawn, not merely beside one — a closure with \
-                 both a spawned and an inline `send_escalation_email` blocks the poll just as \
+                 both a spawned and an inline `escalate_by_assigning` blocks the poll just as \
                  badly. Found in: {escalate}"
             );
         }
@@ -78795,7 +77157,7 @@ fed_expire = 4000000000
             let (armed, lines) = grafana_gate_report(&live, &cfg, "me", false, Some("a@b"));
             assert!(!armed && lines[0].1.contains("no JSM credentials"));
             let (armed, lines) = grafana_gate_report(&live, &cfg, "me", true, None);
-            assert!(!armed && lines[0].1.contains("no escalation mailbox"));
+            assert!(!armed && lines[0].1.contains("no Atlassian account id"));
             let (armed, _) = grafana_gate_report(&Mode::Sim, &cfg, "me", true, Some("a@b"));
             assert!(!armed, "Sim never arms a live terminate");
 
@@ -78804,18 +77166,6 @@ fed_expire = 4000000000
             let joined: String = lines.iter().map(|(_, m)| m.as_str()).collect();
             assert!(joined.contains("12 minute") && joined.contains("25 minute"), "{joined}");
             assert!(!joined.contains("a@b"), "the mailbox address never appears in a log line");
-        }
-
-        #[test]
-        fn grafana_escalates_with_nothing_but_a_code_and_a_time() {
-            let s = grafana_escalation_subject("2026-10-19T10:00:00Z");
-            assert_eq!(
-                s,
-                ec2_manager::reaper::escalation_subject(
-                    ec2_manager::reaper::OutcomeCode::Failure,
-                    "2026-10-19T10:00:00Z"
-                )
-            );
         }
 
         #[test]
@@ -78888,7 +77238,7 @@ fed_expire = 4000000000
             assert!(!armed && lines[0].1.contains("credentials"), "{lines:?}");
 
             let (armed, lines) = disk_grow_gate_report("me", &cfg, &live, true, false);
-            assert!(!armed && lines[0].1.contains("mailbox"), "{lines:?}");
+            assert!(!armed && lines[0].1.contains("account id"), "{lines:?}");
 
             // Armed: ON CALL ONLY, and every excluded environment by name.
             cfg.excluded_environments = vec!["PROD".to_string(), " ".to_string(), "uat2".to_string()];
@@ -78922,25 +77272,6 @@ fed_expire = 4000000000
             let (on, msg) = disk_grow_on_call_decision(Err("boom".to_string()));
             assert!(!on, "a failed lookup counts as off call");
             assert!(msg.contains("boom") && msg.contains("disk grow"), "{msg}");
-        }
-
-        #[test]
-        fn the_disk_grow_escalation_subject_carries_only_the_code_and_the_time() {
-            let ts = "2026-10-28T10:00:00Z";
-            let s = disk_grow_escalation_subject(ts);
-            assert_eq!(
-                s,
-                ec2_manager::reaper::escalation_subject(
-                    ec2_manager::reaper::OutcomeCode::Failure,
-                    ts
-                )
-            );
-            for leak in ["i-", "disk", "vol-", "Disk"] {
-                assert!(!s.contains(leak), "{s:?} must not carry {leak:?}");
-            }
-            // The Pi-side daemon tiers on this literal code.
-            assert!(s.starts_with("RE-F"), "{s:?}");
-            assert_eq!(s, "RE-F 2026-10-28T10:00:00Z");
         }
 
         /// The production half of the file, and one top-level function's body
@@ -79081,8 +77412,7 @@ fed_expire = 4000000000
             assert!(fs.contains("dg::df_h_for_mount(&after.df_h, mount)"), "{fs}");
             assert!(!fs.contains("Grown { df_after"), "the script's own output is never the comment");
             let calls = src.matches("dg::alert_comment(").count();
-            // One real build, plus the Test Alert Match preview of the same text.
-            assert_eq!(calls, 2, "alert_comment is built in the real path and the dry-run preview");
+            assert_eq!(calls, 1, "alert_comment is built in the real path only");
             let once = disk_grow_fn_body(src, "fn disk_grow_grow_volume(");
             assert!(once.contains("dg::df_h_for_mount(&probe.df_h, &dev.mount)"), "{once}");
         }

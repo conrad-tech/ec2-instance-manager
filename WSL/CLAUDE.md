@@ -1167,6 +1167,27 @@ touches an instance — which is why it is its own module rather than a second
   blocks longer than one HTTP call, so unlike reaper there is no per-incident
   thread; the only work handed off is the send.
 
+#### SUPERSEDED (2026-11-17): escalation is now "assign the alert to me"
+
+Every watcher's escalation (reaper, pingdom, unhealthy host, instance age,
+Grafana, disk utilization, custom alerts, and the manual Run Remediation
+paths) no longer sends email. `escalate_by_assigning` calls
+`alerts::assign_if_open`: it re-reads the alert and, only if it is still open,
+`POST`s `/alerts/{id}/assign` with `{"owner":{"id":"<MY_ID>"}}`. A closed
+alert is left alone, as before. `send_escalation.ps1`, its marker parser and
+the Outlook plumbing are deleted. Consequences worth knowing:
+
+- **The gate is now `MY_ID`** (env or Credential Manager), not the escalation
+  mailbox: with no account id the escalating watchers stay dark and say so.
+- **Test Alert Match just assigns the alert to you**, whatever its state. It no
+  longer routes to a watcher or probes any box.
+- **The assign endpoint is assumed** (Opsgenie-compatible), not yet verified
+  against the live tenant. A wrong endpoint surfaces as a failed escalation
+  in the log.
+- Still in the lib but unused by the GUI: `reaper::escalation_subject`,
+  `jsm_auth::escalation_mailbox`. The sections below describing the email
+  (subject carries only a code, Outlook COM, EDR constraints) are history.
+
 #### The escalation send — the app's first working outbound path
 
 Until this landed **nothing in the app sent anything**: `ReaperEvent::Outcome`

@@ -1869,7 +1869,7 @@ impl Features {
     /// Fails closed.
     ///
     /// `auth` is a parameter, not a lookup, for the same reason
-    /// `on_call_test_visible_for` takes `mailbox` as one: resolving it reads
+    /// this is resolved by the caller: resolving it reads
     /// the Windows registry, so the caller resolves it once (see
     /// `Self::alerts_auth`) and passes the answer in rather than this being
     /// re-resolved on every call.
@@ -1933,28 +1933,6 @@ impl Features {
     /// and the shipped file ships one.
     pub fn user_sync_enabled_for(&self, user: &str) -> bool {
         self.user_sync.is_allowed_user(user)
-    }
-
-    /// True when the **Send test escalation** action should be shown to
-    /// `user`: the gate lets them in *and* a recipient actually resolves.
-    ///
-    /// Both halves, in one tested function, for the same reason
-    /// `alerts_visible_for` combines its two — a visible control that cannot
-    /// work is worse than an absent one: it invites a click, does nothing,
-    /// and leaves the user unable to tell whether the failure was theirs or
-    /// the app's.
-    ///
-    /// `mailbox` is a parameter rather than a lookup so this module stays
-    /// clear of `jsm_auth` and the Windows credential store. The caller
-    /// resolves it **once, at startup** and passes the answer in — see
-    /// `jsm_auth::escalation_mailbox`, which is an environment read plus a
-    /// `CredReadW` per call and must not be run per frame.
-    ///
-    /// Fails closed twice over: the shipped allow-list is empty, and a blank
-    /// address is absent rather than a destination.
-    pub fn on_call_test_visible_for(&self, user: &str, mailbox: Option<&str>) -> bool {
-        self.on_call_test.is_allowed_user(user)
-            && mailbox.is_some_and(|m| !m.trim().is_empty())
     }
 
     /// True when the automatic `fed up` login should run for `user`. Fails
@@ -2608,7 +2586,6 @@ mod tests {
         let open: Features =
             serde_json::from_str(r#"{"on_call_test":{"allowed_users":["*"]}}"#).expect("parses");
         assert!(open.on_call_test.is_allowed_user("anyone"));
-        assert!(open.on_call_test_visible_for("anyone", Some("oncall@example.com")));
 
         // And the shipped file really carries the block, rather than relying
         // on the default to look the same as a closed gate.
@@ -2621,31 +2598,6 @@ mod tests {
         // assertion above cannot be replaced by "the list is empty".
         let missing: Features = serde_json::from_str("{}").expect("parses");
         assert!(!missing.on_call_test.is_allowed_user("anyone"));
-    }
-
-    #[test]
-    fn the_on_call_test_action_needs_both_the_gate_and_a_recipient() {
-        let open: Features =
-            serde_json::from_str(r#"{"on_call_test":{"allowed_users":["*"]}}"#).expect("parses");
-        let closed: Features = serde_json::from_str("{}").expect("parses");
-        let addr = Some("oncall@example.com");
-
-        assert!(open.on_call_test_visible_for("anyone", addr), "gate open, recipient set");
-        assert!(
-            !open.on_call_test_visible_for("anyone", None),
-            "a control that cannot work must not be offered"
-        );
-        assert!(
-            !closed.on_call_test_visible_for("anyone", addr),
-            "a recipient does not grant the gate"
-        );
-        assert!(!closed.on_call_test_visible_for("anyone", None), "neither");
-
-        // Blank is absent, not a destination -- the same rule `jsm_auth`
-        // applies on the way in, restated here so a caller that hands over an
-        // untrimmed value cannot open the action by accident.
-        assert!(!open.on_call_test_visible_for("anyone", Some("")));
-        assert!(!open.on_call_test_visible_for("anyone", Some("   ")));
     }
 
     #[test]

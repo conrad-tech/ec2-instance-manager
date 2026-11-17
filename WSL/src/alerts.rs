@@ -568,6 +568,50 @@ pub fn acknowledge_alert(auth: &AlertsAuth, alert_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The JSON body for an assignment: `{"owner":{"id":"<account id>"}}`.
+/// Built with `serde_json` so nothing in the id can break out of the body.
+pub fn assign_body(account_id: &str) -> String {
+    serde_json::json!({ "owner": { "id": account_id } }).to_string()
+}
+
+/// Assign an alert to an Atlassian account (`POST .../alerts/{id}/assign`).
+///
+/// The endpoint and body are assumed from the Opsgenie-compatible API (like
+/// `add_note`) and must be verified against the live tenant on first use.
+pub fn assign_alert(auth: &AlertsAuth, alert_id: &str, account_id: &str) -> Result<()> {
+    require_complete(auth)?;
+    validate_alert_id(alert_id)?;
+    if account_id.trim().is_empty() {
+        return Err(AppError::Parse(
+            "alerts: no Atlassian account id to assign to (set MY_ID or store it in Credential Manager)"
+                .to_string(),
+        ));
+    }
+    let url = format!("{}/alerts/{alert_id}/assign", ops_base(auth));
+    curl_request(auth, &url, &[], Some(&assign_body(account_id.trim())))?;
+    Ok(())
+}
+
+/// What [`assign_if_open`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssignOutcome {
+    Assigned,
+    /// The alert had closed, so nothing was assigned.
+    AlreadyClosed,
+}
+
+/// The escalation: re-read the alert and assign it to `account_id` only if it
+/// is still open. A closed alert is left alone, and a failed re-read is an
+/// error rather than a guess either way.
+pub fn assign_if_open(auth: &AlertsAuth, alert_id: &str, account_id: &str) -> Result<AssignOutcome> {
+    let alert = fetch_alert(auth, alert_id)?;
+    if !is_open(&alert) {
+        return Ok(AssignOutcome::AlreadyClosed);
+    }
+    assign_alert(auth, alert_id, account_id)?;
+    Ok(AssignOutcome::Assigned)
+}
+
 /// The JSON body for a note: `{"note": "<text>"}`, built with `serde_json`
 /// so quotes, backslashes and newlines in arbitrary text cannot break out.
 pub fn note_body(note: &str) -> String {

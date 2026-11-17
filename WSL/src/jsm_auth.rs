@@ -75,13 +75,6 @@ pub const OPSGENIE_API_KEY_TARGET: &str = "ec2_manager/opsgenie_api_key";
 /// Environment variable that overrides the stored Opsgenie API key.
 pub const OPSGENIE_API_KEY_ENV: &str = "OPSGENIE_API_KEY";
 
-/// Credential Manager target for the escalation mailbox address (password
-/// field only). Not a secret, but it must not be committed: it is a personal
-/// address, and it is the point at which data leaves the org.
-pub const ESCALATION_MAILBOX_TARGET: &str = "ec2_manager/escalation_mailbox";
-/// Environment variable that overrides the stored escalation mailbox address.
-pub const ESCALATION_MAILBOX_ENV: &str = "ESCALATION_MAILBOX";
-
 /// First non-blank of the candidates, trimmed. Blank-but-set is treated as
 /// absent: `export JIRA_TOKEN=` must not shadow a real stored credential.
 ///
@@ -175,54 +168,6 @@ fn some_unless_blank(v: String) -> Option<String> {
 pub fn opsgenie_api_key() -> Option<String> {
     let v = resolve_id(OPSGENIE_API_KEY_ENV, OPSGENIE_API_KEY_TARGET, "");
     some_unless_blank(v)
-}
-
-/// The escalation mailbox, resolved from the two sources it has.
-///
-/// Pure: both candidates are passed in, so the precedence and the
-/// blank-is-absent rule are testable without touching the real environment
-/// or the Windows credential store — the same reason `resolve_auth` is
-/// shaped this way.
-///
-/// Environment beats the credential store, and a blank-but-set environment
-/// value is absent rather than an override, so `set ESCALATION_MAILBOX=`
-/// cannot shadow a working stored address. There is deliberately no third
-/// candidate: no compiled-in fallback, no default.
-pub fn resolve_escalation_mailbox(
-    from_env: Option<String>,
-    from_store: Option<String>,
-) -> Option<String> {
-    some_unless_blank(first_non_blank([
-        from_env.as_deref(),
-        from_store.as_deref(),
-        None,
-    ]))
-}
-
-/// The address escalation mail is sent to, if one is configured.
-///
-/// **Resolve this once and store the answer; never call it per frame.** It
-/// is a `std::env::var` plus a `CredReadW` on every call, and egui is
-/// immediate mode — a menu-visibility check runs every frame, which would
-/// turn this into dozens of Win32 credential reads a second. The convention
-/// here is to settle a gate at startup, as `fed_auth_enabled` does, and pass
-/// the resolved value on (see `Features::on_call_test_visible_for`, which
-/// takes the mailbox as a parameter for exactly this reason).
-///
-/// Deliberately has no fallback and no default. An address nobody configured
-/// must never become an address the app invents — this is the destination for
-/// mail that crosses the org boundary, so "unset" has to mean the feature is
-/// unavailable rather than "send it somewhere". Same fail-closed posture as
-/// `allow_delete_user` and the Alerts button.
-///
-/// Stored in Credential Manager rather than `features.json` (committed, so a
-/// personal address would enter the corporate repo) or `config.ini` (plain
-/// text, and it would let any user aim the app at any external address).
-pub fn escalation_mailbox() -> Option<String> {
-    resolve_escalation_mailbox(
-        std::env::var(ESCALATION_MAILBOX_ENV).ok(),
-        crate::wincred::read_generic(ESCALATION_MAILBOX_TARGET).map(|(_user, secret)| secret),
-    )
 }
 
 #[cfg(test)]
@@ -405,86 +350,5 @@ mod tests {
         assert_eq!(SCHEDULE_ID_ENV, "SCHEDULE_ID");
         assert_eq!(ATLASSIAN_ACCOUNT_ID_ENV, "MY_ID");
         assert_eq!(OPSGENIE_API_KEY_ENV, "OPSGENIE_API_KEY");
-    }
-
-    #[test]
-    fn the_escalation_mailbox_target_and_env_match_what_is_documented() {
-        // These two strings are what the user typed into Credential Manager
-        // with `cmdkey /generic:...` and may have exported. Renaming either
-        // silently disables the feature on a machine that is correctly set
-        // up, so they are pinned here rather than left to a refactor.
-        assert_eq!(ESCALATION_MAILBOX_TARGET, "ec2_manager/escalation_mailbox");
-        assert_eq!(ESCALATION_MAILBOX_ENV, "ESCALATION_MAILBOX");
-    }
-
-    // -- escalation_mailbox -------------------------------------------------
-    //
-    // The precedence rules are exercised through `resolve_escalation_mailbox`,
-    // which takes both candidates as arguments: the credential store cannot be
-    // written from a test (and does not exist on Linux at all), and driving the
-    // real `ESCALATION_MAILBOX` variable would give a developer who has it set
-    // a different answer than CI -- the same flakiness the opsgenie tests above
-    // avoid. `escalation_mailbox` itself is then pinned to the two constants it
-    // must read, which is the part a rename or a copy-paste would break.
-
-    #[test]
-    fn the_escalation_mailbox_environment_beats_the_credential_store() {
-        assert_eq!(
-            resolve_escalation_mailbox(
-                Some("env@example.com".to_string()),
-                Some("stored@example.com".to_string())
-            ),
-            Some("env@example.com".to_string())
-        );
-    }
-
-    #[test]
-    fn a_blank_escalation_mailbox_environment_does_not_shadow_a_stored_value() {
-        // `set ESCALATION_MAILBOX=` must not read as "configured with an empty
-        // address": that would hide a working stored address behind nothing,
-        // and the send would go to nobody while the app reported success.
-        for blank in ["", "   ", "\t"] {
-            assert_eq!(
-                resolve_escalation_mailbox(
-                    Some(blank.to_string()),
-                    Some("stored@example.com".to_string())
-                ),
-                Some("stored@example.com".to_string()),
-                "blank env {blank:?} must not shadow the store"
-            );
-        }
-    }
-
-    #[test]
-    fn the_credential_store_is_used_when_the_environment_is_unset() {
-        assert_eq!(
-            resolve_escalation_mailbox(None, Some("stored@example.com".to_string())),
-            Some("stored@example.com".to_string())
-        );
-    }
-
-    #[test]
-    fn nothing_configured_yields_no_escalation_mailbox() {
-        // No fallback and no default: an address nobody configured must never
-        // become an address the app invents. The caller hides the action.
-        assert_eq!(resolve_escalation_mailbox(None, None), None);
-        assert_eq!(
-            resolve_escalation_mailbox(Some(String::new()), Some("   ".to_string())),
-            None
-        );
-    }
-
-    #[test]
-    fn escalation_mailbox_reads_the_documented_environment_variable_and_target() {
-        // Calls the real function, and passes whether or not the developer
-        // running this has a mailbox configured: it asserts that the wrapper
-        // agrees with `resolve_escalation_mailbox` fed from the two documented
-        // sources. Wiring it to the wrong constant -- or to a compiled-in
-        // fallback -- makes the two disagree.
-        let expected = resolve_escalation_mailbox(
-            std::env::var(ESCALATION_MAILBOX_ENV).ok(),
-            crate::wincred::read_generic(ESCALATION_MAILBOX_TARGET).map(|(_u, secret)| secret),
-        );
-        assert_eq!(escalation_mailbox(), expected);
     }
 }

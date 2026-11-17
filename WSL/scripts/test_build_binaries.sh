@@ -106,7 +106,6 @@ test_package_windows_zip_ships_both_powershell_scripts() {
   # on sight and this app has a CrowdStrike quarantine in its history.
   local missing=""
   [[ -f "$WINDOWS_DIST_DIR/send_access_email.ps1" ]] || missing="$missing send_access_email.ps1"
-  [[ -f "$WINDOWS_DIST_DIR/send_escalation.ps1" ]] || missing="$missing send_escalation.ps1"
   if [[ -n "$missing" ]]; then
     echo "assertion failed: not copied beside the exe:$missing" >&2
     exit 1
@@ -127,7 +126,7 @@ test_package_windows_zip_ships_both_powershell_scripts() {
   local listing
   listing="$(unzip -Z1 "$zip_path" | tr '\n' ' ')"
   local extract_dir="$WINDOWS_DIST_DIR/ec2_manager_windows"
-  for shipped in send_access_email.ps1 send_escalation.ps1 \
+  for shipped in send_access_email.ps1 \
                  "${CLI_APP_NAME}_${APP_VERSION}.exe" \
                  "${GUI_APP_NAME}_${APP_VERSION}.exe"; do
     if [[ "$listing" != *"$shipped"* ]]; then

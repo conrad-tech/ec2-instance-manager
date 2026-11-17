@@ -101,8 +101,8 @@
     "  fetch_count        alerts pulled per poll. 0 means the default (10).",
     "",
     "Off call it does nothing at all -- no acknowledge, no timer, no escalation.",
-    "Escalating also needs an escalation mailbox (ESCALATION_MAILBOX, or the",
-    "ec2_manager/escalation_mailbox credential); without one the watcher stays dark."
+    "Escalating means assigning the alert to you, so it needs your Atlassian",
+    "account id (MY_ID, or the stored credential); without one the watcher stays dark."
   ],
   "pingdom": {
     "enabled": false,
@@ -166,7 +166,7 @@
     "  fetch_count            alerts pulled per poll. 0 means the default (10).",
     "",
     "Off call no incident starts (no acknowledge, no terminate, no notification);",
-    "one already running finishes. Needs the escalation mailbox like pingdom."
+    "one already running finishes. Needs your Atlassian account id (MY_ID) like pingdom."
   ],
   "unhealthy_host": {
     "enabled": false,
