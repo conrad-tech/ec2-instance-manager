@@ -627,30 +627,20 @@ pub fn acknowledge_alert(auth: &AlertsAuth, alert_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The JSON bodies to try for an assignment, in order. The API's own field
-/// name for the owner is not confirmed: `id` and `accountId` have each been
-/// answered with 422 `must not be blank`, so each spelling is tried, and the
-/// by-login form last. Built with `serde_json` so nothing in a value can
-/// break out of the body.
-pub fn assign_bodies(account_id: &str, email: &str) -> Vec<String> {
-    let mut v = vec![
+/// The JSON bodies to try for an assignment. Atlassian's published spec
+/// (`AssignAlertRequest`, required `accountId`) is a FLAT object:
+/// `{"accountId":"<id>"}`. Nesting it under `owner` -- the Opsgenie shape --
+/// is what produced 422 `: must not be blank`. The nested spellings stay as
+/// fallbacks only. Built with `serde_json` so nothing in a value can break
+/// out of the body.
+pub fn assign_bodies(account_id: &str, _email: &str) -> Vec<String> {
+    vec![
+        serde_json::json!({ "accountId": account_id }),
         serde_json::json!({ "owner": { "accountId": account_id } }),
-        serde_json::json!({ "owner": { "id": account_id } }),
-        serde_json::json!({ "owner": { "id": account_id, "accountId": account_id } }),
-    ];
-    if !email.trim().is_empty() {
-        v.push(serde_json::json!({ "owner": { "username": email.trim() } }));
-        // The 422 names no field, so a required one may be missing entirely:
-        // the Opsgenie action payloads also take `user`, `source` and `note`.
-        v.push(serde_json::json!({
-            "owner": { "accountId": account_id },
-            "user": email.trim(),
-            "source": "EC2 Manager",
-            "note": "Assigned from EC2 Manager",
-        }));
-        v.push(serde_json::json!({ "user": email.trim(), "owner": { "id": account_id } }));
-    }
-    v.into_iter().map(|b| b.to_string()).collect()
+    ]
+    .into_iter()
+    .map(|b| b.to_string())
+    .collect()
 }
 
 /// The first body in [`assign_bodies`].
@@ -901,7 +891,7 @@ mod tests {
     /// takes a row off the button.
     #[test]
     fn the_assign_body_names_the_account_id() {
-        assert_eq!(assign_body("abc:123"), r#"{"owner":{"accountId":"abc:123"}}"#);
+        assert_eq!(assign_body("abc:123"), r#"{"accountId":"abc:123"}"#);
     }
 
     #[test]

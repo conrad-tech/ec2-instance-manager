@@ -205,7 +205,7 @@ pub fn request_with_method(
     let mut cmd = Command::new("curl");
     cmd.args(["-sS", "--fail-with-body", "-K", "-", "-H", "Accept: application/json"]);
     match body {
-        Some(body) => {
+        Some(_) => {
             // The body goes in on stdin, in the same curl config as the
             // credentials, not as an argument: a JSON body is full of double
             // quotes, and handing those through a Windows command line is
