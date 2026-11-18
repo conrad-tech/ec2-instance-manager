@@ -147,6 +147,26 @@ pub fn clear_api_calls() {
     }
 }
 
+/// A value as curl's config-file syntax wants it: double-quoted, with `\\`,
+/// `"` and line breaks escaped. The config parser reads these escapes inside
+/// quotes, so the body arrives byte for byte.
+pub fn config_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// One request against an Atlassian API. `query` pairs are sent with
 /// `-G --data-urlencode` for GET; `post_body` switches it to a POST with a
 /// JSON body. Credentials go in on stdin via curl's `-K -` config so the
@@ -186,7 +206,11 @@ pub fn request_with_method(
     cmd.args(["-sS", "--fail-with-body", "-K", "-", "-H", "Accept: application/json"]);
     match body {
         Some(body) => {
-            cmd.args(["-X", method, "-H", "Content-Type: application/json", "-d", body]);
+            // The body goes in on stdin, in the same curl config as the
+            // credentials, not as an argument: a JSON body is full of double
+            // quotes, and handing those through a Windows command line is
+            // exactly where a body gets mangled or lost. See `config_quote`.
+            cmd.args(["-X", method, "-H", "Content-Type: application/json"]);
         }
         None => {
             cmd.arg("-G");
@@ -224,6 +248,9 @@ pub fn request_with_method(
         // never recorded — the trace holds `display_url` and the response,
         // neither of which sees it.
         writeln!(stdin, "user = \"{}:{}\"", email.trim(), token.trim())?;
+        if let Some(body) = body {
+            writeln!(stdin, "data = {}", config_quote(body))?;
+        }
     }
     let output = child.wait_with_output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -284,6 +311,15 @@ pub fn request_with_method(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_json_body_is_quoted_for_curls_config_file() {
+        assert_eq!(
+            config_quote(r#"{"owner":{"username":"a\b"}}"#),
+            r#""{\"owner\":{\"username\":\"a\\b\"}}""#
+        );
+        assert_eq!(config_quote("a\nb"), "\"a\\nb\"");
+    }
+
     use super::*;
 
     fn sample_call(url: &str, body: &str) -> ApiCall {
