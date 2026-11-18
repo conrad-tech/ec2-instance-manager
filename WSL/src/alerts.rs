@@ -640,6 +640,15 @@ pub fn assign_bodies(account_id: &str, email: &str) -> Vec<String> {
     ];
     if !email.trim().is_empty() {
         v.push(serde_json::json!({ "owner": { "username": email.trim() } }));
+        // The 422 names no field, so a required one may be missing entirely:
+        // the Opsgenie action payloads also take `user`, `source` and `note`.
+        v.push(serde_json::json!({
+            "owner": { "accountId": account_id },
+            "user": email.trim(),
+            "source": "EC2 Manager",
+            "note": "Assigned from EC2 Manager",
+        }));
+        v.push(serde_json::json!({ "user": email.trim(), "owner": { "id": account_id } }));
     }
     v.into_iter().map(|b| b.to_string()).collect()
 }
@@ -660,16 +669,23 @@ pub fn assign_alert(auth: &AlertsAuth, alert_id: &str, account_id: &str) -> Resu
 /// The shape of a body for the log: its keys, never the values (the account id
 /// and login are not for a log that gets pasted into tickets).
 fn body_shape(body: &str) -> String {
-    match serde_json::from_str::<serde_json::Value>(body) {
-        Ok(v) => match v.get("owner").and_then(|o| o.as_object()) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return "?".to_string();
+    };
+    let Some(top) = v.as_object() else {
+        return "?".to_string();
+    };
+    let parts: Vec<String> = top
+        .iter()
+        .map(|(k, val)| match val.as_object() {
             Some(o) => {
                 let keys: Vec<&str> = o.keys().map(String::as_str).collect();
-                format!("owner{{{}}}", keys.join(","))
+                format!("{k}{{{}}}", keys.join(","))
             }
-            None => "?".to_string(),
-        },
-        Err(_) => "?".to_string(),
-    }
+            None => k.clone(),
+        })
+        .collect();
+    parts.join("+")
 }
 
 /// [`assign_alert`] plus one line per body tried, so a failure shows which
