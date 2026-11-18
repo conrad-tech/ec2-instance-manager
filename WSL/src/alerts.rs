@@ -97,6 +97,11 @@ pub struct Alert {
     /// Every identifier the `owner` field carried (the string itself, or an
     /// object's `accountId` / `id` / `username` / `email`), for matching.
     pub owner_ids: Vec<String>,
+    /// The `owner` field exactly as the API sent it (compact JSON), and the
+    /// alert's top-level field names. Diagnostic only: they say what shape
+    /// this tenant uses for assignment.
+    pub owner_raw: String,
+    pub field_keys: String,
 }
 
 /// Raw shape of a single alert in the API response. Unknown fields ignored;
@@ -211,6 +216,8 @@ impl Alert {
             extra,
             owner,
             owner_ids,
+            owner_raw: raw.owner.to_string(),
+            field_keys: String::new(),
         }
     }
 
@@ -573,7 +580,11 @@ pub fn parse_single_alert(body: &str) -> Result<Alert> {
     let inner = v.get("data").or_else(|| v.get("value")).unwrap_or(&v);
     let raw: RawAlert = serde_json::from_value(inner.clone())
         .map_err(|e| AppError::Parse(format!("alerts: unexpected alert shape: {e}")))?;
-    Ok(Alert::from_raw(raw))
+    let mut alert = Alert::from_raw(raw);
+    if let Some(o) = inner.as_object() {
+        alert.field_keys = o.keys().cloned().collect::<Vec<_>>().join(",");
+    }
+    Ok(alert)
 }
 
 /// The newest `count` alerts, newest first. One request, no paging — the
@@ -616,29 +627,99 @@ pub fn acknowledge_alert(auth: &AlertsAuth, alert_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The JSON body for an assignment: `{"owner":{"accountId":"<account id>"}}`.
-/// (`id` was tried first and the API answered 422 `title: must not be blank`.)
-/// Built with `serde_json` so nothing in the id can break out of the body.
+/// The JSON bodies to try for an assignment, in order. The API's own field
+/// name for the owner is not confirmed: `id` and `accountId` have each been
+/// answered with 422 `must not be blank`, so each spelling is tried, and the
+/// by-login form last. Built with `serde_json` so nothing in a value can
+/// break out of the body.
+pub fn assign_bodies(account_id: &str, email: &str) -> Vec<String> {
+    let mut v = vec![
+        serde_json::json!({ "owner": { "accountId": account_id } }),
+        serde_json::json!({ "owner": { "id": account_id } }),
+        serde_json::json!({ "owner": { "id": account_id, "accountId": account_id } }),
+    ];
+    if !email.trim().is_empty() {
+        v.push(serde_json::json!({ "owner": { "username": email.trim() } }));
+    }
+    v.into_iter().map(|b| b.to_string()).collect()
+}
+
+/// The first body in [`assign_bodies`].
 pub fn assign_body(account_id: &str) -> String {
-    serde_json::json!({ "owner": { "accountId": account_id } }).to_string()
+    assign_bodies(account_id, "").remove(0)
 }
 
 /// Assign an alert to an Atlassian account (`POST .../alerts/{id}/assign`).
 ///
-/// The endpoint and body are assumed from the Opsgenie-compatible API (like
-/// `add_note`) and must be verified against the live tenant on first use.
+/// A rejected body (422/400) moves on to the next spelling; the first accepted
+/// one wins. If all are refused the last error is returned.
 pub fn assign_alert(auth: &AlertsAuth, alert_id: &str, account_id: &str) -> Result<()> {
-    require_complete(auth)?;
-    validate_alert_id(alert_id)?;
+    assign_alert_traced(auth, alert_id, account_id).1
+}
+
+/// The shape of a body for the log: its keys, never the values (the account id
+/// and login are not for a log that gets pasted into tickets).
+fn body_shape(body: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) => match v.get("owner").and_then(|o| o.as_object()) {
+            Some(o) => {
+                let keys: Vec<&str> = o.keys().map(String::as_str).collect();
+                format!("owner{{{}}}", keys.join(","))
+            }
+            None => "?".to_string(),
+        },
+        Err(_) => "?".to_string(),
+    }
+}
+
+/// [`assign_alert`] plus one line per body tried, so a failure shows which
+/// spellings the API refused and what it said.
+pub fn assign_alert_traced(
+    auth: &AlertsAuth,
+    alert_id: &str,
+    account_id: &str,
+) -> (Vec<String>, Result<()>) {
+    let mut lines: Vec<String> = Vec::new();
+    if let Err(e) = require_complete(auth).and_then(|_| validate_alert_id(alert_id)) {
+        return (lines, Err(e));
+    }
     if account_id.trim().is_empty() {
-        return Err(AppError::Parse(
-            "alerts: no Atlassian account id to assign to (set MY_ID or store it in Credential Manager)"
-                .to_string(),
-        ));
+        return (
+            lines,
+            Err(AppError::Parse(
+                "alerts: no Atlassian account id to assign to (set MY_ID or store it in Credential Manager)"
+                    .to_string(),
+            )),
+        );
     }
     let url = format!("{}/alerts/{alert_id}/assign", ops_base(auth));
-    curl_request(auth, &url, &[], Some(&assign_body(account_id.trim())))?;
-    Ok(())
+    let bodies = assign_bodies(account_id.trim(), &auth.email);
+    let total = bodies.len();
+    let mut last = None;
+    for (i, body) in bodies.iter().enumerate() {
+        let shape = body_shape(body);
+        match curl_request(auth, &url, &[], Some(body)) {
+            Ok(_) => {
+                lines.push(format!("assign try {}/{total} {shape}: accepted", i + 1));
+                return (lines, Ok(()));
+            }
+            Err(e) => {
+                let text = e.to_string();
+                let rejected = text.contains("422") || text.contains("400");
+                lines.push(format!(
+                    "assign try {}/{total} {shape}: {}: {text}",
+                    i + 1,
+                    if rejected { "refused" } else { "failed, not trying more" }
+                ));
+                last = Some(e);
+                if !rejected {
+                    break;
+                }
+            }
+        }
+    }
+    let err = last.unwrap_or_else(|| AppError::Parse("alerts: assign: no body to send".to_string()));
+    (lines, Err(err))
 }
 
 /// What [`assign_if_open`] did.

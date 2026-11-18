@@ -3379,6 +3379,9 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         error: Option<String>,
         ack_in_flight: bool,
         assign_in_flight: bool,
+        /// `(owner as the alert spells it, display name)` once looked up in
+        /// Jira, so the window can show the name instead of the login.
+        owner_name: Option<(String, String)>,
         note: Option<std::result::Result<String, String>>,
         /// The alert's notes: `None` until read, `Err` when they could not be.
         notes: Option<std::result::Result<Vec<alerts::AlertNote>, String>>,
@@ -3394,6 +3397,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                 error: None,
                 ack_in_flight: false,
                 assign_in_flight: false,
+                owner_name: None,
                 note: None,
                 notes: None,
             }
@@ -3413,6 +3417,13 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
         Assigned {
             id: String,
             result: std::result::Result<(), String>,
+            /// One line per request body tried.
+            lines: Vec<String>,
+        },
+        OwnerName {
+            id: String,
+            owner: String,
+            name: String,
         },
         Notes {
             id: String,
@@ -20932,8 +20943,9 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                     ec2_manager::jsm_auth::ATLASSIAN_ACCOUNT_ID_TARGET,
                     "",
                 );
-                let result = alerts::assign_alert(&auth, &id, &me).map_err(|e| e.to_string());
-                let _ = tx.send(AlertDetailEvent::Assigned { id, result });
+                let (lines, result) = alerts::assign_alert_traced(&auth, &id, &me);
+                let result = result.map_err(|e| e.to_string());
+                let _ = tx.send(AlertDetailEvent::Assigned { id, result, lines });
             });
         }
 
@@ -20951,8 +20963,36 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                         match result {
                             Ok(alert) => {
                                 win.tiny_id = alert.tiny_id.clone();
+                                let owner = alert.owner.clone();
+                                let diag = format!(
+                                    "alerts: {id}: owner as sent = {} (read as {:?}); fields: {}",
+                                    alert.owner_raw, alert.owner, alert.field_keys
+                                );
+                                let known = win
+                                    .owner_name
+                                    .as_ref()
+                                    .is_some_and(|(o, _)| o == &owner);
                                 win.alert = Some(*alert);
                                 win.error = None;
+                                self.log_alerts(LogLevel::Info, diag);
+                                if !owner.is_empty() && !known && self.jira_site.is_complete() {
+                                    let site = self.jira_site.clone();
+                                    let tx = self.alert_detail_tx.clone();
+                                    let id = id.clone();
+                                    std::thread::spawn(move || {
+                                        if let Ok(users) =
+                                            ec2_manager::jira::search_users(&site, &owner)
+                                        {
+                                            if let Some(u) = users.into_iter().next() {
+                                                let _ = tx.send(AlertDetailEvent::OwnerName {
+                                                    id,
+                                                    owner,
+                                                    name: u.display_name,
+                                                });
+                                            }
+                                        }
+                                    });
+                                }
                             }
                             Err(err) => {
                                 self.log_alerts(LogLevel::Error, format!("alerts: {id}: {err}"));
@@ -20964,6 +21004,11 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                             }
                         }
                     }
+                    AlertDetailEvent::OwnerName { id, owner, name } => {
+                        if let Some(win) = self.alert_windows.iter_mut().find(|w| w.id == id) {
+                            win.owner_name = Some((owner, name));
+                        }
+                    }
                     AlertDetailEvent::Notes { id, result } => {
                         if let Err(e) = &result {
                             self.log_alerts(LogLevel::Warn, format!("alerts: {id}: notes: {e}"));
@@ -20972,7 +21017,15 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                             win.notes = Some(result);
                         }
                     }
-                    AlertDetailEvent::Assigned { id, result } => {
+                    AlertDetailEvent::Assigned { id, result, lines } => {
+                        for line in &lines {
+                            let level = if line.ends_with(": accepted") {
+                                LogLevel::Info
+                            } else {
+                                LogLevel::Warn
+                            };
+                            self.log_alerts(level, format!("alerts: {id}: {line}"));
+                        }
                         if let Some(win) = self.alert_windows.iter_mut().find(|w| w.id == id) {
                             win.assign_in_flight = false;
                             win.note = Some(match &result {
@@ -23284,6 +23337,7 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
 
             for idx in 0..self.alert_windows.len() {
                 let assign_in_flight = self.alert_windows[idx].assign_in_flight;
+                let owner_name = self.alert_windows[idx].owner_name.clone();
                 let (id, tiny_id, alert, loading, error, ack_in_flight, note) = {
                     let w = &self.alert_windows[idx];
                     (
@@ -23389,10 +23443,18 @@ const DISK_SCRIPT_OK_BANNER: Duration = Duration::from_secs(60);
                                         ui.weak("Assigned to");
                                         if alert.owner.is_empty() {
                                             note_label(ui, egui::Color32::from_rgb(220, 160, 60), "unassigned");
-                                        } else if assigned_to_me {
-                                            ui.label(format!("{} (you)", alert.owner));
                                         } else {
-                                            ui.label(&alert.owner);
+                                            let shown = owner_name
+                                                .as_ref()
+                                                .filter(|(o, _)| o == &alert.owner)
+                                                .map(|(_, n)| n.as_str())
+                                                .unwrap_or(alert.owner.as_str());
+                                            let r = if assigned_to_me {
+                                                ui.label(format!("{shown} (you)"))
+                                            } else {
+                                                ui.label(shown)
+                                            };
+                                            r.on_hover_text(&alert.owner);
                                         }
                                         ui.end_row();
                                         field(ui, "Source", &alert.source);
